@@ -1,0 +1,205 @@
+<h1>dsh-cost-ledger</h1>
+<blockquote>
+<p>Cross-session persistent cost ledger for <a href="https://github.com/deepseek-ai/deepseek-harness">DeepSeek Harness</a>.
+Auto-logs every LLM token-usage event to SQLite and exposes <code>record_cost</code> / <code>query_cost</code> / <code>set_budget</code> agent tools. Built-in DeepSeek pricing, overridable via plugin config. Install-and-go, no extra wiring.</p>
+</blockquote>
+<h2>Status</h2>
+<p><strong>Phase 1 (host side) — complete &amp; live-verified in DSH 0.1.0-rc.6 (last verified 2026-08-13).</strong> 28 data-layer checks pass (<code>pnpm selftest</code>); the plugin loads and runs in a real <code>dsh web</code> profile.</p>
+<p>The token-usage source and tool registration API are <strong>confirmed from DSH 0.1.0-rc.6 source</strong> and wired for real:</p>
+<table>
+<thead>
+<tr>
+<th>Integration</th>
+<th>API</th>
+<th>Status</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>Token usage capture</td>
+<td><code>ctx.on('llm/stream', (options, next) =&gt; AsyncIterable&lt;StreamChunk&gt;)</code> — Cordis waterfall around every model call</td>
+<td>✅ wired</td>
+</tr>
+<tr>
+<td>Tool registration</td>
+<td><code>ctx.tools.register(ToolDefinition)</code> — real <code>{ name, description, parameters, output:{schema,render}, execute(args, exec) }</code></td>
+<td>✅ wired</td>
+</tr>
+<tr>
+<td>Persistent store</td>
+<td>SQLite via <code>better-sqlite3</code> (prebuilt win32 binary, no compile)</td>
+<td>✅</td>
+</tr>
+<tr>
+<td>Pricing</td>
+<td>DeepSeek official (CNY/1M tok), cache-aware; config-overridable</td>
+<td>✅</td>
+</tr>
+<tr>
+<td>Live load in <code>dsh web</code></td>
+<td>installed via <code>dsh plugin --profile web add .</code>, host loads the bundle, <code>apply()</code> runs, SQLite opens</td>
+<td>✅ verified</td>
+</tr>
+<tr>
+<td>End-to-end token capture</td>
+<td><code>dsh --profile headless "..."</code> → real LLM call → <code>llm/stream</code> listener fires → usage chunk harvested → SQLite row written</td>
+<td>✅ verified</td>
+</tr>
+</tbody></table>
+<p><strong>Live-verified:</strong> a one-shot <code>dsh --profile headless "reply with exactly: hi"</code> produced real rows in <code>ledger.db</code> (<code>{model:"glm-5-2", inputTokens, outputTokens, cacheReadTokens}</code>) — the full <code>llm/stream</code> → usage-chunk → SQLite pipeline works against the real host.</p>
+<p>Module loading uses <code>.ts</code> extension specifiers (<code>./store.ts</code>) — the Cordis loader rewrites these and loads TypeScript directly, so <strong>no build step</strong> is needed; the plugin runs from source after install.</p>
+<p>Two issues found &amp; fixed during live integration:</p>
+<ul>
+<li><strong><code>{ global: true }</code> on <code>ctx.on('llm/stream')</code></strong> — without it the listener only sees calls from its own fiber; the agent loop dispatches from a different scope. (Mirrors the host's own <code>invariant.js</code> usage.)</li>
+<li><strong>No uninjected service access</strong> — <code>ctx.session</code>/<code>ctx.workspace</code> throw "cannot get property without inject" unless declared in <code>inject</code>. Session id now comes from the <code>llm/stream</code> event's <code>options.sessionId</code> instead.</li>
+</ul>
+<p><strong>Phase 2 (WebUI dashboard panel) — researched, not implemented.</strong> See <a href="#phase-2-webui-panel">Phase 2</a>.</p>
+<hr>
+<h2>What it does</h2>
+<ul>
+<li><strong>Auto-logs token usage</strong>: subscribes to the <code>llm/stream</code> waterfall and writes <code>{timestamp, session, project, model, inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens, cost}</code> per real provider call (including retries).</li>
+<li><strong>Computes cost</strong>: built-in DeepSeek pricing (<code>deepseek-chat</code> / <code>deepseek-reasoner</code>, CNY per 1M tokens). <code>inputTokens</code> is uncached input; billed input = <code>input + cacheRead + cacheWrite</code>, each priced at its own rate. Override or add models via config.</li>
+<li><strong>Three agent tools</strong>:<ul>
+<li><code>record_cost</code> — manually record a usage entry (backfill/test).</li>
+<li><code>query_cost</code> — total spend + per-model breakdown within a range (<code>today</code>/<code>week</code>/<code>month</code>/<code>all</code>/ISO); reports current daily-budget status.</li>
+<li><code>set_budget</code> — create/update/remove a spending budget (<code>daily</code>/<code>weekly</code>/<code>monthly</code>/<code>never</code> window, label-scoped: <code>daily</code>, <code>model:&lt;name&gt;</code>, <code>project:&lt;name&gt;</code>).</li>
+</ul>
+</li>
+</ul>
+<h2>Install (community / standard)</h2>
+<pre><code>dsh plugin --profile web add &lt;path-or-package&gt;
+</code></pre>
+<p>The host discovers the plugin from <code>package.json</code> (<code>dsh.bundle.patch</code>) — no absolute path, no manual wiring. The <code>prepare</code> script builds <code>lib/</code> from source, so a git checkout installs self-contained. Restart <code>dsh web</code> after install.</p>
+<blockquote>
+<p><strong>Git install note:</strong> pnpm ≥10 blocks a git dependency's <code>prepare</code> script until allowed. If the first <code>add</code> fails, copy the exact package key pnpm printed into the profile's <code>pnpm-workspace.yaml</code> (<code>allowBuilds: dsh-cost-ledger: true</code>) and re-run — exactly as the official docs describe.</p>
+</blockquote>
+<h2>Local development</h2>
+<pre><code>pnpm install
+pnpm selftest              # verify the data layer (28 checks)
+pnpm typecheck
+pnpm build                 # build host (lib/*.js) + client (lib/client.js)
+
+# load into a running dsh web via the patch (absolute path, this machine):
+dsh web --patch ./cordis.patch.yml
+</code></pre>
+<h2>Pricing — built-in official rates</h2>
+<p>Built-in model pricing (元/百万 tokens, from each platform's official pricing page):</p>
+<ul>
+<li><code>deepseek-v4-flash</code> — input 0.10 / output 3.0 / cacheRead 9.0 (peak tier)</li>
+<li><code>deepseek-v4-pro</code> — input 0.30 / output 9.0 / cacheRead 27.0 (peak tier)</li>
+<li><code>deepseek-chat</code> (V3) / <code>deepseek-reasoner</code> (R1) — legacy aliases</li>
+<li><code>glm-5-2</code> — default 0 (override in the dashboard ⚙️设置 tab or config; fill from Zhipu's pricing)</li>
+</ul>
+<p>Unknown models record tokens only (cost = 0) until you set a price. Override anytime via the <strong>⚙️设置 tab</strong> in the dashboard or the WebUI settings card — changes apply to new calls immediately.</p>
+<h2>Config</h2>
+<p>Edited in the dashboard <strong>⚙️设置</strong> tab (runtime, not persisted across restart) or under the WebUI plugin config card (durable) / <code>cordis.patch.yml</code>:</p>
+<pre><code>config:
+  dbPath: 'dsh-cost-ledger/ledger.db'      # relative to DSH cwd
+  defaultDailyBudget: 0                     # CNY; 0 = no limit
+  pricing:
+    deepseek-chat:                          # override or add any model
+      input: 2
+      output: 8
+      cacheRead: 0.5
+      cacheWrite: 8
+</code></pre>
+<h2>Architecture</h2>
+<pre><code>src/
+  pricing.ts   built-in DeepSeek price table + computeCost()
+  store.ts     SQLite ledger: insert + summaryByModel + spentSince + budgets
+  tools.ts     three ToolDefs (pure handlers over store + config)
+  config.ts    Schema (schemastery) config
+  index.ts     apply(ctx): llm/stream listener + registerTools + cleanup
+  client/      Phase 2 WebUI entry (stub)
+cordis.patch.yml   local-dev profile patch (absolute path)
+scripts/selftest.ts   standalone data-layer verification
+</code></pre>
+<h3>Token capture (confirmed API)</h3>
+<p><code>llm/stream</code> is a Cordis <strong>waterfall</strong> wrapping every streaming model call (retries included). The listener transparently forwards the underlying stream while harvesting the <code>usage</code> chunk:</p>
+<pre><code>ctx.on('llm/stream', (options, next) =&gt; (async function* () {
+  let usage: TokenUsage | undefined
+  for await (const chunk of next()) {
+    if (chunk.type === 'usage') usage = chunk.usage
+    yield chunk
+  }
+  if (usage) record(options, usage)   // persist one row
+})())
+</code></pre>
+<p>Key billing facts (from official <code>TokenUsage</code>):</p>
+<ul>
+<li><code>inputTokens</code> = uncached input only. Billed input = <code>input + cacheRead + cacheWrite</code>.</li>
+<li><code>reasoningTokens</code> is already included in <code>outputTokens</code> — never double-count.</li>
+<li><code>usage</code> is not guaranteed (early abort/error) — absence is logged at debug.</li>
+</ul>
+<p>The <code>TokenUsage</code> / <code>StreamChunk</code> / <code>GenerateOptions</code> types live in <code>@deepseek-ai/dsh-llm</code> (an unpublished host-injected package). This plugin declares minimal local types to typecheck standalone; swap for a real <code>import type</code> once the host package is resolvable.</p>
+<h2>Phase 2 (WebUI panel)</h2>
+<p>Researched against the <code>dsh-web-ui</code> reference. Key finding: <strong>DSH exposes no general-purpose sidebar-panel slot</strong> for external plugins. <code>sidebar.workspaces</code> / <code>sidebar.settings</code> are single-occupant and taken by the shell. Options:</p>
+<ul>
+<li><strong>DOM-level bypass</strong> (the <code>dsh-task-board</code> / <code>dsh-ssh</code> approach): <code>MutationObserver</code> + <code>createRoot</code> into <code>[data-pane="sidebar"]</code> / <code>[data-pane="conversation"]</code>. Most flexible.</li>
+<li><strong>Settings card</strong> via <code>web-ui.plugin.item</code> (lightest — a summary card under Settings → Plugins).</li>
+<li><strong>No chart-library precedent</strong> in the ecosystem. Recommended: inline SVG, or vendor <code>recharts</code> (strict CSP, no CDN).</li>
+</ul>
+<h2>Compatibility</h2>
+<ul>
+<li><strong>DSH version:</strong> verified against <code>0.1.0-rc.6</code> (the API surface — <code>ctx.on('llm/stream')</code>, <code>ctx.tools.register</code>, <code>ctx.inject</code>, <code>agentDefaultModel</code> — is confirmed from DSH 0.1.0-rc.6 source).</li>
+<li><strong>Last verified:</strong> 2026-08-13.</li>
+<li><strong>Profiles:</strong> loads under both <code>dsh web</code> (full UI + HTTP API + dashboard) and <code>dsh --profile headless</code> (token capture + tools only; HTTP API and dashboard are web-profile-only and silently skipped).</li>
+<li><strong>OS:</strong> the SQLite backend ships a prebuilt win32 binary via <code>better-sqlite3</code>; other platforms build from source at install time (requires a C++ toolchain). Verified on Windows 11 / Node 22.</li>
+<li><strong>Pre-release caveat:</strong> DSH is in developer preview with expected compatibility-breaking changes. The token-usage source and tool registration API are confirmed against rc.6; a future mainline may rename them, which would require a plugin update.</li>
+</ul>
+<h2>Install</h2>
+<pre><code>dsh plugin --profile web add &lt;path-or-package&gt;
+</code></pre>
+<p>The host discovers the plugin from <code>package.json</code> (<code>dsh.bundle.patch</code>) — no absolute path, no manual wiring. The <code>prepare</code> script builds <code>lib/</code> from source, so a git checkout installs self-contained. Restart <code>dsh web</code> after install.</p>
+<blockquote>
+<p><strong>Git install note:</strong> pnpm ≥10 blocks a git dependency's <code>prepare</code> script until allowed. If the first <code>add</code> fails, copy the exact package key pnpm printed into the profile's <code>pnpm-workspace.yaml</code> (<code>allowBuilds: dsh-cost-ledger: true</code>) and re-run — exactly as the official docs describe.</p>
+</blockquote>
+<h2>Uninstall</h2>
+<pre><code># Remove the bundle from the profile, then restart dsh web
+dsh plugin --profile web remove dsh-cost-ledger
+</code></pre>
+<p>This removes the bundle from the profile's <code>dsh.profile.bundles</code> list and unlinks the package. The ledger database (<code>dsh-cost-ledger/ledger.db</code>) and any config overrides in <code>cordis.patch.yml</code> are <strong>not</strong> removed automatically — delete them manually if you want a clean sweep:</p>
+<pre><code>Remove-Item -Recurse -Force dsh-cost-ledger   # the data dir created under the DSH cwd
+</code></pre>
+<p>To disable temporarily without removing: comment out <code>dsh-cost-ledger</code> in the profile's <code>cordis.yml</code> <code>bundles</code> list and restart.</p>
+<h2>Quick start</h2>
+<pre><code># 1. Install into your web profile (see Install above)
+dsh plugin --profile web add .
+
+# 2. Restart dsh web, then just use the agent normally
+dsh web
+</code></pre>
+<p>Every model call is now auto-logged. After a few prompts, ask the agent to query spend:</p>
+<pre><code>&gt; 查一下今天花了多少钱（query_cost today）
+</code></pre>
+<p>Or open the dashboard panel in the Web UI (the cost-ledger tab) to see a live summary, per-model breakdown, and the budget/budget settings — no extra wiring.</p>
+<h2>Permissions &amp; data</h2>
+<ul>
+<li><strong>Files written:</strong> one SQLite database at <code>dsh-cost-ledger/ledger.db</code> (path configurable via <code>dbPath</code>, relative to the DSH working directory) plus its WAL/SHM sidecar files. Nothing else touches the filesystem.</li>
+<li><strong>Network:</strong> none. The plugin makes no outbound network calls. (The <code>parse-prices</code> endpoint calls the <strong>host's</strong> own <code>ctx.llm.stream()</code> — it reuses the model call path you already configured, not a new connection.)</li>
+<li><strong>Credentials:</strong> none read, stored, or transmitted. The plugin never touches your API keys; it only reads token counts and model names that the host already emits on the <code>llm/stream</code> event.</li>
+<li><strong>Data logged per model call:</strong> <code>{timestamp, sessionId, project, model, provider, inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens, cost}</code>. No prompt content or completions are ever stored — only aggregate token counts and metadata.</li>
+<li><strong>HTTP API:</strong> when running under <code>dsh web</code>, the plugin registers read-only-ish JSON endpoints under <code>/api/cost-ledger/*</code>. They bind to the host's web server and are reachable from the same origin as the Web UI. The <code>cleanup</code> and <code>parse-prices</code> endpoints are write/POST endpoints intended for the dashboard UI.</li>
+</ul>
+<h2>Troubleshooting</h2>
+<ul>
+<li><strong><code>Cannot find module './store.ts'</code> / load error after a git pull:</strong> the Cordis loader resolves <code>.ts</code> specifiers directly, but a stale <code>lib/</code> can interfere. Run <code>pnpm build</code> (or <code>pnpm install</code> to trigger <code>prepare</code>) and restart <code>dsh web</code>.</li>
+<li><strong><code>better-sqlite3</code> install fails on macOS/Linux:</strong> the prebuilt binary is win32-only; other platforms compile from source. Install a C++ toolchain (<code>build-essential</code> / Xcode CLT) and re-run <code>pnpm install</code>.</li>
+<li><strong>No cost rows appear:</strong> confirm the model call actually emitted a <code>usage</code> chunk (early aborts/errors may not). Token capture is best-effort — absent usage is logged at debug level. Also confirm <code>dbPath</code> is writable.</li>
+<li><strong><code>parse-prices</code> returns 503 / "default model not configured":</strong> the <code>agentDefaultModel</code> service hadn't resolved yet, or no default model is set in Agent settings. Set a default model and retry.</li>
+<li><strong>pnpm blocks the <code>prepare</code> script on git install:</strong> add <code>allowBuilds: dsh-cost-ledger: true</code> to the profile's <code>pnpm-workspace.yaml</code> and re-run <code>dsh plugin add</code>.</li>
+<li><strong>Logs:</strong> plugin diagnostics go to the host log (<code>dsh web</code> console / <code>dsh-run.log</code>); the SQLite ledger itself is the system of record for cost data.</li>
+<li><strong>Rollback:</strong> <code>dsh plugin --profile web remove dsh-cost-ledger</code> + restart; optionally delete the <code>dsh-cost-ledger/</code> data dir (see Uninstall).</li>
+</ul>
+<h2>Development</h2>
+<pre><code>pnpm install
+pnpm selftest              # verify the data layer (28 checks)
+pnpm typecheck
+pnpm build                 # build host (lib/*.js) + client (lib/client.js)
+
+# load into a running dsh web via the patch (absolute path, this machine):
+dsh web --patch ./cordis.patch.yml
+</code></pre>
+<p><code>react</code> / <code>react-dom</code> and the <code>@deepseek-ai/dsh-client-*</code> runtime packages are <strong>external</strong> to the client bundle (resolved by the host's module loader at runtime), so they are correctly declared as <code>devDependencies</code> / <code>peerDependencies</code>, not <code>dependencies</code>. The only runtime <code>dependency</code> is <code>better-sqlite3</code>.</p>
+<h2>License &amp; security</h2>
+<p>MIT — see <a href="https://github.com/suimi8/dsh-cost-ledger/blob/HEAD/LICENSE">LICENSE</a>.</p>
+<p><strong>Security reporting:</strong> this plugin has no network surface and stores no credentials, but if you find a vulnerability (e.g. unsafe SQL handling, path traversal via <code>dbPath</code>), please <strong>do not open a public issue</strong>. Report it privately via <a href="https://github.com/suimi8/dsh-cost-ledger/security/advisories/new">GitHub Security Advisories</a> (Security → Report a vulnerability on the repo). All SQL uses parameterized statements (<code>@named</code> bind params) and all filesystem access is confined to the configured <code>dbPath</code>.</p>

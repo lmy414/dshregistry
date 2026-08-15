@@ -1,0 +1,446 @@
+<p align="center">
+  <img src="https://raw.githubusercontent.com/Lhy723/dsh-self-evolution/main/docs/social-preview.zh-CN.jpg" alt="dsh-self-evolution 中文社交预览图">
+</p>
+
+<p align="center">
+  <a href="https://github.com/Lhy723/dsh-self-evolution/blob/HEAD/README.en.md">English</a> · 简体中文
+</p>
+
+<h1 align="center">dsh-self-evolution</h1>
+
+<p align="center">
+  <a href="https://github.com/Lhy723/dsh-self-evolution/blob/HEAD/LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License"></a>
+  <a href="https://github.com/Lhy723/dsh-self-evolution/blob/HEAD/package.json"><img src="https://img.shields.io/badge/node-%3E%3D22-339933.svg" alt="Node"></a>
+  <a href="https://github.com/Lhy723/dsh-self-evolution/blob/HEAD/COMPATIBILITY.md"><img src="https://img.shields.io/badge/deepseek--harness-0.1.0--rc.6-8A2BE2.svg" alt="DeepSeek Harness"></a>
+</p>
+
+<p>面向 <strong>DeepSeek Harness / Cordis</strong> 的基准驱动自我进化插件：让 Agent Profile（<code>AGENTS.md</code>、Skills、<code>runtime.json</code>、config）在冻结的 Benchmark 上自我迭代——每次改进必须<strong>严格优于</strong>当前版本才会被接受，否则从已验证的快照精确回滚。</p>
+<pre><code>Agent Profile v1
+  ↓ frozen Benchmark
+Target Subagents × Case × Run
+  ↓
+Private Evaluator Subagents
+  ↓ score + public feedback + DeepSeek Session IDs
+Isolated Optimizer Subagent
+  ↓ bounded file operations
+AGENTS.md / Skills / runtime.json / config
+  ↓ Agent Profile v2
+re-evaluate
+  ├─ score strictly better → snapshot + accept
+  └─ otherwise             → verified rollback
+</code></pre>
+<h2>特性亮点</h2>
+<ul>
+<li><strong>原生集成</strong>：直接调用 <code>ctx.subagents.start(...)</code> 与 <code>ctx.tools.register(defineTool(...))</code>，是真正的 Cordis Service（<code>ctx.evolution</code>），不是 shell 包装脚本。</li>
+<li><strong>确定性宿主策略</strong>：评测决策不进 LLM——Benchmark 冻结哈希、Case × Run 矩阵、严格接受门槛（<code>&gt;</code> 而非 <code>&gt;=</code>，平分回滚）、单调版本号、快照验证全部由宿主代码执行。</li>
+<li><strong>三类隔离角色</strong>：Target 继承 Profile 的 persona 与工具范围；Evaluator 只见私有 rubric + 原始输出；Optimizer 只见公开证据，并带 <code>{ allow: [] }</code> 全工具隔离，只能通过受限文件操作提候选。</li>
+<li><strong>隐私边界</strong>：私有 rubric 不进 Target / Optimizer 上下文；公开与私有产物分目录落盘。</li>
+<li><strong>事务化变更</strong>：候选文件白名单、路径穿越与符号链接防护、单 Profile 互斥锁、外部改动检测（漂移时拒绝覆盖回滚）。</li>
+<li><strong>全程可追踪</strong>：每个子 Agent 都有独立 DeepSeek Session ID，Scoreboard 与运行事件日志可复盘每一轮的决策。</li>
+<li><strong>即插即用</strong>：声明 <code>dsh.bundle</code> 的 profile bundle，<code>dsh plugin</code> 一条命令完成安装与组合。</li>
+</ul>
+<h2>快速开始</h2>
+<h3>前置条件</h3>
+<ul>
+<li>一个已初始化的 DeepSeek Harness profile（<code>dsh</code> CLI 与 <code>pnpm</code> 在 PATH 上）；</li>
+<li>profile 自带 <code>tools</code> / <code>subagents</code> 注册表与官方 <code>spawn</code> provider（默认 <code>@deepseek-ai/dsh-base</code> 即满足）；</li>
+<li>一个 Agent Profile 目录（含 <code>AGENTS.md</code> 与 <code>runtime.json</code>）；</li>
+<li>一个冻结的 Benchmark 目录（<strong>放在 Target workspace 之外</strong>）。</li>
+</ul>
+<h3>安装</h3>
+<p>本包是 DeepSeek Harness <strong>profile bundle</strong>（<code>package.json</code> 的 <code>"dsh"</code> 段指向根目录 <a href="https://github.com/Lhy723/dsh-self-evolution/blob/HEAD/cordis.patch.yml"><code>cordis.patch.yml</code></a>），安装、激活一条命令完成：</p>
+<pre><code># 方式一：npm registry（推荐）
+dsh plugin --profile web add dsh-self-evolution
+
+# 方式二：直接从 GitHub 仓库安装（无需发布，立即可用）
+dsh plugin --profile web add github:Lhy723/dsh-self-evolution
+
+# 方式三：本地 tarball
+dsh plugin --profile web add ./dsh-self-evolution-0.1.1.tgz
+</code></pre>
+<p>npm 包：<a href="https://www.npmjs.com/package/dsh-self-evolution">dsh-self-evolution</a>（当前版本 <code>0.1.1</code>）。</p>
+<p><code>dsh plugin</code> 会把包安装进 profile 目录，并把包名追加进 <code>dsh.profile.bundles</code>；启动时 bundle 的 patch 应用在 <code>@deepseek-ai/dsh-base</code> 之后。无论用哪种 spec（registry 名 / git / tarball），reconcile 都会按真实包名 <code>dsh-self-evolution</code> 记录，后续 <code>dsh plugin ... update</code> 正常工作。</p>
+<blockquote>
+<p>GitHub 安装说明：pnpm 默认阻止 git 依赖的 build 脚本，而本仓库<strong>直接提交了预构建的 <code>dist/</code></strong>，因此不需要 <code>prepare</code> 构建步骤，也不需要配置 <code>allowBuilds</code>。</p>
+</blockquote>
+<h3>验证安装</h3>
+<pre><code>dsh --profile web --dump-config
+</code></pre>
+<p>输出里应出现由本 bundle 注入的行：</p>
+<pre><code># == dsh-self-evolution
+- id: self-evolution
+  name: dsh-self-evolution
+  config:
+    stateRoot: ~/.dsh/self-evolution
+    subagentProvider: spawn
+    ...
+</code></pre>
+<p>之后在会话里能看到四个 <code>evolution_*</code> 工具，即安装成功。</p>
+<h3>第一次运行</h3>
+<ol>
+<li><p>把 <a href="https://github.com/Lhy723/dsh-self-evolution/blob/HEAD/examples/profile"><code>examples/profile</code></a> 复制到 Agent workspace；</p>
+</li>
+<li><p>把 <a href="https://github.com/Lhy723/dsh-self-evolution/blob/HEAD/examples/benchmarks/demo"><code>examples/benchmarks/demo</code></a> 复制到 workspace 外部的私有目录；</p>
+</li>
+<li><p>在会话中先做一次纯评测建立基线：</p>
+<pre><code>{
+  "profile_dir": "./agent-profile",
+  "benchmark_dir": "/private/benchmarks/demo",
+  "runs_per_case": 1
+}
+</code></pre>
+<p>（让 Agent 调用 <code>evolution_evaluate</code>，或直接用上面的参数。）</p>
+</li>
+<li><p>确认 Scoreboard 出现 Baseline 后，再跑一轮进化：</p>
+<pre><code>{
+  "profile_dir": "./agent-profile",
+  "benchmark_dir": "/private/benchmarks/demo",
+  "rounds": 1,
+  "runs_per_case": 2
+}
+</code></pre>
+<p>观察接受与拒绝两种路径后，再考虑无人值守的批量优化。</p>
+</li>
+</ol>
+<h2>工作原理</h2>
+<p>插件不是在 shell 里套一层脚本，它直接使用 DeepSeek Harness 的原生能力：</p>
+<ul>
+<li><strong>Target</strong> 是继承当前 Agent preset 的一等子 Agent；Profile 的 <code>AGENTS.md</code>、Skills、config 注入其 persona，<code>runtime.json.toolFilter</code> 成为其 scoped Tool Restriction；</li>
+<li><strong>Evaluator</strong> 与 <strong>Optimizer</strong> 使用 <code>{ allow: [] }</code> 清空继承工具，只保留 harness 为结构化输出临时注册的子 Agent 自有工具；</li>
+<li>每个 Target / Evaluator / Optimizer 都有独立、可追踪的 DeepSeek Session ID；</li>
+<li>插件通过 <code>ctx.tools.register(defineTool(...))</code> 注册模型工具，并作为 Cordis Service 暴露为 <code>ctx.evolution</code>。</li>
+</ul>
+<p>与「让模型自己改 Prompt」的本质区别：以下部分全部在确定性的宿主代码中执行——Benchmark 冻结与内容哈希、Case × Run 并发矩阵、候选文件白名单与路径防护、单 Profile 互斥锁与外部改动检测、单调版本号与快照验证、严格提升门槛（<code>candidate.score &gt; reference.score + minImprovement</code>）、接受/拒绝/手工回滚、JSON Scoreboard 与公开/私有产物分离。</p>
+<h2>模型工具</h2>
+<p>默认前缀为 <code>evolution</code>，可通过 <code>toolPrefix</code> 配置修改。</p>
+<table>
+<thead>
+<tr>
+<th>工具</th>
+<th>作用</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>evolution_run</code></td>
+<td>完整闭环：基线 → 候选生成 → 评测 → 严格接受或回滚</td>
+</tr>
+<tr>
+<td><code>evolution_evaluate</code></td>
+<td>只评测不修改，追加一条 durable reference</td>
+</tr>
+<tr>
+<td><code>evolution_status</code></td>
+<td>当前版本、实际哈希、漂移、下一版本、Benchmark 引用与快照</td>
+</tr>
+<tr>
+<td><code>evolution_rollback</code></td>
+<td>恢复到某个已验证的版本快照</td>
+</tr>
+</tbody></table>
+<h3><code>evolution_run</code></h3>
+<pre><code>{
+  "profile_dir": "./agent-profile",
+  "benchmark_dir": "/private/benchmarks/code-review",
+  "rounds": 3,
+  "runs_per_case": 2,
+  "baseline_runs": 1,
+  "target_score": 85
+}
+</code></pre>
+<p><code>target_score</code> 可选，达到即提前停止（0–100）。<code>adopt_external_changes: true</code> 可把人工改动的受管 Profile 采纳为新版本，而不是因 digest 漂移失败。</p>
+<h3><code>evolution_evaluate</code></h3>
+<pre><code>{
+  "profile_dir": "./agent-profile",
+  "benchmark_dir": "/private/benchmarks/code-review",
+  "runs_per_case": 3
+}
+</code></pre>
+<h3><code>evolution_status</code></h3>
+<pre><code>{ "profile_dir": "./agent-profile" }
+</code></pre>
+<h3><code>evolution_rollback</code></h3>
+<pre><code>{ "profile_dir": "./agent-profile", "version": 2 }
+</code></pre>
+<p>回滚不会复用后续候选版本号：例如 v4 被拒绝或回滚后，下一个候选仍是 v5。</p>
+<h2>Agent Profile</h2>
+<p>Profile 是一个普通目录：</p>
+<pre><code>agent-profile/
+├── AGENTS.md
+├── runtime.json
+├── skills/
+│   └── verification/
+│       └── SKILL.md
+└── config/
+    └── quality-policy.md
+</code></pre>
+<table>
+<thead>
+<tr>
+<th>文件</th>
+<th>角色</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>AGENTS.md</code></td>
+<td>目标 Agent 的核心行为说明，进入 Target persona</td>
+</tr>
+<tr>
+<td><code>skills/*/SKILL.md</code></td>
+<td>可复用能力，按名称排序后完整注入；Optimizer 可增删改</td>
+</tr>
+<tr>
+<td><code>config/**/*.json|md</code></td>
+<td>稳定策略 / 格式契约 / 领域配置，同样进入 Target persona</td>
+</tr>
+<tr>
+<td><code>runtime.json</code></td>
+<td>唯一被机器解释的 Profile 文件</td>
+</tr>
+</tbody></table>
+<p><code>runtime.json</code>：</p>
+<pre><code>{
+  "schemaVersion": 1,
+  "version": 1,
+  "agentOptions": {
+    "maxTokens": 8192
+  },
+  "toolFilter": {
+    "deny": ["schedule_create", "cordis_define"]
+  },
+  "metadata": {
+    "owner": "agent-platform"
+  }
+}
+</code></pre>
+<table>
+<thead>
+<tr>
+<th>字段</th>
+<th>含义</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>version</code></td>
+<td>当前 Profile 版本；候选版本由引擎分配，拒绝后不复用</td>
+</tr>
+<tr>
+<td><code>agentOptions</code></td>
+<td>子 Agent 的 <code>provider</code> / <code>model</code> / <code>maxTokens</code> 覆盖</td>
+</tr>
+<tr>
+<td><code>toolFilter</code></td>
+<td>scoped Tool Restriction：<code>allow</code> / <code>deny</code></td>
+</tr>
+<tr>
+<td><code>metadata</code></td>
+<td>插件不解释的普通 JSON 元数据</td>
+</tr>
+</tbody></table>
+<p>默认禁止 Optimizer 修改 <code>provider</code> 与 <code>model</code>，避免换模型被误记为 Profile 改进；设置 <code>allowModelRouteMutation: true</code> 才开放。完整示例见 <a href="https://github.com/Lhy723/dsh-self-evolution/blob/HEAD/examples/profile"><code>examples/profile</code></a>。</p>
+<h2>Benchmark</h2>
+<p>Benchmark 必须声明 <code>frozen: true</code>：</p>
+<pre><code>benchmark/
+├── benchmark.json
+├── public/          # Target 可见
+│   ├── concise-answer.md
+│   └── verification.md
+└── private/         # 仅 Evaluator 可见
+    ├── concise-answer.md
+    └── verification.md
+</code></pre>
+<p><code>benchmark.json</code>：</p>
+<pre><code>{
+  "schemaVersion": 1,
+  "id": "assistant-quality",
+  "title": "Assistant quality",
+  "frozen": true,
+  "evaluatorInstructions": "Score observable behavior, not writing style alone.",
+  "cases": [
+    {
+      "id": "concise-answer",
+      "statementFile": "public/concise-answer.md",
+      "rubricFile": "private/concise-answer.md",
+      "weight": 1
+    }
+  ]
+}
+</code></pre>
+<p>每个 Case：内联 <code>statement</code> 或 <code>statementFile</code> 二选一、<code>rubricFile</code> 必填、可选正数 <code>weight</code>、可选 <code>tags</code>。</p>
+<p>manifest、公开 Statement 与私有 Rubric 全部纳入 Benchmark digest：评测前后 digest 不一致则整轮失败；已有 Scoreboard 也拒绝同 ID、不同 digest 的 Benchmark。<strong>生产环境请把 Benchmark（尤其 private rubric）放在 Target workspace 之外</strong>——默认 <code>allowBenchmarkInsideWorkspace: false</code> 会拒绝 workspace 内的 Benchmark。示例见 <a href="https://github.com/Lhy723/dsh-self-evolution/blob/HEAD/examples/benchmarks/demo"><code>examples/benchmarks/demo</code></a>。</p>
+<h2>接受规则</h2>
+<p>候选只有在以下条件全部满足时才接受：</p>
+<ol>
+<li>Optimizer 产出有效、受限的文件操作；</li>
+<li>Candidate 应用后 Profile digest 可重建；</li>
+<li>完整 Case × Run 矩阵均有有效评分；</li>
+<li>Benchmark digest 未变化；</li>
+<li>评测期间 Profile 未被其他进程修改；</li>
+<li><code>candidate.score &gt; reference.score + minImprovement</code>。</li>
+</ol>
+<p><strong>不使用 <code>&gt;=</code>，平分会回滚。</strong> Baseline 在 Benchmark digest、Profile version、Profile digest 三者完全一致时可复用；Candidate 的 <code>runs_per_case</code> 可以高于先前 Baseline，Scoreboard 会分别记录各自的 Run 数。</p>
+<h2>状态与产物</h2>
+<p>默认状态根：</p>
+<pre><code>~/.dsh/self-evolution/
+└── profiles/&lt;sha256(real-profile-path)[0:24]&gt;/
+    ├── state.json
+    ├── profile.lock
+    ├── snapshots/
+    │   ├── v1/
+    │   └── v2/...
+    ├── scoreboards/&lt;benchmark-id&gt;.json
+    └── runs/&lt;run-id&gt;/
+        ├── run.json
+        ├── events.jsonl
+        ├── public/          # Target 输出、分数、公开反馈、Session ID
+        └── private/         # rubric、Evaluator 私有理由
+</code></pre>
+<p>Optimizer Prompt 只由公开证据构建；私有产物绝不回灌模型上下文。</p>
+<h2>配置参考</h2>
+<table>
+<thead>
+<tr>
+<th>配置</th>
+<th align="right">默认</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>stateRoot</code></td>
+<td align="right"><code>~/.dsh/self-evolution</code></td>
+<td>快照、Scoreboard 与运行记录根目录</td>
+</tr>
+<tr>
+<td><code>subagentProvider</code></td>
+<td align="right"><code>spawn</code></td>
+<td><code>ctx.subagents.start()</code> provider 名</td>
+</tr>
+<tr>
+<td><code>maxParallelEvaluations</code></td>
+<td align="right"><code>4</code></td>
+<td>并发 Case×Run cell 数</td>
+</tr>
+<tr>
+<td><code>minImprovement</code></td>
+<td align="right"><code>0</code></td>
+<td>候选必须严格超过 Reference 的额外分差</td>
+</tr>
+<tr>
+<td><code>maxCandidateOperations</code></td>
+<td align="right"><code>12</code></td>
+<td>单候选最大文件操作数</td>
+</tr>
+<tr>
+<td><code>maxCandidateBytes</code></td>
+<td align="right"><code>262144</code></td>
+<td>单候选写入总 UTF-8 字节数</td>
+</tr>
+<tr>
+<td><code>evaluationRetries</code></td>
+<td align="right"><code>1</code></td>
+<td>Target cell 失败后的额外尝试数</td>
+</tr>
+<tr>
+<td><code>evaluatorRetries</code></td>
+<td align="right"><code>2</code></td>
+<td>同一 Target 输出的 Evaluator 额外尝试数</td>
+</tr>
+<tr>
+<td><code>optimizerRetries</code></td>
+<td align="right"><code>1</code></td>
+<td>无效候选的额外 Optimizer 尝试数</td>
+</tr>
+<tr>
+<td><code>lockStaleMs</code></td>
+<td align="right"><code>1800000</code></td>
+<td>过期 Profile lock 判定</td>
+</tr>
+<tr>
+<td><code>allowBenchmarkInsideWorkspace</code></td>
+<td align="right"><code>false</code></td>
+<td>是否允许私有 Benchmark 位于 Target workspace</td>
+</tr>
+<tr>
+<td><code>allowModelRouteMutation</code></td>
+<td align="right"><code>false</code></td>
+<td>是否允许候选修改 provider/model</td>
+</tr>
+<tr>
+<td><code>managedFiles</code></td>
+<td align="right">见源码</td>
+<td>可修改/快照的 glob</td>
+</tr>
+<tr>
+<td><code>excludedFiles</code></td>
+<td align="right">见源码</td>
+<td>Secret 与非状态文件排除 glob</td>
+</tr>
+<tr>
+<td><code>requiredFiles</code></td>
+<td align="right"><code>AGENTS.md</code>, <code>runtime.json</code></td>
+<td>不得删除的文件</td>
+</tr>
+<tr>
+<td><code>toolPrefix</code></td>
+<td align="right"><code>evolution</code></td>
+<td>四个工具的名称前缀</td>
+</tr>
+<tr>
+<td><code>maxDepth</code></td>
+<td align="right"><code>4</code></td>
+<td>子 Agent 委派深度上限</td>
+</tr>
+<tr>
+<td><code>targetAgentOptions</code></td>
+<td align="right">未设置</td>
+<td>Target 的部署级 AgentOptions 覆盖</td>
+</tr>
+<tr>
+<td><code>evaluatorAgentOptions</code></td>
+<td align="right">未设置</td>
+<td>Evaluator 的部署级 AgentOptions 覆盖</td>
+</tr>
+<tr>
+<td><code>optimizerAgentOptions</code></td>
+<td align="right">未设置</td>
+<td>Optimizer 的部署级 AgentOptions 覆盖</td>
+</tr>
+</tbody></table>
+<h2>安全边界</h2>
+<p>插件保证的是<strong>上下文与文件事务边界</strong>，不是新的 OS sandbox：</p>
+<ul>
+<li>Rubric 不会进入 Target 或 Optimizer Prompt；</li>
+<li>Evaluator / Optimizer 的继承工具被清空；</li>
+<li>Candidate 不能写绝对路径、<code>..</code>、符号链接路径、Secret glob 或非受管文件；</li>
+<li>Profile 漂移会阻止回滚覆盖外部修改。</li>
+</ul>
+<p>但若 Target 子 Agent 继承了可越界工具（如 <code>danger-full-access</code> shell），它仍可能主动搜索 workspace 外的宿主文件。把 private rubric 作为强保密数据时，必须同时使用 harness 的 workspace sandbox / filesystem policy，或在 <code>runtime.json.toolFilter</code> 中移除可越界工具。详见 <a href="https://github.com/Lhy723/dsh-self-evolution/blob/HEAD/SECURITY.md"><code>SECURITY.md</code></a>。</p>
+<h2>模型与 Token 影响</h2>
+<ul>
+<li><strong>工具面</strong>：注册 4 个工具，每个 schema 约 1KB 量级描述，进入能看到该工具层的 Agent 的 prompt。</li>
+<li><strong>子 Agent 扇出</strong>：一次 <code>evolution_run</code> 的模型调用量约为 <code>rounds × cases × (runs_per_case × (1 target + 1 evaluator) + 1 optimizer) + baseline</code>，请按此预算 token 与 KV-cache。</li>
+<li><strong>上下文注入</strong>：Target persona 注入完整 Profile；Optimizer prompt 注入公开证据与完整受管 Profile；rubric 与私有评估笔记<strong>不</strong>进入模型上下文（由宿主侧隐私边界保证）。</li>
+<li><strong>确定性开销</strong>：digest、快照均为本地哈希/文件操作，不产生模型调用；并发受 <code>maxParallelEvaluations</code> 限制。</li>
+</ul>
+<h2>已知限制与待办</h2>
+<ul>
+<li>带模型凭据的 live E2E 尚未执行：<code>runtime.json.toolFilter</code> 的实际生效依赖官方 <code>spawn</code> provider 的 Tool Restriction 语义，已按 rc.6 类型核对但未经 live 验证。</li>
+<li>插件提供上下文与文件事务边界，而非 OS sandbox（见上）。</li>
+<li><code>evolution_status</code> 与 <code>evolution_rollback</code> 需要调用 Agent（<code>exec.agent</code>）；无 Agent 上下文会报 <code>MISSING_AGENT</code>。</li>
+<li>单 Profile 互斥靠 <code>profile.lock</code> + <code>lockStaleMs</code> 过期判定，跨主机并发不在其列（无分布式锁）。</li>
+</ul>
+<h2>开发与验证</h2>
+<pre><code>npm run build                          # 真实 @deepseek-ai/*@rc.6 声明的严格构建
+node scripts/smoke-register.mjs        # 真实 dsh-tools / dsh-invariants 注册冒烟
+dsh --profile &lt;name&gt; --dump-config     # 真实 launcher 的 bundle 组合验证
+npm pack                               # 产出发布 tarball
+</code></pre>
+<p>验证分三层：</p>
+<ol>
+<li><strong>真实类型构建</strong>：以发布版 <code>@deepseek-ai/*@0.1.0-rc.6</code> 的声明做严格构建，覆盖 <code>defineTool</code>、<code>ctx.subagents.start</code> 完整请求面、<code>Session.header.cwd</code>、<code>ObjectJsonSchema</code> 子集。</li>
+<li><strong>真实 runtime 冒烟</strong>：用真实注册表挂载本插件，验证四个工具注册、<code>./invariant</code> 伴侣注册、fiber dispose 后零泄漏（HMR 安全），并由真实 launcher 组合 bundle patch。</li>
+</ol>
+<p>尚未执行的只有带模型凭据的端到端运行；部署到自己的 profile 后，可按 <a href="https://github.com/Lhy723/dsh-self-evolution/blob/HEAD/COMPATIBILITY.md"><code>COMPATIBILITY.md</code></a> 的验收步骤验证，完整构建记录见 <a href="https://github.com/Lhy723/dsh-self-evolution/blob/HEAD/BUILD_REPORT.md"><code>BUILD_REPORT.md</code></a>。</p>
+<h2>贡献</h2>
+<p>Issues 与 PR 欢迎。改动源码后请跑完上方的三层验证再提交；<code>dist/</code> 与源码同 commit 提交（git 安装依赖预构建产物）。</p>
+<h2>License</h2>
+<p><a href="https://github.com/Lhy723/dsh-self-evolution/blob/HEAD/LICENSE">MIT</a></p>

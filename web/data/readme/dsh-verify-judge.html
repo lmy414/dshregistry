@@ -1,0 +1,164 @@
+<h1>dsh-verify-judge</h1>
+<p>English | <a href="https://github.com/zriyox/dsh-verify-judge/blob/HEAD/README.zh.md">中文</a></p>
+<p><strong>What it does, in one sentence: when your AI agent says "I'm done", this plugin makes it prove it.</strong></p>
+<p>You're running a long task with a goal in <a href="https://github.com/deepseek-ai/deepseek-harness">DeepSeek Harness</a>. The agent works a few rounds, then announces "done". But done according to whom? By default, according to itself — and models are known to rationalize half-finished work.</p>
+<p>With this plugin installed, "done" has a price:</p>
+<ul>
+<li>The agent calls <code>update_goal(complete)</code> to close its goal → the plugin <strong>actually runs the project's test suite first</strong>. Red tests → the completion is rejected, and the failure output goes back to the agent as "keep fixing" instructions.</li>
+<li>The agent tries to skip the ceremony and just <em>say</em> it's done in chat, then end the turn → the plugin checks again at the turn boundary and <strong>sends it back to work</strong>.</li>
+</ul>
+<p>If everything is genuinely green, the agent never notices the plugin exists. That's the whole UX: invisible when honest, immovable when not.</p>
+<h2>What it solves</h2>
+<p>Autonomous goal loops (e.g. dsh's goal mode) let an agent run many rounds by itself — but the moment of "I'm done" was pure self-declaration. With a vague or ambitious objective, the model could stamp <code>complete</code> while tests were still red. <code>verify-judge</code> turns stamping into a gated action: the goal can only close when the workspace's own verification commands exit 0.</p>
+<h2>Test evidence (real runs, 2026-08-14, headless profile, live API)</h2>
+<p>Same workspace, same failing test (<code>add</code> implemented as <code>a - b</code>); only the gate differs:</p>
+<table>
+<thead>
+<tr>
+<th>Run</th>
+<th>Gate</th>
+<th>What the model did</th>
+<th>Result</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>A/B control</td>
+<td><strong>OFF</strong> (<code>disabled: true</code>)</td>
+<td>Created goal, immediately stamped complete with tests still failing</td>
+<td>❌ Stamp accepted — goal "complete" with a red suite, 0 rounds spent</td>
+</tr>
+<tr>
+<td>A1</td>
+<td>ON</td>
+<td>Stamped without fixing</td>
+<td>🚫 Denied: "Verification failed — the goal cannot be marked complete yet", with the failing command and output tail fed back; goal stayed <code>active</code></td>
+</tr>
+<tr>
+<td>A2</td>
+<td>ON</td>
+<td>Fixed the bug per the denial feedback, re-stamped</td>
+<td>✅ Accepted after <code>npm test</code> exit 0; goal <code>complete</code>, auto-disarmed</td>
+</tr>
+<tr>
+<td>A4</td>
+<td>ON</td>
+<td>Goal in a workspace with no detectable test command (write a text file)</td>
+<td>✅ Stamped normally — nothing to verify, default <code>allow</code></td>
+</tr>
+<tr>
+<td>Turn-end gate (v0.2.0)</td>
+<td>ON</td>
+<td>Created a goal, then declared "done" in prose <strong>without stamping or fixing</strong></td>
+<td>🚫 The turn-end gate re-ran <code>npm test</code>, found it red, and steered the agent to keep working — twice, then stopped per <code>maxTurnEndRetries</code>; the model's own words: "只要验证器继续触发，我会继续如实报告"</td>
+</tr>
+<tr>
+<td>Happy path (v0.2.0)</td>
+<td>ON</td>
+<td>Created a goal, fixed the code properly, then stamped</td>
+<td>✅ Zero interference — both gates stayed silent, goal closed on first stamp; the model reported "没有收到任何来自验证器的提示"</td>
+</tr>
+<tr>
+<td><code>onUndetected: deny</code> (v0.2.0)</td>
+<td>ON</td>
+<td>Stamp in a marker-less workspace</td>
+<td>🚫 Denied with configuration guidance; the model correctly explained the two remedies (set <code>commands</code> or add a test script)</td>
+</tr>
+<tr>
+<td>Command timeout (v0.2.0)</td>
+<td>ON</td>
+<td>Verification command <code>sleep 5</code> with <code>timeoutMs: 2000</code></td>
+<td>🚫 Denied ("timed out after 2000ms"); recognizing the failure as deterministic, the model escalated to <code>blocked</code> with a concrete reason — the intended pressure valve</td>
+</tr>
+<tr>
+<td>Nonexistent command (v0.2.0)</td>
+<td>ON</td>
+<td><code>commands: ['definitely-not-a-real-command-xyz']</code></td>
+<td>🚫 Denied with <code>exit code 127 / command not found</code>; the model located the misconfiguration in the harness profile, <strong>refused to tamper with it</strong> ("修改它属于篡改验证系统，不可为"), and marked the goal <code>blocked</code></td>
+</tr>
+</tbody></table>
+<p>Full-philosophy demo (goal + <code>plan.md</code> acceptance checklist + gate): the agent fixed <code>capitalize</code>, implemented the missing <code>reverseWords</code>, ticked all three checkboxes in <code>plan.md</code> itself, and stamped — the gate re-ran <code>npm test</code> (2 pass / 0 fail) and let the goal close. The receipt on disk (<code>plan.md</code> fully checked) matches the test reality.</p>
+<h2>Demo</h2>
+<p>A self-contained, reproducible demo lives in <a href="https://github.com/zriyox/dsh-verify-judge/blob/HEAD/demo/README.md"><code>demo/</code></a>: a workspace with an intentionally failing test, a <code>plan.md</code> acceptance checklist, and <code>run-demo.sh</code>. It walks through the deny → fix → pass loop against the live harness, plus the A/B control (disable the gate and watch the stamp sail through with red tests).</p>
+<h2>Install</h2>
+<pre><code>dsh plugin --profile web add github:zriyox/dsh-verify-judge
+# or a local checkout:
+dsh plugin --profile web add /absolute/path/to/dsh-verify-judge
+</code></pre>
+<p>Restart <code>dsh web</code> (or let the patch watcher reload). From then on, every <code>update_goal(complete)</code> in every session runs the gate.</p>
+<h2>How it works</h2>
+<pre><code>model calls update_goal(action: "complete")
+  → tools/pre-execute waterfall intercepts the call
+  → resolve verification commands:
+      config.commands (always wins)
+      → else auto-detect in the session workspace:
+          package.json with scripts.test → &lt;pm&gt; test (pm from lockfile)
+          go.mod → go test ./...
+          Cargo.toml → cargo test
+  → run each through ctx.shell (inherits the deployment's sandbox)
+  → all exit 0 → next() → the stamp proceeds
+  → any failure → deny; the model receives the failing command,
+    exit code, and an output tail as its fix instruction
+</code></pre>
+<p>Nothing else is touched: non-<code>update_goal</code> calls and non-<code>complete</code> actions delegate via <code>next()</code> unchanged. Disable the row (<code>disabled: true</code>) and behavior returns to stock.</p>
+<h2>Configuration</h2>
+<p>Add config to the plugin row (profile or home <code>cordis.patch.yml</code>):</p>
+<pre><code>- id: verify-judge
+  config:
+    commands: ['pnpm test', 'pnpm run lint']  # always wins over auto-detect
+    onUndetected: allow                        # allow (default) | deny
+    timeoutMs: 300000                          # per-command cap
+    outputTailChars: 4000                      # failure tail fed to the model
+</code></pre>
+<table>
+<thead>
+<tr>
+<th>Field</th>
+<th>Default</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>commands</code></td>
+<td>auto-detect</td>
+<td>Explicit verification commands, run in the session workspace</td>
+</tr>
+<tr>
+<td><code>onUndetected</code></td>
+<td><code>allow</code></td>
+<td><code>deny</code> refuses the stamp when no command is found</td>
+</tr>
+<tr>
+<td><code>timeoutMs</code></td>
+<td><code>300000</code></td>
+<td>Per-command timeout</td>
+</tr>
+<tr>
+<td><code>outputTailChars</code></td>
+<td><code>4000</code></td>
+<td>Cap on the output tail included in denial feedback</td>
+</tr>
+<tr>
+<td><code>gateTurnEnd</code></td>
+<td><code>true</code></td>
+<td>Also re-verify at turn end while a goal is active</td>
+</tr>
+<tr>
+<td><code>maxTurnEndRetries</code></td>
+<td><code>2</code></td>
+<td>Max verification-driven continuations per turn</td>
+</tr>
+</tbody></table>
+<h2>Development</h2>
+<pre><code>pnpm install
+pnpm run build        # tsc → lib/
+</code></pre>
+<p>Debug without an API key using the harness's mock LLM (<code>pnpm run mock:llm</code> in the deepseek-harness repo), then drive a session that creates a goal and lets the model try to complete it against a workspace with a failing test.</p>
+<h2>Roadmap</h2>
+<ul>
+<li><strong>v2.1</strong>: anchor the verification surface at goal-creation time (snapshot commands + hash test files); deny when the suite drifts mid-goal — closes the "edit the tests, then stamp" reward hack.</li>
+<li><strong>v2.2</strong>: parse acceptance items from <code>plan.md</code>; judge non-scriptable items with an isolated-context subagent (the main session only receives the verdict table).</li>
+<li><strong>v3</strong>: verification receipts — any successful mutating tool call after a pass invalidates the receipt, so the next conclude must re-verify.</li>
+</ul>
+<p>Shipped in 0.2.0: the turn-end gate (<code>agent/turn-stopping</code>), per-workspace serialized runs, fail-closed abort handling, runner-error class (no "fix the environment by editing tests" pressure).</p>
+<h2>License</h2>
+<p><a href="https://github.com/zriyox/dsh-verify-judge/blob/HEAD/LICENSE">MIT</a></p>

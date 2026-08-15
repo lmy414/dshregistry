@@ -1,0 +1,110 @@
+<h1>dsh-review-loop</h1>
+<p>Incremental diff reviewer for <a href="https://github.com/deepseek-ai/deepseek-harness">DeepSeek Harness</a>.</p>
+<p><a href="https://github.com/wuxiangru915/dsh-review-loop/blob/HEAD/README.zh.md">中文说明</a> · <a href="https://github.com/wuxiangru915/dsh-review-loop/blob/HEAD/LICENSE">MIT License</a></p>
+<p><code>dsh-review-loop</code> turns code review of agent work into an incremental, closed-loop process: after you approve a batch of changes, a checkpoint is recorded and the next review shows only the changes made afterward — never a re-review of what you already saw. Review feedback is injected back to the agent through the harness's normal message channel, without interrupting its work.</p>
+<h2>What it solves</h2>
+<p>An agent task commonly touches a dozen or more files. Reviewing the full diff every time is slow, and re-reviewing unchanged work wastes attention. This plugin makes review follow the agent's progress:</p>
+<pre><code>agent works (modifies files)
+  -&gt; open the review panel: only changes since the last review checkpoint
+  -&gt; inspect each file's diff, add feedback
+  -&gt; approve: a new checkpoint is recorded, feedback is injected to the agent
+  -&gt; the agent responds and keeps working; new changes become the next batch
+</code></pre>
+<h2>Features</h2>
+<ul>
+<li><strong>Incremental review (since-review)</strong>: approving snapshots the working tree into a checkpoint; the next review diffs <code>checkpoint -&gt; current</code>, so reviewed files disappear from the queue unless they change again.</li>
+<li><strong>Two entry points</strong>: a Web UI review panel docked above the conversation composer (2s polling), and a <code>/review</code> command for keyboard-first use. The same core logic backs both.</li>
+<li><strong>Feedback closed loop</strong>: approvals may carry a comment, delivered to the agent as a user message via <code>agent.inject()</code>.</li>
+<li><strong>No tool-call parsing</strong>: any on-disk change — by the agent, by you, or by another process — is reflected; the plugin reads git, not the agent loop.</li>
+<li><strong>Checkpoint persistence</strong>: <code>$DSH_HOME/review-loop/&lt;workspace-hash&gt;.json</code>, written atomically, never polluting the workspace's own git status.</li>
+<li><strong>Zero core modifications</strong>: a pure bundle plugin (<code>dsh.bundle</code> patch layer); the agent-loop skeleton is untouched.</li>
+</ul>
+<h2>Installation</h2>
+<pre><code># one line, from a git source
+dsh plugin --profile web add github:wuxiangru915/dsh-review-loop
+
+# restart the web server, then hard-refresh the page
+</code></pre>
+<p>Local development:</p>
+<pre><code>pnpm install &amp;&amp; pnpm build
+dsh plugin --profile web add /path/to/dsh-review-loop
+</code></pre>
+<p>The repository ships prebuilt <code>lib/</code> artifacts, so git-source installs work without a build step on the user's machine.</p>
+<h2>Usage</h2>
+<h3>Web UI</h3>
+<p>In any session whose workspace is a git repository, a review panel appears above the composer:</p>
+<ul>
+<li>A status line — <code>N file(s) to review</code> — with an <strong>Open review</strong> button.</li>
+<li>The expanded panel lists the pending files with toggleable, colorized diffs (added lines use the success token, removed lines the error token; the sign is always visible).</li>
+<li>An optional feedback input and an <strong>Approve &amp; checkpoint</strong> button.</li>
+<li>After approval the panel shows the reviewed state; later edits re-surface the file.</li>
+</ul>
+<h3>Command line</h3>
+<table>
+<thead>
+<tr>
+<th>Command</th>
+<th>Behavior</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>/review</code></td>
+<td>Incremental: changes since the last checkpoint (or the full change set vs HEAD when none exists)</td>
+</tr>
+<tr>
+<td><code>/review all</code></td>
+<td>The complete working-tree change set vs HEAD, ignoring the checkpoint</td>
+</tr>
+<tr>
+<td><code>/review approve</code></td>
+<td>Record a checkpoint</td>
+</tr>
+<tr>
+<td><code>/review approve &lt;comment&gt;</code></td>
+<td>Record a checkpoint and inject the comment into the agent</td>
+</tr>
+</tbody></table>
+<h2>Architecture</h2>
+<pre><code>src/
+├── review.ts      Pure core (collectState / approve / renderState) — shared by command and HTTP paths
+├── git.ts         git helpers (status / diff / hash-object; zero-dependency spawnSync)
+├── checkpoint.ts  checkpoint persistence ($DSH_HOME/review-loop/&lt;ws-hash&gt;.json, atomic write)
+├── http.ts        Web routes: GET /plugins/dsh-review-loop/state · POST /plugins/dsh-review-loop/approve
+└── client/
+    └── review-panel.tsx  Browser panel (conversation.input.dock slot, polling refresh)
+</code></pre>
+<pre><code>command: /review ------&gt; renderState() ----+
+                                           +--&gt; src/review.ts (pure, shared)
+web UI:  GET /state ----&gt; collectState() --+
+         POST /approve --&gt; approve() + agent.inject()
+</code></pre>
+<p>The client bundle is a CJS <code>__ModuleLoader__</code> artifact served at <code>/plugins/@dsh-plugin/dsh-review-loop/client.js</code>; routes and command share one checkpoint store, so approving from the UI advances the same queue the <code>/review</code> command reads.</p>
+<h3>Incremental algorithm</h3>
+<pre><code>for each working-tree change vs HEAD:
+  compare its content hash with the checkpoint's recorded hash
+    same  -&gt; reviewed (hidden)
+    changed / new / HEAD moved -&gt; pending (the incremental queue)
+approve re-snapshots the tree -&gt; the checkpoint advances
+</code></pre>
+<h2>Testing</h2>
+<pre><code>pnpm test       # 7 integration tests: real cordis + real git repositories
+pnpm typecheck
+pnpm build      # dual-half build: host ESM + client bundle
+</code></pre>
+<h2>Roadmap</h2>
+<ul>
+<li> <code>/review</code> command (incremental diff / approve / feedback injection)</li>
+<li> Web UI review panel (file list + diff + approve)</li>
+<li> Checkpoint persistence (incremental queue)</li>
+<li> Line-level comments (diff parser)</li>
+<li> Session-branch coupling (checkpoint follows session branches)</li>
+<li> npm publish (<code>@dsh-plugin/dsh-review-loop</code>)</li>
+</ul>
+<h2>Requirements</h2>
+<ul>
+<li><a href="https://github.com/deepseek-ai/deepseek-harness">DeepSeek Harness</a> &gt;= 0.1.0-rc.5 (Cordis 4.x)</li>
+<li>A git repository (hard prerequisite)</li>
+<li>Node.js &gt;= 22</li>
+</ul>
+<h2>License</h2>
+<p><a href="https://github.com/wuxiangru915/dsh-review-loop/blob/HEAD/LICENSE">MIT</a></p>

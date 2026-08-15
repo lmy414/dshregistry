@@ -1,0 +1,144 @@
+<p align="center">
+  <img src="https://raw.githubusercontent.com/yoke233/dsh-tool-monitor/HEAD/assets/readme/hero.svg" alt="dsh-tool-monitor 通过惰性输出 tee 监听现有 DSH 后台 Job，而不重复执行原命令">
+</p>
+
+<p align="center">
+  <strong>让 DeepSeek Harness 在后台服务出错时立即收到事件。</strong><br>
+  订阅已经运行的 Bash 或 PowerShell Job；保留原始 <code>job_output</code>，不启动第二个业务进程。
+</p>
+
+<p align="center">
+  <a href="#快速开始">快速开始</a> ·
+  <a href="#为什么需要它">为什么需要它</a> ·
+  <a href="#工作方式">工作方式</a> ·
+  <a href="#工具参数">工具参数</a> ·
+  <a href="#兼容性与边界">兼容性与边界</a>
+</p>
+
+<h2>快速开始</h2>
+<p>安装到 DSH profile：</p>
+<pre><code>dsh plugin --profile web add github:yoke233/dsh-tool-monitor
+</code></pre>
+<p>启动或重启 profile：</p>
+<pre><code>dsh --profile web
+</code></pre>
+<p>先正常启动后台服务：</p>
+<pre><code>pwsh(command: "npm run dev", run_in_background: true)
+→ pwsh-1
+</code></pre>
+<p>再让 <code>job_monitor</code> 订阅这个 Job：</p>
+<pre><code>{
+  "job_id": "pwsh-1",
+  "description": "监听后端错误",
+  "pattern": "error|fatal|exception"
+}
+</code></pre>
+<pre><code>→ monitor-1
+</code></pre>
+<p><code>monitor-1</code> 只订阅 <code>pwsh-1</code> 的输出。出现匹配行时，插件向所属 Agent 投递会话事件；原服务始终只运行一份。</p>
+<h2>为什么需要它</h2>
+<p>DSH 的普通后台 Job 会在任务结束时通知 Agent，但长期运行的后端服务可能在退出前就已经出现需要处理的错误。这个插件补充运行中的事件通道：</p>
+<table>
+<thead>
+<tr>
+<th>行为</th>
+<th>结果</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>监听现有 <code>job_id</code></td>
+<td>不重新执行服务命令</td>
+</tr>
+<tr>
+<td>一次读取、多路分发</td>
+<td>Monitor 不会吃掉 <code>job_output</code> 的内容</td>
+</tr>
+<tr>
+<td>惰性启用 tee</td>
+<td>没有 Monitor 的 Job 保持官方读取路径，不被轮询</td>
+</tr>
+<tr>
+<td>Host 本地过滤与批处理</td>
+<td>没有匹配事件时，不触发模型请求</td>
+</tr>
+<tr>
+<td>独立 Monitor 生命周期</td>
+<td>停止 Monitor 不会终止目标 Job</td>
+</tr>
+</tbody></table>
+<h2>工作方式</h2>
+<pre><code>Bash / Pwsh background process
+              │
+              │ readOutput() once
+              ▼
+       lazy bounded output tee
+          ┌────────────┴────────────┐
+          ▼                         ▼
+     job_output                 monitor-N
+   original output        filtered complete lines
+                                  │
+                                  ▼
+                         followup() / inject()
+</code></pre>
+<p>插件使用兼容的 <code>JobRegistry</code> 实现扩展官方 <code>LocalJobRegistry</code>，继续复用 DSH 的所有权隔离、等待、取消、完成通知、容量限制和清理语义。原来的 <code>job_list</code>、<code>job_output</code>、<code>job_kill</code> 以及 Bash/Pwsh 工具保持不变。</p>
+<p>完整设计和生命周期约束见 <a href="https://github.com/yoke233/dsh-tool-monitor/blob/HEAD/DESIGN.md">DESIGN.md</a>。</p>
+<h2>工具参数</h2>
+<table>
+<thead>
+<tr>
+<th>参数</th>
+<th align="center">必填</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>job_id</code></td>
+<td align="center">是</td>
+<td>已有流式后台 Job 的 id，通常来自带 <code>run_in_background: true</code> 的 <code>bash</code> 或 <code>pwsh</code></td>
+</tr>
+<tr>
+<td><code>description</code></td>
+<td align="center">是</td>
+<td>显示在 Monitor 通知中的简短说明</td>
+</tr>
+<tr>
+<td><code>pattern</code></td>
+<td align="center">否</td>
+<td>JavaScript 正则表达式，逐完整输出行匹配</td>
+</tr>
+<tr>
+<td><code>case_sensitive</code></td>
+<td align="center">否</td>
+<td>是否区分大小写，默认 <code>false</code></td>
+</tr>
+<tr>
+<td><code>timeout_ms</code></td>
+<td align="center">否</td>
+<td>订阅时限；默认持续到目标 Job 结束</td>
+</tr>
+</tbody></table>
+<p>Monitor 本身也是普通 Job：</p>
+<ul>
+<li><code>job_list</code> 同时显示目标 Job 和 Monitor。</li>
+<li><code>job_output</code> 分别读取目标 Job 的原始输出和 Monitor 的匹配输出。</li>
+<li><code>job_kill monitor-1</code> 只停止订阅。</li>
+<li>目标 Job 结束时，关联 Monitor 自动结束并刷新最后一条不完整输出行。</li>
+</ul>
+<h2>兼容性与边界</h2>
+<ul>
+<li>支持 Bash 的 LF 与 PowerShell 的 CRLF 输出。</li>
+<li>只支持公开流式 <code>readOutput()</code> 的后台 Job；非流式 Job 会被明确拒绝。</li>
+<li>所有权校验仍由 DSH Registry 执行，不能跨会话监听其他 Agent 的 Job。</li>
+<li>Job 和 Monitor 都是 Host 进程内状态，不跨 DSH Host 重启持久化。</li>
+<li>插件安装前由另一 Registry 创建的历史 Job 不可补挂监听。</li>
+<li>缓冲区按 UTF-8 字节设置上限；发生丢弃时，<code>job_output</code> 会显示明确提示。</li>
+</ul>
+<h2>本地开发</h2>
+<pre><code>pnpm install
+pnpm run build
+pnpm test
+dsh plugin --profile web add ./dsh-tool-monitor
+</code></pre>
+<p>测试覆盖 Bash、PowerShell、原 <code>job_*</code> 工具兼容、输出竞态、所有权隔离、目标结束与独立取消。</p>
+<h2>License</h2>
+<p><a href="https://github.com/yoke233/dsh-tool-monitor/blob/HEAD/LICENSE">MIT</a></p>

@@ -1,0 +1,119 @@
+<h1>dsh-plugin-safety — 插件健康告警</h1>
+<p>DSH 插件故障防控的最后两环：</p>
+<ol>
+<li><strong>预检 + 自动禁用</strong>：<code>scripts/check-profile-plugins.py</code> 在 dsh-web 启动前预检
+profile 中每个未禁用的插件入口；import 失败的坏插件自动写入
+<code>disabled: true</code>（bundle 则移除 bundle），并落盘告警。</li>
+<li><strong>持久告警 + 自动修复会话</strong>：浏览器半部渲染红色告警卡片，× 掉前
+刷新/重开页面都会重现；host 半部在返回告警前保证每个告警 action 都有
+对应的 headless 修复会话。</li>
+</ol>
+<h2>核心不变式</h2>
+<blockquote>
+<p><strong>只要出现“不可用插件已被禁用/需人工处理”的告警，就自动创建修复会话。</strong>
+不区分告警来源：预检脚本检出、直接写 <code>notice.json</code> 的测试/手工场景，
+都遵守同一规则。</p>
+</blockquote>
+<p>具体机制：</p>
+<ul>
+<li>host 半部 <code>GET /plugins/dsh-plugin-safety/notice</code> 返回告警前先检查
+<code>fixActionIds</code> 是否覆盖全部 action；未覆盖就调用
+<code>check-profile-plugins.py --ensure-fix</code> 补启动。</li>
+<li>同一批 action 只启动一次；同一份告警新增坏插件时，只为新增 action
+补启动一次。</li>
+<li><code>Popen</code> 成功才写 <code>fixStartedAt</code> / <code>fixActionIds</code>；启动失败时前端如实
+显示“修复会话自动创建失败”，不再假装已创建。</li>
+<li>文件锁防多个 GET/预检并发重复启动。</li>
+</ul>
+<h2>组件</h2>
+<table>
+<thead>
+<tr>
+<th>文件</th>
+<th>职责</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>index.js</code></td>
+<td>host 半部：告警读写端点 + 返回前 ensure-fix</td>
+</tr>
+<tr>
+<td><code>client.js</code></td>
+<td>浏览器半部：持久弹窗、× 关闭（POST 清除）</td>
+</tr>
+<tr>
+<td><code>scripts/check-profile-plugins.py</code></td>
+<td>预检、自动禁用、告警落盘、修复会话启动</td>
+</tr>
+<tr>
+<td><code>cordis.patch.yml</code></td>
+<td>bundle patch：把插件挂进 profile</td>
+</tr>
+<tr>
+<td><code>dsh.plugin.json</code></td>
+<td>DSH 插件元数据</td>
+</tr>
+</tbody></table>
+<p>零第三方依赖：host/脚本仅用 Node/Python 标准库；client 为原生 DOM。</p>
+<h2>告警文件</h2>
+<p><code>$DSH_HOME/storages/plugin-safety/notice.json</code>（未设置 <code>DSH_HOME</code> 时为
+<code>~/.dsh/storages/plugin-safety/notice.json</code>）：</p>
+<pre><code>{
+  "at": 1786799000000,
+  "actions": [
+    {
+      "id": "some-plugin",
+      "name": "some-plugin",
+      "kind": "patch",
+      "reason": "Cannot find package 'some-plugin'",
+      "disabledAt": 1786799000000,
+      "autoDisabled": true,
+      "profile": "/home/me/.dsh/profiles/web"
+    }
+  ],
+  "fixStartedAt": 1786799001000,
+  "fixActionIds": ["some-plugin"],
+  "fixWorkspace": "/home/me/.dsh/plugin-maintenance",
+  "fixLogFile": "/home/me/.dsh/plugin-maintenance/plugin-safety-fix.log"
+}
+</code></pre>
+<p>POST 同一端点即视为用户已叉掉告警，文件重置为
+<code>{"at": 0, "actions": []}</code>；下一条新告警会重新生成。</p>
+<h2>安装</h2>
+<pre><code>dsh plugin --profile web add github:Seryta/dsh-plugin-safety
+</code></pre>
+<p>安装后重启 dsh-web（host 半部需要进程重新 import；client.js 是静态服务，
+重启前刷新页面也能拿到新逻辑）。</p>
+<p>如果同时想要启动前预检（推荐），把随包脚本放到 <code>$DSH_HOME/scripts</code> 并
+挂到 systemd <code>ExecStartPre</code>：</p>
+<pre><code>mkdir -p ~/.dsh/scripts
+cp ~/.dsh/profiles/web/node_modules/dsh-plugin-safety/scripts/check-profile-plugins.py \
+   ~/.dsh/scripts/check-profile-plugins.py
+</code></pre>
+<p><code>ExecStartPre=-/home/&lt;you&gt;/.dsh/scripts/check-profile-plugins.py</code>
+（<code>-</code> 前缀表示预检失败不阻断启动；脚本对能自动禁用的失败返回 0，
+对无法自动禁用且需人工处理的失败返回 1）。</p>
+<h2>验证</h2>
+<pre><code>npm test                       # host/脚本/客户端逻辑测试，全部使用假 dsh，不创建真实会话
+node --check index.js
+python3 -m py_compile scripts/check-profile-plugins.py
+</code></pre>
+<p>本仓库的测试覆盖：</p>
+<ul>
+<li>预检发现坏插件 → 自动禁用、备份、落盘告警、启动一次修复会话；</li>
+<li>重复预检不重复启动；新增坏插件只补启动一次；</li>
+<li>直接写 <code>notice.json</code> → host GET 前补建修复会话，第二次 GET 不重复；</li>
+<li>POST 清除告警；无告警返回 <code>notice: null</code>；</li>
+<li>客户端弹窗持久渲染、× 关闭、以及 <code>fixStartedAt</code> 有无时的如实文案。</li>
+</ul>
+<h2>已知边界</h2>
+<ul>
+<li>浏览器只在页面加载时 poll 一次；页面开着期间新写入的告警会在下次刷新
+时出现（与“刷新/重开仍在”的持久语义一致）。</li>
+<li>自动修复会话是 headless DSH 任务；它本身无法修复时会在会话内报告阻塞
+原因，host 不会阻塞重试。</li>
+<li><code>$DSH_HOME</code> 会被 host 与预检脚本一致尊重；systemd 预检通常不设置该
+变量，因此走默认 <code>~/.dsh</code>。</li>
+</ul>
+<h2>License</h2>
+<p>MIT</p>

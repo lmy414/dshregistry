@@ -1,0 +1,235 @@
+<h1>dsh-test-runner</h1>
+<p>DeepSeek Harness 插件：结构化测试运行工具 <strong><code>test_run</code></strong>。</p>
+<p>让 agent 用一次工具调用完成「改代码 → 跑测试 → 修」闭环：自动探测测试框架、执行测试、<strong>只返回结构化摘要</strong>（通过/失败统计 + 失败用例名称与错误信息 + 输出尾部），避免模型阅读整段原始测试输出（省 token、少一轮）。</p>
+<h2>功能</h2>
+<table>
+<thead>
+<tr>
+<th>能力</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>框架自动探测</td>
+<td><code>package.json</code> 的 vitest/jest 依赖 → <code>vitest</code>/<code>jest</code>；<code>scripts.test</code> → <code>npm-test</code>；<code>pyproject.toml</code>/<code>pytest.ini</code>/<code>conftest.py</code> → <code>pytest</code>；<code>test/</code> 目录或 <code>*.test.*</code> 文件 → <code>node</code>（node:test）</td>
+</tr>
+<tr>
+<td>目标过滤</td>
+<td><code>target</code> 指定文件/目录/用例模式（如 <code>tests/test_api.py::test_login</code>），多个目标空格分隔</td>
+</tr>
+<tr>
+<td>失败摘要</td>
+<td>每个失败用例提取名称 + 错误信息（vitest <code>×</code>/<code>→</code>、jest <code>●</code>、pytest <code>FAILED</code>、node:test TAP <code>not ok</code> + <code>error:</code> 块）</td>
+</tr>
+<tr>
+<td>只重跑失败</td>
+<td><code>last_failed</code> → vitest <code>--lastFailed</code> / jest <code>--onlyFailures</code> / pytest <code>--lf</code></td>
+</tr>
+<tr>
+<td>自定义命令</td>
+<td><code>command</code> 完全覆盖默认命令（如 <code>pnpm vitest run</code>、<code>python -m pytest -x -q</code>）</td>
+</tr>
+<tr>
+<td>超时与取消</td>
+<td><code>timeout_ms</code> 默认 120s；工具取消信号转发给子进程</td>
+</tr>
+<tr>
+<td>沙箱合规</td>
+<td>按调用会话解析 <code>sandboxPolicy</code>（会话覆盖 &gt; 部署默认），与 bash 工具同一策略</td>
+</tr>
+</tbody></table>
+<h2>安装</h2>
+<pre><code>dsh plugin --profile web add ./dsh-test-runner        # 本地目录
+# 或从 GitHub（需要 prepare 脚本 + allowBuilds 放行）
+dsh plugin --profile web add github:you/dsh-test-runner
+</code></pre>
+<p>重启 <code>dsh --profile web</code> 后生效。管理面板：设置 → 插件。</p>
+<h2>使用示例</h2>
+<p>模型侧直接调用：</p>
+<ul>
+<li><code>test_run</code>（自动探测，跑全部）</li>
+<li><code>test_run(target="src/utils.test.ts")</code>（跑单文件）</li>
+<li><code>test_run(framework="pytest", target="tests/test_api.py::test_login")</code></li>
+<li><code>test_run(last_failed=true)</code>（只重跑上次失败）</li>
+<li><code>test_run(command="pnpm vitest run --coverage")</code></li>
+</ul>
+<p>返回结构：</p>
+<pre><code>{
+  "ok": false,
+  "framework": "node",
+  "command": "node --test",
+  "exitCode": 1,
+  "durationMs": 800,
+  "summary": { "total": 6, "passed": 5, "failed": 1, "skipped": 0 },
+  "failures": [
+    { "name": "string: broken case (intentional failure)",
+      "message": "Expected values to be strictly equal: | 'WORLD' !== 'WRLD' | ..." }
+  ],
+  "outputTail": "&lt;原始输出尾部 3000 字符&gt;"
+}
+</code></pre>
+<h2>兼容性</h2>
+<ul>
+<li>DSH mainline 持续快速演进，本插件只依赖 <code>shell</code> / <code>fs</code> / <code>sandboxPolicy</code> 三个稳定服务 seam 与 <code>ctx.tools</code> 注册接口。</li>
+<li>验证日期：2026-08（Windows + PowerShell 执行器 + node:test 实测）。</li>
+<li><strong>退化安全</strong>：解析器匹配不到失败摘要时不崩溃，退化为 <code>exitCode + 输出尾部</code>——最坏不比直接用 bash 跑测试差。</li>
+</ul>
+<h2>规范合规</h2>
+<p>对照官方开发文档（<code>docs/user/develop/basic/tool.md</code>、<code>docs/cookbook/adding-a-tool.md</code>、<code>docs/user/develop/framework/index.md</code>、<code>docs/user/develop/practice/index.md</code>）逐条核验：</p>
+<h3>execute 契约</h3>
+<table>
+<thead>
+<tr>
+<th>规范要求</th>
+<th>状态</th>
+<th>实现位置</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>args 由 <code>defineTool</code> 校验；手检非空/正数</td>
+<td>✅</td>
+<td><code>timeout_ms</code> 正数校验（参考 bash <code>validateArgs</code>）</td>
+</tr>
+<tr>
+<td>返回单一 canonical JSON value</td>
+<td>✅</td>
+<td>execute 返回纯 object，不含 content blocks</td>
+</tr>
+<tr>
+<td>infra 失败 throw；domain 结果正常返回</td>
+<td>✅</td>
+<td>shell resolve/run 失败 <code>throw</code>；测试失败(exit≠0) 正常返回 value</td>
+</tr>
+<tr>
+<td>Honor <code>exec.signal</code></td>
+<td>✅</td>
+<td>传给 <code>shell.resolve({ signal: exec.signal })</code></td>
+</tr>
+<tr>
+<td><code>output.schema</code> 声明规范值</td>
+<td>✅</td>
+<td><code>{ type: 'json' }</code>，render 与 presentationMeta 派生自 value</td>
+</tr>
+</tbody></table>
+<h3>UI 卡片（硬规则）</h3>
+<table>
+<thead>
+<tr>
+<th>规范要求</th>
+<th>状态</th>
+<th>实现位置</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>presentCall/presentResult 纯函数（无 I/O、无 session state、无 clock/random）</td>
+<td>✅</td>
+<td>只读 args / result.meta</td>
+</tr>
+<tr>
+<td>UI 格式不进 canonical value</td>
+<td>✅</td>
+<td>value 为纯结构化 JSON；卡片格式在 presentResult</td>
+</tr>
+<tr>
+<td>terminal 卡片 title 是命令</td>
+<td>✅</td>
+<td>已知 framework 时 <code>buildCommand</code> 重建真实命令；auto 退回 generic 卡片（不伪造命令）</td>
+</tr>
+<tr>
+<td>presentResult 返回 <code>undefined</code> 做 generic 兜底</td>
+<td>✅</td>
+<td>isError 或无 meta 时返回 undefined</td>
+</tr>
+<tr>
+<td>presentationMeta 派生 replayable JSON</td>
+<td>✅</td>
+<td><code>{ exitCode, timedOut, outputText }</code> 从 value 派生</td>
+</tr>
+</tbody></table>
+<h3>生命周期与依赖</h3>
+<table>
+<thead>
+<tr>
+<th>规范要求</th>
+<th>状态</th>
+<th>实现位置</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>注册 effect-based，fiber 卸载自动注销</td>
+<td>✅</td>
+<td><code>ctx.tools.register(defineTool(...))</code></td>
+</tr>
+<tr>
+<td>副作用可逆</td>
+<td>✅</td>
+<td>无自定义资源需手动清理（shell/fs 为共享服务）</td>
+</tr>
+<tr>
+<td>硬依赖 <code>inject</code>；可选服务 <code>ctx.get</code> + undefined 检查</td>
+<td>✅</td>
+<td><code>inject: ['tools']</code>；shell/fs/sandboxPolicy 用 <code>ctx.get</code> 检查</td>
+</tr>
+<tr>
+<td><code>isConcurrencySafe</code> 声明</td>
+<td>✅</td>
+<td><code>() =&gt; false</code>（测试改状态，独占执行）</td>
+</tr>
+</tbody></table>
+<h3>能力分层与配置</h3>
+<table>
+<thead>
+<tr>
+<th>规范要求</th>
+<th>状态</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>不过早拆分 Service Definition/Provider/Consumer</td>
+<td>✅</td>
+<td>单包工具，未拆（practice 明确说 simple tool 不拆）</td>
+</tr>
+<tr>
+<td>可调值进 Config Schema</td>
+<td>✅</td>
+<td>无部署间可调值（框架/命令由模型参数传入）</td>
+</tr>
+</tbody></table>
+<h3>打包</h3>
+<table>
+<thead>
+<tr>
+<th>规范要求</th>
+<th>状态</th>
+<th>实现位置</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>bundle 声明 <code>dsh.bundle.patch</code></td>
+<td>✅</td>
+<td><code>package.json</code></td>
+</tr>
+<tr>
+<td>cordis.patch.yml 按包名引用</td>
+<td>✅</td>
+<td><code>name: dsh-test-runner</code></td>
+</tr>
+<tr>
+<td>语法校验</td>
+<td>✅</td>
+<td><code>node --check</code> 通过</td>
+</tr>
+</tbody></table>
+<h3>已知边界（诚实声明）</h3>
+<ul>
+<li>解析器正则匹配当前主流版本的<strong>默认 reporter 输出</strong>；框架升级改格式 → 退化安全（不崩，返回 exitCode + 尾部）。</li>
+<li>已验证：vitest/jest/pytest/node:test 默认输出；go test / cargo test 等未覆盖，退化为原始输出。</li>
+<li>仅在 Windows + PowerShell 执行器实测；命令本身跨方言（<code>npx</code>/<code>python</code>/<code>node</code>），bash 下理论可行但未验证。</li>
+</ul>
+<h2>开发</h2>
+<pre><code># 本地覆盖层开发
+pnpm dsh web --patch ./cordis.patch.yml
+</code></pre>
+<h2>License</h2>
+<p>MIT</p>

@@ -1,0 +1,168 @@
+<h1>Agent JIT</h1>
+<p><strong>A DeepSeek Harness plugin that compiles deterministic execution paths out of the LLM agent loop.</strong></p>
+<p>Agent JIT 把 agent loop 中已确定的确定性执行路径（多步工具编排、状态维护、中间数据流转）编译成受限 DSL 程序，交给 schema-validated graph runtime 确定性执行——<strong>把"数据怎么流通"从模型手里拿走</strong>，让 Agent 不再为不需要智能的步骤付 token。</p>
+<p>Agent 仍是 planner；Agent JIT 是执行 offload 层。</p>
+<p><a href="https://github.com/topics/dsh-plugin"><img src="https://img.shields.io/badge/dsh--plugin-community-4b32c3" alt="dsh-plugin"></a>
+<a href="https://github.com/sybolization/agent-jit/blob/HEAD/LICENSE"><img src="https://img.shields.io/badge/license-MIT-green" alt="license"></a></p>
+<h2>安装</h2>
+<p>本仓库即一个 DeepSeek Harness <strong>bundle</strong>（<code>package.json</code> 的 <code>dsh.bundle.patch</code> + <code>cordis.patch.yml</code>）。预构建产物 <code>dist/</code> 随仓库分发，git 安装无需任何构建授权。</p>
+<p>装进 <strong>web profile</strong> 后，每次 <code>dsh web</code> 启动都会自动加载（<code>dsh web</code> 是 <code>--profile web</code> 的别名；<code>npx @deepseek-ai/dsh web</code> 同样生效）：</p>
+<pre><code># npm（推荐；发布的是预构建产物，无构建授权）
+dsh plugin --profile web add agent-jit
+# 或从 GitHub 安装（dist/ 随仓库分发，同样无构建授权）
+dsh plugin --profile web add github:sybolization/agent-jit
+
+dsh web --dump-config    # 验证：应出现 agent-jit-dsl 行
+dsh web                  # 之后每次启动都带插件
+</code></pre>
+<p>要装进其他 profile（headless / 自定义组合）同理换 profile 名；注意<strong>自定义 profile 默认只含 <code>dsh-base</code>（无 Web UI）</strong>，需要 UI 请同时加装 <code>@deepseek-ai/dsh-web-app</code>。卸载：<code>dsh plugin --profile web remove agent-jit</code>。</p>
+<h2>工具</h2>
+<p>插件向 harness 注册的工具（均走标准 <code>ctx.tools</code> 注册，遵守完整执行策略管线）：</p>
+<table>
+<thead>
+<tr>
+<th>工具</th>
+<th>作用</th>
+<th>模式</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>jit_describe_tools</code></td>
+<td>点名工具 → 确定性函数式契约（与 inline 签名同源渲染）</td>
+<td>生产默认</td>
+</tr>
+<tr>
+<td><code>jit_execute_program</code></td>
+<td>DSL 源码 → 编译 → schema-validated IR → graph runtime 执行</td>
+<td>生产默认</td>
+</tr>
+<tr>
+<td><code>github_*</code> ×6、<code>crm_*</code>、<code>users_*</code>、<code>email_*</code></td>
+<td>实验业务工具（默认 mock，github 可切 real/<code>GITHUB_TOKEN</code>）</td>
+<td>仅 <code>experimentMode: true</code></td>
+</tr>
+</tbody></table>
+<p>生产缺省<strong>不注册实验业务工具</strong>——插件使用者只拿到两个 JIT 元工具，自己注册进
+DSH 的工具经宿主工具活视图零配置即可被 DSL 编排。<code>experimentMode: true</code> 才向
+模型开放实验工具（供 benchmark / 演示任务），不会污染普通使用者的工具面。</p>
+<p>实验模式下每个业务工具的 description 注入实验验证的函数式 DSL 签名：</p>
+<pre><code>github_get_repository — 获取单个仓库的详细信息。
+DSL: github.get_repository(full_name: str) -&gt; {full_name: str, forks: int, stars: int}
+</code></pre>
+<p>普通调用看 <code>parameters</code>，JIT 编程看 <code>DSL:</code> 签名——两个接口来自同一个 ToolContract。失败严格语义：未知工具 / 编译失败 / 执行失败整体报错，不允许 partial success。</p>
+<h2>一个例子</h2>
+<pre><code>repos = github.search_repositories(query="dsl", limit=5)
+details = map(repos, github.get_repository(full_name=_.full_name))
+active = filter(details, archived=false)
+top = take(active, 3)
+return top
+</code></pre>
+<p>逐工具执行需要 <strong>11 次</strong> agent loop 往返；<code>jit_execute_program</code> <strong>1 次</strong>调用返回相同结果（有测试断言保护）。</p>
+<p>宿主工具（bash / glob / web_search 等）多返回包装对象，可用<strong>字段投影</strong>与 <strong>collect</strong> 接进数据流：</p>
+<pre><code>files = glob(pattern="src/**/*.ts")
+top = take(files.paths, 3)          # 字段投影：对象.字段 解包数组字段
+hits = web_search(query="dsh plugin")
+proof = bash(command="git log --oneline -1", description="验证")
+both = collect(hits, proof)         # 把两个对象结果包成一个数组
+return both
+</code></pre>
+<h2>为什么有效：实验数据</h2>
+<p>完整实验报告见 <code>experiment_result/</code>。核心结论：<strong>对可提前表达为确定性程序的执行路径，把 orchestration state 从 LLM loop 迁移到 compiler/runtime，任务质量不变，token / 上下文暴露 / 往返轮次显著下降。</strong></p>
+<h3>R4b：一次程序提交 vs 迭代工具调用（真实 GitHub 工具，N=20）</h3>
+<table>
+<thead>
+<tr>
+<th>指标</th>
+<th align="right">DSL/JIT</th>
+<th align="right">迭代工具调用</th>
+<th align="right">差距</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>tokens</td>
+<td align="right">941</td>
+<td align="right">8,904</td>
+<td align="right"><strong>9.5×</strong></td>
+</tr>
+<tr>
+<td>模型往返轮次</td>
+<td align="right">1.0</td>
+<td align="right">4.0</td>
+<td align="right"><strong>4.0×</strong></td>
+</tr>
+<tr>
+<td>暴露给模型的中间数据</td>
+<td align="right">~460 B</td>
+<td align="right">4,196 B</td>
+<td align="right"><strong>9.1×</strong></td>
+</tr>
+<tr>
+<td>端到端延迟</td>
+<td align="right">4,711 ms</td>
+<td align="right">18,844 ms</td>
+<td align="right"><strong>4.0×</strong></td>
+</tr>
+</tbody></table>
+<h3>R4e：分支 + 重组（adversarial 数据集，N=15/30）</h3>
+<p>token 差距 <strong>6.9× / 8.1×</strong>；工具契约完整时两臂 correctness 均为 100%。</p>
+<h3>R5：自主 offload（模型自己决定是否使用 JIT）</h3>
+<table>
+<thead>
+<tr>
+<th>臂</th>
+<th align="right">adoption</th>
+<th align="right">offload precision</th>
+<th align="right">task 完成率</th>
+<th align="right">tokens</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>Control B（不提供 JIT）</td>
+<td align="right">—</td>
+<td align="right">—</td>
+<td align="right">100%</td>
+<td align="right">24,151</td>
+</tr>
+<tr>
+<td>Treatment B（提供 JIT）</td>
+<td align="right"><strong>90%</strong></td>
+<td align="right"><strong>100%</strong></td>
+<td align="right"><strong>100%</strong></td>
+<td align="right"><strong>14,976（-38%）</strong></td>
+</tr>
+</tbody></table>
+<ul>
+<li>在"明显值得程序化"的任务上，模型自主选择 offload 9/10，且全部语义正确；</li>
+<li>在"不值得 JIT"的简单任务上 unnecessary offload 为 <strong>0%</strong>——DSL 参考按需加载，不使用 JIT 的成本接近零。</li>
+</ul>
+<p>机制不是"模型更聪明"，而是：<strong>确定性数据流由 runtime 消费，而不是由 LLM context 消费。</strong></p>
+<h2>配置</h2>
+<p>插件行 config（可被用户 patch 层覆盖）：</p>
+<pre><code>experimentMode: false  # true = 注册实验业务工具（github_*/crm_*/users_*/email_*）；
+                       # false（缺省）= 生产：只挂 jit_* 元工具
+providers:             # 仅 experimentMode: true 时生效
+  github: mock   # mock | real（GITHUB_TOKEN）| none
+  domain: mock   # mock | none
+dsl:
+  signatureInDescription: inline   # 业务工具 description 注入 DSL 签名（inline | none）
+  systemPrompt: true               # 常驻 DSL 语言参考 system prompt section
+  guidance: primitive              # primitive | patterns | full-example
+  describeTools: true              # 是否注册 jit_describe_tools
+# hostTools: []         # 缺省（不写）= 自动发现全部 DSH 宿主工具（describe 即用）；
+#                        # [] 显式关闭；写名字数组 = 白名单
+# excludeHostTools: []  # 黑名单：始终排除（如不想开放 bash 给 DSL）
+</code></pre>
+<p>宿主工具经 hostDiscovery 活视图在运行时自动发现：任何注册进 <code>ctx.tools</code>
+的工具（其他插件 / 动态注册）<strong>describe 即用、DSL 直接可编排，零配置零代码
+修改</strong>；执行走 <code>ctx.tools.execute</code> 嵌套分发（完整策略管线：guard /
+pre-execute / post-execute / 超时 / 沙箱），scope = 调用方 agent。<code>jit_*</code>
+元工具自身被排除，防递归。</p>
+<h2>开发</h2>
+<pre><code>npm run build   # 构建 dist/（bundle 入口 dist/integrations/dsh/index.js）
+npm test        # 544 个单测，含真实 DSH 服务树 smoke 测试（挂载 + 执行路径压缩断言）
+</code></pre>
+<p>开发环（在 <a href="https://github.com/deepseek-ai/deepseek-harness">deepseek-harness</a> checkout 内）：</p>
+<pre><code>pnpm dsh web --patch &lt;本仓库&gt;/cordis.dev.patch.yml --port 3081
+</code></pre>
+<h2>许可证</h2>
+<p><a href="https://github.com/sybolization/agent-jit/blob/HEAD/LICENSE">MIT</a></p>

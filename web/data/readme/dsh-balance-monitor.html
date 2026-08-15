@@ -1,0 +1,324 @@
+<h1>dsh-balance-monitor</h1>
+<p><a href="#english">English</a> | <a href="#%E4%B8%AD%E6%96%87">中文</a></p>
+<p>A DeepSeek Harness plugin that monitors your DeepSeek API account balance: official <code>/user/balance</code> snapshots, in-session queries, per-turn context injection, and a <strong>Matrix-style sidebar badge</strong>.</p>
+<p><img src="https://raw.githubusercontent.com/Rainronin/dsh-balance-monitor/HEAD/assets/screenshot.png" alt="运行截图"></p>
+<hr>
+<p><a></a></p>
+<h2>English</h2>
+<h3>Features</h3>
+<table>
+<thead>
+<tr>
+<th>Capability</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>💬 In-session query</td>
+<td><code>ds_balance</code> tool: the agent can fetch the official balance snapshot anytime (<code>force: true</code> bypasses the cache)</td>
+</tr>
+<tr>
+<td>🔄 Optional per-turn injection</td>
+<td>Fresh balance can be injected into the model context before every turn (off by default — the badge + <code>ds_balance</code> tool already cover it; cache-only read, never blocks the conversation)</td>
+</tr>
+<tr>
+<td>🖥️ Sidebar badge</td>
+<td>Matrix green-phosphor CRT style: <code>▸ BALANCE CNY ¥32.81 · LINK OK</code>, SYNC button for on-demand refresh, 30s auto polling, rail state collapses into a status lamp</td>
+</tr>
+<tr>
+<td>🔐 Zero-config key</td>
+<td>Reuses <code>DEEPSEEK_API_KEY</code> from dsh's credential service (never written to disk, never logged)</td>
+</tr>
+<tr>
+<td>💱 Multi-currency</td>
+<td>CNY/USD both listed (CNY first); amounts stay strings end-to-end, no float math</td>
+</tr>
+<tr>
+<td>🛡️ Rate-limit friendly</td>
+<td>30s TTL cache + request serialization (at most one in-flight request) + 5s timeout</td>
+</tr>
+</tbody></table>
+<h3>Installation</h3>
+<pre><code># Option 1: install straight from GitHub (recommended)
+dsh plugin --profile web add github:Rainronin/dsh-balance-monitor
+
+# Option 2: clone and link-install locally (instant reload while developing)
+git clone https://github.com/Rainronin/dsh-balance-monitor.git
+cd dsh-balance-monitor
+dsh plugin --profile web add .
+
+# host-side changes require a restart
+dsh web
+</code></pre>
+<blockquote>
+<p>If pnpm blocks the <code>prepare</code> build script of a git-hosted plugin, add the
+printed key to <code>allowBuilds</code> in <code>$DSH_HOME/profiles/web/pnpm-workspace.yaml</code>
+and re-run.</p>
+</blockquote>
+<p>The plugin joins <code>dsh.profile.bundles</code> automatically. Inspect the composed tree:</p>
+<pre><code>dsh --profile web --dump-config
+</code></pre>
+<h3>Usage</h3>
+<p><strong>In-session query</strong> — just ask the agent:</p>
+<pre><code>查一下 DeepSeek 余额 / check my DeepSeek balance
+</code></pre>
+<p><strong>Sidebar badge</strong> — at the sidebar footer next to Settings: <code>SYNC</code> force-refreshes
+past the cache; polling refreshes every 30s; the collapsed (rail) state shows a
+single status lamp (green = LINK OK, amber = degraded).</p>
+<h3>Configuration</h3>
+<table>
+<thead>
+<tr>
+<th>Key</th>
+<th>Default</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>apiKeyEnv</code></td>
+<td><code>DEEPSEEK_API_KEY</code></td>
+<td>Credential reference (env var name); change for a different account</td>
+</tr>
+<tr>
+<td><code>cacheTtlMs</code></td>
+<td><code>30000</code></td>
+<td>Cache lifetime in ms</td>
+</tr>
+<tr>
+<td><code>pollIntervalMs</code></td>
+<td><code>30000</code></td>
+<td>Background polling interval in ms</td>
+</tr>
+<tr>
+<td><code>injectEveryTurn</code></td>
+<td><code>false</code></td>
+<td>Whether to inject the balance into context every turn (opt-in; the badge and <code>ds_balance</code> tool are on by default)</td>
+</tr>
+<tr>
+<td><code>requestTimeoutMs</code></td>
+<td><code>5000</code></td>
+<td>Official-API request timeout in ms</td>
+</tr>
+</tbody></table>
+<p>Override in the profile's <code>cordis.patch.yml</code>:</p>
+<pre><code>- id: balance-monitor
+  config:
+    cacheTtlMs: 10000
+    pollIntervalMs: 10000
+</code></pre>
+<h3>Error semantics</h3>
+<table>
+<thead>
+<tr>
+<th>State</th>
+<th>Behavior</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>No API key configured</td>
+<td>Tool returns a Chinese hint; badge shows amber <code>NO KEY</code></td>
+</tr>
+<tr>
+<td>API failure + stale cache</td>
+<td>Last snapshot is returned, marked "snapshot expired Ns (last refresh failed, retrying)"</td>
+</tr>
+<tr>
+<td>API failure + no cache</td>
+<td>The API error (HTTP status) is surfaced; badge shows amber <code>NO SIGNAL</code></td>
+</tr>
+<tr>
+<td>Injection-time API failure</td>
+<td>Silent degradation: nothing injected, conversation unaffected</td>
+</tr>
+</tbody></table>
+<h3>Architecture</h3>
+<pre><code>host half (Node)
+  BalanceRemoteService (service key `balance`; loader mounts the default-exported class)
+  ├─ credential lookup → GET https://api.deepseek.com/user/balance → 30s TTL cache + serialization
+  ├─ ds_balance tool + agent/pre-step injection + 30s polling
+  └─ typert-host.js: hand-written TYPERT strict manifest (exported as ./typert,
+      registered by typert-loader; api-gateway claims /api/balance/* via the strict definition)
+
+browser half (client.tsx → lib/client.js, wrapped in the official __ModuleLoader__ shell)
+  ├─ sidebar.footer.action slot: Matrix badge (wide/rail states)
+  └─ data channel: direct calls over the official RPC protocol (POST /api/balance/&lt;method&gt;,
+      client-request envelope), 30s polling + SYNC force refresh
+</code></pre>
+<p>The third-party Typert Remote client path (<code>$mount</code> contribution → namespace
+service) failed silently in practice, so the badge talks the official RPC wire
+protocol directly (dsh-host-apiproxy fetch-carrier envelope), while the host
+side keeps the official TYPERT strict registration.</p>
+<h3>Development</h3>
+<pre><code>npm install            # toolchain (typescript/pnpm + type deps)
+npm run build          # tsc (host ESM) + tsc (client CJS) + wrap-client shell + full-chain self-check
+node diagnose.mjs      # local cordis integration diagnosis (mock services)
+dsh plugin --profile web add .   # link install
+</code></pre>
+<p>Build notes: the browser half is compiled to CommonJS by tsc, then wrapped by
+<code>wrap-client.mjs</code> into the official <code>window.__ModuleLoader__.load</code> registration
+shell (same shape as official dsh-client-ui-* artifacts, served by
+dsh-client-modules as <code>/plugins/&lt;id&gt;/client.js</code>); <code>verify-client.mjs</code> executes
+the final bundle in a VM and validates registration, slot mounting, and the RPC
+wire protocol end to end.</p>
+<h3>Further reading</h3>
+<ul>
+<li><a href="https://github.com/Rainronin/dsh-balance-monitor/blob/HEAD/UI%E8%AE%BE%E8%AE%A1%E6%9E%84%E6%80%9D.md"><code>UI设计构思.md</code></a> (Chinese): Matrix visual spec (phosphor CRT token system)</li>
+</ul>
+<hr>
+<p><a></a></p>
+<h2>中文</h2>
+<p>DeepSeek Harness 插件：DeepSeek API 账户余额监测——官方 <code>/user/balance</code> 接口快照 + 会话内查询 + Matrix 风格侧边栏徽章。</p>
+<h3>功能</h3>
+<table>
+<thead>
+<tr>
+<th>能力</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>💬 会话内查询</td>
+<td><code>ds_balance</code> 工具：agent 随时可查官方余额快照（<code>force: true</code> 穿透缓存）</td>
+</tr>
+<tr>
+<td>🔄 每轮注入（可选）</td>
+<td>默认关闭。开启后每轮对话前自动把最新余额放进模型上下文（只读缓存，绝不阻塞对话）——徽章与工具已默认覆盖该信息</td>
+</tr>
+<tr>
+<td>🖥️ 侧边栏徽章</td>
+<td>Matrix 绿磷光 CRT 风格：<code>▸ BALANCE CNY ¥32.81 · LINK OK</code>，SYNC 按钮手动穿透刷新，30s 自动轮询，折叠态退化为状态灯</td>
+</tr>
+<tr>
+<td>🔐 零配置密钥</td>
+<td>复用 dsh 凭证服务里的 <code>DEEPSEEK_API_KEY</code>（不落盘、不打印、不缓存）</td>
+</tr>
+<tr>
+<td>💱 多币种</td>
+<td>CNY/USD 全列（CNY 优先），金额全程字符串透传，无浮点运算</td>
+</tr>
+<tr>
+<td>🛡️ 限流友好</td>
+<td>30s TTL 缓存 + 请求串行化（同一时刻最多一个在途请求）+ 5s 超时</td>
+</tr>
+</tbody></table>
+<h3>安装</h3>
+<pre><code># 方式一：GitHub 直装（推荐）
+dsh plugin --profile web add github:Rainronin/dsh-balance-monitor
+
+# 方式二：本地 clone 后 link 安装（改代码即时生效，适合二次开发）
+git clone https://github.com/Rainronin/dsh-balance-monitor.git
+cd dsh-balance-monitor
+dsh plugin --profile web add .
+
+# host 半改动后重启生效
+dsh web
+</code></pre>
+<blockquote>
+<p>git 托管插件若被 pnpm 拦截 prepare 构建脚本，按提示把键加进
+<code>$DSH_HOME/profiles/web/pnpm-workspace.yaml</code> 的 <code>allowBuilds</code> 再重跑。</p>
+</blockquote>
+<p>安装后插件自动进入 <code>dsh.profile.bundles</code> 层列表；检查配置树：</p>
+<pre><code>dsh --profile web --dump-config
+</code></pre>
+<h3>使用</h3>
+<p><strong>会话内查询</strong>——直接让 agent 查：</p>
+<pre><code>帮我查一下 DeepSeek 余额
+</code></pre>
+<p><strong>侧边栏徽章</strong>——侧边栏底部（Settings 旁）：<code>SYNC</code> 按钮穿透缓存立即刷新；
+30s 自动轮询；折叠态（rail）显示单色状态灯（绿 = LINK OK，琥珀 = 异常）。</p>
+<h3>配置</h3>
+<table>
+<thead>
+<tr>
+<th>键</th>
+<th>默认值</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>apiKeyEnv</code></td>
+<td><code>DEEPSEEK_API_KEY</code></td>
+<td>凭证引用名（环境变量名），多账号时改这里</td>
+</tr>
+<tr>
+<td><code>cacheTtlMs</code></td>
+<td><code>30000</code></td>
+<td>缓存有效期（毫秒）</td>
+</tr>
+<tr>
+<td><code>pollIntervalMs</code></td>
+<td><code>30000</code></td>
+<td>后台轮询间隔（毫秒）</td>
+</tr>
+<tr>
+<td><code>injectEveryTurn</code></td>
+<td><code>false</code></td>
+<td>是否每轮注入余额到模型上下文（默认关闭，按需开启）</td>
+</tr>
+<tr>
+<td><code>requestTimeoutMs</code></td>
+<td><code>5000</code></td>
+<td>官方接口请求超时（毫秒）</td>
+</tr>
+</tbody></table>
+<p>覆盖示例（profile 的 <code>cordis.patch.yml</code>）：</p>
+<pre><code>- id: balance-monitor
+  config:
+    cacheTtlMs: 10000
+    pollIntervalMs: 10000
+</code></pre>
+<h3>错误语义</h3>
+<table>
+<thead>
+<tr>
+<th>状态</th>
+<th>表现</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>未配置 key</td>
+<td>工具返回中文提示；徽章显示琥珀 <code>NO KEY</code></td>
+</tr>
+<tr>
+<td>接口失败 + 有旧缓存</td>
+<td>返回最后一次快照并标注"快照已过期 Ns（最近一次刷新失败，自动重试中）"</td>
+</tr>
+<tr>
+<td>接口失败 + 无缓存</td>
+<td>返回接口错误（HTTP 状态码）；徽章显示琥珀 <code>NO SIGNAL</code></td>
+</tr>
+<tr>
+<td>每轮注入时接口失败</td>
+<td>静默降级：不注入、不打断对话</td>
+</tr>
+</tbody></table>
+<h3>架构</h3>
+<pre><code>host 半（Node）
+  BalanceRemoteService（服务键 balance，loader 行直接挂载 default 导出类）
+  ├─ 凭证解析 → GET https://api.deepseek.com/user/balance → 30s TTL 缓存 + 串行化
+  ├─ ds_balance 工具 + 30s 轮询（每轮注入为可选项，默认关闭）
+  └─ typert-host.js：手写 TYPERT strict 元数据（./typert 导出，typert-loader 注册，
+      api-gateway 按 strict 定义认领 /api/balance/* 端点）
+
+browser 半（client.tsx → lib/client.js，__ModuleLoader__ 注册壳）
+  ├─ sidebar.footer.action slot：Matrix 徽章（wide/rail 双态）
+  └─ 数据通道：官方 RPC 公开协议直调（POST /api/balance/&lt;method&gt;，
+      client-request 信封），30s 轮询 + SYNC 穿透刷新
+</code></pre>
+<p>第三方 Typert Remote 客户端链路（<code>$mount</code> 贡献 → 命名空间服务）在本机环境实测
+静默失效，故徽章改用官方 RPC 公开协议直调（dsh-host-apiproxy fetch carrier 信封），
+host 端严格保留官方 TYPERT strict 注册路径。</p>
+<h3>开发</h3>
+<pre><code>npm install            # 装工具链（typescript/pnpm，含类型依赖）
+npm run build          # tsc（host ESM）+ tsc（client CJS）+ wrap-client 包壳 + 全链路自检
+node diagnose.mjs      # 本地 cordis 集成诊断（mock 服务验证工具注册与服务可见性）
+dsh plugin --profile web add .   # link 安装
+</code></pre>
+<p>构建说明：browser 半由 tsc 编译成 CommonJS 后经 <code>wrap-client.mjs</code> 包进官方
+<code>window.__ModuleLoader__.load</code> 注册壳（与官方 dsh-client-ui-* 产物同构，
+由 dsh-client-modules 服务为 <code>/plugins/&lt;id&gt;/client.js</code>）；<code>verify-client.mjs</code>
+在 VM 中执行最终 bundle，全链路验证注册、slot 挂载与 RPC 直调协议。</p>
+<h3>延伸阅读</h3>
+<ul>
+<li><a href="https://github.com/Rainronin/dsh-balance-monitor/blob/HEAD/UI%E8%AE%BE%E8%AE%A1%E6%9E%84%E6%80%9D.md"><code>UI设计构思.md</code></a>：Matrix 视觉规范（磷光 CRT token 系统）</li>
+</ul>

@@ -1,0 +1,176 @@
+<h1>dsh-memoryhub</h1>
+<p>English | <a href="https://github.com/solknight48/dsh-memoryhub/blob/HEAD/README.zh-CN.md">简体中文</a></p>
+<p><a href="https://github.com/solknight48/memoryhub">MemoryHub</a> (<code>mh</code>) integration for
+<a href="https://github.com/deepseek-ai/deepseek-harness">DeepSeek Harness</a> (<code>dsh</code>).</p>
+<p>MemoryHub keeps project memory as <strong>purified sessions in git-versioned
+checkpoints</strong> under <code>.memoryhub/</code>. This plugin wires that into dsh:</p>
+<ul>
+<li><strong>Auto-load on session start</strong> — runs <code>mh load</code> in the session workspace and
+injects the checkpoint memory as durable plugin context. No prompt, no tool
+call; the model simply starts with its memory back.</li>
+<li><strong><code>mh_save</code> bridges dsh sessions to mh</strong> — dsh session files are not among
+the transcript formats mh discovers (Claude Code / pi / Codex), so the
+plugin renders the live session's durable event log as a pi-format JSONL
+transcript (in the temp dir) and saves through mh's existing
+<code>--transcript</code> path. Purified saves and agent-written compact saves both
+work, under a stable per-session identity: re-saving <strong>replaces</strong>, never
+duplicates.</li>
+<li><strong>Six tools</strong> — <code>mh_load</code>, <code>mh_save</code>, <code>mh_status</code>, <code>mh_list</code>, <code>mh_search</code>,
+<code>mh_checkpoint</code> wrap the CLI; the model never has to shell out for the
+common operations. Rarer operations (<code>mh link</code>, <code>mh back</code>, <code>mh import</code>,
+<code>mh ui</code>) stay in the shell, as the skill explains.</li>
+<li><strong>A "Memory" tab in the web UI</strong> — beside chat and trajectory: the <code>mh ui</code>
+checkpoint map of the session's workspace, embedded live (see
+<a href="#the-memory-tab-web-ui">The Memory tab</a>).</li>
+<li><strong>The <code>mh</code> workflow skill</strong> — registered at runtime, it teaches the model
+when to load, when and how to save (including writing compact summaries),
+and the hub rules (no HANDOFF.md files, <code>git -C .memoryhub</code> for anything
+<code>mh</code> does not cover).</li>
+</ul>
+<p><img src="https://raw.githubusercontent.com/solknight48/dsh-memoryhub/HEAD/docs/memory-tab.png" alt="Memory tab in the dsh web UI"></p>
+<h2>Prerequisites</h2>
+<p><code>mh</code> installed and on PATH (<code>uv tool install git+https://github.com/solknight48/memoryhub</code>;
+needs git ≥ 2.32, Python ≥ 3.12). The plugin shells out to it — the hub
+format, git commits, and error wording stay owned by mh.</p>
+<h2>Install</h2>
+<pre><code>dsh plugin --profile web add github:solknight48/dsh-memoryhub
+</code></pre>
+<p>The package declares <code>dsh.bundle</code>, so the install appends its patch layer to
+the profile. For a checkout instead: <code>dsh plugin --profile web add ./dsh-memoryhub</code>.</p>
+<p>Git installs fetch sources, and pnpm ≥ 10 asks before running this package's
+<code>prepare</code> build the first time; allowlist <code>dsh-memoryhub</code> in the profile's
+<code>pnpm-workspace.yaml</code> as <code>dsh</code> instructs, then re-run the add.</p>
+<h2>Configure</h2>
+<p>Every field is optional; these are the defaults:</p>
+<pre><code># $DSH_HOME/profiles/&lt;name&gt;/cordis.patch.yml — restates the whole row.
+- insert:
+    - id: memoryhub
+      name: dsh-memoryhub
+      config:
+        mhBin: mh            # mh executable (PATH-resolved)
+        autoLoad: true       # mh load + inject on every session start
+        # loadBudget: 6000   # token budget for auto-load; omit for mh's default
+        timeoutMs: 20000     # kill any mh invocation after this
+        registerTools: true  # the six mh_* tools
+        registerSkill: true  # the mh workflow skill
+        noHubHint: false     # inject a one-line hint when no hub is found
+        uiTab: true          # serve the mh-ui URL route the web Memory tab fetches
+        uiReadOnly: false    # spawn mh ui --read-only for the Memory tab
+        uiBudget: none       # the Memory tab map's initial budget ('none' = no over-budget badges)
+        contextWindowTokens: 128000  # fallback window for the context-% estimate
+</code></pre>
+<p>With <code>noHubHint: false</code>, a workspace without <code>.memoryhub/</code> stays completely
+silent: no injection, no log spam. mh itself decides what "the project" is by
+walking up from the session's recorded cwd — the same rule as in a shell.</p>
+<h2>Loading: no budget by default, with a context-% receipt</h2>
+<p><code>mh_load</code> loads <strong>every session</strong> in the selected checkpoints — the
+over-budget filtering of stock <code>mh load</code> is off by deployment choice. Pass
+the tool's <code>budget</code> argument when you do want only the newest sessions that
+fit. (Auto-load, if you re-enable it, keeps its budgeted semantics via
+<code>loadBudget</code>: it injects into every session silently, so it stays opt-in per
+token.)</p>
+<p>Every successful <code>mh_load</code> ends with a receipt line, e.g.:</p>
+<pre><code>[memoryhub] memory ≈ 31,240 tokens ≈ 12.2% of the 256,000-token context window (adapter-reported); session total after load ≈ 18.6%
+</code></pre>
+<p>The window comes from the model adapter's own report (the session's newest
+<code>request/context</code> event) when available, otherwise from
+<code>contextWindowTokens</code>. The "session total" adds the last request's measured
+input size, so it reads as "where this load leaves the conversation". Token
+counting uses mh's own ~4 chars/token heuristic, so the number agrees with
+the Memory tab's sizes.</p>
+<h2>The Memory tab (web UI)</h2>
+<p>The package is a dual-face dsh plugin: the same <code>memoryhub</code> row that loads
+the host half also puts the browser half (<code>dsh.client</code> in <code>package.json</code>)
+into the web boot graph. The browser half registers one entry into the
+<code>conversation.view</code> slot ring — a <strong>Memory</strong> tab next to chat and trajectory.</p>
+<p>What the tab shows is not a reimplementation: it is <code>mh ui</code> itself, the
+checkpoint map (timeline, token budget, per-turn editing), embedded in an
+iframe so every mh feature and fix shows up unchanged. The wiring:</p>
+<ol>
+<li>The tab asks the host half for the map URL of its session:
+<code>GET /plugins/memoryhub/mh-ui?session=&lt;id&gt;</code>.</li>
+<li>The host half resolves the session's workspace (<code>session.header.cwd</code>) and
+lazily spawns <code>mh ui --no-browser --port 0</code> there — one server per
+workspace, pooled, killed when the plugin unloads. mh keeps its own hub
+discovery (walk up for <code>.memoryhub/</code>, <code>MH_HUB</code> override).</li>
+<li>The token-bearing URL (<code>http://127.0.0.1:&lt;port&gt;/?t=…</code>) is parsed from the
+child's stdout and returned to the tab, which iframes it. mh's own
+security model (loopback bind, one-shot token, Host check) applies
+unchanged; <code>uiReadOnly: true</code> serves the map without editing.</li>
+</ol>
+<p>A workspace without a hub renders an empty state with a retry button instead
+of a server. The route is registered only when a web server exists, so
+headless compositions never notice the feature.</p>
+<p>The map is spawned with <code>mh ui --budget &lt;uiBudget&gt;</code> (default <code>none</code>, which
+needs mh from the memoryhub repo with <code>mh ui --budget</code> support — 2026-08-14
+or later): the map's budget box starts empty, so its over-budget preview
+badges stay off, matching <code>mh_load</code>'s load-everything default. Set <code>uiBudget</code>
+to a number to restore the budgeted preview.</p>
+<h2>How saving works</h2>
+<p><code>mh save</code> identifies a session through its transcript. mh knows Claude Code,
+pi, and Codex transcript formats; dsh is not one of them (yet). So on
+<code>mh_save</code>, the plugin:</p>
+<ol>
+<li>Walks the session's durable event log and keeps exactly what mh's own
+purifier keeps: genuine user input (<code>source.kind === 'user'</code>) and
+assistant text. Plugin-injected context (including this plugin's own
+auto-load snapshot), tool calls/results, and reasoning stay out.
+Assistant text that <strong>follows an mh load</strong> is dropped too, until the next
+genuine user message: that reply is the load receipt plus a digest of the
+memory that was just loaded — content that already lives in the
+checkpoints. Saving it would re-embed old memory into every new session
+and snowball. The load is detected whether it went through the <code>mh_load</code>
+tool directly or through a <code>run_code</code> block (the web GUI's path); the
+user's own request line stays. Detection is <strong>two-key</strong>: the call must
+have a load's shape (a direct <code>mh_load</code> call, <code>tools.mh_load(…)</code> in code,
+or <code>mh load</code> as a shell command — text that merely mentions mh load in a
+grep or edit payload does not count) AND the call's result must carry
+mh's own load receipt (<code>&lt;!-- mh | loaded:</code> and friends); a failed load
+arms nothing.</li>
+<li>Writes it as a pi-format transcript at
+<code>$TMPDIR/dsh-memoryhub/dsh_&lt;session-id&gt;.jsonl</code>.</li>
+<li>Runs <code>mh save --transcript &lt;that file&gt;</code> (or
+<code>mh save --compact --file &lt;summary.md&gt; --transcript &lt;that file&gt;</code> with the
+summary the model wrote into the tool call).</li>
+</ol>
+<p>Consequences worth knowing:</p>
+<ul>
+<li>The checkpoint filename key follows mh's pi rule (<code>pi-&lt;id12&gt;</code>) even though
+the session came from dsh. Cosmetic only; identity is stable per session.</li>
+<li>The bridge is rebuilt at every save, so a later save sees the whole session
+up to that point and replaces the earlier representation (mh keeps one
+representation per session).</li>
+<li>Steering messages and file attachments are not bridged (v1); a compact
+save's summary can still carry anything important.</li>
+<li><code>mh import</code> backfills Claude Code / pi / Codex history only — dsh history
+enters checkpoints by being saved through this plugin.</li>
+</ul>
+<h2>Verify</h2>
+<pre><code>npm install
+npm run build
+npm test        # e2e against the real mh CLI in a temp HOME
+</code></pre>
+<p>The test suite exercises the exact paths the plugin uses: bridge JSONL →
+<code>mh save --transcript</code> → <code>mh load</code>, compact-replaces-purified,
+save-twice-replaces, and the mh-ui pool against a real <code>mh ui</code> server
+(spawn, token URL, page 200, guard 403, no-hub mapping). Plugin
+registration (six tools + <code>mh(runtime)</code> skill + the Memory tab's client
+bundle in the boot graph and the <code>/plugins/memoryhub/mh-ui</code> route branches)
+was verified by booting a real dsh web profile with the bundle installed.
+The <code>agent/session-start</code> → <code>mh load</code> → <code>agent.inject</code> path uses the same
+extension points as dsh's own hook bridges; it has <strong>not</strong> been exercised
+against a live model session yet (needs an API key), and neither has the
+Memory tab's in-browser render.</p>
+<h2>Layout</h2>
+<pre><code>src/index.ts   plugin: config schema, session-start auto-load, tools, skill,
+               mh-ui route (webServer soft dependency)
+src/bridge.ts  dsh session events -&gt; pi-format JSONL transcript
+src/mh.ts      execFile runner for the mh CLI (non-zero exits are data)
+src/mh-ui.ts   mh ui process pool (one map server per workspace)
+src/estimate.ts context-share estimate for mh_load (adapter window, mh's heuristic)
+src/skill.ts   the mh workflow skill, adapted for dsh
+src/client/    browser half: the Memory conversation-view tab (iframe of mh ui)
+tests/         e2e against the real mh binary
+</code></pre>
+<h2>License</h2>
+<p>MIT</p>

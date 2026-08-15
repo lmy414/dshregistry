@@ -1,0 +1,56 @@
+<h1>auto-compact</h1>
+<p><strong>会话级自动上下文压缩插件</strong>（DeepSeek Harness / DSH）</p>
+<p>在输入区右侧显示一个阈值圆环：当前会话上下文用量实时显示，拖动滑杆设置该会话的压缩阈值（1%–90%，<strong>默认 50%</strong>）。每当用量超过阈值，插件自动触发上下文压缩（compact）——回合中每走一步之前检查一次，回合结束时再检查一次——压缩摘要注入上下文后会话自然继续，全程无需手动干预，也不发送任何「继续」消息。</p>
+<h2>特性</h2>
+<ul>
+<li>🔴 <strong>会话级阈值</strong>：每个会话独立设置，互不影响（按 <code>sessionId</code> 持久化）</li>
+<li>📊 <strong>实时用量</strong>：与自带 ContextMeter 同源（<code>useProjection("contextPressure")</code>），面板打开即实时刷新，无需轮询</li>
+<li>🎚️ <strong>1%–90% 细腻调节</strong>：步进 1%，适合精细控制（<strong>未设置时默认 50%</strong>）</li>
+<li>🤖 <strong>全自动</strong>：回合中每步前 + 回合结束自动检测 → 超阈值自动 compact → 摘要注入后自然继续</li>
+<li>🛡️ <strong>零崩溃风险</strong>：所有检查都在 <code>agent/pre-step</code>（waterfall 中间件）与 <code>agent/turn-stopping</code>（串行事件）里做，全程 try/catch，绝不抛出</li>
+<li>💾 <strong>持久化</strong>：阈值存于 <code>settings.yaml</code> 的 <code>auto-compact</code> 命名空间，重启不丢</li>
+<li>🧊 <strong>与内置安全网并存</strong>：DSH 自带的 <code>compaction-basic</code>（默认 80% 压力阈值）保留为兜底，互不干扰</li>
+</ul>
+<h2>安装</h2>
+<p><strong>前置</strong>：已装好 DSH（<code>dsh web</code> 能正常运行），Node.js ≥ 20、pnpm ≥ 10。</p>
+<h3>一键安装（推荐，复制粘贴即可）</h3>
+<p><strong>macOS / Linux</strong>（Windows 装 Git Bash 或 WSL 也可）：</p>
+<pre><code>curl -fsSL https://raw.githubusercontent.com/JohnathonYe/auto-compact/main/scripts/install.sh | bash
+</code></pre>
+<p>脚本自动完成全部步骤：安装 npm 依赖 → 注册官方挂载（<code>dsh.profile.bundles</code>）→ 清理旧版残留的挂载行。你只需要：</p>
+<ol>
+<li>跑上面这一条命令</li>
+<li><strong>重启 DSH</strong>（装完后脚本会提示命令；也可以加上 <code>--restart</code> 让它自动重启：<code>curl ... | bash -s --restart</code>）</li>
+<li>强刷浏览器（macOS <code>Cmd+Shift+R</code> / Windows·Linux <code>Ctrl+Shift+R</code>），输入区右侧出现阈值圆环 ✅</li>
+</ol>
+<blockquote>
+<p>脚本内部已自动处理：<code>dsh</code> 命令通常不在全局 PATH（DSH 一般经 npx 安装，直接敲 <code>dsh</code> 会报 command not found），脚本会自动改用 npx 调用，无需用户手动处理。</p>
+</blockquote>
+<h3>或者用</h3>
+<pre><code>npx -y --package @deepseek-ai/dsh dsh plugin --profile web add auto-compact
+</code></pre>
+<p>装完同样需要重启 DSH + 强刷浏览器。</p>
+<h3>更新 / 卸载</h3>
+<ul>
+<li><strong>更新</strong>：重跑一键安装命令（或手动命令），装完重启 DSH + 强刷浏览器</li>
+<li><strong>卸载</strong>：<code>npx -y --package @deepseek-ai/dsh dsh plugin --profile web remove auto-compact</code>，卸载后重启生效；若曾手动在 <code>cordis.patch.yml</code> 写过挂载行，一并删除，避免双挂载（两个 Host 半、两个圆环）</li>
+</ul>
+<h2>使用</h2>
+<ol>
+<li>点击输入区右侧的圆环，打开面板</li>
+<li>面板显示当前会话的实时上下文用量（百分比）</li>
+<li>拖动滑杆设置阈值（1%–90%，会话级独立；<strong>未拖动过的新会话默认 50%</strong>，仅当前会话生效，不影响其他会话）</li>
+<li>之后每当用量超过阈值（回合中某一步之前，或回合结束时），插件自动执行 compact 并继续</li>
+</ol>
+<h2>工作原理</h2>
+<ul>
+<li><strong>Host 半</strong>（<code>lib/index.js</code>）：监听 <code>agent/pre-step</code>（回合中每步之前，waterfall 中间件）与 <code>agent/turn-stopping</code>（回合结束，串行事件）两个事件，读取当前会话阈值与用量（<code>tokenMeter.measure()</code> / <code>contextPressure</code> 投影），超阈值时调用 <code>agentPresets.serviceFor(agent, 'compaction').compactIfNeeded(agent, 'context-overflow', signal)</code> 执行压缩 —— 走 context-overflow 分支，绕过引擎自身的 0.8 阈值检查，完全由滑杆决定。</li>
+<li><strong>Client 半</strong>（<code>lib/client.js</code>）：在 <code>conversation.input.right</code> 槽注册圆环 UI；阈值经自定义 webServer 路由 <code>/auto-compact/api</code>（host 侧直写 settings 服务，绕过 DSH <code>api.settings</code> 的官方命名空间白名单）读写（<code>auto-compact.thresholds[sessionId]</code>）；用量来自 <code>useProjection("contextPressure")</code> 实时投影。</li>
+</ul>
+<h2>依赖</h2>
+<ul>
+<li>需要 DSH 的 <code>compaction-basic</code>（<code>@deepseek-ai/dsh-compaction-basic</code>）处于启用状态 —— 默认预设（standard / code / cordis）均已内置，<code>minimal</code> 预设除外</li>
+<li>所有 peer 依赖随 DSH 自带，无需额外安装</li>
+</ul>
+<h2>许可证</h2>
+<p>MIT</p>

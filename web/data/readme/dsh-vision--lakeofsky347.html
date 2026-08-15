@@ -1,0 +1,112 @@
+<h1>dsh-vision — 识图路由插件（Vision Bridge for DeepSeek Harness）</h1>
+<p>让纯文本路由的 DeepSeek 会话也能"看图"：把用户附件中的图片交给视觉模型
+（默认 <code>xiaomi/mimo-v2-omni</code>）生成文字描述，再以文本块回填给 DeepSeek，
+避免 <code>UNSUPPORTED_CONTENT</code> 使整轮失败。</p>
+<p>本包按 <a href="https://github.com/deepseek-ai/deepseek-harness/blob/master/docs/user/develop/basic/publish.md">DeepSeek Harness 插件发布规范</a>
+打包为 <strong>bundle</strong>：<code>package.json</code> 声明 <code>dsh.bundle</code>，随包携带 <code>cordis.patch.yml</code>
+配置层，安装进 profile 后自动插入插件行。</p>
+<h2>工作原理</h2>
+<p>在 <code>llm/stream</code> waterfall 上注册监听器：</p>
+<ul>
+<li><p>请求中无图片块 → <code>next()</code> 原样透传（零开销）。</p>
+</li>
+<li><p>路由模型声明了 <code>image</code> 输入模态 → 原生视觉，请求原样放行（例如路由到
+mimo 的会话直接看图）。</p>
+</li>
+<li><p>其余情况（纯文本模型 + 图片）→ 监听器否决链并返回惰性异步生成器：</p>
+<ol>
+<li>解析路由模型的输入模态；</li>
+<li>对每个携带图片块的消息调用一次视觉模型（按 session + 附件 id 记忆化）；</li>
+<li>将图片块替换为 <code>[用户附件图片的视觉描述]</code> 文本块后重建请求；</li>
+<li>带重入标记重新进入 <code>ctx.llm.stream()</code>，桥接请求自身不再触发监听。</li>
+</ol>
+</li>
+</ul>
+<p>描述按 (session, 附件) 记忆化，历史回放复用文本而不是重复计费视觉调用；
+视觉调用失败时降级为占位文本，DeepSeek 回合不因桥接而中断。
+并发带图回合通过 <code>WeakSet</code> 身份标记隔离，无全局状态，互不干扰。</p>
+<h2>构建与测试</h2>
+<pre><code>npm install
+npm run build   # esbuild 生成 lib/index.js（external @deepseek-ai/*）
+npm test        # node --test，离线 mini-cordis 瀑布模型验证桥接逻辑
+</code></pre>
+<p><code>prepare</code> 脚本在 git 安装 / <code>npm pack</code> / 发布时自动执行构建，保证源码检出
+即可用（无需仓库外上下文）。</p>
+<h2>安装到 profile</h2>
+<p>本包是 bundle（声明了 <code>dsh.bundle</code>），按官方发布规范安装：</p>
+<pre><code># 本地 checkout（开发）
+dsh plugin --profile web add ./dsh-vision
+
+# 从 GitHub 安装（源码检出，pnpm 会执行 prepare 构建）
+dsh plugin --profile web add github:lakeofsky347/dsh-vision
+
+# 或发布/打包后安装预构建产物（无需任何构建权限）
+npm pack
+dsh plugin --profile web add ./dsh-vision-0.1.0.tgz
+</code></pre>
+<blockquote>
+<p><strong>pnpm ≥ 10</strong>：git 依赖的 <code>prepare</code> 脚本默认被禁止，首次 <code>add</code> 会失败并
+打印提示；把报错中的包 key 加入 profile 的 <code>pnpm-workspace.yaml</code>
+（<code>allowBuilds.dsh-vision: true</code>）后重新 <code>add</code>。请只允许信任来源的包，
+并固定提交（<code>github:lakeofsky347/dsh-vision#&lt;sha&gt;</code>）。</p>
+</blockquote>
+<p><code>dsh plugin add</code> 会把 bundle 追加进 <code>dsh.profile.bundles</code>，其
+<code>cordis.patch.yml</code> 插入插件行：</p>
+<pre><code>- insert:
+    - id: vision
+      name: dsh-vision
+</code></pre>
+<p>行内不写配置，默认值由插件的 Schemastery <code>Config</code> schema 填充。部署环境在
+自己的 <code>~/.dsh/profiles/&lt;name&gt;/cordis.patch.yml</code> 里按 <code>id</code> 覆盖整行 config
+（patch 替换整份 config，不做深合并）：</p>
+<pre><code>- id: vision
+  name: dsh-vision
+  config:
+    provider: xiaomi-token-plan-cn
+    model: mimo-v2.5
+</code></pre>
+<h2>配置</h2>
+<table>
+<thead>
+<tr>
+<th>配置</th>
+<th>默认</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>provider</code></td>
+<td><code>xiaomi</code></td>
+<td>视觉模型所在的路由</td>
+</tr>
+<tr>
+<td><code>model</code></td>
+<td><code>mimo-v2-omni</code></td>
+<td>视觉模型 id</td>
+</tr>
+<tr>
+<td><code>prompt</code></td>
+<td>（见 <code>src/index.ts</code>）</td>
+<td>随图发给视觉模型的指令</td>
+</tr>
+<tr>
+<td><code>cache</code></td>
+<td><code>true</code></td>
+<td>是否按 (session, 附件) 记忆化描述</td>
+</tr>
+<tr>
+<td><code>maxTokens</code></td>
+<td>—</td>
+<td>视觉调用输出 token 上限（可省略）</td>
+</tr>
+</tbody></table>
+<h2>目录</h2>
+<pre><code>src/index.ts       插件源码（监听器 + 桥接逻辑 + Config schema）
+scripts/build.mjs  esbuild 构建脚本（build / prepare）
+tests/             node:test 逻辑测试（mini-cordis 瀑布 + stub llm）
+cordis.patch.yml   bundle 配置层（dsh.bundle 指向）
+lib/               构建产物（DSH loader 消费 host half）
+LICENSE            MIT
+</code></pre>
+<h2>License</h2>
+<p>MIT</p>

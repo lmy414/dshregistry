@@ -1,0 +1,169 @@
+<h1>dsh-crw</h1>
+<p><a href="https://fastcrw.com">fastCRW</a>-backed <code>web_search</code> and <code>web_fetch</code> for
+<a href="https://github.com/deepseek-ai/deepseek-harness">DeepSeek Harness</a>.</p>
+<p>The harness treats web access as a capability seam (<code>ctx.web</code>) with pluggable
+providers. This package registers two of them under the id <code>crw</code>, so the model
+keeps the exact same <code>web_search</code> / <code>web_fetch</code> tools and only the backend
+changes.</p>
+<h2>Why</h2>
+<p>The base composition ships <code>web_search</code> on, and <strong><code>web_fetch</code> off</strong>. Its own
+config says why:</p>
+<blockquote>
+<p>Fetch stays disabled and no fetch provider is mounted: that provider defers
+SSRF protection and the model would choose the request target.</p>
+</blockquote>
+<p>That is a fair call. The in-box HTTP fetch provider runs <code>fetch()</code> in the harness
+process, and its README names the gap outright: no blocking of private, loopback,
+link-local or multicast destinations, no DNS-resolve-then-validate. A model that
+picks <code>http://169.254.169.254/</code> gets your cloud metadata endpoint.</p>
+<p>fastCRW resolves and validates the target server-side and refuses private ranges,
+so the harness process never opens a connection the model chose. That is what makes
+turning fetch on reasonable, and it is why <code>fetch: true</code> lives in this bundle
+rather than upstream.</p>
+<p>The second reason is that plain HTTP is not how the open web reads any more:</p>
+<table>
+<thead>
+<tr>
+<th>URL</th>
+<th>in-box HTTP provider</th>
+<th>dsh-crw</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>producthunt.com</code></td>
+<td>403, a Cloudflare interstitial</td>
+<td>200, 27,559 chars of markdown</td>
+</tr>
+<tr>
+<td><code>zillow.com</code></td>
+<td>403, "Access to this page has been denied"</td>
+<td>200, real page content</td>
+</tr>
+<tr>
+<td><code>news.ycombinator.com</code></td>
+<td>200, raw HTML for the tool to convert</td>
+<td>200, markdown from the source</td>
+</tr>
+</tbody></table>
+<p>fastCRW escalates per page from plain HTTP through its browser tiers only when a
+page needs one, so the common case stays fast and the hard case still answers.
+Not every wall falls: an interactive Cloudflare challenge still wins sometimes.</p>
+<h2>Install</h2>
+<pre><code>export CRW_API_KEY=...          # fastcrw.com, 500 free credits, no card
+dsh plugin --profile default add dsh-crw
+dsh --profile default
+</code></pre>
+<p>Get a key at <a href="https://fastcrw.com">fastcrw.com</a>. The free tier is a one-time 500
+credits and needs no card; one page is one credit.</p>
+<p>To install straight from this repo instead, pin a commit and allow the build.
+A git install fetches sources, so pnpm has to run this package's <code>prepare</code>
+script to produce <code>lib/</code>, and pnpm 10+ requires you to say so explicitly:</p>
+<pre><code># $DSH_HOME/profiles/&lt;name&gt;/pnpm-workspace.yaml
+allowBuilds:
+  dsh-crw: true
+</code></pre>
+<pre><code>dsh plugin --profile default add github:us/dsh-crw#&lt;sha&gt;
+</code></pre>
+<p>That allowance runs this package's build on your machine at install time, so
+pin the commit rather than tracking the branch.</p>
+<p>Verify the layer before booting:</p>
+<pre><code>dsh --profile default --dump-config    # shows a "# == dsh-crw" layer
+</code></pre>
+<h2>What the bundle does</h2>
+<p>The shipped <code>cordis.patch.yml</code> applies three changes over <code>@deepseek-ai/dsh-base</code>:</p>
+<ul>
+<li>points <code>web.searchProvider</code> and <code>web.fetchProvider</code> at <code>crw</code></li>
+<li>turns on <code>tool-web</code>'s <code>fetch</code> and raises both timeouts, since a page behind a
+JS or anti-bot wall escalates through browser tiers before it answers</li>
+<li>mounts this plugin, reading <code>$CRW_API_KEY</code></li>
+</ul>
+<p>The base layer's own DeepSeek search provider stays mounted, so switching search
+back is one line in your profile's <code>cordis.patch.yml</code>:</p>
+<pre><code>- id: web
+  config:
+    searchProvider: deepseek-official
+    fetchProvider: crw
+</code></pre>
+<h2>Config</h2>
+<table>
+<thead>
+<tr>
+<th>Key</th>
+<th>Default</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>apiKey</code></td>
+<td><code>$CRW_API_KEY</code></td>
+<td>fastCRW API key. Required against the cloud endpoint; empty is fine when self-hosting.</td>
+</tr>
+<tr>
+<td><code>baseURL</code></td>
+<td><code>https://fastcrw.com/api</code></td>
+<td>Endpoint base; <code>/v1/search</code> and <code>/v1/scrape</code> are appended.</td>
+</tr>
+<tr>
+<td><code>search</code></td>
+<td><code>true</code></td>
+<td>Register the search provider.</td>
+</tr>
+<tr>
+<td><code>fetch</code></td>
+<td><code>true</code></td>
+<td>Register the fetch provider.</td>
+</tr>
+<tr>
+<td><code>answer</code></td>
+<td><code>false</code></td>
+<td>Ask fastCRW to synthesize an answer over the results, returned as the seam's <code>content</code>. Adds an LLM call per search.</td>
+</tr>
+<tr>
+<td><code>maxBodyChars</code></td>
+<td><code>100000</code></td>
+<td>Cap on returned page characters, matching the in-box provider.</td>
+</tr>
+</tbody></table>
+<pre><code>- id: crw
+  name: dsh-crw
+  config:
+    apiKey: !!js process.env.CRW_API_KEY
+    answer: false
+</code></pre>
+<h2>Self-hosting</h2>
+<p>fastCRW is AGPL-3.0 and the engine is one binary, so the whole web layer can stay
+on your own machine:</p>
+<pre><code>crw serve
+</code></pre>
+<pre><code>- id: crw
+  name: dsh-crw
+  config:
+    baseURL: http://127.0.0.1:3002
+</code></pre>
+<p>A self-hosted endpoint takes no credential, so <code>apiKey</code> may be empty. The provider
+only insists on a key when it is pointed at the cloud endpoint.</p>
+<h2>Mapping notes</h2>
+<ul>
+<li><strong>Search.</strong> <code>POST /v1/search</code>. Each result maps to a <code>WebSearchSource</code>: <code>url</code>,
+<code>title</code>, and <code>snippet</code> from the result's snippet or, failing that, its
+description. A result without a URL is dropped rather than given an invented
+one. With <code>answer</code> on, the synthesized answer becomes the seam's <code>content</code>.
+The seam owns the final <code>maxResults</code> truncation.</li>
+<li><strong>Fetch.</strong> <code>POST /v1/scrape</code> with <code>formats: ['markdown']</code>. The body kind is
+<code>text</code>, not <code>html</code>: fastCRW already returns markdown, and <code>html</code> would send it
+back through the tool's turndown pass to convert converted output.</li>
+<li><strong>Non-2xx targets.</strong> fastCRW reports a 404 target as <code>success: false</code> while
+still returning what it got. The seam's contract is the other way round, so an
+envelope carrying a status code is always a result. A <code>WebError</code> is reserved
+for failing to retrieve the resource at all: a rejected URL, a bad key, an
+exhausted balance.</li>
+<li><strong>No renderer hint is sent.</strong> fastCRW's escalation ladder decides per page
+whether plain HTTP is enough.</li>
+</ul>
+<h2>Development</h2>
+<pre><code>bun install
+bun test
+bun run build
+</code></pre>
+<h2>License</h2>
+<p>MIT.</p>

@@ -1,0 +1,56 @@
+<h1>dsh-trellis</h1>
+<p>DeepSeek Harness (dsh) host 插件：把 <a href="https://github.com/mindfold-ai/Trellis">Trellis</a> 工作流带进 dsh，并尽量沿用 DSH 原生能力补齐 Codex / Claude Code 级体验：</p>
+<ol>
+<li><strong>每轮 workflow-state 面包屑注入</strong> — 在每个 <code>agent/pre-step</code>，解析项目 <code>.trellis/workflow.md</code> 的 <code>[workflow-state:*]</code> 块 + 活跃任务状态（no_task / planning / in_progress），把对应面包屑注入会话（与 <code>dsh-agent-instructions</code> 的注入管道相同）。未变化不重复注入；被压缩后自动重注入；提示词里出现独立单词 <code>no-trellis</code> 可跳过当轮。</li>
+<li><strong>隔离的原生会话上下文身份</strong> — 从当前 agent 的 DSH 原生 session header 生成受管的 <code>DSH_TRELLIS_CONTEXT_ID</code>，让 <code>task.py start/create/current</code> 解析到会话级 active-task 指针，并在子代理身份不同于 shell 自身 session 时优先使用被转发的身份；插件命令启动的子进程也显式使用同一个 DSH 身份。</li>
+<li><strong>原生子代理同步</strong> — 安装插件后，Trellis 角色可用 DSH continuable 后台子代理；主会话先继续独立工作，耗尽后调用事件驱动的 <code>trellis_wait</code>。它监听 DSH 的 <code>subagent/end</code>，只在原生 settlement notice 已排入父会话后返回，不用 shell sleep、轮询或 <code>job_output</code>。</li>
+<li><strong><code>/trellis</code> 命令</strong> — <code>/trellis-status</code>（活跃任务 + git 状态）、<code>/trellis-finish</code>（只读检查 + 安全收尾清单，不提前清 active-task 指针）。命令输出不进模型历史；真正的会话收尾走技能面 <code>/trellis-finish-work</code>，由技能先归档再写 journal。</li>
+</ol>
+<p>非 Trellis 项目不注入面包屑；命令只有被用户显式调用时才会检查并返回“未初始化 Trellis”。</p>
+<p>这是 Trellis DSH 适配的<strong>可选伴侣插件</strong>，不是使用 <code>trellis init --dsh</code> 的前置条件。workflow 会按能力选择路径：存在 <code>trellis_wait</code> 时才使用 continuable 后台派发和事件汇合；未安装插件时，依赖结果的子代理从一开始就用 <code>run_in_background: false</code> 前台派发。两条路径都禁止 sleep 或轮询，Trellis CLI 也不会自动安装任何 DSH profile 插件。</p>
+<h2>安装</h2>
+<pre><code># 装进实际使用的 profile（均在该 profile 下次启动时生效）
+dsh plugin --profile web add dsh-trellis
+dsh plugin --profile headless add dsh-trellis
+
+# 如果你维护独立的 tui profile，也需要装进该 profile
+dsh plugin --profile tui add dsh-trellis
+</code></pre>
+<p><code>dsh plugin</code> 会把插件安装到指定 profile；每个实际使用的 profile 都需要单独安装。升级到 npm 上的最新版本：</p>
+<pre><code>dsh plugin --profile web update dsh-trellis
+dsh plugin --profile headless update dsh-trellis
+</code></pre>
+<p>对 <code>tui</code> profile 使用同样的 update，并在该 profile 下次启动时生效。</p>
+<p>如果要从源码开发或验证尚未发布的版本，可以改用本地 <code>file:</code> 安装：</p>
+<pre><code>git clone https://github.com/SajoLuo/dsh-trellis.git
+cd dsh-trellis
+pnpm install --frozen-lockfile
+dsh plugin --profile headless add file:C:/path/to/dsh-trellis
+</code></pre>
+<p><code>file:</code> 插件会作为 profile 内的 pnpm 快照安装；拉取源码更新后，尤其是版本新增文件时，需要先 remove 再 add 刷新该 profile。</p>
+<p>配套要求：项目的 Trellis 平台需包含 dsh（<code>trellis init --dsh</code>，见 Trellis-DeepSeekHarness 适配分支），且 <code>.trellis/scripts</code> 需包含读取原生 <code>DSH_SESSION_ID</code> 的适配（已含在同一分支）。插件目标版本为 DSH <code>0.1.0-rc.6</code>；升级 DSH 时应重跑本仓测试。</p>
+<h2>配置</h2>
+<p>在 profile 的 <code>cordis.patch.yml</code> 里覆盖（整行替换）：</p>
+<pre><code>- id: dsh-trellis
+  config:
+    maxBytes: 4096          # 面包屑注入的字节预算（0 = 关闭注入）
+    skipKeyword: no-trellis # 提示词中的独立单词可跳过当轮注入（空 = 禁用）
+    pythonCmd: ""           # 空 = 自动选择：Windows 先 py -3 再 python；其他系统先 python3 再 python
+    commandsEnabled: true
+</code></pre>
+<h2>工作原理</h2>
+<ul>
+<li><strong>状态解析</strong>（<code>lib/workflow.js</code>）：向上找项目根 → 读 <code>.trellis/workflow.md</code> 解析状态块 → 先看当前会话指针 <code>.trellis/.runtime/sessions/dsh_&lt;id&gt;.json</code>。当前指针缺失时只允许 Trellis 官方的“唯一 session 文件”回退；存在 0 个或 2 个以上 session 文件就拒绝猜测，避免多个 DSH 窗口串任务。</li>
+<li><strong>注入去重</strong>：面包屑带 digest，与最近一次注入相同且仍在可见表面则不重复注入。</li>
+<li><strong>会话身份</strong>：DSH 原生提供 <code>DSH_SESSION_ID = agent.session.header.id</code>，并先丢弃环境中已有的 <code>DSH_*</code> 再重建受管命名空间。Trellis beta 因此会在同时看到 <code>DSH_SHELL=1</code> 与 <code>DSH_SESSION_ID</code> 时优先解析当前 DSH 身份，即使没有插件也不会被外层 host 继承的 <code>TRELLIS_CONTEXT_ID</code> 串任务。插件通过 <code>shellEnv</code> 为每次执行额外生成 <code>DSH_TRELLIS_CONTEXT_ID = dsh_&lt;session-id&gt;</code>，用于转发可能不同于 shell 自身 session 的子代理身份；主会话与子代理仍各自保留 DSH 身份，子代理通过派发 prompt 首行的 <code>Active task:</code> 和角色 prelude 取得父任务上下文。</li>
+<li><strong>Headless 会话</strong>：每次 <code>dsh --profile headless</code> 调用都是新的 DSH session。需要跨轮保留 active-task 指针时，应保持同一会话或显式 resume 返回的 session id，不能把多个独立 headless 调用当成同一 session。</li>
+<li><strong>取消与生命周期</strong>：命令和 <code>trellis_wait</code> 都继承 DSH invocation 的 <code>AbortSignal</code>；取消后命令不会继续尝试另一个 Python 启动器，等待工具也会立即注销临时事件监听器。插件卸载时只注销自己的命令、工具和监听器。</li>
+<li><strong>子代理并发</strong>：workflow 只有在发现 <code>trellis_wait</code> 时才使用 DSH 原生 continuable 后台 <code>subagent</code>。主会话并行做独立工作；需要汇合时调用一次 <code>trellis_wait &lt;subagent_id&gt;</code> 等待原生结算事件。没有该工具时，首次派发直接设置 <code>run_in_background: false</code>，绝不留下无法事件汇合的后台子代理。</li>
+</ul>
+<h2>开发</h2>
+<pre><code>pnpm install
+pnpm test    # node --test test/*.test.js
+</code></pre>
+<p>无构建步骤：纯 ESM JavaScript，<code>main</code> 直接指向 <code>lib/index.js</code>。</p>
+<h2>License</h2>
+<p>MIT</p>

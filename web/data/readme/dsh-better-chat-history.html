@@ -1,0 +1,132 @@
+<h1>⚡ dsh-better-chat-history</h1>
+<p><img src="https://img.shields.io/badge/license-MIT-blue" alt="License">
+<img src="https://img.shields.io/badge/version-0.1.0-2ea44f" alt="Version">
+<img src="https://img.shields.io/badge/dsh-%3E%3D0.1.0--rc.6-purple" alt="DSH">
+<img src="https://img.shields.io/badge/dependencies-0-brightgreen" alt="Dependencies"></p>
+<p><strong>更好的聊天记录加载</strong> —— <a href="https://github.com/deepseek-ai/deepseek-harness">DeepSeek Harness</a>（dsh）会话 I/O 优化插件：消除多 Agent 切换会话时的 JSONL 全量冷读，合并投影缓存写放大，延长 SSD 寿命。</p>
+<p><strong>零依赖</strong>，纯 JS ESM，不修改 DSH 本体——通过包装既有服务实例方法 + patch 配置覆盖生效，静默运行。</p>
+<h2>✨ 特性</h2>
+<ul>
+<li><strong>读路径三级缓存</strong><ul>
+<li><code>inspect</code>：LRU（默认 64 槽，TTL 60s）+ 并发去重（同 id 同时请求只读一次盘）；</li>
+<li><code>readFrom</code>：缓存命中时直接内存截取，零磁盘 IO；</li>
+<li><code>list</code>：5s TTL 缓存，避免每次打开 GUI / 刷新都全盘扫描所有会话 header；</li>
+</ul>
+</li>
+<li><strong>会话预热器</strong> —— web 启动后后台把最近活跃的会话（默认 24 个）预先 inspect 进缓存，让“初次点击”也命中缓存而不是全量冷读——解决首次打开卡顿的关键；</li>
+<li><strong>精确失效</strong> —— 监听 <code>session/event</code> / <code>session/created</code> / <code>session/disposed</code>，会话日志一旦变化立即弃对应缓存：最多返回陈旧视图，绝不产生错误数据；</li>
+<li><strong>写合并</strong> —— 对 fail-soft 的投影缓存做合并落盘（多次 put/delete 在合并窗口内只落盘一次），fsync 频率降低约 10 倍；<code>workspace.json</code> 等权威数据<strong>不</strong>合并，保持原语义。</li>
+</ul>
+<h2>📦 安装</h2>
+<h3>方式 A（推荐）：Release tarball 安装</h3>
+<pre><code>dsh plugin --profile &lt;profile&gt; add ./dsh-better-chat-history-0.1.0.tgz
+</code></pre>
+<p>包内 <code>cordis.patch.yml</code> 自动成为 bundle 层（含配置覆盖与插件挂载），重启后生效。</p>
+<h3>方式 B：手动挂载（零依赖，无需 pnpm）</h3>
+<ol>
+<li>把本包放入目标 profile 的 <code>node_modules\dsh-better-chat-history\</code>（即 <code>lib\index.js</code> + <code>cordis.patch.yml</code> + <code>package.json</code>，零依赖无需 install）；</li>
+<li>在 profile 的 <code>package.json</code> dependencies 加 <code>"dsh-better-chat-history": "file:&lt;本包路径&gt;"</code>；</li>
+<li>在 profile 的 <code>cordis.patch.yml</code> 末尾追加：</li>
+</ol>
+<pre><code># 更好的聊天记录加载
+- id: session-persistence-jsonl
+  config:
+    root: !!js dshHomePath('sessions')
+    preparedSessionCacheSize: 64
+    writeBatchMaxDelayMs: 2000
+
+- id: session-projection-cache
+  config:
+    writeEveryEvents: 500
+    writeIntervalMs: 15000
+
+- insert:
+    - id: io-optimizer
+      name: 'dsh-better-chat-history'
+</code></pre>
+<ol>
+<li>重启 <code>dsh web</code>（或 <code>dsh --profile &lt;profile&gt;</code>）。插件<strong>静默运行</strong>：正常时不输出任何日志（仅 error 级），生效与否看行为——切换 / 初次打开会话明显变快。</li>
+</ol>
+<blockquote>
+<p>需要 dsh ≥ 0.1.0-rc.6。Release 资产见页面右侧 <strong>Releases</strong>。</p>
+</blockquote>
+<h2>✅ 验证</h2>
+<pre><code>dsh --profile web --dump-config
+# 应看到 session-persistence-jsonl 行带 preparedSessionCacheSize: 64 / writeBatchMaxDelayMs: 2000，以及 io-optimizer 行
+</code></pre>
+<p>行为验证：重启后首次点开最近跑过的会话应接近秒开（预热命中）；反复切换会话应无等待（读缓存命中）。</p>
+<h2>⚙️ 配置项</h2>
+<p>profile patch 中给 <code>io-optimizer</code> 行加 config 覆盖：</p>
+<table>
+<thead>
+<tr>
+<th>键</th>
+<th>默认</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>inspectCacheSize</code></td>
+<td>64</td>
+<td>冷读 LRU 槽数</td>
+</tr>
+<tr>
+<td><code>inspectCacheTtlMs</code></td>
+<td>60000</td>
+<td>冷读缓存 TTL</td>
+</tr>
+<tr>
+<td><code>listCacheTtlMs</code></td>
+<td>5000</td>
+<td>会话列表缓存 TTL</td>
+</tr>
+<tr>
+<td><code>coalesceUnits</code></td>
+<td><code>["session_projcache"]</code></td>
+<td>参与写合并的 storage 单元名</td>
+</tr>
+<tr>
+<td><code>coalesceMs</code></td>
+<td>1500</td>
+<td>写合并窗口</td>
+</tr>
+<tr>
+<td><code>warmSessions</code></td>
+<td>24</td>
+<td>启动后预热的最近会话数（0 关闭）</td>
+</tr>
+<tr>
+<td><code>warmDelayMs</code></td>
+<td>10000</td>
+<td>预热开始延迟（避开启动高峰）</td>
+</tr>
+<tr>
+<td><code>warmIntervalMs</code></td>
+<td>600</td>
+<td>每两个会话预热之间的间隔（普通批次）</td>
+</tr>
+<tr>
+<td><code>warmFastCount</code></td>
+<td>5</td>
+<td>优先快速预热的前 N 个会话</td>
+</tr>
+<tr>
+<td><code>warmFastIntervalMs</code></td>
+<td>150</td>
+<td>优先批次的预热间隔</td>
+</tr>
+</tbody></table>
+<h2>🛡️ 语义安全</h2>
+<ul>
+<li>只读路径缓存 + 事件失效：最多返回陈旧视图，绝不产生错误数据；</li>
+<li>写合并仅作用于 fail-soft 单元，权威数据原样直写；</li>
+<li>崩溃丢失窗口：最近 ~2s 的日志事件、合并窗口内的投影缓存更新——均符合原设计语义；</li>
+<li>插件可在 HMR / 重载时恢复原始方法（<code>ctx.effect</code> disposer + 防重复包装标志）。</li>
+</ul>
+<h2>🔗 相关插件</h2>
+<ul>
+<li><a href="https://github.com/echo-xianyu/dsh-go-rotator">dsh-go-rotator</a> —— OpenCode Go 订阅 key 轮换器</li>
+<li><a href="https://github.com/echo-xianyu/dsh-chat-archive">dsh-chat-archive</a> —— 聊天记录管理面板</li>
+</ul>
+<h2>📄 许可证</h2>
+<p><a href="https://github.com/echo-xianyu/dsh-better-chat-history/blob/HEAD/LICENSE">MIT</a> © 2026 dsh-better-chat-history contributors</p>

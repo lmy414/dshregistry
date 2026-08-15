@@ -1,0 +1,188 @@
+<h1>dsh-llm-auto-route</h1>
+<p><code>dsh-llm-auto-route</code> is a community Cordis plugin for DeepSeek Harness. It discovers which already-configured <code>dsh-llm-pi-ai</code> route should handle a request, explains the decision, and performs failover only before the first visible output.</p>
+<p>It is deliberately a routing policy layer. It does not implement HTTP protocols, ship provider SDKs, or register <code>openai</code>, <code>anthropic</code>, <code>deepseek</code>, or other adapter routes. The official <code>@deepseek-ai/dsh-llm-pi-ai</code> plugin remains the owner of those routes.</p>
+<blockquote>
+<p>Community project: this package is not an official DeepSeek Harness package and does not imply DeepSeek endorsement.</p>
+</blockquote>
+<h2>Requirements</h2>
+<ul>
+<li>Node.js <code>&gt;=22.19.0</code></li>
+<li>DeepSeek Harness <code>0.1.0-rc.5</code> or a compatible <code>0.1.x</code> release</li>
+<li><code>@deepseek-ai/dsh-llm-pi-ai</code> configured with the route names you want to select</li>
+</ul>
+<p>The package is tested against the npm <code>0.1.0-rc.6</code> companion packages while keeping the peer range compatible with <code>rc.5</code>.</p>
+<h2>Install</h2>
+<pre><code>pnpm add dsh-llm-auto-route
+</code></pre>
+<p>The official base bundle already contains <code>@deepseek-ai/dsh-llm-pi-ai</code>. If you compose plugins manually, install and load that official adapter before this package. Load the shipped <code>cordis.patch.yml</code> with the normal DeepSeek Harness/Cordis composition command used by your deployment.</p>
+<p>The patch adds one plugin named <code>llm-auto-route</code>; it does not add or replace any official adapter route.</p>
+<h2>Configure the official adapter first</h2>
+<p>The route names in this plugin must already be registered by <code>dsh-llm-pi-ai</code>. The following is an abbreviated official-adapter configuration:</p>
+<pre><code>- id: llm
+  name: '@deepseek-ai/dsh-llm-pi-ai'
+  config:
+    providers:
+      deepseek:
+        apiKeyEnv: DEEPSEEK_API_KEY
+      openai:
+        apiKeyEnv: OPENAI_API_KEY
+      anthropic:
+        apiKeyEnv: ANTHROPIC_API_KEY
+      ollama:
+        baseURL: http://127.0.0.1:11434/v1
+        api: openai-completions
+        models:
+          - id: llama3.1
+            contextWindow: 131072
+            maxTokens: 8192
+      vllm:
+        baseURL: http://127.0.0.1:8000/v1
+        api: openai-completions
+        models:
+          - id: local-model
+            contextWindow: 32768
+            maxTokens: 4096
+      openai-compatible:
+        apiKeyEnv: GATEWAY_API_KEY
+        baseURL: https://gateway.example.test/v1
+        api: openai-completions
+        models:
+          - id: gateway-model
+            contextWindow: 65536
+            maxTokens: 8192
+</code></pre>
+<p><code>dsh-llm-pi-ai</code> owns credentials, model metadata, transport, and stream conversion. The auto-route plugin only sees the route directory and selects one of those route keys.</p>
+<h2>Automatic selection</h2>
+<p>An automatic request uses <code>provider: auto</code>, or omits the provider when the plugin configuration's provider token is <code>auto</code>:</p>
+<pre><code>const options = {
+  provider: 'auto',
+  model: 'deepseek-chat',
+  messages,
+}
+</code></pre>
+<p>The fixed default precedence is:</p>
+<pre><code>explicit → provider_env → base_url → model_prefix
+</code></pre>
+<ul>
+<li>A non-<code>auto</code> provider is always preserved. Explicit requests are never silently rerouted.</li>
+<li><code>DEEPSEEK_API_KEY</code>, <code>OPENAI_API_KEY</code>, and <code>ANTHROPIC_API_KEY</code> are detection signals only; the key value is never written to a log.</li>
+<li><code>LLM_BASE_URL</code> selects the generic <code>openai-compatible</code> rule. <code>11434</code> identifies Ollama and <code>8000</code> identifies a vLLM/OpenAI-compatible local endpoint.</li>
+<li><code>deepseek-*</code>, <code>gpt-*</code>, <code>o1-*</code>, <code>o3-*</code>, and <code>claude-*</code> provide model-prefix hints.</li>
+<li>A candidate is usable only when the official adapter has registered the same route.</li>
+<li>Equal-priority candidates at the same stage return <code>AMBIGUOUS_ROUTE</code>; the plugin does not guess.</li>
+<li>A route's <code>defaultModel</code> is used only when a matching rule supplies one and the request omits its model.</li>
+</ul>
+<p>Every selection can be explained without exposing credentials:</p>
+<pre><code>已选择 deepseek/deepseek-chat；原因：发现 DEEPSEEK_API_KEY
+</code></pre>
+<p>Use an explicit provider or a route <code>priority</code> when an environment intentionally contains multiple credentials.</p>
+<h2>Configuration</h2>
+<p>The shipped patch contains the default rules. An application can override them through its Cordis configuration:</p>
+<pre><code>provider: auto
+precedence:
+  - explicit
+  - provider_env
+  - base_url
+  - model_prefix
+healthCheck:
+  mode: adaptive       # off | adaptive | probe
+  timeoutMs: 3000
+  cacheTtlMs: 30000
+failover:
+  enabled: true
+  maxAttempts: 3
+diagnostics: info      # silent | error | info
+routes:
+  deepseek:
+    apiKeyEnv: DEEPSEEK_API_KEY
+    defaultModel: deepseek-chat
+    priority: 10
+  openai-compatible:
+    apiKeyEnv: GATEWAY_API_KEY
+    baseURLEnv: LLM_BASE_URL
+    modelPrefixes: [gateway-]
+</code></pre>
+<p>Route fields are hints, not adapter configuration:</p>
+<table>
+<thead>
+<tr>
+<th>Field</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>provider</code></td>
+<td>Registered route id to return; defaults to the <code>routes</code> key.</td>
+</tr>
+<tr>
+<td><code>apiKeyEnv</code></td>
+<td>Non-empty environment variable used as a provider-env signal and for discovery.</td>
+</tr>
+<tr>
+<td><code>baseURL</code> / <code>baseURLEnv</code></td>
+<td>Exact or user-supplied endpoint hint. <code>baseURLEnv</code> also supports unknown OpenAI-compatible hosts.</td>
+</tr>
+<tr>
+<td><code>baseURLPatterns</code></td>
+<td>Additional normalized URL prefixes.</td>
+</tr>
+<tr>
+<td><code>ports</code></td>
+<td>Local ports that identify this route when a base URL is supplied.</td>
+</tr>
+<tr>
+<td><code>modelPrefixes</code></td>
+<td>Model id prefixes for automatic selection.</td>
+</tr>
+<tr>
+<td><code>defaultModel</code></td>
+<td>Model to use when the request does not name one.</td>
+</tr>
+<tr>
+<td><code>priority</code></td>
+<td>Tie breaker within one matching stage; higher wins.</td>
+</tr>
+</tbody></table>
+<p>Do not put an API key directly in route configuration. Use the official adapter's credential reference, normally <code>apiKeyEnv</code>, and keep this plugin's <code>apiKeyEnv</code> aligned with it.</p>
+<h2>Health checks and failover</h2>
+<p><code>adaptive</code> health checks reuse the official <code>dsh-llm</code> model-discovery seam when it is available, with a bounded timeout and an in-memory cache. If a deployment cannot expose discovery, route/model resolution is used as the local fallback and the real stream remains the final availability check. <code>off</code> skips preflight checks. <code>probe</code> asks the discovery seam whenever the adapter exposes it.</p>
+<p>Failover is intentionally conservative:</p>
+<ul>
+<li>it is allowed only before text, reasoning, tool-call, or block output has been emitted;</li>
+<li>buffered protocol metadata from a failed attempt is discarded before trying the next route;</li>
+<li>aborts, explicit providers, configuration errors, and requests that already emitted output are not retried;</li>
+<li>a later provider never receives a partial assistant response from an earlier provider.</li>
+</ul>
+<p>The plugin observes <code>agent/request</code>, <code>agent/request-error</code>, and <code>llm/stream</code>. It returns a new immutable request configuration and never mutates a frozen request object.</p>
+<h2>Public API</h2>
+<p>The package exports <code>AutoRouteConfig</code>, <code>RouteRule</code>, <code>RouteDecision</code>, <code>MatchStage</code>, and the pure helpers <code>normalizeConfig</code>, <code>normalizeBaseURL</code>, and <code>resolveRoute</code>:</p>
+<pre><code>import { normalizeConfig, resolveRoute } from 'dsh-llm-auto-route'
+
+const decision = resolveRoute(normalizeConfig(), {
+  model: 'deepseek-chat',
+  env: { DEEPSEEK_API_KEY: 'present' },
+  registeredProviders: new Set(['deepseek']),
+})
+
+if (decision.kind === 'matched') {
+  console.log(decision.candidate.provider, decision.candidate.model, decision.stage)
+}
+</code></pre>
+<p><code>AutoRouteError.code</code> is stable for <code>AMBIGUOUS_ROUTE</code>, <code>MISSING_MODEL</code>, <code>NO_CANDIDATE</code>, and <code>NO_REGISTERED_ROUTE</code>.</p>
+<h2>Troubleshooting</h2>
+<p><strong><code>NO_REGISTERED_ROUTE</code></strong> — the route exists in this plugin's default hints but not in <code>ctx.llm.listProviders()</code>. Add the same key under the official adapter's <code>providers</code> configuration.</p>
+<p><strong><code>AMBIGUOUS_ROUTE</code></strong> — more than one candidate matched at the same stage and priority. Set <code>provider</code> explicitly, remove an unused environment variable, or give one route a higher <code>priority</code>.</p>
+<p><strong><code>MISSING_CREDENTIAL</code> / <code>INVALID_CREDENTIAL</code></strong> — detection and the official adapter must agree on the environment variable. Check the variable name, not its value in logs or issue reports.</p>
+<p><strong>Local gateway is not selected</strong> — set <code>LLM_BASE_URL</code>, or provide a URL containing port <code>11434</code> (Ollama) or <code>8000</code> (vLLM). The official adapter still needs a route with that key and a model catalog.</p>
+<p><strong>A response was not retried</strong> — this is expected after the first text, reasoning, tool-call, or block output, after cancellation, for an explicit provider, or for a configuration failure. Retrying then could duplicate or splice an assistant response.</p>
+<h2>Compatibility and project status</h2>
+<p>This is an independent ecosystem plugin for the DeepSeek Harness developer preview. It follows the current upstream guidance for community plugins, <code>dsh-plugin</code> topics, Discussions announcements, and standalone repositories. It does not open a pull request against the official Harness repository.</p>
+<p>Upstream references:</p>
+<ul>
+<li><a href="https://github.com/deepseek-ai/deepseek-harness/tree/master/packages/llm/llm-pi-ai"><code>dsh-llm-pi-ai</code> README</a></li>
+<li><a href="https://github.com/deepseek-ai/deepseek-harness/blob/master/packages/llm/llm/README.md">LLM interface</a></li>
+<li><a href="https://github.com/deepseek-ai/deepseek-harness/blob/master/docs/subsystems/llm-streaming.md">Streaming and routing extension points</a></li>
+<li><a href="https://github.com/deepseek-ai/deepseek-harness/blob/master/CONTRIBUTING.zh.md">Contribution guide</a></li>
+</ul>
+<h2>License</h2>
+<p>MIT. See <a href="https://github.com/qinyu765/dsh-llm-auto-route/blob/HEAD/LICENSE">LICENSE</a>.</p>

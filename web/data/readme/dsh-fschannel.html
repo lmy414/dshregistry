@@ -1,0 +1,427 @@
+<h1>dsh-fschannel</h1>
+<p><a href="https://github.com/cershuang/dsh-fschannel/blob/HEAD/README.en.md">English</a> | <strong>中文</strong></p>
+<p>让 DeepSeek Harness Web 会话连接到飞书机器人：<strong>新建会话时选择「连接飞书」</strong>，之后在飞书里给机器人发消息，消息进入该 DSH 会话由 Agent 处理，回复自动发回飞书聊天。Web 与飞书可同时驱动同一个会话。</p>
+<p>传输层使用飞书官方 <a href="https://github.com/larksuite/channel-sdk-node">@larksuite/channel</a> SDK —— <strong>WebSocket 长连接，无需公网回调地址</strong>。</p>
+<hr>
+<h2>功能</h2>
+<h3>会话 ↔ 飞书聊天桥接</h3>
+<ul>
+<li>一对一绑定（一个会话对应一个聊天，双向替换），绑定持久化在 <code>$DSH_HOME/feishu-bindings.json</code></li>
+<li><strong>待绑定机制</strong>：会话进入待绑定状态后，你在飞书里给机器人发的<strong>下一条消息</strong>所在聊天即完成绑定（FIFO）</li>
+<li>会话 Agent 不在线时自动 <code>resume</code> 恢复；重启后绑定关系保留</li>
+</ul>
+<h3>消息收发</h3>
+<ul>
+<li><strong>流式卡片</strong>（默认 <code>output: 'stream'</code>）：<strong>回合开始即开卡</strong>（先显示「正在处理…」），回复以打字机卡片逐字呈现；工具调用显示「正在调用工具：{name}」引用行；<strong>回合结束时卡片保留最终结果</strong>，并自动排版为结构化卡片（段落/表格/代码块按 markdown 渲染，无输出或失败也留在卡片内）；无卡片权限时自动回退普通消息</li>
+<li><strong>卡片图片内嵌</strong>：最终卡片中的 markdown 图片引用（<code>![说明](路径)</code>）若指向会话工作区内的本地图片文件，会自动上传并以卡片 <code>img</code> 元素<strong>内嵌</strong>（不显示远程链接/死链）；远程 URL 或无法读取的路径不会出现在卡片中（保留说明文字）</li>
+<li><code>output: 'plain'</code> 可切换为「每步一条 markdown 消息」</li>
+<li><strong>队列处理</strong>：SDK 级去重（30s）+ 按聊天串行投递；Agent 忙碌时回复「前面还有 N 条消息在排队」</li>
+<li><strong>表情反馈</strong>：收到消息时在消息上自动加 👍，该回合完成变 ✅、失败变 ☹️（可配置 emoji 与开关；仅在你自己的消息上生效，Web 触发的回合不会误换）</li>
+<li><strong>图片暂存识别</strong>：飞书图片先暂存不处理，等你的下一条文字消息到达后，把图片路径连同识别指令一起发给 agent —— agent 加载 vision-tools 技能并调用视觉识别工具（vision_glance/vision_ocr 等）逐张识别，结合文字回答（需已安装 @anionex/dsh-vision-toolkit 且 runtime 就绪；图片保存在会话工作区的 <code>.dsh-fschannel-images/</code>）</li>
+<li><strong>会话图片画廊</strong>：会话头部「飞书图片」按钮打开该会话的图片网格（点击查看原图）。图片元数据由插件自管（<code>feishu-bindings.json</code>），<strong>不再写入会话日志</strong> —— 旧版本写入的 <code>feishu/image</code> 事件类型不为 harness 所知，会导致整个会话历史无法加载；v0.1.5.3 起插件在启动时自动修复历史日志（给这类事件补上 harness 认可的 <code>ignorable</code> 标记），并自动补录历史图片索引</li>
+<li><strong>机器人发送图片</strong>：agent 在回合中生成图片（图表、裁剪、代码渲染的 PNG 等）后，可调用 <code>send_feishu_image</code> 工具把图片发送到绑定的飞书聊天（可附带说明文字）；发送的图片同时进入该会话的 Web 画廊。图片路径必须位于会话工作区内（防穿越），支持 PNG/JPEG/WebP/GIF；<code>sendImageTool: false</code> 可关闭此工具</li>
+<li><strong>机器人发送文件</strong>：agent 可调用 <code>send_feishu_file</code> 工具把生成的任意文件（报告、导出、日志等，≤ 30 MiB）发送到绑定的飞书聊天，可指定显示文件名（默认取原文件名）并附带说明文字；<code>sendFileTool: false</code> 可关闭此工具</li>
+<li>群聊默认仅响应 @ 机器人（<code>requireMention</code>）；未绑定聊天收到引导提示（可关）</li>
+</ul>
+<h3>飞书侧模型控制</h3>
+<ul>
+<li>提到「调整/切换/查看 模型/effort」时自动弹出<strong>按钮卡片</strong>，展示当前模型与推理等级，可一键切换</li>
+<li><code>/model</code> — 弹出同一张卡片（查询当前模型与 effort）</li>
+<li><code>/model list</code> — 模型目录（含各模型支持的 effort 级别）</li>
+<li><code>/model use &lt;provider&gt;/&lt;model&gt;</code> — 切换模型（下一条消息起生效）</li>
+<li><code>/model effort &lt;off|high|max&gt;</code> — 切换思考强度</li>
+<li><code>/status</code> — 会话与机器人状态；<code>/stop</code> — 停止当前回合；<code>/help</code> — 命令清单</li>
+<li>切换走宿主 <code>apiProxy</code>（与 Web UI 同一通道），<strong>会话级持久</strong>：重启后自动重放</li>
+</ul>
+<h3>连接飞书（创建新会话时）</h3>
+<ul>
+<li>会话头 chip：未连接 →「连接飞书」；待绑定 → 提示「给机器人发一条消息完成绑定」；已连接 → 显示聊天名（点击断开）</li>
+<li>设置 → <strong>飞书机器人</strong> 标签页（独立页）：状态、输出方式、「新会话默认连接飞书」开关、「新建会话并连接飞书」按钮、绑定/待绑定管理、命令说明</li>
+</ul>
+<hr>
+<h2>安装方式</h2>
+<p>前置：Node 22.19+，已安装 <code>dsh</code> CLI 与 <code>pnpm</code>（<code>npm i -g @deepseek-ai/dsh pnpm</code>）。</p>
+<pre><code># 1. 准备环境（.env 只放路径配置；凭据在启动后于设置页填写）
+cp example.env .env      # 按需修改 FSCHANNEL_REPO / FSCHANNEL_ENV_FILE
+
+# 2. 构建客户端（每次修改源码后执行）
+npm install &amp;&amp; npm run build
+
+# 3. 安装进 web profile（file: 协议会把包复制进 pnpm store 并安装其依赖；
+#    &lt;插件仓库路径&gt; 也可写在 .env 的 FSCHANNEL_REPO 中）
+dsh plugin --profile web add file:&lt;插件仓库路径&gt;
+
+# 4. 重启 dsh web 生效
+dsh web
+</code></pre>
+<blockquote>
+<p>首次安装时 pnpm 可能因构建脚本策略报 <code>ERR_PNPM_IGNORED_BUILDS</code>（protobufjs）。
+protobufjs 是生产传递依赖（<code>@larksuite/channel</code> → <code>@larksuiteoapi/node-sdk</code> → protobufjs）
+且带安装脚本，但本插件不需要它构建。在 <strong>profile 目录</strong>的
+<code>$DSH_HOME/profiles/&lt;profile&gt;/pnpm-workspace.yaml</code>（<strong>不在本仓库内</strong>，需要你自己创建或追加）
+中加入：</p>
+<pre><code>allowBuilds:
+  protobufjs: false
+</code></pre>
+</blockquote>
+<hr>
+<h2>配置</h2>
+<p>注册行 <code>feishu-bot</code>（来自包内 <code>cordis.patch.yml</code>，作为 bundle 层自动叠加）：</p>
+<table>
+<thead>
+<tr>
+<th>字段</th>
+<th>默认</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>envFile</code></td>
+<td><code>&lt;cwd&gt;/.env</code></td>
+<td>路径配置文件（FSCHANNEL_* 键）；不再承担凭据</td>
+</tr>
+<tr>
+<td><code>appId</code> / <code>appSecret</code></td>
+<td>凭据库</td>
+<td>入口配置直接覆盖；设置页「连接凭据」保存到 DSH 凭据库</td>
+</tr>
+<tr>
+<td><code>requireMention</code></td>
+<td><code>true</code></td>
+<td>群聊仅响应 @ 机器人；单成员群（1 用户 + 机器人）免 @</td>
+</tr>
+<tr>
+<td><code>output</code></td>
+<td><code>stream</code></td>
+<td><code>stream</code>=流式打字机卡片（失败回退普通消息）；<code>plain</code>=每步一条消息</td>
+</tr>
+<tr>
+<td><code>modelCardTriggers</code></td>
+<td><code>true</code></td>
+<td>提到模型/effort 时自动弹出按钮卡片</td>
+</tr>
+<tr>
+<td><code>queueAck</code></td>
+<td><code>true</code></td>
+<td>Agent 忙碌时回复排队位置提示</td>
+</tr>
+<tr>
+<td><code>ackInbound</code></td>
+<td><code>false</code></td>
+<td>空闲时也回复「收到，处理中…」</td>
+</tr>
+<tr>
+<td><code>reactInbound</code></td>
+<td><code>true</code></td>
+<td>收到消息时加表情反馈（👍→✅/☹️）</td>
+</tr>
+<tr>
+<td><code>reactReceived</code> / <code>reactDone</code> / <code>reactError</code></td>
+<td><code>THUMBSUP</code> / <code>DONE</code> / <code>SAD</code></td>
+<td>各阶段表情（飞书标准 emoji_type，可自定义）</td>
+</tr>
+<tr>
+<td><code>holdImages</code></td>
+<td><code>true</code></td>
+<td>暂存飞书图片，随下一条文字一起识别</td>
+</tr>
+<tr>
+<td><code>holdHint</code></td>
+<td><code>true</code></td>
+<td>纯图片消息回「已收到 N 张图片…」提示</td>
+</tr>
+<tr>
+<td><code>maxHeldImages</code></td>
+<td><code>10</code></td>
+<td>每个聊天暂存图片上限</td>
+</tr>
+<tr>
+<td><code>maxHeldImageBytes</code></td>
+<td><code>10 MiB</code></td>
+<td>单张图片大小上限</td>
+</tr>
+<tr>
+<td><code>holdTtlMs</code></td>
+<td><code>0</code></td>
+<td>暂存过期时间（毫秒，0=不过期）</td>
+</tr>
+<tr>
+<td><code>imageDir</code></td>
+<td><code>&lt;cwd&gt;/.dsh-fschannel-images</code></td>
+<td>暂存目录（须在会话工作区内）</td>
+</tr>
+<tr>
+<td><code>hintUnbound</code></td>
+<td><code>true</code></td>
+<td>未绑定聊天回复引导提示</td>
+</tr>
+<tr>
+<td><code>hintText</code></td>
+<td>内置</td>
+<td>自定义引导文案</td>
+</tr>
+<tr>
+<td><code>bindingsFile</code></td>
+<td><code>$DSH_HOME/feishu-bindings.json</code></td>
+<td>绑定持久化路径</td>
+</tr>
+</tbody></table>
+<p>凭据解析优先级：插件配置 <code>appId/appSecret</code> &gt; 凭据服务（shell 导出的环境变量 &gt; DSH 凭据库 <code>$DSH_HOME/.credentials.yaml</code> &gt; 项目 <code>.env</code> &gt; <code>~/.dsh/.env</code>）&gt; 插件 <code>envFile</code>。<strong>推荐做法</strong>：在设置页「飞书机器人 → 连接凭据」填写 appId/appSecret，保存到凭据库（appId 仅显示掩码，secret 永不回显；<code>.env</code> 中不要再放凭据）。</p>
+<p><strong>路径配置（放 <code>.env</code>，不入库）</strong>：<code>FSCHANNEL_REPO</code>（插件仓库根目录，脚本/重启用）、<code>FSCHANNEL_ENV_FILE</code>（.env 自身路径，默认取工作目录）、<code>FSCHANNEL_BINDINGS_FILE</code>（绑定数据文件，默认 <code>$DSH_HOME/feishu-bindings.json</code>）。<code>cordis.patch.yml</code> 的 <code>envFile</code> 解析顺序：<code>FSCHANNEL_ENV_FILE</code> 环境变量（由 <code>scripts/restart-dsh.ps1</code> 从 .env 导出）→ <code>&lt;cwd&gt;/.env</code>。</p>
+<hr>
+<h2>使用方式</h2>
+<h3>绑定一个会话到飞书</h3>
+<ol>
+<li>在 Web 界面新建会话（或打开已有会话）</li>
+<li>点击会话标题旁的「连接飞书」（待绑定状态），或：<ul>
+<li>设置 → 飞书机器人 标签页：打开「新会话默认连接飞书」→ 之后每个新会话自动待绑定</li>
+<li>设置 → 飞书机器人 标签页：「新建会话并连接飞书」一键新建并待绑定</li>
+</ul>
+</li>
+<li>在飞书里私聊机器人 / 群里 @ 机器人发一条消息 → 该聊天即绑定此会话</li>
+<li>聊天消息进入会话处理：回复流式呈现，Web 与飞书互通；会话头 chip 显示已连接（点击断开）</li>
+</ol>
+<blockquote>
+<p>设置 → 飞书机器人 标签页的「绑定管理」中可管理：已绑定会话可「断开」；<strong>待绑定会话可「取消待绑定」</strong>（例如创建后未使用、不再需要的会话）。</p>
+</blockquote>
+<h3>飞书侧命令与卡片</h3>
+<table>
+<thead>
+<tr>
+<th>输入</th>
+<th>效果</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>「调整模型」「切换模型」「把 effort 调一下」等</td>
+<td>弹出<strong>按钮卡片</strong>（模型 Pro/Flash + effort off/high/max 一键切换）</td>
+</tr>
+<tr>
+<td><code>/model</code></td>
+<td>弹出同一张卡片</td>
+</tr>
+<tr>
+<td><code>/model list</code></td>
+<td>列出模型目录</td>
+</tr>
+<tr>
+<td><code>/model use &lt;provider&gt;/&lt;model&gt;</code></td>
+<td>切换模型</td>
+</tr>
+<tr>
+<td><code>/model effort &lt;off|high|max&gt;</code></td>
+<td>切换推理等级</td>
+</tr>
+<tr>
+<td><code>/status</code></td>
+<td>会话与机器人状态</td>
+</tr>
+<tr>
+<td><code>/stop</code></td>
+<td>停止当前回合</td>
+</tr>
+<tr>
+<td><code>/help</code></td>
+<td>命令清单</td>
+</tr>
+</tbody></table>
+<hr>
+<h2>注意事项</h2>
+<ul>
+<li><strong>文件修改与重启</strong>：插件源码在插件仓库（本机路径见 <code>.env</code> 的 <code>FSCHANNEL_REPO</code>），改代码后需 <code>npm run build</code>（改了客户端时）→ <code>dsh plugin --profile web add file:&lt;插件仓库路径&gt;</code>（重新复制进 store）→ 重启 <code>dsh web</code> 才生效。</li>
+<li><strong>配置启动时读取一次</strong>：改 <code>cordis.patch.yml</code> 里的配置需重启生效。</li>
+<li><strong>凭据安全</strong>：凭据保存在 <code>$DSH_HOME/.credentials.yaml</code>（0600 权限，dsh 凭据库），设置页永不回显；<code>.env</code> 只放路径配置，可安全提交（仓库 <code>.env</code> 仍被 <code>.gitignore</code> 忽略，<code>example.env</code> 可安全提交）。</li>
+<li><strong>HTTP API 仅本机回环</strong>：<code>/feishu/*</code> 只接受 127.0.0.1 访问（与 Web 同源）。</li>
+<li><strong>流式卡片依赖卡片能力</strong>：若飞书侧无卡片权限，SDK 自动回退普通消息；<code>output: 'plain'</code> 可整体关闭。</li>
+<li><strong>图片暂存识别、文件不转发</strong>：图片先暂存（<code>.dsh-fschannel-images/</code>），随下一条文字一起由 agent 通过 vision-tools 识别；其他文件类型归一化为文本提示；流式卡片只含文本与工具活动行。</li>
+<li><strong>多步回合</strong>：一个回合（含多次工具调用）在同一张流式卡片内叠加。</li>
+<li><strong>一聊天一会话</strong>：重复绑定会替换旧绑定（旧会话自动解绑）。</li>
+<li><strong>未绑定聊天</strong>：默认回引导提示语，不自动创建会话。</li>
+<li><strong>触发词匹配</strong>：模型卡片仅对「调整/切换/查看 模型|effort」等意图短语触发，正文里偶尔出现「模型」二字不会误触发。</li>
+<li><strong>表情反馈权限</strong>：消息表情依赖 <code>im:message</code> 权限（与收消息同一权限）；表情操作失败仅记日志，不影响收发。</li>
+<li><strong>最终卡片排版</strong>：回合结束时用结构化卡片替换流式卡（表格用卡片 v2 table 组件渲染）；若平台拒绝结构化卡片，自动降级为纯 markdown 卡片，最终结果始终可见。</li>
+</ul>
+<h3>与 dsh 升级的关系（更新免疫）</h3>
+<table>
+<thead>
+<tr>
+<th>层</th>
+<th>位置</th>
+<th>dsh 升级后</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>插件本体</td>
+<td>插件仓库（git 仓库，路径见 <code>.env</code> 的 <code>FSCHANNEL_REPO</code>）</td>
+<td>保留</td>
+</tr>
+<tr>
+<td>注册行</td>
+<td>包内 <code>cordis.patch.yml</code>（bundle 层，<code>dsh plugin</code> 自动 reconcile）</td>
+<td>保留</td>
+</tr>
+<tr>
+<td>绑定数据</td>
+<td><code>$DSH_HOME/feishu-bindings.json</code></td>
+<td>保留</td>
+</tr>
+</tbody></table>
+<p>无任何对 dsh 包内部文件的修改，升级后无需重打补丁。</p>
+<hr>
+<h2>开发</h2>
+<pre><code>npm test             # 门禁：lint + 构建 + 全部 10 个离线冒烟（提交前跑这个）
+npm run lint         # 仅静态检查（no-undef —— 漏写 import 只有它能拦住）
+npm run build        # esbuild 构建客户端 bundle (lib/client.js)
+npm run watch        # 监听重建
+
+# 改完代码要生效，必须重装进 profile —— dsh 是把插件**复制**进
+# ~/.dsh/profiles/web/node_modules/dsh-fschannel 的，改仓库文件本身没有任何效果。
+# 而且 pnpm 按 (路径, 版本号) 复用 store 条目，只 add 一次不会覆盖，必须 remove + add。
+# scripts/restart-dsh.ps1 已经把这一串串起来，并在启动前比对 lib/*.js 的哈希，
+# 不一致直接失败而不是打出 UP —— 手动做等价于：
+#   npm run build
+#   dsh plugin --profile web remove dsh-fschannel
+#   dsh plugin --profile web add file:&lt;插件仓库路径&gt;
+
+# 单独跑某个冒烟（npm test 会全部跑一遍）：
+node scripts/smoke-test.mjs     # 服务端冒烟（env/绑定/持久化）
+node scripts/smoke-env-example.mjs      # example.env 不得含凭据
+node scripts/smoke-locales.mjs  # zh/en 字典键与占位符对齐
+node scripts/smoke-client.mjs   # 客户端 bundle 冒烟
+node scripts/smoke-settings-render.mjs  # 设置页渲染冒烟（绑定表格 + 排版）
+node scripts/smoke-cards.mjs    # 模型卡片与触发词测试
+node scripts/smoke-render.mjs   # markdown 分段与结果卡片渲染
+node scripts/smoke-stream.mjs   # 流式卡片缓冲与失败回退
+node scripts/smoke-images.mjs   # 图片校验、暂存与提示语组装
+node scripts/smoke-repair.mjs   # 会话日志修复（feishu/image ignorable 标记 + seq 冲突）
+
+# 需要真实环境，不在 npm test 内：
+node scripts/audit-sessions.mjs # 全量审计所有会话日志的 seq 连续性（需真实 $DSH_HOME）
+node scripts/integration-test.mjs  # 集成测试（真实连接飞书 + mock apiProxy）
+</code></pre>
+<hr>
+<h2>结构</h2>
+<ul>
+<li><code>lib/index.js</code> — 宿主插件：传输、入向/出向桥接、命令通道、卡片动作、/feishu HTTP API</li>
+<li><code>lib/cards.js</code> — 模型/推理设置按钮卡片（构建、触发词、动作解析）</li>
+<li><code>lib/stream.js</code> — 流式卡片（缓冲 + 失败回退）</li>
+<li><code>lib/bindings.js</code> — 绑定存储（JSON 原子写，含会话级模型路由）</li>
+<li><code>lib/env.js</code> — .env 解析（路径配置）+ 凭据分层解析（凭据服务 &gt; envFile）</li>
+<li><code>lib/images.js</code> — 图片类型表、校验、暂存缓冲与提示语组装</li>
+<li><code>lib/render.js</code> — markdown 分段与最终结果卡片渲染</li>
+<li><code>lib/repair.js</code> — 历史会话日志修复（zstd 帧解码、外来事件、seq 冲突）</li>
+<li><code>lib/locales.js</code> — 飞书侧文案（zh/en，跟随宿主语言）</li>
+<li><code>lib/send-image-tool.js</code> — <code>send_feishu_image</code> 工具（agent 发送生成图片到绑定聊天）</li>
+<li><code>lib/send-file-tool.js</code> — <code>send_feishu_file</code> 工具（agent 发送生成文件到绑定聊天）</li>
+<li><code>src/client/index.jsx</code> → <code>lib/client.js</code> — 浏览器端：会话头 chip + 设置行</li>
+</ul>
+<hr>
+<h2>已知限制</h2>
+<ul>
+<li>流式卡片为整回合一张卡；卡片失败自动回退普通消息</li>
+<li>绑定在启动时读取一次；改配置需重启</li>
+<li>图片经 vision-tools 识别后以描述文本形式进入模型（原始字节不入模型）</li>
+<li>停机期间到达的飞书消息不会重放（传输层无 cursor）</li>
+<li>服务端 locale 是进程级全局（最后上报的那个客户端说了算）。设置页的报错不受影响——服务端返回错误码由客户端翻译——但飞书侧文案会跟随最后一个上报的浏览器语言；一个聊天没有自己的语言，这是有意的单租户取舍</li>
+<li><code>POST /feishu/repair-logs</code> 是<strong>运维专用</strong>端点：没有 UI 调用它，限流为每分钟一次，且整个修复过程是同步的，执行期间会阻塞整个 harness 进程（所有 agent、Web 服务、飞书传输）</li>
+</ul>
+<hr>
+<h2>许可证</h2>
+<p>本项目基于 <strong>MIT License</strong> 发布（见仓库根目录 <a href="https://github.com/cershuang/dsh-fschannel/blob/HEAD/LICENSE">LICENSE</a>）：</p>
+<pre><code>Copyright (c) 2026 CersHuang
+</code></pre>
+<p>允许任何修改、使用、复制、合并、发布与商用（包括闭源衍生），<strong>唯一要求</strong>：任何修改或衍生作品（含代码与文档）必须<strong>保留上述版权声明与本许可声明</strong>（开发者信息）。</p>
+<hr>
+<h2>附录：飞书机器人申请与配置（参考流程）</h2>
+<blockquote>
+<p>以下流程参照飞书自建应用的完整配置路径，含两个已知的坑（个人版建不了应用、未发布就配长连接会报错）。控制台界面可能随版本微调。</p>
+</blockquote>
+<h3>步骤 0：确认账号能建自建应用</h3>
+<ol>
+<li>浏览器打开 <a href="https://open.feishu.cn/">https://open.feishu.cn/</a> ，用你的飞书账号登录</li>
+<li>进入「开发者后台」，点「<strong>创建企业自建应用</strong>」</li>
+<li>如果被拦住（提示个人版不支持 / 没有企业）：回到飞书客户端 → 头像 → 设置 →「<strong>升级为团队</strong>」，免费创建一个只有你自己的团队，然后重来第 1 步</li>
+</ol>
+<h3>步骤 1：创建应用并拿凭证</h3>
+<ol>
+<li>创建企业自建应用，名字随便（如 dsh-bot），传个头像</li>
+<li>左侧「<strong>凭证与基础信息</strong>」→ 记下 <strong>App ID</strong>（<code>cli_</code> 开头）和 <strong>App Secret</strong>（Secret 首次不可见，点「重置」或「查看」获取完整值）</li>
+<li>保存到设置页：启动 <code>dsh web</code> 后，打开设置 →「飞书机器人」→「连接凭据」，填入 App ID 与 App Secret（保存到 DSH 凭据库，appId 仅显示掩码，secret 永不回显）。<blockquote>
+<p>历史版本曾放在 <code>.env</code>（<code>FEISHU_APP_ID=...</code> / <code>FEISHU_APP_SECRET=...</code>）；v0.1.5.1 起 <code>.env</code> 不再承担凭据，凭据一律走设置页/凭据库。</p>
+</blockquote>
+</li>
+</ol>
+<h3>步骤 2：开通权限</h3>
+<p>左侧「<strong>权限管理</strong>」→ 逐个搜索并开通以下 6 个权限：</p>
+<table>
+<thead>
+<tr>
+<th>权限标识</th>
+<th>用途</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>im:message</code></td>
+<td>接收用户发给机器人的单聊消息</td>
+</tr>
+<tr>
+<td><code>im:message:send_as_bot</code></td>
+<td>以应用身份发消息（回复、卡片）</td>
+</tr>
+<tr>
+<td><code>im:message.group_at_msg:readonly</code></td>
+<td>接收群组中 @ 机器人的消息</td>
+</tr>
+<tr>
+<td><code>im:chat</code></td>
+<td>获取群信息（绑定后显示群名）</td>
+</tr>
+<tr>
+<td><code>im:chat.members:bot_access</code></td>
+<td>获取群成员信息（单成员群免 @ 判定、绑定后显示群名）</td>
+</tr>
+<tr>
+<td><code>cardkit:card:write</code></td>
+<td>发送/更新交互卡片（流式卡片、模型设置卡片）</td>
+</tr>
+</tbody></table>
+<h3>步骤 2.5：限定可用范围（安全边界，必做）</h3>
+<p>左侧「<strong>版本管理与发布</strong>」→ 创建版本时的「<strong>可用范围</strong>」→ <strong>只勾选你自己这一个成员</strong>，不要选「全部成员」。这是防止别人拿到你会话控制权的唯一屏障。</p>
+<h3>步骤 3：开启机器人能力</h3>
+<p>左侧「<strong>应用能力</strong>」→ 添加「<strong>机器人</strong>」能力。没有这一步，私聊发消息不会触发任何事件。</p>
+<h3>步骤 4：发布应用（必须在配置长连接之前做）</h3>
+<ol>
+<li>左侧「<strong>版本管理与发布</strong>」→「创建版本」→ 填写版本号与更新说明 →「申请发布」</li>
+<li>因为你是这个团队的管理员，去管理后台自己审批通过</li>
+</ol>
+<blockquote>
+<p>⚠️ 已知的坑：<strong>没有已发布版本时，事件订阅页保存长连接配置会报「应用未建立长连接」</strong>。先发布，再配长连接。</p>
+</blockquote>
+<h3>步骤 5：配置事件订阅（长连接）</h3>
+<p>左侧「<strong>事件与回调</strong>」：</p>
+<ol>
+<li>「<strong>事件配置</strong>」→ 订阅方式选「<strong>使用长连接接收事件</strong>」—— 本插件用长连接，<strong>不需要</strong>公网回调地址</li>
+<li>记下 <strong>Encrypt Key</strong> 和 <strong>Verification Token</strong>（长连接方式一般用不到，先记下备用）</li>
+<li>「添加事件」→ 勾选 <strong><code>im.message.receive_v1</code></strong>（接收消息）</li>
+<li>「<strong>回调配置</strong>」→ 添加 <strong><code>card.action.trigger</code></strong>（卡片按钮回调，模型设置卡片点击依赖它）</li>
+<li>保存</li>
+</ol>
+<blockquote>
+<p>保存长连接配置时若报错，通常是本地桥接还没起来：先把 dsh web 跑起来（本插件随 dsh web 启动长连接），再回来保存。</p>
+</blockquote>
+<h3>验证</h3>
+<ol>
+<li>发布生效后，在飞书里<strong>搜索应用名</strong>，私聊机器人；或把机器人<strong>拉进群</strong>（群里 @ 机器人）</li>
+<li>给机器人发一条消息：未绑定聊天会回引导提示 → 说明事件订阅与权限已通</li>
+<li>回到本插件的流程绑定会话，即可收发消息</li>
+</ol>
+<h3>常见问题</h3>
+<ul>
+<li><strong>收不到消息</strong>：检查权限（步骤 2）是否已随版本发布、事件订阅方式是否选的「长连接」、是否订阅了 <code>im.message.receive_v1</code>。</li>
+<li><strong>发不出消息</strong>：确认已开通 <code>im:message:send_as_bot</code> 且版本已发布。</li>
+<li><strong>群里不响应</strong>：需 @ 机器人（<code>requireMention</code> 默认开启），并开通 <code>im:message.group_at_msg:readonly</code>。</li>
+<li><strong>卡片不显示 / 点击没反应</strong>：确认已开通 <code>cardkit:card:write</code> 并配置了 <code>card.action.trigger</code> 回调。</li>
+<li><strong>保存长连接配置报「应用未建立长连接」</strong>：先完成步骤 4（发布应用），再回来配置。</li>
+<li><strong>创建应用被拦住</strong>：按步骤 0 把个人账号升级为团队。</li>
+<li><strong>连接失败</strong>：核对 App Secret 是否完整复制（避免多余空格/换行）。</li>
+</ul>

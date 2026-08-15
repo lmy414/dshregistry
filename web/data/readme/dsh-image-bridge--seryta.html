@@ -1,0 +1,150 @@
+<h1>dsh-image-bridge — 图片理解桥接</h1>
+<p>DSH(DeepSeek Harness)插件:把用户在 Web GUI 里附加到消息中的图片,用视觉模型
+(默认智谱 GLM-4V-Flash,免费)转成文字描述后注入对话,让 DeepSeek 这类纯文本
+模型也能"看见"图片。</p>
+<h2>原理(挂载点)</h2>
+<ul>
+<li>拦截点:<code>agent/pre-step</code> 瀑布事件。它在模型请求组装前运行,返回的
+<code>PreStepDecision.messages</code> 就是进入本步的消息列表,可在进入前替换。</li>
+<li>图片数据结构:消息内容块里 <code>{ type: 'image', attachment: ImageAttachmentRef }</code>;
+图片字节由附件服务(<code>ctx.attachments.readImage</code>)按内容寻址引用取出。</li>
+<li>成功时把图片块替换为 <code>[图片描述] …</code> 文本块,文本块原样保留。</li>
+<li>图片准入:若所选模型声明 <code>inputModalities: ['text']</code>,harness 会在消息进入
+循环前拒绝图片。需要配套一个补 image 模态声明的插件(见
+<a href="https://github.com/Seryta/llm-deepseek-image-admit">llm-deepseek-image-admit</a>,
+或任何同类 provider 包装)。</li>
+</ul>
+<h2>韧性策略</h2>
+<ol>
+<li><strong>单模型重试</strong>:429/503 指数退避重试(默认 2 次:1s、2s);</li>
+<li><strong>模型回退</strong>:404、重试耗尽、其他 5xx 换下一个模型;默认免费档降级链
+<code>glm-4.6v-flash → glm-4.1v-thinking-flash → glm-4v-flash</code>;thinking 模型的
+<code>&lt;think&gt;</code> 推理块自动剥离;</li>
+<li><strong>失败降级</strong>:全部失败时图片块替换为 <code>[图片识别失败] …</code> 说明文本——本轮
+继续跑,模型如实告知用户;不放过图片块触发 <code>UNSUPPORTED_CONTENT</code> 整轮失败。</li>
+</ol>
+<h2>功能特性</h2>
+<ul>
+<li><strong>attachmentId 转译缓存</strong>(单图消息):同一张图在后续步骤不再重复识别;</li>
+<li><strong>体积/分辨率上限</strong>:超 <code>maxImageBytes</code>(默认 10MB)或 <code>maxImagePixels</code>
+(默认 40MP)直接失败说明,不送重试链;</li>
+<li><strong>tool-result 嵌套图片递归转录</strong>;</li>
+<li><strong>content parts 数组健壮性</strong>:网关返回 <code>[{text}]</code> 数组时按序拼接;</li>
+<li><strong>四点式逐字转写 prompt</strong>:逐字文字 → 版面结构 → 视觉元素 → 其他细节,
+完整优先于简洁;</li>
+<li><strong>多厂商凭证 env 名</strong>:<code>ZHIPU_API_KEY / ZHIPUAI_API_KEY / VISION_API_KEY / DASHSCOPE_API_KEY</code> 依次尝试。</li>
+</ul>
+<h2>配置</h2>
+<table>
+<thead>
+<tr>
+<th>项</th>
+<th>环境变量</th>
+<th>默认</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>模型</td>
+<td><code>IMAGE_BRIDGE_MODEL</code></td>
+<td><code>glm-4v-flash</code></td>
+<td>主模型名</td>
+</tr>
+<tr>
+<td>回退模型</td>
+<td><code>IMAGE_BRIDGE_FALLBACKS</code></td>
+<td><code>glm-4.6v-flash,glm-4.1v-thinking-flash,glm-4v-flash</code></td>
+<td>逗号分隔,依次尝试</td>
+</tr>
+<tr>
+<td>重试次数</td>
+<td><code>IMAGE_BRIDGE_RETRIES</code></td>
+<td><code>2</code></td>
+<td>单模型在 429/503 上的额外重试次数</td>
+</tr>
+<tr>
+<td>描述语言</td>
+<td><code>IMAGE_BRIDGE_LOCALE</code></td>
+<td><code>zh</code></td>
+<td><code>zh</code> 中文 / 其他英文</td>
+</tr>
+<tr>
+<td>端点</td>
+<td><code>IMAGE_BRIDGE_BASE_URL</code></td>
+<td>智谱 OpenAI 兼容端点</td>
+<td>换任意 OpenAI 兼容 VLM(配对应 key env 名)</td>
+</tr>
+<tr>
+<td>图片字节上限</td>
+<td><code>IMAGE_BRIDGE_MAX_IMAGE_BYTES</code></td>
+<td><code>10485760</code>(10MB)</td>
+<td>超限直接失败说明</td>
+</tr>
+<tr>
+<td>图片像素上限</td>
+<td><code>IMAGE_BRIDGE_MAX_IMAGE_PIXELS</code></td>
+<td><code>40000000</code>(40MP)</td>
+<td>width×height 超限直接失败说明</td>
+</tr>
+<tr>
+<td>单次请求超时</td>
+<td>—(仅 cordis config <code>attemptTimeoutMs</code>)</td>
+<td><code>30000</code> ms</td>
+<td></td>
+</tr>
+<tr>
+<td>总预算</td>
+<td>—(仅 cordis config <code>budgetMs</code>)</td>
+<td><code>75000</code> ms</td>
+<td>单条消息识别总时间上限</td>
+</tr>
+</tbody></table>
+<p>凭证读取顺序:环境变量 → <code>ctx.credentials.resolve</code> → <code>~/.dsh/.credentials.yaml</code>
+兜底解析(极简 <code>KEY: value</code> 行)。key 绝不进入日志。</p>
+<h2>安装</h2>
+<pre><code>dsh plugin --profile web add github:Seryta/dsh-image-bridge
+</code></pre>
+<p>安装后重启 <code>dsh web</code>。纯手写 JS,零构建、零第三方依赖,仅用 Node 内置模块。</p>
+<h2>验证</h2>
+<pre><code># 单元自检(无网络、不读真实凭证,12 条路径)
+node index.test.mjs
+</code></pre>
+<p>覆盖:成功替换、503 退避重试、404 回退、重试耗尽降级+notice、空响应降级、
+无图片放行、无 key 降级、单图缓存命中、体积超限、<code>&lt;think&gt;</code> 剥离、
+parts 数组拼接、tool-result 嵌套递归。</p>
+<h2>与同类插件的差异</h2>
+<table>
+<thead>
+<tr>
+<th>项目</th>
+<th>形态</th>
+<th>本插件的取舍</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><a href="https://github.com/Flyvhidbwo/dsh-vision-proxy">dsh-vision-proxy</a></td>
+<td>provider-route 包装 + 请求流内转录</td>
+<td>本插件挂 <code>agent/pre-step</code> 重写消息,不改 provider 路由;多模型统一生效</td>
+</tr>
+<tr>
+<td><a href="https://github.com/dsh-external/dsh-vision">dsh-vision</a></td>
+<td><code>view_image</code> 工具</td>
+<td>工具形态模型需主动调用;本插件自动转录、模型无感</td>
+</tr>
+<tr>
+<td><a href="https://github.com/liustack/modlens">modlens</a></td>
+<td>read_image 工具 + 模型变体 + 结构化 evidence</td>
+<td>本插件不引入模型变体与 schema 约束,零配置零构建</td>
+</tr>
+</tbody></table>
+<h2>已知限制</h2>
+<ul>
+<li>一次消息里多张图片合并为一次视觉 API 调用、一段描述;转译缓存按<strong>有序
+attachmentId 组合键</strong>命中(同组同序的图片每步不重复识别;换序视为不同
+组合、重新识别)。</li>
+<li>缓存按 attachmentId 存描述文本(上限 100,FIFO 淘汰);失败结果不缓存。</li>
+<li>图片不做压缩/缩放预处理;超限图片直接失败说明而非自动压缩。</li>
+<li>免费档 VLM 可能限流;重试/回退后仍失败走失败说明路径,对话不受影响。</li>
+</ul>
+<h2>License</h2>
+<p>MIT</p>

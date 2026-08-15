@@ -1,0 +1,65 @@
+<h1>dsh-msg-edit</h1>
+<p>消息编辑 / 重新生成插件（DeepSeek Harness Web）。</p>
+<ul>
+<li><strong>host 插件</strong>（Cordis node 侧）：<code>/api/msg-edit/*</code> 4 条 HTTP RPC<ul>
+<li><code>rewrite-message</code> — 改写单条助手回复（正文/思考），不截断后续</li>
+<li><code>edit-message</code> — 编辑用户消息，截断其后所有节点并重新生成</li>
+<li><code>regenerate</code> — 重新生成某条回复（回溯到归属的真实用户消息）</li>
+<li><code>get-message</code> — 读取助手回复当前文本（编辑预填）</li>
+</ul>
+</li>
+<li><strong>client 插件</strong>（<code>dsh.client</code> 声明式）：助手消息操作条注入「编辑这条回复」「重新生成回复」，编辑弹出行内编辑器（思考+正文），保存走 <code>rewrite-message</code>。</li>
+</ul>
+<p>纯声明式 Cordis bundle：<code>dsh.bundle.patch</code> 指向 <code>cordis.patch.yml</code>，无安装脚本、无构建步骤、无源码补丁工具。</p>
+<h2>安装</h2>
+<h3>方式 A：dsh plugin（推荐）</h3>
+<pre><code># 在 profile 目录内（$DSH_HOME/profiles/&lt;profile&gt;）
+dsh plugin --profile web add @moton16/dsh-msg-edit
+</code></pre>
+<p><code>dsh</code> 会从 npm 安装包，读到 <code>dsh.bundle.patch</code> 后自动把两行插件追加进 profile 的 patch 层。<strong>手动重启 dsh web</strong> 生效（本插件不代重启）。</p>
+<h3>方式 B：git 安装</h3>
+<pre><code>dsh plugin --profile web add github:moton16/dsh-msg-edit
+</code></pre>
+<p>仓库内已提交预构建 <code>lib/</code>（运行时 JS），无需 <code>prepare</code>/<code>postinstall</code>；若 pnpm 提示构建授权，按提示在 profile 的 <code>pnpm-workspace.yaml</code> 中 <code>allowBuilds</code> 放行本包即可（源码可信才放行）。</p>
+<h3>方式 C：手动挂载（本地开发）</h3>
+<ol>
+<li>把 <code>lib/</code> 放进 profile 依赖树（或 <code>pnpm link</code>）；</li>
+<li>在 profile 的 <code>cordis.patch.yml</code> 追加：<pre><code>- insert:
+    - id: msg-edit-host
+      name: '@moton16/dsh-msg-edit'
+    - id: ui-msg-edit
+      name: '@moton16/dsh-msg-edit/client'
+</code></pre>
+</li>
+<li>手动重启 dsh web，浏览器 Ctrl+F5。
+或直接以本仓库的 <code>cordis.yml</code> 作为 <code>--patch</code> overlay 启动：<code>dsh web --profile web --patch ./cordis.yml</code>。</li>
+</ol>
+<h2>验证</h2>
+<ul>
+<li>host：<code>POST /api/msg-edit/{get-message,rewrite-message,edit-message,regenerate}</code> 返回 HTTP 200 + <code>{ok:false,error:{code:'bad-request',...}}</code>（空参）即路由生效。</li>
+<li>client：助手消息悬停出现铅笔（编辑这条回复）与循环（重新生成回复）按钮；点击编辑弹出「思考/正文」行内编辑器。</li>
+<li>本地复验记录：<code>docs/VERIFICATION.md</code>（插件路由 4/4、UI 按钮渲染、截图证据）。</li>
+</ul>
+<h2>已知限制（如实披露，dsh.so 审核要求）</h2>
+<p>插件本体零源码修改；但「编辑/重新生成」在事件溯源日志上追加 <strong>surface-replace 副本事件</strong>，dsh <code>0.1.0-rc.6</code> 的配套组件对这类事件存在以下官方未覆盖行为，<strong>需按本机情况处理</strong>：</p>
+<ol>
+<li><strong>token-meter 重放崩溃（compact 必崩）</strong>：<code>dsh-token-meter@0.1.0-rc.6</code> 的 <code>_foldEvent</code> 对 assistant/message 事件要求配对 step/start；replace 副本（在其所属 step 结束后追加）无配对，重放抛 <code>token meter: assistant/message at seq N has no matching step/start event</code>，导致 <code>/compact</code> 失败。官方仓库（deepseek-ai/deepseek-harness）master 尚未合入对 replace 副本的重放支持。<strong>在官方修复前</strong>，安装侧需对 <code>dsh-token-meter/lib/index.js</code> 的 <code>_foldEvent</code> assistant/message 分支应用一处社区修复（识别 <code>event.surfaceOp.op === 'replace'</code> 副本：跳过 step/start 配对校验、带 usage 时按当前 surface 总量更新锚点、不带 usage 时保持锚点不变；已验证 224605 事件全量重放 CLEAN）。本包为合规不附带补丁脚本，修复文本见下方「兼容补丁」小节，由安装者自行评估应用。</li>
+<li><strong>surface 投影</strong>：编辑后 Web 渲染管线依赖一处社区 surface 投影逻辑（replace 后 surface 状态立即反映新节点）；官方渲染器对 replace 副本的即时投影缺位，未应用该投影时，编辑结果在刷新/重放后才可见。</li>
+<li><strong>agent-loop 去重</strong>：编辑/重新生成后 followup 提交与日志 tail 相同的 user/message 时，官方 agent-loop 会重复 append，可能产生一次空转 turn；社区去重逻辑（tail 同 id 跳过）可消除，非崩溃级。</li>
+<li><strong>用户消息编辑按钮</strong>：<code>conversation.chat.node</code> keyed renderer 的 user 槽被官方 ui-conversation 独占，本插件未覆盖该 renderer，因此「用户消息行内编辑」入口不在本插件范围内（host 的 <code>edit-message</code> RPC 仍可用，可由其他 UI 调用）。</li>
+</ol>
+<blockquote>
+<p>说明：限制 1 是功能正确性依赖（否则 compact 失败）；限制 2-4 为体验级。官方对应组件合入支持后，本插件无需改动即可解除。</p>
+</blockquote>
+<h2>兼容补丁（限制 1 的社区修复，供安装者评估）</h2>
+<p>文件：<code>node_modules/@deepseek-ai/dsh-token-meter/lib/index.js</code>，类 <code>TokenMeter</code> 的 <code>_foldEvent</code> 方法，<code>if (event.type === "assistant/message")</code> 分支：</p>
+<ul>
+<li>原：<code>if (stepStart === void 0 || stepStart.turn !== event.data.turn || stepStart.step !== event.data.step) throw ...</code></li>
+<li>改：先判定 <code>const replaceCopy = event.surfaceOp !== void 0 &amp;&amp; typeof event.surfaceOp === "object" &amp;&amp; event.surfaceOp.op === "replace"</code>，throw 条件加 <code>!replaceCopy &amp;&amp;</code>；</li>
+<li>锚点逻辑改三路：<code>replaceCopy &amp;&amp; usage</code> → 以 <code>usageTokens(event.data.usage)</code> 与 <code>estimateHeader(nextHeader) + surface.tokens</code> 的较大者更新锚点（surfaceTokens 取当前 surface 总量，不重算 sourceEventSeqs）；<code>!replaceCopy &amp;&amp; usage</code> → 原逻辑；<code>!replaceCopy &amp;&amp; !usage</code> → 原逻辑；<code>replaceCopy &amp;&amp; !usage</code> → 锚点不变。</li>
+</ul>
+<h2>许可 / 兼容</h2>
+<ul>
+<li>MIT；作者 @moton16。</li>
+<li>兼容 <code>@deepseek-ai/dsh-base</code> / <code>dsh-web-app</code> <code>0.1.0-rc.6</code>（peerDependencies 声明）。依赖 dsh 的 slot 系统（<code>conversation.chat.assistant-actions</code>）、<code>webServer.register</code>、<code>sessions</code>/<code>agents</code> 服务，这些在 rc.6 均稳定。</li>
+</ul>

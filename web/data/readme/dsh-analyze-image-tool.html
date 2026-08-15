@@ -1,0 +1,98 @@
+<h1>analyze-image-tool</h1>
+<p>给纯文本的 DeepSeek Harness 模型加上「眼睛」：注册一个 <code>analyze_image</code> 工具，把图片和问题转发给<strong>任意 OpenAI 兼容的视觉/多模态端点</strong>，把答案以文本返回。装上之后，即使主模型本身不支持图片输入，所有 dsh 入口（web、TUI、远程通道）也能识图。</p>
+<p>Vision bridge for text-only DeepSeek Harness models: registers an <code>analyze_image</code> tool that answers questions about images via <strong>any OpenAI-compatible vision/multimodal endpoint</strong>. No vendor is hard-coded — bring your own <code>baseURL</code> + <code>apiKey</code> + <code>model</code>.</p>
+<pre><code>用户: 看下 ~/Desktop/error.png 是什么报错
+模型 → analyze_image(path="~/Desktop/error.png", prompt="这个报错的完整文本是什么？")
+     ← "TypeError: Cannot read properties of undefined (reading 'map') at …"
+模型: 这是一个 … 建议 …
+</code></pre>
+<h2>特性</h2>
+<ul>
+<li><strong>通用端点</strong>：一套配置（<code>baseURL</code> + <code>apiKey</code> + <code>model</code>）覆盖任意 OpenAI 兼容端点 —— SiliconFlow、DashScope compatible-mode、智谱、OpenRouter、火山、Ollama 本地、OpenAI……代码里零供应商逻辑。</li>
+<li><strong>沙箱安全读取</strong>：本地图片优先走宿主提供的沙箱 fs 通道（<code>ctx.fs.readBytes</code>），遵守会话路径策略；没有该通道的宿主自动回退到 Node 原生读取。也支持 http(s) URL 和 data: URL。</li>
+<li><strong>Schema 安全</strong>：工具参数经 <code>defineTool</code> 编译为 object 根（<code>type: "object"</code>）的标准 JSON Schema，规避了社区踩过的「工具 schema 根不是 object 导致整个会话 400 崩溃」的坑（<a href="https://github.com/deepseek-ai/deepseek-harness/discussions/297">dsh 社区 #297</a>）。</li>
+<li><strong>健壮性</strong>：API key 在报错信息中自动脱敏；思考型模型的 <code>&lt;think&gt;</code> 推理块自动剥离；<code>&lt;think&gt;</code> 独占响应当作「仅推理无答案」处理并给出可操作提示。</li>
+<li><strong>结构化返回</strong>：<code>{ text, model, usage }</code>，附带端点的模型 id 与 token 用量。</li>
+<li><strong>多插件共存</strong>：工具名 <code>analyze_image</code> 与社区的 <code>view_image</code> / <code>see_image</code> / <code>vision_glance</code> 等不冲突，可与 <a href="https://github.com/deepseek-ai/deepseek-harness/discussions/733">dsh-image-bridge</a> 之类的粘贴桥接补丁搭配使用。</li>
+</ul>
+<h2>安装</h2>
+<p>要求：DeepSeek Harness（<code>dsh</code>）0.1.x，Node.js ≥ 18.17。</p>
+<pre><code>dsh plugin --profile web add github:CaseyTso/analyze_image_tool#v0.1.0
+dsh --profile web
+</code></pre>
+<p>包内 <code>package.json</code> 声明了 <code>dsh.bundle.patch</code>，安装后会自动作为 profile 层生效，无需手工编辑 <code>cordis.patch.yml</code>。</p>
+<h2>配置</h2>
+<p>在 profile 的 <code>cordis.patch.yml</code> 里针对插件 id 配置（或在设置界面/环境变量配置）：</p>
+<pre><code>- id: analyze-image-tool
+  config:
+    baseURL: https://api.siliconflow.cn/v1     # 任意 OpenAI 兼容端点
+    apiKey: ''                                  # 可留空，走下方解析链
+    model: Qwen/Qwen3-VL-32B-Instruct           # 端点上的视觉/多模态模型 id
+    maxTokens: 2048
+    timeoutMs: 60000
+    maxImageBytes: 10485760
+</code></pre>
+<h3>端点示例（都是同一套配置，任选）</h3>
+<table>
+<thead>
+<tr>
+<th>场景</th>
+<th>baseURL</th>
+<th>model 示例</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>SiliconFlow（默认）</td>
+<td><code>https://api.siliconflow.cn/v1</code></td>
+<td><code>Qwen/Qwen3-VL-32B-Instruct</code></td>
+<td>需 key，视觉能力强</td>
+</tr>
+<tr>
+<td>阿里百炼 DashScope</td>
+<td><code>https://dashscope.aliyuncs.com/compatible-mode/v1</code></td>
+<td><code>qwen3-vl-flash</code></td>
+<td>兼容模式，性价比高</td>
+</tr>
+<tr>
+<td>智谱</td>
+<td><code>https://open.bigmodel.cn/api/paas/v4</code></td>
+<td><code>glm-4.6v-flash</code></td>
+<td>有免费档</td>
+</tr>
+<tr>
+<td>OpenRouter</td>
+<td><code>https://openrouter.ai/api/v1</code></td>
+<td><code>google/gemini-2.5-flash</code></td>
+<td>多模型聚合</td>
+</tr>
+<tr>
+<td>Ollama 本地</td>
+<td><code>http://localhost:11434/v1</code></td>
+<td><code>qwen3-vl:4b</code></td>
+<td>无需 key，完全离线</td>
+</tr>
+</tbody></table>
+<h3>API key 解析链（按顺序）</h3>
+<ol>
+<li>插件配置 <code>apiKey</code></li>
+<li>环境变量 <code>VISION_API_KEY</code>，其次 <code>SILICONFLOW_API_KEY</code>（可写入 <code>~/.dsh/.env</code> 或导出）</li>
+<li>dsh 凭据通道（<code>VISION_API_KEY</code>，其次 <code>SILICONFLOW_API_KEY</code>）</li>
+<li>本地端点（localhost）无需 key</li>
+</ol>
+<h2>工具说明</h2>
+<p>模型面对图片相关任务时调用 <code>analyze_image</code>：</p>
+<ul>
+<li><code>path</code>（必填）：图片的绝对本地路径、http(s) URL 或 data: URL（支持 PNG/JPEG/WebP/GIF/BMP/TIFF/HEIC，默认上限 10MB）。</li>
+<li><code>prompt</code>（可选）：具体问题，如「逐字提取图中文字」「数一下有几个按钮」「描述布局」。默认是包含全部可见文字的详细描述。</li>
+</ul>
+<h2>开发</h2>
+<pre><code>npm test        # node --test，无外部依赖（fetch 为 mock）
+</code></pre>
+<h2>安全说明</h2>
+<ul>
+<li>每次调用向<strong>你配置的端点</strong>发起一次 HTTPS 请求，图片内容会以 base64 发给该端点；不要发送你不愿交给该提供方处理的敏感图片。</li>
+<li>插件不写文件、不收集数据、不代管凭据；报错信息中 API key 一律以 <code>***</code> 脱敏。</li>
+</ul>
+<h2>许可</h2>
+<p>MIT，作者为 analyze-image-tool 贡献者。</p>

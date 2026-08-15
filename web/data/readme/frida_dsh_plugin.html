@@ -1,0 +1,341 @@
+<h1>frida-dsh-plugin</h1>
+<p>将 <a href="https://frida.re/">Frida</a> 作为一组受策略约束的工具接入 <a href="https://github.com/deepseek-ai/deepseek-harness">DeepSeek Harness</a>。安装后，大模型可以发现已配置设备、枚举进程或应用、附加或拉起目标、加载 Frida Agent、调用 RPC、读取异步消息，并在会话结束时自动释放资源。</p>
+<p>本插件只应用于你拥有或已明确获准测试的设备和程序。</p>
+<h2>设计概览</h2>
+<pre><code>flowchart LR
+  M["DeepSeek Harness Agent"] --&gt; T["9 个 Frida tools"]
+  T --&gt; P["能力档位与审批策略"]
+  P --&gt; R["FridaRuntime"]
+  R --&gt; O["Agent 资源归属与限额"]
+  R --&gt; E["有界事件缓冲"]
+  R --&gt; N["官方 frida-node"]
+  N --&gt; D["local / USB / remote device"]
+</code></pre>
+<p>关键约束：</p>
+<ul>
+<li>模型只看到部署方配置的设备别名，不能自行提交远程地址或认证信息。</li>
+<li>Session 和 Script 使用不透明句柄，并绑定到创建它们的 Agent；其他 Agent 无法复用。</li>
+<li>默认 <code>discovery</code> 档只允许发现设备、进程和应用，不允许注入。</li>
+<li>注入操作默认进入 Harness 审批链；无审批服务时，<code>ask</code> 会失败关闭。</li>
+<li>脚本消息使用游标式环形缓冲；二进制、事件 JSON 和 RPC JSON 均有字节上限。</li>
+<li>Agent 销毁、插件热替换或 Harness 退出时会清理 Script、Session 和未恢复的暂停进程。</li>
+</ul>
+<h2>环境要求</h2>
+<ul>
+<li>Node.js 20 或更高版本。</li>
+<li>DeepSeek Harness <code>0.1.0-rc.6</code> 兼容版本。</li>
+<li>与目标端兼容的 Frida 环境。Android USB 场景通常需要目标设备上运行版本匹配的 <code>frida-server</code>；其他部署也可以使用 Frida Gadget 或远程 Frida 服务。</li>
+</ul>
+<p>默认后端是当前 Node 进程中的 <code>frida-node</code>。如果设备端必须保留旧版 Frida，而旧版 <code>frida-node</code> 不支持宿主 Node 版本，可以选择 <code>backend: python</code>，让插件通过一个持久、可取消的 JSON-lines worker 复用版本匹配的 Python 虚拟环境；模型工具和安全策略保持不变。</p>
+<p>先确认宿主机能够正常使用 Frida 连接目标设备，再让 Harness 接管调用。插件不会替你绕过设备授权、代码签名、越狱、root 或系统调试限制。</p>
+<h2>构建与安装</h2>
+<p>在本仓库中执行：</p>
+<pre><code>npm install
+npm run build
+npm test
+dsh plugin --profile demo add .
+dsh --profile demo --dump-config
+dsh --profile demo
+</code></pre>
+<p>组合包安装后会插入三行：<code>frida-runtime</code>、<code>frida-tools</code> 和 <code>frida-policy</code>。默认配置是只读的 <code>discovery</code> 档。</p>
+<p>Harness 的后置 patch 会按 <code>id</code> 覆盖前面的行，并整体替换该行的 <code>config</code>。要开启注入能力，请把下列某个示例加入目标 profile 的 <code>cordis.patch.yml</code>；仓库中的 <a href="https://github.com/mang0cola/frida_dsh_plugin/blob/HEAD/examples"><code>examples</code></a> 目录也提供了可复制版本。</p>
+<h2>能力档位</h2>
+<table>
+<thead>
+<tr>
+<th>档位</th>
+<th>发现设备/目标</th>
+<th>Attach</th>
+<th>内置模板</th>
+<th>原始 JS</th>
+<th>Spawn/Resume/Kill</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>discovery</code></td>
+<td>是</td>
+<td>否</td>
+<td>否</td>
+<td>否</td>
+<td>否</td>
+</tr>
+<tr>
+<td><code>templates</code></td>
+<td>是</td>
+<td>是</td>
+<td>是</td>
+<td>否</td>
+<td>否</td>
+</tr>
+<tr>
+<td><code>full</code></td>
+<td>是</td>
+<td>是</td>
+<td>是</td>
+<td>是</td>
+<td>是；Kill 还需 <code>allowKill: true</code></td>
+</tr>
+</tbody></table>
+<h3>仅发现设备与目标（默认）</h3>
+<pre><code>- id: frida-runtime
+  config:
+    backend: node
+    pythonExecutable: python3
+    capabilityProfile: discovery
+    approvalMode: ask
+    devices:
+      - alias: local
+        kind: local
+      - alias: usb
+        kind: usb
+        timeoutMs: 5000
+    defaultDevice: usb
+    targetAllowlist: []
+    allowKill: false
+    operationTimeoutMs: 30000
+    maxSessions: 8
+    maxScriptsPerSession: 8
+    maxScriptBytes: 262144
+    eventBufferSize: 1000
+    maxEventDataBytes: 65536
+</code></pre>
+<h3>只允许审计过的模板</h3>
+<pre><code>- id: frida-runtime
+  config:
+    backend: node
+    pythonExecutable: python3
+    capabilityProfile: templates
+    approvalMode: ask
+    devices:
+      - alias: usb
+        kind: usb
+        timeoutMs: 10000
+    defaultDevice: usb
+    targetAllowlist:
+      - 'com.example.*'
+      - 'Example App'
+    allowKill: false
+    operationTimeoutMs: 30000
+    maxSessions: 4
+    maxScriptsPerSession: 4
+    maxScriptBytes: 262144
+    eventBufferSize: 1000
+    maxEventDataBytes: 65536
+</code></pre>
+<h3>完整能力与远程设备</h3>
+<p>认证令牌只从宿主进程环境变量读取，不写入 Harness 配置或模型上下文：</p>
+<pre><code>- id: frida-runtime
+  config:
+    backend: node
+    pythonExecutable: python3
+    capabilityProfile: full
+    approvalMode: ask
+    devices:
+      - alias: lab-android
+        kind: remote
+        address: '10.20.0.15:27042'
+        tokenEnv: FRIDA_LAB_TOKEN
+        keepaliveInterval: 30
+    defaultDevice: lab-android
+    targetAllowlist:
+      - 'com.example.app'
+    allowKill: false
+    operationTimeoutMs: 30000
+    maxSessions: 4
+    maxScriptsPerSession: 4
+    maxScriptBytes: 262144
+    eventBufferSize: 1000
+    maxEventDataBytes: 65536
+</code></pre>
+<p>设备项支持：</p>
+<table>
+<thead>
+<tr>
+<th>字段</th>
+<th>含义</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>alias</code></td>
+<td>暴露给模型的稳定名称，必须唯一</td>
+</tr>
+<tr>
+<td><code>kind</code></td>
+<td><code>local</code>、<code>usb</code>、<code>remote</code> 或 <code>id</code></td>
+</tr>
+<tr>
+<td><code>id</code></td>
+<td><code>id</code> 设备必填；USB 多设备时也可指定</td>
+</tr>
+<tr>
+<td><code>address</code></td>
+<td><code>remote</code> 设备必填，由部署方固定</td>
+</tr>
+<tr>
+<td><code>tokenEnv</code></td>
+<td>包含远程认证令牌的环境变量名</td>
+</tr>
+<tr>
+<td><code>certificate</code> / <code>origin</code></td>
+<td>Frida 远程连接参数</td>
+</tr>
+<tr>
+<td><code>keepaliveInterval</code></td>
+<td>远程连接保活间隔</td>
+</tr>
+<tr>
+<td><code>timeoutMs</code></td>
+<td>发现该设备时的等待上限</td>
+</tr>
+</tbody></table>
+<p><code>targetAllowlist</code> 使用区分大小写的 <code>*</code> 通配符，匹配运行进程名或 Spawn 的程序/应用标识。空数组表示不额外限制目标；生产环境开启 <code>templates</code> 或 <code>full</code> 时建议显式列出目标。</p>
+<p><code>approvalMode</code> 的含义：</p>
+<ul>
+<li><code>ask</code>：Attach、加载脚本、RPC、Spawn 和进程控制进入 Harness 审批流程。</li>
+<li><code>allow</code>：策略层直接放行档位内的操作，适合隔离且已有外部授权控制的自动化环境。</li>
+<li><code>deny</code>：保留发现工具，但拒绝所有注入和控制操作。</li>
+</ul>
+<h3>使用已有 Frida Python 虚拟环境</h3>
+<p>下面的配置适用于设备端 Frida 16.0.2、宿主 Node 版本无法加载同版本 <code>frida-node</code> 的场景：</p>
+<pre><code>- id: frida-runtime
+  config:
+    backend: python
+    pythonExecutable: '/absolute/path/to/frida-16/bin/python'
+    capabilityProfile: templates
+    approvalMode: ask
+    devices:
+      - alias: usb16
+        kind: usb
+        timeoutMs: 30000
+    defaultDevice: usb16
+    targetAllowlist:
+      - 'com.example.*'
+    allowKill: false
+    operationTimeoutMs: 30000
+    maxSessions: 4
+    maxScriptsPerSession: 4
+    maxScriptBytes: 262144
+    eventBufferSize: 1000
+    maxEventDataBytes: 65536
+</code></pre>
+<p><code>pythonExecutable</code> 是部署方信任边界内的本机可执行文件路径，不会暴露为模型参数。该 Python 环境必须已经安装与设备端兼容的 <code>frida</code> 包。</p>
+<h2>模型工具</h2>
+<table>
+<thead>
+<tr>
+<th>工具</th>
+<th>用途</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>frida_list_devices</code></td>
+<td>返回配置过的设备别名及可用状态</td>
+</tr>
+<tr>
+<td><code>frida_enumerate</code></td>
+<td>分页枚举进程或应用</td>
+</tr>
+<tr>
+<td><code>frida_attach</code></td>
+<td>按 PID 或精确进程名附加，返回 <code>sessionId</code></td>
+</tr>
+<tr>
+<td><code>frida_spawn</code></td>
+<td>暂停启动并立即附加，返回 <code>sessionId</code></td>
+</tr>
+<tr>
+<td><code>frida_load_script</code></td>
+<td>加载内置模板或原始 JavaScript，返回 <code>scriptId</code></td>
+</tr>
+<tr>
+<td><code>frida_call_rpc</code></td>
+<td>调用脚本的 <code>rpc.exports</code> 方法</td>
+</tr>
+<tr>
+<td><code>frida_read_events</code></td>
+<td>用游标读取 <code>send()</code>、错误和 console 日志</td>
+</tr>
+<tr>
+<td><code>frida_process_control</code></td>
+<td>恢复插件 Spawn 的暂停进程，或在允许时终止它</td>
+</tr>
+<tr>
+<td><code>frida_close</code></td>
+<td>卸载 Script 或关闭 Session</td>
+</tr>
+</tbody></table>
+<p>典型 Attach 流程：</p>
+<ol>
+<li><code>frida_list_devices</code></li>
+<li><code>frida_enumerate</code></li>
+<li><code>frida_attach</code></li>
+<li><code>frida_load_script</code></li>
+<li><code>frida_call_rpc</code> 和/或 <code>frida_read_events</code></li>
+<li><code>frida_close</code></li>
+</ol>
+<p>典型 Spawn 流程是 <code>frida_spawn</code> → <code>frida_load_script</code> → <code>frida_process_control(action: resume)</code>。如果在 Resume 前关闭 Session 或 Agent 被销毁，插件会尽力终止它创建的暂停进程，避免设备上遗留挂起目标。</p>
+<h2>内置模板</h2>
+<table>
+<thead>
+<tr>
+<th>模板</th>
+<th><code>templateArgs</code></th>
+<th>RPC</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>enumerate-modules</code></td>
+<td>无</td>
+<td><code>run(offset?, limit?)</code></td>
+</tr>
+<tr>
+<td><code>enumerate-exports</code></td>
+<td><code>{ "moduleName": "..." }</code></td>
+<td><code>run(offset?, limit?)</code></td>
+</tr>
+<tr>
+<td><code>java-classes</code></td>
+<td>无</td>
+<td><code>run(offset?, limit?)</code></td>
+</tr>
+<tr>
+<td><code>objc-classes</code></td>
+<td>无</td>
+<td><code>run(offset?, limit?)</code></td>
+</tr>
+<tr>
+<td><code>hook-native-export</code></td>
+<td><code>{ "moduleName": "...", "exportName": "..." }</code></td>
+<td>通过事件返回 enter/leave</td>
+</tr>
+</tbody></table>
+<p>例如，枚举目标模块时依次调用：</p>
+<pre><code>{"sessionId":"frida-session-1","template":"enumerate-modules"}
+</code></pre>
+<p>然后：</p>
+<pre><code>{"scriptId":"frida-script-1","exportName":"run","args":[0,3]}
+</code></pre>
+<p>上述四个枚举模板返回 <code>{ items, total, offset, limit, truncated }</code>；<code>limit</code> 默认为 100，最大为 500。模型可以直接读取总数并按游标分页，不需要借助 Shell 处理大型 RPC 结果。</p>
+<p><code>frida_load_script</code> 返回的 <code>nextCursor</code> 是模板加载完成后的游标。读取后续 hook 消息时把它传给 <code>frida_read_events</code>，并在下一次读取时继续使用新返回的 <code>nextCursor</code>。若缓冲区发生覆盖，<code>droppedCount</code> 会明确报告丢失数量。</p>
+<h2>开发命令</h2>
+<pre><code>npm run typecheck
+npm test
+npm run build
+npm pack --dry-run
+</code></pre>
+<p>对已经运行的授权测试目标执行 Python 后端端到端冒烟测试：</p>
+<pre><code>FRIDA_PYTHON=/absolute/path/to/frida-16/bin/python \
+FRIDA_TARGET=com.example.app \
+npm run test:device
+</code></pre>
+<p>该命令只 Attach 已运行目标，不负责启动或终止应用；它会完成设备/应用/进程枚举、原始脚本 RPC、事件回读、内置模块模板分页和 Session 清理。</p>
+<p>测试中的 Runtime 使用 provider-neutral 假设备，因此不要求连接真实手机。真实部署仍应在授权测试设备上完成一次端到端验证，包括 Frida 主机端/目标端版本、Attach 权限、目标名称 allowlist 和 Harness 审批交互。</p>
+<h2>当前边界</h2>
+<ul>
+<li>原始 Agent 只接受 JavaScript；插件暂不负责 TypeScript 编译或 Frida Compiler 工程构建。</li>
+<li>句柄和事件缓冲只存在于当前 Harness 进程，不跨重启恢复。</li>
+<li>插件提供结构化工具，不模拟交互式 <code>frida</code> REPL。</li>
+<li>高风险能力没有内置 Stalker、内存任意读写等模板；在 <code>full</code> 档中可通过经过审批的原始脚本显式实现。</li>
+</ul>
+<h2>License</h2>
+<p><a href="https://github.com/mang0cola/frida_dsh_plugin/blob/HEAD/LICENSE">MIT</a></p>

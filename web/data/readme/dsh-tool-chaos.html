@@ -1,0 +1,258 @@
+<h1>dsh-tool-chaos</h1>
+<p><strong>English</strong> · <a href="https://github.com/cyanseek/dsh-tool-chaos/blob/HEAD/README.zh-CN.md">简体中文</a></p>
+<p><a href="https://github.com/cyanseek/dsh-tool-chaos/actions/workflows/ci.yml"><img src="https://github.com/cyanseek/dsh-tool-chaos/actions/workflows/ci.yml/badge.svg" alt="CI"></a></p>
+<blockquote>
+<p>Deterministic fault injection and evidence-backed resilience tests for the DeepSeek Harness tool pipeline.</p>
+</blockquote>
+<p><code>dsh-tool-chaos</code> runs an isolated DSH experiment through <strong>baseline → dry-run → fault injection → PASS / FAIL / INCONCLUSIVE</strong>. It helps plugin and Agent authors verify retry, fallback, cancellation, policy-denial, and untrusted-result behavior before those paths fail unexpectedly.</p>
+<p>Status: <strong><code>0.1.0-next.0</code> prerelease</strong>. DSH is still in developer preview, so pin versions and review the <a href="https://github.com/cyanseek/dsh-tool-chaos/blob/HEAD/docs/COMPATIBILITY.md">tested compatibility matrix</a>.</p>
+<h2>Highlights</h2>
+<ul>
+<li>Five DSH-native actions: <code>deny</code>, <code>error</code>, <code>delay</code>, <code>abort</code>, and <code>block</code>.</li>
+<li>Reproducible matching and sampling; no runtime randomness.</li>
+<li>Disabled and dry-run by default, with bounded injections and explicit global-wildcard opt-in.</li>
+<li>JSON and Markdown reports with structured decision events and a three-state verdict.</li>
+<li>Native Cordis plugin, zero-runtime-dependency CLI, TypeScript engine API, and Codex/Agent Skill surfaces.</li>
+</ul>
+<h2>Quick start</h2>
+<p>The npm prerelease has not been published yet. The currently available path is a source checkout and a locally built tarball:</p>
+<pre><code>git clone https://github.com/cyanseek/dsh-tool-chaos.git
+cd dsh-tool-chaos
+npm ci
+npm run build
+npm pack --silent
+
+dsh plugin --profile chaos-demo add ./dsh-tool-chaos-0.1.0-next.0.tgz
+dsh --profile chaos-demo --dump-config
+</code></pre>
+<p>The effective config should contain <code>tool-chaos</code> and <code>tool-chaos-reporter</code>. Both are inert after installation: the main plugin is disabled and the reporter is disabled.</p>
+<p>Generate a complete dry-run overlay:</p>
+<pre><code>node bin/dsh-tool-chaos.mjs init .dsh-chaos/retry.patch.yml --preset retry
+</code></pre>
+<p>Review the generated tool matcher, task, and assertion, then run it against the disposable profile:</p>
+<pre><code>node bin/dsh-tool-chaos.mjs run \
+  --mode dry-run \
+  --profile chaos-demo \
+  --patch .dsh-chaos/retry.patch.yml \
+  --task "Use web_fetch and recover from one transient failure" \
+  --expect "expected stable phrase" \
+  --no-install \
+  --json
+</code></pre>
+<p>A dry-run must show the intended <code>dryRun: true</code> decision while leaving tool execution unchanged. Run a real experiment only after that match is exact.</p>
+<h2>Install from a pinned GitHub commit</h2>
+<p>DSH can install this repository directly:</p>
+<pre><code>dsh plugin --profile chaos-demo add \
+  github:cyanseek/dsh-tool-chaos#&lt;commit-sha&gt;
+</code></pre>
+<p>pnpm 10+ can intentionally block a Git dependency's <code>prepare</code> script. If it does, review the pinned source and copy the <strong>exact package key printed by pnpm</strong> into that profile's <code>pnpm-workspace.yaml</code>:</p>
+<pre><code>allowBuilds:
+  dsh-tool-chaos@https://codeload.github.com/cyanseek/dsh-tool-chaos/tar.gz/&lt;commit-sha&gt;: true
+</code></pre>
+<p>Rerun the install and verify the effective config. This approval allows package code to execute during installation; a reviewed tarball remains the simpler option.</p>
+<p>To uninstall and verify removal:</p>
+<pre><code>dsh plugin --profile chaos-demo remove dsh-tool-chaos
+dsh --profile chaos-demo --dump-config
+</code></pre>
+<h2>Configuration</h2>
+<p>Installed defaults cannot inject a fault:</p>
+<pre><code>- id: tool-chaos
+  config:
+    enabled: false
+    dryRun: true
+    seed: dsh-tool-chaos
+    allowGlobalWildcard: false
+    rules: []
+</code></pre>
+<p>A bounded preview rule looks like this:</p>
+<pre><code>- id: tool-chaos
+  config:
+    enabled: true
+    dryRun: true
+    seed: retry-suite-v1
+    allowGlobalWildcard: false
+    rules:
+      - id: first-github-error
+        tool: github_*
+        action: error
+        scope: root
+        argumentsPattern: ''
+        probability: 1
+        afterMatches: 0
+        every: 1
+        maxInjections: 1
+        delayMs: 1000
+        message: deterministic GitHub transport failure
+</code></pre>
+<p><code>tool</code> is an anchored, case-sensitive glob. <code>argumentsPattern</code> runs against stable key-sorted JSON. DSH patch rows replace a row's complete <code>config</code>, so every overlay must restate all keys it relies on.</p>
+<h2>Fault actions</h2>
+<table>
+<thead>
+<tr>
+<th>Action</th>
+<th>DSH pipeline phase</th>
+<th>Behavior</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>deny</code></td>
+<td><code>tools/pre-execute</code></td>
+<td>Reject before dispatch</td>
+</tr>
+<tr>
+<td><code>error</code></td>
+<td><code>tools/execute</code></td>
+<td>Return a structured injected error without running the tool body</td>
+</tr>
+<tr>
+<td><code>delay</code></td>
+<td><code>tools/execute</code></td>
+<td>Add abort-aware latency</td>
+</tr>
+<tr>
+<td><code>abort</code></td>
+<td><code>tools/execute</code></td>
+<td>Abort a derived signal and restore the upstream signal</td>
+</tr>
+<tr>
+<td><code>block</code></td>
+<td><code>tools/post-execute</code></td>
+<td>Run the tool, then withhold its result</td>
+</tr>
+</tbody></table>
+<p>Each decision emits <code>tool-chaos/decision</code>. The optional reporter converts it to a stable stderr JSONL boundary prefixed with <code>DSH_TOOL_CHAOS_EVENT </code>.</p>
+<h2>Evidence and verdicts</h2>
+<p>The CLI writes a JSON source-of-truth report and a Markdown summary. Reports include configuration hashes, bounded process metadata, parsed chaos decisions, assertions, verdict, and a reproduction command. Raw command output is excluded unless explicitly requested.</p>
+<table>
+<thead>
+<tr>
+<th>Verdict</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>PASS</code></td>
+<td>The intended fault occurred and the declared recovery behavior is supported by evidence</td>
+</tr>
+<tr>
+<td><code>FAIL</code></td>
+<td>The intended fault occurred and at least one recovery assertion failed</td>
+</tr>
+<tr>
+<td><code>INCONCLUSIVE</code></td>
+<td>Baseline, installation, matching, safety, or observation evidence is incomplete</td>
+</tr>
+</tbody></table>
+<p>Exit code alone is never sufficient evidence of resilience.</p>
+<h2>CLI</h2>
+<pre><code>dsh-tool-chaos doctor [--profile name] [--json]
+dsh-tool-chaos setup [--profile name] [--source npm-or-path] [--codex] [--json]
+dsh-tool-chaos init [path] [--preset retry|timeout|nested|result-block|deny] [--force]
+dsh-tool-chaos run --patch file --task prompt [--mode baseline|dry-run|experiment]
+                   [--expect regex] [--profile name] [--json]
+dsh-tool-chaos install-plugin [--profile name] [--source npm-or-path] [--json]
+dsh-tool-chaos install-skill [--global | --project path]
+dsh-tool-chaos install-codex-plugin [--dir path] [--json]
+dsh-tool-chaos verify [--json]
+dsh-tool-chaos prompt [--lang en|zh] &lt;requirement...&gt;
+dsh-tool-chaos codex [--cwd path] [--json] &lt;requirement...&gt;
+</code></pre>
+<p>Automation should consume <code>--json</code> instead of scraping human-readable output.</p>
+<h2>Codex and Agent Skill</h2>
+<p>The repository contains a Codex marketplace plugin and an open Agent Skill. Install the Codex plugin from a checkout:</p>
+<pre><code>codex plugin marketplace add /absolute/path/to/dsh-tool-chaos
+codex plugin add dsh-tool-chaos@dsh-tool-chaos
+</code></pre>
+<p>Start a new thread and invoke:</p>
+<pre><code>$dsh-chaos-test Prove the retry path survives one deterministic GitHub tool error.
+</code></pre>
+<p>See <a href="https://github.com/cyanseek/dsh-tool-chaos/blob/HEAD/docs/CODEX.md">Codex integration</a> for the source-checkout workflow. <code>npx dsh-tool-chaos ...</code> commands become available only after the npm prerelease is published.</p>
+<h2>Programmatic engine</h2>
+<p>The <code>dsh-tool-chaos/engine</code> export has no Cordis or DSH runtime import:</p>
+<pre><code>import { ChaosEngine, resolveConfig } from 'dsh-tool-chaos/engine'
+
+const engine = new ChaosEngine(resolveConfig({
+  enabled: true,
+  dryRun: false,
+  seed: 'ci-retry-v1',
+  rules: [{
+    id: 'first-web-error',
+    tool: 'web_fetch',
+    action: 'error',
+    maxInjections: 1,
+  }],
+}))
+
+const decision = engine.decide('execute', {
+  callId: 'call-1',
+  rootCallId: 'call-1',
+  name: 'web_fetch',
+  arguments: { url: 'https://example.test' },
+})
+</code></pre>
+<p>See <a href="https://github.com/cyanseek/dsh-tool-chaos/blob/HEAD/examples/engine-api.mjs">the engine example</a>.</p>
+<h2>Safety boundaries</h2>
+<ul>
+<li>Use disposable profiles and synthetic or read-only test inputs.</li>
+<li>Keep <code>dryRun: true</code> until the exact intended match is visible.</li>
+<li>Exact global <code>*</code> requires <code>allowGlobalWildcard: true</code>.</li>
+<li>Every rule injects at most once by default.</li>
+<li>The runtime plugin does not rewrite arguments, read files, or access the network.</li>
+<li><code>abort</code> is cooperative; a same-process tool that ignores <code>AbortSignal</code> cannot be hard-killed.</li>
+<li>Never represent skipped or unobservable checks as success.</li>
+</ul>
+<p>Production/shared profiles, external mutations, credentials, broad targeting, or privilege changes require separate safeguards and explicit authorization.</p>
+<h2>Compatibility</h2>
+<table>
+<thead>
+<tr>
+<th>Surface</th>
+<th>Verified state</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>Tests</td>
+<td>Strict TypeScript compile and 32 unit/CLI/real-runtime tests pass</td>
+</tr>
+<tr>
+<td>Node</td>
+<td>24.11.1 locally; GitHub CI passes on 22.19.0 and 24.x</td>
+</tr>
+<tr>
+<td>DSH</td>
+<td><code>@deepseek-ai/dsh-tools@0.1.0-rc.6</code> runtime integration passes</td>
+</tr>
+<tr>
+<td>Tarball consumer</td>
+<td>Install, repeated add, config dump, and read-only headless dry-run preview pass</td>
+</tr>
+<tr>
+<td>GitHub source</td>
+<td>Pinned commit install, repeated install, config dump, uninstall, and reinstall pass with pnpm 11.7.0</td>
+</tr>
+<tr>
+<td>npm</td>
+<td>Not published; no npm availability claim is made</td>
+</tr>
+</tbody></table>
+<p>Evidence was collected on August 14, 2026 with isolated profiles and synthetic read-only input. See <a href="https://github.com/cyanseek/dsh-tool-chaos/blob/HEAD/docs/COMPATIBILITY.md">Compatibility</a> for the precise matrix and limitations.</p>
+<h2>Documentation</h2>
+<ul>
+<li><a href="https://github.com/cyanseek/dsh-tool-chaos/blob/HEAD/docs/CLI.md">CLI and machine API</a></li>
+<li><a href="https://github.com/cyanseek/dsh-tool-chaos/blob/HEAD/docs/REPORT-SCHEMA.md">Report schema</a></li>
+<li><a href="https://github.com/cyanseek/dsh-tool-chaos/blob/HEAD/docs/ARCHITECTURE.md">Architecture</a></li>
+<li><a href="https://github.com/cyanseek/dsh-tool-chaos/blob/HEAD/docs/CODEX.md">Codex integration</a></li>
+<li><a href="https://github.com/cyanseek/dsh-tool-chaos/blob/HEAD/docs/COMPATIBILITY.md">Compatibility</a></li>
+<li><a href="https://github.com/cyanseek/dsh-tool-chaos/blob/HEAD/CONTRIBUTING.md">Contributing</a></li>
+<li><a href="https://github.com/cyanseek/dsh-tool-chaos/blob/HEAD/SECURITY.md">Security</a></li>
+<li><a href="https://github.com/cyanseek/dsh-tool-chaos/blob/HEAD/SUPPORT.md">Support</a></li>
+<li><a href="https://github.com/cyanseek/dsh-tool-chaos/blob/HEAD/CHANGELOG.md">Changelog</a></li>
+</ul>
+<h2>Development</h2>
+<pre><code>npm ci
+npm run sync:skill
+npm run check
+</code></pre>
+<p>Compatibility claims must be backed by the exact environment and command that passed.</p>
+<h2>License</h2>
+<p><a href="https://github.com/cyanseek/dsh-tool-chaos/blob/HEAD/LICENSE">MIT</a></p>

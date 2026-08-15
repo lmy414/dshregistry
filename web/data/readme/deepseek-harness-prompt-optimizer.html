@@ -1,0 +1,101 @@
+<h1>DeepSeek Harness Prompt Optimizer</h1>
+<p>An installable DeepSeek Harness profile bundle that uses an auxiliary LLM call to improve prompts. The Web UI adds a sparkle button beside Send, and the host plugin can also optimize direct user messages on the cooperative <code>agent/pre-step</code> waterfall. It does not patch the agent loop.</p>
+<p><a href="https://github.com/lizhecome/deepseek-harness-prompt-optimizer/blob/HEAD/README.zh.md">中文说明</a></p>
+<h2>Install</h2>
+<p>Requires DeepSeek Harness <code>0.1.0-rc.6</code> or later.</p>
+<pre><code>gh repo clone lizhecome/deepseek-harness-prompt-optimizer
+cd deepseek-harness-prompt-optimizer
+dsh plugin --profile web add --ignore-workspace-root-check .
+</code></pre>
+<p>Use <code>headless</code> instead of <code>web</code> to enable automatic optimization for one-shot tasks. The composer button is available only in the <code>web</code> profile. DeepSeek Harness anchors <code>add .</code> to the invoking checkout before pnpm switches to the profile directory. The package manifest declares a <code>dsh.bundle</code> patch and a Web client entry, so installation mounts the host optimizer, invariant companion, and composer control automatically.</p>
+<p>To remove it:</p>
+<pre><code>dsh plugin --profile web remove --ignore-workspace-root-check @lizhecome/dsh-prompt-optimizer
+</code></pre>
+<h2>Behavior</h2>
+<h3>Composer button</h3>
+<p>The Web UI contributes a sparkle button to <code>conversation.input.right</code>, immediately before the normal send control. It is disabled while the draft is blank or the composer is busy. Clicking it runs one auxiliary request and replaces the unsent draft with the rewritten text.</p>
+<p>The button compares both the draft revision and exact text before applying the response. If the user edits while optimization is running, the response is not applied and the current draft is preserved. Transport, routing, and model failures also preserve the draft and place the failure in the button's accessible status and tooltip.</p>
+<p>The host exposes the same operation as <code>/optimize-prompt &lt;prompt&gt;</code>. The button marks its successful result for a one-time exact-match bypass: sending that unchanged result does not trigger a second automatic optimization. Editing the result removes that match, so the normal automatic policy applies when it is sent.</p>
+<h3>Automatic optimization</h3>
+<p>The listener delegates first, then inspects the final <code>PreStepDecision</code>. It optimizes only direct-user messages whose blocks are all text and whose trimmed length reaches <code>minChars</code>. Plugin context, tool results, goal rounds, relays, images, and short prompts pass through unchanged.</p>
+<p>The default <code>append</code> delivery preserves the original user message and adds the optimized text as a separately sourced <code>notice</code>. Both messages are recorded as <code>user/message</code> events before the main request, so replay and the model see the same content. <code>replace</code> keeps the original message identity and source but records and sends only the optimized text.</p>
+<p>The optimizer route resolves in this order:</p>
+<ol>
+<li>configured <code>provider</code> and <code>model</code>;</li>
+<li>the session's last routed request;</li>
+<li>the agent's explicit provider/model options.</li>
+</ol>
+<p>If none is available, optimization fails. With the default <code>pass-through</code> policy, the plugin logs a warning and preserves the original prompt. <code>fail</code> rejects the proposed step instead. Turn cancellation is always propagated.</p>
+<h2>Configuration</h2>
+<p>Later profile patches replace a row's complete <code>config</code>, so restate every field you want to keep:</p>
+<pre><code>- id: prompt-optimizer
+  config:
+    provider: deepseek
+    model: deepseek-chat
+    maxTokens: 1024
+    minChars: 20
+    delivery: append
+    failureMode: pass-through
+    instruction: &gt;-
+      Rewrite the prompt for precise execution. Preserve every constraint and
+      return only the rewritten prompt; do not solve the task.
+</code></pre>
+<table>
+<thead>
+<tr>
+<th>Field</th>
+<th align="right">Default</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>provider</code></td>
+<td align="right"><code>''</code></td>
+<td>Auxiliary provider. Set together with <code>model</code>; empty follows the agent route.</td>
+</tr>
+<tr>
+<td><code>model</code></td>
+<td align="right"><code>''</code></td>
+<td>Auxiliary model. Set together with <code>provider</code>; empty follows the agent route.</td>
+</tr>
+<tr>
+<td><code>maxTokens</code></td>
+<td align="right"><code>1024</code></td>
+<td>Positive integer output cap for the optimizer call. A capped response is rejected as incomplete.</td>
+</tr>
+<tr>
+<td><code>minChars</code></td>
+<td align="right"><code>20</code></td>
+<td>Non-negative trimmed character threshold for optimization.</td>
+</tr>
+<tr>
+<td><code>delivery</code></td>
+<td align="right"><code>append</code></td>
+<td><code>append</code> preserves the original and adds a sourced notice; <code>replace</code> substitutes its text.</td>
+</tr>
+<tr>
+<td><code>failureMode</code></td>
+<td align="right"><code>pass-through</code></td>
+<td>Preserve the original after a runtime error, or <code>fail</code> the proposed step.</td>
+</tr>
+<tr>
+<td><code>instruction</code></td>
+<td align="right">built in</td>
+<td>System instruction for the auxiliary call; a blank value is rejected at load.</td>
+</tr>
+</tbody></table>
+<p><code>provider</code> and <code>model</code> are an atomic pair. A half-configured route, non-integer bound, or blank instruction fails at plugin load.</p>
+<h2>Model and cost effects</h2>
+<p>Every prompt eligible for automatic optimization adds one independent model request. A button click also adds one request, but sending its unchanged result consumes the one-time bypass and does not add another optimizer request. If the result is edited before sending, normal automatic eligibility applies. Each optimizer input is the draft or direct user message plus the optimizer system instruction, and its output is bounded by <code>maxTokens</code>. <code>append</code> makes an automatically optimized main request longer because it contains both versions; <code>replace</code> avoids that duplication but does not retain the original prompt in durable history. Auxiliary requests reuse the session id for routing but do not reuse the main conversation prefix.</p>
+<p>The built-in instruction tells the optimizer to preserve language, facts, identifiers, quoted text, constraints, and requested output format; remove ambiguity and redundancy; avoid inventing requirements; and return only a rewritten prompt.</p>
+<h2>Known limitations</h2>
+<ul>
+<li>Multimodal and mixed-block direct-user messages pass through unchanged.</li>
+<li>Prompt optimization is semantic model output, so it can still distort intent; use <code>append</code> when auditability matters.</li>
+<li>The auxiliary model exchange is not stored as a separate model event. Button results are stored in the durable command lifecycle, while automatically delivered output is stored in the main turn.</li>
+</ul>
+<h2>Development</h2>
+<pre><code>pnpm install
+pnpm run check
+</code></pre>
+<p>The tests boot the published Harness services and a real agent loop with a deterministic in-process LLM adapter. They verify durable append/replace behavior, failure fallback, short-prompt bypass, command execution, one-time deduplication, listener disposal, DOM replacement, and concurrent-edit protection.</p>

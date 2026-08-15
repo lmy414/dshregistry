@@ -1,0 +1,54 @@
+<h1>dsh-vision —— 给纯文本模型自动配眼</h1>
+<p>让 DeepSeek-V4 这类纯文本模型在 dsh 里"看到"图片:图片消息自动桥接为视觉模型生成的文字描述,原图保留在人类转录中。零新增凭据 —— 视觉模型复用 profile 已配置的 <code>llm-pi-ai</code> 路由(默认 <code>opencode-go / minimax-m3</code>,与主模型同一把 key)。</p>
+<h2>原理(全部基于 dsh 官方机制,零 hack)</h2>
+<ol>
+<li>拦截 <code>llm/stream</code> waterfall:请求含 image 块且目标模型未声明 image 输入时触发;</li>
+<li>用视觉模型把图片转为文字描述;</li>
+<li>把描述作为一条 <code>user/message</code> surface-replace 事件 append 进会话日志(与 compaction 压缩历史同款机制)——<strong>只对模型可见,人类转录保留原图</strong>;</li>
+<li>本次请求用同一份描述改写后放行,首轮即成功;</li>
+<li>替换事件落库后,后续每轮历史投影天然给出稳定文本:网关前缀缓存与普通文本会话完全等价(历史全命中,仅新消息 miss)。</li>
+</ol>
+<h2>安装</h2>
+<pre><code># 1. 接线到 profile(把本地目录作为 link 依赖加入 bundle,依赖自动 reconcile 进层栈)
+dsh plugin --profile web add link:D:/dsh-plugins/dsh-vision
+
+# 2. 重启 dsh web 后验证挂载
+dsh --profile web --dump-config | Select-String dsh-vision
+</code></pre>
+<h2>配置(官方 settings 通道,热生效)</h2>
+<p><strong>界面方式</strong>:设置 → 插件 → 额外插件 → 可配置插件 → 展开 <strong>dsh-vision</strong> 卡片:</p>
+<ul>
+<li><strong>视觉模型下拉</strong>:自动枚举当前所有 provider 中声明 <code>[text, image]</code> 输入的模型(按提供方分组);</li>
+<li>高级字段:输出上限、模式(auto/manual/both)、超时。</li>
+</ul>
+<p>保存后写入 <code>settings.yaml</code> 的 <code>dsh-vision</code> 分节(与 <code>llm-pi-ai</code> 同款官方通道),下一次识图立即生效。</p>
+<p><strong>文件方式</strong>(组合层默认值,见 bundle 自带 <code>cordis.patch.yml</code>):</p>
+<pre><code>- insert:
+    - id: dsh-vision
+      name: dsh-vision
+      config:
+        provider: opencode-go   # 视觉模型路由(复用已配置的 key)
+        model: minimax-m3       # 快(~3s)且便宜;可选 kimi-k2.7-code / qwen3.6-plus / kimi-k3 / qwen3.7-plus / mimo-v2.5 / grok-4.5
+        maxTokens: 4096         # 描述输出上限
+        mode: both              # auto=仅自动桥 | manual=仅 see_image 工具 | both=两者
+        timeoutMs: 60000        # 视觉调用超时
+</code></pre>
+<blockquote>
+<p>配置解析顺序:patch 的 <code>config</code>(组合层 base)→ <code>settings.yaml</code> 用户层,后者优先;字段级覆盖,热生效。
+说明:官方"插件配置"标签页只服务 dsh 仓库内白名单命名空间(apiproxy),第三方插件的配置 UI 由 uiopt 的"额外插件"卡片承载,数据通道仍是官方 settings seam。</p>
+</blockquote>
+<h2>行为说明</h2>
+<ul>
+<li><strong>自动桥</strong>:图片出现在纯文本模型的请求中时自动转换,无需模型或用户做任何事;</li>
+<li><strong>原生看图优先</strong>:当前模型自身支持 image(如 <code>kimi-k3</code>)时插件完全不干预;</li>
+<li><strong><code>see_image</code> 工具</strong>:手动/追问入口,<code>file_path</code> + 可选 <code>question</code>;</li>
+<li><strong>缓存</strong>:描述固化在日志,历史前缀缓存与文本会话等价;新图首次出现按未命中价计费一次(与发送新消息相同);</li>
+<li><strong>失败语义</strong>:视觉调用失败时本次请求仍成功(图片位置为"解析失败"占位),且不固化,下次自动重试;</li>
+<li><strong>成本</strong>:视觉调用不进入会话 usage 统计(绕过 agent loop 记录路径),缓存命中后趋零;图片描述通常几百 token,按视觉模型单价计。</li>
+</ul>
+<h2>限制</h2>
+<ul>
+<li>依赖 dsh 预览版 API(<code>llm/stream</code> waterfall、surface replace、<code>foldSurface</code>),rc 升级若改签名需同步更新;</li>
+<li>图片位于历史中部首次出现时,该轮从图片处起前缀缓存失效一次,之后恢复(前缀缓存固有特性);</li>
+<li>视觉模型必须真实支持图片输入,配置错误会导致占位文本(不会死循环)。</li>
+</ul>

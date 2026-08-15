@@ -1,0 +1,130 @@
+<h1>dsh-mcp-proxy</h1>
+<p>Context-cheap MCP access for <a href="https://github.com/deepseek-ai/deepseek-harness">DeepSeek Harness</a>.</p>
+<p>The shipped <code>dsh-mcp-client</code> registers <strong>every</strong> tool of <strong>every</strong> configured server on <code>ctx.tools</code>, so a handful of MCP servers puts hundreds of JSON schemas into the system prompt of every request — whether or not the model ever calls one.</p>
+<p>This plugin registers exactly <strong>two</strong> tools regardless of how many servers you configure, and reaches those servers lazily. The standing prompt cost is constant in the number of MCP tools available.</p>
+<h2>Install</h2>
+<pre><code>dsh plugin --profile web add dsh-mcp-proxy
+</code></pre>
+<p>Then declare your servers by overriding the row (the shipped row has none — see <a href="#trust">Trust</a>).</p>
+<h2>What the model sees</h2>
+<table>
+<thead>
+<tr>
+<th>Tool</th>
+<th>Purpose</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>mcp_discover</code></td>
+<td>Search the tool catalog by keyword; returns each hit's server, name, description, and argument names</td>
+</tr>
+<tr>
+<td><code>mcp_call</code></td>
+<td>Invoke one tool by server and name, passing arguments through unchanged</td>
+</tr>
+</tbody></table>
+<p>The catalog is cached on disk, so <code>mcp_discover</code> answers from a <strong>cold start without connecting to anything</strong>, and keeps answering when a server is temporarily down.</p>
+<h2>How it behaves</h2>
+<ul>
+<li><strong>Nothing connects at boot.</strong> A server is contacted on first discovery or first call.</li>
+<li><strong>A warm connection is reused</strong> across calls and closed after <code>idleDisconnectMs</code> of silence. Concurrent calls share one handshake.</li>
+<li><strong>One unreachable server degrades discovery instead of failing it</strong>: the model gets the servers that answered, plus a named reason for each that did not.</li>
+<li><strong>A tool-reported failure is a successful result</strong> carrying <code>isError: true</code>, so a Code Mode caller branches on the flag rather than parsing prose. Only transport and protocol failures are tool errors.</li>
+<li><strong>Catalog entries for servers you removed are pruned</strong> at load, so a renamed server stops advertising tools nothing can call.</li>
+<li><strong>A corrupt cache file starts empty</strong> rather than stopping the harness from booting — it is a derived cache, not a source of truth.</li>
+<li>Disposal closes every connection and clears every timer.</li>
+</ul>
+<h2>Configuration</h2>
+<pre><code>- id: mcp-proxy
+  name: dsh-mcp-proxy
+  config:
+    cachePath: !!js dshHomePath('mcp-proxy/catalog.json')
+    catalogTtlMs: 86400000
+    idleDisconnectMs: 300000
+    connectTimeoutMs: 30000
+    callTimeoutMs: 60000
+    discoverLimitDefault: 15
+    discoverLimitMax: 50
+    servers:
+      - name: github
+        transport: stdio
+        command: npx
+        args: ['-y', '@modelcontextprotocol/server-github']
+        env:
+          GITHUB_TOKEN: !!js process.env.GITHUB_TOKEN
+
+      - name: internal
+        transport: streamable-http
+        url: http://localhost:3000/mcp
+        headers:
+          Authorization: !!js `Bearer ${process.env.MCP_TOKEN}`
+</code></pre>
+<table>
+<thead>
+<tr>
+<th>Field</th>
+<th>Default</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>servers</code></td>
+<td><code>[]</code></td>
+<td>The servers this deployment can reach. Names are <code>[A-Za-z0-9_-]{1,32}</code> and must be unique</td>
+</tr>
+<tr>
+<td><code>cachePath</code></td>
+<td>— (required)</td>
+<td>JSON file caching each server's tool list</td>
+</tr>
+<tr>
+<td><code>catalogTtlMs</code></td>
+<td><code>86400000</code> (1 day)</td>
+<td>Age at which a cached catalog is refetched on the next discovery</td>
+</tr>
+<tr>
+<td><code>idleDisconnectMs</code></td>
+<td><code>300000</code> (5 min)</td>
+<td>Idle period after which a warm connection closes</td>
+</tr>
+<tr>
+<td><code>connectTimeoutMs</code></td>
+<td><code>30000</code></td>
+<td>Bound on one MCP handshake</td>
+</tr>
+<tr>
+<td><code>callTimeoutMs</code></td>
+<td><code>60000</code></td>
+<td>Bound on one <code>callTool</code> request</td>
+</tr>
+<tr>
+<td><code>discoverLimitDefault</code></td>
+<td><code>15</code></td>
+<td>Hits returned when the model omits <code>limit</code></td>
+</tr>
+<tr>
+<td><code>discoverLimitMax</code></td>
+<td><code>50</code></td>
+<td>Hard cap, whatever the model asks for</td>
+</tr>
+</tbody></table>
+<h2>Trust</h2>
+<p><code>servers</code> ships <strong>empty on purpose</strong>. Every MCP server command is trusted executable code running <strong>outside the agent sandbox</strong>, so no package may enable one on a user's behalf. The shipped harness makes the same choice for <code>dsh-mcp-client</code>.</p>
+<p>This plugin adds no approval gate of its own. Gate <code>mcp_call</code> the way you gate any other tool — a <code>tools/pre-execute</code> listener, <code>ctx.tools.guard()</code>, or the permission presets — so the policy stays in one place instead of forking per transport.</p>
+<h2>Running alongside dsh-mcp-client</h2>
+<p>Supported, and often the right setup: promote the two or three servers whose tools you want <strong>natively visible</strong> (so the model calls them without a discovery round trip) to <code>dsh-mcp-client</code> rows, and leave the long tail behind this proxy. Tool names do not collide — <code>dsh-mcp-client</code> registers <code>mcp__&lt;server&gt;__&lt;tool&gt;</code>, this plugin registers only <code>mcp_discover</code> and <code>mcp_call</code>.</p>
+<h2>Trade-off</h2>
+<p>A proxy costs the model one extra round trip when it does not already know the tool name, and hides the tool's full JSON schema behind argument names. That is the deliberate exchange: constant prompt cost, at the price of discovery latency on first use. If you have one MCP server with four tools, <code>dsh-mcp-client</code> is the better fit.</p>
+<h2>Alternative worth knowing</h2>
+<p>The harness's own idiom for progressive disclosure is <code>ctx.tools.restrict()</code>, which masks a registered tool set per agent. That path keeps full schemas for the visible subset but still requires connecting at boot to enumerate. This plugin chooses the proxy shape instead so that <strong>nothing connects until the model asks</strong> — the property that matters when a deployment configures a dozen servers it rarely uses.</p>
+<h2>Development</h2>
+<pre><code>pnpm install --ignore-workspace
+pnpm run typecheck
+pnpm test
+pnpm run build
+</code></pre>
+<p>The suite runs against a real MCP stdio server (<code>tests/fixture-server.mjs</code>) over the real SDK transport, so it covers handshakes, listing, calling, tool-level failures, unreachable servers, and catalog persistence without depending on any third-party server.</p>
+<h2>License</h2>
+<p>MIT</p>
+<h2>Prior art</h2>
+<p>The context-saving proxy idea comes from <a href="https://github.com/nicobailon/pi-mcp-adapter">pi-mcp-adapter</a> (MIT) in the Pi ecosystem. This is an independent implementation against Harness extension points and shares no code with it; it covers the lazy-connection and proxy-tool core, not pi-mcp-adapter's OAuth flows, tool promotion, or <code>/mcp</code> configuration panel.</p>

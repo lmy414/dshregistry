@@ -1,0 +1,137 @@
+<h1>dsh-code-check</h1>
+<p>DeepSeek Harness(DSH)的自动类型检查诊断插件。</p>
+<p>模型编辑或创建代码文件后,本插件在后台(按项目、防抖)自动运行
+<code>tsc --noEmit</code>,并通过 <code>code_check</code> 工具汇报哪里改坏了——按文件分组,带
+行列号、严重级别和 TS 错误码。模型看到报告后可以自己修复,形成
+"改 → 查 → 修"闭环。Claude Code 有官方 LSP 插件,pi 有 pi-lens,现在 DSH
+也有了 dsh-code-check。</p>
+<h2>特性</h2>
+<ul>
+<li>监听 harness 的 <code>fs/observed</code> 变更事件(与内置 skill 文件系统同一条缝),零核心改动。</li>
+<li>800ms 防抖,连续编辑合并为每个项目一次检查。</li>
+<li>按被编辑文件向上找最近的 <code>tsconfig.json</code>,只检查对应项目;<code>node_modules</code> 内部的文件不会被依赖自带的 <code>tsconfig.json</code> 劫持。</li>
+<li>直接以 <code>node typescript/bin/tsc</code> 方式启动:不经过 shell / npx / <code>.cmd</code>,Windows 与 POSIX 行为完全一致;命令行固定 <code>--pretty false</code>,解析器同时兼容 ANSI 颜色码与 <code>--pretty</code> 的 <code>file:line:col - error TSxxxx</code> 格式。</li>
+<li><code>code_check</code> 工具返回缓存报告,传 <code>run: true</code> 强制重跑,支持按路径过滤(按路径段精确匹配,<code>bad.ts</code> 不会误匹配 <code>bad.tsx</code>;自动规范化 <code>./</code> 前缀与尾部斜杠)。首次调用时会扫描调用方工作区找 <code>tsconfig.json</code>,没编辑过也能用。</li>
+<li>优雅降级:没有 <code>tsconfig.json</code> 或本地没装 TypeScript 时给出明确提示,而不是崩溃;tsconfig 配置错误(如 <code>include: []</code>、<code>files</code> 指向缺失文件)会标注为 <code>tsconfig/global error</code>,与运行环境故障区分开。</li>
+<li>全部配置项可通过 <code>settings.yaml</code> / profile patch 层调整。</li>
+</ul>
+<h2>安装</h2>
+<pre><code>dsh plugin --profile web add "github:a179-sanae/dsh-code-check#main"
+</code></pre>
+<p>安装后重启 <code>dsh web</code>。工具会自动出现在模型的工具集里,结果以普通工具
+卡片渲染在 Web UI 中——不需要任何 UI 改动。</p>
+<h3>安装注意事项</h3>
+<ul>
+<li><code>@deepseek-ai/*</code> 运行时包(<code>cordis</code>、<code>schemastery</code>、<code>dsh-tools</code>、
+<code>dsh-llm</code>)是 <strong>peer 依赖</strong>:由 DSH 宿主提供。<strong>不要把它们手动装进
+profile</strong>——profile 里出现第二份 <code>dsh-tools</code> 会让宿主的工具调度器解析到
+错误实例,所有工具调用都会报 <code>Cannot read properties of undefined (reading 'prepare')</code>(已在 rc.6 实测,属宿主 loader 解析问题)。</li>
+<li>若插件加载报 <code>Cannot find package '@deepseek-ai/...'</code>,说明 profile 安装
+没解析到宿主包:检查 profile 的 <code>pnpm-workspace.yaml</code>,并在
+<code>pnpm install --force</code> 后重新执行 <code>dsh plugin --profile web add "github:a179-sanae/dsh-code-check#main"</code>。</li>
+</ul>
+<h2>用法</h2>
+<p>让模型正常改代码即可:后台检查会自动调度,随时可以让模型:</p>
+<ul>
+<li>直接说 <em>"run code_check"</em> 查看当前诊断</li>
+<li>或模型在编辑后自行调用 <code>code_check</code></li>
+</ul>
+<p>首次使用:项目通过文件编辑事件(<code>fs/observed</code>)习得;还没编辑过时,带
+<code>run: true</code> 的 <code>code_check</code> 会先扫描调用方工作区找 <code>tsconfig.json</code>,按需检查。</p>
+<p>示例报告:</p>
+<pre><code>Type check report — 2 diagnostics (checked at 21:30:04)
+  src/app.ts:12:5  error TS2345  Argument of type 'string' is not assignable to parameter of type 'number'
+  src/app.ts:40:1  error TS2304  Cannot find name 'foo'
+Tip: fix the errors, then call code_check again to verify.
+</code></pre>
+<h2>配置</h2>
+<p>全部可选,默认值如下:</p>
+<table>
+<thead>
+<tr>
+<th>Key</th>
+<th>默认值</th>
+<th>含义</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>enabled</code></td>
+<td><code>true</code></td>
+<td>后台监听总开关。</td>
+</tr>
+<tr>
+<td><code>debounceMs</code></td>
+<td><code>800</code></td>
+<td>最后一次编辑后的防抖窗口(毫秒)。</td>
+</tr>
+<tr>
+<td><code>triggerTools</code></td>
+<td><code>['edit', 'write']</code></td>
+<td>触发检查的工具 actor 名单。</td>
+</tr>
+<tr>
+<td><code>includeExtensions</code></td>
+<td><code>['.ts', '.tsx', '.mts', '.cts']</code></td>
+<td>触发检查的文件扩展名。</td>
+</tr>
+<tr>
+<td><code>maxDiagnostics</code></td>
+<td><code>120</code></td>
+<td>单份报告最多展示的诊断数。</td>
+</tr>
+<tr>
+<td><code>tscTimeoutMs</code></td>
+<td><code>60000</code></td>
+<td>单次 tsc 超时。</td>
+</tr>
+<tr>
+<td><code>extraArgs</code></td>
+<td><code>['--incremental']</code></td>
+<td><code>tsc --noEmit -p &lt;tsconfig&gt;</code> 之后的附加参数。</td>
+</tr>
+<tr>
+<td><code>cacheCap</code></td>
+<td><code>200</code></td>
+<td>缓存项目上限(最久未检查的先淘汰)。</td>
+</tr>
+</tbody></table>
+<p>通过 profile patch 层覆盖,例如:</p>
+<pre><code># $DSH_HOME/profiles/web/cordis.patch.yml
+- id: code-check
+  config:
+    debounceMs: 1500
+    maxDiagnostics: 200
+</code></pre>
+<p>覆盖 patch 是平铺的 loader 条目(<code>- id:</code> + <code>config:</code>),不是 <code>- update:</code> 嵌套
+写法——后者会被 loader 静默跳过,配置不生效(实测确认)。id-targeted 覆盖会
+整体替换 <code>config</code>,想保留的字段必须一并写上。</p>
+<h2>工作原理</h2>
+<ol>
+<li><code>apply</code> 订阅 <code>fs/observed</code>(见 <code>src/runtime.ts</code>)。</li>
+<li><code>edit</code>/<code>write</code> 工具对配置扩展名的文件产生变更后,为最近的含
+<code>tsconfig.json</code> 项目调度一次防抖检查。</li>
+<li><code>runTypeCheck</code> 用项目本地 <code>typescript/bin/tsc</code> 启动 Node(见
+<code>src/diagnostics.ts</code>),把 <code>path(line,col): error TSxxxx: message</code> 行(自动
+剥离 ANSI 颜色,兼容 <code>--pretty</code> 的 <code>path:line:col - error TSxxxx</code> 格式)解析
+成结构化诊断,并按项目根缓存。</li>
+<li><code>code_check</code> 工具读缓存(或强制重跑)并格式化报告;结果走标准工具结果
+管线,在 Web UI 里显示为普通卡片。</li>
+</ol>
+<h2>开发</h2>
+<pre><code>pnpm install
+pnpm run typecheck   # src + tests 严格类型检查
+pnpm test            # vitest:引擎 + 基于 tests/fixtures/ts-project 的真实 tsc 测试
+pnpm run build
+pnpm run verify:self-contained
+</code></pre>
+<p>仓库自包含(遵循官方 plugin-template 契约):构建、测试、发布都不需要宿主
+源码检出。</p>
+<h2>路线图</h2>
+<ul>
+<li>接入真实 LSP(tsserver via <code>vscode-languageserver-protocol</code>),流式增量诊断。</li>
+<li>ESLint / 其他语言路由(pyright、<code>cargo check</code>、gopls)。</li>
+<li>自定义 Web UI 诊断卡片(文件级徽标)。</li>
+<li>检查失败时向下一个模型回合注入紧凑提示。</li>
+</ul>
+<h2>许可证</h2>
+<p>MIT</p>

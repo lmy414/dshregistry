@@ -1,0 +1,160 @@
+<h1>dsh-sitemap</h1>
+<blockquote>
+<p>DeepSeek Harness（DSH）站点地图插件 · 把 Yakit 的站点地图交互搬进 DSH</p>
+</blockquote>
+<p>在 DSH 侧边栏一键打开「站点地图」：按主机树形组织工作区侦察到的接口，支持搜索、接口详情（方法 / 参数 / 出现次数）、一键复制 curl，数据实时同步。</p>
+<hr>
+<h2>设计来源</h2>
+<p>Yakit 里的「站点地图」我觉得做得很好，就借鉴了它的交互：把发现的所有接口按主机自动归类，形成一棵可展开、可搜索的树：</p>
+<pre><code>hosts
+└── account.example.com
+    └── /user/webrest/v1/login.do
+    └── /user/webrest/v1/initData.do
+</code></pre>
+<p>做资产梳理和接口测试时，这棵树比零散的请求记录直观得多。本插件把同样的体验带到 DeepSeek Harness：不用另开工具，在 DSH 侧边栏点一下「🗺 站点地图」，应用内直接弹出树形接口地图。</p>
+<h2>特性</h2>
+<ul>
+<li>🗺 <strong>侧边栏入口</strong>：点击「站点地图」打开应用内全屏地图（中 / 英双语）</li>
+<li>🌲 <strong>主机树</strong>：主机 → 接口路径两级树，可折叠、显示统计</li>
+<li>🔍 <strong>实时搜索</strong>：按主机名 / 接口路径过滤</li>
+<li>📋 <strong>接口详情</strong>：方法、参数、出现次数；一键复制 curl、新窗口打开</li>
+<li>⚡ <strong>数据实时同步</strong>：每次打开 / 刷新都从宿主路由读取最新数据，无缓存</li>
+</ul>
+<h2>使用方法</h2>
+<ol>
+<li>把插件放入 DSH 插件目录并重启（见「安装」）</li>
+<li>侧边栏底部点击「🗺 站点地图」打开地图</li>
+<li>弹窗打开时会自动从宿主路由拉取最新数据；点「刷新」可随时重新拉取</li>
+</ol>
+<p><strong>数据从哪来？</strong> 插件只负责展示，不负责扫描——数据源是工作区里的 <code>sitemap_data.json</code>（格式见下节），由你自己的侦察工作流生成，例如 JS / 接口挖掘脚本把结果按主机汇总成该格式即可。</p>
+<p><strong>什么时候触发？</strong> 按钮在插件加载后常驻侧边栏；每次打开弹窗或点「刷新」才触发一次数据拉取（无缓存，拿最新内容）。文件不存在时弹窗显示错误 / 空状态；文件更新后重新打开或点「刷新」即见新数据，无需重启 DSH。</p>
+<h2>实现原理</h2>
+<h3>整体架构：双半区</h3>
+<p>DSH 插件分两个半区运行，本插件亦是如此：</p>
+<table>
+<thead>
+<tr>
+<th>半区</th>
+<th>文件</th>
+<th>运行环境</th>
+<th>职责</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>宿主半区</td>
+<td><code>src/index.ts</code></td>
+<td>Node 侧（cordis 插件）</td>
+<td>注册 webServer 路由，读取工作区数据文件</td>
+</tr>
+<tr>
+<td>浏览器半区</td>
+<td><code>src/client/index.tsx</code></td>
+<td>浏览器侧（React）</td>
+<td>侧边栏入口 + 树形地图弹窗，fetch 拉取数据</td>
+</tr>
+</tbody></table>
+<h3>宿主半区：只做数据中转</h3>
+<p>宿主半区是一个 cordis 插件，通过 <code>ctx.inject(['webServer'])</code> 拿到宿主 webServer 能力后注册两条路由：</p>
+<ul>
+<li><code>GET /dsh-sitemap/data</code> → 读取 <code>&lt;workspace&gt;/&lt;dataDir&gt;/sitemap_data.json</code>，以 JSON 信封 <code>{ ok, data }</code> 返回；文件不存在时返回 404</li>
+<li><code>POST /dsh-sitemap/regen</code> → 同样重新读取并返回（预留"重新生成后取数"的语义）</li>
+</ul>
+<p>文件访问被<strong>严格限制在工作区数据目录内</strong>（<code>join(workspace, dataDir)</code>），不触碰工作区其他文件。</p>
+<h3>浏览器半区：零文件权限</h3>
+<p>浏览器半区不读文件系统，数据全部经宿主路由中转：</p>
+<ol>
+<li>通过 <code>ctx.locale.register()</code> 注册 <code>sitemap</code> 命名空间的 <code>zh</code> / <code>en</code> 两套文案</li>
+<li>通过 <code>ctx.slots.inject('sidebar.footer.action', ...)</code> 向侧边栏底部动作槽注入「站点地图」按钮（<code>order: 40</code>，位于设置按钮旁）</li>
+<li>点击后打开全屏弹窗：左侧按主机渲染可折叠树，右侧渲染选中接口的详情</li>
+<li>弹窗加载 / 点「刷新」时 <code>fetch('/dsh-sitemap/data', { cache: 'no-store' })</code> 拉取最新数据</li>
+</ol>
+<h3>数据流</h3>
+<pre><code>flowchart LR
+    A["sitemap_data.json&lt;br/&gt;（工作区 dataDir 目录）"] --&gt; B["宿主半区&lt;br/&gt;webServer 路由&lt;br/&gt;/dsh-sitemap/data"]
+    B --&gt;|"GET · no-store"| C["浏览器半区&lt;br/&gt;fetch"]
+    C --&gt; D["树形地图弹窗"]
+    D --&gt;|"刷新 / 重新打开"| C
+</code></pre>
+<h3>构建与分发</h3>
+<ul>
+<li><code>scripts/build.mjs</code> 用 esbuild 打两套产物：<ul>
+<li><code>lib/index.js</code>：宿主 ESM 包，<code>@deepseek-ai/cordis</code> 设为 external（宿主提供）</li>
+<li><code>lib/client.js</code>：浏览器包，用 <code>window.__ModuleLoader__.load({ id, factory })</code> 包装成 DSH 模块加载器格式；<code>@deepseek-ai/*</code> 与 <code>react</code> 全部 external</li>
+</ul>
+</li>
+<li><code>package.json</code> 声明 <code>dsh.bundle.patch</code>（<code>cordis.patch.yml</code>），宿主半区以 bundle patch 挂载，符合社区装法规范</li>
+<li><code>dsh.plugin.json</code> 声明宿主内置插件清单（id / version / client 注入依赖），<code>lib/</code> 产物随仓库提交，clone 即用</li>
+</ul>
+<h2>数据格式</h2>
+<p>数据文件默认位于工作区根目录下（<code>&lt;workspace&gt;/sitemap_data.json</code>，也可用 <code>dataDir</code> 配置子目录），结构为「主机 → 接口路径 → 元信息」：</p>
+<pre><code>{
+  "api.example.com": {
+    "endpoints": {
+      "/v1/login": { "methods": ["POST"], "count": 3, "params": ["account", "password"] },
+      "/v1/user/profile": { "methods": ["GET"], "count": 1 }
+    }
+  }
+}
+</code></pre>
+<p>可运行示例见 <a href="https://github.com/deCOLE118/dsh-sitemap/blob/HEAD/examples/sample-data.json"><code>examples/sample-data.json</code></a>。示例使用占位域名，<strong>仓库内不包含任何真实站点数据</strong>。</p>
+<h2>安装</h2>
+<ol>
+<li><p>将本仓库复制到 DSH 的插件目录：</p>
+<pre><code>git clone https://github.com/deCOLE118/dsh-sitemap.git &lt;DSH插件目录&gt;/dsh-sitemap
+</code></pre>
+</li>
+<li><p><code>lib/</code> 构建产物已随仓库提交，可直接使用；如需重新构建：</p>
+<pre><code>npm install
+npm run build
+</code></pre>
+</li>
+<li><p>重启 DSH，侧边栏底部即可看到「🗺 站点地图」入口。</p>
+</li>
+</ol>
+<p>本插件是标准的 <strong>bundle 类型</strong>插件：<code>package.json</code> 声明了 <code>dsh.bundle.patch</code>（<code>cordis.patch.yml</code>），社区安装器（如 find-plugins）可直接识别装法并挂载宿主半区。</p>
+<h2>配置</h2>
+<p>插件接受以下配置（宿主加载插件时传入）：</p>
+<table>
+<thead>
+<tr>
+<th>配置项</th>
+<th>类型</th>
+<th>默认值</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>workspace</code></td>
+<td><code>string</code></td>
+<td><code>$DSH_WORKSPACE</code> 或当前工作目录</td>
+<td>工作区根目录（绝对路径）</td>
+</tr>
+<tr>
+<td><code>dataDir</code></td>
+<td><code>string</code></td>
+<td>工作区根目录</td>
+<td>存放 <code>sitemap_data.json</code> 的子目录名；不配置则直接读工作区根目录下的文件</td>
+</tr>
+</tbody></table>
+<h2>开发</h2>
+<pre><code>npm install        # 安装依赖（仅 esbuild / typescript / react）
+npm run build      # 构建 lib/（宿主 + 浏览器两套产物）
+</code></pre>
+<blockquote>
+<p>类型说明：<code>@deepseek-ai/dsh-client-*</code> 类型包由 DSH 宿主提供，未随本仓库安装；在 DSH 源码目录（monorepo）下开发可获得完整类型提示，单独构建本仓库不受影响（类型导入会被 esbuild 擦除）。</p>
+</blockquote>
+<p>目录结构：</p>
+<pre><code>dsh-sitemap/
+├── dsh.plugin.json        # 宿主内置插件清单（id / version / client inject）
+├── cordis.patch.yml       # bundle 声明（宿主半区挂载）
+├── src/
+│   ├── index.ts           # 宿主半区：webServer 路由
+│   └── client/index.tsx   # 浏览器半区：侧边栏入口 + 树形地图弹窗
+├── scripts/build.mjs      # esbuild 构建脚本
+├── lib/                   # 构建产物（随仓库提交）
+└── examples/              # 示例数据（占位域名）
+</code></pre>
+<h2>免责声明</h2>
+<p>本插件仅用于<strong>已获授权</strong>的安全测试与资产梳理。请遵守目标系统的授权范围与当地法律法规，使用者需对自身行为负责。</p>
+<h2>许可证</h2>
+<p><a href="https://github.com/deCOLE118/dsh-sitemap/blob/HEAD/LICENSE">BSD-3-Clause</a> © 2026 deCOLE118</p>

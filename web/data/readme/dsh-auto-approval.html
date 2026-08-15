@@ -1,0 +1,93 @@
+<h1>dsh-auto-approval</h1>
+<p><strong>English</strong>: An LLM-gated auto-approval plugin for <a href="https://github.com/deepseek-ai/deepseek-harness">DeepSeek Harness</a> (dsh). It adds an "auto" stance on top of dsh's four permission presets: every operation that would normally pop an approval prompt is first judged by your current default model — low-risk operations proceed without interrupting you, anything doubtful still asks. Fail-closed by design: judge errors, timeouts, and unparseable replies always fall back to the human. See <a href="#%E5%AE%89%E8%A3%85%E4%B8%8E%E4%BD%BF%E7%94%A8">安装与使用</a> below (Chinese).</p>
+<hr>
+<p>一个给 <a href="https://github.com/deepseek-ai/deepseek-harness">DeepSeek Harness</a>(dsh)加「Auto 审批模式」的插件。</p>
+<p>dsh 自带四种权限模式(Read-only / Workspace / Write / Full Access),但「要不要弹窗问用户」这件事只有 ask / never 两档。这个插件加了第五种姿态:<strong>每次要弹窗的操作,先由你当前选用的模型判定风险——明确安全的直接放行,拿不准的照常问你</strong>。思路与 Codex 的「替我审批」、Claude Code 的 auto 模式一致,但实现完全走 dsh 自己的审批管线。</p>
+<h2>工作原理</h2>
+<pre><code>工具调用需要审批
+      │
+      ▼
+ApprovalService.request()           ← 记 approval/asked 审计事件
+      │
+      ▼
+approval/request 瀑布(本插件 prepend 在链首)
+      │
+      ├─ Auto 关 → next() → 内置 answerer 弹窗
+      ▼
+  判定模型(当前默认模型)
+  输入:工具名 + 完整参数 JSON + 申请理由 + 工作区路径
+      │
+      ├─ "approve" → 返回 allowed-once,不弹窗,直接执行
+      └─ 其他一切  → next() → 照常弹窗(ask / 解析失败 / 报错 / 30s 超时)
+</code></pre>
+<p>两个关键实现细节(都是踩坑换来的):</p>
+<ul>
+<li><strong>必须 prepend</strong>:<code>approval/request</code> 瀑布里,dsh 内置的 web answerer(dsh-host-apiproxy)在启动时注册,认领请求时<strong>不调 <code>next()</code></strong>——正常 append 的监听器永远轮不到执行。本插件以 <code>ctx.on('approval/request', fn, true)</code> 插到链首。</li>
+<li><strong>参数是旁路缓存的</strong>:<code>ApprovalRequest</code> 只带 <code>toolName / callId / reason</code>,不带工具参数。插件另挂 <code>tools/pre-execute</code> 观察者,按 <code>callId</code> 缓存每个调用的参数快照,判定时拼进 prompt。</li>
+</ul>
+<p>审计不受影响:<code>approval/asked</code> + <code>approval/decided</code> 由 ApprovalService 自己记录,无论谁认领。</p>
+<h2>安全边界</h2>
+<ul>
+<li><strong>不改变沙箱</strong>:Read-only 模式下该被沙箱拦的操作照样被拦;Auto 只接管「本来要问你」的那一步。</li>
+<li><strong>fail-closed</strong>:判定模型报错、超时(默认 30s)、返回无法解析的内容、或回答 <code>ask</code>——全部落到你熟悉的弹窗。</li>
+<li>判定每次调用消耗一点额外 token(用的就是你当前会话的模型)。</li>
+</ul>
+<h2>安装与使用</h2>
+<h3>从 Release 安装(推荐)</h3>
+<pre><code># 下载 release 里的 dsh-auto-approval-&lt;version&gt;.tgz,然后:
+dsh plugin --profile web add dsh-auto-approval-&lt;version&gt;.tgz
+# 重启 dsh
+</code></pre>
+<h3>从源码构建</h3>
+<pre><code>git clone https://github.com/SipengXie2024/dsh-auto-approval.git
+cd dsh-auto-approval
+npm install
+npm run build    # tsc(host)+ tsdown(client 闭包工厂 bundle)
+npm pack         # 产出 dsh-auto-approval-&lt;version&gt;.tgz
+dsh plugin --profile web add dsh-auto-approval-&lt;version&gt;.tgz
+# 重启 dsh
+</code></pre>
+<h3>使用</h3>
+<ul>
+<li>输入框工具排(权限模式开关旁)有 <code>Auto</code> 药丸,点一下开关;</li>
+<li>「设置 → Auto 审批」页有完整面板:开关、见证/放行/转人工/判定失败四项统计、带理由的判定记录、清空按钮;</li>
+<li><strong>默认开启</strong>(config <code>enabled: true</code>)。想默认关:在 profile 的 patch 里给 <code>auto-approval</code> 行加 <code>config: { enabled: false }</code>。</li>
+</ul>
+<h3>配置项</h3>
+<table>
+<thead>
+<tr>
+<th>键</th>
+<th>默认</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>enabled</code></td>
+<td><code>true</code></td>
+<td>启动时是否开启 Auto 模式</td>
+</tr>
+<tr>
+<td><code>judgeTimeoutMs</code></td>
+<td><code>30000</code></td>
+<td>判定调用超时,超时转人工</td>
+</tr>
+<tr>
+<td><code>judgeMaxTokens</code></td>
+<td><code>256</code></td>
+<td>判定输出预算</td>
+</tr>
+</tbody></table>
+<h2>适用与局限</h2>
+<ul>
+<li>目前判定路由跟随会话的默认模型(provider/model),暂未支持单独指定一个小模型;</li>
+<li>判定偏保守是设计使然:只有模型明确说 <code>approve</code> 才放行。在低权限模式下,会触发审批的操作大多是提权类,天然落在「转人工」区间——Auto 的价值是筛掉重复的低危确认,不是替你点掉所有弹窗;</li>
+<li>插件作用于整个进程:对本进程所有会话(含子 agent)的审批生效。</li>
+</ul>
+<h2>相关</h2>
+<ul>
+<li>灵感:Codex 的 agent-approved 模式、Claude Code 的 auto 模式;</li>
+<li>工程骨架参照 <a href="https://github.com/SipengXie2024/dsh-memory-hermes">dsh-memory-hermes</a> 的打包姿势(tsc + tsdown 闭包工厂 client bundle + <code>dsh.bundle.patch</code>)。</li>
+</ul>
+<h2>License</h2>
+<p>MIT</p>

@@ -1,0 +1,78 @@
+<h1>dsh-book2skill</h1>
+<p>书籍转技能（Book → Skill）：DSH 插件包，把一个 5 阶段长任务工作流带进 DeepSeek Harness——
+<strong>获取书籍 → 解析分章 → 深度阅读 → 生成 SKILL.md → 安装</strong>，中途有 <strong>3 个人类门控</strong>。</p>
+<p>确定性步骤（EPUB 解析 / PDF 提取 / OCR / 安装复制）是宿主工具；理解与生成（浅读建地图、
+设计方向问题、深读核心章、撰写 SKILL.md 与自检）由 agent 执行；浏览器面板负责 5 阶段时间线
+展示与门控审批。任务状态存宿主存储域，<strong>跨会话、跨重启可恢复，可随时取消</strong>。</p>
+<h2>架构</h2>
+<table>
+<thead>
+<tr>
+<th>平面</th>
+<th>内容</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>宿主（<code>src/index.ts</code>）</td>
+<td><code>book2skill</code> 存储域（jobs 表）、<code>/book2skill</code> HTTP 面板路由、10 个 <code>book2skill_*</code> 工具</td>
+</tr>
+<tr>
+<td>浏览器（<code>src/client/</code>）</td>
+<td><code>conversation.view</code> 时间线面板（React），纯 fetch 轮询宿主路由</td>
+</tr>
+<tr>
+<td>脚本（<code>scripts/</code>）</td>
+<td><code>parse_epub.py</code>（修复版：标题行不再丢失、&gt;5000 字章节按 <code>##</code> 拆分）、<code>pdf_parse.py</code>（PyPDF2 探测/分块）</td>
+</tr>
+</tbody></table>
+<h2>5 阶段 + 3 门控</h2>
+<ol>
+<li><strong>获取书籍</strong>：本地路径（目录选择器，browse 能力）/ z-lib 搜索下载（复用 book-downloader 的 cookies，无硬编码密钥）</li>
+<li><strong>解析分章</strong>：EPUB → 按章 md + toc.md（&lt;200 字合并、&gt;5000 字拆分）；PDF → PyPDF2 先探测（&lt;5000 有效字或乱码判扫描型）→ 扫描型走 OCR，面板显示逐页进度（37/420）与「排队中」</li>
+<li><strong>深度阅读【门控1】</strong>：agent 浅读建地图 → 发布 ≤3 个选择题（选项带书中章节背景）→ 用户在面板作答 → agent 深读 3-5 个核心章</li>
+<li><strong>生成 SKILL.md【门控2】</strong>：可编辑预览 + 知识地图 + 3 项自检清单（SOP 可溯源 / 索引准确 / 触发词宽窄，不通过标红，可一键让 agent 修）→ [重新生成] / [通过并继续]</li>
+<li><strong>安装【门控3】</strong>：目标多选（<del>/.claude/skills、</del>/.codex/skills、~/kk_skill/skills 同步仓库）→ 确认后 agent 调 <code>book2skill_install</code> → 完成卡（触发示例 chips + 复制即试）</li>
+</ol>
+<h2>OCR 解耦（三级探测，无硬依赖）</h2>
+<p>本插件<strong>不 inject</strong> <code>paddleOcr</code>（缺失服务会永远挂起本行）。运行时按级探测：</p>
+<ol>
+<li><code>ctx.get('paddleOcr')</code> 宿主服务（dsh-paddle-ocr 发布该服务时自动生效，契约见 <code>src/vendor-shims.d.ts</code>）</li>
+<li><code>/paddle-ocr</code> loopback RPC（已安装的 dsh-paddle-ocr 面板任务通道：<code>task/start → task/status 轮询 → task/commit</code>，逐页进度透传）</li>
+<li>HTTP 直调 stub（<code>BOOK2SKILL_OCR_ENDPOINT</code>，缺省 <code>http://127.0.0.1:8011/api/pdf/ocr</code>）</li>
+</ol>
+<p>全部不可用时明确报错并给出 agent 兜底路径：用 <code>paddle_ocr_layout</code> 工具解析 → <code>book2skill_import_ocr</code> 导入。</p>
+<h2>宿主工具</h2>
+<p><code>book2skill_start</code> / <code>book2skill_parse</code> / <code>book2skill_get_job</code> / <code>book2skill_stage_note</code>
+（summary·knowledge-map·deep-read·draft·questions·selfcheck）/ <code>book2skill_read_chapter</code> /
+<code>book2skill_zlib_search</code> / <code>book2skill_download</code> / <code>book2skill_import_ocr</code> / <code>book2skill_install</code> / <code>book2skill_cancel</code></p>
+<h2>兼容性</h2>
+<ul>
+<li>DSH <code>&gt;=0.1.0-rc.3 &lt;0.2.0</code>（使用 rc.3 的 <code>ctx.shell</code> 能力契约）</li>
+<li>Node.js <code>^22.19.0 || &gt;=24.0.0</code></li>
+<li>Profile Bundle：<code>package.json#dsh.bundle.patch</code> 自动应用 <code>cordis.patch.yml</code></li>
+</ul>
+<h2>构建与安装</h2>
+<pre><code># 1. 用当前 DSH rc.3 npm 运行时链接类型依赖并完整验收
+npm ci
+DSH_NODE_MODULES_ROOT=/path/to/dsh-rc3/node_modules npm run setup:dsh-workspace
+npm run typecheck
+npm test
+npm run build
+
+# 2. 打包并通过插件命令安装到目标 profile
+npm pack
+dsh plugin --profile web add file:/absolute/path/dsh-book2skill-0.1.2.tgz
+
+# 3. 重启 dsh web（宿主行需要进程重启），浏览器刷新后对话区出现「书籍转技能」标签
+</code></pre>
+<p>不要再把 <code>book2skill</code> 行手工写进 profile：插件包已经声明 Profile Bundle，手工追加会形成重复
+loader entry。发布到 npm 时 <code>publishConfig.access</code> 固定为 <code>restricted</code>。</p>
+<p>宿主半的代码改动需要重启 <code>dsh web</code> 生效；浏览器半重建 <code>lib/client.js</code> 后，HMR 会自动重载该插件
+（页面无需刷新；未开 <code>pnpm run dev:web</code> 时手动 <code>npm run build</code> 即可触发）。</p>
+<h2>红线自查</h2>
+<ul>
+<li>不硬编码任何密钥：z-lib 登录态读 <code>~/.claude/skills/book-downloader/auth/zlib-cookies.json</code>（用户已有），OCR token 由 dsh-paddle-ocr 的凭据保险箱管理</li>
+<li>生成内容可溯源：SOP 步骤必须来自 references 章节（自检1 强制回读校验），references 索引与触发词均有自检项</li>
+</ul>
+<h2>许可</h2>
+<p>BSD-3-Clause。面板素材（assets/*.svg）由 Codex 生成。</p>

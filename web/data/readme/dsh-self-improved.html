@@ -1,0 +1,158 @@
+<h1>dsh-self-improved</h1>
+<p><strong>Long-term memory &amp; self-evolving plugin</strong> for DeepSeek Harness (fully local).</p>
+<blockquote>
+<p>Status: M0–M6 complete and deployed to a real environment (web profile). Design/research docs stay local only (see <code>.gitignore</code>).</p>
+</blockquote>
+<h2>What it is</h2>
+<p>Adds the two missing capabilities to DSH — "cross-session memory + self-evolution":</p>
+<ul>
+<li><strong>Memory</strong>: automatically distills key points from conversations (facts / preferences / events / instructions) into a local memory store; before each new turn, relevant memories are injected to the model — the AI "remembers you".</li>
+<li><strong>Self-evolution</strong>: memories are consolidated, decayed and corrected; successful workflows can be distilled into reusable skills; the user persona keeps evolving with conversations.</li>
+</ul>
+<p>The architecture follows the four-layer memory pyramid of TencentDB Agent Memory (L0 capture → L1 extraction → L2 scene grouping → L3 persona), but <strong>reuses DSH-native services</strong> (<code>ctx.llm</code> / <code>session</code> events / <code>agent/pre-step</code> injection / <code>dsh-skill</code> / <code>storageDomain</code>) with a fully local SQLite store (FTS5 + sqlite-vec). No data is uploaded anywhere.</p>
+<h2>Roadmap</h2>
+<table>
+<thead>
+<tr>
+<th>Milestone</th>
+<th>Scope</th>
+<th>Status</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>M0</td>
+<td>Probe: event capture / recall injection / tool registration / settings namespace</td>
+<td>✅ Verified (isolated headless)</td>
+</tr>
+<tr>
+<td>M1</td>
+<td>Memory store: SQLite + FTS5 + jieba + sqlite-vec; L0 capture to disk; memory/search tools</td>
+<td>✅ Verified (unit + headless integration)</td>
+</tr>
+<tr>
+<td>M2</td>
+<td>Extraction pipeline: <code>ctx.llm</code> L1 extraction + strict JSON validation/fallback + dedup + throttled pump</td>
+<td>✅ Unit-tested; running in production</td>
+</tr>
+<tr>
+<td>M3</td>
+<td>Recall injection: <code>agent/pre-step</code> injection + keyword/vector/hybrid retrieval (RRF)</td>
+<td>✅ Unit-tested + end-to-end verified</td>
+</tr>
+<tr>
+<td>M4</td>
+<td>Self-evolution: L2/L3 consolidation (scenes + versioned persona), decay, correct/forget tools, skill synthesis → dsh-skill</td>
+<td>✅ Unit-tested; synthesized skills in production</td>
+</tr>
+<tr>
+<td>M5</td>
+<td>UI/ops: settings panel (auto-rendered) + hot runtime toggles + <code>/memory</code> command + memory browser</td>
+<td>✅ Complete, deployed to web profile</td>
+</tr>
+<tr>
+<td>M6</td>
+<td>Growth governance (caps/cleanup) + scheduling (nightly review / free maintenance / startup backfill)</td>
+<td>✅ Complete: governance caps, nightly review (default 22:00), 15-min loop is maintenance-only, master switch stops all timers</td>
+</tr>
+</tbody></table>
+<h2>Installation</h2>
+<blockquote>
+<p><strong>Since 0.1.1</strong>: the package declares <code>dsh.bundle</code>, so <strong><code>dsh plugin add</code> / plugin-marketplace one-click install auto-mounts it</strong> (dsh registers it as a profile layer automatically) — <strong>no manual <code>cordis.patch.yml</code> edits needed</strong>. Just restart dsh after installing.</p>
+</blockquote>
+<h3>Option 1: npm (recommended; same as marketplace one-click)</h3>
+<pre><code>dsh plugin --profile web add dsh-self-improved
+# or find dsh-self-improved in the plugin marketplace and click install
+# restart dsh — it auto-mounts
+</code></pre>
+<h3>Option 2: from GitHub (source snapshot, prepare builds lib/ automatically)</h3>
+<pre><code># 1) One-time environment prep (only if you hit store mismatch / blocked build):
+#    - point the store back to the directory consistent with node_modules:
+#      pnpm config set store-dir E:\dshPro\.pnpm-store --global   # or set store-dir=... in a profile-level .npmrc
+#    - allow prepare builds for git-installed packages (pnpm &gt;= 10 blocks by default); in pnpm-workspace.yaml:
+#      allowBuilds:
+#        dsh-self-improved: true
+
+# 2) Install (dsh plugin forwards to pnpm in the profile; github:owner/repo fetches the snapshot and runs prepare=tsc)
+dsh plugin --profile web add github:madage/dsh-self-improved
+
+# 3) Restart dsh (auto-mounts since 0.1.1; if it still doesn't load, add the manual insert below)
+</code></pre>
+<blockquote>
+<p>Manual mount (legacy versions or special layouts only): add to the <code>insert</code> list of <code>$DSH_HOME/profiles/web/cordis.patch.yml</code>:</p>
+<pre><code>- insert:
+    - id: dsh-self-improved
+      name: dsh-self-improved
+</code></pre>
+</blockquote>
+<h3>Option 3: local development (file: link)</h3>
+<pre><code># build, then copy lib/ + client.js + package.json into
+# $DSH_HOME/profiles/web/node_modules/dsh-self-improved/
+# add "dsh-self-improved": "file:node_modules/dsh-self-improved" to package.json dependencies
+# add the cordis.patch.yml insert (above) → restart
+</code></pre>
+<h3>⚠️ Install notice: peerDependencies double-instance pitfall (located &amp; fixed)</h3>
+<p><strong>Symptom</strong>: after install, <strong>new sessions work but resuming an old session errors</strong> — <code>deployment:persona already registered</code>, with a hint "register through that agent's agent.ctx instead".</p>
+<p><strong>Root cause (not a plugin bug)</strong>: pnpm's default <code>autoInstallPeers</code> installs the plugin's <code>@deepseek-ai/*</code> peerDependencies as <strong>physical copies</strong> inside the profile's <code>node_modules</code>, creating two independent module instances of the same package as the ones embedded in the dsh main install (e.g. <code>dsh-scope</code>). DSH's scoping (preset/persona layers) binds identity via <code>Symbol("dsh.scope")</code>; with two instances the persona registration lands in the global layer and collides with the host's <code>deployment:persona</code> → resume fails. New sessions happen to succeed because the global layer is not yet occupied on first registration.</p>
+<p><strong>Fix (verified)</strong>:</p>
+<ol>
+<li>Replace the redundant <code>@deepseek-ai/*</code> physical copies in the profile with <strong>symlinks</strong> to the packages embedded in the dsh main install (dsh's self-healing layout <code>$DSH_HOME/profiles/node_modules</code>);</li>
+<li>Set <code>auto-install-peers=false</code> in a profile-level <code>.npmrc</code> (or turn off <code>autoInstallPeers</code> in <code>pnpm-workspace.yaml</code>).</li>
+</ol>
+<p><strong>Note for users (keep when publishing)</strong>:</p>
+<blockquote>
+<p>dsh-self-improved's peerDependencies may be auto-installed as physical copies in the profile; use the dsh self-healing symlink layout, or set <code>auto-install-peers=false</code> in the profile's <code>.npmrc</code>.</p>
+</blockquote>
+<h3>⚠️ Install notice: duplicate loader entry id (bundle re-mount, instant boot crash)</h3>
+<p><strong>Symptom</strong>: dsh <strong>fails to start</strong> (window flashes and closes), and <code>dsh --profile web --dump-config</code> shows the same entry <code>id</code> twice.</p>
+<p><strong>Root cause</strong>: packages declaring <code>dsh.bundle</code> (this plugin since 0.1.1, <code>dsh-plugin-marketplace</code>, etc.) are <strong>automatically</strong> added to <code>dsh.profile.bundles</code> and their bundled <code>cordis.patch.yml</code> inserts one entry; if the profile-level <code>cordis.patch.yml</code> <strong>also manually inserts the same id</strong> → the loader throws <code>duplicate loader entry id</code> at boot.</p>
+<p><strong>Fix (verified)</strong>: reset the profile-level <code>cordis.patch.yml</code> to <code>[]</code> — bundle assembly is fully owned by <code>dsh.profile.bundles</code>; do <strong>not</strong> manually insert bundle plugins at the profile layer.</p>
+<p><strong>Debug tip</strong>: if dsh crashes at startup, run <code>dsh --profile web --dump-config</code> and count each entry id; more than one occurrence is this problem.</p>
+<h2>Configuration</h2>
+<pre><code># $DSH_HOME/settings.yaml
+dsh-self-improved:
+  enabled: true
+  modules:
+    capture: true
+    extract: true
+    consolidate: true
+    evolve: true
+    recall: true
+    tools: true
+  review:
+    enabled: true      # nightly review (one full evolution per day)
+    time: "22:00"      # HH:MM, 24h
+</code></pre>
+<p>Notes:</p>
+<ul>
+<li><strong>Master switch off = plugin fully dormant</strong>: all background timers stop (15-min maintenance loop / nightly review / startup backfill), <code>/memory</code> and memory tools are unregistered; stored memories are kept and everything resumes when re-enabled.</li>
+<li><strong>Scheduling</strong>: the 15-minute loop only does extraction + free maintenance (decay/governance, no LLM cost); full evolution (scenes/persona/skills) runs at the nightly review (default 22:00), ~60s after startup, or via manual <code>/memory evolve</code>.</li>
+<li><strong><code>/memory</code> commands are zero-LLM</strong>: they query the local memory store directly; the command declares <code>input</code>, so parameterized input is handled by the command system (trigger via the command menu, <code>/</code>).</li>
+<li>The memory browser (Settings → "Self-evolving memory" → "Memory" tab) lets you view/filter/correct/forget memories, the persona, scenes and synthesized skills.</li>
+</ul>
+<h2>Compliance</h2>
+<ul>
+<li>The plugin's <strong>architecture is inspired by</strong> <a href="https://github.com/TencentCloud/TencentDB-Agent-Memory">TencentDB Agent Memory</a> (MIT); it is an <strong>independent implementation</strong> with no affiliation with Tencent.</li>
+<li>The plugin and all its dependencies are MIT-licensed and run fully locally.</li>
+</ul>
+<h2>Acknowledgements</h2>
+<p>This project references the following open-source projects; many thanks to their authors and communities:</p>
+<ul>
+<li><strong><a href="https://github.com/TencentCloud/TencentDB-Agent-Memory">TencentDB Agent Memory</a></strong> (Tencent Cloud) — the four-layer memory pyramid (L0 capture → L1 extraction → L2 scene grouping → L3 persona) and memory-management ideas are the direct inspiration for this plugin's pipeline;</li>
+<li><strong><a href="https://github.com/pskoett/self-improving-agent">self-improving-agent</a></strong> (author <strong>pskoett</strong>) — a self-evolution skill in the OpenClaw ecosystem: distilling lessons, corrections and reusable flows from experience; this plugin's self-evolution module (memory consolidation / forgetting / correction + skill synthesis) takes design inspiration from it.</li>
+</ul>
+<h2>Docs</h2>
+<ul>
+<li><code>README.md</code> — this file (English)</li>
+<li><code>README.zh.md</code> — 中文版说明</li>
+<li><code>docs/</code> (install/verify checklists, testing guide, design docs, DSH research) — <strong>local only</strong>, excluded via <code>.gitignore</code></li>
+</ul>
+<p>Unit tests: <code>node scripts/test-storage.mjs</code> / <code>test-extract.mjs</code> / <code>test-recall.mjs</code> / <code>test-evolve.mjs</code> / <code>test-commands.mjs</code> (all PASS).</p>
+<h2>License</h2>
+<p>MIT License — see <a href="https://github.com/madage/dsh-self-improved/blob/HEAD/LICENSE">LICENSE</a> for the full text.</p>
+<p>Summary:</p>
+<ul>
+<li><strong>Grant</strong>: anyone may obtain a copy of the software and associated docs and use, copy, modify, merge, publish, distribute, sublicense and/or sell it;</li>
+<li><strong>Condition</strong>: the above copyright notice and permission notice must be included in all copies or substantial portions;</li>
+<li><strong>Disclaimer</strong>: the software is provided "AS IS" without warranty of any kind; in no event shall the authors or copyright holders be liable for any claim, damages or other liability.</li>
+</ul>
+<p>Copyright (c) 2026 mashao. <code>package.json</code> declares <code>license: MIT</code>.</p>

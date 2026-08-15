@@ -1,0 +1,308 @@
+<h1>dsh-blackhole</h1>
+<p><strong>English</strong> | <a href="https://github.com/Asaiuta/dsh-blackhole/blob/HEAD/README.zh-CN.md">简体中文</a></p>
+<p>A DSH port of <a href="https://github.com/k0valik/pi-blackhole"><code>k0valik/pi-blackhole</code></a>'s
+brief compiler (VCC conversation-compiler), wrapped in a dual-pipeline
+compaction engine.</p>
+<p>Drop-in replacement for the official <code>@deepseek-ai/dsh-compaction-basic</code>
+backend that routes inside the single <code>summarize()</code> hook:</p>
+<ul>
+<li><strong>OpenAI (or any provider with a configured Responses endpoint)</strong> — the
+official remote path: summarization is delegated to the <strong>model server</strong> via
+the Responses API <code>compaction_trigger</code> (the same protocol Codex's remote
+compaction uses), and the opaque replacement history is persisted per
+session;</li>
+<li><strong>remote failure</strong> (no endpoint, missing key, timeout, protocol error) —
+by default the region is compiled locally by a <strong>deterministic VCC-style
+compiler</strong> (zero model calls, near-lossless <code>(seq N)</code> pointers back into
+the durable session log), with the native one-shot LLM summarizer available
+via <code>fallbackMode: "llm"</code>;</li>
+<li><strong>every other provider</strong> — the local compiler, straight away, no network.</li>
+</ul>
+<p>Remote compaction branch ports
+<a href="https://github.com/algal/pi-openai-server-compaction"><code>algal/pi-openai-server-compaction</code></a>
+(MIT). The local compiler is a <strong>port of pi-blackhole's <code>brief.ts</code> compiler</strong>
+(VCC conversation-compiler, MIT; rule lineage: lllyasviel/VCC →
+dsh-compaction-instant) — the differential suite pins content-level
+equivalence against the real pi-blackhole sources (see <em>Equivalence</em>
+below).</p>
+<h2>Why</h2>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>pi</th>
+<th>DSH (this plugin)</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>Remote compaction v2</td>
+<td>via algal/kky42/lll9p extensions</td>
+<td><strong>remote branch</strong> of the routing engine</td>
+</tr>
+<tr>
+<td>Zero-cost local compaction</td>
+<td>pi-vcc / pi-blackhole (algorithmic)</td>
+<td><strong>local compiler branch</strong> (<code>fallbackMode: "instant"</code>)</td>
+</tr>
+<tr>
+<td>Compaction seam</td>
+<td>extension event hooks</td>
+<td><code>CompactionEngine.summarize()</code> — the official single customization hook</td>
+</tr>
+<tr>
+<td>Fallback chain</td>
+<td>—</td>
+<td>instant → (optional) native LLM → fail</td>
+</tr>
+<tr>
+<td>Opaque window persistence</td>
+<td>pi session JSONL <code>compaction.details.remoteCompaction</code></td>
+<td>per-session JSON state under <code>$DSH_HOME/plugins/dsh-blackhole/state</code></td>
+</tr>
+</tbody></table>
+<h2>How it works</h2>
+<ol>
+<li>DSH decides to compact (pressure / overflow / <code>/compact</code>) and calls the
+engine's <code>summarize()</code> hook with the replayed conversation region.</li>
+<li>The routed provider/model is resolved (durable request header first, agent
+options second) and matched against the configured <code>endpoints</code>.</li>
+<li><strong>Remote branch</strong> (matched endpoint): the region is converted into
+Responses input items (text, reasoning, tool calls/results), a
+<code>compaction_trigger</code> is appended, and the compaction response streams from
+<code>{baseUrl}/responses</code>. The assistant-authored summary becomes the readable
+checkpoint; the opaque <code>compaction</code> item plus the retained tail of user
+messages (Codex-style 20K token budget) is persisted per session. A later
+remote compaction for the same provider/model replays that opaque window
+and appends only the new trailing surface.</li>
+<li><strong>Fallback</strong>: any remote failure logs a warning and hands the region to
+the local compiler (<code>instant</code>, default) or the native LLM summarizer
+(<code>llm</code>). <code>instant-then-llm</code> tries the compiler first and only then the LLM.</li>
+<li><strong>Local compiler branch</strong> (no endpoint match, or fallback): a deterministic
+zero-model pass over the region that keeps ONLY original tokens — every
+tool call becomes one line <code>* bash "ls" (seq 2 -&gt; result 3)</code>, tool results
+never occupy entries (one recall away via the pointer), reasoning is
+elided, long text truncates with <code>...(truncated from seq N)</code>, noise XML is
+stripped, and a token cap drops the oldest rows first with an explicit
+<code>[N entries elided: seqs a-b]</code> note. The <code>(seq N)</code> pointers resolve against
+the REAL durable session log (each flattened message is matched to its
+stored event by id), so a recall tool mounted next to this engine restores
+the exact original content.</li>
+</ol>
+<p>The engine subclasses the official <code>BasicCompactionEngine</code>, so all pressure /
+retention / policy knobs, the token-meter pricing, and the context-overflow
+recovery behave exactly as upstream.</p>
+<h2>Install</h2>
+<p>Requires DSH <code>0.1.0-rc.6</code> (web or headless profile).</p>
+<pre><code># into the profile that serves your sessions
+dsh plugin --profile web add dsh-blackhole
+# or from a local tarball:
+npm pack dsh-blackhole &amp;&amp; dsh plugin --profile web add ./dsh-blackhole-0.2.0.tgz
+</code></pre>
+<p>The bundle patch:</p>
+<ul>
+<li>disables the official <code>compaction-basic</code> row (already disabled by the
+web-app bundle — idempotent),</li>
+<li>re-enables <code>command-compact</code> (the <code>/compact</code> command, which the web-app
+bundle disables; it is backend-independent),</li>
+<li>inserts this engine under its own row.</li>
+</ul>
+<p>Exactly one <code>compaction</code> service ends up mounted; the dual pipeline lives
+inside the engine.</p>
+<h2>Configure</h2>
+<p>In the profile's settings (or <code>~/.dsh/settings.yaml</code> under the plugin key):</p>
+<pre><code>dsh-blackhole:
+  # inherited BasicCompactionEngine knobs (all optional, same defaults as
+  # @deepseek-ai/dsh-compaction-basic):
+  thresholdRatio: 0.75
+  retainRatio: 0.25
+  auto: true
+
+  # Responses-assisted knobs:
+  endpoints:
+    # direct OpenAI Responses
+    - provider: openai
+      baseUrl: https://api.openai.com/v1
+      apiKeyEnv: OPENAI_API_KEY
+    # any OpenAI-compatible gateway that forwards the Responses API
+    - provider: '*'
+      baseUrl: https://my-gateway.example.com/v1
+      apiKeyEnv: MY_GATEWAY_KEY
+    # official Codex backend (needs the beta-feature header)
+    - provider: openai-codex
+      baseUrl: https://chatgpt.com/backend-api
+      apiKeyEnv: CODEX_TOKEN
+      headers:
+        OpenAI-Beta: responses=experimental
+        x-codex-beta-features: remote_compaction_v2
+  timeoutMs: 120000      # abort the remote attempt after 2 min
+  fallbackMode: instant  # instant | instant-then-llm | llm
+  retainedMessageTokenBudget: 20000
+  persistRemoteHistory: true
+  stateDir: ~/.dsh/plugins/dsh-blackhole/state
+
+  # Local compiler knobs (all optional):
+  compileMaxTokens: 8192     # floor; scaled by checkpointScale on big regions
+  checkpointScale: 0.1       # cap = max(compileMaxTokens, shadowed x scale)
+  checkpointCap: 65536       # hard ceiling
+  textTokens: 512            # per assistant text/reasoning block
+  userTextTokens: 1024       # per user text block
+  toolCallTokens: 128        # per tool one-liner
+  includeReasoning: false
+  stripNoiseXml: true
+  noisePatterns: []          # empty = built-in VCC patterns
+  toolArgTools: []           # empty = built-in whitelist
+  hideTools: []              # e.g. [TodoWrite, ToolSearch]
+</code></pre>
+<p>Endpoint matching: <code>provider</code> matches the DSH provider route the latest request
+ran on (exact, or <code>*</code> for any); <code>model</code> matches exact id or a <code>*</code> glob.
+Authorization uses <code>apiKeyEnv</code> (env var name) or <code>apiKey</code> (inline — never
+commit a real key).</p>
+<p><code>fallbackMode</code> semantics (applies to remote failures only):</p>
+<table>
+<thead>
+<tr>
+<th>mode</th>
+<th>remote ok</th>
+<th>remote fails</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>instant</code> (default)</td>
+<td>server summary</td>
+<td>local compiler (zero model calls)</td>
+</tr>
+<tr>
+<td><code>instant-then-llm</code></td>
+<td>server summary</td>
+<td>local compiler; LLM only if the compiler itself fails</td>
+</tr>
+<tr>
+<td><code>llm</code></td>
+<td>server summary</td>
+<td>native one-shot LLM summarizer</td>
+</tr>
+</tbody></table>
+<p>The legacy <code>fallbackToLlm</code> boolean still maps: <code>false</code> forces <code>instant</code>;
+<code>true</code> behaves like the default. Targets with <strong>no matching endpoint</strong> always
+take the local compiler (or, in <code>llm</code> mode, the native LLM).</p>
+<h2>Behavior notes</h2>
+<ul>
+<li><strong>Images</strong>: DSH stores image bytes in the attachment store, which a remote
+compaction call cannot resolve; image blocks are carried as an explicit
+"image content omitted" text visit instead of being silently dropped. The
+local compiler renders them as <code>[image] (seq N)</code> labels.</li>
+<li><strong>Checkpoint framing</strong>: the engine returns plain text; the inherited
+backend wraps it in the standard <code>&lt;compacted-summary&gt;</code> checkpoint framing.</li>
+<li><strong>Deployments with agent presets</strong>: presets mount their own compaction realm.
+If a preset also compacts, either disable <code>auto</code> on one side or drop the
+preset's compaction rows — two engines must not compact the same session.</li>
+<li><strong>Normal-turn opaque replay remains adapter-owned</strong>: DSH's immutable
+<code>llm/stream</code> request has no message-rewrite hook. This package therefore
+provides the optional <code>responsesCompactionReplay</code> service. A Responses
+adapter should call <code>prepareInput({ sessionId, provider, model, trailingMessages, endpoint })</code> immediately before building its HTTP payload;
+it returns <code>[owned opaque replacement history, ...trailingMessages]</code>, including
+a final incomplete user/tool turn for the request being sent, or a portable
+conversion of the supplied DSH messages when no owned artifact is available.
+<code>replayHistory(...)</code> remains available for the compaction-side variant, which
+deliberately retains only completed trailing turns. Foreign provider/model
+state, legacy artifacts, endpoint mismatches, and fallback compactions are
+rejected or removed rather than replayed. The Responses compaction path uses
+the completed-turn contract automatically on the next compaction.</li>
+</ul>
+<h3>Adapter wiring contract (<code>responsesCompactionReplay</code>)</h3>
+<p>The seam is one method call inside the adapter that serializes an ordinary
+Responses request. <code>tests/protocol-smoke.mjs</code> pins the whole matrix as
+executable assertions; this is the shape an adapter must implement:</p>
+<pre><code>// Inside the Responses adapter fiber:
+const replay = ctx.get('responsesCompactionReplay') as
+  import('dsh-blackhole').ResponsesCompactionReplay | undefined
+
+// Immediately before building the HTTP payload for a NON-compaction turn:
+const input = replay === undefined
+  ? dshMessagesToResponseItems(trailing)
+  : await replay.prepareInput({
+      sessionId,            // agent/session id (the opaque window is keyed by it)
+      provider,             // durable route: e.g. 'openai'
+      model,                // durable model: e.g. 'gpt-5'
+      trailingMessages: trailing, // the DSH Messages being sent this turn
+      endpoint,             // optional; pass the base URL if known
+    })
+// builder.send({ model, input, stream: true, store: false, ... })
+</code></pre>
+<p>Contract semantics (all enforced by <code>RemoteCompactionStateStore</code>):</p>
+<ul>
+<li><strong>Owned artifact</strong> (same provider/model/endpoint, versioned <code>details</code>):
+returns <code>[opaque replacement items, ...input items for </code>trailingMessages<code>]</code>,
+keeping a final incomplete user/tool turn (<code>includePending</code>) so the request
+being sent is not lost.</li>
+<li><strong>No state / foreign route / legacy artifact / endpoint mismatch</strong>: returns
+the plain DSH→Responses conversion (fail closed — never a stale opaque
+window). <code>replayHistory()</code> returns <code>undefined</code> in exactly these cases.</li>
+<li><strong>Compaction turns</strong>: do not call <code>prepareInput()</code> with the compaction
+intent — <code>RoutingCompactionEngine</code> already replays the completed-turn
+window internally when it summarizes. The service exists for ordinary
+conversation turns only.</li>
+<li><strong>Fallback compactions</strong> invalidate the stored window (<code>state.remove</code>), so
+a later same-route turn starts from DSH messages and cannot skip the new
+local checkpoint.</li>
+<li><strong>Pure-text regions</strong> compress less than tool-dense ones (tool results cost
+zero tokens in the compiled view); a region the compiler cannot shrink is
+rejected fail-closed, exactly like the upstream instant engine's shrink
+guarantee.</li>
+</ul>
+<h2>Development</h2>
+<pre><code>pnpm install
+pnpm run typecheck   # tsc --noEmit against the rc.6 packages
+pnpm run build       # esbuild → lib/index.js
+node tests/smoke-load.mjs      # loader composition mounts the engine
+node tests/protocol-smoke.mjs  # conversion/SSE/round-trip vs a local fake endpoint
+node tests/hybrid-smoke.mjs    # compiler unit + routing (remote/instant/llm/compat)
+node tests/equivalence/build-algal.mjs &amp;&amp; node tests/equivalence/differential.mjs
+                               # protocol equivalence vs the REAL upstream bundle
+node tests/equivalence/build-blackhole.mjs &amp;&amp; node tests/equivalence/differential-brief.mjs
+                               # CONTENT-level differential vs the REAL pi-blackhole
+                               # brief compiler (BRIEF-DIFF.md: 11/12 vectors aligned)
+node tests/instant-blackhole-align.mjs
+                               # regression suite pinning the aligned brief rules
+node tests/equivalence/differential-real-session.mjs
+                               # content differential on a REAL recorded pi session
+                               # (live transcript, not synthetic vectors)
+node tests/equivalence/entity-fidelity.mjs
+                               # entity-level retention audit (paths/symbols/errors)
+DSH_EVAL_KEY=... DSH_EVAL_BASE=... node tests/equivalence/eval-fidelity-llm.mjs
+                               # LLM A/B: answer accuracy with full vs brief context
+                               # (see FIDELITY.md; key/base/model/session via env)
+</code></pre>
+<h2>Equivalence to the upstream port</h2>
+<p><code>tests/equivalence/</code> snapshots the upstream source at a pinned commit
+(<code>algal/SOURCE.json</code>) and bundles it with pi dependencies stubbed (only the
+computation helpers are replaced; the protocol code runs unmodified). The
+differential test then feeds identical vectors to both implementations:
+request body, replacement history (retention, 20K truncation, image
+exemption, empty-message filtering), SSE parsing (success + every error
+path), message conversion (pi↔DSH semantic projection), identity headers,
+and a full local-endpoint round trip. <strong>15/15 vectors pass.</strong></p>
+<p>Differences that remain are platform adaptation, not protocol drift:</p>
+<ul>
+<li><strong>Eligibility detection</strong>: upstream auto-detects direct OpenAI / Codex
+models from the pi-ai registry (host must be <code>api.openai.com</code>); this port
+matches a declared <code>endpoints</code> (provider + model glob), so it can also
+target your own gateway. The upstream host gate would reject exactly the
+deployments this plugin is for.</li>
+<li><strong>Checkpoint text source</strong>: upstream runs a parallel local summary and
+stores the remote artifact as <code>details.remoteCompaction</code> (pi has that
+slot); DSH's <code>summarize()</code> returns one text, so this port surfaces the
+server-side summary text as the checkpoint and falls back per
+<code>fallbackMode</code>. One LLM call at most — and by default, none.</li>
+<li><strong>Images</strong>: pi carries image bytes (→ <code>input_image</code>); DSH only has
+attachment ids, so image visits become explicit placeholder text.</li>
+<li><strong>Exposed knobs</strong>: <code>retainedMessageTokenBudget</code> (upstream's fixed 20K),
+<code>timeoutMs</code>, <code>sendIdentityHeaders</code>, <code>installationId</code> are extra options;
+defaults reproduce upstream behavior exactly.</li>
+</ul>
+<h2>License</h2>
+<p>MIT. Portions derived from
+<a href="https://github.com/algal/pi-openai-server-compaction">algal/pi-openai-server-compaction</a>
+(MIT) and the compiler rules of
+<a href="https://github.com/KitDoesIt/dsh-compaction-instant"><code>dsh-compaction-instant</code></a>
+(MIT, VCC conversation-compiler port) — see LICENSE.</p>

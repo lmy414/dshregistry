@@ -1,0 +1,148 @@
+<h1>dsh-session-index</h1>
+<p>DeepSeek Harness 的<strong>会话全文索引插件</strong>（组合包 / <code>dsh.bundle</code>）。</p>
+<p>监听 <code>session/event</code> 事件流，把每一段会话里的<strong>用户消息、助手回复、工具调用/结果、会话标题</strong>
+抽取成可检索文档，构建跨会话倒排索引，并通过 <code>session_search</code> / <code>session_index_stats</code>
+两个工具暴露给模型 —— 让 agent 能"回忆"之前任何一次对话里说过什么、做过什么。</p>
+<h2>功能</h2>
+<table>
+<thead>
+<tr>
+<th>能力</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>实时增量</td>
+<td>每个 <code>session/event</code> 追加立即入索引（按 <code>sessionId#seq</code> 幂等去重）</td>
+</tr>
+<tr>
+<td>历史回填</td>
+<td>启动时先索引内存活动会话，再按水位线用 <code>ctx.sessionPersistence.readFrom(id, fromSeq)</code> 增量补全落盘旧会话 —— 弥补 <code>session/event</code> 不重放已恢复会话历史事件的缺口</td>
+</tr>
+<tr>
+<td>混合检索</td>
+<td><code>preferFts</code> 开启时，<strong>FTS5 + 内存索引并跑、按会话去重合并</strong>：框架 <code>ctx.sessionQuery</code>（SQLite FTS5）负责英文/词级召回，内置二元组索引补足中文召回（FTS5 unicode61 不做中文切词）</td>
+</tr>
+<tr>
+<td>富卡片</td>
+<td><code>presentCall</code>/<code>presentResult</code> + <code>output.presentationMeta</code> 投影成 Web UI 的 <code>card:'search'</code> 卡片：按会话分组的可展开命中列表（组头=会话 id+标题，组内=命中片段）</td>
+</tr>
+<tr>
+<td>持久化</td>
+<td>索引文档按 JSONL 追加到 <code>$DSH_HOME/session-index/&lt;sessionId&gt;.jsonl</code>，重启只补增量</td>
+</tr>
+<tr>
+<td>会话销毁清理</td>
+<td><code>session/disposed</code> 时同步移除该会话全部文档与索引文件</td>
+</tr>
+<tr>
+<td>隐私开关</td>
+<td><code>indexReasoning</code>（默认关，不索引 CoT 思考文本）、<code>indexToolResults</code>（默认开）</td>
+</tr>
+</tbody></table>
+<p>索引内容：<code>user/message</code>、<code>assistant/message</code> 的 text（reasoning 可选）、<code>tool/call</code>（工具名+参数）、<code>tool/result</code>、<code>session/title</code>。</p>
+<h2>仓库结构</h2>
+<pre><code>dsh-session-index/           # 包根 = 仓库根（组合包，dsh.bundle）
+├── src/session-index.ts     # 插件源码（单文件，可擦除 TS，Node 22.18+ 原生类型剥离即可加载）
+├── index.js                 # 编译产物（build 生成，随包分发）
+├── cordis.patch.yml         # ① 挂载插件 ② 把框架自带 FTS5 从 openAt:never 启用为 first-search
+├── test-index.mjs           # 引擎独立测试（不启动 dsh）：65 项断言
+├── tsconfig.json / package.json / LICENSE / .gitignore
+└── README.md
+</code></pre>
+<h2>安装</h2>
+<pre><code># ① 打包（在仓库根目录）
+pnpm pack          # 产出 dsh-session-index-0.1.0.tgz
+# ② 装进 profile（web = 桌面端用的 profile）
+dsh plugin --profile web add ./dsh-session-index-0.1.0.tgz
+# ③ 重启桌面应用 / dsh web
+</code></pre>
+<p>组合包自带 patch 层会额外<strong>覆盖 dsh-base 里 <code>session-query-sqlite</code> 行的配置</strong>：
+把框架自带 FTS5 从默认的 <code>openAt: never</code> 改成 <code>openAt: first-search</code> + 持久化路径
+<code>$DSH_HOME/session-query.sqlite</code>，从而 <code>session_search</code> 自动进入混合检索。
+想关掉就在自己 profile 的 <code>cordis.patch.yml</code> 里再覆盖该行（patch 按层后写覆盖前写）。</p>
+<blockquote>
+<p><strong>为什么用 tarball 而不是 <code>add ./目录</code></strong>：pnpm 对 <code>link:</code> 协议的本地目录包
+<strong>不会安装它的 dependencies</strong>（实测）；<code>pnpm pack</code> 出的 tarball 是普通包，依赖正常装进
+profile 的 <code>.pnpm</code> 子树，bundle 内 <code>@deepseek-ai/*</code> 导入才能解析。</p>
+</blockquote>
+<h2>开发与测试</h2>
+<pre><code># 依赖：@deepseek-ai/* 解析需要本地符号链接（不入库）
+mkdir -p node_modules &amp;&amp; ln -sfn &lt;dsh安装目录&gt;/node_modules/@deepseek-ai node_modules/@deepseek-ai
+#   其中 &lt;dsh安装目录&gt; 通常是 ~/.npm/_npx/&lt;hash&gt;/；桌面端与 dsh web 共用同一份。
+#   tsc 类型检查还需要 @types/node（npm i -D 或复用本机已有安装）
+
+node test-index.mjs                                  # 65 项引擎单测
+pnpm run build                                       # tsc 编译 src → dist/ → index.js
+</code></pre>
+<h2>配置项</h2>
+<table>
+<thead>
+<tr>
+<th>键</th>
+<th>默认</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>dataDir</code></td>
+<td><code>''</code>（自动 = <code>$DSH_HOME/session-index</code>）</td>
+<td>索引落盘目录；填自定义路径可改位置</td>
+</tr>
+<tr>
+<td><code>maxResults</code></td>
+<td><code>20</code></td>
+<td><code>session_search</code> 默认最大命中数</td>
+</tr>
+<tr>
+<td><code>maxSnippetChars</code></td>
+<td><code>240</code></td>
+<td>摘要片段最大字符数（Unicode 码点）</td>
+</tr>
+<tr>
+<td><code>maxDocChars</code></td>
+<td><code>4000</code></td>
+<td>单条文档索引的最大字符数（工具结果可能很大，截断防膨胀）</td>
+</tr>
+<tr>
+<td><code>indexReasoning</code></td>
+<td><code>false</code></td>
+<td>是否索引 assistant 的 reasoning 思考文本</td>
+</tr>
+<tr>
+<td><code>indexToolResults</code></td>
+<td><code>true</code></td>
+<td>是否索引工具返回结果</td>
+</tr>
+<tr>
+<td><code>preferFts</code></td>
+<td><code>true</code></td>
+<td>是否优先使用框架 <code>ctx.sessionQuery</code> FTS5（并跑混合检索）；false 则纯内存索引</td>
+</tr>
+</tbody></table>
+<h2>设计要点</h2>
+<ul>
+<li><strong>为什么需要回填</strong>：<code>session/event</code> 是"提交后追加"事件流，<strong>恢复（resume）的会话不会重放
+seed 历史事件</strong>（<code>constructor seeds do not emit</code>）。插件启动时 ① 用 <code>ctx.sessions.list()</code>
+索引内存活动会话，② 用 <code>ctx.sessionPersistence.list() + readFrom(id, watermark+1)</code> 按水位线
+增量补全落盘旧会话。水位线存在内存 + 持久化索引文件里，重启后只补增量。</li>
+<li><strong>幂等</strong>：<code>sessionId#seq</code> 做文档主键，重复 ingest（回填与实时事件重叠）不重复计数。</li>
+<li><strong>为什么混合</strong>：FTS5 <code>unicode61</code> 分词器不做中文切词，整串 CJK 是单个 token（"可以跨会话
+搜索历史了"匹配不到"跨会话搜索"）；内存索引的二元组召回互补。<code>engine</code> 字段报告实际引擎：
+<code>memory</code> / <code>fts5</code> / <code>hybrid</code>。</li>
+<li><strong>富卡片数据流</strong>：<code>execute</code> 返回规范值 → <code>output.presentationMeta</code> 投影出纯 JSON 卡片数据
+（随 <code>tool/result</code> 事件持久化，可回放）→ <code>presentResult</code> 把它还原成 <code>card:'search'</code> 视图，
+Web UI 按会话分组渲染成可展开卡片。</li>
+</ul>
+<h2>已知限制</h2>
+<ul>
+<li>索引目录应由单个 dsh 进程独占（与框架 session-query 的派生索引一致）；多进程共享同一
+<code>dataDir</code> 未做并发保护。</li>
+<li>中文按二元组召回：单字查询（如"插"）只能命中孤立单字文档，建议至少输入两字。</li>
+<li>框架 FTS5 不索引 <code>session/title</code>，<code>kind='title'</code> 过滤走内存索引。</li>
+<li>卡片内暂无"跳转原会话"交互（框架 wire format 无 link/action 块，前端无会话跳转 URL），
+卡片携带会话 id + 标题，配合侧边栏定位。</li>
+<li><code>session/disposed</code> 只清理内存与自己的 JSONL 文件，不影响原始会话日志。</li>
+</ul>
+<h2>License</h2>
+<p>MIT</p>

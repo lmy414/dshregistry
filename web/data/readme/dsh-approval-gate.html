@@ -1,0 +1,103 @@
+<h1>dsh-approval-gate</h1>
+<p>DeepSeek Harness 自动审批门控插件 v2：<strong>多级判定管道，安全自动批准、危险转人工（fail-safe）</strong>。</p>
+<p>当会话的权限预设为 <code>auto-approve</code>（自动审批（Flash））时，每次审批请求（沙箱越界）按四级管道判定：</p>
+<pre><code>DENY（不可逆危险词）→ 白名单（确定性规则）→ flash 兜底（LLM 多因子）→ 人工学习
+</code></pre>
+<ul>
+<li><strong>① DENY 层</strong>：<code>rm -rf</code> / <code>drop table</code> / <code>force push</code> / 格式化等不可逆危险词命中 → 转人工（<strong>最高优先，fail-safe</strong>）</li>
+<li><strong>② 白名单层</strong>：命中规则 → 直接放行（确定性，不过 LLM）。默认规则 <code>{mode:"workspace-write"}</code> —— 工作区写入（可回补）自动放行，对应 Claude Code <code>acceptEdits</code> / Codex <code>workspace-write</code> 哲学</li>
+<li><strong>③ flash 兜底</strong>：仅 <code>danger-full-access</code>（任意文件/系统）越界走 LLM 多因子判断（不可回补 + 敏感资源 + 沙箱模式语义）</li>
+<li><strong>④ 人工学习</strong>：flash 判 RISKY 转人工、被用户批准 ≥3 次 → 自动沉淀进白名单（<code>danger-full-access</code> 永不自动沉淀）</li>
+</ul>
+<h2>安装</h2>
+<pre><code># 方式一：npm 安装（推荐）
+dsh plugin --profile web add dsh-approval-gate
+
+# 方式二：GitHub 安装
+dsh plugin --profile web add "github:moon09300731/dsh-approval-gate#main"
+</code></pre>
+<h2>⚠️ 安装后必须手动配置权限预设（关键步骤）</h2>
+<p>插件无法向权限预设表添加选项（预设表在配置构造时冻结），需要手动在 profile 的 <code>cordis.patch.yml</code> 中补一条 preset：</p>
+<p>编辑 <code>~/.dsh/profiles/web/cordis.patch.yml</code>，追加（或合并进已有的 <code>permission</code> 行——<strong>loader 的 patch 会整体替换目标行的 config，若已有该行必须重述全部预设</strong>）：</p>
+<pre><code>- id: permission
+  name: '@deepseek-ai/dsh-permission-presets'
+  config:
+    presets:
+      read-only:
+        sandbox: read-only
+        approval: ask
+      workspace-write:
+        sandbox: workspace-write
+        approval: ask
+      danger-full-access:
+        sandbox: danger-full-access
+        approval: never
+      auto-approve:
+        sandbox: workspace-write
+        approval: ask
+        name: 自动审批（Flash）
+        description: 多级判定：工作区写入自动放行，危险操作转人工审批。
+</code></pre>
+<p>重启 <code>dsh web</code> 后，权限下拉菜单会出现「自动审批（Flash）」选项。</p>
+<h2>配置（可选）</h2>
+<p>数据文件统一放在 <code>$DSH_HOME/auto-approve/</code>（默认 <code>~/.dsh/auto-approve/</code>）：</p>
+<table>
+<thead>
+<tr>
+<th>文件</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>allowlist.json</code></td>
+<td>白名单/黑名单配置（首次运行自动生成默认值）</td>
+</tr>
+<tr>
+<td><code>learning.json</code></td>
+<td>学习状态（自动维护，跨会话持久化）</td>
+</tr>
+<tr>
+<td><code>audit.log</code></td>
+<td>审计日志（追加式）</td>
+</tr>
+</tbody></table>
+<p><code>allowlist.json</code> 结构：</p>
+<pre><code>{
+  "denyKeywords": ["rm -rf", "drop table", "force push", "格式化"],
+  "allowRules": [
+    { "mode": "workspace-write", "description": "工作区写入自动放行" },
+    { "tool": "bash", "mode": "workspace-write", "contains": "git add", "description": "特定工具+模式+关键词" }
+  ],
+  "learning": { "enabled": true, "threshold": 3 }
+}
+</code></pre>
+<ul>
+<li><code>denyKeywords</code>：命中即转人工（不可逆危险操作）</li>
+<li><code>allowRules</code>：每条规则 <code>tool</code> / <code>mode</code> / <code>contains</code> 三者均满足才放行（缺省表示任意）</li>
+<li><code>learning.threshold</code>：同一「工具+模式」被人工批准达到该次数后自动沉淀白名单</li>
+</ul>
+<h2>使用</h2>
+<p>在会话的权限下拉（<code>/permission</code> 弹窗或设置页）选中**「自动审批（Flash）」**，该会话即启用自动审批；其他会话不受影响（按会话预设门控）。</p>
+<h2>安全设计</h2>
+<ol>
+<li><strong>DENY 层最高优先</strong>：不可逆危险词命中即转人工，不消耗模型调用、无误判</li>
+<li><strong>fail-safe</strong>：任何异常（flash 调用失败、超时 20s、输出不明确）一律转人工，绝不自动放行</li>
+<li><strong>可回补优先</strong>：<code>workspace-write</code>（写工作区）默认放行，<code>danger-full-access</code>（任意文件/系统）才走 flash 判断</li>
+<li><strong>危险操作永不自动沉淀</strong>：学习闭环只沉淀非 danger 模式，<code>danger-full-access</code> 永远人工</li>
+<li><strong>按会话门控</strong>：只有显式选中「自动审批（Flash）」预设的会话才介入</li>
+<li><strong>只预判、不执行</strong>：插件只返回允许/转人工决策，不修改审批流程的其他环节</li>
+</ol>
+<blockquote>
+<p>警告：自动审批会显著降低人工介入频率。<strong>仅供可信环境使用</strong>，涉及生产数据、远程系统、支付扣费等高风险场景请保持 <code>ask</code> 预设。</p>
+</blockquote>
+<h2>技术说明</h2>
+<ul>
+<li>挂载于 <code>approval/request</code> 瀑布最前（<code>prepend: true</code>，先于 web answerer 接单）</li>
+<li>门控：<code>permissionPresets.current(session.events) === 'auto-approve'</code></li>
+<li>DSH 审批触发点是沙箱越界，<code>reason</code> 固定为 <code>escalate sandbox to &lt;mode&gt;: &lt;justification&gt;</code>，<code>mode</code> 仅 <code>workspace-write</code> / <code>danger-full-access</code> 两级</li>
+<li>flash 判断参数：<code>reasoningEffort: 'off'</code> + <code>maxTokens: 64</code>（默认 maxTokens:16 且开推理时输出会被推理 token 耗尽，导致误判 RISKY）</li>
+<li>超时兜底：<code>Promise.race</code> + <code>ctx.timeout(20s)</code></li>
+<li>学习闭环通过 waterfall 的 <code>next()</code> 返回值捕获人工批准结果（<code>allowed-once</code>）</li>
+</ul>
+<h2>License</h2>
+<p>MIT</p>

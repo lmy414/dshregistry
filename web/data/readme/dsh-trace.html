@@ -1,0 +1,187 @@
+<h1>@deepseek-ai/dsh-trace</h1>
+<p>English | <a href="https://github.com/vibeinging/dsh-trace/blob/HEAD/README.zh.md">中文</a></p>
+<p><code>dsh-trace</code> stores DeepSeek Harness session telemetry in a local embedded yiTrace database. It observes records after the host's <code>telemetry/record</code> waterfall, projects each DSH turn into one yiTrace trace, and writes SDK-native start, log, and end events through yiTrace's Node-API database. No HTTP server, port, or token is required. The plugin is opt-in, adds no model-visible context, and lives outside the DeepSeek Harness monorepo.</p>
+<h2>Features</h2>
+<ul>
+<li><strong>Embedded local storage</strong> — writes directly through <code>@yitrace/db</code>; no HTTP service, port, or access token.</li>
+<li><strong>Complete agent trace tree</strong> — records one root trace per DSH turn, model-step spans below it, and tool-call spans below each step.</li>
+<li><strong>Debugging context</strong> — keeps model identity, token usage, message and tool input/output, error state, and generic in-turn log events.</li>
+<li><strong>Lifecycle recovery</strong> — marks traces that begin mid-turn, closes unfinished spans as failed, flushes on natural boundaries, and recovers committed data when the database reopens.</li>
+<li><strong>Local queries</strong> — supports yiTrace trace, span, full-text search, and aggregate APIs against the configured directory.</li>
+</ul>
+<p>The plugin does not provide a viewer or built-in redaction rules. Use yiTrace-compatible local tools or the <code>@yitrace/db</code> query API to inspect the configured data directory.</p>
+<h2>Use cases</h2>
+<ul>
+<li>Reconstruct an agent turn to see which model step or tool call caused a failure.</li>
+<li>Compare token use, model output, and tool behavior while developing prompts or workflows.</li>
+<li>Search historical local traces for repeated error messages, tool results, or session attributes.</li>
+<li>Keep observability data on the same machine when an HTTP telemetry service is unnecessary or not allowed.</li>
+</ul>
+<h2>Prerequisites</h2>
+<ul>
+<li>Node.js <code>^22.19.0 || &gt;=24.0.0</code> and pnpm <code>11.7.0</code>.</li>
+<li>A writable local directory for yiTrace data.</li>
+<li>Git credentials with read access to the private plugin repository.</li>
+<li>A compatible DSH <code>web</code> or <code>headless</code> profile that provides Session Telemetry and the invariant service.</li>
+</ul>
+<p>The package is private and is not published to an npm registry. Its checked-in <code>lib/</code> runtime allows a pinned private GitHub commit to install without executing a dependency build against private DSH SDK packages. The install command must include <code>-w</code> because a DSH profile is a pnpm workspace root.</p>
+<h2>Quick start</h2>
+<p>The bundle disables the shipped OTLP telemetry backend and replaces it with local embedded yiTrace. It can store user and assistant text, reasoning, tool arguments and results, session ids, and configured identities. Do not boot the profile until its local retention and redaction policy is acceptable.</p>
+<ol>
+<li>Choose an absolute local data directory:</li>
+</ol>
+<pre><code>export DSH_TRACE_DATA_DIR=/absolute/path/to/dsh-traces
+export DSH_TRACE_TENANT_ID=1
+mkdir -p "$DSH_TRACE_DATA_DIR"
+</code></pre>
+<ol>
+<li>Install a reviewed commit directly from the private GitHub repository:</li>
+</ol>
+<pre><code>dsh plugin --profile web add -w github:dsh-external/dsh-trace#&lt;reviewed-commit&gt;
+</code></pre>
+<p>The package's <code>dsh.bundle.patch</code> disables <code>telemetry-otel</code>, loads <code>dsh-trace</code> from <code>DSH_TRACE_DATA_DIR</code>, and loads its invariant companion. Use the same command with <code>--profile headless</code> to enable that independent profile.</p>
+<ol>
+<li>Inspect the composed profile before booting it, then start DSH:</li>
+</ol>
+<pre><code>dsh --profile web --dump-config
+dsh --profile web
+</code></pre>
+<p>The dump must show <code>telemetry-otel</code> as disabled and include <code>dsh-trace</code> plus <code>dsh-trace-invariant</code>. Each completed turn is stored under <code>DSH_TRACE_DATA_DIR</code>; shutdown also closes unfinished spans and flushes the database. Remove the bundle with <code>dsh plugin --profile web remove -w @deepseek-ai/dsh-trace</code>.</p>
+<ol>
+<li>After DSH releases the data directory, inspect traces with <code>@yitrace/db</code>:</li>
+</ol>
+<pre><code>import { YiTraceDB } from '@yitrace/db'
+
+const dataDir = process.env.DSH_TRACE_DATA_DIR
+if (!dataDir) throw new Error('DSH_TRACE_DATA_DIR is required')
+
+const tenantId = process.env.DSH_TRACE_TENANT_ID
+const database = await YiTraceDB.open({
+  dataDir,
+  ...(tenantId ? { tenantId } : {}),
+})
+
+try {
+  const traces = await database.traces()
+  console.dir(traces, { depth: null })
+
+  const first = traces[0]
+  const traceId = first?.externalTraceId
+    ?? first?.external_trace_id
+    ?? first?.traceId
+    ?? first?.trace_id
+  if (traceId !== undefined) {
+    console.dir(await database.trace(traceId), { depth: null })
+  }
+
+  console.dir(await database.search({ text: 'tool process exited' }), { depth: null })
+} finally {
+  await database.close()
+}
+</code></pre>
+<p>Use the same <code>tenantId</code> for writing and reading. The example profile writes tenant <code>1</code>; set <code>DSH_TRACE_TENANT_ID=1</code> before running the query script.</p>
+<h2>Configuration reference</h2>
+<table>
+<thead>
+<tr>
+<th>Field</th>
+<th>Required or default</th>
+<th>Purpose</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>database.dataDir</code></td>
+<td>Required</td>
+<td>Local yiTrace directory. Relative paths resolve from the process working directory at plugin load; use an absolute path for service deployments.</td>
+</tr>
+<tr>
+<td><code>database.tenantId</code></td>
+<td>Optional</td>
+<td>Unsigned 64-bit tenant scope attached to writes. Use the same value when querying.</td>
+</tr>
+<tr>
+<td><code>database.maxBuffered</code></td>
+<td><code>batchSize × 16</code></td>
+<td>Maximum events retained in memory after embedded ingest failures; the oldest events are dropped after the limit.</td>
+</tr>
+<tr>
+<td><code>batchSize</code></td>
+<td><code>256</code></td>
+<td>Events collected before one serialized embedded ingest.</td>
+</tr>
+<tr>
+<td><code>nodeId</code></td>
+<td>Derived by yiTrace</td>
+<td>Snowflake node id in <code>0..1023</code>. Parallel writers must not share an explicit value.</td>
+</tr>
+<tr>
+<td><code>agentName</code></td>
+<td>Harness product identity</td>
+<td>Agent name attached to every span.</td>
+</tr>
+<tr>
+<td><code>shutdownTimeoutMillis</code></td>
+<td><code>3000</code></td>
+<td>Maximum time DSH awaits shutdown. The deadline cannot cancel a native database call already in progress.</td>
+</tr>
+</tbody></table>
+<p>An empty data directory, invalid unsigned 64-bit tenant id, invalid node id, or non-positive size/deadline fails at plugin load.</p>
+<p>The telemetry seam admits one backend per Cordis context. Loading this package together with <code>session-telemetry-otel</code> fails as a duplicate service instead of recording twice. A host-level privacy switch must disable every configured telemetry row; the plugin does not bypass that host policy.</p>
+<h2>Verification and CI</h2>
+<p>The project <code>.npmrc</code> selects the private <code>@deepseek-ai/*</code> scope; pnpm 11 reads its <code>${NPM_TOKEN}</code> authentication mapping from the trusted user-level <code>~/.npmrc</code>. Set <code>NPM_TOKEN</code> and run <code>pnpm install --ignore-scripts</code>. The SDK packages are pinned to the reviewed <code>0.0.1-rc.2</code> set. Do not link or check out DSH source into this repository. <code>pnpm run check</code> enforces the repository boundary, runs source linting and strict type checking, executes seven tests against a real embedded database and a real YAML Loader profile, builds the production entries, runs <code>publint</code> without creating a tarball, and imports the built entries with plain Node. CI maps the <code>NPM_TOKEN</code> secret into setup-node's trusted user configuration.</p>
+<h2>Trace mapping</h2>
+<table>
+<thead>
+<tr>
+<th>DSH source</th>
+<th>yiTrace projection</th>
+<th>Important fields</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>turn/start</code> … <code>turn/end</code></td>
+<td>One root <code>dsh.turn</code> span and one yiTrace trace</td>
+<td>DSH session id, turn number, end reason, status</td>
+</tr>
+<tr>
+<td><code>step/start</code> … <code>step/end</code></td>
+<td>Child <code>dsh.step</code> span</td>
+<td>provider, model, token usage, latest system prompt, redacted message history observed by this backend instance, assistant output</td>
+</tr>
+<tr>
+<td><code>tool/call</code> … <code>tool/result</code></td>
+<td>Child <code>tool.&lt;name&gt;</code> span</td>
+<td>call id, tool name, arguments, result, error status</td>
+</tr>
+<tr>
+<td>Other ledger events inside an open turn</td>
+<td>yiTrace log event on the open step or turn</td>
+<td>event type, source seq, redacted body</td>
+</tr>
+<tr>
+<td><code>agent-error</code></td>
+<td>Error log plus failed open step/turn</td>
+<td>normalized error name and body</td>
+</tr>
+<tr>
+<td><code>shutdown</code></td>
+<td>Close any still-open spans as failed, then flush and close the database</td>
+<td>no synthetic standalone span</td>
+</tr>
+</tbody></table>
+<p>The adapter preserves source event timestamps and derives span duration from their millisecond times. <code>@yitrace/trace-sdk</code> owns deterministic event ids, batching, and wire encoding; <code>@yitrace/db</code> owns the embedded write-ahead log, recovery, durable read models, and queries. DSH string session ids are mapped to yiTrace's numeric <code>session_id</code> through deterministic FNV-1a 64-bit hashing; the original id remains in <code>dsh.session.id</code> span attributes.</p>
+<h2>Data and reliability boundary</h2>
+<p>Every record passes the seam's <code>telemetry/record</code> waterfall before this backend reads it. User and assistant text, reasoning, tool arguments/results, generic event bodies, the session id, and configured agent/tenant identity may be stored in <code>database.dataDir</code>. The seam ships no redaction rules, so a deployment that must not retain raw sensitive values mounts its own rule before enabling yiTrace. The data remains local to the configured directory; the plugin does not open a network connection.</p>
+<p><code>emit()</code> creates yiTrace SDK events and enqueues them in memory. Turn/session flush hints are serialized: each drains <code>BatchExporter</code>, retries the bounded embedded-write buffer, and flushes the database. Disposal closes unfinished spans, drains the same queue, flushes yiTrace's durable state, and closes the database within the configured deadline. An abrupt process crash can still lose events that had not reached the embedded database, while committed yiTrace data is recovered when the directory is reopened.</p>
+<h2>Model Experience</h2>
+<p>None, as the plugin observes post-log session records and never changes a model request, tool schema, or response.</p>
+<h4>KV Cache effect</h4>
+<p>None; this package neither assembles nor sends provider requests.</p>
+<h2>Known Limitations and Deferred Work</h2>
+<ul>
+<li><strong>Private Git distribution</strong> — the package is not published to a registry. Installation requires authorized GitHub access, pnpm <code>11.7.0</code>, a reviewed commit, and a compatible DSH profile.</li>
+<li><strong>The database is a native dependency</strong> — <code>@yitrace/db</code> currently supplies prebuilt packages for macOS arm64/x64, glibc Linux arm64/x64, and Windows x64. Other operating systems, CPU targets, and musl Linux are not covered by this package's current lockfile.</li>
+<li><strong>One local storage mode</strong> — the plugin deliberately has no HTTP backend or cross-machine transport. Give concurrently running DSH processes separate writable data directories unless the yiTrace database documents a shared-writer setup for that deployment.</li>
+<li><strong>State is segmented across telemetry reloads</strong> — disposal closes open spans as failed and resets the adapter's message accumulator. A later positioned event (<code>turn</code>/<code>step</code>) opens a span marked <code>dsh.recovered_segment</code>; its input includes only redacted message events observed after that backend instance loaded. A lone <code>user/message</code> has no position in its payload and cannot reconstruct a missing step by itself.</li>
+<li><strong>Hashed session identity</strong> — yiTrace's TypeScript SDK accepts a numeric <code>session_id</code>, while DSH owns opaque string ids. FNV-1a makes the mapping stable but leaves a theoretical 64-bit collision risk; a future SDK string-id surface would remove this compromise.</li>
+</ul>

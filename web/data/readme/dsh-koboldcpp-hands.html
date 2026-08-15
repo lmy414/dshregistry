@@ -1,0 +1,316 @@
+
+
+<h1>KoboldCpp for DeepSeek Harness</h1>
+<p><strong><code>dsh-koboldcpp-hands</code></strong> — give your DeepSeek Harness agent a pair of local hands.</p>
+<p><a href="https://github.com/MicroHEROX/dsh-koboldcpp-hands"><img src="https://img.shields.io/badge/version-0.1.0-blue" alt="version"></a>
+<a href="https://github.com/MicroHEROX/dsh-koboldcpp-hands/blob/HEAD/LICENSE"><img src="https://img.shields.io/badge/license-MIT-green" alt="license"></a>
+<a href="https://nodejs.org"><img src="https://img.shields.io/badge/node-%3E%3D20-339933" alt="node"></a>
+<a href="https://github.com/deepseek-ai/deepseek-harness"><img src="https://img.shields.io/badge/DeepSeek%20Harness-0.1.0--rc-4D6BFE" alt="harness"></a></p>
+<p><strong><a href="https://github.com/MicroHEROX/dsh-koboldcpp-hands/blob/HEAD/README.md">English</a> · <a href="https://github.com/MicroHEROX/dsh-koboldcpp-hands/blob/HEAD/README.zh-CN.md">中文</a></strong></p>
+
+
+<p>A third-party <strong>tool plugin</strong> for <a href="https://github.com/deepseek-ai/deepseek-harness">DeepSeek Harness</a> that lets the <strong>online model</strong> (your main conversation model) hand repetitive, token-cheap labor to a <strong>local KoboldCpp</strong> (llama.cpp) server — plain text work <em>and</em> vision work (image analysis / OCR / comparison).</p>
+<p>The main model stays where your deployment puts it. When it decides a job is better done locally, it calls:</p>
+<ul>
+<li><strong><code>koboldcpp_run</code></strong> — run one prompt on the local text model (batch rewrites, name translations, string munging, short summarization, extraction).</li>
+<li><strong><code>koboldcpp_vision</code></strong> — send images to a local multimodal model (OCR, image analysis, multi-image comparison) with structured report templates.</li>
+</ul>
+<p>The plugin manages the local server lifecycle: it launches <strong>your</strong> KoboldCpp binary with <strong>your</strong> <code>.kcpps</code> launch config (which owns the GPU backend, model, <code>mmproj</code>, port), waits for the model to load, and stops the server on an idle timeout and/or harness exit. An externally started KoboldCpp is reused and <strong>never</strong> killed.</p>
+<hr>
+<h2>What it does</h2>
+<ul>
+<li><strong>Two model-facing tools</strong> registered on the harness tool registry (<code>ctx.tools</code>), following the official <code>dsh-tools</code> contract (<code>defineTool</code>, canonical JSON values, pure render/presenters, <code>exec.signal</code> forwarding).</li>
+<li><strong>On-demand server lifecycle</strong>: first tool call spawns <code>exePath</code> with your <code>kcppsPath</code> + <code>--port</code>, polls <code>/v1/models</code> until healthy, self-heals if the server dies, and stops per <code>stopBehavior</code> (<code>exit</code> / <code>idle</code> / <code>never</code>). Windows process-<strong>tree</strong> termination (<code>taskkill /T</code>) because KoboldCpp relaunches itself as a child process.</li>
+<li><strong>Text + vision wire support</strong>: non-streaming OpenAI-compatible chat-completions; images sent as the standard multimodal <code>content</code> array.</li>
+<li><strong>Three image sources</strong> for the vision tool: local file paths, <code>data:</code>/<code>http(s):</code> URLs, or the images attached to the current conversation (read through the harness attachment service). <strong>Note:</strong> the conversation-attachment source requires a main model that declares image input — with a text-only main model only <code>image_paths</code> / <code>image_urls</code> work (see <a href="#current-limitation-text-only-main-models--images-arrive-by-link-or-local-path-only">current limitation</a>).</li>
+<li><strong>Structured vision prompts</strong> structured, machine-verifiable report contracts: <code>analyze</code> (8-section report), <code>ocr</code> (character-exact), <code>compare</code> (multi-image, 5-section) — plus a fidelity rule for the online model (relay verbatim, never invent, preserve uncertainty).</li>
+<li><strong>Live config</strong>: a <code>llm-koboldcpp:</code> section in the harness user-settings document overrides the plugin config without a restart; <code>KOBOOLDCPP_EXE</code> / <code>KOBOOLDCPP_KCPPS</code> env fallbacks.</li>
+<li><strong>Safe ownership</strong>: external KoboldCpp processes are reused, never touched; only servers the plugin spawned are stopped.</li>
+</ul>
+<h2>What it does NOT do</h2>
+<ul>
+<li>Does <strong>not</strong> replace the harness LLM provider — the online model stays the main model; the local model is only reached through the two tools.</li>
+<li>Does <strong>not</strong> decide GPU backends, model paths, or templates for you. Everything about the KoboldCpp launch lives in <strong>your <code>.kcpps</code> file</strong> (backend <code>usecuda</code>/<code>usevulkan</code>/<code>usecpu</code>, <code>model_param</code>, <code>mmproj</code>, port). No probing, no auto-flags.</li>
+<li>Does <strong>not</strong> modify any DeepSeek Harness file; it is a pure add-on plugin.</li>
+<li>Does <strong>not</strong> bundle or host GGUF / <code>mmproj</code> model files — bring your own.</li>
+<li>Does <strong>not</strong> use streaming or an API key (local server; no credentials involved).</li>
+<li>Does <strong>not</strong> run inside the harness process as a service — it spawns a separate KoboldCpp process only when needed.</li>
+</ul>
+<h2>Requirements</h2>
+<table>
+<thead>
+<tr>
+<th>Item</th>
+<th>Requirement</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>Node.js</td>
+<td>≥ 20</td>
+</tr>
+<tr>
+<td>DeepSeek Harness</td>
+<td>installed (<code>npx @deepseek-ai/dsh web</code> or a source checkout)</td>
+</tr>
+<tr>
+<td>KoboldCpp binary</td>
+<td><code>koboldcpp.exe</code> (NVIDIA/CUDA) or <code>koboldcpp-nocuda.exe</code> (AMD/Vulkan), any release with <code>/v1/chat/completions</code></td>
+</tr>
+<tr>
+<td>GGUF model</td>
+<td>your own; vision additionally needs a multimodal GGUF <strong>and its <code>mmproj</code></strong> (set <code>"mmproj"</code> in the kcpps)</td>
+</tr>
+</tbody></table>
+<h2>Install</h2>
+<p>Inside your harness project (the directory whose <code>cordis.yml</code> / <code>cordis.patch.yml</code> composes your deployment):</p>
+<pre><code>npm install dsh-koboldcpp-hands
+</code></pre>
+<p>The package ships a <code>dsh.bundle</code> manifest, so <strong>the plugin row is inserted automatically</strong> by the harness loader — you only need the config overrides below. From a source checkout of the harness you can instead point the plugin row directly at a clone of this repo (plain-dependency install, row not auto-inserted):</p>
+<pre><code>- insert:
+    - id: koboldcpp-tool
+      name: '../dsh-koboldcpp-hands'
+</code></pre>
+<h2>Configure</h2>
+<p>You own the launch settings. After an npm install the row already exists with defaults; <strong>override it by id from your profile <code>cordis.patch.yml</code> without <code>insert</code></strong> (an <code>insert</code> with the same id crashes the loader with <code>duplicate loader entry id</code>):</p>
+<pre><code>- id: koboldcpp-tool
+  name: 'dsh-koboldcpp-hands'
+  config:
+    baseURL: 'http://127.0.0.1:5001'                     # must match the port in your kcpps
+    exePath: 'C:\path\to\koboldcpp-nocuda.exe'           # your binary (CUDA or Vulkan build)
+    kcppsPath: 'C:\path\to\your-model.kcpps'             # your launch config: backend + model + mmproj + port
+    autoStart: true
+    stopBehavior: idle
+    idleStopMinutes: 30
+</code></pre>
+<p>(For a plain-dependency install — git/local row, no bundle — use <code>- insert:</code> with the same row instead.)</p>
+<p>The launched command is exactly:</p>
+<pre><code>koboldcpp-nocuda.exe "C:\path\to\your-model.kcpps" --port 5001
+</code></pre>
+<p>Full config reference (all 17 fields with defaults): <a href="https://github.com/MicroHEROX/dsh-koboldcpp-hands/blob/HEAD/docs/api.md">docs/api.md</a> §1.2.</p>
+<h2>Using the tools</h2>
+<h3><code>koboldcpp_run</code> — text</h3>
+<table>
+<thead>
+<tr>
+<th>param</th>
+<th>type</th>
+<th>required</th>
+<th>meaning</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>prompt</code></td>
+<td>string</td>
+<td>yes</td>
+<td>instruction/text sent as a user message</td>
+</tr>
+<tr>
+<td><code>system</code></td>
+<td>string</td>
+<td>no</td>
+<td>optional system instructions</td>
+</tr>
+<tr>
+<td><code>temperature</code></td>
+<td>number</td>
+<td>no</td>
+<td>sampling temperature (0–2)</td>
+</tr>
+<tr>
+<td><code>max_tokens</code></td>
+<td>integer</td>
+<td>no</td>
+<td>output cap (default <code>maxTokens</code>)</td>
+</tr>
+<tr>
+<td><code>stop</code></td>
+<td>string[]</td>
+<td>no</td>
+<td>stop sequences</td>
+</tr>
+</tbody></table>
+<p>Returns <code>{ text, reasoning?, model, usage, elapsedMs }</code>.</p>
+<h3><code>koboldcpp_vision</code> — images / OCR</h3>
+<table>
+<thead>
+<tr>
+<th>param</th>
+<th>type</th>
+<th>required</th>
+<th>meaning</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>mode</code></td>
+<td><code>analyze</code>/<code>ocr</code>/<code>compare</code></td>
+<td>no</td>
+<td>built-in prompt template (default <code>analyze</code>)</td>
+</tr>
+<tr>
+<td><code>prompt</code></td>
+<td>string</td>
+<td>no</td>
+<td>custom instruction (overrides the template)</td>
+</tr>
+<tr>
+<td><code>image_paths</code></td>
+<td>string[]</td>
+<td>no</td>
+<td>local images (png/jpg/jpeg/webp/gif/bmp, ≤20 MB each)</td>
+</tr>
+<tr>
+<td><code>image_urls</code></td>
+<td>string[]</td>
+<td>no</td>
+<td><code>data:image/...</code> or <code>http(s)://</code> URLs</td>
+</tr>
+<tr>
+<td><code>temperature</code></td>
+<td>number</td>
+<td>no</td>
+<td>sampling temperature (lower for OCR, ~0.2)</td>
+</tr>
+<tr>
+<td><code>max_tokens</code></td>
+<td>integer</td>
+<td>no</td>
+<td>output cap</td>
+</tr>
+<tr>
+<td><code>stop</code></td>
+<td>string[]</td>
+<td>no</td>
+<td>stop sequences</td>
+</tr>
+</tbody></table>
+<p>Image sources resolve in order: explicit <code>image_paths</code> + <code>image_urls</code> → the most recent image(s) attached to the conversation → clear error. <code>compare</code> sends 2–4 images in ONE request for joint reasoning.</p>
+<p>Returns <code>{ text, reasoning?, model, images, usage, elapsedMs }</code>.</p>
+<blockquote>
+<p>Vision requires a multimodal GGUF <strong>and its <code>mmproj</code> projector</strong> in the kcpps. Without <code>mmproj</code> the request completes but the model cannot see the image.</p>
+</blockquote>
+<h2>Current limitation: text-only main models — images arrive by link or local path only</h2>
+<p><strong>In the current release (plugin 0.1.0, harness 0.1.0-rc.6), when your main model is text-only, <code>koboldcpp_vision</code> can only receive images through the two explicit channels: <code>image_paths</code> (local file paths) and <code>image_urls</code> (online / <code>data:</code> links).</strong> The conversation-attachment source is unavailable in that setup — and this is a hard limit of the harness, not of this plugin:</p>
+<ol>
+<li>When you paste or drop an image while a text-only model is selected, dsh <strong>rejects the message before it ever enters the session</strong> with <code>attachment-error / MODEL_DOES_NOT_SUPPORT_IMAGES</code> (the UI shows "当前模型不支持图片，请切换支持图片的模型"). The check lives in <code>dsh-host-apiproxy</code>: the selected model's declared input modalities (from the pi-ai model catalog) must include <code>image</code>; a model catalogued as <code>input: ["text"]</code> (e.g. <code>deepseek-v4-flash</code> / <code>deepseek-v4-pro</code> on the <code>opencode-go</code> route) is refused.</li>
+<li>Even if an image part got through, <code>dsh-llm-pi-ai</code>'s streaming adapter rejects image content for the same text-only models (<code>UNSUPPORTED_CONTENT</code>), and subagent continuation sessions block images in the browser client entirely.</li>
+<li>Because the message is refused before it is durably attached, the "most recent conversation-attachment" source has nothing to read — unlike OpenCode / Pi, dsh does <strong>not</strong> currently turn a pasted image into a temporary file path for text-only models.</li>
+</ol>
+<p><strong>Workarounds that work today:</strong></p>
+<ul>
+<li>Ask the model to call <code>koboldcpp_vision</code> with <code>image_paths: ["C:\\...\\photo.png"]</code> — any path readable by the harness process.</li>
+<li>Or pass an online link: <code>image_urls: ["https://example.com/photo.png"]</code> (also <code>data:</code> URLs).</li>
+<li>Or switch the main model to one whose catalog entry declares image input (e.g. <code>minimax-m3</code>, <code>qwen3.7-plus</code>, <code>kimi-k2.6</code>, <code>kimi-k3</code>, <code>grok-4.5</code> on the <code>opencode-go</code> route) — the conversation-attachment source then works automatically.</li>
+</ul>
+<p>Tracked upstream in <a href="https://github.com/deepseek-ai/deepseek-harness/discussions/1378">deepseek-harness discussion #1378</a> (request: allow image attachments for text-only models and deliver them to tools as links/paths). This section will be updated when the harness relaxes the restriction.</p>
+<h2>Roadmap</h2>
+<p><strong>Possible / planned directions:</strong></p>
+<ul>
+<li>More vision modes and prompt templates (document layouts, table extraction).</li>
+<li>Multi-model <code>autoswapmode</code> support (kcpps-level; the wire <code>model</code> field is already configurable).</li>
+<li>Publishing to the npm registry and the <code>dsh-plugin</code> topic.</li>
+<li>Batch jobs: drive many local calls from one agent turn.</li>
+</ul>
+<p><strong>Deliberately NOT planned:</strong></p>
+<ul>
+<li>Automatic GPU/backend detection or flag injection — <strong>your kcpps is authoritative</strong> by design.</li>
+<li>Becoming an LLM provider adapter — the plugin stays a tool; the online model stays the main model.</li>
+<li>Streaming responses — tool calls get the full answer in one round trip (simpler and sufficient).</li>
+<li>Bundling model files (<code>gguf</code>/<code>mmproj</code>) or modifying DeepSeek Harness itself.</li>
+</ul>
+<h2>Uninstall</h2>
+<p>Removing the plugin is as clean as installing it:</p>
+<ol>
+<li><strong>Remove the plugin row</strong> from your profile <code>cordis.patch.yml</code> (or <code>cordis.yml</code>):<pre><code># delete this block
+- insert:
+    - id: koboldcpp-tool
+      name: 'dsh-koboldcpp-hands'
+</code></pre>
+</li>
+<li><strong>Restart the harness</strong> (or let HMR reload if you edit the config live). The two tools (<code>koboldcpp_run</code>, <code>koboldcpp_vision</code>) are unregistered automatically — the online model no longer sees them.</li>
+<li><strong>Server lifecycle</strong> after removal:<ul>
+<li><code>stopBehavior: exit</code> — the plugin stops its spawned KoboldCpp when the harness shuts down gracefully.</li>
+<li><code>stopBehavior: idle</code> — the server stops after the idle window.</li>
+<li><code>stopBehavior: never</code> — the server keeps running; stop it yourself (e.g. <code>taskkill /PID &lt;pid&gt; /T /F</code> on Windows).</li>
+<li>An externally started KoboldCpp is <strong>never</strong> touched.</li>
+</ul>
+</li>
+<li><strong>No residue</strong>: the plugin writes nothing into the harness, leaves no lingering processes on graceful shutdown, and creates no config files of its own. If you installed it via npm, remove it with <code>npm uninstall dsh-koboldcpp-hands</code>.</li>
+</ol>
+<h3>Removing the plugin package itself</h3>
+<ul>
+<li><strong>Installed via npm</strong> — one command removes the package from your project:<pre><code>npm uninstall dsh-koboldcpp-hands
+</code></pre>
+</li>
+<li><strong>Installed from a git clone</strong> (profile row points at the checkout) — remove the profile row, then delete the checkout:<pre><code>Remove-Item -Recurse -Force C:\path\to\dsh-koboldcpp-hands
+</code></pre>
+<pre><code>rm -rf /path/to/dsh-koboldcpp-hands
+</code></pre>
+</li>
+</ul>
+<h2>Version &amp; compatibility</h2>
+<table>
+<thead>
+<tr>
+<th>Component</th>
+<th>Version</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>This plugin</td>
+<td><code>0.1.0</code></td>
+</tr>
+<tr>
+<td>DeepSeek Harness</td>
+<td><code>0.1.0-rc</code> series (tested against npm <code>@deepseek-ai/*</code> <code>0.1.0-rc.6</code>)</td>
+</tr>
+<tr>
+<td>Node.js</td>
+<td>≥ 20</td>
+</tr>
+<tr>
+<td>KoboldCpp</td>
+<td>any release exposing <code>/v1/chat/completions</code></td>
+</tr>
+</tbody></table>
+<p>Peer dependencies (runtime): <code>@deepseek-ai/cordis ^4.0.1</code>, <code>@deepseek-ai/dsh-tools</code>/<code>dsh-llm</code>/<code>dsh-session</code>/<code>dsh-attachment</code>/<code>dsh-settings</code>/<code>dsh-launch-environment</code> <code>&gt;=0.1.0-rc.2</code>, <code>@deepseek-ai/schemastery ^3.18.1</code>.</p>
+<h2>Development</h2>
+<pre><code>npm install
+npm run typecheck   # tsc --noEmit
+npm test            # vitest run (45 tests: unit, tool, integration, Loader composition)
+npm run build       # tsc -&gt; lib/
+</code></pre>
+<p>Tests include a REAL-composition tier (app boot → Cordis Loader → <code>cordis.yml</code>) per the harness testing policy, and a real-machine scenario driver (<code>tests/real-driver.mjs</code>) for autostart / reuse / not-running behaviors.</p>
+<h2>Documentation</h2>
+<table>
+<thead>
+<tr>
+<th>doc</th>
+<th>content</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><a href="https://github.com/MicroHEROX/dsh-koboldcpp-hands/blob/HEAD/docs/engineering.md">docs/engineering.md</a></td>
+<td>structure, plugin contract, commands, test tiers</td>
+</tr>
+<tr>
+<td><a href="https://github.com/MicroHEROX/dsh-koboldcpp-hands/blob/HEAD/docs/api.md">docs/api.md</a></td>
+<td>authoritative API reference (Config, tools, classes, error codes)</td>
+</tr>
+<tr>
+<td><a href="https://github.com/MicroHEROX/dsh-koboldcpp-hands/blob/HEAD/docs/glossary.md">docs/glossary.md</a></td>
+<td>standard terminology</td>
+</tr>
+<tr>
+<td><a href="https://github.com/MicroHEROX/dsh-koboldcpp-hands/blob/HEAD/docs/solutions.md">docs/solutions.md</a></td>
+<td>pitfalls, troubleshooting, methodology</td>
+</tr>
+</tbody></table>
+<h2>Credits &amp; thanks</h2>
+<ul>
+<li><strong><a href="https://github.com/deepseek-ai/deepseek-harness">DeepSeek AI</a></strong> — the DeepSeek Harness platform this plugin plugs into, and the reference implementations (<code>dsh-llm-deepseek</code>, <code>dsh-tool-todo</code>) that define the patterns we follow.</li>
+<li><strong><a href="https://github.com/LostRuins/koboldcpp">LostRuins / KoboldCpp</a></strong> — the excellent local llama.cpp server with an OpenAI-compatible API that makes all of this possible.</li>
+<li><strong><a href="https://github.com/cordiverse/cordis">Cordis</a></strong> — the plugin runtime that powers the harness.</li>
+<li>The open-source models and quantizers (llama.cpp ecosystem, GGUF) that run locally on your machine.</li>
+</ul>
+<h2>License</h2>
+<p><a href="https://github.com/MicroHEROX/dsh-koboldcpp-hands/blob/HEAD/LICENSE">MIT</a>. Not affiliated with DeepSeek AI or LostRuins; <code>dsh</code> and <code>koboldcpp</code> are trademarks of their respective owners.</p>

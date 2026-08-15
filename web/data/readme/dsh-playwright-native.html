@@ -1,0 +1,349 @@
+<h1>把 Playwright 原生 CLI 注册成 DeepSeek Harness 工具</h1>
+<blockquote>
+<p>目标：让 Agent <strong>直接调用本机安装的原生 <code>playwright</code> 命令</strong>——<code>playwright test</code>、<code>playwright install</code>、<code>playwright show-report</code>、<code>playwright --version</code>……——而不是某个二次封装后的语义工具。</p>
+</blockquote>
+<p>DSH 里"给 Agent 加一个工具"只有一条正路：在插件里用 <code>ctx.tools.register(defineTool(...))</code> 注册。所以"把 Playwright CLI 注册成 DSH 插件"的正确做法是：<strong>注册一个名叫 <code>playwright</code> 的透传工具</strong>，把 Agent 给的参数<strong>原样、按序</strong>转发给本机 <code>playwright</code> 二进制。它不拆分 <code>install/test/show-report</code> 子工具、不做任何参数映射——Agent 敲什么，就跑什么。</p>
+<p>本仓库就是这样一个插件（<code>dsh-playwright-native</code>），可直接安装：</p>
+<pre><code>dsh plugin --profile web add github:mitao-su/dsh-playwright-native
+</code></pre>
+<hr>
+<h2>目录</h2>
+<ol>
+<li><a href="#1-%E5%AE%83%E5%92%8C%E5%B0%81%E8%A3%85%E7%9A%84%E5%8C%BA%E5%88%AB%E5%85%88%E7%9C%8B%E6%B8%85%E8%A6%81%E4%BB%80%E4%B9%88">它和"封装"的区别（先看清要什么）</a></li>
+<li><a href="#2-%E5%89%8D%E7%BD%AE%E8%A6%81%E6%B1%82">前置要求</a></li>
+<li><a href="#3-%E5%8E%9F%E7%90%86%E5%B7%A5%E5%85%B7%E6%B3%A8%E5%86%8C--ctxtoolsregister">原理：工具注册 = <code>ctx.tools.register</code></a></li>
+<li><a href="#4-%E5%B7%A5%E7%A8%8B%E7%BB%93%E6%9E%84">工程结构</a></li>
+<li><a href="#5-step-1-packagejson">Step 1 <code>package.json</code></a></li>
+<li><a href="#6-step-2-cordispatchyml">Step 2 <code>cordis.patch.yml</code></a></li>
+<li><a href="#7-step-3-srcindexts-%E5%AE%9E%E7%8E%B0%E9%80%8F%E4%BC%A0%E5%B7%A5%E5%85%B7">Step 3 <code>src/index.ts</code> 实现透传工具</a></li>
+<li><a href="#8-step-4-%E6%9E%84%E5%BB%BA">Step 4 构建</a></li>
+<li><a href="#9-step-5-%E6%B3%A8%E5%86%8C%E8%BF%9B-profile">Step 5 注册进 profile</a></li>
+<li><a href="#10-step-6-%E4%BD%BF%E7%94%A8">Step 6 使用</a></li>
+<li><a href="#11-step-7-%E5%8F%91%E5%B8%83%E5%88%B0-github%E5%B8%A6-dsh-plugin-topic">Step 7 发布到 GitHub（带 <code>dsh-plugin</code> topic）</a></li>
+<li><a href="#12-%E5%B8%B8%E8%A7%81%E9%97%AE%E9%A2%98">常见问题</a></li>
+</ol>
+<hr>
+<h2>1. 它和"封装"的区别（先看清要什么）</h2>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>语义封装（不要）</th>
+<th>原生注册（本仓库）</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>工具名</td>
+<td><code>playwright_version</code> / <code>playwright_test</code> / …</td>
+<td><strong><code>playwright</code></strong></td>
+</tr>
+<tr>
+<td>参数</td>
+<td>每个子命令一套自订字段</td>
+<td>一个 <code>args: string[]</code>，原样透传</td>
+</tr>
+<tr>
+<td>行为</td>
+<td>把 CLI 选项映射成自定义 schema</td>
+<td><strong>Agent 敲什么就 <code>playwright</code> 什么</strong></td>
+</tr>
+<tr>
+<td>Agent 视角</td>
+<td>调一个"别人打包过的工具"</td>
+<td>调<strong>原生命令</strong></td>
+</tr>
+</tbody></table>
+<p>一句话：<strong>CLI 是能力，<code>ctx.shell</code> 是执行缝，<code>defineTool</code> + <code>cordis.patch.yml</code> 是注册。</strong> 我们要的是最后两样，不重写第一样。</p>
+<hr>
+<h2>2. 前置要求</h2>
+<table>
+<thead>
+<tr>
+<th>项</th>
+<th>要求</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>Playwright</td>
+<td>本机已安装 <code>playwright</code> 命令（<code>playwright --version</code> 可跑）。默认用它；也可在配置里改成 <code>npx --no-install playwright</code></td>
+</tr>
+<tr>
+<td>DSH</td>
+<td><code>dsh</code> 可用（本教程验证于 <code>0.1.0-rc.6</code>）；目标 profile 已挂载 shell 执行器（标准 <code>web</code>/<code>headless</code> 自带）</td>
+</tr>
+<tr>
+<td>pnpm</td>
+<td>用于 <code>dsh plugin add</code>（pnpm ≥ 10 对 Git 依赖默认拦截构建脚本，见 §11）</td>
+</tr>
+</tbody></table>
+<p>验证环境：</p>
+<pre><code>playwright --version     # 例如 Version 1.62.1
+dsh --version            # 例如 0.1.0-rc.6
+</code></pre>
+<hr>
+<h2>3. 原理：工具注册 = <code>ctx.tools.register</code></h2>
+<p>DSH 的模型可见工具全部来自插件注册（或 MCP server）。核心契约：</p>
+<pre><code>export const name = 'playwright-native'
+export const inject = ['tools', 'shell', 'systemPrompt']   // 必需 service
+
+export function apply(ctx: Context, config: Config): void {
+  ctx.tools.register(defineTool({
+    name: 'playwright',            // ← Agent 看到的工具名，就是原生命令名
+    description: '...',
+    parameters: { args: { type: 'array', items: { type: 'string' }, required: true } },
+    output: { schema, render },
+    execute: async (args, exec) =&gt; run(exec, ['playwright', ...args.args]),  // 原样转发
+  }))
+}
+</code></pre>
+<ul>
+<li><strong>执行缝走 <code>ctx.shell</code></strong>（与官方 <code>bash</code>/<code>pwsh</code> 工具同源），自动获得 sandbox 策略、<code>DSH_*</code> 环境、输出截断、超时/中止分类。</li>
+<li><strong><code>cordis.patch.yml</code> + <code>dsh.bundle.patch</code></strong> 让这个包成为 profile 配置树里的一层，<code>dsh plugin add</code> 安装后自动把它写进 <code>dsh.profile.bundles</code>。</li>
+</ul>
+<hr>
+<h2>4. 工程结构</h2>
+<pre><code>dsh-playwright-native/
+├── package.json          # dsh.bundle.patch + exports + peerDeps
+├── tsconfig.json         # src/ → lib/
+├── cordis.patch.yml      # 插件配置层（注册的核心）
+├── LICENSE
+└── src/
+    └── index.ts          # apply() + defineTool('playwright', 透传)
+</code></pre>
+<hr>
+<h2>5. Step 1 <code>package.json</code></h2>
+<pre><code>{
+  "name": "dsh-playwright-native",
+  "version": "0.1.0",
+  "type": "module",
+  "main": "lib/index.js",
+  "types": "lib/index.d.ts",
+  "exports": {
+    ".": { "types": "./lib/index.d.ts", "default": "./lib/index.js" },
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "files": ["lib", "cordis.patch.yml", "README.md", "LICENSE"],
+  "dsh": { "bundle": { "patch": "./cordis.patch.yml" } },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "keywords": ["dsh-plugin", "deepseek-harness", "playwright", "e2e", "testing"],
+  "license": "MIT",
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.1",
+    "@deepseek-ai/dsh-agent": "^0.1.0-rc.6",
+    "@deepseek-ai/dsh-shell": "0.1.0-rc.6",
+    "@deepseek-ai/dsh-tools": "0.1.0-rc.6",
+    "@deepseek-ai/schemastery": "3.18.1"
+  }
+}
+</code></pre>
+<p>要点：</p>
+<ul>
+<li><strong><code>dsh.bundle.patch</code> 是注册的关键</strong>：没有它，包只是普通依赖，不会成为 profile 层。</li>
+<li><code>exports</code> 必须暴露 <code>./cordis.patch.yml</code> 和 <code>./package.json</code>，供 loader 读取。</li>
+<li>DSH/Cordis 运行时声明为 <code>peerDependencies</code>，避免复制运行时身份。</li>
+<li><code>keywords</code> 里的 <code>dsh-plugin</code> 服务 npm 搜索；GitHub 仓库的 topic 是另一处（§11）。</li>
+</ul>
+<p><code>tsconfig.json</code>：</p>
+<pre><code>{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "strict": true,
+    "declaration": true,
+    "outDir": "lib",
+    "rootDir": "src",
+    "skipLibCheck": true,
+    "esModuleInterop": true,
+    "forceConsistentCasingInFileNames": true,
+    "types": ["node"]
+  },
+  "include": ["src"]
+}
+</code></pre>
+<hr>
+<h2>6. Step 2 <code>cordis.patch.yml</code></h2>
+<p>顶层数组；<code>id</code> 是配置树里稳定的行身份，<code>name</code> 是 Node 可解析的包名：</p>
+<pre><code># dsh-playwright-native bundle layer.
+- insert:
+    - id: playwright-native
+      name: dsh-playwright-native
+      config:
+        command: playwright        # 可改成 "npx --no-install playwright" 强制本地副本
+        timeoutMs: 600000          # 每次调用的默认超时（毫秒）
+</code></pre>
+<p>注意：后层按 <code>id</code> 覆盖前层，且 <code>config</code> 是<strong>整段替换</strong>（不是深合并），覆盖时要重述所需键。</p>
+<hr>
+<h2>7. Step 3 <code>src/index.ts</code> 实现透传工具</h2>
+<p>完整实现见 <a href="https://github.com/mitao-su/dsh-playwright-native/blob/HEAD/src/index.ts"><code>src/index.ts</code></a>。核心只有两点——<strong>把 <code>args</code> 原样拼到命令上</strong>，<strong>用 <code>ctx.shell</code> 跑</strong>：</p>
+<pre><code>export const name = 'playwright-native'
+export const inject = ['tools', 'shell', 'systemPrompt']
+
+export interface Config { command: string; timeoutMs: number }
+export const Config = z.object({
+  command: z.string().default('playwright'),      // 默认直呼本机原生命令
+  timeoutMs: z.number().default(600_000),
+})
+
+export function apply(ctx: Context, config: Config): void {
+  const run = async (exec: ToolRunContext, argv: string[]) =&gt; {
+    const command = argv.map(quote).join(' ')
+    const spec = ctx.shell.resolve({              // 走 shell 执行器，不做 child_process 手搓
+      command,
+      workdir: resolveWorkdir(args.workdir, exec),  // 默认会话工作区
+      timeoutMs: config.timeoutMs,
+      signal: exec.signal,                          // 转发中止
+    })
+    const result = await ctx.shell.run(spec)
+    return canonical(result)                        // { exitCode, signal, stdout, stderr, ... }
+  }
+
+  ctx.systemPrompt.section({
+    name: 'tool:playwright',
+    order: 106,
+    text: 'The `playwright` tool runs the native Playwright CLI ... check the [exit code: N] and [sandbox: ...] markers.',
+  })
+
+  ctx.tools.register(defineTool({
+    name: 'playwright',
+    description:
+      'Run the native Playwright CLI with the exact arguments you would type on the command line. ' +
+      'Arguments are forwarded verbatim and in order — do not prepend `playwright` yourself. ...',
+    parameters: {
+      args: {                        // ← 唯一核心参数：原生命令参数数组
+        type: 'array',
+        items: { type: 'string' },
+        required: true,
+        description: 'Playwright CLI arguments in order, e.g. ["test", "tests/", "--reporter", "html"].',
+      },
+      workdir: { type: 'string', description: 'Working directory (default: session workspace).' },
+      timeoutMs: { type: 'integer', description: 'Timeout override in milliseconds.' },
+    },
+    output: { schema: runSchema, render: (_, v) =&gt; textBlock(renderRun(v)) },
+    isConcurrencySafe: () =&gt; false,  // playwright test 共享 test-results/report 目录，不并发
+    execute: async (args, exec) =&gt;
+      run(exec, [...config.command.split(/\s+/).filter(Boolean), ...args.args]),  // 原样透传
+    presentCall: (args) =&gt; ({
+      card: 'terminal',
+      title: `playwright ${(args.args ?? []).join(' ')}`,
+      description: 'Run the native Playwright CLI',
+    }),
+  }))
+}
+</code></pre>
+<p>几个"原生"的关键点：</p>
+<ul>
+<li><strong>只有一个 <code>args</code> 数组</strong>，没有把 <code>install/test/show-report</code> 拆成不同工具，也没有把 CLI 选项映射成自定义 schema。</li>
+<li><strong>非零退出 = 报告，不是报错</strong>：结果带 <code>[exit code: N]</code> 标记，由模型自行决定下一步。</li>
+<li><strong><code>command</code> 可配置</strong>：默认 <code>playwright</code>（直呼本机原生命令）；要强制走项目本地副本时改成 <code>npx --no-install playwright</code>。</li>
+<li><strong>沙箱升级</strong>：<code>playwright test</code> 会 fork worker 子进程、<code>playwright install</code> 会下载浏览器，都可能被文件沙箱拒绝。完整实现里保留了与官方 shell 工具一致的 <code>sandbox_permissions</code> + <code>justification</code> 升级出口（拒绝后带 <code>[sandbox: file access denied ...]</code> 标记，用最窄更宽模式重试、执行前弹审批）。</li>
+</ul>
+<hr>
+<h2>8. Step 4 构建</h2>
+<pre><code>pnpm install
+pnpm build        # tsc → lib/index.js + lib/index.d.ts
+</code></pre>
+<p>把 <code>lib/</code> 提交进 Git（本仓库即如此），Git 分发时 pnpm <strong>不执行任何 prepare 脚本</strong>、零交互、无需 <code>allowBuilds</code>。</p>
+<hr>
+<h2>9. Step 5 注册进 profile</h2>
+<p><code>dsh plugin</code> 是 profile 目录里的 <strong>pnpm 转发层</strong>：首次使用时初始化 profile → 转发 <code>pnpm add</code> → 按安装状态把声明了 <code>dsh.bundle</code> 的包<strong>对账进 <code>dsh.profile.bundles</code></strong>。</p>
+<pre><code># 本地路径（先这样验证）
+dsh plugin --profile web add ./dsh-playwright-native
+
+# GitHub（本机 git 可访问 GitHub）
+dsh plugin --profile web add github:mitao-su/dsh-playwright-native
+
+# 受限网络备选：GitHub tarball
+dsh plugin --profile web add https://github.com/mitao-su/dsh-playwright-native/archive/refs/heads/main.tar.gz
+</code></pre>
+<p>安装后<strong>重启目标 profile</strong>。验证注册生效：</p>
+<pre><code>dsh --profile web --dump-config
+</code></pre>
+<p>应能看到这一层（本教程实测）：</p>
+<pre><code># == dsh-playwright-native
+- id: playwright-native
+  name: dsh-playwright-native
+  config:
+    command: playwright
+    timeoutMs: 600000
+</code></pre>
+<blockquote>
+<p>实测过程：全新 profile 先被初始化为 <code>@deepseek-ai/dsh-base</code>，<code>add</code> 后 <code>dsh.profile.bundles</code> 变成 <code>["@deepseek-ai/dsh-base", "dsh-playwright-native"]</code>，<code>--dump-config</code> 里出现上面这层。</p>
+</blockquote>
+<p>配置覆盖（profile 的 <code>cordis.patch.yml</code> 按 <code>id</code> 整段替换）：</p>
+<pre><code>- insert:
+    - id: playwright-native
+      name: dsh-playwright-native
+      config:
+        command: npx --no-install playwright
+        timeoutMs: 600000
+</code></pre>
+<hr>
+<h2>10. Step 6 使用</h2>
+<p>注册后，Agent 的工具列表里多了一个 <strong><code>playwright</code></strong>，直接传原生命令参数：</p>
+<table>
+<thead>
+<tr>
+<th>Agent 想做的事</th>
+<th>调用 <code>playwright</code> 的 <code>args</code></th>
+</tr>
+</thead>
+<tbody><tr>
+<td>看版本</td>
+<td><code>["--version"]</code></td>
+</tr>
+<tr>
+<td>装浏览器</td>
+<td><code>["install", "chromium"]</code></td>
+</tr>
+<tr>
+<td>跑测试</td>
+<td><code>["test", "tests/login.spec.ts", "--reporter", "html"]</code></td>
+</tr>
+<tr>
+<td>打开报告</td>
+<td><code>["show-report"]</code></td>
+</tr>
+<tr>
+<td>录脚本</td>
+<td><code>["codegen", "https://example.com"]</code></td>
+</tr>
+<tr>
+<td>截图</td>
+<td><code>["screenshot", "https://example.com", "shot.png"]</code></td>
+</tr>
+</tbody></table>
+<p>无 GUI 的一次真实任务验证：</p>
+<pre><code>dsh --profile headless "用 playwright 跑 tests/ 下的用例并打开报告"
+</code></pre>
+<hr>
+<h2>11. Step 7 发布到 GitHub（带 <code>dsh-plugin</code> topic）</h2>
+<p><code>keywords</code> 里的 <code>dsh-plugin</code> 只服务 npm 搜索；<strong>GitHub 仓库的 topic 是另一处</strong>。</p>
+<pre><code>cd dsh-playwright-native
+git init -b main &amp;&amp; git add . &amp;&amp; git commit -m "register the native Playwright CLI as a DSH tool"
+
+# 1) 建公开仓库并从本地推上去（owner 省略时默认当前登录账号）
+gh repo create dsh-playwright-native --public --source . --remote origin --push \
+  --description "把原生 Playwright CLI 注册为 DeepSeek Harness 透传工具"
+
+# 2) 打 topic
+gh repo edit mitao-su/dsh-playwright-native --add-topic dsh-plugin
+
+# 3) 验证
+gh repo view mitao-su/dsh-playwright-native --json name,url,repositoryTopics
+</code></pre>
+<p>Git 分发说明：Git 获取的是<strong>源码</strong>，不是构建产物。本仓库走"把 <code>lib/</code> 提交进 Git"的无交互安装路径（无 <code>prepare</code> 脚本），所以无需 <code>allowBuilds</code>；若你的插件要跑构建脚本，pnpm ≥ 10 会默认拦截，需在 profile 的 <code>pnpm-workspace.yaml</code> 显式 <code>allowBuilds</code> 后重跑 <code>add</code>。</p>
+<hr>
+<h2>12. 常见问题</h2>
+<ul>
+<li><strong>沙箱拒绝</strong>：<code>playwright test</code> fork worker / <code>playwright install</code> 下载浏览器可能被文件沙箱拒绝，结果带 <code>[sandbox: file access denied ...]</code> 标记。用 <code>sandbox_permissions</code> + <code>justification</code> 以最窄更宽模式重试同一命令（执行前弹审批，仅本次生效）。</li>
+<li><strong>双副本</strong>：若把 <code>command</code> 配成 <code>npx --no-install playwright</code>，它只认 workdir 里的本地 <code>@playwright/test</code>；spec 文件与 CLI 解析到不同副本会出现 <code>test.describe() not expected here</code>。解决：<code>workdir</code> 指向装有本地 <code>@playwright/test</code> 的项目目录，或直接保持默认 <code>command: playwright</code>。</li>
+<li><strong>引号</strong>：参数按挂载 shell 方言（bash/pwsh）自动安全引用；含单引号的路径请先重命名。</li>
+<li><strong>并发</strong>：<code>playwright test</code> 声明 <code>isConcurrencySafe: () =&gt; false</code>（共享 test-results/report 目录）。</li>
+</ul>
+<h2>License</h2>
+<p>MIT（见 <a href="https://github.com/mitao-su/dsh-playwright-native/blob/HEAD/LICENSE">LICENSE</a>）。</p>

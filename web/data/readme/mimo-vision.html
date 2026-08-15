@@ -1,0 +1,181 @@
+<h1>mimo-vision · Native vision plugin for DSH</h1>
+<p><strong>English</strong> | <a href="https://github.com/wulusai2333/mimo-vision/blob/HEAD/README.zh.md">中文</a></p>
+<p><strong>mimo-vision</strong> is a native plugin for <strong>DeepSeek Harness (DSH)</strong>, package name <code>mimo-vision</code>. It registers a <code>describe_image</code> tool that sends an image to a mimo-v2.5-series multimodal model and returns the <strong>text description</strong> to the main model — a "vision bridge" built for main models (e.g. <code>deepseek-v4-flash</code>) that have no vision input of their own.</p>
+<p>It is not a standalone process: it is a first-class citizen of DSH's "everything is a plugin" model. <code>apply</code> does exactly one thing — registers the capability as a first-class dsh tool. Dependencies, files, credentials, and subprocesses all go through dsh's defined capability seams; uninstalling cleans up cleanly.</p>
+<h3>Implementation paradigm: a direct landing of DSH's native plugin primitives</h3>
+<ul>
+<li><strong>Registration is reversible by construction</strong>: <code>apply(ctx)</code> contains a single <code>ctx.tools.register(defineTool(...))</code>. <code>register()</code> returns a disposer; when the plugin fiber disposes, the tool is unregistered and its schema is automatically withdrawn from the system prompt. There is no leftover cleanup code — clean uninstall is a <strong>structural guarantee</strong>, not hand-written cleanup.</li>
+<li><strong><code>inject</code> declares dependencies</strong>: <code>export const inject = ['tools', 'fs', 'credentials']</code> follows the pure Cordis effect spec — activation only happens once the seams are in place. <code>ctx.get('subprocess')</code> in <code>transcode.ts</code> is an optional capability with a default fallback, used at execution time, not activation time. This is "declared dependencies", not "probed dependencies".</li>
+<li><strong>All capabilities go through dsh seams</strong>: file reads use <code>ctx.fs.resolve/stat/readBytes</code> + <code>ctx.emit('fs/observed')</code>; credentials use <code>ctx.credentials.resolve(credentialRef(...))</code> with no hand-rolled parsing; subprocess (transcoding) uses <code>ctx.subprocess</code>. The one exception: transcode temp files are written via <code>node:fs</code> to the system temp directory (see Known Limitations below).</li>
+<li><strong>Uninstallable / composable</strong>: uninstall is pure — the disposer runs and everything is reclaimed: no disk writes, no timers, no long-lived connections to manually wind down.</li>
+</ul>
+<h2>Tool</h2>
+<table>
+<thead>
+<tr>
+<th>Tool</th>
+<th>Arguments</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>describe_image</code></td>
+<td><code>path</code> (required), <code>question</code> (optional)</td>
+<td>Describes an image file and returns text</td>
+</tr>
+</tbody></table>
+<p>Supported image formats:</p>
+<ul>
+<li><strong>Sent natively</strong>: PNG / JPEG / GIF / WebP / BMP (all verified decodable by the vision model)</li>
+<li><strong>Auto-transcoded</strong>: SVG / TIFF / HEIC / PSD / ICO / EXR / JP2 / JXL / AVIF — when ImageMagick is installed locally, these are transcoded to PNG before sending, downscaled to a ≤2048px long edge (saves tokens)</li>
+<li>Any other extension, or a transcode-format when ImageMagick is not installed, returns an explicit error (never sent silently)</li>
+</ul>
+<p>Usage example (tell the model): <code>Use describe_image to describe D:\photos\cat.png, focusing on what breed of cat it is</code>.</p>
+<h2>How it works</h2>
+<ol>
+<li><strong>Key resolution</strong>: <code>ctx.credentials.resolve</code> takes the first non-empty of <code>OPENCODE_GO_API_KEY</code> → <code>OPENCODE_API_KEY</code> (DSH credential layering: process env &gt; <code>~/.dsh/.credentials.yaml</code> &gt; <code>.env</code>).</li>
+<li><strong>Read the image</strong>: <code>ctx.fs.resolve</code> (relative paths resolve against the session workspace cwd) → <code>ctx.fs.readBytes</code> (20 MiB cap); non-native formats (SVG/TIFF/HEIC…) are transcoded to PNG via ImageMagick (through the <code>ctx.subprocess</code> seam) and downscaled to a 2048px long edge → base64.</li>
+<li><strong>Routing</strong>: the free Zen route (<code>mimo-v2.5-free</code>) is tried first; on failure (non-2xx / timeout) it falls back to the paid Go route (<code>mimo-v2.5</code>) once per request; <code>allowPaid: false</code> disables the paid fallback.</li>
+</ol>
+<p>Design decisions are documented in <a href="https://github.com/wulusai2333/mimo-vision/blob/HEAD/adr/0002-dsh-native-plugin.md">adr/0002-dsh-native-plugin.md</a> (which supersedes the earlier MCP approach, ADR-0001).</p>
+<hr>
+<h2>Quick install (npm-installed DSH, recommended)</h2>
+<blockquote>
+<p>For <code>npx @deepseek-ai/dsh web</code> or a globally installed DSH. The repo ships <strong>prebuilt artifacts</strong> (<code>lib/index.js</code>) — no build toolchain required.</p>
+</blockquote>
+<p><strong>Prerequisite</strong>: Node <code>^22.19 || &gt;=24</code>, and DSH already able to start.</p>
+<h3>Step 0 · Install and activate (one command)</h3>
+<p>mimo-vision declares <code>dsh.bundle</code> (see the <code>dsh</code> field in <code>package.json</code>), so <code>dsh plugin add</code> reconciles it as a bundle layer of the profile — <strong>installing the package, mounting the layer, and activating the tool happen in one step</strong>:</p>
+<pre><code>dsh plugin --profile web add github:wulusai2333/mimo-vision
+</code></pre>
+<blockquote>
+<p>If the repo is not on its default branch, use <code>github:wulusai2333/mimo-vision#&lt;branch-or-tag&gt;</code>.
+This path relies on the <strong>dependency closure</strong> that DSH maintains in <code>~/.dsh/profiles/node_modules</code> (symlinking all <code>@deepseek-ai/*</code> seams to the dsh install tree), so the plugin's runtime <code>import "@deepseek-ai/dsh-tools"</code> etc. resolves to the <strong>same instance DSH uses</strong> — singleton-safe, <code>register()</code>/<code>inject</code> semantics unchanged.
+GitHub-source installs require this repo to commit a <strong>prebuilt <code>lib/</code></strong> (kept in sync with <code>src/</code>): pnpm installs the source with <code>lib/</code> included, no build runs, no <code>allowBuilds</code> needed.</p>
+</blockquote>
+<details>
+<summary>Offline / manual mount from source (fallback path when pnpm is unavailable)</summary>
+
+<p>Manually copy the artifacts into the profile's plugin resolution root, then mount the patch in the profile's <code>cordis.patch.yml</code> (equivalent to automatic bundle mounting, but two manual steps):</p>
+<pre><code># Windows PowerShell
+$dst = "$env:USERPROFILE\.dsh\profiles\node_modules\mimo-vision"
+New-Item -ItemType Directory -Path $dst -Force | Out-Null
+Copy-Item package.json -Destination $dst -Force
+Copy-Item cordis.patch.yml -Destination $dst -Force
+Copy-Item lib -Destination $dst -Recurse -Force
+</code></pre>
+<pre><code># macOS / Linux
+dst="$HOME/.dsh/profiles/node_modules/mimo-vision"
+mkdir -p "$dst"
+cp package.json "$dst/"
+cp cordis.patch.yml "$dst/"
+cp -r lib "$dst/"
+</code></pre>
+<p>Then edit <code>~/.dsh/profiles/web/cordis.patch.yml</code> and add:</p>
+<pre><code>- insert:
+    - id: tool-vision
+      name: 'mimo-vision'
+      config:
+        allowPaid: true
+</code></pre>
+</details>
+
+<h3>Step 1 · Configure the key</h3>
+<p>Put an opencode key in <code>~/.dsh/.credentials.yaml</code> (<code>OPENCODE_GO_API_KEY</code> preferred, <code>OPENCODE_API_KEY</code> as fallback):</p>
+<pre><code>OPENCODE_GO_API_KEY: sk-...
+</code></pre>
+<blockquote>
+<p>You can also put it in the environment of the process that starts DSH (<code>OPENCODE_GO_API_KEY=... dsh web</code>). Credential seam layering priority: process env &gt; <code>.credentials.yaml</code> &gt; <code>.env</code>.</p>
+</blockquote>
+<h3>Step 2 · Restart and verify</h3>
+<p><strong>A restart is required on first integration</strong> (so the process <code>import</code>s the new package). After that, changes to this plugin's code or config such as <code>allowPaid</code> hot-reload without restart.</p>
+<p>After restarting, verify: <code>mimo-vision</code> should appear in DSH's settings, with <code>describe_image</code> among the available tools; or just tell the model "use describe_image to describe some image" and try it.</p>
+<h3>Uninstall</h3>
+<p><code>dsh plugin remove</code> takes the <strong>package name</strong> (the key in the profile's <code>dependencies</code>), not the install source:</p>
+<pre><code>dsh plugin --profile web remove mimo-vision
+</code></pre>
+<blockquote>
+<p>Passing <code>github:wulusai2333/mimo-vision</code> errors with <code>ERR_PNPM_CANNOT_REMOVE_MISSING_DEPS</code> ("no such dependency found") — the dependency is recorded by package name <code>mimo-vision</code>, so <code>remove</code> needs that key. The command removes both the dependency and the bundle layer.</p>
+</blockquote>
+<hr>
+<h2>Configuration (all optional, defaults provided)</h2>
+<table>
+<thead>
+<tr>
+<th>Field</th>
+<th>Default</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>allowPaid</code></td>
+<td><code>true</code></td>
+<td>Whether to fall back to the paid route after the free route fails</td>
+</tr>
+<tr>
+<td><code>freeBaseUrl</code></td>
+<td><code>https://opencode.ai/zen/v1</code></td>
+<td>Free route base URL</td>
+</tr>
+<tr>
+<td><code>freeModel</code></td>
+<td><code>mimo-v2.5-free</code></td>
+<td>Free route model</td>
+</tr>
+<tr>
+<td><code>paidBaseUrl</code></td>
+<td><code>https://opencode.ai/zen/go/v1</code></td>
+<td>Paid route base URL</td>
+</tr>
+<tr>
+<td><code>paidModel</code></td>
+<td><code>mimo-v2.5</code></td>
+<td>Paid route model</td>
+</tr>
+</tbody></table>
+<p>A minimal registration only sets <code>allowPaid</code>; everything else uses the defaults:</p>
+<pre><code>- insert:
+    - id: tool-vision
+      name: 'mimo-vision'
+      config:
+        allowPaid: false
+</code></pre>
+<hr>
+<h2>Building from source / development (DSH monorepo)</h2>
+<p>To modify the plugin source, put it into the DSH source tree and go through the repo gates:</p>
+<pre><code># 1. Copy this repo as packages/vision/tool-vision
+cp -r /path/to/mimo-vision &lt;dsh&gt;/deepseek-harness/packages/vision/tool-vision
+
+# 2. Install and verify (tsc typecheck + vitest unit tests + oxlint)
+cd &lt;dsh&gt;/deepseek-harness
+pnpm install
+npx tsc -b packages/vision/tool-vision   # typecheck
+npx vitest run packages/vision/tool-vision   # unit tests
+npx oxlint packages/vision/tool-vision       # lint
+
+# 3. Produce lib/index.js (prebuilt artifacts)
+cd packages/vision/tool-vision
+npx tsdown lib/types/index.js lib/types/invariant.js \
+  --out-dir lib --format esm --platform node --target es2024 --fixed-extension false
+</code></pre>
+<blockquote>
+<p>Steps 2/3 can also be run inside the package with <code>pnpm run test</code> / <code>pnpm run typecheck</code> / <code>pnpm run build</code> (the scripts are in <code>package.json</code>).</p>
+</blockquote>
+<blockquote>
+<p>Note: the <code>@deepseek-ai/dsh-*</code> internal packages are not published to npm, so the plugin cannot be installed standalone via <code>npm install</code>; either use the prebuilt artifacts from "Quick install" above, or run it from source inside the monorepo.</p>
+</blockquote>
+<h2>Failure semantics</h2>
+<p>Any failure (no key, unsupported format, both routes failing, file missing / not a regular file, over the limit, non-image response) is returned as a <strong>tool-level error</strong>: <code>execute</code> throws, the registry materializes <code>isError</code>, the process does not exit and the session does not break.</p>
+<h2>Known Limitations</h2>
+<ul>
+<li><strong>Transcode temp files bypass the <code>ctx.fs</code> sandbox</strong>: when non-native formats (SVG/TIFF/HEIC…) are transcoded via ImageMagick, the source bytes and the resulting PNG go through <code>node:fs</code> to the system temp directory (<code>os.tmpdir()</code>), because <code>ctx.subprocess</code> needs real OS paths to feed the local <code>magick</code>, while <code>ctx.fs</code>'s <code>FsTarget</code> may be an abstract/remote/sandboxed path. This bypasses the <code>dsh-fs-sandbox</code> file sandbox policy; the temp directory is deleted immediately after conversion. It only triggers when ImageMagick is installed locally <strong>and</strong> a transcode format is requested — native formats (PNG/JPEG/GIF/WebP/BMP) never take this path.</li>
+<li><strong>The prebuilt <code>lib/</code> must stay in sync with <code>src/</code></strong>: GitHub-source installs load the committed <code>lib/index.js</code> directly and never build at install time. After changing <code>src/</code>, rebuild and commit <code>lib/</code>, or the deployed version loads stale artifacts.</li>
+</ul>
+<h2>Security</h2>
+<ul>
+<li>The key is only read via <code>ctx.credentials.resolve</code> — never printed, never written to disk, never directory-scanned;</li>
+<li>The key is only used in the request header <code>Authorization: Bearer ...</code>;</li>
+<li>Images are read into memory via <code>ctx.fs</code> and sent straight as base64, never written to disk (non-native formats are routed through the system temp dir during transcoding and deleted immediately after).</li>
+</ul>
+<h2>License</h2>
+<p>MIT</p>

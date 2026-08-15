@@ -1,0 +1,88 @@
+<h1>dsh-funnel</h1>
+<p>English | <a href="https://github.com/YuanyuanMa03/dsh-funnel/blob/HEAD/README.zh.md">中文</a></p>
+<p><strong>Curate tool output before it enters the model's context — keep the lines that matter, spill the rest to disk with a pointer. Faster turns, smaller context, sharper attention, for every tool.</strong></p>
+<h2>The problem</h2>
+<p>Every tool result is appended to the conversation and re-sent on <strong>every subsequent model request</strong>. A <code>npm test</code> run that prints 500 lines rides along for the rest of the session: you pay for it on each turn, it fills the context window, and it buries the one <code>AssertionError</code> the model actually needs.</p>
+<p>The existing layers don't cover this:</p>
+<table>
+<thead>
+<tr>
+<th>Layer</th>
+<th>What exists</th>
+<th>What it doesn't do</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>Capture (executor)</td>
+<td>64 MB spill protects the process from OOM</td>
+<td>nothing about what the model sees</td>
+</tr>
+<tr>
+<td>Execution (bash only)</td>
+<td><code>maxOutputBytes</code> byte-cap, head truncation</td>
+<td>shell tools only; blind cut, no error lines kept</td>
+</tr>
+<tr>
+<td>Compaction time</td>
+<td>official <code>tool-result-pruner</code> rewrites over-budget results on the surface</td>
+<td>fires only when compacting; blind head/tail; model can't read the original back</td>
+</tr>
+<tr>
+<td>Ingestion — every result, immediately</td>
+<td>—</td>
+<td><strong>← dsh-funnel</strong></td>
+</tr>
+</tbody></table>
+<p>Compaction-time pruning cleans up after the budget is already blown; dsh-funnel keeps it from being blown. They compose.</p>
+<h2>How it works</h2>
+<p>dsh-funnel wraps the <code>tools/execute</code> extension point (the seam the official timeout guard uses) and curates the canonical <code>value</code> of successful results: the registry re-projects model-facing content from <code>value</code>, so the curated view is exactly what the model sees and what the session log records. Long string fields inside <code>value</code> — stdout, stderr, fetched pages, file contents — are replaced in place; error results are never touched.</p>
+<h2>What you get</h2>
+<ol>
+<li><p><strong>Install and forget.</strong> One command, zero configuration. The plugin covers every tool that returns text — bash, file reads, web fetch, search — and results under the threshold pass through byte-identical, so you never notice it until it saves you.</p>
+</li>
+<li><p><strong>A ~24× smaller model view, measured.</strong> In a real headless session, a 2001-line (8,893-byte) bash result reached the model as <strong>370 characters</strong>: head, tail, and every error/warning line kept:</p>
+<pre><code>- [2001 lines of raw output]
++ [dsh-funnel] output curated: 2001 lines → 40 kept (head 15, tail 25, 0 pattern-matched). Full output: .dsh-funnel/2026-08-15T09-21-56-548Z-bash-1.log
++ 1 … 15
++ [dsh-funnel] … 1959 similar lines omitted …
++ 1977 … 2000
+</code></pre>
+<p>Every later turn in the session pays for 370 characters instead of 8,893 — the saving compounds each request.</p>
+</li>
+<li><p><strong>Nothing is lost, and the model recovers on its own.</strong> The full text spills to <code>.dsh-funnel/</code> and the notice carries the path. In testing, the model missed a middle line in the curated view, searched the spill file itself, and answered correctly — curation is pagination, not deletion. The spool doubles as an audit trail of what the agent actually saw.</p>
+</li>
+<li><p><strong>Long tasks hold up better.</strong> Smaller context means cheaper turns, later compaction, and less attention dilution — the agent stays sharp deeper into a session instead of degrading as junk accumulates.</p>
+</li>
+<li><p><strong>Tune it to your workflow.</strong> Threshold, kept lines, keyword patterns (add your project's own failure markers), per-tool aggressiveness, spill on/off.</p>
+</li>
+</ol>
+<p>Boundaries: error results are never touched (they are short and load-bearing); this complements compaction rather than replacing it; per-session savings accounting ("N tokens avoided") is on the roadmap.</p>
+<h2>Install</h2>
+<pre><code>dsh plugin add github:YuanyuanMa03/dsh-funnel
+</code></pre>
+<p>Works on every tool that returns text — bash, file reads, web fetch, search — because it wraps the <code>tools/execute</code> extension point (the same seam the official timeout guard uses).</p>
+<h2>Configuration</h2>
+<p>All fields optional; set them under the plugin entry in your profile:</p>
+<pre><code>- id: dsh-funnel
+  name: 'dsh-funnel'
+  config:
+    maxChars: 4000        # results at or below this length pass through untouched
+    keepHead: 15          # lines kept verbatim from the head
+    keepTail: 25          # lines kept verbatim from the tail (errors usually live here)
+    keepPatterns: [error, warn, fail, fatal, exception, assert, denied, panic]
+    maxLineChars: 1000    # single oversized lines (minified/JSON) are capped
+    spill: true           # write the full text to disk and reference it
+    tools:                # per-tool overrides
+      web_fetch: { maxChars: 2000 }
+</code></pre>
+<h2>Safety properties</h2>
+<ul>
+<li><strong>Error results are never touched</strong> — they are short and load-bearing.</li>
+<li><strong>Lossless at the disk level</strong> — spilling keeps the full text; the model re-reads on demand.</li>
+<li><strong>Model-visible ⟺ logged</strong> — the curated view replaces the result at the tool seam, so the session log records exactly what the model saw.</li>
+<li><strong>Byte-identical passthrough</strong> — results under <code>maxChars</code> return as the same object; zero allocation when idle.</li>
+</ul>
+<h2>Status</h2>
+<p>v0.1.0 — verified end-to-end in a real headless session: a 2001-line bash result was curated to 40 lines in model view and log, and the model recovered the omitted middle by reading the spill file (its own words: "the tool curates long output for display … verified against the complete saved output"). Unit tests cover the curation logic and the plugin wrapper. Roadmap: session-level savings accounting ("this session: N tokens avoided").</p>
+<h2>License</h2>
+<p><a href="https://github.com/YuanyuanMa03/dsh-funnel/blob/HEAD/LICENSE">MIT</a></p>

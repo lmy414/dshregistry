@@ -1,0 +1,134 @@
+<h1>dsh-migrate</h1>
+<p>English | <a href="https://github.com/kkkkkkkkki/dsh-migrate/blob/HEAD/README.zh.md">中文</a></p>
+<p>Import chat history and memory from other AI agents into <a href="https://github.com/deepseek-ai/deepseek-harness">DeepSeek Harness</a>.</p>
+<p>Switching harnesses should not mean losing your context. <code>dsh-migrate</code> reads the transcripts and memory stores other agents leave on disk and writes them as native DeepSeek Harness session logs — searchable, inspectable in the Trajectory view, and resumable (<code>--fork</code>-style continue) as if they had been recorded by DSH itself.</p>
+<h2>Supported sources</h2>
+<table>
+<thead>
+<tr>
+<th>Agent</th>
+<th>Sessions</th>
+<th>Memory</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong>Claude Code</strong></td>
+<td><code>~/.claude/projects/**.jsonl</code> (text, thinking, tool_use/tool_result)</td>
+<td><code>~/.claude/CLAUDE.md</code>, project <code>memory/*.md</code></td>
+</tr>
+<tr>
+<td><strong>Codex CLI</strong></td>
+<td><code>~/.codex/sessions/**/rollout-*.jsonl</code> (messages, reasoning, function calls)</td>
+<td><code>~/.codex/AGENTS.md</code>, <code>instructions.md</code></td>
+</tr>
+<tr>
+<td><strong>Gemini CLI</strong></td>
+<td><code>~/.gemini/tmp/**/chats/session-*.json</code> (messages, thoughts, toolCalls)</td>
+<td><code>~/.gemini/GEMINI.md</code></td>
+</tr>
+<tr>
+<td><strong>Cline / Roo Code</strong></td>
+<td>VS Code <code>globalStorage/*/tasks/*/api_conversation_history.json</code></td>
+<td>—</td>
+</tr>
+<tr>
+<td><strong>OpenCode</strong></td>
+<td><code>~/.local/share/opencode/**</code> message/part JSON files</td>
+<td>—</td>
+</tr>
+<tr>
+<td><strong>Aider</strong></td>
+<td><code>**/.aider.chat.history.md</code> (bounded scan)</td>
+<td><code>CONVENTIONS.md</code> files</td>
+</tr>
+<tr>
+<td><strong>Hermes Agent</strong></td>
+<td><code>~/.hermes/state.db</code> (SQLite sessions+messages, read-only)</td>
+<td><code>~/.hermes/memories/MEMORY.md</code>, <code>USER.md</code></td>
+</tr>
+<tr>
+<td><strong>OpenClaw</strong></td>
+<td><code>~/.openclaw/agents/*/agent/openclaw-agent.sqlite</code> (transcript_events, read-only)</td>
+<td>workspace <code>MEMORY.md</code>, <code>memory/*.md</code></td>
+</tr>
+</tbody></table>
+<p>Every adapter is tolerant: malformed lines and unknown row types are skipped, never fatal. Missing fields degrade gracefully (unknown model → <code>imported</code>, unknown cwd → the <code>_no-cwd</code> project).</p>
+<h2>Install</h2>
+<pre><code># 1. Install the plugin into your DSH web profile
+dsh plugin --profile web add @ersss/dsh-migrate
+
+# 2. Restart DSH
+dsh web
+</code></pre>
+<p>The package declares a <code>dsh.bundle</code> patch layer, so installing it does two things at once:</p>
+<ul>
+<li>registers the <strong><code>/migrate</code></strong> slash command, and</li>
+<li>points DSH's session store at <code>$DSH_HOME/sessions-imported</code> in raw-JSONL mode — a dedicated root for imported logs that never mixes with the default store's encoding.</li>
+</ul>
+<blockquote>
+<p><strong>Heads-up:</strong> the bundled patch relocates the <em>default</em> session root, which means sessions you recorded before installing the plugin stay in the old <code>sessions/</code> root and stop being listed. If you have existing DSH sessions you still want listed, either merge the patch's two rows into <code>$DSH_HOME/profiles/web/cordis.patch.yml</code> and keep both roots by alternating <code>--patch</code>, or simply run the CLI with <code>--out</code> pointed at your <em>live</em> root (raw JSONL reads fine under a zstd root only if the root was created with <code>compression: 'none'</code>). Fresh installs are unaffected.</p>
+</blockquote>
+<h2>Use</h2>
+<p>From inside DSH (Web UI, TUI, headless):</p>
+<pre><code>/migrate list                 # show what each agent has on disk
+/migrate run                  # import everything
+/migrate run --source claude-code --limit 10
+</code></pre>
+<p>From a terminal, without DSH running (also the right choice for big archives):</p>
+<pre><code>npx @ersss/dsh-migrate list
+npx @ersss/dsh-migrate run                       # → $DSH_HOME/sessions-imported
+npx @ersss/dsh-migrate run --out /path/to/root   # anywhere you like
+npx @ersss/dsh-migrate run --write-instructions .  # also fold memory into ./AGENTS.md
+</code></pre>
+<p>Imported sessions appear in the sidebar grouped by their original project directory, and in the Trajectory view with their full event stream — prompts, reasoning, tool calls, and results.</p>
+<h2>What gets written</h2>
+<p>DSH's session log is an append-only JSONL event stream (<code>SESSION_FORMAT_VERSION 0</code>). For every source session, <code>dsh-migrate</code> writes one log:</p>
+<pre><code>$DSH_HOME/sessions-imported/--&lt;project&gt;--/&lt;id&gt;/session.jsonl
+
+  {"type":"session","version":0,"id":"…","createdAt":…,"delegationDepth":0,"cwd":"…"}
+  {"type":"turn/start","seq":0,"time":…,"data":{"turn":1}}
+  {"type":"user/message","seq":1,…,"data":{"role":"user","source":{"kind":"user","via":"dsh-migrate:claude-code"},"content":[{"type":"text","text":"…"}]},"surfaceOp":"append"}
+  {"type":"step/start",…} {"type":"assistant/message",…} {"type":"tool/call",…} {"type":"tool/result",…} {"type":"step/end",…}
+  {"type":"turn/end",…,"data":{"turn":1,"reason":{"kind":"completed"}}}
+  …
+  {"type":"session/end-seed",…}        ← marks the log as imported seed history
+</code></pre>
+<p>Mapping decisions, briefly:</p>
+<ul>
+<li><strong>Turns.</strong> One source user prompt (plus the assistant work it triggered) becomes one <code>turn/start…turn/end</code> bracket. Tool-result-only user rows (Claude Code, Cline) attach to the pending <code>tool/call</code> instead of opening a turn.</li>
+<li><strong>Messages.</strong> User and system text become <code>user/message</code> events; assistant text/reasoning/tool-calls become one <code>assistant/message</code> per step; tool results become <code>tool/result</code> paired by call id.</li>
+<li><strong>Provenance, not impersonation.</strong> Imported assistant messages keep the original provider and model (<code>provider: "dsh-migrate:anthropic", model: "claude-fable-5"</code>). Imported user messages are <code>kind: "user"</code> — required for the trajectory view and history derivation — with the importer declared on the merge-extensible <code>via</code> channel (<code>via: "dsh-migrate:claude-code"</code>).</li>
+<li><strong>Timestamps and ids.</strong> Original timestamps are preserved when the source records them (monotonicity enforced); missing call ids get fresh UUIDs; session ids are fresh UUIDs (never the source's) so an import can never shadow a live session.</li>
+<li><strong>Memory.</strong> Each source's memory records become one "Imported memory" session (readable, searchable, resumable), and <code>--write-instructions &lt;project&gt;</code> additionally folds them into that project's <code>AGENTS.md</code> between <code>&lt;!-- dsh-migrate … --&gt;</code> markers (idempotent re-runs).</li>
+<li><strong>Append-only honesty.</strong> Writes use <code>wx</code> (no overwrite). A colliding id is retried with a fresh one; existing logs are never modified.</li>
+</ul>
+<h2>How resume works</h2>
+<p>The trailing <code>session/end-seed</code> event makes the whole imported log <em>seed history</em>: when you continue an imported session, DSH replays the log as inherited context, then starts a clean live segment — the model sees the prior conversation exactly as DSH would have logged it. The agent preset and tools of the <em>current</em> runtime apply; tools the old agent had and DSH does not simply become history.</p>
+<h2>Notes &amp; limitations</h2>
+<ul>
+<li><strong>Read-only on sources.</strong> The importer never writes to the source agents' directories.</li>
+<li><strong>Images and attachments</strong> are not imported (DSH attachments are content-addressed host objects); their surrounding text is.</li>
+<li><strong>Compaction history</strong> in source transcripts is flattened to plain messages.</li>
+<li><strong>SQLite sources are read immutably</strong> (<code>mode=ro&amp;immutable=1</code>), so a running Hermes/OpenClaw gateway is never disturbed. OpenClaw imports every <code>session_window</code>; resets/rollover windows appear as separate sessions (they were separate transcripts upstream too).</li>
+<li><strong>Aider scan roots</strong> are <code>$DSH_MIGRATE_SCAN</code> (path-list), <code>~/projects</code>, <code>~/code</code>, <code>~/dev</code>, <code>~/work</code>, and a shallow <code>$HOME</code> sweep — its history files live inside projects, so a fixed home-relative path cannot find them.</li>
+<li>Format drift: these layouts are undocumented internals of the source agents and change over time. Adapters skip what they do not recognise; if your agent version is newer, please open an issue with a (redacted) sample row.</li>
+</ul>
+<h2>Development</h2>
+<pre><code>npm install
+npm run build      # tsc → dist/
+npm test           # fixture-driven end-to-end tests (real DSH codec replay)
+</code></pre>
+<p>The test suite replays produced logs through the actual <code>@deepseek-ai/dsh-session</code> codec (<code>decodeStorageRecord</code> + <code>foldSurface</code>) vendored from a live DSH profile, so format regressions fail loudly.</p>
+<h2>Contributing a source adapter</h2>
+<p>One adapter = one file in <code>src/formats/</code> implementing:</p>
+<pre><code>interface SourceAdapter {
+  key: string
+  label: string
+  detect(home: string): Promise&lt;DiscoveredSource | undefined&gt;
+  readSessions(home: string, options?: { limit?: number }): Promise&lt;IrSession[]&gt;
+  readMemories(home: string): Promise&lt;IrMemory[]&gt;
+}
+</code></pre>
+<p>Register it in <code>src/formats/index.ts</code> and add a fixture test. See <code>src/formats/claude-code.ts</code> for the reference implementation.</p>
+<h2>License</h2>
+<p>MIT</p>

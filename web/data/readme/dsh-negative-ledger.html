@@ -1,0 +1,120 @@
+<h1>dsh-negative-ledger</h1>
+<p>A negative-knowledge ledger for coding agents. It records only <strong>disproven paths</strong> — failed commands, missing files, rejected approaches, unavailable APIs — together with the evidence behind each conclusion and the conditions under which a retry becomes legitimate. When the evidence changes, the conclusion is invalidated automatically.</p>
+<p><a href="https://github.com/akslcw/dsh-negative-ledger/blob/HEAD/README.zh.md">中文</a></p>
+<h2>What it is not</h2>
+<ul>
+<li><strong>Not memory</strong>: no positive knowledge, no semantic recall.</li>
+<li><strong>Not a cache</strong>: it stores conclusions, not tool results.</li>
+<li><strong>Not a bug regression tracker</strong>: it covers any tool call and file read, not just fix attempts.</li>
+</ul>
+<h2>The core loop</h2>
+<ol>
+<li>A tool call fails (non-zero exit, <code>FS_NOT_FOUND</code>, …) → a <strong>negative fact</strong> is recorded with outcome witnesses (exit code, error code) and precondition witnesses (file state from DSH's <code>fs/observed</code>).</li>
+<li>The next identical attempt matches the fact's <strong>fingerprint</strong> (normalized command + cwd, or file path).</li>
+<li>While every precondition witness is unchanged, the attempt is <strong>warned</strong> (<code>warn</code> mode) or <strong>denied</strong> (<code>block</code> mode).</li>
+<li>Any precondition change marks the fact <strong>stale</strong> — the reminder is withdrawn and the retry is allowed. A successful retry marks it <strong>resolved</strong>.</li>
+</ol>
+<p>The differentiation: a DSH-native, evidence-bound persistent negative-memory gate — failure conclusions activate and revoke themselves with the environmental evidence, and stay transactionally consistent across concurrent agents.</p>
+<h2>Quick start — one-command install</h2>
+<pre><code>dsh plugin --profile &lt;name&gt; add @akslcw/dsh-negative-ledger
+</code></pre>
+<p>Installs the package and activates its bundle layer: the shipped <code>cordis.patch.yml</code> (declared by the <code>dsh.bundle</code> manifest) mounts the ledger policy with production defaults — sqlite backend, <code>warn</code> mode, <code>.ledger</code> directory, default TTLs. Verify without booting, then boot:</p>
+<pre><code>dsh --profile &lt;name&gt; --dump-config   # the "@akslcw/dsh-negative-ledger" layer and its negative-ledger row
+dsh --profile &lt;name&gt;                 # boot
+</code></pre>
+<p>Remove: <code>dsh plugin --profile &lt;name&gt; remove @akslcw/dsh-negative-ledger</code>. A clean-environment end-to-end smoke (add → layer → headless warn + sqlite ledger → remove → profile still boots) is <code>powershell -File smoke/plugin-add-smoke.ps1</code>.</p>
+<p>In-checkout hacking (engine and CLI only, no DSH composition):</p>
+<pre><code>node src/cli.ts --dir .ledger stats
+node demos/run-demos.ts      # S1 command dedup, S2 missing-file dedup, S3 evidence-change invalidation
+node smoke/real-mount.ts     # real-mount smoke inside a deepseek-harness checkout
+</code></pre>
+<p>Requires Node <code>^22.19.0 || &gt;=24.0.0</code> (aligned with the official DSH engines range).</p>
+<h2>CLI</h2>
+<pre><code>node src/cli.ts [--dir &lt;path&gt;] [--backend sqlite|jsonl] &lt;list | show &lt;id&gt; | stale | stats&gt;
+</code></pre>
+<p>The backend flag wins; otherwise the directory is auto-detected (<code>ledger.db</code> → sqlite, <code>ledger.jsonl</code> → jsonl); with neither present the primary sqlite backend is used.</p>
+<table>
+<thead>
+<tr>
+<th>Command</th>
+<th>Output</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>list</code></td>
+<td>Every fact: status, kind, id, claim</td>
+</tr>
+<tr>
+<td><code>show &lt;id&gt;</code></td>
+<td>One fact as pretty JSON</td>
+</tr>
+<tr>
+<td><code>stale</code></td>
+<td>Facts invalidated by evidence change</td>
+</tr>
+<tr>
+<td><code>stats</code></td>
+<td>Honest interception counters (duplicate failures observed, warnings emitted, calls denied)</td>
+</tr>
+</tbody></table>
+<h2>Engine API</h2>
+<p>Two store backends sit behind one <code>LedgerStore</code> seam: the default transactional SQLite store (<code>SqliteLedgerStore</code>: WAL, revision-based optimistic concurrency, operation receipts, retry leases, JSONL import) and the legacy single-process JSONL store (<code>JsonlLedgerStore</code>).</p>
+<ul>
+<li><code>getFact(scope, kind, fingerprint)</code> / <code>queryFacts(filter)</code> — current facts with revision and active-lease summaries.</li>
+<li><code>commitAttemptDecision(request)</code> — the only decision entry: <code>deny</code> / <code>observe-warn</code> / <code>verify-retry</code> (allow and stale-allow both compete for a lease); revision conflicts re-read and re-decide.</li>
+<li><code>recordFact(input, meta)</code> — records a disproven path; repeats append versions on the same id; idempotent by operation receipt and <code>(fact, toolCallId, operation_kind)</code>.</li>
+<li><code>transitionFacts(batch, meta)</code> — batched, all-or-nothing state transitions (one FS observation can invalidate many facts).</li>
+<li><code>settleLease(settlement)</code> — the lease holder's retry outcome: succeeded → resolved, failed → new evidence version, released → fact untouched.</li>
+<li><code>summarize(scope?)</code> — three honest counters: <code>duplicateFailuresObserved</code>, <code>warningsEmitted</code>, <code>callsDenied</code>. No token estimates — trajectory replay/A-B diffing owns that number.</li>
+</ul>
+<h2>DSH integration</h2>
+<p>The bundle layer shipped in the package is exactly:</p>
+<pre><code>- id: negative-ledger
+  name: '@akslcw/dsh-negative-ledger'
+</code></pre>
+<p>Override the row by <code>id</code> in a later layer (your profile's <code>cordis.patch.yml</code>) — a patch replaces the whole <code>config</code>, so restate every key you change:</p>
+<pre><code>- id: negative-ledger
+  name: '@akslcw/dsh-negative-ledger'
+  config:
+    backend: sqlite       # sqlite (default, transactional) | jsonl (legacy single-process)
+    mode: block           # off | warn | block (default warn)
+    dir: .ledger          # ledger directory (default .ledger)
+    commandRetryAfterMs: 300000   # TTL on auto-recorded command facts
+    commandTools: [bash, pwsh]   # recorded as command_failed
+    readTools: [read]            # recorded as file_missing
+</code></pre>
+<ul>
+<li><p>The store connection and the background invalidation queue are owned by the plugin fiber: disposal drains the queue and closes the store (HMR-safe).</p>
+</li>
+<li><p><code>warn</code> (default): attaches <code>additionalContexts</code> on <code>tools/post-execute</code>; never blocks, never rewrites tool results.</p>
+</li>
+<li><p><code>block</code>: denies at <code>tools/pre-execute</code> before dispatch. Denied calls still flow through post-execute and are recognized by the plugin's own denial prefix, so one attempt is never double-counted.</p>
+</li>
+<li><p>Auto-recorded command facts carry a short <code>after</code> TTL (<code>commandRetryAfterMs</code>, default 5 minutes): <code>block</code> mode releases them automatically instead of locking a command forever on transient failures. <code>never</code>/<code>manual</code> are reserved for facts an explicit, trusted author recorded.</p>
+</li>
+<li><p><code>off</code>: disables recording and interception entirely.</p>
+</li>
+<li><p><code>fs/observed</code> events (<code>present</code> with version, or <code>absent</code>) map one-to-one onto <code>file-state</code> precondition witnesses; the emitting execution is correlated so a model-supplied path (scoped by the session cwd) and the backend's resolved <code>displayPath</code> witness the same fact; every observation change drives invalidation, so file hashing is never needed.</p>
+</li>
+<li><p>Successful tool results resolve the fact through settlement or a lease-free transition — the reminder is withdrawn after a working retry.</p>
+</li>
+<li><p>The ledger is shared across agents (subagents do not repeat the parent's failures); counters are transactional columns (sqlite) or append-only hit lines (jsonl).</p>
+</li>
+</ul>
+<p>Security posture:</p>
+<ul>
+<li>Claims never embed raw command text; model-facing previews are control-character-sanitized and length-capped. Raw commands stay in the ledger FILE (they are the fingerprint) — the file is written 0600 inside a 0700 directory.</li>
+<li>The ledger renders facts as quoted data, never as instructions.</li>
+<li>Single-writer JSONL applies to the legacy backend only; the sqlite backend is multi-process (WAL).</li>
+</ul>
+<p>Boundary with <code>repeat-tool-reminder</code>: that guard nudges on byte-identical consecutive repeats within one session; the ledger is persistent, evidence-bound, and auto-invalidating across sessions.</p>
+<h2>Known limitations and deferred work</h2>
+<ul>
+<li><strong>Single-writer JSONL (legacy)</strong>: <code>backend: jsonl</code> keeps the v0 single-process store for migrations and debugging; concurrent multi-process writers are unsupported there. The default <code>backend: sqlite</code> is the transactional WAL store with unique indexes, idempotent operation receipts, and crash recovery.</li>
+<li>Command fingerprints use the calling agent's session cwd; a sandbox-policy workspace-root override is not visible to the plugin. Raw command text is preserved (no whitespace collapsing) so semantically different shell programs never collide, but equivalent re-spellings do.</li>
+<li>A non-zero exit does not always disprove a path (e.g. <code>grep</code> exits 1 for "no match"); the short TTL and the warn-default posture bound the damage, but per-tool recording policy is deferred.</li>
+<li>v0 matches exact fingerprints only; no semantic similarity.</li>
+<li><code>approach_rejected</code> and <code>api_unavailable</code> kinds exist in the model but are not wired to tools yet.</li>
+<li>Token savings are deliberately not estimated here; the trajectory lab (#4) owns A/B and replay diffs.</li>
+<li>Future seams: failed_attempts in subagent contract results (#1), active/stale projection into task checkpoints (#3), repeat-failure rates in trajectory regression (#4), fail-closed promotion of high-risk paths (#2).</li>
+</ul>

@@ -1,0 +1,153 @@
+<h1>dsh-vision-subagent</h1>
+<p>Eyes for text-only DeepSeek Harness agents: delegate image reading to a <strong>one-shot subagent</strong> running on a separately configured <strong>vision route</strong> (MiniMax / Kimi / any OpenAI-compatible provider). Image bytes and the vision model's intermediate context <strong>never enter the main session</strong> — only the final text answer comes back.</p>
+<h2>Why a subagent</h2>
+<ul>
+<li><strong>Context isolation</strong>: large screenshots and multi-image comparisons never occupy the main model's window</li>
+<li><strong>Multi-turn visual reasoning</strong>: the child can call read_image on more workspace files before answering</li>
+<li><strong>Cost &amp; route separation</strong>: vision calls bill on the MiniMax/Kimi route; the main model only reasons</li>
+</ul>
+<h2>Quick start</h2>
+<p><code>sh dsh plugin --profile web add /path/to/dsh-vision-subagent </code></p>
+<p>Then edit <code>~/.dsh/profiles/web/cordis.patch.yml</code>:</p>
+<p>`yaml</p>
+<ul>
+<li>insert:<ul>
+<li>id: vision-subagent
+name: 'dsh-vision-subagent'
+config:
+  provider: kimi-coding   # or minimax-cn / a hand-declared route
+  model: k3               # or MiniMax-M3 / MiniMax-VL-01</li>
+</ul>
+</li>
+</ul>
+<p>`</p>
+<p>Restart <code>dsh web</code>, open a new session, and ask: "Look at ~/Desktop/error.png — what is the error?" The model calls <code>vision_agent(images=[...], question=...)</code> on its own.</p>
+<h2>Paste images into the composer (Codex-style)</h2>
+<p>The Web composer accepts pasted/dropped images natively. On send, the client plugin uploads them to the host endpoint, which:</p>
+<ol>
+<li>validates the session and stores the images as durable attachments (bounded by deployment limits)</li>
+<li>runs ONE vision-route analysis on an isolated context (image bytes never enter the main session)</li>
+<li>sends only the analysis text along with your message — the main model answers immediately, no tool call needed</li>
+</ol>
+<p>On failure (timeout, route error) the message is not sent and the composer draft is preserved. This channel complements the vision_agent tool: pasted images take the automatic path, while workspace files are read by the model calling the tool itself.</p>
+<h2>MiniMax / Kimi vision models</h2>
+<table>
+<thead>
+<tr>
+<th>Provider</th>
+<th>baseURL</th>
+<th>Vision models</th>
+<th>Key env</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>Kimi (Moonshot)</td>
+<td><a href="https://api.moonshot.cn/v1">https://api.moonshot.cn/v1</a></td>
+<td>k3 / kimi-k3 / moonshot-v1-8k-vision-preview</td>
+<td>MOONSHOT_API_KEY</td>
+</tr>
+<tr>
+<td>MiniMax</td>
+<td><a href="https://api.minimaxi.com/v1">https://api.minimaxi.com/v1</a></td>
+<td>MiniMax-VL-01</td>
+<td>MINIMAX_API_KEY</td>
+</tr>
+<tr>
+<td>MiniMax CN</td>
+<td>(built-in llm-pi-ai minimax-cn route)</td>
+<td>MiniMax-M3</td>
+<td>MINIMAX_CN_API_KEY</td>
+</tr>
+</tbody></table>
+<p>If a route already exists in Settings/Models (e.g. kimi-coding, minimax-cn), the plugin config only names provider + model — the key stays in the route's credential reference. The plugin itself never touches secrets.</p>
+<h2>Configuration</h2>
+<table>
+<thead>
+<tr>
+<th>Field</th>
+<th>Default</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>enabled</td>
+<td>true</td>
+<td>Master switch</td>
+</tr>
+<tr>
+<td>provider / model</td>
+<td>'' (dormant)</td>
+<td>Vision route; must be set together</td>
+</tr>
+<tr>
+<td>subagentProvider</td>
+<td>spawn</td>
+<td>ctx.subagents provider</td>
+</tr>
+<tr>
+<td>maxDepth</td>
+<td>0</td>
+<td>Child delegation cap (0 = none)</td>
+</tr>
+<tr>
+<td>maxImages</td>
+<td>4</td>
+<td>Images per call</td>
+</tr>
+<tr>
+<td>maxImageBytes</td>
+<td>10 MiB</td>
+<td>Per-image byte cap</td>
+</tr>
+<tr>
+<td>maxPromptChars</td>
+<td>8000</td>
+<td>Question length cap</td>
+</tr>
+<tr>
+<td>maxOutputChars</td>
+<td>32000</td>
+<td>Returned text truncation</td>
+</tr>
+<tr>
+<td>allowRemoteUrls</td>
+<td>false</td>
+<td>Reserved (v0.1 supports local paths only)</td>
+</tr>
+<tr>
+<td>allowOutsideWorkspace</td>
+<td>false</td>
+<td>Workspace containment bypass</td>
+</tr>
+<tr>
+<td>extraAllowedRoots</td>
+<td>[]</td>
+<td>Extra allowed image roots</td>
+</tr>
+<tr>
+<td>guidance</td>
+<td>''</td>
+<td>Extra instructions appended to the child prompt</td>
+</tr>
+</tbody></table>
+<h2>Security model</h2>
+<ul>
+<li>Keys live only in the vision route's credential reference (env); the plugin accepts no plaintext secrets</li>
+<li>Local images default to the session workspace; symlinks are rejected; reads are byte-capped</li>
+<li>The child runs with maxDepth: 0 and instructions forbid file modification and shell use</li>
+</ul>
+<h2>Architecture</h2>
+<p><code>Main model (text-only)    └─ vision_agent(images, question) ──┐         │ 1. admission: ext / containment / symlink / byte cap         │ 2. ctx.attachments.saveImage → durable content-addressed refs         │ 3. ctx.subagents.start('spawn', { agentOptions: {provider, model} })         ▼ One-shot subagent (MiniMax/Kimi vision route, own context)    └─ final text ──► main session (only this message enters main context)</code></p>
+<p>The plugin consumes harness services structurally (duck-typed) and is rc-version tolerant. Runtime dependencies: @deepseek-ai/dsh-tools (defineTool) and @deepseek-ai/schemastery (config schema) only.</p>
+<h2>Roadmap</h2>
+<ul>
+<li> Web paste bridge: composer images auto-trigger vision analysis (v0.2)</li>
+<li> Settings panel for provider/model selection</li>
+<li> Remote image URL support (bounded fetch)</li>
+<li> Embedded SKILL.md steering when to delegate</li>
+</ul>
+<h2>Development</h2>
+<p><code>sh npm install &amp;&amp; npm run typecheck &amp;&amp; npm test &amp;&amp; npm run build </code></p>
+<p>Before publishing, align @deepseek-ai/* versions in dependencies/devDependencies with the target harness rc (runtime deps currently rc.6, peer range &gt;=rc.5 &lt;0.1.0 — compatible with a local rc.5 checkout).</p>
+<h2>License</h2>
+<p>MIT</p>

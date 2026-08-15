@@ -1,0 +1,321 @@
+<h1>DSH Adaptive Agent Policy</h1>
+<p>中文 | <a href="https://github.com/YuXuanLiang-dev/dsh-plugin-adaptive-agent-policy/blob/HEAD/README.en.md">English</a></p>
+<p>一个可独立发布的非官方 DeepSeek Harness 插件：根据任务类别动态控制提示词、输出上限、软硬步骤预算与
+工具结果裁剪，在保持用户所选模型和工具展示方式稳定的前提下，减少大型任务中的无效循环。</p>
+<blockquote>
+<p>状态：<code>0.1.0-rc.3</code> 发布候选。DeepSeek Harness 仍处于开发者预览阶段，插件以公开的
+<code>0.1.0-rc.6</code> 包 API 构建；升级 DSH 时应先重新运行测试。</p>
+</blockquote>
+<h2>出处与声明</h2>
+<table>
+<thead>
+<tr>
+<th>项目</th>
+<th>精确版本</th>
+<th>用途</th>
+<th>许可证</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>DeepSeek Harness</td>
+<td><a href="https://github.com/deepseek-ai/deepseek-harness/tree/47f943859bef60e4160492346772ded9b24f765a"><code>47f943859b</code></a></td>
+<td>基础架构、Agent Loop、事件日志与插件接口</td>
+<td>MIT</td>
+</tr>
+<tr>
+<td>OpenCode</td>
+<td><a href="https://github.com/anomalyco/opencode/tree/e23586af2623f1bc2e8e6965d2d7acf7bd03d5c3"><code>e23586af26</code></a></td>
+<td>模型提示词、最后一步、工具输出限界与压缩策略参考</td>
+<td>MIT</td>
+</tr>
+<tr>
+<td>本插件</td>
+<td>本仓库</td>
+<td>按 DSH 事件与插件约定重新实现的自适应策略</td>
+<td>MIT</td>
+</tr>
+</tbody></table>
+<p>OpenCode 是设计参考，不是运行时依赖。具体参考文件包括
+<a href="https://github.com/anomalyco/opencode/blob/e23586af2623f1bc2e8e6965d2d7acf7bd03d5c3/packages/opencode/src/session/system.ts"><code>session/system.ts</code></a>、
+<a href="https://github.com/anomalyco/opencode/blob/e23586af2623f1bc2e8e6965d2d7acf7bd03d5c3/packages/opencode/src/session/prompt.ts"><code>session/prompt.ts</code></a>、
+<a href="https://github.com/anomalyco/opencode/blob/e23586af2623f1bc2e8e6965d2d7acf7bd03d5c3/packages/opencode/src/tool/truncate.ts"><code>tool/truncate.ts</code></a>
+与
+<a href="https://github.com/anomalyco/opencode/blob/e23586af2623f1bc2e8e6965d2d7acf7bd03d5c3/packages/opencode/src/session/compaction.ts"><code>session/compaction.ts</code></a>。
+完整来源声明见 <a href="https://github.com/YuXuanLiang-dev/dsh-plugin-adaptive-agent-policy/blob/HEAD/NOTICE.md">NOTICE.md</a>。本项目不代表 DeepSeek 或 OpenCode 官方立场，也不宣称获得上游背书。</p>
+<h2>增加的能力</h2>
+<ul>
+<li>无模型调用的多语言任务路由：<code>read</code>、<code>small</code>、<code>frontend</code>、<code>large</code>、<code>batch</code>；</li>
+<li>第二层风险路由：只在软检查点从九类风险中选择一个高置信度、尚未覆盖的检查；</li>
+<li>每个任务类别独立的最大输出 token、软检查步骤与纯文本硬终步；</li>
+<li>策略状态使用非持久化 system section；同阶段内容稳定，且不再把逐轮通知追加到会话历史；</li>
+<li>根据步骤数或上下文压力选择 <code>moderate</code>、<code>tight</code>、<code>critical</code> 裁剪等级；</li>
+<li>保护近期工具结果、设置最小总节省量、保留可安全回放的事件；</li>
+<li>对外仅一个插件配置项，包内增强裁剪器使用独立服务名，不与 DSH 上游静态裁剪器冲突。</li>
+</ul>
+<p>插件不会更改用户选择的提供方、模型、推理强度、权限、沙箱或 Native/Code 工具展示方式。</p>
+<h2>设计思路</h2>
+<pre><code>flowchart LR
+  U["Human request"] --&gt; R["Deterministic task router"]
+  R --&gt; P["Task profile"]
+  P --&gt; L["Non-persistent phase section and output cap"]
+  L --&gt; S{"Step or context pressure"}
+  S --&gt;|Normal| L
+  S --&gt;|Prune| C["Replay-safe result pruning"]
+  C --&gt; L
+  S --&gt;|Soft| V["Bounded risk router"]
+  V --&gt; Q{"One uncovered high-confidence risk?"}
+  Q --&gt;|Yes| T["One targeted existing check"]
+  Q --&gt;|No| F
+  T --&gt; L
+  S --&gt;|Hard| F["Text-only final step"]
+</code></pre>
+<p>核心原则：</p>
+<ol>
+<li><strong>按任务比例施加控制。</strong> 只读分析不应承担跨模块重构的循环成本。</li>
+<li><strong>尽量保持缓存前缀稳定。</strong> 不热切换模型或工具 schema；插件的 system section 在同阶段完全一致，仅在软检查点、
+硬终步或新任务切换时变化。</li>
+<li><strong>高置信度才增加检查。</strong> 风险路由器每轮最多选择一个尚未覆盖的风险；证据不足时不制造验证工作。</li>
+<li><strong>只在有收益时裁剪。</strong> 未达到大小和总节省阈值时完全不改写历史。</li>
+<li><strong>状态不写入会话。</strong> 当前策略在每次请求组装时提供一个紧凑 system section，不产生 user/context 历史消息，
+因此策略文本的输入占用是常量而不是随步骤累积。</li>
+<li><strong>一切仍是插件。</strong> 路由策略与裁剪服务边界独立，可通过普通 Cordis 生命周期替换。</li>
+</ol>
+<h2>安装</h2>
+<pre><code>dsh plugin --profile web add dsh-plugin-adaptive-agent-policy@next
+</code></pre>
+<p>安装命令会把包加入 <code>web</code> Profile 的依赖和 <code>dsh.profile.bundles</code>，无需修改
+<code>settings.yaml</code> 或手动编辑 <code>cordis.patch.yml</code>。检查组合结果后启动：</p>
+<pre><code>dsh --profile web --dump-config
+dsh web
+</code></pre>
+<p>从源码开发或使用自定义 Cordis 根配置时，也可以直接加入：</p>
+<pre><code>- id: adaptive-agent-policy
+  name: dsh-plugin-adaptive-agent-policy
+  config: {}
+</code></pre>
+<p>插件会自动安装包内的增强裁剪服务。无需另外安装或配置 DSH 上游的
+<code>@deepseek-ai/dsh-compaction-tool-result-pruner</code>。</p>
+<p>第二层路由器默认无需配置。若需要调整保守程度，在 Profile 的 <code>cordis.patch.yml</code> 中覆盖本插件行；
+这属于组合配置，不写入 <code>settings.yaml</code>：</p>
+<pre><code>- id: adaptive-agent-policy
+  config:
+    riskRouter:
+      enabled: true
+      minimumScore: 4
+      maxRequestChars: 4096
+      maxEvidenceChars: 8192
+      skipCovered: true
+</code></pre>
+<h2>默认参数</h2>
+<h3>任务配置</h3>
+<table>
+<thead>
+<tr>
+<th>类别</th>
+<th align="right">最大输出 token</th>
+<th align="right">软检查步骤</th>
+<th align="right">纯文本硬终步</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>read</code></td>
+<td align="right">16,384</td>
+<td align="right">4</td>
+<td align="right">8</td>
+</tr>
+<tr>
+<td><code>small</code></td>
+<td align="right">32,768</td>
+<td align="right">5</td>
+<td align="right">9</td>
+</tr>
+<tr>
+<td><code>frontend</code></td>
+<td align="right">32,768</td>
+<td align="right">8</td>
+<td align="right">14</td>
+</tr>
+<tr>
+<td><code>large</code></td>
+<td align="right">65,536</td>
+<td align="right">10</td>
+<td align="right">18</td>
+</tr>
+<tr>
+<td><code>batch</code></td>
+<td align="right">65,536</td>
+<td align="right">10</td>
+<td align="right">20</td>
+</tr>
+</tbody></table>
+<p>最大输出仅在 Agent 没有明确 <code>maxTokens</code> 时生效；更严格的调用方或提供方上限始终优先。</p>
+<h3>渐进式裁剪</h3>
+<table>
+<thead>
+<tr>
+<th>等级</th>
+<th align="right">步骤</th>
+<th align="right">压力</th>
+<th align="right">结果阈值</th>
+<th align="right">保留头／尾</th>
+<th align="right">保护近期步骤</th>
+<th align="right">最小节省量</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>moderate</code></td>
+<td align="right">6</td>
+<td align="right">45%</td>
+<td align="right">16,384 chars</td>
+<td align="right">12,288 / 2,048</td>
+<td align="right">2</td>
+<td align="right">8,192 chars</td>
+</tr>
+<tr>
+<td><code>tight</code></td>
+<td align="right">10</td>
+<td align="right">65%</td>
+<td align="right">8,192 chars</td>
+<td align="right">4,096 / 1,024</td>
+<td align="right">1</td>
+<td align="right">4,096 chars</td>
+</tr>
+<tr>
+<td><code>critical</code></td>
+<td align="right">14</td>
+<td align="right">75%</td>
+<td align="right">4,096 chars</td>
+<td align="right">2,048 / 1,024</td>
+<td align="right">1</td>
+<td align="right">2,048 chars</td>
+</tr>
+</tbody></table>
+<p>步骤或压力条件任一满足即可进入该等级。没有模型上下文窗口元数据时，压力路由关闭，步骤路由继续。</p>
+<h3>风险路由器</h3>
+<p>候选风险为 <code>boundary</code>、<code>retry</code>、<code>concurrency</code>、<code>persistence</code>、<code>security</code>、<code>compatibility</code>、
+<code>frontend</code>、<code>resource</code> 与 <code>batch-integrity</code>。路由器只在每轮第一次到达软检查点时运行一次，最多读取
+4,096 个请求字符和 8,192 个近期工具结果字符，不发起 LLM 请求。只读任务、纯文档改动、低置信度匹配和
+近期输出已经明确通过的风险都会跳过；命中时也只要求一个现有检查或最小复现。</p>
+<h2>基准测试</h2>
+<p>以下 2026-08-15 的受控对比对应 <code>rc.2</code> 策略，使用相同 <code>deepseek-v4-pro</code> High 路由、凭据来源、提示词、种子工作区、可见测试与
+隔离会话目录。隐藏检查不在模型工作区内。每行仅运行一次，不是统计平均值。</p>
+<table>
+<thead>
+<tr>
+<th>任务</th>
+<th>版本</th>
+<th align="right">步骤</th>
+<th align="right">总 token</th>
+<th align="right">用时</th>
+<th align="right">缓存命中</th>
+<th>质量结果</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>小型重试修复</td>
+<td>原版</td>
+<td align="right">6</td>
+<td align="right">59,891</td>
+<td align="right">44.2s</td>
+<td align="right">84.1%</td>
+<td>5/5；隐藏边界通过</td>
+</tr>
+<tr>
+<td>小型重试修复</td>
+<td>最终自适应版</td>
+<td align="right">6</td>
+<td align="right">66,830</td>
+<td align="right">49.5s</td>
+<td align="right">85.2%</td>
+<td>5/5；隐藏边界通过</td>
+</tr>
+<tr>
+<td>前端仪表盘</td>
+<td>原版</td>
+<td align="right">9</td>
+<td align="right">174,022</td>
+<td align="right">180.4s</td>
+<td align="right">93.2%</td>
+<td>5/5；390 px 溢出</td>
+</tr>
+<tr>
+<td>前端仪表盘</td>
+<td>最终自适应版</td>
+<td align="right">7</td>
+<td align="right">162,141</td>
+<td align="right">194.0s</td>
+<td align="right">92.7%</td>
+<td>5/5；390 px 无溢出，主题持久化</td>
+</tr>
+<tr>
+<td>跨模块队列</td>
+<td>原版</td>
+<td align="right">8</td>
+<td align="right">207,525</td>
+<td align="right">355.5s</td>
+<td align="right">93.4%</td>
+<td>7/7；隐藏转换 2/2</td>
+</tr>
+<tr>
+<td>跨模块队列</td>
+<td>最终自适应版</td>
+<td align="right">6</td>
+<td align="right">158,420</td>
+<td align="right">255.0s</td>
+<td align="right">91.4%</td>
+<td>7/7；隐藏转换 2/2</td>
+</tr>
+</tbody></table>
+<table>
+<thead>
+<tr>
+<th>汇总</th>
+<th align="right">原版</th>
+<th align="right">最终自适应版</th>
+<th align="right">差异</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>总 token</td>
+<td align="right">441,438</td>
+<td align="right">387,391</td>
+<td align="right">-12.2%</td>
+</tr>
+<tr>
+<td>总耗时</td>
+<td align="right">580.2s</td>
+<td align="right">498.6s</td>
+<td align="right">-14.1%</td>
+</tr>
+</tbody></table>
+<p>大型任务 token 减少 23.7%、用时减少 28.3%，质量持平；小型任务为保留交互边界多用了 11.6% token；
+前端少用 6.8% token，但为修复移动端溢出多耗时 7.5%。正常基准中裁剪替换次数为零，因为没有符合条件的
+陈旧大型工具结果；裁剪的三个等级由单元与集成测试单独覆盖。</p>
+<p>早期宽泛提示词版本曾把前端任务诱导到自建 CDP 验证器，膨胀到 30 步、1.316M token、675.7 秒。<code>rc.2</code>
+因此使用确定性分类、一次类别专属检查、有界前端验证和纯文本终步，而不继续堆叠通用提示词。</p>
+<p>一份第三方单次测试报告了另一项重要反例：原版输入约 72 万 token，PTC 模式约 117 万，标准模式约
+105 万；虽然输出从约 45 万降至 25 万／14 万，标准模式总量约与原版持平，PTC 总量反而约高 22%。
+该报告未附可复跑的原始日志，因此仅作为外部观察，不与上表合并。它揭示了 <code>rc.2</code> 将策略通知写入会话历史的
+输入累积问题，并直接促成 <code>rc.3</code> 改用非持久化阶段 section。<code>rc.3</code> 的真实模型 token 收益仍需用相同任务重新实测。</p>
+<p>该载体的缓存取舍是可预测的：同一阶段内插件 section 字节完全稳定；进入软检查点或硬终步时会改变一次
+system header，可能让该次请求失去旧前缀缓存。插件接受每轮最多两次阶段切换的有限成本，以避免每步都向历史
+追加策略消息造成的持续输入增长。</p>
+<p>这些都是非确定性模型的单次样本，只能支持优化方向，不能证明普遍或统计显著的性能优势。</p>
+<h2>开发与独立发布</h2>
+<pre><code>pnpm install
+pnpm run check
+npm login
+npm publish --tag next
+</code></pre>
+<h2>已知边界</h2>
+<ul>
+<li>文本路由可能保守地误判含糊任务；它有意不增加路由模型调用。</li>
+<li>风险路由器是启发式证据选择器，不是完整静态分析或安全审计；低置信度时刻意不触发。</li>
+<li><code>rc.2</code> 及更早版本写入的旧策略通知仍存在于原会话历史；<code>rc.3</code> 不再产生新的策略历史消息。</li>
+<li>阶段切换会改变 system header，可能造成该次请求的缓存前缀失配；同阶段内 header 保持稳定。</li>
+<li>字符裁剪不等于精确 token 裁剪，也不会理解被裁剪内容的语义重要性。</li>
+<li>纯文本硬终步能限制失控循环，也可能截断确实需要更多工具步骤的任务，应依据重复测试调参。</li>
+<li>DSH 仍在快速迭代；该插件目前把 <code>0.1.0-rc.6</code> 作为兼容边界。</li>
+</ul>
+<h2>许可证</h2>
+<p><a href="https://github.com/YuXuanLiang-dev/dsh-plugin-adaptive-agent-policy/blob/HEAD/LICENSE">MIT</a>。再分发时请同时保留 <a href="https://github.com/YuXuanLiang-dev/dsh-plugin-adaptive-agent-policy/blob/HEAD/NOTICE.md">NOTICE.md</a> 中的出处声明。</p>

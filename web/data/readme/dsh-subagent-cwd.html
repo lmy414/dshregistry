@@ -1,0 +1,181 @@
+<h1>dsh-subagent-cwd</h1>
+<p>Enhanced subagent delegation tools for <a href="https://github.com/deepseek-ai/deepseek-harness">DeepSeek Harness</a> (dsh)
+<strong>with per-call working-directory control</strong>.</p>
+<p>Everything in <a href="https://github.com/lynx-gt/dsh-subagent-tools">dsh-subagent-tools</a> (per-call model / provider /
+persona / toolFilter overrides, <code>@preset:</code> references, <code>provider/model</code> composite ids) <strong>plus</strong> a per-call
+<code>cwd</code> parameter — shipped with the two small provider patches that make <code>cwd</code> actually work.</p>
+<p>| <a href="https://github.com/lynx-gt/dsh-subagent-cwd/blob/HEAD/README.md">English</a> | <a href="https://github.com/lynx-gt/dsh-subagent-cwd/blob/HEAD/README.zh.md">中文</a> |</p>
+<p><a href="https://awesome-dsh-plugin.com"><img src="https://awesome-dsh-plugin.com/badge.svg" alt="awesome · DSH plugin"></a></p>
+<h2>Choose one of the two packages — not both</h2>
+<table>
+<thead>
+<tr>
+<th>Package</th>
+<th>Per-call model/provider/persona/toolFilter</th>
+<th><code>@preset:</code></th>
+<th><code>cwd</code></th>
+<th>Patches</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong>dsh-subagent-tools</strong></td>
+<td>✅</td>
+<td>✅</td>
+<td>❌</td>
+<td><strong>none (bundle only)</strong></td>
+</tr>
+<tr>
+<td><strong>dsh-subagent-cwd</strong> (this)</td>
+<td>✅</td>
+<td>✅</td>
+<td>✅</td>
+<td>2 provider patches</td>
+</tr>
+</tbody></table>
+<p>Install <strong>either</strong> one. Both expose the same tool surface (<code>subagent</code> / <code>subagent_fork</code>) and colliding
+installations would fight over the tool names.</p>
+<h2>Why cwd needs patches (and the other features don't)</h2>
+<p><code>SubagentStartRequest</code> has <strong>no cwd field</strong>, and the in-process drive layer builds child session meta purely
+from <code>childSessionMeta(parent, ...)</code> — a per-call cwd is never forwarded. Two code paths create in-process
+children, and <strong>both</strong> must be patched or you hit the classic trap where the foreground path honors <code>cwd</code>
+while the background path silently ignores it:</p>
+<table>
+<thead>
+<tr>
+<th>Path</th>
+<th>Package to patch</th>
+<th>File</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>Foreground (one-shot)</td>
+<td><code>@deepseek-ai/dsh-subagent-in-process-driver</code></td>
+<td><code>lib/index.js</code></td>
+</tr>
+<tr>
+<td>Background (continuable)</td>
+<td><code>@deepseek-ai/dsh-subagent</code></td>
+<td><strong><code>lib/index.js</code> (the BUNDLE — not <code>lib/types/continuation.js</code>!)</strong></td>
+</tr>
+</tbody></table>
+<p>The second one is a bundle trap: <code>package.json</code> main/exports point at <code>lib/index.js</code>, which contains an
+inline copy of the continuation manager. Patching the source-shaped <code>lib/types/continuation.js</code> has <strong>no
+effect</strong> — always patch and verify the bundle.</p>
+<h2>persona × preset coexistence (patch v2)</h2>
+<p>When <code>preset</code> and <code>persona</code> are given TOGETHER (e.g.
+<code>subagent(preset: "@preset:router-standard", persona: "@preset:翻译员")</code>), the old patch registered the
+per-call persona as the <code>deployment:persona</code> section, which router-style presets then deleted by name on
+every assemble (<code>applyPersona</code> strips every section whose name matches /persona/i) — the role persona was
+silently lost.</p>
+<p>Patch v2 (install.ps1 hunk 3 / hunk 5, three-state: raw / old-patch / new-patch all upgrade) instead:</p>
+<ul>
+<li>skips the <code>deployment:persona</code> registration when preset AND persona are both given;</li>
+<li>registers the per-call persona AFTER recompose as <strong><code>delegation:role</code></strong> (order 1, no "persona" in the
+name), which the router's filter cannot reach — so the preset's own reasoning persona and the delegated
+role persona COEXIST.</li>
+</ul>
+<p>Passing only <code>persona</code> (no <code>preset</code>) keeps the old behavior: plain <code>deployment:persona</code> shadowing.</p>
+<p>The patch v2 hunks (3–5) are currently implemented <strong>only in <code>install.ps1</code> (Windows)</strong>.
+The POSIX <code>install.sh</code> preset hunks will be added in a follow-up; on Linux the <code>preset</code>
+parameter is accepted but does not recompose until that lands.</p>
+<h3>⚠️ Limitation: persona is lost under router-style presets</h3>
+<p>Even with patch v2 in place, when a subagent/member uses a <strong>router-style preset</strong> (e.g.
+<code>@preset:dsh-router-standard</code>), the per-call <code>persona</code> still does NOT reach the system
+prompt. This is a mechanism-level behavior of router-style presets: their
+<code>system-prompt</code>/<code>assemble</code> hook deletes every section whose name matches /persona/i and
+injects the preset's own dynamic persona. As a result only the preset's built-in dynamic
+persona takes effect; your custom role persona is silently dropped.</p>
+<p>Workarounds:</p>
+<ul>
+<li>a) Use a non-router-style preset (e.g. <code>standard</code>) so the <code>persona</code> parameter is honored;</li>
+<li>b) Inject the role definition through the <strong>message layer</strong> instead (first-turn prompt
+prefix / task-message prefix, e.g. the stitching mechanism used by agent-teams), which
+does not depend on cwd;</li>
+<li>c) Or accept that the <code>persona</code> parameter is a no-op under router-style presets (the
+preset's own dynamic persona takes over).</li>
+</ul>
+<h2>Installation</h2>
+<pre><code># 1. install the plugin (npm / git / local)
+dsh plugin --profile web add dsh-subagent-cwd
+
+# 2. apply the two provider patches (required for `cwd`)
+powershell -ExecutionPolicy Bypass -File patches\install.ps1    # Windows
+# or: ./patches/install.sh                                       # POSIX
+
+# 3. Web sessions: also run the preset adapter (see below)
+powershell -ExecutionPolicy Bypass -File install-preset.ps1     # Windows
+# or: ./install-preset.sh                                       # POSIX
+</code></pre>
+<p>Restart <code>dsh --profile web</code> and start a NEW session.</p>
+<h3>Web sessions need the preset adapter</h3>
+<p>In the <strong>web</strong> profile, agent tools are provided by the mounted agent <strong>preset</strong>
+(the default <code>standard</code> preset composes <code>subagent</code> / <code>subagent_fork</code> pointing at
+<code>@deepseek-ai/dsh-tool-subagent</code>), <strong>not</strong> by the host plane — a bundle patch is
+invisible to Web sessions. <code>install-preset.ps1</code> / <code>install-preset.sh</code> copies
+<code>standard</code> to <code>$DSH_HOME/.agent-presets/standard-plus</code>, rewrites its delegation
+rows to point at this package, and switches the default preset. Presets are read
+at session creation, so you must start a NEW session (live sessions cannot
+switch). Revert: pick <code>standard</code> in the UI (General &gt; Agent preset) and delete
+<code>standard-plus</code>.</p>
+<blockquote>
+<p><code>headless</code> and other non-web profiles do not need the preset adapter.</p>
+</blockquote>
+<h3>Upgrading dsh</h3>
+<p>A dsh upgrade rewrites <code>node_modules</code> and <strong>wipes both patches</strong>. After every upgrade:</p>
+<pre><code># re-run the installer (it is idempotent; it also detects version-mismatched anchors)
+powershell -ExecutionPolicy Bypass -File patches\install.ps1
+</code></pre>
+<p>If the installer reports "anchor not found", the target packages changed shape — check for a new
+dsh-subagent-cwd release or file an issue.</p>
+<h3>Uninstall</h3>
+<pre><code>powershell -ExecutionPolicy Bypass -File patches\uninstall.ps1   # Windows
+# or: ./patches/uninstall.sh                                     # POSIX
+dsh plugin --profile web remove dsh-subagent-cwd
+</code></pre>
+<h2>Example</h2>
+<pre><code>Let a subagent work in a directory without the repo's AGENTS.md injected:
+  subagent(description="Summarize this file", prompt="...", cwd="D:\\projects\\scratch\\notes")
+</code></pre>
+<h2>Design</h2>
+<ul>
+<li><strong>The tool surface is a bundle.</strong> The shipped <code>tool-subagent</code> /
+<code>tool-subagent-fork</code> rows are disabled and replaced by this package's rows;
+no official package file is modified for the tool surface itself.</li>
+<li><strong><code>cwd</code> is the one capability that cannot stay a bundle-only feature.</strong>
+<code>SubagentStartRequest</code> has no cwd field, so a per-call cwd must be forwarded
+by the in-process subagent providers. That needs the two small patches (one
+hunk each) in <code>patches/</code> — idempotent, backed up on first run, and
+<code>node --check</code>-verified. This is the entire reason this package exists
+separately from <code>dsh-subagent-tools</code>.</li>
+<li><strong>Version contract:</strong> <code>peerDependencies</code> pin the public dsh packages
+(<code>^0.1.0-rc.6</code>). The patches target the same version; a dsh upgrade rewrites
+the dsh installation's <code>node_modules</code> and <strong>wipes both patches</strong> — re-run
+<code>patches/install.ps1</code> / <code>install.sh</code> after every upgrade (see <em>Upgrading dsh</em>).
+The bundle itself lives in the profile's own <code>node_modules</code> and survives an
+upgrade, but a changed public API will make <code>peerDependencies</code> refuse to load.</li>
+</ul>
+<h2>Verified</h2>
+<p>Tested against a stock dsh <code>0.1.0-rc.6</code> install on Windows (headless + web):</p>
+<ul>
+<li>Everything <code>dsh-subagent-tools</code> verifies (per-call model/provider/persona/
+toolFilter, <code>@preset:</code>, <code>presetHints</code>) ✅</li>
+<li><strong><code>cwd</code> on the foreground path</strong> ✅ — the child's <code>pwd</code> and its sandbox
+workspace both switch to the requested directory</li>
+<li><strong><code>cwd</code> on the continuable (background) path</strong> ✅ — background children honor
+the same directory (the classic "foreground works, background silently
+ignores cwd" trap does not occur)</li>
+<li><code>toolFilter</code> scoping ✅</li>
+<li><code>patches/install.ps1</code> and <code>patches/uninstall.ps1</code> round-trip ✅ (backup,
+apply, <code>node --check</code>, restore, re-verify)</li>
+</ul>
+<h2>Limitations</h2>
+<ul>
+<li><strong>Patches target rc.6 only.</strong> The two patches match exact anchors in the
+rc.6 bundle; a dsh upgrade invalidates them until re-run (or a new release).</li>
+<li><strong><code>@preset:</code> depends on the local preset layout</strong> — same caveat as
+<code>dsh-subagent-tools</code>.</li>
+<li><strong>Web sessions need the preset adapter</strong> (<code>install-preset.ps1</code>) for the same
+reason as <code>dsh-subagent-tools</code>.</li>
+</ul>
+<h2>License</h2>
+<p>MIT</p>

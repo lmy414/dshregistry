@@ -1,0 +1,769 @@
+<p align="center">
+  <img src="https://raw.githubusercontent.com/happyren/dsh-agent-messaging/HEAD/docs/media/social-card.png" alt="dsh-agent-messaging — the payments-api session sends a steer to the checkout-client session, carrying &quot;tenant_id is now required&quot;. Delivery modes: steer interrupts, followup opens a new turn, context does not wake.">
+</p>
+
+<p align="center">
+  <a href="https://github.com/happyren/dsh-agent-messaging/releases/latest"><img src="https://img.shields.io/github/v/release/happyren/dsh-agent-messaging?color=5B7CFF&amp;label=release" alt="Release"></a>
+  <a href="https://github.com/happyren/dsh-agent-messaging/blob/HEAD/LICENSE"><img src="https://img.shields.io/badge/license-MIT-5B7CFF" alt="MIT"></a>
+  <a href="https://github.com/topics/dsh-plugin"><img src="https://img.shields.io/badge/dsh--plugin-topic-5B7CFF" alt="dsh-plugin topic"></a>
+</p>
+
+<h1>dsh-agent-messaging</h1>
+<p><strong>Cross-session verification, claims and a decision ledger for
+<a href="https://github.com/deepseek-ai/deepseek-harness">DeepSeek Harness</a> — so two agent
+sessions don't repeat, contradict or deadlock each other.</strong></p>
+<p>Two sessions you started yourself — in the Web UI, in a headless run, in separate
+worktrees, in separate <code>dsh</code> processes — cannot tell each other anything. When one
+discovers a breaking change the other is about to trip over, you are the transport:
+you read it in one terminal and retype it in the other.</p>
+<p>This plugin gives them an address and a mailbox. One session names another and
+delivers a message into its inbox; the harness schedules it like any other
+model-facing input.</p>
+<pre><code>session "payments-api"                      session "checkout-client"
+        │                                              │
+        │  peer_send  to: checkout-client              │
+        │             mode: steer                      │
+        ├─────────────────────────────────────────────►│  interrupts at the next step
+        │  "tenant_id is now required on ChargeRequest │
+        │   — your call site will break"               │
+</code></pre>
+<p>An arriving message is its own card in the transcript, so a reader can tell at a
+glance that another <em>agent</em> spoke — not the human, and not the harness injecting
+context:</p>
+<p><img src="https://raw.githubusercontent.com/happyren/dsh-agent-messaging/HEAD/docs/media/card.png" alt="A peer message rendered as its own card: sender payments-api, interrupted this step, information only"></p>
+<p><img src="https://raw.githubusercontent.com/happyren/dsh-agent-messaging/HEAD/docs/media/card-dark.png" alt="The same card in dark mode"></p>
+<p>It names the sender, what the delivery cost (<code>interrupted this step</code>, <code>next turn</code>,
+or <code>delivered quietly</code>), what this session was told it may do about it, and the
+message itself rather than the framing around it. The accent colour is derived
+from the sender's session id, so one peer keeps one colour even if its title
+changes.</p>
+<h2>One real run, end to end</h2>
+<p>Everything below is a single live run: four sessions with real models in one
+<code>dsh web</code> host, over a repo where each session owns a different directory. No
+mock-ups — these are screenshots of the run that produced the numbers further
+down.</p>
+<p><strong>1 · Who's who.</strong> Each session publishes a capability card: an alias, what it
+owns, and what it is <em>not</em> responsible for.</p>
+<pre><code>peer_card  alias: "payments-api"
+           role: "Owns api/ and the charge contract. I do NOT own client code."
+           owns: [{ resource: "api" }]
+           groups: ["backend"]
+</code></pre>
+<p><strong>2 · A collision, refused.</strong> <code>payments-api</code> claims <code>api/charges.ts</code>. Moments
+later the checkout session tries to claim <code>api/</code> — and is told who holds what
+beneath it, and why.</p>
+<p><img src="https://raw.githubusercontent.com/happyren/dsh-agent-messaging/HEAD/docs/media/claim-refused.png" alt="The checkout session's claim on api/ is refused, naming payments-api as the holder"></p>
+<p>The interesting part is the last paragraph: without being asked, it decides <em>not</em>
+to edit in parallel and to coordinate first. That is the largest single failure
+mode in the <a href="https://arxiv.org/abs/2503.13657">MAST taxonomy</a> — step repetition,
+15.7% of observed multi-agent failures — not happening.</p>
+<p><strong>3 · A breaking change, delivered mid-task.</strong> <code>payments-api</code> edits the file for
+real, then steers the peer whose call site it just broke. The receiving session
+does not take the claim on trust: it reads both files, confirms the change is
+real, and only then acts — on a file it owns.</p>
+<p><img src="https://raw.githubusercontent.com/happyren/dsh-agent-messaging/HEAD/docs/media/card-in-context.png" alt="The receiving session gets the card, replies, reads both files, and claims its own file before editing"></p>
+<p><strong>4 · A false belief, caught before it ships.</strong> The checkout session is about to
+drop the <code>currency</code> field, believing the API rejects non-USD. It asks the peer
+that owns that file to check — and is refuted.</p>
+<p><img src="https://raw.githubusercontent.com/happyren/dsh-agent-messaging/HEAD/docs/media/verify-refuted.png" alt="payments-api refutes the claim after reading the file, and declines to send an acknowledgement"></p>
+<p>Two things in one screenshot. The refutation is the point:
+<a href="https://arxiv.org/pdf/2310.01798">self-verification is known to fail</a>, and a
+peer that didn't write the code has to go and look. The second thing is the model
+declining to send a courtesy reply — <em>"sending a 'noted' back would just cost them
+a turn"</em> — which is <a href="#what-it-cost">the fix described below</a> doing its job.</p>
+<p><strong>5 · A mutual wait, made visible.</strong> The docs session declares itself blocked on
+checkout; checkout is already blocked on docs. The cycle is reported the moment
+it closes.</p>
+<p><img src="https://raw.githubusercontent.com/happyren/dsh-agent-messaging/HEAD/docs/media/deadlock.png" alt="The docs session declares itself blocked and is told it is in a deadlock cycle"></p>
+<p>Without this, a deadlock is silent: every participant looks merely <code>idle</code>, nobody
+is finished, and nothing reports it.</p>
+<p><strong>6 · A newcomer that reads the history it was never told.</strong> A fifth session,
+started fresh and told only to add currency validation, finds the recorded
+decision, checks it against the current file, and refuses — offering supersession
+as the only correct route.</p>
+<p><img src="https://raw.githubusercontent.com/happyren/dsh-agent-messaging/HEAD/docs/media/newcomer-ledger.png" alt="A new session finds the recorded decision and declines to reopen it"></p>
+<h2>What it cost</h2>
+<p>The same scenario, run twice, on the same models — with one sentence changed in
+<code>peer_send</code>'s description between the runs:</p>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>before</th>
+<th>after</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>messages delivered</td>
+<td>20</td>
+<td><strong>7</strong></td>
+</tr>
+<tr>
+<td>dropped by loop control</td>
+<td>2</td>
+<td>0</td>
+</tr>
+<tr>
+<td>collisions avoided</td>
+<td>1</td>
+<td>1</td>
+</tr>
+<tr>
+<td>false claims caught</td>
+<td>1</td>
+<td>1</td>
+</tr>
+<tr>
+<td>deadlocks detected</td>
+<td>1</td>
+<td>1</td>
+</tr>
+</tbody></table>
+<p>The first run's transcripts showed why: once the work was done the sessions kept
+going — <em>"Noted, thanks."</em> → <em>"Anytime — good luck."</em> → <em>"Thanks, will keep you
+posted."</em> → <em>"Perfect — I'm here."</em> — until loop control dropped a duplicate and
+one of them observed, in its own words, that the exchange had wound down.</p>
+<p>Autonomous peers are polite, and politeness costs a turn each time. The fix was
+one sentence telling them not to be:</p>
+<blockquote>
+<p>Every message costs the receiver a turn, so send only what changes what it will
+do. Do NOT send acknowledgements, thanks, sign-offs, or "noted" — a peer that
+has nothing to act on is better left working.</p>
+</blockquote>
+<p><strong>65% less traffic, identical catches.</strong> That is what the accounting is for: it
+made a prompt-level regression visible, and then showed the fix worked. Run it on
+your own work with <code>npx dsh-agent-messaging report</code>.</p>
+<h2>What it is not</h2>
+<table>
+<thead>
+<tr>
+<th>If you want</th>
+<th>Use</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>To pull another session's history into your next message</td>
+<td><a href="https://github.com/deepseek-ai/deepseek-harness/blob/master/docs/subsystems/session-reference.md"><code>dsh-session-reference</code></a> (<code>@[label](dsh-session:…)</code>)</td>
+</tr>
+<tr>
+<td>A coordinator that spawns and supervises workers</td>
+<td>the <a href="https://github.com/deepseek-ai/deepseek-harness/blob/master/docs/subsystems/subagent.md">subagent</a> subsystem</td>
+</tr>
+<tr>
+<td>To continue one conversation elsewhere</td>
+<td>resume the session</td>
+</tr>
+<tr>
+<td><strong>To tell another independent session something, now</strong></td>
+<td><strong>this plugin</strong></td>
+</tr>
+</tbody></table>
+<p>A message is text. Never conversation history, never files.</p>
+<h2>Install</h2>
+<pre><code>npx -p @deepseek-ai/dsh dsh plugin --profile web add dsh-agent-messaging
+</code></pre>
+<p>Restart the profile, then check the install from inside or outside a session:</p>
+<pre><code>npx dsh-agent-messaging doctor
+</code></pre>
+<pre><code>OK    node                v24.13.1
+OK    build               host and browser bundles present
+OK    state-root          /Users/you/.dsh/agent-messaging (writable)
+OK    presence            2 live hosts, 0 stale records
+OK    socket-permissions  owner-only (0600)
+OK    accounting          recording; run `npx dsh-agent-messaging report` to see what this cost and caught
+</code></pre>
+<p>It exits non-zero on anything that would stop messaging working, and every line
+that reports a problem also says what to do about it — so a session that suspects
+its own messaging is broken can run this and read the answer.</p>
+<p><strong>Nothing else to configure.</strong> A session is addressable and informative from the
+moment it starts: peers see what directory it works in, and what the humans wrote
+about that directory in <code>AGENTS.md</code> or <code>README.md</code>. <code>peer_card</code> upgrades that from
+inferred to declared; it is not a prerequisite.</p>
+<p>The transcript card needs the Web UI. Everything else works headless, and without
+the browser half a message renders as the harness's ordinary context row.</p>
+<details>
+<summary>Installing from git instead</summary>
+
+<pre><code>npx -p @deepseek-ai/dsh dsh plugin --profile web add github:happyren/dsh-agent-messaging
+</code></pre>
+<p><code>dsh plugin</code> shells out to pnpm, and pnpm blocks build scripts from git
+dependencies until you allow them. The first <code>add</code> will fail and print the package
+key; add it to the profile's <code>pnpm-workspace.yaml</code>:</p>
+<pre><code>allowBuilds:
+  dsh-agent-messaging: true
+</code></pre>
+<p>then re-run the <code>add</code>. Pin a commit (<code>github:happyren/dsh-agent-messaging#&lt;sha&gt;</code>) so
+a later push cannot change what runs on your machine.</p>
+</details>
+
+<h2>Tools</h2>
+<p>Nine tools register by default. That is a lot of competition for a model's
+attention, so a deployment only pays for what it uses:</p>
+<pre><code>- id: agent-messaging
+  config:
+    capabilities:
+      claims: true         # peer_claim
+      verification: false  # peer_verify, peer_verify_reply
+      identity: false      # peer_card, peer_status
+      decisions: false     # peer_decide, peer_decisions
+</code></pre>
+<p>That leaves three: <code>peer_list</code>, <code>peer_send</code>, <code>peer_claim</code>. Addressing and delivery
+are always registered — without them nothing else has a point. Everything defaults
+<strong>on</strong>, so upgrading never silently removes a tool a workflow depends on.</p>
+<p><code>peer_inbox</code> registers only under <code>inbound: hold</code>, because held messages do not
+exist otherwise and a tool that always reads an empty list is pure overhead.</p>
+<h3><code>peer_list</code></h3>
+<p>Sessions this one can address — name, state, title, directory. Identities only;
+never their contents.</p>
+<pre><code>payments-api [running] "Add tenant_id to charges" — /repo/test-project
+    "payments-api" — Owns api/ and the charge contract. I do NOT own client code. · owns api · groups: #backend
+    working on: api/charges.ts (adding a required tenant_id to ChargeRequest)
+checkout-client [idle] "Wire up checkout submit" — /repo/test-project
+    task: blocked on docs-writer: waiting on billing wording before updating checkout
+    "checkout-client" — Owns client/ and the checkout flow. · owns client · groups: #backend
+ready-57a1 [not running] "ready." — /repo/test-project
+</code></pre>
+<p>A session that published a card is listed by its <strong>alias</strong> — the last line above
+is one that did not, folded from a session whose first reply happened to be
+"ready.", which is exactly why an alias is worth publishing. Names are
+collision-disambiguated, so an address you read in one listing still resolves in
+the next. A wait is stored as a session id, because that is the only form a
+deadlock cycle can be walked in, but it is <em>shown</em> as the address you would use
+to break it.</p>
+<h3><code>peer_send</code></h3>
+<p>Deliver one message. The sender's identity comes from the executing agent, so a model
+cannot send a message claiming to be another session.</p>
+<table>
+<thead>
+<tr>
+<th><code>mode</code></th>
+<th>Arrives</th>
+<th>Use for</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>steer</code></td>
+<td>At the receiver's next step boundary, interrupting it</td>
+<td>Something that makes its current work wrong</td>
+</tr>
+<tr>
+<td><code>followup</code> <em>(default)</em></td>
+<td>As its own later turn</td>
+<td>The ordinary handoff</td>
+</tr>
+<tr>
+<td><code>context</code></td>
+<td>Folded into whatever it does next, without waking it</td>
+<td>Background it should know but need not act on</td>
+</tr>
+</tbody></table>
+<p>These map onto <code>Agent.steer()</code>, <code>Agent.followup()</code> and <code>Agent.inject()</code> — the inbox
+boundaries the harness already owns. Choosing is the sender's job, because only the
+sender knows whether the news invalidates work already in progress.</p>
+<p>A session that is <strong>not running</strong> still accepts messages: they are spooled and
+delivered when it next starts, within the configured age and depth bounds.</p>
+<p>Replies correlate through <code>reply_to</code>. The tool tells senders not to send
+acknowledgements — <a href="#what-it-cost">the measured reason</a> is above.</p>
+<p><strong>Groups.</strong> Address <code>#backend</code> to reach a whole set at once. Membership is declared
+on each session's <code>peer_card</code>, and the <em>shape</em> is an operator decision in config —
+because denser is not automatically better and every extra recipient costs a turn:</p>
+<pre><code>- id: agent-messaging
+  config:
+    groups:
+      backend: { topology: star, lead: payments-api }
+    maxFanout: 8
+</code></pre>
+<p><code>mesh</code> reaches everyone; <code>star</code> routes a member's message to the lead alone and lets
+the lead broadcast — one message in costs one turn instead of N. Each recipient is
+an ordinary send, so inbound policy, loop control and accounting apply per
+recipient: a group address is a convenience for the sender, never a way around the
+receiver.</p>
+<p>Configure the lead against a session's <strong>alias</strong> (<code>peer_card alias: "payments-api"</code>),
+not its display name — display names are folded from session titles and move.</p>
+<h3><code>peer_card</code></h3>
+<p>Declare what this session is for and what it owns, so peers route work correctly
+instead of guessing from a folded title.</p>
+<p><strong>This is an upgrade, not a prerequisite.</strong> A session that never calls it is still
+listed with what can be read off the workspace — the directory it works in, and
+the headline of that directory's <code>AGENTS.md</code> or <code>README.md</code> — marked <code>inferred from the workspace, not declared</code> so nobody mistakes an inference for a statement.
+Models do not do reliable setup, and a listing that says nothing until one makes a
+tool call is a listing that is usually empty of meaning.</p>
+<pre><code>peer_card  alias: "payments-api"
+           role: "Owns api/ and the charge contract. I do NOT own client code."
+           owns: [{ resource: "api" }, { resource: "charge validation rules", scope: "topic" }]
+           skills: ["payments-api", "validation-rules"]
+           groups: ["backend"]
+</code></pre>
+<p>An <code>alias</code> is a <strong>stable address</strong>, not decoration. Display names are folded from
+session titles, so they move — and read like an accident (<code>ready-57a1</code>) when a
+title is short. An alias is chosen and stays put. Every address a peer can use —
+<code>peer_send</code>, <code>peer_verify</code>, a group lead, a <code>blocked_on</code> — resolves an alias ahead
+of a derived name, and a session that published one is <em>referred to</em> by it in
+every record a peer reads: refused claims, decisions, waits, and the card on a
+delivered message.</p>
+<p>This targets <strong>FM-1.2 disobey role specification</strong> and <strong>FM-2.3 task derailment
+(7.4%)</strong>; role specification was one of only two interventions MAST measured
+directly, at <strong>+9.4%</strong>. Shaped after
+<a href="https://en.wikipedia.org/wiki/Agent2Agent">A2A Agent Cards</a> so the same
+declaration can later serve cross-vendor discovery.</p>
+<p>Ownership here is <strong>standing responsibility, not a reservation</strong> — it never
+conflicts and reserves nothing. <code>peer_claim</code> is the short-lived "I am editing this
+right now" signal. Saying what you <em>don't</em> own is as useful as what you do, since
+it stops peers sending you work that isn't yours.</p>
+<h3><code>peer_claim</code></h3>
+<p>Announce what you are working on, and find out whether a peer is already on it.</p>
+<pre><code>peer_claim  resource: "api"  intent: "adding tenant support to the charge call"
+→ refused: "api" overlaps a claim held by another session.
+  payments-api holds "api/charges.ts" — adding a required tenant_id to
+  ChargeRequest (expires in ~30 min)
+  Message the holder with peer_send instead of working in parallel.
+</code></pre>
+<p>This targets the <strong>largest single failure mode</strong> in the
+<a href="https://arxiv.org/abs/2503.13657">MAST taxonomy</a>: <em>step repetition</em>, 15.7% of
+observed multi-agent failures — whose concrete instance in coding is two sessions
+editing the same file, or re-deriving what a sibling already knows.</p>
+<p>Path claims nest, so holding <code>client</code> covers <code>client/checkout.ts</code>, and sibling
+names never collide (<code>src/app</code> does not contain <code>src/apple</code>). Topics don't nest.
+Claims expire on their own, and are dropped when the holding session ends.</p>
+<p>Claims are <strong>advisory, not locks.</strong> The plugin cannot stop another process
+writing a file, and a lock that can't be enforced is worse than an honest hint —
+it invites callers to skip the check they'd otherwise make. Claimed resources
+show up in <code>peer_list</code> under <code>working_on</code>.</p>
+<h3><code>peer_verify</code> and <code>peer_verify_reply</code></h3>
+<p>Ask a differently-situated peer to check a claim you're about to act on.</p>
+<pre><code>peer_verify  to: "payments-api"
+             claim: "createCharge rejects any currency other than usd"
+             evidence: [{ locator: "api/charges.ts" }]
+→ REFUTED — createCharge only validates amount_cents and tenant_id;
+  currency is never checked, so non-USD currencies are accepted.
+</code></pre>
+<p>The peer is told to <em>check, not agree</em> — "go and look before answering; do not
+take the claim on trust" — and replies with a typed verdict: <code>confirmed</code>,
+<code>refuted</code>, <code>inconclusive</code>, or <code>declined</code>, plus what it actually examined.</p>
+<p>This targets MAST's <strong>task-verification category (24.5% of failures)</strong> and is the
+intervention with its largest measured gain (<strong>+15.6%</strong>). It belongs in a
+messaging plugin rather than an agent's own loop because
+<a href="https://arxiv.org/pdf/2310.01798">self-verification is known to fail</a> — a model
+largely cannot check its own reasoning. A peer is a different verifier in the way
+that matters: it didn't produce the artefact, so it has to go and look.</p>
+<p>A <code>refuted</code> verdict comes back as a <code>steer</code>, because the asker is probably acting
+on the claim right now and a queued turn would arrive too late.</p>
+<h3><code>peer_status</code></h3>
+<p>Say what your <em>work</em> is doing — <code>working</code>, <code>blocked</code>, <code>done</code>, <code>abandoned</code> — and
+find out if you have just deadlocked.</p>
+<pre><code>peer_status  phase: "blocked"  blocked_on: "checkout-client"
+             summary: "waiting on the final checkout field list"
+→ published: blocked
+  DEADLOCK — you are in a mutual wait:
+  docs-writer → checkout-client → docs-writer
+  Nobody in this cycle will proceed on their own. Break it: message one of them
+  with peer_send, do the part you can without waiting, or ask your user to decide.
+</code></pre>
+<p>The agent registry already reports <code>idle</code>/<code>running</code>, but that describes a
+<em>driver</em>, not a task. A session is <code>idle</code> both when it has finished and when it
+is waiting on a peer — indistinguishable from outside, and the difference is
+exactly what a peer needs to decide whether to wait.</p>
+<p>This targets <strong>FM-1.5 unaware of termination (12.4%)</strong> and <strong>FM-3.1 premature
+termination (6.2%)</strong>, and is common ground in
+<a href="https://dl.acm.org/doi/abs/10.1109/MIS.2004.74">Klein's sense</a> — a teammate that
+cannot signal completion or blockage cannot be coordinated with.</p>
+<p>Because <code>blocked</code> carries <em>who</em> it is blocked on, a mutual wait becomes
+representable and therefore detectable. The check runs when a session declares
+itself blocked, which is the moment a cycle can first close.</p>
+<h3><code>peer_decide</code> and <code>peer_decisions</code></h3>
+<p>Record what was settled, so a session that starts later doesn't reopen it.</p>
+<pre><code>peer_decisions  about: "api/charges.ts"
+→ 2026-08-15 20:40 · payments-api [api/charges.ts]
+    Multi-currency is deferred until tenant billing lands; createCharge accepts
+    any currency string for now.
+    why: Validating currency needs the tenant billing profile, which does not
+         exist yet.
+    id: bd408a8e…
+</code></pre>
+<p>Messages are ephemeral — delivered once, folded into a transcript, gone when that
+session compacts or ends. Common ground has to outlive them, which needs a record
+rather than a conversation. This targets <strong>FM-1.4 loss of conversation history</strong>
+and <strong>FM-2.1 conversation reset</strong>.</p>
+<p>It's the <a href="https://arxiv.org/html/2606.19911v1">transactive-memory</a> direction:
+rather than replicating every session's context into every other, publish the
+small durable index of <em>conclusions</em> and let peers query it by area. A directory
+covers what's beneath it, same nesting rule as claims and ownership.</p>
+<p><strong>Nothing is ever edited or deleted — decisions are superseded.</strong> A later decision
+names the one it replaces; <code>peer_decisions</code> returns only what's in force, so
+nobody acts on a reversed decision, and <code>include_superseded</code> shows the history.</p>
+<h3><code>peer_inbox</code></h3>
+<p>Lists messages held for you under the <code>hold</code> policy, and releases them when your
+operator asks. Empty under the default <code>accept</code>.</p>
+<h3>The <code>peer-coordination</code> skill</h3>
+<p>Tools say what is possible; the skill says what is wise. It ships with the plugin
+and teaches the judgment the tools cannot carry — claim before editing shared
+code, verify a claim you did not produce, record what was settled, say when you
+are blocked, and <em>stop replying when an exchange is over</em>.</p>
+<p>Every rule in it came out of a measured run rather than a style guide, including
+the one that <a href="#what-it-cost">cut message traffic by 65%</a>. Set <code>skill: false</code> if
+your deployment supplies its own coordination guidance.</p>
+<h2>Collaboration and safety</h2>
+<p>By default a peer message is <strong>information, not instruction</strong>. The receiving model is
+told it may act on a request inside it only if its own user asks. That is the right
+default between two sessions that merely happen to share a machine, and the wrong one
+between two sessions you are deliberately running as a pair.</p>
+<p><code>peerAuthority</code> and <code>trustedPeers</code> change that, per receiving session:</p>
+<pre><code>- id: agent-messaging
+  config:
+    peerAuthority: act
+    trustedPeers:
+      - payments-api
+</code></pre>
+<p>With this, a message from <code>payments-api</code> is framed as coming from a peer the operator
+has authorised, and the receiver may act on it directly. Everything else still arrives
+as information.</p>
+<p>Three properties worth being precise about, because the setting is easy to over-read:</p>
+<ul>
+<li><strong>It is prompt-level, not enforcement.</strong> It changes what the receiving model is
+told. The enforcement boundary is the receiving session's own permission rules,
+access mode, and sandbox — identical at every authority level.</li>
+<li><strong>It grants nothing.</strong> At <em>both</em> levels the message is explicitly unable to approve
+an action, grant a permission, or change configuration. Those are the operator's to
+give, and no setting delegates them. An authorised peer that asks for something
+outside the receiver's existing permissions is refused.</li>
+<li><strong>Raising the level alone does nothing.</strong> <code>trustedPeers</code> is empty by default and
+matched exactly, so a session that appears later never inherits standing it was
+never granted, and a lookalike name (<code>payments-api-staging</code>) does not match
+<code>payments-api</code>.</li>
+</ul>
+<p><code>inform</code> is not paralysis, and the run above shows the distinction: the checkout
+session acted on the arriving message — but only after verifying the claim itself,
+and only on a file it owns and had already been asked to work on. What <code>inform</code>
+prevents is a <em>peer</em> originating authority.</p>
+<p>For work that should stay under human control, prefer <code>inbound: hold</code> — messages
+wait, and <code>peer_inbox</code> releases them when you say so.</p>
+<h2>Is it paying for itself?</h2>
+<p>Every feature here is justified by someone else's measured failure rates. None is
+justified by <em>yours</em> — so the plugin counts what it cost and what it caught:</p>
+<pre><code>npx dsh-agent-messaging report              # all recorded activity
+npx dsh-agent-messaging report --days 7
+</code></pre>
+<pre><code>COST — turns this plugin caused a session to spend
+  messages delivered               7
+  dropped by loop control          0
+CAUGHT — what would otherwise have gone wrong
+  collisions avoided               1   (a peer already held the resource)
+  false claims caught              1   (verification refuted them)
+  deadlocks detected               1
+
+7 receiver turns spent, 3 problems caught.
+</code></pre>
+<p>Deliberately framed as <strong>cost versus catch</strong>, not usage counters: "42 messages
+sent" says nothing, while "42 receiver turns spent, 6 collisions avoided" is a
+judgement you can actually make. Counts are local and aggregate — <strong>no message
+content is stored</strong> — and <code>metrics: false</code> turns recording off entirely.</p>
+<p>This is a command rather than a tenth <code>peer_*</code> tool on purpose. The audience is
+you, deciding whether the plugin earns its turns; putting it in front of the model
+would take attention from the nine tools that do the work.</p>
+<p>The report states its own limit at the bottom, and means it: a caught collision
+is a real save, but these counts cannot tell you whether the turns spent were
+worth it. The one thing they demonstrably <em>can</em> do is catch a regression in what
+collaboration costs — <a href="#what-it-cost">that is how the 20 became a 7</a>.</p>
+<h2>The benchmark</h2>
+<p>The claim this project makes — coordination costs turns and saves more than it
+costs — was argued from runs whose scoring I wrote. <a href="https://github.com/happyren/dsh-agent-messaging/blob/HEAD/bench/"><code>bench/</code></a> replaces
+that with something falsifiable: five scenarios an uncoordinated pair gets wrong,
+scored on <strong>whether the repository ended up correct</strong>, priced in model turns. An
+arm is chosen by <em>profile</em>, so this plugin, a competing one, and no coordination
+at all are measured identically.</p>
+<p>DeepSeek-V4-Flash, one run per arm per scenario:</p>
+<table>
+<thead>
+<tr>
+<th>scenario</th>
+<th>baseline</th>
+<th>plugin</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>stale-contract</code></td>
+<td>fail · 2t</td>
+<td><strong>pass</strong> · 4t</td>
+</tr>
+<tr>
+<td><code>collision</code></td>
+<td>n/r · 2t</td>
+<td>n/r · 3t</td>
+</tr>
+<tr>
+<td><code>false-belief</code></td>
+<td>fail · 2t</td>
+<td>fail · 5t</td>
+</tr>
+<tr>
+<td><code>mutual-wait</code></td>
+<td>n/r · 2t</td>
+<td>n/r · 8t</td>
+</tr>
+<tr>
+<td><code>stale-decision</code></td>
+<td>fail · 2t</td>
+<td><strong>pass</strong> · 2t</td>
+</tr>
+<tr>
+<td><strong>passed</strong></td>
+<td><strong>0/3</strong></td>
+<td><strong>2/3</strong></td>
+</tr>
+<tr>
+<td><strong>turns on scoring scenarios</strong></td>
+<td>6</td>
+<td>11</td>
+</tr>
+</tbody></table>
+<p><strong>0 of 3 became 2 of 3, at roughly double the turns.</strong> That is the claim measured
+against a control for the first time — and it is one run, which is an anecdote
+with a table around it.</p>
+<p>Three things the benchmark found that I would not have:</p>
+<ul>
+<li><strong>Two scenarios don't reproduce their failure here</strong> and are excluded rather
+than counted. A lost update is structurally prevented by a patch-based editor;
+a mutual wait doesn't happen because these models do the part they can rather
+than block. Both are marked <code>n/r</code> — a benchmark whose author quietly banks free
+passes is measuring its own suite length.</li>
+<li><strong>Verification can change beliefs without changing actions.</strong> In
+<code>false-belief</code> the peer reviewed the file, corrected the false premise, and the
+client recorded a superseding decision — then removed the field anyway on a
+different rationale. Coordination worked; the outcome still failed.</li>
+<li><strong>Stale peers invite diffusion of responsibility.</strong> An earlier run was
+invalidated when a session deferred work to peers that had been dead for hours,
+because it read their titles and nothing contradicted it. Stopped sessions now
+carry their age in <code>peer_list</code>.</li>
+</ul>
+<p>Read <a href="https://github.com/happyren/dsh-agent-messaging/blob/HEAD/bench/README.md"><code>bench/README.md</code></a> before quoting any number from it,
+including mine.</p>
+<h2>Reaching agents outside DSH</h2>
+<p>Configure an <a href="https://en.wikipedia.org/wiki/Agent2Agent">Agent2Agent</a> endpoint and
+it becomes an ordinary peer — it shows up in <code>peer_list</code> and accepts <code>peer_send</code>:</p>
+<pre><code>- id: agent-messaging
+  config:
+    a2aEndpoints:
+      reviewer: { url: "https://reviewer.example/a2a", token: "…" }
+</code></pre>
+<p>A2A is the agent-to-agent standard worth building against — Google donated it to
+the Linux Foundation, with AWS, Cisco, Microsoft, Salesforce, SAP and ServiceNow
+among the founding members — and it complements MCP rather than competing:
+<strong>MCP connects an agent to tools, A2A connects agents to each other.</strong></p>
+<p>Two boundaries worth knowing:</p>
+<ul>
+<li><strong>External senders are never elevated.</strong> A2A <a href="https://arxiv.org/pdf/2606.31498">cannot express authority
+scope</a>, so an external agent is always
+<code>inform</code>, whatever <code>peerAuthority</code> says and whatever it claims about itself.
+Trust is a property of your configuration, not of a field a stranger can set.
+Its messages carry a <code>from an external agent</code> marker on the transcript card.</li>
+<li><strong>Outbound only.</strong> DSH sessions can reach out; external agents cannot reach in.
+Serving an Agent Card needs an HTTP surface and its own authorization story,
+and shipping half of that would be worse than shipping none.</li>
+</ul>
+<p>Endpoints must be <code>https</code>, or <code>localhost</code> for local development. A misconfigured
+endpoint is logged and skipped — local messaging keeps working.</p>
+<h2>How it reaches another process</h2>
+<p>One <code>dsh</code> host holds many sessions, so discovery and delivery split:</p>
+<ul>
+<li><strong>Discovery</strong> reuses <code>ctx.sessionQuery</code>, which already merges the live store with
+the persistence backend and reports both availabilities. The plugin adds only the
+fact that service cannot know — which <em>other host process</em> currently holds a
+session.</li>
+<li><strong>Delivery</strong> is a direct call when the recipient is a live agent in the same
+process; otherwise it crosses a per-host Unix domain socket, discovered through
+advisory presence records under <code>$DSH_HOME/agent-messaging/hosts/</code>. Records whose
+process or socket is gone are pruned on sight.</li>
+</ul>
+<p>Both routes converge on the same admission path, so a receiver's policy cannot be
+bypassed by happening to share a process with it.</p>
+<h2>Configuration</h2>
+<p>Override in your profile's <code>cordis.patch.yml</code>:</p>
+<pre><code>- id: agent-messaging
+  config:
+    inbound: accept
+    spoolOffline: true
+</code></pre>
+<table>
+<thead>
+<tr>
+<th>Key</th>
+<th>Default</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>inbound</code></td>
+<td><code>accept</code></td>
+<td><code>accept</code>, <code>hold</code> (await operator release), or <code>refuse</code></td>
+</tr>
+<tr>
+<td><code>peerAuthority</code></td>
+<td><code>inform</code></td>
+<td><code>act</code> lets authorised peers be acted on directly</td>
+</tr>
+<tr>
+<td><code>trustedPeers</code></td>
+<td><code>[]</code></td>
+<td>Peers authorised by <code>peerAuthority: act</code>, matched exactly</td>
+</tr>
+<tr>
+<td><code>capabilities</code></td>
+<td>all on</td>
+<td>Which optional tool groups register</td>
+</tr>
+<tr>
+<td><code>groups</code></td>
+<td><code>{}</code></td>
+<td>Named groups and their topology (<code>mesh</code> or <code>star</code>)</td>
+</tr>
+<tr>
+<td><code>maxFanout</code></td>
+<td><code>8</code></td>
+<td>Recipients one group send may reach</td>
+</tr>
+<tr>
+<td><code>stateRoot</code></td>
+<td><code>$DSH_HOME/agent-messaging</code></td>
+<td>Presence records, claims, cards, ledger, spool</td>
+</tr>
+<tr>
+<td><code>includeSubagents</code></td>
+<td><code>false</code></td>
+<td>Make subagent children addressable</td>
+</tr>
+<tr>
+<td><code>spoolOffline</code></td>
+<td><code>true</code></td>
+<td>Hold messages for sessions that are not running</td>
+</tr>
+<tr>
+<td><code>spoolMaxAgeMs</code></td>
+<td><code>86400000</code></td>
+<td>Discard a spooled message older than this</td>
+</tr>
+<tr>
+<td><code>spoolMaxPerSession</code></td>
+<td><code>20</code></td>
+<td>Spool depth per recipient</td>
+</tr>
+<tr>
+<td><code>rateMaxPerWindow</code></td>
+<td><code>10</code></td>
+<td>Messages one sender may deliver per window</td>
+</tr>
+<tr>
+<td><code>rateWindowMs</code></td>
+<td><code>60000</code></td>
+<td>Rate window</td>
+</tr>
+<tr>
+<td><code>duplicateWindowMs</code></td>
+<td><code>30000</code></td>
+<td>Identical bodies dropped inside this window</td>
+</tr>
+<tr>
+<td><code>maxHeld</code></td>
+<td><code>100</code></td>
+<td>Held messages retained per session</td>
+</tr>
+<tr>
+<td><code>deliveryTimeoutMs</code></td>
+<td><code>5000</code></td>
+<td>Wait for a peer host's receipt</td>
+</tr>
+<tr>
+<td><code>metrics</code></td>
+<td><code>true</code></td>
+<td>Record the cost/catch counts <code>npm run report</code> reads</td>
+</tr>
+<tr>
+<td><code>a2aEndpoints</code></td>
+<td><code>{}</code></td>
+<td>External Agent2Agent peers</td>
+</tr>
+</tbody></table>
+<p>To stop receiving entirely, set <code>inbound: refuse</code>. To stop sending, deny the tools in
+your permission rules.</p>
+<h2>Security model</h2>
+<p>A peer is another agent, not your operator, and the plugin is built so that
+distinction survives contact.</p>
+<ul>
+<li><strong>Inbound messages are framed as untrusted.</strong> Every delivery carries a fixed warning
+describing what the block is and what it cannot do. This follows the convention the
+harness established for cross-session references. The transcript card is a
+presentation of that message, never a replacement: the harness's own context row
+stays beneath it holding the exact bytes the model read.</li>
+<li><strong>A body cannot forge its own frame.</strong> The data region is JSON with every <code>&lt;</code> emitted
+as its lossless JSON unicode escape, so no peer-supplied string can spell the
+surrounding tags and escape into the instruction area.</li>
+<li><strong>Senders cannot be impersonated.</strong> Identity is read from the executing agent, never
+from tool arguments.</li>
+<li><strong>Loop control terminates runaways.</strong> Per-sender rate limiting and duplicate
+suppression mean two agents that answer each other automatically stop on their own —
+which is not theoretical: it is what ended the courtesy loop measured above.</li>
+<li><strong>The inbox is owner-only.</strong> The socket is <code>chmod 0600</code>; on a shared machine another
+user's processes cannot reach it.</li>
+<li><strong>Wire input is validated before it reaches policy.</strong> Unknown protocol versions,
+wrong types, oversized bodies and oversized frames are rejected at the boundary.</li>
+</ul>
+<p>Permission boundaries stay per-session: an arriving message never answers a pending
+prompt, and anything it asks for is still subject to the receiving session's own rules.</p>
+<h2>Limitations</h2>
+<ul>
+<li><strong>Same machine only.</strong> Delivery is by Unix domain socket, so two sessions can reach
+each other only when they share a filesystem. A container and its host cannot; two
+sessions inside one container can.</li>
+<li><strong>Plain text only.</strong> No structured payloads, no attachments.</li>
+<li><strong>Spooled messages are best-effort.</strong> They expire, and the deepest are dropped first.</li>
+<li><strong>Presence is advisory.</strong> A host that dies between publishing and delivery makes a
+session look reachable until the record is pruned.</li>
+<li><strong>Tool-call cards are not rendered.</strong> Every tool declares
+<code>presentCall</code>/<code>presentResult</code>, the harness's documented presentation vocabulary, but
+the Web UI still draws the generic row against the <code>rc</code> builds this was developed on.
+The declarations cost nothing to carry; make no plans around them.</li>
+<li><strong>The harness is a developer preview</strong> with no compatibility promise. This builds
+against the npm <code>rc</code> line; service keys have been renamed between releases before, so
+re-verify after a harness upgrade.</li>
+</ul>
+<h2>Development</h2>
+<pre><code>npm install
+npm run verify   # typecheck (host + browser), tests, build
+</code></pre>
+<p>The layering keeps policy testable without a running harness: <code>src/domain</code> is pure and
+imports no framework, <code>src/app</code> holds the use cases behind the interfaces in
+<code>src/ports</code>, and <code>src/adapters</code> binds those to Cordis, the agent registry, sockets and
+disk.</p>
+<p><code>src/client</code> is the browser half — the transcript card — built separately
+(<code>lib/client.js</code>, its own tsconfig, DOM and JSX instead of Node) and served by the
+harness to the Web UI. Its projection and formatting are pure functions, so the
+card is tested here rather than in a browser.</p>
+<p><strong>367 tests.</strong> Three of them carry more weight than the rest:</p>
+<ul>
+<li><code>tests/scenario.integration.test.ts</code> runs a three-session team through a breaking
+contract change on the real stack — real stores, real sockets, real loop control,
+real accounting — and pins the exact numbers that come out. If a change makes
+collaboration quieter or noisier, those numbers move and the test says so.</li>
+<li><code>tests/agent-sink.test.ts</code> reads the record the host writes back through the card's
+own reader, so the two halves of the plugin cannot drift apart quietly.</li>
+<li><code>tests/tool-guidance.test.ts</code> pins the sentences in tool descriptions that a live
+run proved load-bearing — including the one that cut message traffic by 65%.</li>
+</ul>
+<p>Transport, presence and spool tests run against real Unix sockets and real files rather
+than mocks.</p>
+<p><a href="https://github.com/happyren/dsh-agent-messaging/blob/HEAD/docs/design.md"><code>docs/design.md</code></a> covers why each seam is where it is, and which
+alternatives were rejected. <a href="https://github.com/happyren/dsh-agent-messaging/blob/HEAD/docs/roadmap.md"><code>docs/roadmap.md</code></a> is the research
+note behind what gets built next: what the multi-agent literature actually shows
+(including that agent debate usually <em>loses</em> at equal token budget), which
+measured failure modes each planned feature attacks, and what is deliberately not
+being built.</p>
+<h2>Contributing</h2>
+<p>Pull requests are welcome — see <a href="https://github.com/happyren/dsh-agent-messaging/blob/HEAD/CONTRIBUTING.md">CONTRIBUTING.md</a>.</p>
+<p>The most useful thing you can send is not a patch: it is a run where coordination
+cost more than it caught. Paste what <code>npx dsh-agent-messaging report</code> says, with
+the transcript if two sessions talked past each other. Every significant fix in
+this project so far came from watching real sessions fail, and so far all of those
+runs have been mine.</p>
+<p>Questions, ideas and design feedback belong in
+<a href="https://github.com/happyren/dsh-agent-messaging/discussions">Discussions</a>.</p>
+<h2>License</h2>
+<p><a href="https://github.com/happyren/dsh-agent-messaging/blob/HEAD/LICENSE">MIT</a> © Kaixiang Ren</p>

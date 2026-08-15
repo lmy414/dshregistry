@@ -1,0 +1,106 @@
+<h1>dsh-session-cost</h1>
+<p>一个 DeepSeek Harness Web 插件：实时显示当前会话已花费的金额（费用），显示在输入框下方的状态条区域。</p>
+<p>A DeepSeek Harness web plugin that shows, in real time, how much the current session has spent — rendered as a cost line under the composer (next to the stats line).</p>
+<h2>原理 / How it works</h2>
+<ul>
+<li><strong>宿主侧（<code>lib/index.js</code>）</strong>：注册一个 <code>sessionCost</code> 会话投影单元。它重放会话的持久化日志，把每次模型调用的 token 用量（<code>assistant/chunk</code> 的 usage 采样与 <code>assistant/message</code> 的最终 usage）按当时生效的模型路由（<code>request/header</code> 快照）乘以价格表换算成金额。</li>
+<li><strong>浏览器侧（<code>lib/client.js</code>）</strong>：一个手写的客户端 bundle，通过框架标准的 <code>useProjection('sessionCost')</code> 座位读取该投影，挂载到 <code>conversation.composer.dock</code> 插槽（自带统计条 StatsLine 所在的位置）。宿主每次推送新的 <code>session/projection</code> 帧，金额实时刷新；悬浮提示会显示价格来源与更新时间。</li>
+</ul>
+<p>计费口径与 <code>dsh-token-meter</code> 一致：input / cacheRead / cacheWrite / output 四个桶互不相交；同一 (turn, step) 先出现 usage 采样、后有最终 usage 时以后者替换前者，一步只计费一次。</p>
+<h2>价格怎么保持正确（重点）</h2>
+<p>三层机制，价格变动时要么自动跟上、要么明确提示，不会静默算错：</p>
+<ol>
+<li><p><strong>官网价格自动同步（默认开启）</strong>
+插件在启动时和每 <code>updateIntervalHours</code>（默认 24h）抓取 DeepSeek 官方价格页
+（<a href="https://api-docs.deepseek.com/zh-cn/quick_start/pricing/">模型 &amp; 价格</a>），
+<strong>模型无关地自动识别价格表里的全部模型</strong>（价格表按"每模型一列"排布，解析器按列数发现模型、
+逐列取价——所以将来 DeepSeek 出新模型（比如 v5），只要官网价格表列出，插件就会自动为它取价），
+并把检测到的变动<strong>按生效时间追加到每个模型的价格时间轴</strong>（每次请求按其自身时间戳取价）。
+官方页面若预告了未来调价（例如 2026-08-17 的峰谷定价公告），解析器会连同<strong>生效日期</strong>一起读入，
+到时自动切换，无需人工操作。已观测到的价格历史持久化在
+<code>$DSH_HOME/storages/dsh-session-cost-pricing.json</code>，重启不丢失。
+每次变动都会在服务日志里打一条明显的变更记录；抓取失败则沿用上次价格并在投影中报告
+<code>pricingWarn</code>，界面悬浮提示可见。</p>
+</li>
+<li><p><strong>本地配置可覆盖 / 冻结</strong>
+<code>pricing</code> 里的条目是"种子"：官网抓取到新价后会被更新。给某模型加 <code>pin: true</code>
+即完全由你掌控，永不自动改动。<code>fallback</code> 仍是未收录模型的兜底（默认 0 = 未计价并计入
+<code>unpricedRequests</code>）。</p>
+</li>
+<li><p><strong>来源可见</strong>
+投影值携带 <code>pricingSource</code>（<code>official-auto</code> / <code>official-auto-failed</code> / <code>config</code>）、
+<code>pricingUpdatedAt</code>（最近一次成功抓取时间）和 <code>pricingWarn</code>（抓取失败/疑似巨变待确认时非空），
+客户端悬浮提示直接展示，价格是否"新鲜"一目了然。</p>
+</li>
+</ol>
+<p><strong>价格变动时的行为</strong>：新请求按新价计费；过去请求按其发生时刻的价格计费（时间轴）。若你手动改了配置，
+profile 补丁热加载会重启该行并用当前时间轴重算全部历史（确定性重放，结果一致）。</p>
+<h3>峰谷定价</h3>
+<p>DeepSeek 自 2026-08-17 00:00（北京）起实行峰谷价：高峰 9:00–12:00、14:00–18:00（北京），闲时为高峰一半。
+插件支持两种写法（可同时用于配置与自动同步）：</p>
+<pre><code>pricing:
+  deepseek-v4-flash:
+    peak:    { input: 3.0, output: 9.0,  cacheRead: 0.10 }
+    offPeak: { input: 1.5, output: 4.5,  cacheRead: 0.05 }
+</code></pre>
+<p>或显式时间轴（<code>from</code> 接受 ISO 时间、epoch 毫秒或中文日期"2026 年 8 月 17 日 00:00"）：</p>
+<pre><code>pricing:
+  deepseek-v4-flash:
+    schedule:
+      - from: 0
+        input: 1
+        output: 2
+        cacheRead: 0.02
+      - from: 2026-08-17T00:00:00+08:00
+        peak:    { input: 3.0, output: 9.0,  cacheRead: 0.10 }
+        offPeak: { input: 1.5, output: 4.5,  cacheRead: 0.05 }
+</code></pre>
+<p><code>peakWindow: ["09:00-12:00", "14:00-18:00"]</code> 可自定义高峰时段（默认即官方窗口，北京时间）。</p>
+<h2>安装 / Install</h2>
+<p>在插件包目录执行（<code>&lt;path&gt;</code> 可以是本目录或打包后的 tarball）：</p>
+<pre><code>dsh plugin --profile web add &lt;path&gt;
+</code></pre>
+<p>然后<strong>刷新浏览器页面</strong>（F5）。若 Web 服务正在运行，把激活行加入
+<code>$DSH_HOME/profiles/web/cordis.patch.yml</code> 可热加载（配置变更无需重启）；
+<strong>宿主代码变更（如本插件的功能升级）需要重启一次 <code>dsh web</code></strong>，因为宿主模块走 Node 模块缓存。</p>
+<h2>配置 / Configuration</h2>
+<pre><code>config:
+  currency: CNY            # 显示与计价货币（ISO 4217）
+  autoUpdate: true         # 是否自动同步官网价格（默认 true）
+  updateIntervalHours: 24  # 抓取间隔（默认 24）
+  pricing:                 # 按模型 id 计价；种子值会被官网新价更新，加 pin: true 则冻结
+    deepseek-v4-flash: { input: 1, output: 2, cacheRead: 0.02, cacheWrite: 0 }
+    deepseek-v4-pro:   { input: 3, output: 6, cacheRead: 0.025, cacheWrite: 0 }
+  fallback:                # 未在 pricing 中的模型（默认全 0 = 未计价）
+    input: 0
+    output: 0
+    cacheRead: 0
+    cacheWrite: 0
+</code></pre>
+<h2>投影值 / Projection value</h2>
+<p><code>sessionCost</code> 投影的值为：</p>
+<pre><code>{
+  "currency": "CNY",
+  "totalCost": 0.0123,        // 本会话累计费用
+  "requests": 3,              // 已计费的模型调用步数
+  "unpricedRequests": 0,      // 价格表中没有的模型调用步数
+  "inputTokens": 12000,
+  "outputTokens": 600,
+  "cacheReadTokens": 3000,
+  "cacheWriteTokens": 200,
+  "lastModel": "deepseek-v4-flash",
+  "pricingSource": "official-auto",   // official-auto | official-auto-failed | config
+  "pricingUpdatedAt": 1786805927947,  // 最近一次官网抓取时间（epoch ms）
+  "pricingWarn": null                 // 抓取失败或疑似巨变待确认时非空
+}
+</code></pre>
+<h2>已知限制 / Limitations</h2>
+<ul>
+<li>费用按<strong>会话自身日志</strong>统计；子代理（subagent）的模型调用发生在子会话的日志里，不会计入父会话的金额。</li>
+<li>推理 token（reasoningTokens）是输出桶的子集，按输出价计费，不再重复加价。</li>
+<li><strong>新模型计价有一个窗口</strong>：模型首次出现在官网价格表后，插件要等下一次抓取（启动或每 24h）才认识它；
+在认识之前，该模型的请求计入 <code>unpricedRequests</code> 并在悬浮提示标注「未计价」（不会静默漏算——你总能看见）。
+认识之后按官网价从时间 0 起算。若你关闭了 <code>autoUpdate</code>，新模型需手动加入 <code>pricing</code>。</li>
+<li>官网页面是唯一自动价格源，解析基于页面结构，<strong>失败即安全降级</strong>（沿用上次价格并提示），不会给出错误的"自动"数字；若官网改版导致连续抓取失败，<code>pricingWarn</code> 会一直提示，届时应手动更新配置。</li>
+<li>价格终归是部署事实：自动同步只是让"默认跟随官网"成为常态，<code>pin: true</code> 的条目和 <code>fallback</code> 始终由你掌控。</li>
+</ul>

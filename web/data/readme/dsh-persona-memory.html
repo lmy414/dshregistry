@@ -1,0 +1,537 @@
+<h1>dsh-persona-memory</h1>
+<p>持久化长期人格记忆插件 for <a href="https://github.com/deepseek-ai/deepseek-harness">DeepSeek Harness</a>（DSH）。</p>
+<p>让 agent 跨会话记住用户、项目与教训：事实写入磁盘永久保存，每次请求注入上下文；后台自动学习、纠正检测、失败记忆、容量合并让记忆"自己长出来且不失控"；磁盘格式与 <a href="https://github.com/chandra447/pi-hermes-memory">pi-hermes-memory</a> 字节兼容，DSH 与 Pi 可读写同一份记忆文件。</p>
+<hr>
+<h2>功能清单</h2>
+<h3>A. 存储与共享</h3>
+<table>
+<thead>
+<tr>
+<th>功能</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>跨会话持久记忆</td>
+<td><code>MEMORY.md</code>（事实/偏好/约定/环境）+ <code>USER.md</code>（用户画像），写入即永久保存</td>
+</tr>
+<tr>
+<td>每请求上下文注入</td>
+<td>每次请求自动把当前记忆注入系统提示词（<code>memory:profile</code> 段，按字符预算截断）</td>
+</tr>
+<tr>
+<td>与 Pi 共用记忆</td>
+<td>磁盘格式与 pi-hermes-memory 完全兼容，DSH 与 Pi 读写同一份文件（MEMORY/USER/STANDING/failures/projects）</td>
+</tr>
+<tr>
+<td>项目级记忆</td>
+<td>每个项目独立记忆（git 仓库根为身份，worktree 共享），按会话 cwd 自动注入（<code>memory:project</code> 段）</td>
+</tr>
+<tr>
+<td>记忆老化</td>
+<td>条目携带 <code>created/last</code> 日期，合并时据此判断陈旧条目</td>
+</tr>
+</tbody></table>
+<h3>B. 读写与检索工具</h3>
+<table>
+<thead>
+<tr>
+<th>功能</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>memory</code> 工具</td>
+<td><code>read</code> / <code>add</code> / <code>update</code> / <code>delete</code> / <code>rewrite</code>；<code>which</code> 选 memory/user/failure；<code>project</code> 参数操作项目记忆</td>
+</tr>
+<tr>
+<td><code>memory_search</code>（混合检索）</td>
+<td>优先 <strong>FTS5 + 语义向量（RRF 融合）</strong>：FTS5 全文索引（<code>&lt;dir&gt;/.memory-index.sqlite</code>，mtime 自动重建）+ 向量索引（<code>vectorIndexDir</code> 下 <code>.memory-vec.sqlite</code>，只存 embedding、指纹增量同步、纯 JS 余弦）；向量未启用时走 FTS5，SQLite 不可用时回退子串扫描；结果始终 ≤<code>searchMaxResults</code> 条、只进工具输出，注入成本不随检索方式增加</td>
+</tr>
+<tr>
+<td>用量提示</td>
+<td>所有 <code>memory</code> 操作返回用量百分比；达 90%（<code>usageNudgeThreshold</code>）提醒用 <code>rewrite</code> 合并</td>
+</tr>
+<tr>
+<td><code>/standing</code> 命令</td>
+<td>用户管理常驻指令（列出 / add / remove / clear）</td>
+</tr>
+</tbody></table>
+<h3>C. 自动学习机制</h3>
+<table>
+<thead>
+<tr>
+<th>功能</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>后台学习</td>
+<td>每 <code>learnIntervalTurns</code>（默认 10）轮用会话自身 LLM 路由复习近期对话，自动提取持久事实存入记忆</td>
+</tr>
+<tr>
+<td>纠正检测</td>
+<td><code>/feedback</code> 事件 + 对话内模式检测（强/弱/负向模式 + 指令词，仅直接人工消息，3 轮限频）→ 立即存 <code>[correction]</code> 失败条目</td>
+</tr>
+<tr>
+<td>失败记忆</td>
+<td><code>failures.md</code> 结构化记录 <code>[category] 内容 — Failed: 原因 — Corrected to: 修正</code>；最近 7 天最多 5 条自动注入上下文（<code>memory:failures</code> 段），防止重蹈覆辙</td>
+</tr>
+<tr>
+<td>自动合并</td>
+<td>记忆超限时用 LLM 合并精简（&gt;30 天无引用可删、偏好/纠正优先保留）；<strong>只有结果严格更小、可解析且过扫描才提交</strong>，失败绝不损坏记忆</td>
+</tr>
+</tbody></table>
+<h3>D. 安全与约束</h3>
+<table>
+<thead>
+<tr>
+<th>功能</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>内容扫描</td>
+<td>每次写入过安检：提示注入/数据外泄载荷、API key/token/私钥、不可见 Unicode 字符一律拦截（防凭据落盘、防记忆被植入恶意指令）</td>
+</tr>
+<tr>
+<td>常驻指令</td>
+<td>STANDING.md 每行一条、硬预算（20 条/2000 字符）、始终注入（<code>memory:standing</code> 段，早于其他记忆）；<strong>只有 <code>/standing</code> 命令或直接编辑能写</strong>——模型无写入口，防止模型把"常驻指令"偷偷注入</td>
+</tr>
+</tbody></table>
+<h3>E. 工程与容错</h3>
+<table>
+<thead>
+<tr>
+<th>功能</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>原子写 + 单锁串行队列</td>
+<td>临时文件 + rename，崩溃不留半截文件；add/update/remove 走单锁原子读-改-写（<code>mutate</code>），并发工具调用绝不互相覆盖；只读/纯写各自加锁</td>
+</tr>
+<tr>
+<td>跨进程写保护</td>
+<td>写前 sha256 指纹预检（对照 Pi 的 ExternalMemoryWriteConflict）：外部（Pi/手动编辑）改过就不覆盖，重试一次后返回 <code>conflict</code> 提示</td>
+</tr>
+<tr>
+<td>与 Pi 字节兼容</td>
+<td>对齐 pi-hermes-memory v0.9.4 实测：无尾随换行、charCount 含分隔符、USER 上限 5000、超限拒绝写入、failure 去重按 (text, project)、注入 <code>&lt;memory-context&gt;</code> 围栏</td>
+</tr>
+<tr>
+<td>优雅降级</td>
+<td>FTS5 不可用回退子串搜索；SQLite 动态 import，插件绝不硬依赖</td>
+</tr>
+<tr>
+<td>111 项冒烟测试</td>
+<td>用真实 hermes 文件副本验证格式兼容、解析、读写、扫描、合并、项目、纠正、FTS、向量索引、溢出拒绝、字节格式、并发、围栏全链路</td>
+</tr>
+</tbody></table>
+<hr>
+<h2>借鉴来源（明确声明）</h2>
+<p>本插件大量借鉴 <a href="https://github.com/chandra447/pi-hermes-memory">pi-hermes-memory</a>（MIT，作者 chandra447，其本身移植自 <a href="https://github.com/anthropics/hermes-agent">hermes-agent</a>）。按借鉴程度分四档：</p>
+<h3>1. 代码级移植（近逐行，MIT 保留声明）</h3>
+<table>
+<thead>
+<tr>
+<th>文件</th>
+<th>来源</th>
+<th>移植内容</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>lib/secret-scanner.js</code></td>
+<td>hermes <code>content-scanner.ts</code></td>
+<td>11 条提示注入/外泄威胁模式 + 19 条凭据模式 + 不可见 Unicode 字符集</td>
+</tr>
+<tr>
+<td><code>lib/standing.js</code>（核心）</td>
+<td>hermes <code>standing-instructions.ts</code></td>
+<td>容错解析（<code>#</code> 注释/<code>-</code>/<code>*</code> 列表符/去重）、硬预算（20 条/2000 字符）、<code>&lt;standing-instructions&gt;</code> 渲染块（超预算在块内声明遗漏）、来源约束（仅用户可写）</td>
+</tr>
+<tr>
+<td><code>lib/correction.js</code></td>
+<td>hermes <code>correction-detector.ts</code> 的模式部分</td>
+<td>强/弱/负向三组正则 + 23 个指令词 + <code>extractCorrectionDirective</code></td>
+</tr>
+</tbody></table>
+<h3>2. 格式级兼容（字节兼容，实现重写）</h3>
+<table>
+<thead>
+<tr>
+<th>文件</th>
+<th>来源</th>
+<th>兼容内容</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>lib/memory-store.js</code>（磁盘格式）</td>
+<td>hermes <code>MemoryStore</code></td>
+<td><code>\n§\n</code> 分隔符、<code>encodeEntry</code>/<code>decodeEntry</code> 正则（含 <code>project64</code> 字段）、<code>YYYY-MM-DD</code> 日期</td>
+</tr>
+<tr>
+<td><code>lib/failures.js</code></td>
+<td>hermes <code>buildFailureMemoryText</code></td>
+<td><code>[category] 内容 — Failed: … — Corrected to: …</code> 结构化文本</td>
+</tr>
+<tr>
+<td><code>lib/projects.js</code></td>
+<td>hermes <code>project.ts</code> / <code>paths.ts</code></td>
+<td>项目根解析（<code>~/.pi/agent/projects-memory</code>）、git 仓库根身份（worktree 共享）、迁移桥、cwd 检测</td>
+</tr>
+</tbody></table>
+<h3>3. 概念级移植（思路照搬，代码全新）</h3>
+<table>
+<thead>
+<tr>
+<th>功能</th>
+<th>来源概念</th>
+<th>本插件实现</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>后台学习</td>
+<td>hermes 每 10 轮复习</td>
+<td>DSH <code>session/event</code> 钩子 + <code>ctx.llm.stream</code> + 自写提示词</td>
+</tr>
+<tr>
+<td>自动合并</td>
+<td>hermes <code>auto-consolidate.ts</code></td>
+<td>超限触发、合并规则、<strong>严格更小才提交</strong>安全护栏</td>
+</tr>
+<tr>
+<td>纠正检测落库</td>
+<td>hermes 自动失败捕获</td>
+<td><code>feedback/record</code> 事件 + 对话内模式 → <code>[correction]</code> 失败条目</td>
+</tr>
+<tr>
+<td>记忆老化</td>
+<td>hermes Memory Aging</td>
+<td><code>created/last</code> 日期驱动合并决策</td>
+</tr>
+</tbody></table>
+<h3>4. DSH 原生（未借鉴 hermes，基于 DSH API 构建）</h3>
+<table>
+<thead>
+<tr>
+<th>模块</th>
+<th>基于的 DSH 能力</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>memory</code> / <code>memory_search</code> 工具</td>
+<td><code>ctx.tools.register</code> + <code>defineTool</code></td>
+</tr>
+<tr>
+<td>记忆注入段落</td>
+<td><code>ctx.systemPrompt</code> 注册表（variable + section）</td>
+</tr>
+<tr>
+<td><code>/standing</code> 命令</td>
+<td><code>ctx.commands</code> 注册</td>
+</tr>
+<tr>
+<td><code>lib/llm-helper.js</code></td>
+<td>会话 <code>request/header</code> 路由解析 + <code>ctx.llm.stream</code></td>
+</tr>
+<tr>
+<td><code>lib/fts.js</code></td>
+<td><code>node:sqlite</code> FTS5（DSH <code>dsh-session-query-sqlite</code> 同款契约）</td>
+</tr>
+<tr>
+<td>存储实现（原子写/队列/API）</td>
+<td>全新编写（hermes 的 MemoryStore 耦合 Pi API，无法直接复用）</td>
+</tr>
+</tbody></table>
+<blockquote>
+<p>刻意未移植：hermes 的 SQLite 会话搜索（DSH 原生 <code>dsh-session-query-sqlite</code> 已具备）、程序性技能（DSH 原生 skills 已具备）、子进程传输与 SQLite 锁协调器（DSH 插件进程内运行，不需要）。</p>
+</blockquote>
+<hr>
+<h2>工具与命令</h2>
+<table>
+<thead>
+<tr>
+<th>工具/命令</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>memory</code></td>
+<td><code>read</code> / <code>add</code> / <code>update</code> / <code>delete</code> / <code>rewrite</code>，<code>which</code> 选 <code>memory</code> / <code>user</code> / <code>failure</code>；<code>project</code> 参数操作项目记忆；failure 支持 <code>category</code> / <code>failure_reason</code> / <code>corrected_to</code></td>
+</tr>
+<tr>
+<td><code>memory_search</code></td>
+<td><code>query</code> + 可选 <code>which</code>（<code>memory</code>/<code>user</code>/<code>failure</code>/<code>all</code>）+ 可选 <code>project</code></td>
+</tr>
+<tr>
+<td><code>/standing</code></td>
+<td>列出常驻指令</td>
+</tr>
+<tr>
+<td><code>/standing add &lt;文本&gt;</code></td>
+<td>钉住一条常驻指令</td>
+</tr>
+<tr>
+<td><code>/standing remove &lt;n&gt;</code></td>
+<td>按 1 起编号移除</td>
+</tr>
+<tr>
+<td><code>/standing clear</code></td>
+<td>清空</td>
+</tr>
+</tbody></table>
+<h2>安装到 DSH profile</h2>
+<p>插件声明了 <code>"dsh": { "bundle": { "patch": "./cordis.patch.yml" } }</code>，安装后 dsh <strong>自动激活</strong>为 profile 层（无需手动挂载）：</p>
+<pre><code># 安装（本地路径开发 / npm 发布版均可）
+dsh plugin --profile web add file:E:/GitHub/lian_dsh
+# 或：dsh plugin --profile web add dsh-persona-memory
+
+# 重启 dsh web
+dsh --profile web
+</code></pre>
+<p>如需覆盖配置（如 <code>dir</code>），在 profile 的 <code>cordis.patch.yml</code> 里按 id 覆盖即可（bundle 行在后层会被 profile 行覆盖）：</p>
+<pre><code>- id: persona-memory
+  config:
+    dir: C:/Users/Quophic/.pi/agent/pi-hermes-memory
+</code></pre>
+<h2>配置（均可选）</h2>
+<table>
+<thead>
+<tr>
+<th>键</th>
+<th>默认</th>
+<th>含义</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>dir</code></td>
+<td>见下</td>
+<td>记忆文件目录；显式设置优先</td>
+</tr>
+<tr>
+<td><code>memoryCharLimit</code></td>
+<td><code>5000</code></td>
+<td>MEMORY.md 注入上下文的最大字符数</td>
+</tr>
+<tr>
+<td><code>userCharLimit</code></td>
+<td><code>8000</code></td>
+<td>USER.md 注入上下文的最大字符数</td>
+</tr>
+<tr>
+<td><code>enableSecretScanning</code></td>
+<td><code>true</code></td>
+<td>是否启用写入扫描</td>
+</tr>
+<tr>
+<td><code>inject</code></td>
+<td><code>true</code></td>
+<td>是否注册系统提示词注入段落</td>
+</tr>
+<tr>
+<td><code>sectionOrder</code></td>
+<td><code>55</code></td>
+<td>注入段落在系统提示词中的顺序</td>
+</tr>
+<tr>
+<td><code>searchMaxResults</code></td>
+<td><code>10</code></td>
+<td><code>memory_search</code> 单次最多返回条数</td>
+</tr>
+<tr>
+<td><code>usageNudgeThreshold</code></td>
+<td><code>0.9</code></td>
+<td>达到该用量比例（如 90%）时在结果中提醒合并</td>
+</tr>
+<tr>
+<td><code>correctionDetection</code></td>
+<td><code>true</code></td>
+<td>收到 <code>feedback/record</code> 时自动存 <code>[correction]</code> 失败条目</td>
+</tr>
+<tr>
+<td><code>correctionPatternDetection</code></td>
+<td><code>true</code></td>
+<td>对话内纠正模式检测（强/弱/负向模式，仅直接人工消息）</td>
+</tr>
+<tr>
+<td><code>correctionRateLimitTurns</code></td>
+<td><code>3</code></td>
+<td>对话内纠正保存的最小间隔（轮）</td>
+</tr>
+<tr>
+<td><code>memoryFtsEnabled</code></td>
+<td><code>true</code></td>
+<td>启用 SQLite FTS5 记忆镜像（<code>memory_search</code> 全文检索）</td>
+</tr>
+<tr>
+<td><code>vectorEnabled</code></td>
+<td><code>false</code></td>
+<td>启用语义向量搜索（<code>memory_search</code> 变混合检索：FTS5 + 向量 RRF 融合）</td>
+</tr>
+<tr>
+<td><code>vectorIndexDir</code></td>
+<td><code>$DSH_HOME/memory</code></td>
+<td>向量索引目录（DSH 侧，绝不写入 Pi 共享记忆目录）</td>
+</tr>
+<tr>
+<td><code>embeddingProvider</code></td>
+<td><code>remote</code></td>
+<td><code>remote</code>（OpenAI 兼容 <code>/embeddings</code> API）或 <code>local</code>（自带 transformers.js，模型自动下载）</td>
+</tr>
+<tr>
+<td><code>embeddingBaseUrl</code></td>
+<td><code>''</code></td>
+<td>远程 embedding API 基址（如 <code>https://api.openai.com/v1</code>）</td>
+</tr>
+<tr>
+<td><code>embeddingApiKey</code></td>
+<td><code>''</code></td>
+<td>远程 embedding API Key；不填则读 <code>DSH_EMBEDDING_API_KEY</code> 环境变量</td>
+</tr>
+<tr>
+<td><code>embeddingModel</code></td>
+<td><code>text-embedding-3-small</code></td>
+<td>embedding 模型名（local 默认 <code>Xenova/all-MiniLM-L6-v2</code>）</td>
+</tr>
+<tr>
+<td><code>embeddingCacheDir</code></td>
+<td><code>$DSH_HOME/models</code></td>
+<td>local 模型缓存目录（首次自动下载到此处）</td>
+</tr>
+<tr>
+<td><code>embeddingRemoteHost</code></td>
+<td><code>https://huggingface.co</code></td>
+<td>local 模型下载源；大陆可用 <code>https://hf-mirror.com</code></td>
+</tr>
+<tr>
+<td><code>learnEnabled</code></td>
+<td><code>true</code></td>
+<td>是否启用后台自动学习</td>
+</tr>
+<tr>
+<td><code>learnIntervalTurns</code></td>
+<td><code>10</code></td>
+<td>每 N 轮（turn/end）触发一次复习</td>
+</tr>
+<tr>
+<td><code>learnRecentTurns</code></td>
+<td><code>2</code></td>
+<td>每次复习取最近多少个轮次的对话</td>
+</tr>
+<tr>
+<td><code>learnMaxChars</code></td>
+<td><code>6000</code></td>
+<td>复习用的对话/记忆摘要最大字符数</td>
+</tr>
+<tr>
+<td><code>learnTimeoutMs</code></td>
+<td><code>120000</code></td>
+<td>学习 LLM 调用的超时</td>
+</tr>
+<tr>
+<td><code>standingEnabled</code></td>
+<td><code>true</code></td>
+<td>是否启用常驻指令（STANDING.md + <code>/standing</code> 命令）</td>
+</tr>
+<tr>
+<td><code>standingCharLimit</code></td>
+<td><code>2000</code></td>
+<td>STANDING.md 注入预算（硬上限）</td>
+</tr>
+<tr>
+<td><code>standingMaxEntries</code></td>
+<td><code>20</code></td>
+<td>STANDING.md 最大条数（硬上限）</td>
+</tr>
+<tr>
+<td><code>autoConsolidate</code></td>
+<td><code>true</code></td>
+<td>超限时自动 LLM 合并（严格更小才提交）</td>
+</tr>
+<tr>
+<td><code>consolidateStaleDays</code></td>
+<td><code>30</code></td>
+<td>合并时判定"陈旧可删"的天数（无近期引用）</td>
+</tr>
+<tr>
+<td><code>consolidateTimeoutMs</code></td>
+<td><code>120000</code></td>
+<td>合并 LLM 调用的超时</td>
+</tr>
+<tr>
+<td><code>failureInjectionEnabled</code></td>
+<td><code>true</code></td>
+<td>是否注入最近失败（learn from mistakes）</td>
+</tr>
+<tr>
+<td><code>failureMaxAgeDays</code></td>
+<td><code>7</code></td>
+<td>失败注入窗口（按 created 日期）</td>
+</tr>
+<tr>
+<td><code>failureMaxEntries</code></td>
+<td><code>5</code></td>
+<td>失败注入最多条数</td>
+</tr>
+<tr>
+<td><code>failureCharLimit</code></td>
+<td><code>10000</code></td>
+<td>failures.md 字符上限（hermes 默认 memory×2）</td>
+</tr>
+<tr>
+<td><code>projectEnabled</code></td>
+<td><code>true</code></td>
+<td>是否启用项目级记忆</td>
+</tr>
+<tr>
+<td><code>projectCharLimit</code></td>
+<td><code>5000</code></td>
+<td>单项目记忆字符上限</td>
+</tr>
+</tbody></table>
+<p><code>dir</code> 默认解析顺序：① 显式 <code>config.dir</code> → ② <code>~/.pi/agent/pi-hermes-memory</code>（若已存在 <code>MEMORY.md</code>，即与 Pi 共用）→ ③ <code>$DSH_HOME/memory</code>（默认 <code>~/.dsh/memory</code>）。</p>
+<h2>磁盘格式（与 pi-hermes-memory 一致）</h2>
+<pre><code>&lt;条目文本&gt; &lt;!-- created=2026-08-13, last=2026-08-13 --&gt;
+§
+&lt;另一条目文本&gt; &lt;!-- created=2026-08-13, last=2026-08-13 --&gt;
+</code></pre>
+<ul>
+<li>条目以 <code>\n§\n</code> 分隔，每条是单行文本 + 行尾 <code>&lt;!-- created=YYYY-MM-DD, last=YYYY-MM-DD --&gt;</code> 注释。</li>
+<li>无注释的旧条目照常解析（日期默认为今天）。</li>
+<li>写入采用原子写（临时文件 + rename），并按文件串行化，避免并发工具调用互相覆盖。</li>
+<li>STANDING.md 例外：每行一条，无分隔符、无元数据（见下节）。</li>
+</ul>
+<h2>语义向量搜索（可选，默认关闭）</h2>
+<p><code>memory_search</code> 默认走 <strong>FTS5 全文检索</strong>（字面匹配）；开启 <code>vectorEnabled</code> 后升级为<strong>混合检索</strong>：</p>
+<ul>
+<li><strong>存储不变</strong>：MEMORY.md / USER.md / failures.md 仍是唯一真相源，与 Pi 逐字节共用不变。</li>
+<li><strong>索引在 DSH 侧</strong>：<code>.memory-vec.sqlite</code> 存在 <code>vectorIndexDir</code>（默认 <code>$DSH_HOME/memory</code>），<strong>只存 embedding 数据</strong>（每条记忆的向量 BLOB + sha256 指纹），Pi 完全不感知；索引可随时删除重建。</li>
+<li><strong>指纹增量同步</strong>：每次搜索前对比文件条目 sha256，<strong>只对新增/变化的条目重新 embedding</strong>——Pi 改共享文件后自动跟上，不重复计算存量。</li>
+<li><strong>混合排序</strong>：FTS5 精确匹配 + 向量语义匹配通过 <strong>RRF（倒数排名融合）</strong> 合并，精确词与近义命中互相补足；向量不可用自动降级 FTS5/子串。</li>
+<li><strong>注入成本不变</strong>：结果仍 ≤<code>searchMaxResults</code> 条、只进工具输出，不常驻上下文。</li>
+</ul>
+<p>启用示例（profile 的 cordis.patch.yml 覆盖）：</p>
+<pre><code>- id: persona-memory
+  config:
+    vectorEnabled: true
+    embeddingProvider: local
+    # embeddingModel: Xenova/all-MiniLM-L6-v2   # 默认，可换
+    # embeddingCacheDir: C:/Users/xxx/.dsh/models # 默认 $DSH_HOME/models
+    # embeddingRemoteHost: https://hf-mirror.com  # 大陆镜像（可选）
+</code></pre>
+<blockquote>
+<p><strong>本地模型自动下载</strong>：<code>embeddingProvider: local</code> 时，插件自带 <code>@xenova/transformers</code>，<strong>首次使用自动从 HuggingFace 下载模型</strong>（默认 <code>Xenova/all-MiniLM-L6-v2</code>，约 80MB）到 <code>$DSH_HOME/models</code>，之后完全离线运行；下载进度会打印到 dsh 日志。网络受限时可用 <code>embeddingRemoteHost: https://hf-mirror.com</code> 走镜像，或预下载模型放入 <code>embeddingCacheDir</code>。</p>
+<p>远程方案（备选）：<code>embeddingProvider: remote</code> + <code>embeddingBaseUrl</code>（如 <code>https://api.openai.com/v1</code>）+ <code>embeddingApiKey</code>（或 <code>DSH_EMBEDDING_API_KEY</code> 环境变量）。DeepSeek 官方 <code>/v1/embeddings</code> 接口曾出现可用性问题（见 <a href="https://github.com/deepseek-ai/DeepSeek-R1/issues/652">deepseek-ai/DeepSeek-R1#652</a>），不建议依赖。</p>
+</blockquote>
+<h2>常驻指令（STANDING.md）</h2>
+<p>与 pi-hermes-memory 一致：<strong>每行一条</strong>，无分隔符、无元数据；容忍空行、<code>#</code> 注释和行首 <code>-</code>/<code>*</code> 列表符，手改时仍是普通 Markdown。注入块用 <code>&lt;standing-instructions&gt;</code> 围栏，声明"用户亲写的规则、始终生效、高于默认行为"；超预算时在块<strong>内部</strong>声明被省略的条数，绝不静默丢弃。</p>
+<p><strong>来源约束</strong>：只有 <code>/standing</code> 命令或用户直接编辑文件能写入——模型无写入口（后台学习、合并、纠正检测都不碰它）。</p>
+<h2>与 Pi 共用的注意点</h2>
+<ul>
+<li><strong>避免同时写</strong>：两边都是原子写，但 Pi 有跨进程锁（<code>.pi-hermes-locks.sqlite</code> + recovery 文件），DSH 侧用<strong>写前指纹预检</strong>兜底——检测到外部改动就不覆盖并提示冲突。极端并发下仍可能互相感知不到，<strong>不同时运行最安全</strong>。</li>
+<li>本插件覆盖 <code>MEMORY.md</code> / <code>USER.md</code> / <code>STANDING.md</code> / <code>failures.md</code> / <code>projects-memory/</code>（项目根与 Pi 一致）。</li>
+<li>两边扫描标准一致（同一份 content-scanner 移植），hermes 写入的内容 DSH 直接可读，反之亦然；磁盘格式（含无尾随换行、project64、超限拒绝）已对齐 Pi v0.9.4 实测。</li>
+</ul>
+<h2>许可与致谢</h2>
+<p>MIT。磁盘格式、内容扫描器、常驻指令、纠正模式与合并策略移植自 <a href="https://github.com/chandra447/pi-hermes-memory">pi-hermes-memory</a>（MIT，作者 chandra447），其本身又移植自 <a href="https://github.com/anthropics/hermes-agent">hermes-agent</a>。具体移植清单见上文「借鉴来源」。</p>

@@ -1,0 +1,183 @@
+<h1>dsh-statecore</h1>
+<p><a href="https://github.com/yul761/dsh-statecore/actions/workflows/ci.yml"><img src="https://github.com/yul761/dsh-statecore/actions/workflows/ci.yml/badge.svg" alt="CI"></a></p>
+<p>Native memory for DeepSeek Harness — auditable facts with evidence chains, powered by <a href="https://github.com/yul761/StateCore">StateCore</a>.</p>
+<p><code>dsh-statecore</code> is a <a href="https://github.com/deepseek-ai/deepseek-harness">dsh</a> plugin, not an MCP server: it mounts StateCore's memory engine straight onto <code>dsh</code>'s own plugin context, so memory participates in <code>dsh</code>'s session log, permission system, and Code Mode the same way any other native capability does.</p>
+<h2>What it does</h2>
+<ul>
+<li><strong>Auto-ingest</strong> — every <code>user/message</code> and <code>assistant/message</code> in a session is fed into per-project memory as it happens, with no model cooperation required. An MCP server can only be pull: a model has to decide to call a write tool. This plugin also pushes.</li>
+<li><strong>Auto-inject</strong> — each session's <code>agent/pre-step</code> waterfall folds a budgeted digest of project memory into the model's context automatically, the same fold pattern <code>@deepseek-ai/dsh-agent-instructions</code> uses for <code>AGENTS.md</code>/<code>CLAUDE.md</code> instructions.</li>
+<li><strong>Five native tools, plus why they're native, not MCP</strong> — <code>remember</code>/<code>recall</code>/<code>facts</code>/<code>why</code>/<code>forget</code> register through <code>dsh-tools</code>, so they carry honest JSON <code>output.schema</code> (Code Mode can <code>await tools.why({factId})</code> for a structured evidence chain, not just text), participate in <code>dsh</code>'s permission and presentation pipeline, and unregister cleanly on plugin dispose (HMR-safe).</li>
+</ul>
+<p>Digest — the background pass that consolidates raw conversational events into stable, auditable facts — runs on <strong>the host's own configured model</strong>, through <code>ctx.llm</code>. There is no separate API key to configure: whatever model you've already pointed <code>dsh</code> at drives memory distillation too.</p>
+<h2>Privacy and data flow</h2>
+<p>With <code>url</code> unset (the default), nothing leaves the machine except through the host's own already-configured model calls: <code>remember</code>/<code>recall</code>/<code>facts</code>/<code>why</code>/<code>forget</code> and auto-ingest all read and write the local embedded SQLite store under <code>dataDir</code>. The one exception is digest — when <code>config.digest</code> is true (the default) and enough events have accumulated, digest sends the pending conversation-derived event text to whichever model <code>ctx.llm</code> is configured to call, the same route your other requests already go through. Set <code>digest: false</code> to keep memory fully local (raw events are still stored and recalled; they are just never distilled into consolidated facts by a model). Pointing <code>url</code> at a self-hosted StateCore deployment changes the destination of every operation, not just digest, to that server.</p>
+<h2>Install</h2>
+<p>Three ways to enable the plugin, in order of how committed you are to using it.</p>
+<h3>1. <code>dsh plugin add</code> + profile patch (recommended)</h3>
+<pre><code>dsh plugin --profile web add dsh-statecore
+dsh --profile web
+</code></pre>
+<p><code>dsh plugin add</code> installs the package into the profile's own <code>node_modules</code> via <code>pnpm</code>, then reconciles <code>dsh.profile.bundles</code>: because this package's <code>package.json</code> declares <code>"dsh": { "bundle": { "patch": "./statecore.cordis.yml" } }</code>, it joins the profile's bundle layer stack automatically — no manual <code>--patch</code> needed on later runs.</p>
+<h3>2. Checkout + relative-path <code>--patch</code> overlay (local development)</h3>
+<p>A <code>--patch</code> overlay row that names a package by its bare name only resolves once that package is genuinely <strong>installed</strong> somewhere Node can find it (<code>dsh</code>'s own <a href="https://github.com/deepseek-ai/deepseek-harness/blob/main/docs/user/develop/basic/publish.md">package-and-install tutorial</a>: "the patch references a package by name so Node resolution finds the installed code"). A source checkout that has not gone through route 1 is not that, so a bare <code>name: dsh-statecore</code> row in an ad hoc <code>--patch</code> file will fail to resolve against one. Point the row at the checkout's built entry file instead — the same relative-path form <code>dsh</code>'s own <a href="https://github.com/deepseek-ai/deepseek-harness/blob/main/docs/user/develop/basic/config.md">local-plugin tutorial</a> uses (<code>name: './src/my-plugin.ts'</code>):</p>
+<pre><code>git clone https://github.com/yul761/dsh-statecore
+cd dsh-statecore
+npm install &amp;&amp; npm run build
+</code></pre>
+<pre><code># local-patch.yml, alongside the checkout
+- insert:
+    - id: statecore-memory
+      name: ./dsh-statecore/dist/index.js
+      config:
+        dataDir: /absolute/path/to/.statecore
+</code></pre>
+<pre><code>dsh web --patch ./local-patch.yml
+</code></pre>
+<p>Nothing persists across runs; pass <code>--patch</code> again next time, or move to route 1.</p>
+<h3>3. Bundle entry (scripted/reproducible profile setup)</h3>
+<p>For a profile built without the interactive <code>dsh plugin add</code> flow (CI, infra-as-code), add the package as an ordinary dependency in the profile's <code>package.json</code> and append it to <code>dsh.profile.bundles</code> directly:</p>
+<pre><code>// $DSH_HOME/profiles/&lt;name&gt;/package.json
+{
+  "dependencies": { "dsh-statecore": "^0.1.0" },
+  "dsh": { "profile": { "bundles": ["@deepseek-ai/dsh-base", "dsh-statecore"] } }
+}
+</code></pre>
+<p>Then <code>pnpm install</code> in the profile directory before <code>dsh --profile &lt;name&gt;</code>. This is the same shape <code>dsh plugin add</code> produces for you in route 1 — use this route when a build step manages the profile directory instead of a human running <code>pnpm</code>.</p>
+<h2>Configuration</h2>
+<p>All fields live under the mounted plugin's <code>config:</code> in <code>statecore.cordis.yml</code> (see the shipped file for the commented defaults).</p>
+<table>
+<thead>
+<tr>
+<th>Field</th>
+<th>Default</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>dataDir</code></td>
+<td><code>~/.statecore</code></td>
+<td>Embedded SQLite store directory. Ignored when <code>url</code> is set. Shared with <code>statecore-mcp</code>'s own default.</td>
+</tr>
+<tr>
+<td><code>url</code></td>
+<td>unset</td>
+<td>Talk to a self-hosted StateCore deployment over HTTP instead of the embedded backend. Unlocks Postgres/pgvector semantic retrieval.</td>
+</tr>
+<tr>
+<td><code>httpUserId</code></td>
+<td><code>local</code></td>
+<td>User id sent on every HTTP backend request. Ignored unless <code>url</code> is set; this plugin has no multi-user concept beyond this one value.</td>
+</tr>
+<tr>
+<td><code>injectBudget</code></td>
+<td><code>4000</code></td>
+<td>Characters of recalled memory (digest + facts) injected per turn. The rendered wrapper adds roughly 100 more characters on top, unbounded by this field.</td>
+</tr>
+<tr>
+<td><code>inject</code></td>
+<td><code>true</code></td>
+<td>Fold recalled project memory into the model context every step.</td>
+</tr>
+<tr>
+<td><code>ingest</code></td>
+<td><code>true</code></td>
+<td>Auto-ingest session messages into memory.</td>
+</tr>
+<tr>
+<td><code>digest</code></td>
+<td><code>true</code></td>
+<td>Run digest passes over <code>ctx.llm</code>. <code>false</code> means this plugin never calls <code>ctx.llm</code> at all, and scrubs the engine's own env-derived digest gate so an ambient <code>FEATURE_LLM</code>/API key in the host process can't open it either.</td>
+</tr>
+<tr>
+<td><code>digestThreshold</code></td>
+<td><code>20</code></td>
+<td>Pending ingested events before a digest pass runs. The embedded engine also runs one startup catch-up pass per scope, at threshold 1, when a backend first initializes — independent of this field, and only for scopes that already have pending events.</td>
+</tr>
+<tr>
+<td><code>digestProvider</code></td>
+<td>unset</td>
+<td>Pin the digest pipeline's llm provider. Must be set together with <code>digestModel</code>. Unset resolves to whichever provider registered first.</td>
+</tr>
+<tr>
+<td><code>digestModel</code></td>
+<td>unset</td>
+<td>Pin the digest pipeline's llm model id. Must be set together with <code>digestProvider</code>.</td>
+</tr>
+</tbody></table>
+<h2>Shared memory with statecore-mcp</h2>
+<p><code>dsh-statecore</code> and <a href="https://github.com/yul761/StateCore/tree/main/apps/mcp"><code>statecore-mcp</code></a> both read and write the same embedded <code>~/.statecore</code> SQLite store by default (same scope-resolution rule: git root, else the working directory). A fact <code>dsh</code> remembers is visible to Claude Code over MCP, and vice versa, with no sync step:</p>
+<pre><code># In dsh, in this project:
+#   "Remember that our validation drink is lapsang-42."
+# In Claude Code, connected to statecore-mcp, in the same project:
+claude mcp add statecore -- npx -y statecore-mcp
+#   "What's our validation drink? Check memory." -&gt; lapsang-42
+</code></pre>
+<h2>Compatibility matrix</h2>
+<table>
+<thead>
+<tr>
+<th><code>dsh-statecore</code></th>
+<th><code>@deepseek-ai/*</code> (tools/session/system-prompt/agent/llm)</th>
+<th><code>@deepseek-ai/cordis</code></th>
+<th>Node</th>
+<th>Tested</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>0.1.0</code></td>
+<td><code>0.1.0-rc.6</code></td>
+<td><code>^4.0.1</code> (peer), <code>4.0.1</code> (tested)</td>
+<td><code>^22.19.0 || &gt;=24.0.0</code> (inherited from the <code>dsh</code> host's own engine floor; <code>statecore-mcp</code> itself supports Node <code>&gt;=20</code> standalone)</td>
+<td>Yes</td>
+</tr>
+</tbody></table>
+<p><code>deepseek-harness</code> is pre-release: every <code>@deepseek-ai/*</code> package pins an exact <code>rc</code>, and a <code>dsh</code> rc bump that changes plugin-facing APIs needs a matching <code>dsh-statecore</code> patch release. There is no compatibility promise across rc boundaries yet.</p>
+<h3>Building from source right now</h3>
+<p><code>package.json</code>'s <code>statecore-mcp</code> dependency is currently <code>file:../StateCore/apps/mcp</code> — a <code>git clone</code> of this repo only works standalone once <code>statecore-mcp@0.2.0</code> (the version carrying the <code>statecore-mcp/lib</code> entry this package imports) is published to npm and the dependency is swapped to <code>^0.2.0</code>. Until then, building from source requires <code>~/Code/StateCore-App/StateCore</code> (or wherever you clone <a href="https://github.com/yul761/StateCore"><code>yul761/StateCore</code></a>) checked out as a sibling directory, built (<code>pnpm install &amp;&amp; pnpm run db:generate:lite &amp;&amp; pnpm run build</code>), before <code>npm install</code> here resolves. See <a href="https://github.com/yul761/dsh-statecore/blob/HEAD/RELEASING.md"><code>RELEASING.md</code></a> for the exact human-gate publish sequence that retires this step.</p>
+<h2>More</h2>
+<ul>
+<li><a href="https://github.com/yul761/StateCore">StateCore</a> — the memory engine this plugin and <code>statecore-mcp</code> both front</li>
+<li><a href="https://github.com/yul761/StateCore/tree/main/apps/mcp"><code>statecore-mcp</code></a> — the MCP front end for the same engine, for every other MCP-speaking host</li>
+</ul>
+<h2>Model Experience</h2>
+<h3>Injected project memory</h3>
+<h4>What the model sees</h4>
+<p>When <code>config.inject</code> is true and a project has recalled memory, each eligible <code>agent/pre-step</code> folds one <code>UserMessage</code> into the entering batch, right after the step's own claimed prompt (mirroring <code>dsh-agent-instructions</code>'s fold position). The message wraps <code>recall({maxChars: injectBudget})</code>'s digest and fact list.</p>
+<h5>Verbatim text for this field, when needed</h5>
+<pre><code>## Project memory (StateCore)
+
+&lt;digest text, when present&gt;
+
+- [&lt;factId&gt;] &lt;fact text&gt;
+- [&lt;factId&gt;] &lt;fact text&gt;
+
+Use the `why`, `facts`, and `recall` tools to verify or explore this memory further.
+</code></pre>
+<h4>Token effect</h4>
+<p>Capped by <code>injectBudget</code> characters of recalled body plus roughly 100 characters of wrapper text (the header and the closing tool-pointer line, unbounded by <code>injectBudget</code>). Not added on every step: a content fingerprint (the digest text plus the set of fact ids) is cached per session, so an unchanged memory version is never re-spliced — only a step where the recalled memory actually changed pays this cost again.</p>
+<h4>KV Cache effect</h4>
+<p>Append-only. Each distinct memory version adds one new message after the existing reusable prefix and does not invalidate earlier KV-cache entries. Because nothing removes an earlier injected message, distinct memory versions accumulate across a session's lifetime until compaction shadows the earlier ones — the same accumulation shape <code>@deepseek-ai/dsh-time-context</code> documents for its own positive-interval readings.</p>
+<h3>Tool schemas (<code>remember</code> / <code>recall</code> / <code>facts</code> / <code>why</code> / <code>forget</code>)</h3>
+<h4>What the model sees</h4>
+<p>Five tool definitions (name, description, JSON parameter schema, JSON <code>output.schema</code>) enter the tool-definition preamble of every request once the plugin is mounted — see <a href="https://github.com/yul761/dsh-statecore/blob/HEAD/src/tools.ts"><code>src/tools.ts</code></a> for the exact schemas. Descriptions are reused verbatim from <code>statecore-mcp</code>'s own MCP tool registrations, so a model sees identical guidance whether the backend is reached through MCP or natively.</p>
+<h4>Token effect</h4>
+<p>Fixed direct token effect for every request while the plugin is mounted: all five schemas register together, with no per-tool config toggle (mounting the plugin is the opt-in for all five).</p>
+<h4>KV Cache effect</h4>
+<p>Independent of turn content. Tool schemas are part of the request's tool-definition preamble, not the conversation transcript; they stay stable across steps within a turn (the registered tool set does not change mid-session), so they do not themselves invalidate a reusable prefix.</p>
+<h3>Digest pipeline llm calls</h3>
+<h4>What the model sees</h4>
+<p>Nothing, directly. When <code>config.digest</code> is true and a scope's pending ingested-event count crosses <code>digestThreshold</code> (or, on a backend's first <code>init()</code> for a scope that already has pending events, the engine's own startup catch-up pass), <code>src/llm-bridge.ts</code>'s <code>createDigestLlm</code> issues a separate <code>ctx.llm.stream()</code> call — using <code>digestProvider</code>/<code>digestModel</code> when pinned, else the first registered provider — to classify and consolidate pending events into facts. This call is never appended to the user's own conversation.</p>
+<h4>Token effect</h4>
+<p>Zero direct token effect on the user's own request. A separate request against the host's already-configured <code>ctx.llm</code> capacity and billing, sized by the pending event batch (bounded by <code>digestThreshold</code>), not by the user's context window.</p>
+<h4>KV Cache effect</h4>
+<p>Independent model request: a distinct <code>ctx.llm.stream()</code> call outside the user's own conversation history, so it neither reuses nor invalidates the user's request KV cache.</p>
+<h2>Known Limitations and Deferred Work</h2>
+<ul>
+<li><strong>Tool scope follows the calling agent's session; a headless, single-scope process is unchanged.</strong> <code>src/tools.ts</code>'s <code>registerTools(ctx, config, pool)</code> resolves a fresh <code>MemoryBackend</code> per call, from <code>exec.agent.session</code> through the same <code>createScopeCache</code> <code>registerIngest</code>/<code>registerInject</code> already use, falling back to the process default scope (<code>resolveDshScope</code>) only when a call carries no agent (a direct <code>ctx.tools.execute()</code> call outside an agent loop). In a single-workspace <code>dsh</code> process, or any call with a live agent, this always resolves to the calling session's own project. Only a tool call genuinely made with no agent at all falls back to the process default.</li>
+<li><strong>This is a pre-release integration against a pre-release host.</strong> <code>deepseek-harness</code> has no compatibility promise across rc boundaries (see the matrix above), and this package has not yet exercised a host rc bump itself.</li>
+<li><strong>Embedded/lite retrieval is keyword + CJK bigram, not semantic.</strong> The default embedded backend runs on SQLite with no pgvector; <code>recall</code> still returns a budgeted digest, believed facts, and matching events, but won't find a paraphrase with no matching tokens. Semantic retrieval needs <code>url</code> pointed at a full StateCore deployment.</li>
+<li><strong>Distillation needs <code>ctx.llm</code> mounted</strong>, even when <code>digest</code> is left at its default <code>true</code> and no other plugin in the profile happens to need an llm provider — <code>inject = ['tools', 'llm', 'agents', 'sessions']</code> is a fixed, not config-conditional, requirement list, so a profile with no llm adapter mounted fails to load this plugin at all, not just its digest path.</li>
+<li><strong><code>session/event</code> ingest covers only <code>user/message</code>/<code>assistant/message</code>.</strong> Tool calls and results are never ingested directly. A fact recalled back into a later <code>user/message</code> (through injection) does get re-ingested as ordinary conversation text — an accepted first-order approximation, not a loop this plugin tries to break.</li>
+<li><strong>No per-tool disable.</strong> <code>Config</code> gates <code>inject</code>/<code>ingest</code>/<code>digest</code> as three whole-plugin switches; there is no flag to keep, say, <code>remember</code>/<code>recall</code> mounted while dropping <code>forget</code>.</li>
+<li><strong>Unbounded per-process caches.</strong> <code>src/inject.ts</code>'s <code>fingerprints</code> map and the three per-consumer <code>ScopeCache</code> maps (<code>src/backend.ts</code>) each grow by one entry per distinct session id, and <code>createBackendPool</code>'s backend pool grows by one live embedded backend (one Prisma/SQLite client) per distinct scope — none of the four ever evicts. Bounded in practice by how many sessions/scopes a process actually sees, and harmless for a short-lived CLI invocation; a long-lived <code>dsh web</code> process serving many workspaces over a long uptime accumulates all of them for the process lifetime.</li>
+</ul>

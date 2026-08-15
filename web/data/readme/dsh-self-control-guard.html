@@ -1,0 +1,148 @@
+<h1>self-control-guard</h1>
+<p>English | <a href="https://github.com/pandashere/dsh-self-control-guard/blob/HEAD/README.zh.md">中文</a></p>
+<p>A self-control guard for the DeepSeek Harness host process.</p>
+<h2>Why</h2>
+<p>When developing DSH plugins, an agent frequently — by accident or by a misfired command — <strong>kills its own host process</strong> (<code>pkill dsh</code>, <code>kill -9 &lt;host-pid&gt;</code>, <code>kill $PPID</code>, <code>killall dsh</code>). The session dies mid-task, work is lost, and there is no audit trail. This plugin is designed to <strong>prevent agent self-termination</strong>: it intercepts high-confidence host-kill attempts from the <code>bash</code> tool, hard-denies them, teaches the model the controlled exit tool, and leaves an audit trail.</p>
+<p>It does three things:</p>
+<ol>
+<li><strong>Intercepts</strong> high-confidence attempts to terminate the host from the <code>bash</code> tool (canonical <code>kill &lt;host-pid&gt;</code>, <code>kill $PPID</code>, <code>pkill dsh</code>, <code>killall dsh</code> forms) with a monotonic hard denial that no <code>pre-execute</code> listener can force-allow.</li>
+<li><strong>Teaches</strong> the model the controlled tools — <code>dsh_self_exit</code> always, and <code>dsh_self_restart</code> only when <code>restartEnabled: true</code> (hidden by default — TBD, see Known Limitations) — by injecting a pinned guidance message right after an interception. The tools are <strong>registered up front but hidden</strong>: they never appear in the model-facing tool list (<code>hidden: true</code> keeps them out of <code>schemas()</code>), so an unassisted model cannot discover them by enumeration — yet they stay callable by name, so a caller that learns them from outside the tool list (the guard's denial text, a user instruction, another tool) can invoke them immediately.</li>
+<li><strong>Runs a token-confirmed graceful exit/restart</strong> through the launcher's existing seams: the headless runner's <code>ctx.headlessIo.exit(code)</code> (code-exact) on one-shot runs, and the launcher's <code>SIGTERM</code> graceful shutdown on long-lived surfaces (web).</li>
+</ol>
+<p><strong>Design stance: this is a UX/interception layer, not a security boundary.</strong> The matcher recognizes canonical kill forms at the simple-command level inside a bounded shell command list (<code>; &amp;&amp; || | |&amp; &amp;</code>, newlines, comments, quoting, <code>( list )</code> / <code>{ list; }</code> groups, redirections (target word opaque)); dynamic construction (<code>$VAR</code>, <code>$(...)</code>, backticks, globs, heredocs), shell functions, unsupported compound syntax, and parser-limit failures abstain. Variable splicing, encodings, interpreters, process-group signals, PTY, MCP, Code Runtime, <code>cordis_mount</code>, and direct syscalls are all documented out-of-scope (see <a href="#interception-coverage">Interception coverage</a> and <a href="#known-limitations-and-deferred-work">Known Limitations</a>). The OS can always kill the host; the guard's job is to make the model reach for the controlled tools instead, and to leave an audit trail when it does.</p>
+<h2>Installation</h2>
+<p>Requirements: Node.js 22 or newer and <code>@deepseek-ai/dsh@0.1.0-rc.6</code>.
+The plugin ships as a standalone bundle installable into any DSH profile.</p>
+<p>Build, validate, and pack it from the plugin directory:</p>
+<pre><code>npm install
+npm run check
+npm pack
+</code></pre>
+<p>Install the generated tarball into a DSH profile, then restart <code>dsh web</code>.
+Installing the source directory as a link is not supported because host peers
+are supplied by the DSH profile:</p>
+<pre><code>npx @deepseek-ai/dsh@0.1.0-rc.6 plugin --profile web add ./self-control-guard-0.1.0.tgz
+npx @deepseek-ai/dsh@0.1.0-rc.6 web
+</code></pre>
+<p>The plugin has no browser bundle. Verify it in the Web settings plugin list.
+To update, build a tarball with a newer package version, remove the installed
+bundle, add the new tarball, and restart. To uninstall:</p>
+<pre><code>npx @deepseek-ai/dsh@0.1.0-rc.6 plugin --profile web remove self-control-guard
+</code></pre>
+<h2>Config</h2>
+<pre><code>- id: self-control-guard
+  name: self-control-guard
+  config:
+    enabled: true              # master switch
+    confirmationCalls: 2       # total calls: first arms the token, final confirms
+    confirmationTtlMs: 60000   # token validity window
+    retryCooldownMs: 10000     # lockout after a failed attempt at the call ceiling
+    interceptModes: [kill-host-pid, kill-parent, pkill-dsh, killall-dsh]
+    exitCode: 0                # code requested by dsh_self_exit
+    restartExitCode: 42        # code requested by dsh_self_restart; must differ from exitCode
+    restartEnabled: false      # hidden by default (no supervisor on web); set true to offer the tool
+    headlessRestart: deny      # headless one-shot restart policy: deny | exit-code
+    allowedAgents: roots       # who may request host exit: roots | all
+    # privilegedBash:          # explicit escape hatch for BLOCKED commands
+    #   enabled: false         #   default off; the tool is not registered
+    #   matchers: [kill-parent, pkill-dsh, killall-dsh]
+    #                          #   advisory now (relaxed re-check); duplicates still fail
+</code></pre>
+<p>Fail-loud at load: duplicate or empty <code>interceptModes</code>, <code>exitCode === restartExitCode</code>, <code>confirmationCalls &lt; 2</code>, non-positive TTL, negative cooldown, an invalid enum member, or a duplicate <code>privilegedBash.matchers</code> list throws — never a silent fall-back. <code>enabled: false</code> is the only way to fully disable interception.</p>
+<h2>Interception coverage</h2>
+<h3>Intercepted (hard-denied)</h3>
+<p>The matcher (<code>src/matcher.ts</code>) is a pure function over the <code>bash</code> tool's <code>command</code> argument: it scans the command list under a bounded shell subset (resource caps: 64 KiB input, 4096 tokens, nesting depth 32) and applies the canonical allowlist to every extracted simple command:</p>
+<table>
+<thead>
+<tr>
+<th>matcher id</th>
+<th>canonical forms</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>kill-host-pid</code></td>
+<td><code>kill</code>/<code>/bin/kill</code>/<code>/usr/bin/kill</code>, optional <code>command</code>/<code>builtin</code>/<code>exec</code>/<code>env</code>/<code>nice</code> prefix (a state machine mirroring bash: <code>command -p</code> keeps the builtin, <code>exec</code>/<code>env</code>/<code>nice</code> switch to the external binary, invalid chains like <code>env exec kill</code> abstain), any Bash-accepted signal spelling (<code>-9|-KILL|-SIGKILL|-TERM|-15|-HUP|-INT|-1|-s &lt;sig&gt;|-n &lt;num&gt;|--</code>; names case-insensitive with optional <code>SIG</code>, builtin real-time <code>RTMIN+0..30</code>/<code>RTMAX-1..14</code>, external <code>RTMIN+n</code>, numbers 1..64; external kill paths also accept IOT/CLD/POLL aliases but not <code>-n</code>), and a pid LIST that contains the literal host pid (each pid canonicalized like Bash — <code>+4242</code>/<code>0004242</code> address host <code>4242</code>; <code>42424</code> never does). Builtin semantics: options end at the first operand, so <code>kill -TERM &lt;host&gt; -FOOBAR</code> still matches and bad operands are skipped. External procps semantics (verified against procps 3.3.17, TWO-PHASE): <code>skill_sig_option</code> takes the FIRST bare <code>-&lt;sig&gt;</code> (including <code>-0</code>) as the initial signal, then getopt <code>-s</code>/<code>--signal</code>/attached <code>--signal=</code>/<code>-s&lt;sig&gt;</code> overwrite it with the LAST one winning regardless of argv order (<code>-s 0 -9 PID</code> is a probe and abstains; <code>-s TERM -- -9 PID</code> matches; a second bare <code>-&lt;sig&gt;</code> makes procps abort, <code>-9 -TERM PID</code> abstains); <code>-l</code>/<code>-L</code>/<code>--list</code>/<code>-h</code>/<code>--help</code>/<code>-V</code>/<code>--version</code>/unknown flags never terminate (abstain); <code>-q</code>/<code>--queue</code> consume a validated C-long value (missing/non-numeric/overflow abstains; <code>-q 9007199254740992</code> matches on 64-bit); <code>-0</code> after <code>--</code> is positional (a second <code>-0</code> there is an operand — <code>-TERM PID -- -0</code> matches because PID was already sent, <code>-TERM -- -0 PID</code> abstains because the utility dies first; a first bare <code>-0</code> anywhere probes or is overwritten by <code>-s</code>, so <code>-s TERM -- -0 PID</code> matches), while a second <code>-0</code> BEFORE <code>--</code> is a getopt case-'?' that exits before any operand (<code>-TERM PID -0</code> abstains, target survives); The bash builtin's <code>-0</code> after <code>--</code> is a group-0 operand: it kills the UTILITY before any later pid is processed (<code>kill -s TERM -- -0 PID</code> abstains, <code>kill -s TERM -- PID -0</code> matches — its earlier pid was already sent; the external <code>/bin/kill</code> differs: there the first bare <code>-0</code> is overwritten by <code>-s TERM</code>, so <code>/bin/kill -s TERM -- -0 PID</code> matches); bad operands stop delivery (<code>/bin/kill bad 4242</code> does not match, <code>/bin/kill 4242 bad</code> matches); <code>--</code> ends getopt (only the FIRST <code>--</code> — a second is a bad operand) but a bare <code>-&lt;sig&gt;</code> after it still sets the signal (<code>-- -TERM PID</code> matches); a numeric negative token after <code>--</code> is a process-group operand (<code>-TERM PID -- -9</code> matches), a named negative token is a bad operand (<code>-TERM -- -TERM PID</code> abstains)</td>
+</tr>
+<tr>
+<td><code>kill-parent</code></td>
+<td><code>kill</code> with the same optional prefixes/signal spellings and <code>$PPID</code>, alone or mixed into a numeric pid list (<code>kill $PPID &lt;pid&gt;</code>); a list containing BOTH the literal host pid and <code>$PPID</code> is <code>kill-host-pid</code> (host pid wins — the privileged channel permanently refuses that id)</td>
+</tr>
+<tr>
+<td><code>pkill-dsh</code></td>
+<td><code>pkill [−9] [−f|−x|−P &lt;n&gt;] dsh</code>, optionally under <code>command</code>/<code>exec</code>/<code>env</code>/<code>nice</code> (not <code>builtin</code> — pkill is an external binary)</td>
+</tr>
+<tr>
+<td><code>killall-dsh</code></td>
+<td><code>killall [−9|−r] dsh</code>, same prefix rule</td>
+</tr>
+</tbody></table>
+<p>Any simple command in the list matching an enabled canonical form denies the whole call — so compound forms like <code>kill -9 $PPID; echo x</code> are intercepted. <code># comments</code> are stripped, quoting is honored (a quoted/escaped single plain token like <code>'kill'</code>/<code>"4242"</code>/<code>"/usr/bin/kill"</code>/<code>kill "+4242"</code>/<code>"bad_arg"</code> is literal; anything containing <code>$</code> or whitespace stays opaque), and <code>( list )</code> / <code>{ list; }</code> groups are recursed into; <code>$PPID</code> matches only unquoted.</p>
+<h3>Not intercepted (abstain — passes through)</h3>
+<p>Unsupported constructs <strong>abstain</strong> rather than guess, so they run for real:</p>
+<ul>
+<li><strong>Dynamic construction</strong>: <code>$VAR</code>, <code>"$HOST"</code>, <code>${HOST}</code>, <code>$(...)</code>, backticks, globs, heredocs — the matcher sees the <strong>unexpanded</strong> shell source at <code>pre-execute</code> time, so a variable target is indistinguishable from any other dynamic value.</li>
+<li><strong>Shell functions</strong>: a function body (<code>run() { kill ...; }</code>) or a function call that wraps a kill — the matcher does not enter function bodies.</li>
+<li><strong>Compound/unsupported syntax</strong>: <code>case</code>/<code>if</code>/<code>for</code> loops, arrays, positional parameters, arithmetic/process substitution, <code>eval</code>, <code>bash -c</code>, alias, glob, <code>xargs</code>, pipes to interpreters, background (<code>&amp;</code>).</li>
+<li><strong>Signal probes / listings</strong>: <code>kill -0 &lt;pid&gt;</code>, <code>kill -l</code> / <code>kill -L</code> — never terminate, so they abstain (a probe stays possible).</li>
+<li><strong>Assignment prefixes</strong>: <code>X=1 kill ...</code>.</li>
+<li><strong>Non-canonical forms</strong>: <code>kill -1</code> (HUP to the whole group), <code>pidfd_send_signal</code>, process-group signals (<code>kill -- -&lt;pgid&gt;</code>), unknown signal names, malformed operator sequences, parser-limit failures.</li>
+<li><strong>Out-of-process surfaces</strong>: PTY (<code>node-pty</code> spawns outside <code>ctx.subprocess</code>), MCP, Code Runtime, <code>cordis_mount</code> (same-process, bash-equivalent trust), interpreters, direct syscalls.</li>
+<li><strong>Non-host targets</strong>: killing any process whose PID is not the host pid is not intercepted.</li>
+</ul>
+<h3>Left-over bypass paths (documented)</h3>
+<p>Because this is a UX layer, not a security boundary, the following remain <strong>possible</strong> ways to terminate the host:</p>
+<ol>
+<li><strong>Any abstained form above</strong> — most naturally a <strong>variable-constructed kill</strong>: <code>kill "$HOST"</code>, <code>pid=...; kill "$pid"</code>, a loop/function parameter. The matcher sees the unexpanded source and abstains; bash then expands and really kills the host — <strong>without any guidance or audit</strong>. The first signal the model sees is the session ending. See Known Limitations. (An optional <code>block-dynamic-kill</code> strict policy — reject any canonical kill whose target is a variable — is a possible future config, but it would also block legitimate kills of non-host processes and is therefore not a default.)</li>
+<li><strong><code>dsh_self_bash</code> (if enabled)</strong> — the privileged escape hatch intentionally runs any command the root agent confirms (relaxed matcher re-check): compound forms, redirections, pipes, even a literal host pid, under the token + approval gates (danger-full-access / active-goal exempt). This is the documented escape for legitimate-termination cases, not a bypass of the ordinary guard for unintended kills.</li>
+<li><strong>OS-level escapes</strong> — <code>setsid</code>, interpreters, <code>pidfd_send_signal</code>, process-group signals, PTY/MCP/Code Runtime, <code>cordis_mount</code>, direct syscalls. Preventing these is OS isolation work (PID namespaces, seccomp, a supervisor), out of scope here.</li>
+</ol>
+<h2>Controlled exit / restart</h2>
+<p>Both tools share one confirmation state machine: the first call returns an unpredictable <code>confirmation_token</code> (32 random bytes, stored only as a SHA-256 digest) and performs no shutdown; every later call must present the current token within its TTL; the final call consumes it and dispatches the exit on a fresh tick after the tool result is logged (<code>exec.concludeTurn()</code> first). Tokens are per-agent, per-action, time-bounded, and a wrong token at the call ceiling arms a short cooldown.</p>
+<ul>
+<li><strong>Headless one-shot:</strong> <code>ctx.headlessIo.exit(code)</code> with the exact configured code. Restart is <strong>refused by default</strong> (<code>headlessRestart: deny</code>) because re-running the same task could repeat external side effects; opt in with <code>headlessRestart: exit-code</code>.</li>
+<li><strong>Long-lived surfaces (web):</strong> the guard reuses the launcher's <code>SIGTERM</code> graceful shutdown (<code>process.kill(process.pid, 'SIGTERM')</code>). There is no custom exit-code channel on web, so a restart there exits with the launcher's signal code and the restart semantics are carried by the supervisor's "process vanished" policy — see Known Limitations.</li>
+<li><strong>Agent fence:</strong> only top-level agents (<code>allowedAgents: roots</code>, the default) may request host exit; a subagent's request is rejected.</li>
+</ul>
+<h2>Privileged bash (<code>dsh_self_bash</code>)</h2>
+<p>The escape hatch for the <strong>legitimate-termination false positive</strong>: a blocked command (<code>kill $PPID</code>, <code>pkill dsh</code>, <code>killall dsh</code>) that the model genuinely intended — killing another dsh instance, or a wrapper that changed <code>$PPID</code>'s meaning. It is an explicit, gated tool (sudo-like), <strong>not</strong> a guard bypass: the monotonic guard stays untouched for ordinary bash. Off by default (<code>privilegedBash.enabled: false</code>); when enabled it is registered up front (process-global and hidden from the model tool list, like the exit tools — the registry has no per-agent registration), and its execution is gated by the root-only fence.</p>
+<p>The gate has three layers that must ALL hold before anything runs:</p>
+<ol>
+<li><strong>Root-only fence</strong> — the tool is ALWAYS limited to top-level agents, independent of <code>allowedAgents</code>: a subagent never obtains a channel that can re-execute a host-kill command.</li>
+<li><strong>Command-bound confirmation token</strong> — the first call returns a <code>confirmation_token</code> and executes nothing; the second call must present it <strong>with the exact same command</strong> (a SHA-256 fingerprint binds the token to the command, so a verified token cannot be replayed against a different command). The agent confirms the target itself — there is no matcher re-check, so any command (compound forms, redirections, pipes, even a literal host pid) arms, and the token + approval gates carry the control surface.</li>
+<li><strong>One-time human approval</strong> — through <code>ctx.approval</code>, <code>allowed-once</code> only; <code>never</code> / no approval service / cancel fail closed. <strong>Exemption:</strong> an agent already running under <code>danger-full-access</code>, or an agent with an <strong>active goal</strong> (<code>ctx.goals.get(agent).phase === 'active'</code> — an autonomous continuation), executes directly; both are explicit all-access/autonomous grants, so the approval adds no value. The token gate stays mandatory in every mode.</li>
+</ol>
+<p><code>privilegedBash.matchers</code> is now <strong>advisory</strong> (kept for documentation and telemetry; duplicates still fail at load), and <code>kill-host-pid</code> is no longer rejected at load — the relaxed stance trusts the root agent's own confirmation. The command runs through the <code>ctx.bash</code> executor seam under the <strong>same resolved sandbox policy and session cwd</strong> as the ordinary bash tool (same env scrubbing / timeout / cancel semantics), never through <code>ctx.tools.execute</code> (which would re-enter the guard). A confirmed execution appends a log-only <code>guard/self-control</code> <code>privileged-bash-executed</code> event carrying the gate used (<code>granted</code> | <code>full-access-exempt</code>), preceded by a <code>privileged-bash-dispatch</code> event written BEFORE the command runs — so a command that terminates the host mid-run still leaves a dispatch trace. The dispatch is flushed through <code>ctx.sessions.flush</code> before execution; without a persistence listener the dispatch stays in-memory only.</p>
+<h2>Restart recovery (roster manifest)</h2>
+<p>When a restart is confirmed AND <code>manifestPath</code> is configured (opt-in; default empty = no roster), the guard atomically writes the live top-level session ids to that file (<code>{ version, restartId, createdAt, sessions: [{ sessionId }] }</code>, random-name exclusive tmp + rename, mode 0600, malformed input tolerated as "no roster"). The next host process can read it to know which persisted session logs were live at restart time.</p>
+<p>The recovery side is a thin RPC: <code>session.resume</code> (host apiproxy) resumes a batch of persisted sessions as live agents through the existing <code>agentFor()</code> cold-resume transaction — the same path a browser opening a session already uses. Per-item outcomes: <code>resumed</code> / <code>already-live</code> / <code>failed</code> (each item settles independently). The browser reconnection pipeline (client runtime) calls it automatically: on <code>handleConnected</code>, the sessions manager resumes every in-memory session instance from the previous connection generation (generation-scoped and abortable — a disconnect invalidates the in-flight transaction); <code>failed</code> items surface as list removals driven by the scope-prune lifecycle. Roster authorization against the manifest is <strong>deferred</strong>: the RPC does not yet verify membership — the caller's in-memory knowledge is the roster. The batch is bounded (50) and duplicate ids are rejected.</p>
+<h2>Audit trail</h2>
+<p>Every transition appends a log-only <code>guard/self-control</code> event (<code>shell-intercepted</code>, <code>confirmation-armed</code>, <code>confirmation-rejected</code>, <code>shutdown-requested</code>, <code>privileged-bash-dispatch</code>, <code>privileged-bash-executed</code>) with only matcher id, action, reason, rejection detail, exit code, and the gate used for a privileged execution — never the command text, the token, or free text. Events carry no surface metadata. The <code>./invariant</code> companion validates the protocol on the authoritative stream before commit: a terminal transition must follow a matching armed transition for the same action (and reason for the accepted shutdown); a <code>privileged-bash-executed</code> must follow a <code>self-bash</code> armed transition and carry the matcher and approval gate.</p>
+<h2>Telemetry redaction</h2>
+<p>A <code>telemetry/record</code> redactor replaces intercepted <code>bash</code> command text, <code>dsh_self_bash</code> command text, and <code>dsh_self_*</code> <code>confirmation_token</code> values with a fixed placeholder in ledger exports. The canonical session log is untouched — the model must still read its own token.</p>
+<h2>Model Experience</h2>
+<h3>Interception guidance (pinned, injected verbatim)</h3>
+<h4>What the model sees</h4>
+<p>After a canonical host-kill command is blocked, that agent receives the guidance below. The controlled tools are registered up front but hidden, so they never appear in the tool list on their own — this guidance is how the model first learns their names and payloads.</p>
+<pre><code>You are attempting to terminate the DeepSeek Harness host process. This command was blocked. Do not rewrite, encode, or route around the denial.
+
+For a controlled exit, call dsh_self_exit with:
+{"reason_code":"user-request"}
+
+For a controlled restart request, call dsh_self_restart with:
+{"reason_code":"apply-configuration"}
+(shown only when restartEnabled: true)
+
+The first call returns a confirmation_token and performs no shutdown. Read that result, then call the same tool again with the unchanged reason_code and the returned confirmation_token.
+</code></pre>
+<h2>Known Limitations and Deferred Work</h2>
+<ul>
+<li><strong>Not a security boundary.</strong> Obfuscation, base64, command substitution, shell functions, <code>setsid</code>, interpreters, <code>kill -1</code>, <code>pidfd_send_signal</code>, process-group signals, PTY (node-pty spawns outside <code>ctx.subprocess</code>), MCP, Code Runtime, and <code>cordis_mount</code> (same-process, bash-equivalent trust) all bypass the matcher. Preventing host termination is OS isolation work (PID namespaces, seccomp, supervisor), out of scope here.</li>
+<li><strong>Web restart has no distinct exit code.</strong> The web surface exits via <code>SIGTERM</code> with the launcher's code; a supervisor cannot distinguish "restart requested" from a plain exit by code. A code-exact channel needs launcher cooperation and is deferred. The exit is dispatched only after the accepted tool's turn settles (<code>agent.whenIdle()</code>), with a 10s bounded fallback timer.</li>
+<li><strong>Restart tool is hidden by default (TBD).</strong> <code>dsh_self_restart</code> is not registered unless <code>restartEnabled: true</code> — the web surface has no supervisor, so a confirmed restart only terminates the host without auto-reviving it. The code path is retained; revive the flow once a supervisor channel exists.</li>
+<li><strong>Hidden registration is process-global and not revoked.</strong> The tools register on the plugin's global context at load: every agent/session can call them by name (execution stays gated by <code>allowedAgents</code>), but they stay out of the model tool list for the whole life of the plugin; HMR or plugin unload removes them with the effect. There is no disclosure event: the guard denies, teaches, and the model calls the already-registered tools.</li>
+<li><strong>Denied-command false positives.</strong> A user legitimately terminating another dsh instance, or a wrapper changing the meaning of <code>$PPID</code>, is reported. The matcher is deliberately conservative to keep this bounded: it never uses substring matching, and dynamic construction (<code>$VAR</code>, <code>$(...)</code>, backticks, globs, heredocs), assignment prefixes (<code>X=1 kill ...</code>), and unsupported shell syntax all abstain. The legitimate case now has a documented exit: <code>dsh_self_bash</code> re-executes the blocked command under a token + approval gate (full-access exempt); <code>kill-host-pid</code> is excluded by design.</li>
+<li><strong>Ordinary variable usage is NOT covered.</strong> The matcher sees the <strong>unexpanded</strong> shell source at <code>pre-execute</code> time: a command written as <code>kill "$HOST"</code>, <code>pid=...; kill "$pid"</code>, a loop or function parameter, or any form whose target comes from a variable is abstained and executes for real. Only a literal host PID (or <code>$PPID</code> / <code>pkill dsh</code> / <code>killall dsh</code>) is intercepted. This is the natural way a script or an agent writes a kill, so a variable-constructed host kill can terminate the host <strong>without any guidance or audit</strong> — the first signal the model sees is the session ending. This is a deliberate coverage boundary for the UX/interception stance (a <code>$VAR</code> is indistinguishable at parse time from any other dynamic value); deployments that must also stop variable-constructed kills need OS-level isolation (PID namespaces, seccomp, a supervisor), not matcher changes. An optional <code>block-dynamic-kill</code> strict policy (reject any canonical kill whose target is a variable) is a possible future config, but it would also block legitimate kills of non-host processes and is therefore not a default.</li>
+<li><strong><code>pkill dsh</code> / <code>killall dsh</code> still match the host.</strong> These forms cannot express "only another instance" — they match every dsh process including the host. They are permitted in <code>privilegedBash.matchers</code> (a subset of <code>interceptModes</code>), but they always carry the token gate, and under <code>danger-full-access</code> the human-approval exemption means a confirmed <code>pkill dsh</code> can terminate the host. Deployments that must not allow this should keep them out of the privileged set.</li>
+<li><strong>In-memory confirmation state.</strong> A session resumed from persistence starts with no armed token; the protocol re-arms from scratch. Each agent holds a single confirmation slot at a time, keyed by action + reason + token; wrong tokens exhaust the remaining confirmation chances and arm a cooldown during which re-arming is refused.</li>
+<li><strong>Recovery authorization is deferred.</strong> <code>session.resume</code> does not yet verify the <code>restartId</code>/manifest membership (the caller's in-memory knowledge is the roster), and pending inbox items do not auto-start after resume (the agent-loop has no <code>startPending</code>). A session not in the browser's memory is resumed when a user opens it, through the lazy <code>agentFor</code> path.</li>
+</ul>

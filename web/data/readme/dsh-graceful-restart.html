@@ -1,0 +1,168 @@
+<h1>dsh-graceful-restart</h1>
+<p>DeepSeek Harness（dsh）的优雅重启 / 关闭 / 启动守护插件。</p>
+<p><strong>用户启动方式完全不变</strong>（<code>dsh web</code>）。插件自动"套壳"：第一代进程阻止自身启动（占用非正式端口）并拉起正式实例（继承同一控制台），随后常驻为<strong>隐形 launcher</strong>——负责重启时的换代、启动失败的自动回滚，以及向正式实例传递重启 / 关闭请求。</p>
+<p>无常驻看门狗（第一代只响应显式请求）、无外部工具、无轮询、无多余常驻进程。</p>
+<hr>
+<h2>做了什么</h2>
+<h3>1. 优雅重启（等当前轮次结束）</h3>
+<p><code>restart_harness</code> 工具或 <code>/restart</code> 命令触发后，插件不会立刻杀进程，而是等待<strong>所有 agent 轮次结束</strong>（当前回复完整落盘）再优雅退出，由第一代在同一控制台拉起新一代——<strong>不丢工作</strong>。</p>
+<h3>2. 重启后自动唤醒继续</h3>
+<p>重启前把活跃会话 id 写入 marker；新一代启动后轮询等待会话恢复，然后自动 <code>steer()</code> <strong>唤醒智能体继续之前的工作</strong>。唤醒时的继续提示优先级：</p>
+<pre><code>restart_harness 的 continuePrompt 参数（智能体触发时指定）&gt; settings.yaml 默认值 &gt; 内置默认
+</code></pre>
+<h3>3. 关闭与撤销</h3>
+<ul>
+<li><code>shutdown_harness</code> / <code>/shutdown</code>：等轮次结束后关闭整个进程树（第一代一并退出），不重启</li>
+<li><code>cancel_harness_action</code>：<strong>撤销</strong>已安排但尚未执行的重启 / 关闭（触发后发现不需要了，随时改变主意）</li>
+</ul>
+<h3>4. 启动守护：失败自动回滚（核心）</h3>
+<p>每次 spawn 前记录<strong>插件清单快照</strong>（profile <code>package.json</code> 的 dependencies）；第二代启动失败（退出码非 0，或宽限期 20 秒内退出）时：</p>
+<ol>
+<li>对比当前清单与<strong>最近一次成功基线</strong> → 找出"该基线之后新增"的插件</li>
+<li>逐个 <code>dsh plugin remove</code>（官方 CLI，同步清理 bundles）→ <strong>自动重试</strong></li>
+<li>仍失败 → 逐级回溯<strong>更早的成功基线</strong>（多版本 history），再卸掉下一批增量</li>
+<li>连续回滚达上限后保持第一代存活，明确提示手动处理</li>
+</ol>
+<p>成功基线保留<strong>多个版本</strong>（设置菜单可调 <code>snapshotKeep</code>，1–10，默认 3）：第 N 次回滚使用第 N 个旧基线。启动成功（存活超宽限期）后新基线入列，与最新相同则不重复记录。</p>
+<p>误判保护：Ctrl+C、显式关闭、显式重启都不触发回滚——只有<strong>意外启动失败</strong>才会。</p>
+<h3>5. 页面自动刷新（无轮询）</h3>
+<p>每个 DSH 进程的代际 ID = 进程启动时刻 <code>startedAt</code>。页面加载时把 ID 存入 localStorage；每次<strong>连接恢复</strong>（ws 重连成功）时查一次 <code>/status</code> 对比：</p>
+<ul>
+<li>ID 不同（或缺失）→ 页面状态可能过时 → <strong>自动刷新一次</strong>（先更新持久化值防循环）</li>
+<li>ID 相同（ws 抖动）→ 不动</li>
+</ul>
+<p>覆盖：wrapper 重启、手动完整重启（<code>dsh web</code>）、守护回滚（服务真空期有短窗口重试）、<strong>页面一直开着、DSH 关闭很久后重新打开</strong>。不依赖轮询，只在连接事件时动作。</p>
+<h3>6. 设置菜单</h3>
+<p>设置页新增 <strong>"优雅重启"</strong> 页签（<code>settings.section</code>）：</p>
+<ul>
+<li><strong>快照保留版本数</strong>（1–10，默认 3）——成功基线保留几个版本，回滚逐级回溯用</li>
+</ul>
+<hr>
+<h2>设想的场景</h2>
+<table>
+<thead>
+<tr>
+<th>场景</th>
+<th>行为</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>长任务进行中需要重启（升级配置、装插件）</td>
+<td>等轮次结束再退出，不打断当前回复；重启后自动唤醒继续</td>
+</tr>
+<tr>
+<td>装了一个会破坏启动的插件</td>
+<td>第二代 boot 失败 → 守护自动卸载新增插件 → 重试 → 恢复服务（全程无人值守）</td>
+</tr>
+<tr>
+<td>多个坏插件叠加、或回滚后仍失败</td>
+<td>逐级回溯更早的成功基线，再多卸一批；达上限后停下并提示</td>
+</tr>
+<tr>
+<td>重启/关闭安排错了</td>
+<td><code>cancel_harness_action</code> 一键撤销，进程继续运行</td>
+</tr>
+<tr>
+<td>浏览器页面一直开着，DSH 关闭很久后重新打开</td>
+<td>连接恢复 → 代际 ID 对比 → 自动刷新</td>
+</tr>
+<tr>
+<td>手动完整重启 / wrapper 重启 / 回滚换代</td>
+<td>页面都自动刷新，无需手动 F5</td>
+</tr>
+<tr>
+<td>想彻底关闭</td>
+<td><code>shutdown_harness</code> / <code>/shutdown</code> 优雅退出整棵树</td>
+</tr>
+</tbody></table>
+<hr>
+<h2>工作原理（自动套壳）</h2>
+<pre><code>用户终端（ConPTY 管道）
+  └── dsh web（第一代，用户启动，无 DSH_LAUNCHER_WRAPPER）
+        ├── bundle patch 把 webServer 端口条件化：第一代用正式端口+1（不占 3080）
+        ├── spawn 第二代（非 detached + inherit → 继承控制台 + IPC 通道）
+        ├── 启动守护：快照插件清单 → 监测第二代存活/退出
+        └── 第二代（DSH_LAUNCHER_WRAPPER=1）→ 正常模式：
+              · 监听正式端口，输出回用户终端（句柄继承链）
+              · 注册 restart_harness / shutdown_harness / cancel_harness_action
+              · /restart /shutdown 命令、/status /settings 端点、设置菜单
+重启：等轮次结束 → 写 resume marker → IPC 通知第一代
+  → 第一代杀旧第二代 → 拉起新一代（同控制台 + WAKE=1）
+  → 新一代服务 + 读 marker → 等会话恢复 → steer 唤醒
+失败回滚：新一代启动失败（非 0 退出/过快退出）
+  → 第一代对比清单基线 → dsh plugin remove 新增插件 → 重试（逐级回溯）
+关闭：IPC 通知第一代 → 杀子 → 整个树退出
+</code></pre>
+<h3>关键设计笔记</h3>
+<ul>
+<li><strong>Windows Terminal（ConPTY）限制</strong>（实测三重确认）：AttachConsole 外部附加不可渲染、数字 fd 继承失效、detached 断链——唯一可靠的"输出回原终端"是<strong>句柄继承链</strong>（用户终端 → 第一代 → 第二代 → 新一代）</li>
+<li><strong>父退杀子</strong>：非 detached 子进程在父退出时被连带终止（实测）——第一代因此常驻不退出</li>
+<li><strong>唤醒时序</strong>：会话恢复发生在客户端重连之后，apply 时 agents 为空——重启前写 marker（活跃会话 id），重启后轮询等待恢复再 steer</li>
+<li><strong>回滚走官方 CLI</strong>：<code>node bin.js plugin --profile &lt;p&gt; remove &lt;pkg&gt;</code>，与手敲 <code>dsh plugin remove</code> 完全等价（bin.js 是 dsh 命令的真实入口），remove 成功后自动同步 bundles</li>
+<li><strong>每次 spawn 都重读清单</strong>：重启期间新装的插件也能进回滚判定（否则只对比 wrapper 启动时的旧清单）</li>
+<li><strong>回滚重试携带唤醒</strong>：重启+唤醒触发的失败，恢复后仍会唤醒（marker 未消费）</li>
+</ul>
+<hr>
+<h2>安装</h2>
+<pre><code># 从 npm（发布后）
+dsh plugin --profile web add dsh-graceful-restart
+
+# 或本地开发
+dsh plugin --profile web add "file:D:/Project/dsh-graceful-restart"
+</code></pre>
+<p>重启 DSH 生效（<code>file:</code> 依赖是复制快照——改代码后需 <code>remove</code> + <code>add</code> 重新同步）。</p>
+<h3>设置（settings.yaml 或设置页"优雅重启"）</h3>
+<pre><code>dsh-graceful-restart:
+  snapshotKeep: 3   # 成功基线保留版本数（1-10，默认 3）
+</code></pre>
+<h3>触发表</h3>
+<table>
+<thead>
+<tr>
+<th>触发方式</th>
+<th>行为</th>
+<th>唤醒</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>模型工具 <code>restart_harness</code>（可带 <code>continuePrompt</code>）</td>
+<td>重启</td>
+<td>✅ 自动 <code>steer()</code> 继续</td>
+</tr>
+<tr>
+<td>斜杠命令 <code>/restart</code></td>
+<td>重启</td>
+<td>❌ 等人</td>
+</tr>
+<tr>
+<td>模型工具 <code>shutdown_harness</code></td>
+<td>关闭（不重启）</td>
+<td>—</td>
+</tr>
+<tr>
+<td>斜杠命令 <code>/shutdown</code></td>
+<td>关闭（不重启）</td>
+<td>—</td>
+</tr>
+<tr>
+<td>模型工具 <code>cancel_harness_action</code></td>
+<td>撤销未执行的重启/关闭</td>
+<td>—</td>
+</tr>
+</tbody></table>
+<hr>
+<h2>文件清单（$DSH_HOME 下）</h2>
+<ul>
+<li><code>dsh-process.json</code> — pid/命令行索引</li>
+<li><code>dsh-graceful-restart-snapshot.json</code> — 启动守护快照（成功基线 history / current / rollbacks）</li>
+<li><code>dsh-resume.json</code> — 唤醒 marker（重启前写，唤醒完成后清除）</li>
+<li><code>dsh-graceful-restart.log</code> — 插件 + wrapper + 守护日志</li>
+</ul>
+<hr>
+<h2>致谢</h2>
+<ul>
+<li><strong>dsh-restart 插件作者（anweat）</strong>：本项目最初正是为了理解并<strong>替换</strong>其插件（它会中断会话）而起。感谢它的存在让我系统研究了 dsh 的插件加载、启动链路与 Windows 控制台机制——本插件的每一个设计决策（自动套壳、句柄继承链、官方 CLI 回滚）都建立在对那次踩坑的完整复盘之上。致敬并致谢。</li>
+<li>本插件由 <strong>dsh（DeepSeek Harness）</strong> 驱动开发，全部代码由 <strong>deepseek-flash-0813</strong> 模型编写、调试与迭代完成——包括这个 README。</li>
+</ul>
+<h2>License</h2>
+<p>MIT</p>

@@ -1,0 +1,304 @@
+<h1>dsh-usage-ledger ( Token费用统计 )</h1>
+<p><a href="https://github.com/topics/dsh-plugin"><img src="https://img.shields.io/badge/topic-dsh--plugin-blue" alt="dsh-plugin"></a>
+<a href="https://github.com/beijingwahw/dsh-usage-ledger/blob/HEAD/LICENSE"><img src="https://img.shields.io/badge/license-MIT-green" alt="license"></a></p>
+<p><strong>中文</strong> | <a href="#english">English</a></p>
+<p>DeepSeek Harness 的 Token / 用量统计与成本控制插件：按对话聚合消耗、动态跟随官方定价、支持预算拦截，并内置 Web 仪表盘。</p>
+<h2>功能特性</h2>
+<ul>
+<li><strong>按会话统计</strong>：监听 <code>session/event</code>，把每次 <code>assistant/message</code> 的 <code>usage</code>（输入 / 输出 / 缓存读写 Token）折算为费用，按会话、按北京日、按生命周期三个维度聚合，并持久化到账本文件。</li>
+<li><strong>动态官方定价</strong>：定期抓取官方定价页，自动解析并热更新价格，官方调价 / 上新模型时无需改代码即可生效。</li>
+<li><strong>DeepSeek 峰谷分时</strong>：识别官方「高峰 / 空闲」时段表与生效日期，按调用发生的北京时间实时取价。</li>
+<li><strong>多厂商价格目录</strong>：覆盖 DeepSeek、智谱 GLM、月之暗面 Kimi、阿里通义、字节豆包、MiniMax、百度文心等主流国产模型，新模型上线官方定价页后自动导入。</li>
+<li><strong>预算控制</strong>：支持日 / 总 / 单会话三级预算，达到阈值进入告警，超限可通过 <code>llm/stream</code> 钩子直接拦截模型调用。</li>
+<li><strong>Web 仪表盘</strong>：通过 <code>dsh-host-webserver</code> 注册 <code>/usage-ledger</code> 路由，提供用量可视化与 JSON API。</li>
+<li><strong>用户覆盖价</strong>：<code>customPrices</code> 设置可为任意模型（含自定义模型）覆盖或补充价格，优先级最高。</li>
+</ul>
+<h2>安装</h2>
+<p>将本仓库放入 DeepSeek Harness 的插件目录（或通过包管理器安装），Harness 会依据 <code>dsh.plugin.json</code> 与 <code>cordis.patch.yml</code> 自动加载。</p>
+<pre><code>git clone https://github.com/beijingwahw/dsh-usage-ledger.git
+cd dsh-usage-ledger
+pnpm install
+pnpm run build
+</code></pre>
+<h2>配置</h2>
+<p>在 Harness 的 <code>cordis.yml</code> 中挂载并配置：</p>
+<pre><code>- name: dsh-usage-ledger
+  config:
+    ledgerPath: ''            # 留空则使用 $DSH_HOME/usage-ledger.json
+    saveIntervalMs: 5000      # 账本落盘防抖
+    pricingTimeoutMs: 10000   # 单次定价抓取超时
+</code></pre>
+<p><code>usage-ledger</code> 命名空间的用户设置（可在运行时热更新）：</p>
+<table>
+<thead>
+<tr>
+<th>设置</th>
+<th>默认</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>dailyBudget</code></td>
+<td><code>0</code></td>
+<td>日预算（元），0 关闭</td>
+</tr>
+<tr>
+<td><code>totalBudget</code></td>
+<td><code>0</code></td>
+<td>总预算（元），0 关闭</td>
+</tr>
+<tr>
+<td><code>sessionBudget</code></td>
+<td><code>0</code></td>
+<td>单会话预算（元），0 关闭</td>
+</tr>
+<tr>
+<td><code>warnRatio</code></td>
+<td><code>0.8</code></td>
+<td>进入告警的预算占比</td>
+</tr>
+<tr>
+<td><code>enforceBudget</code></td>
+<td><code>true</code></td>
+<td>超预算时拦截模型调用</td>
+</tr>
+<tr>
+<td><code>pricingUrl</code></td>
+<td>DeepSeek 官方页</td>
+<td>定价刷新来源</td>
+</tr>
+<tr>
+<td><code>refreshIntervalMin</code></td>
+<td><code>60</code></td>
+<td>定价刷新间隔（分钟）</td>
+</tr>
+<tr>
+<td><code>customPrices</code></td>
+<td><code>{}</code></td>
+<td>按模型 id 覆盖价格（最长前缀匹配）</td>
+</tr>
+</tbody></table>
+<p><code>customPrices</code> 示例：</p>
+<pre><code>{
+  "glm-4.6": { "inputCacheHit": 1, "inputMiss": 5, "output": 5 }
+}
+</code></pre>
+<p>价格单位为 <strong>元 / 百万 tokens</strong>。</p>
+<h2>价格解析优先级</h2>
+<p><code>用户覆盖 &gt; DeepSeek 实时表 &gt; 各厂商实时抓取表 &gt; 内置目录精确匹配 &gt; 最长前缀匹配</code></p>
+<p>各厂商抓取方式（<code>fetchKind</code>）：</p>
+<table>
+<thead>
+<tr>
+<th>厂商</th>
+<th>通道</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>DeepSeek</td>
+<td>官方定价页 HTML（含峰谷表）</td>
+</tr>
+<tr>
+<td>智谱 GLM</td>
+<td>SPA <code>app.*.js</code> 内嵌价格 + 公开运营位接口</td>
+</tr>
+<tr>
+<td>Kimi</td>
+<td>Next.js RSC flight payload 子页</td>
+</tr>
+<tr>
+<td>通义千问</td>
+<td>官方定价页表格</td>
+</tr>
+<tr>
+<td>豆包</td>
+<td>火山文档中心服务端 Markdown</td>
+</tr>
+<tr>
+<td>MiniMax</td>
+<td>官方定价页表格</td>
+</tr>
+<tr>
+<td>文心</td>
+<td>百度 CDN Gatsby page-data</td>
+</tr>
+</tbody></table>
+<p>抓取失败时沿用上一次成功的价格，网络异常不影响记账。</p>
+<h2>提供的工具</h2>
+<ul>
+<li><code>usage_report</code>：输出当前用量 / 费用 / 预算状态报表。</li>
+</ul>
+<h2>HTTP 接口</h2>
+<ul>
+<li><code>GET /usage-ledger</code>：仪表盘页面。</li>
+<li><code>GET /usage-ledger/api/...</code>：用量与定价 JSON API。</li>
+</ul>
+<h2>开发</h2>
+<pre><code>pnpm run build        # 编译到 lib/
+pnpm run typecheck    # 仅类型检查
+</code></pre>
+<p>目录结构：</p>
+<pre><code>src/
+  index.ts      # 插件入口：事件折叠、预算门、工具与路由注册
+  ledger.ts     # 用量聚合、持久化、预算评估
+  pricing.ts    # 定价抓取、解析、变更检测
+  catalog.ts    # 厂商元信息与内置价格目录
+  scrapers.ts   # 通用 / 专用定价页解析器
+  types.ts      # 共享类型
+</code></pre>
+<h2>参与贡献</h2>
+<p>欢迎提交 Issue 与 Pull Request。请保持改动聚焦，提交前运行 <code>pnpm run typecheck</code>。</p>
+<h2>许可</h2>
+<p><a href="https://github.com/beijingwahw/dsh-usage-ledger/blob/HEAD/LICENSE">MIT</a></p>
+<hr>
+<p><a></a></p>
+<h1>dsh-usage-ledger</h1>
+<p><strong><a href="#dsh-usage-ledger">中文</a></strong> | English</p>
+<p>A token usage &amp; cost ledger plugin for <a href="https://github.com/topics/dsh-plugin">DeepSeek Harness</a>: per-session cost aggregation, dynamic official pricing, budget gating, and a built-in web dashboard.</p>
+<h2>Features</h2>
+<ul>
+<li><strong>Per-session accounting</strong>: listens to <code>session/event</code>, prices every <code>assistant/message</code> <code>usage</code> record (input / output / cache read &amp; write tokens), and aggregates it per session, per Beijing-time day, and per lifetime, persisting everything to a ledger file.</li>
+<li><strong>Dynamic official pricing</strong>: periodically scrapes official pricing pages, parses and hot-reloads prices — official price changes and newly published models take effect without any code change.</li>
+<li><strong>DeepSeek peak/off-peak</strong>: understands the official peak/off-peak schedule and its effective date, resolving the price in force at the exact Beijing time of each call.</li>
+<li><strong>Multi-vendor catalog</strong>: covers DeepSeek, Zhipu GLM, Moonshot Kimi, Alibaba Qwen, ByteDance Doubao, MiniMax and Baidu ERNIE; new models are imported automatically once they appear on an official pricing page.</li>
+<li><strong>Budget control</strong>: daily / total / per-session budgets with a warning threshold, optionally blocking model calls through the <code>llm/stream</code> gate when exceeded.</li>
+<li><strong>Web dashboard</strong>: registers the <code>/usage-ledger</code> route via <code>dsh-host-webserver</code>, with usage visualization and a JSON API.</li>
+<li><strong>User price overrides</strong>: the <code>customPrices</code> setting can override or add prices for any model (including custom ones) and takes top priority.</li>
+</ul>
+<h2>Installation</h2>
+<p>Drop this repository into the DeepSeek Harness plugin directory (or install it via a package manager). Harness loads it automatically through <code>dsh.plugin.json</code> and <code>cordis.patch.yml</code>.</p>
+<pre><code>git clone https://github.com/beijingwahw/dsh-usage-ledger.git
+cd dsh-usage-ledger
+pnpm install
+pnpm run build
+</code></pre>
+<h2>Configuration</h2>
+<p>Mount and configure it in Harness's <code>cordis.yml</code>:</p>
+<pre><code>- name: dsh-usage-ledger
+  config:
+    ledgerPath: ''            # empty = $DSH_HOME/usage-ledger.json
+    saveIntervalMs: 5000      # ledger persistence debounce
+    pricingTimeoutMs: 10000   # wall-clock budget for one pricing fetch
+</code></pre>
+<p>User settings in the <code>usage-ledger</code> namespace (hot-reloadable at runtime):</p>
+<table>
+<thead>
+<tr>
+<th>Setting</th>
+<th>Default</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>dailyBudget</code></td>
+<td><code>0</code></td>
+<td>Daily cost budget (CNY); 0 disables</td>
+</tr>
+<tr>
+<td><code>totalBudget</code></td>
+<td><code>0</code></td>
+<td>Lifetime cost budget (CNY); 0 disables</td>
+</tr>
+<tr>
+<td><code>sessionBudget</code></td>
+<td><code>0</code></td>
+<td>Per-session cost budget (CNY); 0 disables</td>
+</tr>
+<tr>
+<td><code>warnRatio</code></td>
+<td><code>0.8</code></td>
+<td>Ratio at which budgets enter the warning state</td>
+</tr>
+<tr>
+<td><code>enforceBudget</code></td>
+<td><code>true</code></td>
+<td>Block model calls once any budget is exceeded</td>
+</tr>
+<tr>
+<td><code>pricingUrl</code></td>
+<td>DeepSeek official page</td>
+<td>Pricing refresh source</td>
+</tr>
+<tr>
+<td><code>refreshIntervalMin</code></td>
+<td><code>60</code></td>
+<td>Pricing refresh interval (minutes)</td>
+</tr>
+<tr>
+<td><code>customPrices</code></td>
+<td><code>{}</code></td>
+<td>Price overrides by model id (longest-prefix match)</td>
+</tr>
+</tbody></table>
+<p><code>customPrices</code> example:</p>
+<pre><code>{
+  "glm-4.6": { "inputCacheHit": 1, "inputMiss": 5, "output": 5 }
+}
+</code></pre>
+<p>All prices are <strong>CNY per 1M tokens</strong>.</p>
+<h2>Price Resolution Priority</h2>
+<p><code>user overrides &gt; DeepSeek live sheet &gt; vendor live tables &gt; built-in catalog exact match &gt; longest-prefix match</code></p>
+<p>Per-vendor fetch channels (<code>fetchKind</code>):</p>
+<table>
+<thead>
+<tr>
+<th>Vendor</th>
+<th>Channel</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>DeepSeek</td>
+<td>Official pricing page HTML (incl. peak/off-peak table)</td>
+</tr>
+<tr>
+<td>Zhipu GLM</td>
+<td>Prices embedded in the SPA <code>app.*.js</code> bundle + public operation API</td>
+</tr>
+<tr>
+<td>Kimi</td>
+<td>Next.js RSC flight payload subpages</td>
+</tr>
+<tr>
+<td>Qwen</td>
+<td>Official pricing page tables</td>
+</tr>
+<tr>
+<td>Doubao</td>
+<td>Volcano doc-center server-side Markdown</td>
+</tr>
+<tr>
+<td>MiniMax</td>
+<td>Official pricing page tables</td>
+</tr>
+<tr>
+<td>ERNIE</td>
+<td>Baidu CDN Gatsby page-data</td>
+</tr>
+</tbody></table>
+<p>On fetch failure the last good prices are kept, so network issues never break accounting.</p>
+<h2>Provided Tool</h2>
+<ul>
+<li><code>usage_report</code>: reports current usage / cost / budget status.</li>
+</ul>
+<h2>HTTP Endpoints</h2>
+<ul>
+<li><code>GET /usage-ledger</code>: dashboard page.</li>
+<li><code>GET /usage-ledger/api/...</code>: usage and pricing JSON API.</li>
+</ul>
+<h2>Development</h2>
+<pre><code>pnpm run build        # compile to lib/
+pnpm run typecheck    # type check only
+</code></pre>
+<p>Layout:</p>
+<pre><code>src/
+  index.ts      # plugin entry: event folding, budget gate, tool &amp; route registration
+  ledger.ts     # usage aggregation, persistence, budget evaluation
+  pricing.ts    # pricing fetch, parsing, change detection
+  catalog.ts    # vendor metadata and built-in price catalog
+  scrapers.ts   # generic / vendor-specific pricing page parsers
+  types.ts      # shared types
+</code></pre>
+<h2>Contributing</h2>
+<p>Issues and pull requests are welcome. Please keep changes focused and run <code>pnpm run typecheck</code> before submitting.</p>
+<h2>License</h2>
+<p><a href="https://github.com/beijingwahw/dsh-usage-ledger/blob/HEAD/LICENSE">MIT</a></p>

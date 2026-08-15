@@ -1,0 +1,97 @@
+<h1>dsh-fork-perf</h1>
+<p><a href=""><img src="https://img.shields.io/badge/version-0.1.0-blue" alt="Version"></a>
+<a href=""><img src="https://img.shields.io/badge/dsh-0.1.0--rc.6-green" alt="dsh"></a>
+<a href="https://github.com/orangeofcarl0-sys/dsh-fork-perf/blob/HEAD/LICENSE"><img src="https://img.shields.io/badge/License-MIT-yellow.svg" alt="License: MIT"></a></p>
+<p>DSH（DeepSeek Harness）对话分支（fork）性能插件。</p>
+<h2>问题</h2>
+<p>dsh <code>0.1.0-rc.6</code> 的 fork 路径对整个会话事件日志做<strong>多次全量深拷贝</strong>，大会话（&gt;15MB）
+一次 fork 产生数百毫秒同步阻塞，足以打断流式中的 LLM 响应（表现为 TRANSPORT/心跳
+超时重试）、UI 卡顿甚至"卡死"：</p>
+<table>
+<thead>
+<tr>
+<th>环节</th>
+<th>18.2MB/20k 事件实测</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>Session</code> 构造器逐事件 <code>snapshotJsonValue</code>（纯 JS 深拷贝）</td>
+<td>~344ms</td>
+</tr>
+<tr>
+<td>persistence <code>initFor</code> 再 <code>structuredClone(seed)</code></td>
+<td>~135ms</td>
+</tr>
+<tr>
+<td>write-behind <code>enqueue</code> 逐事件 <code>structuredClone</code>（分摊）</td>
+<td>~134ms</td>
+</tr>
+<tr>
+<td><strong>合计（fork 瞬时）</strong></td>
+<td><strong>~480ms</strong></td>
+</tr>
+</tbody></table>
+<h2>方案</h2>
+<ol>
+<li><strong>零拷贝 fork</strong>（<code>zeroCopyFork</code>）：fork 的 seed 事件本就是 <code>deepFreeze</code> 的不可变
+纯 JSON 树。补丁改走 <code>Session.prepare(..., { seedSource: 'persistence' })</code> 的
+<code>fromRestore</code> 通道——原地冻结复用引用，跳过整树深拷贝。子会话 header
+（<code>parentSession</code>/<code>seedLength</code>/<code>cwd</code>）与官方 fork 逐字段一致，磁盘布局不变。</li>
+<li><strong>fast init-for</strong>（<code>fastInitFor</code>）：<code>PersistenceCoordinator.initFor</code> 里那次
+<code>structuredClone(seed)</code> 替换为冻结引用复用。带 rc.6 源码特征校验
+（<code>structuredClone(e)</code> 标记），内部结构不匹配时自动跳过并告警。</li>
+<li><strong>监控与 API</strong>：fork 计时/路径统计；<code>/dsh-fork-perf/api</code> HTTP 路由。</li>
+</ol>
+<p>实测同负载：fork 主体 <strong>344ms → 19ms（≈18×）</strong>；<code>initFor</code> <strong>135ms → ~0ms</strong>。</p>
+<h3>安全性</h3>
+<ul>
+<li>共享引用等价于深拷贝：事件在进入源会话时已通过完整 JSON 边界与 surface 验证并
+深冻结，任何代码都无法修改。</li>
+<li>三层回退：(a) 调用时能力探测缺失方法 → 官方实现；(b) restore 通道运行时异常 →
+try/catch 回退官方实现；(c) 配置开关 <code>zeroCopyFork: false</code> → 永远官方路径。</li>
+<li>dispose 完整还原所有补丁。</li>
+</ul>
+<h2>安装</h2>
+<pre><code># 从 GitHub 安装（推荐）
+dsh plugin --profile web add github:orangeofcarl0-sys/dsh-fork-perf
+# 或
+dsh plugin --profile web add https://github.com/orangeofcarl0-sys/dsh-fork-perf
+
+# 本地开发
+dsh plugin --profile web add file:&lt;本仓库路径&gt;
+</code></pre>
+<blockquote>
+<p>注意：每次修改仓库代码后，需把 <code>lib/</code>、<code>cordis.patch.yml</code>、<code>package.json</code>
+同步到 <code>&lt;DSH_HOME&gt;/profiles/web/node_modules/dsh-fork-perf/</code>（<code>file:</code> 安装
+不会自动跟随源文件更新），或重新执行 <code>dsh plugin add</code>。</p>
+</blockquote>
+<p>重启 <code>dsh web</code> 生效。日志出现 <code>[fork-perf] zero-copy fork installed</code> 即成功。</p>
+<h2>API</h2>
+<p><code>POST http://127.0.0.1:3080/dsh-fork-perf/api/&lt;method&gt;</code>：</p>
+<ul>
+<li><code>stats.get</code> — fork 次数 / 零拷贝占比 / 回退次数 / 最近记录（事件数、耗时、路径）</li>
+<li><code>stats.reset</code> — 清零</li>
+<li><code>config.get</code> / <code>config.set</code> — 运行时开关（<code>zeroCopyFork</code>、<code>fastInitFor</code>、
+<code>slowForkWarnMs</code>、<code>keepRecent</code>），<code>config.set</code> 同时写 settings 持久化</li>
+</ul>
+<pre><code>curl -X POST http://127.0.0.1:3080/dsh-fork-perf/api/stats.get
+curl -X POST http://127.0.0.1:3080/dsh-fork-perf/api/config.set \
+  -d '{"zeroCopyFork": false}'
+</code></pre>
+<h2>验证</h2>
+<ul>
+<li><code>smoke_test.mjs</code>（14 断言）：官方 fork 基线 / 零拷贝 fork 功能等价
+（header、事件数、深冻结、boundary、open-turn 拒绝）/ dispose 还原 /
+版本漂移回退 —— ALL PASS</li>
+<li><code>test_fast_initfor.mjs</code>（8 断言）：initFor 补丁安装 / 源码特征漂移跳过 /
+无 persistence 服务存活 —— ALL PASS</li>
+<li><code>bench_fork2.mjs</code>：18.2MB/20k 事件，fork 主体 343.8ms → 18.8ms</li>
+</ul>
+<h2>局限</h2>
+<ul>
+<li><code>enqueue</code> 的逐事件 <code>structuredClone</code>（第三次拷贝）在插件层无法安全消除——它在
+write-behind 闭包内部，且承担"persistence 独立于生产者"的所有权语义。根治需
+上游改为按需快照。</li>
+<li>补丁绑定 rc.6 内部结构（<code>_forkSeed</code>、<code>initFor</code> 源码特征）；大版本升级后特征
+校验会自动跳过优化并保持官方行为，重新适配即可。</li>
+</ul>

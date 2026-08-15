@@ -1,0 +1,507 @@
+<h1>DSH Pi</h1>
+<p>Run trusted, unmodified <a href="https://pi.dev/docs/latest/extensions">Pi extensions</a> inside <a href="https://github.com/deepseek-ai/deepseek-harness">DeepSeek Harness</a>. This is a compatibility host, not a source-to-source converter: Pi's official loader and <code>ExtensionRunner</code> own Pi semantics, while this package adapts their observable surface to agent-scoped DSH tools, commands, messages, attachments, and lifecycle hooks.</p>
+<p>The project currently targets Pi <code>0.80.x</code> and DSH <code>0.1.0-rc.6</code>. DSH is still a developer preview; the peer range is intentionally narrow.</p>
+<h2>Why a host instead of generated plugins</h2>
+<p>An extension factory is executable code with lifecycle and session state. Converting its source once cannot preserve tools registered during <code>session_start</code>, mutable active-tool sets, cancellation, providers, or per-agent state. The host therefore creates one Pi runtime per DSH agent and reconciles registrations into that agent's Cordis context.</p>
+<pre><code>flowchart LR
+  C["DSH bundle config"] --&gt; R["Package / manifest resolver"]
+  R --&gt; P["Pi loader + ExtensionRunner"]
+  P --&gt; A["Agent-scoped adapter"]
+  A --&gt; T["DSH tools"]
+  A --&gt; M["DSH commands"]
+  A --&gt; L["DSH lifecycle and messages"]
+  F["Existing Pi packages\nread-only fixtures"] --&gt; R
+</code></pre>
+<h2>Local development</h2>
+<pre><code>pnpm install
+pnpm check
+PI_FIXTURE_WORKSPACE=/absolute/path/to/pi pnpm test
+pnpm compat /absolute/path/to/pi
+</code></pre>
+<p>The repository at <code>../pi</code> is only read. Compatibility tests inventory its <code>packages/pi-*</code> manifests and source API usage; representative smoke tests load built entries without calling paid tools.</p>
+<h2>Install as a DSH bundle</h2>
+<p>Install the published bundle and the Pi extensions you want in the same profile:</p>
+<pre><code>dsh plugin --profile demo add dsh-pi-host \
+  @amaster.ai/pi-image-gen \
+  @amaster.ai/pi-video-gen
+dsh --profile demo --dump-config
+</code></pre>
+<p>For local development, replace <code>dsh-pi-host</code> with the path to this checkout, such as <code>./dsh-pi</code> when running from its parent directory.</p>
+<p>The selected Pi packages must be installed in the same DSH profile so bare package specifiers resolve from that profile. DSH may warn that they declare no <code>dsh.bundle</code>; that is expected because they are plain dependencies loaded by <code>dsh-pi-host</code>, not independent DSH layers. Install any other package named in <code>extensions</code> the same way.</p>
+<h3>Choose Pi extensions</h3>
+<p>Then override the bundle row in the profile's <code>cordis.patch.yml</code>. DSH replaces a row's complete <code>config</code>, so keep every field:</p>
+<pre><code>- id: dsh-pi
+  config:
+    extensions:
+      - '@amaster.ai/pi-image-gen'
+      - '@amaster.ai/pi-video-gen'
+    projectTrusted: false
+    allowLocalPaths: false
+    strict: false
+    flags: {}
+</code></pre>
+<p><code>strict: true</code> fails agent composition when any selected Pi tool schema cannot be represented without widening it. With <code>strict: false</code>, those tools are skipped, excluded from the Pi-visible adapted active set, and retried only after their definition changes or they are reactivated; for the current <code>pi-video-gen</code> fixture this skips <code>video_generate</code> because DSH cannot enforce its numeric <code>minimum</code>, while the other three video tools still mount.</p>
+<p>For local fixture packages, enable the explicit code-execution boundary:</p>
+<pre><code>- id: dsh-pi
+  config:
+    extensions:
+      - '/Users/me/Workspace/pi/packages/pi-image-gen'
+    projectTrusted: false
+    allowLocalPaths: true
+    strict: true
+    flags: {}
+</code></pre>
+<p><code>allowLocalPaths</code> is off by default because Pi extensions are trusted Node.js code, not sandboxed plugins. <code>projectTrusted</code> is a separate switch: it controls whether extensions may consume project-local Pi settings and policies. The host loads only entries resolved from <code>extensions</code>; it never auto-discovers <code>&lt;cwd&gt;/.pi/extensions</code>.</p>
+<p>Reload the profile after changing <code>extensions</code>, then run <code>dsh --profile demo --dump-config</code> to verify the effective list.</p>
+<h3>Configure Pi extensions</h3>
+<p>Keep Pi settings beside the DSH profile configuration and point <code>PI_CODING_AGENT_DIR</code> at that profile directory. Use Pi's established <code>settings.json</code> filename rather than a separate <code>pi-settings.json</code> compatibility format:</p>
+<pre><code>$DSH_HOME/profiles/demo/
+├── cordis.patch.yml   # selects Pi extensions
+└── settings.json      # configures those Pi extensions
+</code></pre>
+<p>For <code>pi-image-gen</code>, the minimum configuration selects a model and keeps the API key in the environment:</p>
+<pre><code>{
+  "pi-image-gen": {
+    "defaultModel": "nano-banana"
+  }
+}
+</code></pre>
+<pre><code>export DSH_HOME="$HOME/.dsh"
+export PI_CODING_AGENT_DIR="$DSH_HOME/profiles/demo"
+export GEMINI_API_KEY="..."
+dsh --profile demo
+</code></pre>
+<p>The same settings file can configure multiple selected Pi extensions under their own top-level keys. Project-local <code>&lt;cwd&gt;/.pi/settings.json</code> remains available only when <code>projectTrusted</code> is enabled.</p>
+<h2>Pi API to DSH compatibility</h2>
+<p>Status:</p>
+<ul>
+<li>✅ <strong>Supported</strong> — the observable Pi behavior has a DSH mapping.</li>
+<li>🟡 <strong>Partial</strong> — useful behavior works, but some Pi semantics are missing.</li>
+<li>❌ <strong>Unsupported</strong> — there is no faithful adapter yet; the host does not pretend it worked.</li>
+</ul>
+<h3>ExtensionAPI methods</h3>
+<table>
+<thead>
+<tr>
+<th>Pi ExtensionAPI</th>
+<th>Closest DSH capability</th>
+<th align="right">Implemented here</th>
+<th>Notes</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>pi.on(...)</code></td>
+<td>Cordis <code>ctx.on(...)</code> and DSH agent/session/tool events</td>
+<td align="right">🟡 Partial</td>
+<td>See the lifecycle-event table below.</td>
+</tr>
+<tr>
+<td><code>pi.registerTool(...)</code></td>
+<td><code>agent.ctx.tools.register(...)</code></td>
+<td align="right">🟡 Partial</td>
+<td>Execution, strict schema projection (including disjoint TypeBox literal unions), <code>prepareArguments</code>, cancellation, sanitized errors, ordered updates, images, concurrency, active-tool changes and lifecycle-time registration/replacement work. Successful text is bounded to 50KB/2000 lines, oversized details are omitted, and images are checked against DSH attachment limits before decoding. Unrepresentable schemas are rejected; Pi TUI renderers and DSH live update cards do not.</td>
+</tr>
+<tr>
+<td><code>pi.registerCommand(...)</code></td>
+<td><code>agent.ctx.commands.register(...)</code></td>
+<td align="right">🟡 Partial</td>
+<td>Command handlers, sanitized unexpected failures, and <code>ctx.ui.notify</code> text work. Pi completions and interactive <code>ctx.ui</code> dialogs do not.</td>
+</tr>
+<tr>
+<td><code>pi.registerShortcut(...)</code></td>
+<td>No plugin-owned DSH keyboard-shortcut registry</td>
+<td align="right">❌ Unsupported</td>
+<td>Requires a separate client/UI plugin.</td>
+</tr>
+<tr>
+<td><code>pi.registerFlag(...)</code></td>
+<td>DSH plugin config plus the embedded Pi flag store</td>
+<td align="right">✅ Supported</td>
+<td>Defaults and configured overrides use Pi's official runner.</td>
+</tr>
+<tr>
+<td><code>pi.getFlag(...)</code></td>
+<td>Read the embedded Pi flag store</td>
+<td align="right">✅ Supported</td>
+<td>Preserves Pi flag lookup behavior.</td>
+</tr>
+<tr>
+<td><code>pi.registerMessageRenderer(...)</code></td>
+<td>DSH replayable message projections/UI plugins</td>
+<td align="right">❌ Unsupported</td>
+<td>Pi TUI components cannot be replayed as DSH render intents.</td>
+</tr>
+<tr>
+<td><code>pi.registerEntryRenderer(...)</code></td>
+<td>DSH session projections/UI plugins</td>
+<td align="right">❌ Unsupported</td>
+<td>Same renderer-model mismatch.</td>
+</tr>
+<tr>
+<td><code>pi.sendMessage(...)</code></td>
+<td><code>agent.followup()</code>, <code>agent.steer()</code>, <code>agent.inject()</code>, <code>agent.send()</code></td>
+<td align="right">🟡 Partial</td>
+<td>Non-waking idle injection, trigger-turn, steering, follow-up and native next-turn delivery map. Attachment persistence is drained at lifecycle boundaries and delivery is suppressed after disposal begins; durable Pi custom entries, <code>display</code>, <code>customType</code> and renderer details do not map.</td>
+</tr>
+<tr>
+<td><code>pi.sendUserMessage(...)</code></td>
+<td><code>agent.followup()</code> / <code>agent.steer()</code></td>
+<td align="right">✅ Supported</td>
+<td>Text and images map to identified DSH messages; images use DSH attachments.</td>
+</tr>
+<tr>
+<td><code>pi.appendEntry(...)</code></td>
+<td>Declared custom <code>SessionEventMap</code> event plus <code>session.append()</code></td>
+<td align="right">🟡 Partial</td>
+<td>Stored in the embedded Pi session only; not yet durable in the DSH log.</td>
+</tr>
+<tr>
+<td><code>pi.setSessionName(...)</code></td>
+<td>DSH session-title domain/projection</td>
+<td align="right">🟡 Partial</td>
+<td>Updates Pi-side in-memory state only.</td>
+</tr>
+<tr>
+<td><code>pi.getSessionName()</code></td>
+<td>Read DSH title projection</td>
+<td align="right">🟡 Partial</td>
+<td>Returns the Pi-side in-memory name.</td>
+</tr>
+<tr>
+<td><code>pi.setLabel(...)</code></td>
+<td>Custom DSH session event/projection</td>
+<td align="right">🟡 Partial</td>
+<td>Stored in the embedded Pi session tree only.</td>
+</tr>
+<tr>
+<td><code>pi.exec(...)</code></td>
+<td>DSH subprocess/shell services</td>
+<td align="right">✅ Supported</td>
+<td>Uses Pi's own process runner with cwd, env, timeout and cancellation options.</td>
+</tr>
+<tr>
+<td><code>pi.getActiveTools()</code></td>
+<td><code>ctx.tools.schemas(agent)</code> / scoped tool view</td>
+<td align="right">🟡 Partial</td>
+<td>Returns the filtered active set of adapted Pi tools; DSH-native tools are not included.</td>
+</tr>
+<tr>
+<td><code>pi.getAllTools()</code></td>
+<td><code>ctx.tools.get()</code> / <code>ctx.tools.schemas()</code></td>
+<td align="right">🟡 Partial</td>
+<td>Returns Pi's official extension registry, not DSH-native tools.</td>
+</tr>
+<tr>
+<td><code>pi.setActiveTools(...)</code></td>
+<td>Dispose/register agent-scoped DSH tool effects</td>
+<td align="right">🟡 Partial</td>
+<td>Reconciles adapted Pi registrations and ignores unknown names, but does not toggle DSH-native tools.</td>
+</tr>
+<tr>
+<td><code>pi.getCommands()</code></td>
+<td><code>ctx.commands.list(agent)</code></td>
+<td align="right">🟡 Partial</td>
+<td>Returns Pi extension commands only; DSH-native commands, skills and templates are not included.</td>
+</tr>
+<tr>
+<td><code>pi.setModel(...)</code></td>
+<td>DSH <code>Agent.options</code> plus an installed <code>LlmAdapter</code></td>
+<td align="right">🟡 Partial</td>
+<td>Provider/model ids map; DSH still owns adapter availability and credentials.</td>
+</tr>
+<tr>
+<td><code>pi.getThinkingLevel()</code></td>
+<td>DSH request reasoning effort/header</td>
+<td align="right">🟡 Partial</td>
+<td>Pi-side state only.</td>
+</tr>
+<tr>
+<td><code>pi.setThinkingLevel(...)</code></td>
+<td>DSH request reasoning effort/header</td>
+<td align="right">🟡 Partial</td>
+<td>Does not yet update DSH reasoning effort.</td>
+</tr>
+<tr>
+<td><code>pi.registerProvider(...)</code></td>
+<td>Register a DSH <code>LlmAdapter</code></td>
+<td align="right">❌ Unsupported</td>
+<td>Pi <code>ProviderConfig</code> is not a DSH adapter. Configure <code>@deepseek-ai/dsh-llm-pi-ai</code> separately.</td>
+</tr>
+<tr>
+<td><code>pi.unregisterProvider(...)</code></td>
+<td>Dispose a DSH <code>LlmAdapter</code> registration</td>
+<td align="right">❌ Unsupported</td>
+<td>The host does not own a corresponding DSH adapter.</td>
+</tr>
+<tr>
+<td><code>pi.events</code></td>
+<td>Cordis event bus</td>
+<td align="right">✅ Supported</td>
+<td>Pi's shared <code>EventBus</code> is supplied directly by the official Pi loader.</td>
+</tr>
+</tbody></table>
+<h3>ExtensionContext and command context</h3>
+<table>
+<thead>
+<tr>
+<th>Pi context capability</th>
+<th>Closest DSH capability</th>
+<th align="right">Implemented here</th>
+<th>Notes</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>ctx.ui.*</code></td>
+<td>DSH command response and optional client UI plugins</td>
+<td align="right">🟡 Partial</td>
+<td><code>/command</code> handlers capture <code>ctx.ui.notify</code> as response text. Dialogs and Pi TUI controls use Pi's no-op UI context.</td>
+</tr>
+<tr>
+<td><code>ctx.mode</code></td>
+<td>Active host transport</td>
+<td align="right">🟡 Partial</td>
+<td>Reports the embedded Pi mode (<code>rpc</code> by default), not the connected DSH frontend.</td>
+</tr>
+<tr>
+<td><code>ctx.hasUI</code></td>
+<td>Availability of dialog-capable UI</td>
+<td align="right">✅ Supported</td>
+<td>Correctly returns <code>false</code>; this host exposes no Pi dialogs.</td>
+</tr>
+<tr>
+<td><code>ctx.cwd</code></td>
+<td><code>agent.session.header.cwd</code></td>
+<td align="right">✅ Supported</td>
+<td>Uses the DSH agent's working directory.</td>
+</tr>
+<tr>
+<td><code>ctx.sessionManager</code></td>
+<td>DSH event-sourced session</td>
+<td align="right">🟡 Partial</td>
+<td>An in-memory Pi SessionManager is available, but DSH history is not projected into it.</td>
+</tr>
+<tr>
+<td><code>ctx.modelRegistry</code></td>
+<td>DSH LLM adapter/catalog services</td>
+<td align="right">🟡 Partial</td>
+<td>Pi provider registrations are recorded; DSH adapters, credentials and model catalog are not exposed.</td>
+</tr>
+<tr>
+<td><code>ctx.model</code></td>
+<td>Selected DSH provider/model</td>
+<td align="right">❌ Unsupported</td>
+<td>No Pi <code>Model</code> object is synthesized.</td>
+</tr>
+<tr>
+<td><code>ctx.isIdle()</code></td>
+<td><code>agent.status</code></td>
+<td align="right">✅ Supported</td>
+<td>Reads the DSH agent's live status.</td>
+</tr>
+<tr>
+<td><code>ctx.isProjectTrusted()</code></td>
+<td><code>projectTrusted</code> config</td>
+<td align="right">✅ Supported</td>
+<td>Returns the explicit host trust decision.</td>
+</tr>
+<tr>
+<td><code>ctx.signal</code></td>
+<td>DSH turn/tool <code>AbortSignal</code></td>
+<td align="right">✅ Supported</td>
+<td>Invocation-scoped and safe for parallel Pi tools.</td>
+</tr>
+<tr>
+<td><code>ctx.abort()</code></td>
+<td><code>agent.cancel(...)</code></td>
+<td align="right">✅ Supported</td>
+<td>Cancels the current DSH agent operation.</td>
+</tr>
+<tr>
+<td><code>ctx.hasPendingMessages()</code></td>
+<td>DSH inbox</td>
+<td align="right">✅ Supported</td>
+<td>Reads the agent inbox.</td>
+</tr>
+<tr>
+<td><code>ctx.shutdown()</code></td>
+<td>DSH agent cancellation/disposal</td>
+<td align="right">🟡 Partial</td>
+<td>Cancels the current agent operation; it does not exit the DSH process.</td>
+</tr>
+<tr>
+<td><code>ctx.getContextUsage()</code></td>
+<td>DSH usage projections</td>
+<td align="right">❌ Unsupported</td>
+<td>No Pi <code>ContextUsage</code> projection yet.</td>
+</tr>
+<tr>
+<td><code>ctx.compact(...)</code></td>
+<td>DSH compaction lifecycle</td>
+<td align="right">❌ Unsupported</td>
+<td>The contracts differ and no operation is invoked.</td>
+</tr>
+<tr>
+<td><code>ctx.getSystemPrompt()</code></td>
+<td>DSH system-prompt assembly</td>
+<td align="right">❌ Unsupported</td>
+<td>The effective assembled prompt is not exposed to Pi.</td>
+</tr>
+<tr>
+<td><code>ctx.getSystemPromptOptions()</code></td>
+<td>DSH assembly context</td>
+<td align="right">🟡 Partial</td>
+<td>Command contexts receive <code>cwd</code> only.</td>
+</tr>
+<tr>
+<td><code>ctx.waitForIdle()</code></td>
+<td><code>agent.whenIdle()</code></td>
+<td align="right">✅ Supported</td>
+<td>Waits for the owning DSH agent to settle.</td>
+</tr>
+<tr>
+<td><code>ctx.newSession()</code>, <code>ctx.fork()</code>, <code>ctx.navigateTree()</code>, <code>ctx.switchSession()</code></td>
+<td>DSH agent/session creation APIs</td>
+<td align="right">❌ Unsupported</td>
+<td>Pi's mutable session-tree operations do not map faithfully; calls fail explicitly.</td>
+</tr>
+<tr>
+<td><code>ctx.reload()</code></td>
+<td>Cordis/DSH plugin reload</td>
+<td align="right">❌ Unsupported</td>
+<td>DSH owns plugin reload; calls fail explicitly.</td>
+</tr>
+</tbody></table>
+<h3>Lifecycle events</h3>
+<table>
+<thead>
+<tr>
+<th>Pi event</th>
+<th>Closest DSH event/capability</th>
+<th align="right">Implemented here</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>project_trust</code></td>
+<td>Deployment/plugin trust configuration</td>
+<td align="right">🟡 Configured <code>projectTrusted</code> controls <code>ctx.isProjectTrusted()</code>; the interactive handler is not run.</td>
+</tr>
+<tr>
+<td><code>resources_discover</code></td>
+<td>DSH skill and system-prompt registries</td>
+<td align="right">🟡 Handler runs, but returned skill/prompt/theme paths are not mounted into DSH.</td>
+</tr>
+<tr>
+<td><code>session_start</code></td>
+<td><code>agent/session-start</code></td>
+<td align="right">✅ Per-agent and awaited before the first step.</td>
+</tr>
+<tr>
+<td><code>session_shutdown</code></td>
+<td><code>agent/disposed</code> / Cordis effect disposal</td>
+<td align="right">🟡 Runs once and drains during agent or plugin teardown, but every DSH teardown is reported to Pi with reason <code>quit</code>.</td>
+</tr>
+<tr>
+<td><code>session_info_changed</code></td>
+<td>DSH session-title projection</td>
+<td align="right">❌ Not mapped.</td>
+</tr>
+<tr>
+<td><code>session_before_switch</code>, <code>session_before_fork</code></td>
+<td>DSH session preparation/publication</td>
+<td align="right">❌ No equivalent veto mapping yet.</td>
+</tr>
+<tr>
+<td><code>session_before_compact</code>, <code>session_compact</code></td>
+<td>DSH compaction plugins/events</td>
+<td align="right">❌ Different compaction contract; only reload-style startup is currently emitted after compact lifecycle changes.</td>
+</tr>
+<tr>
+<td><code>session_before_tree</code>, <code>session_tree</code></td>
+<td>DSH event-sourced session history</td>
+<td align="right">❌ Pi tree navigation has no direct DSH equivalent.</td>
+</tr>
+<tr>
+<td><code>input</code></td>
+<td>First <code>agent/pre-step</code> of a DSH turn</td>
+<td align="right">🟡 <code>continue</code>, <code>handled</code>, and text/image transforms run once for the initial claimed DSH message batch. Text is newline-joined, images are preserved, and a transform replaces the claimed batch with one new DSH message identity.</td>
+</tr>
+<tr>
+<td><code>before_agent_start</code></td>
+<td>First <code>agent/pre-step</code> plus <code>system-prompt/assemble</code></td>
+<td align="right">🟡 Handler runs once per agent run; returned custom messages and system-prompt replacement are not applied yet.</td>
+</tr>
+<tr>
+<td><code>agent_start</code></td>
+<td>First <code>agent/pre-step</code> in a DSH turn</td>
+<td align="right">✅ Emitted once per turn.</td>
+</tr>
+<tr>
+<td><code>agent_end</code></td>
+<td>Committed DSH <code>session/event: turn/end</code></td>
+<td align="right">🟡 Runs once after the DSH turn is durably closed, including error and cancellation paths. Text history maps; exact images, usage and tool messages are reduced.</td>
+</tr>
+<tr>
+<td><code>agent_settled</code></td>
+<td>Committed turn end with no pending DSH inbox messages</td>
+<td align="right">🟡 Emitted after <code>agent_end</code> when no queued input remains; DSH and Pi still have different queue models.</td>
+</tr>
+<tr>
+<td><code>turn_start</code></td>
+<td>DSH step start</td>
+<td align="right">✅ Emitted once per DSH step.</td>
+</tr>
+<tr>
+<td><code>turn_end</code></td>
+<td>Next DSH step / committed <code>turn/end</code></td>
+<td align="right">🟡 Paired with each emitted <code>turn_start</code>, including failed or aborted final steps; final text assistant messages map, but Pi <code>toolResults</code> are not reconstructed.</td>
+</tr>
+<tr>
+<td><code>context</code></td>
+<td>DSH durable request reconstruction</td>
+<td align="right">❌ Mutable Pi context arrays cannot safely replace DSH durable history.</td>
+</tr>
+<tr>
+<td><code>message_start</code>, <code>message_update</code>, <code>message_end</code></td>
+<td>DSH session message/chunk events</td>
+<td align="right">❌ No exact live-message mapping yet.</td>
+</tr>
+<tr>
+<td><code>tool_call</code></td>
+<td><code>tools/pre-execute</code> / adapted tool wrapper</td>
+<td align="right">🟡 Blocking works; DSH freezes arguments, so Pi handlers cannot reliably mutate them in place.</td>
+</tr>
+<tr>
+<td><code>tool_result</code></td>
+<td><code>tools/post-execute</code> / adapted tool wrapper</td>
+<td align="right">✅ Can replace content, details and error state before DSH conversion.</td>
+</tr>
+<tr>
+<td><code>tool_execution_start</code>, <code>tool_execution_end</code></td>
+<td>DSH tool execution pipeline</td>
+<td align="right">✅ Paired around adapted Pi tools, including failures and cancellation.</td>
+</tr>
+<tr>
+<td><code>tool_execution_update</code></td>
+<td>No matching DSH tool-owned live-update callback</td>
+<td align="right">🟡 Pi handlers receive and finish updates before <code>tool_execution_end</code>; DSH UI does not stream them.</td>
+</tr>
+<tr>
+<td><code>before_provider_request</code>, <code>before_provider_headers</code>, <code>after_provider_response</code></td>
+<td>DSH <code>LlmAdapter</code> boundary</td>
+<td align="right">❌ Must be implemented inside a DSH provider adapter.</td>
+</tr>
+<tr>
+<td><code>model_select</code>, <code>thinking_level_select</code></td>
+<td>DSH agent/request configuration</td>
+<td align="right">❌ No selection-event mapping yet.</td>
+</tr>
+<tr>
+<td><code>user_bash</code></td>
+<td>DSH shell tool policy/events</td>
+<td align="right">❌ DSH does not expose Pi's user-bash interception contract.</td>
+</tr>
+</tbody></table>
+<p>The host additionally provides Pi package-manifest discovery, dynamic extension selection through DSH config, one official Pi runtime per DSH agent, HMR-safe effect disposal, and invocation-scoped cancellation for parallel tools.</p>
+<p>See <a href="https://github.com/TGYD-helige/dsh-pi/blob/HEAD/docs/compatibility.md">the detailed compatibility matrix</a> and the executable source of truth in <a href="https://github.com/TGYD-helige/dsh-pi/blob/HEAD/src/capabilities.ts"><code>src/capabilities.ts</code></a>.</p>
+<h2>Publishing</h2>
+<p>Git installs need pnpm permission to run this package's <code>prepare</code> build. The npm package ships prebuilt <code>lib/</code> and needs no install-time build permission. Maintainers publish by pushing a tag that exactly matches the package version, for example <code>v0.1.0-rc.2</code>; the release workflow validates, builds, tests, and publishes <code>dsh-pi-host</code> with the repository's <code>NPM_TOKEN</code> secret. Prereleases use npm's <code>next</code> tag and stable versions use <code>latest</code>.</p>

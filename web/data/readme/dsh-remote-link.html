@@ -1,0 +1,127 @@
+<h1>dsh-remote-link</h1>
+<p><a href="https://awesome-dsh-plugin.com"><img src="https://awesome-dsh-plugin.com/badge.svg" alt="Awesome DSH Plugin"></a></p>
+<p>把 DeepSeek Harness（DSH）的官方 Web UI <strong>安全地</strong>暴露到局域网——手机扫码即遥控电脑上的 agent——并给模型增加 <code>fork_session</code> 会话分叉工具。零核心改动、零运行时依赖。</p>
+<p><strong>v1.5：QR 一次性配对 + HMAC 挑战-响应 + HttpOnly Cookie 会话 + 设备注册表</strong>（v1 的 <code>?token=</code> 明文折衷已删除，设计见 <code>docs/PAIRING-DESIGN.md</code>）。</p>
+<pre><code>手机扫码(→ /pair#p=sid.secret, secret 留在 fragment)
+   → GET /pair/challenge?sid  → {nonce, ts}
+   → proof = HMAC(secret, sid|nonce|ts)
+   → POST /pair/verify        → Set-Cookie rls=&lt;token&gt; (HttpOnly, SameSite=Strict, 30d)
+   → 官方 UI / /api RPC / WS 事件流全部走 cookie，无密码无弹窗
+</code></pre>
+<h2>为什么这样设计</h2>
+<ul>
+<li><strong>主 webserver 保持 loopback</strong>：DSH 官方 CLI 明确拒绝 <code>--host 0.0.0.0</code>（"would expose remote code execution to the network"）。本插件是"被认可的远程暴露方式"：网关在独立端口做认证，反代到 loopback。</li>
+<li><strong>官方前端直接复用</strong>：不做自己的 UI（dsh-desktop 也是 Electron 壳 loadURL 官方 UI），聊天框就是遥控器。</li>
+<li><strong><code>?token=</code> 查询参数认证</strong>：浏览器 WebSocket/EventSource API 无法携带 <code>Authorization</code> 头，官方 UI 的事件流（<code>/api/events.mux</code>）在手机上必须有这条通路（与 MiMo 移动端方案一致）。</li>
+</ul>
+<h2>安装</h2>
+<pre><code>dsh plugin --profile web add ./dsh-remote-link     # 本地目录
+# 或 dsh plugin --profile web add github:&lt;you&gt;/dsh-remote-link
+</code></pre>
+<p>在 <code>$DSH_HOME/profiles/web/cordis.patch.yml</code> 的 <code>remote-link</code> 行配置：</p>
+<table>
+<thead>
+<tr>
+<th>配置</th>
+<th>默认</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>host</code></td>
+<td><code>0.0.0.0</code></td>
+<td>网关绑定地址</td>
+</tr>
+<tr>
+<td><code>port</code></td>
+<td><code>3081</code></td>
+<td>网关端口；<code>0</code> 为系统随机分配</td>
+</tr>
+<tr>
+<td><code>username</code> / <code>password</code></td>
+<td><code>dsh</code> / 空</td>
+<td>Basic Auth 后备（curl/桌面浏览器便利）；配对启用时可留空</td>
+</tr>
+<tr>
+<td><code>pairing.enabled</code></td>
+<td><code>true</code></td>
+<td>QR/短码配对 + cookie 会话；关闭后非 loopback 必须设 <code>password</code></td>
+</tr>
+<tr>
+<td><code>pairing.ttlMs</code></td>
+<td><code>300000</code></td>
+<td>配对秘密有效期（5 分钟、一次性）</td>
+</tr>
+<tr>
+<td><code>pairing.sessionMaxAgeDays</code></td>
+<td><code>30</code></td>
+<td>cookie 会话最长寿命</td>
+</tr>
+<tr>
+<td><code>pairing.deviceIdleExpiryDays</code></td>
+<td><code>90</code></td>
+<td>设备闲置自动出局</td>
+</tr>
+<tr>
+<td><code>pairing.devicesFile</code></td>
+<td><code>$DSH_HOME/remote-link/devices.json</code></td>
+<td>设备注册表（0600）</td>
+</tr>
+<tr>
+<td><code>targetHost</code> / <code>targetPort</code></td>
+<td><code>127.0.0.1</code> / 自动</td>
+<td>反代目标；默认取宿主 webserver 实际端口</td>
+</tr>
+<tr>
+<td><code>mdns</code></td>
+<td><code>true</code></td>
+<td>非 loopback 绑定时广播 <code>_http._tcp</code>（TXT 标注 `auth=pairing</td>
+</tr>
+<tr>
+<td><code>publicUrl</code></td>
+<td>空</td>
+<td>二维码/短码的公开基础地址（如 <code>https://xxx.trycloudflare.com</code>）；手机走流量/外网时必填，否则二维码指向局域网 IP 不可达</td>
+</tr>
+<tr>
+<td><code>rateLimit</code></td>
+<td>60s 300 次</td>
+<td>每客户端 IP 固定窗口限速</td>
+</tr>
+<tr>
+<td><code>authFailure</code></td>
+<td>5min 10 次失败→封禁 5min</td>
+<td>暴力破解阻尼（配对端点另有独立 10/min 桶）</td>
+</tr>
+</tbody></table>
+<p>启动日志直接打印<strong>一次性配对二维码</strong>（ASCII）+ 6 位短码。手机扫码 → 官方 UI 无弹窗打开；扫不了码就在任意设备打开 <code>http://&lt;IP&gt;:3081/pair</code> 输短码。</p>
+<h2>管理工具（聊天框即面板）</h2>
+<ul>
+<li><strong><code>remote_qr</code></strong>：铸新的一次性配对（QR URL + ASCII 图 + 短码 + 剩余有效期）——"给我配对码"。</li>
+<li><strong><code>remote_devices</code></strong>：<code>list / revoke &lt;名称或ID&gt; / revoke-all</code>——"看看谁连过我 / 踢掉我的旧 iPad"；吊销后会话立即失效。</li>
+</ul>
+<h2>fork_session 工具</h2>
+<p>模型可调用：以<strong>最近一个已完成回合</strong>为边界创建子会话（继承全部上下文，当前会话不受影响），并自动挂回同一工作区。复刻官方 UI "分叉" 按钮的完整配方（边界计算 → <code>agents.create</code> 带 seed/meta → <code>workspace.attachSession</code>）。对用户说"分个叉试试别的方向"即可触发。</p>
+<h2>安全边界</h2>
+<ul>
+<li>非 loopback 绑定且既无密码又关闭配对 → <strong>拒绝加载</strong>。</li>
+<li>配对秘密 5 分钟一次性；QR 里的 secret 只存在于 URL fragment，<strong>永不发给服务器</strong>；proof 是 HMAC，nonce 单次有效（每次尝试即作废）+ ±300s 时间窗 + 常时比较。</li>
+<li>会话 cookie：HttpOnly + SameSite=Strict，服务端只存 SHA-256 摘要；吊销设备即刻断线。</li>
+<li>短码路径以 6 位码为弱共享秘密（20 bit），由独立 10/min 限速桶 + v1 封禁窗 + 5 分钟一次性 TTL 约束，单次配对窗口内猜中概率 ~10⁻⁵。设计稿原定"sid 数字投影"会随 sid 泄漏而可推导，已改为 HMAC 派生（安全修正）。</li>
+<li><strong>已知未解决（HTTP 天花板）</strong>：LAN 嗅探者可复制 cookie 接管会话；<code>devices.json</code> 内含 deviceKey 明文（0600，与进程同权限）。v2 TLS relay 落地后自动收紧。</li>
+<li>Host 头重写为 loopback 以通过 DSH 信任围栏——<code>settings.*</code>、<code>credentials.*</code> 等特权 RPC 在通过网关认证后可达：网关认证是唯一信任边界。</li>
+<li>认证失败独立计数，超限封禁（429 + Retry-After）。</li>
+</ul>
+<h2>开发</h2>
+<pre><code>node --test test/*.test.js            # 86 项（单元 + 真实 socket 集成 + 配对协议正反路径）
+dsh web --patch overlay.yml --port 0  # 真机冒烟：/pair 页 → challenge → verify → cookie → UI/RPC
+node scripts/vision-decode.mjs "..."  # 可选：macOS Vision 真扫一遍自产的 QR（需 swift）
+</code></pre>
+<p>零依赖。mDNS 响应器（<code>src/dns-codec.js</code>）为手写实现；QR 编码器使用 vendored 的 qrcode-terminal 核心（Kazuhiko Arase QRCode，MIT，<code>src/vendor/QRCode/</code>，含 UTF-8 补丁），替代早期手写编码器（曾产出结构自洽但扫码器无法识别的码）。内嵌配对页的纯 JS HMAC-SHA256 与 <code>node:crypto</code> 全量交叉验证一致。</p>
+<p><strong>sentinel 发布自扫</strong>：tarball 判定 <code>review</code>（6 分）——三个 <code>JS-IMPORT-NET</code> medium 即插件本职（认证网关），无 critical/high、无运行时依赖、无生命周期脚本。</p>
+<p><strong>windtunnel</strong>：<code>remote-link-pairing-happy</code> 用例绿（3/3 断言 + 17/17 L1 契约）；另三例（坏输入/新配对/headless 挂载）卡在 windtunnel headless 权限流语义（<code>permission/preset</code> 后无 <code>tool/result</code>），非插件侧问题，留待风洞侧跟进。</p>
+<h2>路线图（v2）</h2>
+<ul>
+<li>TLS relay 模式（tailscale serve / relay 域名）+ <code>Secure</code> cookie + AEAD</li>
+<li>官方前端 client module 注入（<code>dsh.client</code> 声明 + <code>window.__ModuleLoader__.load()</code>）</li>
+<li>approval 推送、成本面板、按设备能力分级</li>
+</ul>

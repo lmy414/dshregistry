@@ -1,0 +1,184 @@
+<h1>dsh-safeguard</h1>
+<p>面向 DeepSeek Harness（DSH）的危险命令 + 密钥泄漏拦截插件。挂载到 <code>tools/pre-execute</code> waterfall，在工具解析前短路拒绝，被拦截的副作用不会发生。</p>
+<h2>简介</h2>
+<ul>
+<li><strong>危险命令拦截</strong>：对 <code>bash</code> 工具的命令做正则匹配，命中即 <code>deny</code>。</li>
+<li><strong>密钥泄漏拦截</strong>：对所有工具的 arguments 做 <code>JSON.stringify</code> 后扫描常见密钥模式，命中即 <code>deny</code>。</li>
+<li><strong>可配置</strong>：危险/密钥检测开关、额外正则、精确豁免名单。</li>
+<li><strong>两个辅助工具</strong>：<code>guard_list</code>（列出当前规则）与 <code>guard_check</code>（纯检查不拦截，供调试/自检）。</li>
+</ul>
+<blockquote>
+<p>重要：本插件是<strong>基于正则的启发式拦截</strong>，不验签、不识别密钥真伪、不做沙箱隔离。它无法替代密钥扫描器、签名校验或操作系统级沙箱，只能拦截明显的高风险动作。</p>
+</blockquote>
+<h2>安装</h2>
+<pre><code>dsh plugin --profile &lt;profile&gt; add dsh-safeguard
+</code></pre>
+<p>本地开发安装：</p>
+<pre><code>dsh plugin --profile &lt;profile&gt; add file:./plugins/dsh-safeguard
+</code></pre>
+<h2>默认规则表</h2>
+<h3>危险命令（<code>enableDanger</code>）</h3>
+<table>
+<thead>
+<tr>
+<th>规则名</th>
+<th>匹配内容</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>rm -rf</td>
+<td><code>rm -rf</code> / <code>rm -fr</code> 且目标是 <code>/</code>、<code>*</code>、<code>./</code>、<code>../</code>、<code>.</code>, <code>~</code>、<code>$HOME</code></td>
+</tr>
+<tr>
+<td>git push --force</td>
+<td><code>git push --force</code> / <code>--force-with-lease</code> / <code>-f</code></td>
+</tr>
+<tr>
+<td>git reset --hard</td>
+<td><code>git reset --hard</code></td>
+</tr>
+<tr>
+<td>git clean -fd</td>
+<td><code>git clean</code> 带 <code>-fd</code> / <code>-df</code> 等同时含 f、d 的标志</td>
+</tr>
+<tr>
+<td>chmod -R 777</td>
+<td><code>chmod -R 777</code></td>
+</tr>
+<tr>
+<td>mkfs</td>
+<td><code>mkfs</code> / <code>mkfs.ext4</code> 等</td>
+</tr>
+<tr>
+<td>dd 写盘</td>
+<td><code>dd if=... of=/dev/...</code></td>
+</tr>
+<tr>
+<td>重定向到块设备</td>
+<td><code>&gt; /dev/sd[a-z]</code></td>
+</tr>
+<tr>
+<td>curl|sh 管道执行</td>
+<td><code>curl ... | sh</code>、<code>wget ... | bash</code> 等</td>
+</tr>
+<tr>
+<td>SQL DROP</td>
+<td>以 <code>DROP TABLE/DATABASE/INDEX/...</code> 开头</td>
+</tr>
+<tr>
+<td>SQL DELETE</td>
+<td>以 <code>DELETE FROM</code> 开头</td>
+</tr>
+<tr>
+<td>SQL TRUNCATE</td>
+<td>以 <code>TRUNCATE [TABLE] ...</code> 开头</td>
+</tr>
+</tbody></table>
+<h3>密钥泄漏（<code>enableSecrets</code>）</h3>
+<table>
+<thead>
+<tr>
+<th>规则名</th>
+<th>匹配模式</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>AWS Access Key (AKIA)</td>
+<td><code>AKIA[0-9A-Z]{16}</code></td>
+</tr>
+<tr>
+<td>sk- API Key</td>
+<td><code>sk-[A-Za-z0-9]{20,}</code></td>
+</tr>
+<tr>
+<td>GitHub PAT (ghp_)</td>
+<td><code>ghp_[A-Za-z0-9]{30,}</code></td>
+</tr>
+<tr>
+<td>GitHub Fine-grained PAT (github_pat_)</td>
+<td><code>github_pat_[A-Za-z0-9_]{10,}</code></td>
+</tr>
+<tr>
+<td>PEM 私钥</td>
+<td><code>-----BEGIN (RSA|OPENSSH|EC|PGP) PRIVATE KEY-----</code></td>
+</tr>
+<tr>
+<td>Slack Token (xox-)</td>
+<td><code>xox[baprs]-...</code></td>
+</tr>
+</tbody></table>
+<blockquote>
+<p><code>eyJ</code> 开头的长 JWT <strong>不拦截</strong>（模式太宽，误报率高）。</p>
+</blockquote>
+<h2>配置项</h2>
+<p>在 profile 的 <code>cordis.patch.yml</code>（或 bundle 配置）中覆盖：</p>
+<pre><code>- insert:
+    - id: guard
+      name: dsh-safeguard
+      config:
+        enableDanger: true      # 危险命令拦截开关（默认 true）
+        enableSecrets: true     # 密钥泄漏拦截开关（默认 true）
+        extraPatterns:          # 额外正则字符串（额外危险命令规则）
+          - 'curl.*\|.*bash'
+        allowList:              # 精确豁免名单（字符串完全一致才豁免）
+          - 'rm -rf /tmp/safe-dir'
+</code></pre>
+<table>
+<thead>
+<tr>
+<th>配置项</th>
+<th>类型</th>
+<th>默认</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>enableDanger</code></td>
+<td>boolean</td>
+<td><code>true</code></td>
+<td>是否拦截危险命令</td>
+</tr>
+<tr>
+<td><code>enableSecrets</code></td>
+<td>boolean</td>
+<td><code>true</code></td>
+<td>是否拦截密钥泄漏</td>
+</tr>
+<tr>
+<td><code>extraPatterns</code></td>
+<td>string[]</td>
+<td><code>[]</code></td>
+<td>额外危险命令正则（非法正则以警告跳过）</td>
+</tr>
+<tr>
+<td><code>allowList</code></td>
+<td>string[]</td>
+<td><code>[]</code></td>
+<td>精确豁免：危险命令按整条命令、密钥按命中片段做完全一致匹配</td>
+</tr>
+</tbody></table>
+<h2>两个工具的用法</h2>
+<h3><code>guard_list</code></h3>
+<p>无参，列出当前启用的规则类别与条目数：</p>
+<pre><code>[dsh-safeguard] 规则清单
+危险命令: 启用（12 条规则）
+密钥检测: 启用（6 条规则）
+额外正则: 0 条
+豁免名单: 0 条
+</code></pre>
+<h3><code>guard_check</code></h3>
+<p>参数 <code>text</code>（必填 string）。纯检查不拦截，返回命中规则名 / 类别 / 是否豁免：</p>
+<ul>
+<li><code>guard_check("rm -rf /")</code> → 命中，类别 <code>danger</code>，规则 <code>rm -rf</code></li>
+<li><code>guard_check("aws key: AKIAIOSFODNN7EXAMPLE")</code> → 命中，类别 <code>secrets</code>，规则 <code>AWS Access Key (AKIA)</code></li>
+<li><code>guard_check("echo hello")</code> → 通过</li>
+</ul>
+<p>模型可通过 <code>await tools.guard_check({ text: "..." })</code> 做程序化自检。</p>
+<h2>不验签、不做沙箱替代</h2>
+<ul>
+<li>本插件只做<strong>正则模式匹配</strong>，不校验密钥真实性，也不校验命令签名。</li>
+<li>它<strong>不是沙箱</strong>：不会隔离文件系统、网络或子进程，拦截的是「命中明显高风险模式」的调用。</li>
+<li>生产环境仍应配合密钥扫描器（如 gitleaks、trufflehog）、签名校验与操作系统级沙箱（如 <code>dsh-bash-sandbox</code>）使用。</li>
+</ul>
+<h2>License</h2>
+<p>MIT</p>

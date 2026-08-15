@@ -1,0 +1,718 @@
+<h1>Chat2Skill</h1>
+<p>Automatically learn reusable skills and project memory from your assistant conversations.</p>
+<p>After each session, Chat2Skill analyzes the conversation for corrections,
+preferences, constraints, and project facts, distills them into local memory
+and <code>SKILL.md</code> files, and injects the relevant ones into your future sessions.
+It is domain-general: coding workflows are the first-class integration target,
+while the same mechanism works for support, research, writing, operations,
+sales, education, and other assistant domains that produce usable transcripts.</p>
+<p>Works best with <strong>Claude Code</strong>, <strong>Codex</strong>, and <strong>Cursor</strong>. Other agents
+can use Chat2Skill when they support lifecycle hooks or can run the
+included CLI scripts.</p>
+<h2>What the Algorithm Produces</h2>
+<p>Chat2Skill extracts reusable project context in two stores:</p>
+<ul>
+<li><strong>Atomized skills</strong>: focused <code>SKILL.md</code> files for one interaction preference,
+procedure, constraint, success pattern, or failure pattern.</li>
+<li><strong>Project memory</strong>: project facts, decisions, procedures, and
+warnings stored in the local SQLite database and retrieved dynamically.</li>
+<li><strong>Project skill</strong>: a synthesized <code>PROJECT_SKILL.md</code> that merges active
+atomized skills into a compact project-level instruction file for human
+review and response-guard policy.</li>
+</ul>
+<p>A skill is not meant to remember one transcript. It captures a generalizable
+behavior that would change future assistant behavior across similar situations.</p>
+<h2>Core Concepts</h2>
+<table>
+<thead>
+<tr>
+<th>Concept</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>Conversation</td>
+<td>Recent assistant/user messages for one session. Long sessions are trimmed to the latest analysis window.</td>
+</tr>
+<tr>
+<td>Signal</td>
+<td>Evidence that something should be learned: correction, explicit constraint, negative feedback, or stable behavioral preference.</td>
+</tr>
+<tr>
+<td>Analysis</td>
+<td>A structured diagnosis of what went wrong or what worked, including failure type, root cause, confidence, and proposed action.</td>
+</tr>
+<tr>
+<td>Proposal</td>
+<td>The create/edit/discard decision for a skill candidate.</td>
+</tr>
+<tr>
+<td>Memory item</td>
+<td>Evidence extracted before materializing a skill, such as failure cause, failure memory, success, or constraint.</td>
+</tr>
+<tr>
+<td>Skill</td>
+<td>A validated, actionable <code>SKILL.md</code> with metadata such as confidence, evidence count, language, replay score, and status.</td>
+</tr>
+<tr>
+<td>Response guard</td>
+<td>Optional frontmatter policy for hard wording constraints, such as evidence-based deterministic wording.</td>
+</tr>
+</tbody></table>
+<h2>Learning Loop</h2>
+<pre><code>+---------------------------------------------------------+
+| 1. Retrieve relevant project memory and active skills    |
++---------------------------+-----------------------------+
+                            |
+                            v
++---------------------------------------------------------+
+| 2. Inject retrieved project memory + skills into prompt  |
++---------------------------+-----------------------------+
+                            |
+                            v
++---------------------------------------------------------+
+| 3. Assistant works; user accepts, corrects, or constrains |
++---------------------------+-----------------------------+
+                            |
+                            v
++---------------------------------------------------------+
+| 4. Extract learning signals at session end               |
++---------------------------+-----------------------------+
+                            |
+                            v
++---------------------------------------------------------+
+| 5. Create / edit / discard atomized skill candidates     |
++---------------------------+-----------------------------+
+                            |
+                            v
++---------------------------------------------------------+
+| 6. Validate, replay, merge, and store active skills      |
++---------------------------+-----------------------------+
+                            |
+                            v
++---------------------------------------------------------+
+| 7. Rebuild PROJECT_SKILL.md and update local profile     |
++---------------------------+-----------------------------+
+                            |
+                            +------------- back to step 1
+</code></pre>
+<p>The algorithm is a feedback loop, not a one-shot workflow. Each completed
+session can change project memory and the skill bank; the next session retrieves
+from those updated local stores; later user feedback reinforces, edits, rejects,
+or ages out earlier context.</p>
+<p>There is still a single extraction pass inside the loop. That pass is:</p>
+<pre><code>recent conversation + existing skills + profile
+  -&gt; detect signals
+  -&gt; analyze root cause
+  -&gt; propose create/edit/discard
+  -&gt; generate SKILL.md
+  -&gt; quality gate
+  -&gt; judge
+  -&gt; optional replay
+  -&gt; active/rejected/no-action result
+</code></pre>
+<p>The LLM path uses Proposer, Generator, and Judge style stages. When no LLM is
+available, the loop still runs with keyword detection and template-based
+generation.</p>
+<h2>Loop Layers</h2>
+<p>Chat2Skill has three nested loops:</p>
+<ol>
+<li><strong>Session learning loop</strong>: retrieve skills before work, observe user feedback
+during work, extract or update skills after work, then use the updated skill
+bank next time.</li>
+<li><strong>Candidate refinement loop</strong>: if the judge rejects a generated skill, feed
+the judge weakness back into generation and retry up to two times.</li>
+<li><strong>Maintenance loop</strong>: score active skills by utilization, replay
+effectiveness, recency, and overlap; merge near-duplicates and archive old
+weak skills instead of letting the prompt grow forever.</li>
+</ol>
+<h2>How it works</h2>
+<pre><code>your machine                                Chat2Skill cloud
+─────────────────────────────────────       ─────────────────────────
+Stop hook ──► response guard ──► continue on violation
+     │
+     └────► queue ──► worker ─────────────► POST /v1/extract
+                          │                 (stateless algorithm,
+   ~/.chat2skill/ ◄───────┘                  your own LLM credential)
+   skills + profile + history     ◄──────── skill + profile + replay
+                                            POST /v1/project-skill
+UserPromptSubmit hook ◄── local retrieval   (project skill + detailed skills)
+</code></pre>
+<ul>
+<li><strong>Your data stays local.</strong> Skills, profile, and history live in
+<code>~/.chat2skill/</code> (SQLite + markdown files). The cloud runs the
+extraction algorithm statelessly and stores nothing.</li>
+<li><strong>Bring your own credential.</strong> Extraction LLM calls support an API key or a
+short-lived OAuth bearer token acquired by the host. The credential is sent
+with each request, used in memory, never persisted or logged server-side.
+Without a usable credential, the server falls back to lower-quality
+heuristics.</li>
+<li><strong>Response guard.</strong> When a project skill contains a high-confidence
+deterministic wording constraint, the Stop hook checks the final assistant
+message locally. The learned rule is evidence-based: verified facts must use
+definitive wording; evidence gaps must name the missing source material,
+data, record, document, log, test, command output, or code and the next
+validation step. The guard only reads explicit <code>response_guard</code> frontmatter,
+never prose examples or code identifiers. The default guard mode is
+<code>strict</code>: every violation is continued for correction. Set
+<code>CHAT2SKILL_RESPONSE_GUARD=false</code> to disable the guard.</li>
+<li><strong>Cost.</strong> A typical extraction makes ~4 LLM calls on your key
+(detect, analyze, generate, judge); replay validation against your
+history adds up to 5 more. Conversations are windowed (last ~40
+messages) so long sessions stay cheap. Extraction only triggers when
+a correction/constraint signal is detected, not on every session.</li>
+</ul>
+<h2>Install</h2>
+<h3>1. Install the plugin</h3>
+<p>Normal users should install Chat2Skill from their agent's plugin marketplace.
+Do not clone this repository just to run <code>scripts/chat2skill_init.py</code>.</p>
+<p>Codex:</p>
+<pre><code>codex plugin marketplace add rxacc/chat2skill
+codex
+</code></pre>
+<p>Then open <code>/plugins</code>, select the <code>chat2skill</code> marketplace, and install
+<code>chat2skill</code>.</p>
+<p>Claude Code:</p>
+<pre><code>claude plugin marketplace add https://github.com/rxacc/chat2skill
+claude plugin install chat2skill@chat2skill
+</code></pre>
+<p>Cursor:</p>
+<p>Open <strong>Settings -&gt; Plugins</strong>, paste this repository URL, and install the
+Chat2Skill plugin.</p>
+<p>Chat2Skill hooks run Python code, so the machine running the agent must have
+Python 3 available as <code>python3</code>, <code>python</code>, or <code>py -3</code>. If Python is missing,
+the plugin cannot initialize local storage or run retrieval/learning.</p>
+<p>After the plugin is installed and trusted, the first hook run initializes the
+local data directory:</p>
+<ul>
+<li>macOS/Linux: <code>~/.chat2skill/</code></li>
+<li>Windows: <code>%USERPROFILE%\.chat2skill\</code></li>
+</ul>
+<p>The initialization creates the config file, SQLite database, and skills
+directory:</p>
+<ul>
+<li><code>config.json</code></li>
+<li><code>c2s.db</code></li>
+<li><code>skills/</code></li>
+</ul>
+<h3>2. Configure local settings</h3>
+<p>Edit the config file created under the local data directory. Chat2Skill calls
+the stateless learn API for extraction and stores returned project memory,
+conversations, skills, and profiles in <code>~/.chat2skill/c2s.db</code>. Prompt retrieval
+runs locally from that database and always injects retrieved project memory
+plus relevant skills. Rendered skill files stay under
+<code>~/.chat2skill/skills/</code>.</p>
+<p>If you are developing from a source checkout or using the CLI scripts manually,
+you can initialize the same local data directory yourself:</p>
+<pre><code>python3 scripts/chat2skill_init.py
+</code></pre>
+<p>From a source checkout on Windows:</p>
+<pre><code>python .\scripts\chat2skill_init.py
+</code></pre>
+<p>From a source checkout, manual setup is equivalent:</p>
+<pre><code>mkdir -p ~/.chat2skill
+cp config.example.json ~/.chat2skill/config.json
+# edit ~/.chat2skill/config.json: set api_url and an llm credential
+</code></pre>
+<p>Without a source checkout, create the same config file yourself using one of
+the JSON examples below.</p>
+<p>For OpenAI-compatible models, write <code>~/.chat2skill/config.json</code> like this:</p>
+<pre><code>{
+  "api_url": "https://api.chat2skill.com",
+  "user_id": "alice",
+  "memory": {
+    "target_model": "generic",
+    "token_budget": 4000,
+    "memory_ratio": 0.6,
+    "skill_top_k": 6,
+    "prompt_memory_top_k": 12,
+    "prompt_memory_min_score": 0.3,
+    "prompt_skill_min_score": 0.2,
+    "learn_memory_top_k": 40,
+    "learn_skill_top_k": 20
+  },
+  "llm": {
+    "api_key": "your-openai-compatible-api-key",
+    "provider": "openai",
+    "base_url": null,
+    "model": "gpt-4.1"
+  },
+  "embedding": {
+    "provider": "local_transformers",
+    "model": "Snowflake/snowflake-arctic-embed-xs",
+    "dimensions": 384
+  }
+}
+</code></pre>
+<p>For DeepSeek, write <code>~/.chat2skill/config.json</code> like this:</p>
+<pre><code>{
+  "api_url": "https://api.chat2skill.com",
+  "user_id": "alice",
+  "memory": {
+    "target_model": "generic",
+    "token_budget": 4000,
+    "memory_ratio": 0.6,
+    "skill_top_k": 6,
+    "prompt_memory_top_k": 12,
+    "learn_memory_top_k": 40,
+    "learn_skill_top_k": 20
+  },
+  "llm": {
+    "api_key": "your-deepseek-api-key",
+    "provider": "openai",
+    "base_url": "https://api.deepseek.com",
+    "model": "deepseek-chat"
+  },
+  "embedding": {
+    "provider": "local_transformers",
+    "model": "Snowflake/snowflake-arctic-embed-xs",
+    "dimensions": 384
+  }
+}
+</code></pre>
+<p>For Anthropic, use the native provider adapter rather than Anthropic's OpenAI
+compatibility layer:</p>
+<pre><code>{
+  "api_url": "https://api.chat2skill.com",
+  "user_id": "alice",
+  "llm": {
+    "api_key": "your-anthropic-api-key",
+    "provider": "anthropic",
+    "base_url": "https://api.anthropic.com/v1/",
+    "model": "claude-sonnet-5"
+  },
+  "embedding": {
+    "provider": "local_transformers",
+    "model": "Snowflake/snowflake-arctic-embed-xs",
+    "dimensions": 384
+  }
+}
+</code></pre>
+<p>The server also infers <code>anthropic</code> from an <code>api.anthropic.com</code> base URL for
+older configs that do not yet contain <code>llm.provider</code>.</p>
+<p>For an OAuth-enabled LLM, put the actual access token in <code>llm.access_token</code>:</p>
+<pre><code>{
+  "llm": {
+    "access_token": "paste-your-oauth-token-here",
+    "provider": "anthropic",
+    "base_url": "https://api.anthropic.com/v1/",
+    "model": "claude-sonnet-5"
+  }
+}
+</code></pre>
+<p>The inline value is checked before the environment variable and token file, so
+no environment variable is required. <code>auth_type: "oauth"</code> is still accepted
+explicitly. <code>access_token_env</code> and <code>llm.access_token_file</code> remain compatibility
+fallbacks; the file is read for each hook invocation so a host-managed token
+refresh is picked up. Chat2Skill does not implement provider-specific browser
+login or store refresh tokens.</p>
+<p>Claude Code's correct OAuth command is <code>claude setup-token</code>. It walks through
+OAuth authorization and prints a one-year <code>CLAUDE_CODE_OAUTH_TOKEN</code>; it does
+not save the token. However, Chat2Skill's default architecture sends
+<code>llm.access_token</code> to the remote <code>api_url</code>, so a Claude subscription token must
+not be pasted into this config for remote extraction. Anthropic documents these
+tokens for Claude Code and native Anthropic applications, and prohibits
+third-party services from routing Claude subscription credentials on behalf of
+users. Use an Anthropic Console API key or an approved workload identity for
+remote Chat2Skill extraction. A local Claude Code/Agent SDK adapter is required
+to keep the subscription token on the host.</p>
+<p>See the <a href="https://code.claude.com/docs/en/authentication">Claude Code authentication guide</a>
+for <code>claude setup-token</code> and the <a href="https://code.claude.com/docs/en/legal-and-compliance">credential-use policy</a>.</p>
+<p>For OpenAI/Codex, the provider login is:</p>
+<pre><code># Browser OAuth flow.
+codex login
+
+# Headless/device-code OAuth flow.
+codex login --device-auth
+
+# Verify the active mode.
+codex login status
+</code></pre>
+<p>Codex stores and refreshes its ChatGPT credentials locally in
+<code>~/.codex/auth.json</code>. Do not copy that file or its token into Chat2Skill's
+remote <code>llm.access_token</code> field. ChatGPT-managed Codex OAuth is for Codex
+account usage, while the OpenAI Platform API path used by the remote extractor
+uses an OpenAI API key. A local Codex adapter is required to use the former
+without forwarding the credential to <code>api.chat2skill.com</code>.</p>
+<p>For a remote OpenAI-compatible embedding endpoint, replace the <code>embedding</code>
+block with:</p>
+<pre><code>{
+  "embedding": {
+    "api_key": "your-embedding-api-key",
+    "base_url": "http://127.0.0.1:8080/v1",
+    "model": "BAAI/bge-large-en-v1.5"
+  }
+}
+</code></pre>
+<p>These are the equivalent environment variables. You only need environment
+variables if you prefer shell config or need to override the JSON file.</p>
+<h2>Local Admin UI</h2>
+<p>Chat2Skill includes a local-only management page for reviewing and managing
+stored project memory and skills. This section is for source checkout or manual
+CLI users; ordinary plugin installation does not require running this server.</p>
+<p>From a source checkout on macOS, Linux, or WSL:</p>
+<pre><code>python3 scripts/chat2skill_admin.py
+</code></pre>
+<p>From a source checkout on Windows PowerShell:</p>
+<pre><code>python .\scripts\chat2skill_admin.py
+</code></pre>
+<p>From an installed Codex plugin, every system must first enter the installed
+plugin directory. The path includes the marketplace name, plugin name, and
+version.</p>
+<p>macOS, Linux, or WSL installed plugin:</p>
+<pre><code>cd ~/.codex/plugins/cache/chat2skill/chat2skill/&lt;version&gt;
+python3 scripts/chat2skill_admin.py
+</code></pre>
+<p>Windows PowerShell installed plugin:</p>
+<pre><code>cd "$env:USERPROFILE\.codex\plugins\cache\chat2skill\chat2skill\&lt;version&gt;"
+python .\scripts\chat2skill_admin.py
+</code></pre>
+<p>The command initializes <code>.chat2skill</code> if needed, prints a one-time URL such as
+<code>http://127.0.0.1:8765/?token=...</code>, and opens it in your browser by default.
+If the browser does not open, copy the printed URL exactly; the token is
+required.</p>
+<p>Useful options:</p>
+<pre><code>python3 scripts/chat2skill_admin.py --port 8766
+python3 scripts/chat2skill_admin.py --no-open
+</code></pre>
+<p>The admin server binds to <code>127.0.0.1</code> by default and reads/writes only the
+local <code>~/.chat2skill/c2s.db</code> database. It can:</p>
+<ul>
+<li>list Chat2Skill projects discovered from the local database</li>
+<li>view and rebuild the project-level <code>PROJECT_SKILL.md</code></li>
+<li>search, edit, archive, activate, and delete atomized skills</li>
+<li>search, edit, archive, activate, and delete project memories</li>
+<li>inspect the source skill snapshot used for the current project skill version</li>
+</ul>
+<p>For frontend development, run the Vite shell separately:</p>
+<pre><code>cd admin/frontend
+npm install
+npm run dev
+</code></pre>
+<p>Keep the Python admin server running on <code>127.0.0.1:8765</code> while using the Vite
+dev server; Vite proxies <code>/api</code> requests to the Python backend.</p>
+<table>
+<thead>
+<tr>
+<th>Environment variable</th>
+<th>JSON key</th>
+<th>Default</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>CHAT2SKILL_API_URL</code></td>
+<td><code>api_url</code></td>
+<td><code>https://api.chat2skill.com</code></td>
+<td>Chat2Skill API endpoint used for stateless learn/extract calls.</td>
+</tr>
+<tr>
+<td><code>CHAT2SKILL_MEMORY_TARGET_MODEL</code></td>
+<td><code>memory.target_model</code></td>
+<td><code>generic</code></td>
+<td>Reserved renderer target for API-compatible payloads.</td>
+</tr>
+<tr>
+<td><code>CHAT2SKILL_MEMORY_TOKEN_BUDGET</code></td>
+<td><code>memory.token_budget</code></td>
+<td><code>4000</code></td>
+<td>Total prompt-injection token budget for memory plus skills.</td>
+</tr>
+<tr>
+<td><code>CHAT2SKILL_MEMORY_MEMORY_RATIO</code></td>
+<td><code>memory.memory_ratio</code></td>
+<td><code>0.6</code></td>
+<td>Fraction of retrieval budget initially allocated to memory.</td>
+</tr>
+<tr>
+<td><code>CHAT2SKILL_MEMORY_SKILL_TOP_K</code></td>
+<td><code>memory.skill_top_k</code></td>
+<td><code>6</code></td>
+<td>Maximum detailed skills injected by local prompt retrieval.</td>
+</tr>
+<tr>
+<td><code>OPENAI_API_KEY</code></td>
+<td><code>llm.api_key</code></td>
+<td>unset</td>
+<td>Your OpenAI-compatible LLM API key.</td>
+</tr>
+<tr>
+<td><code>OPENAI_BASE_URL</code></td>
+<td><code>llm.base_url</code></td>
+<td><code>null</code></td>
+<td>Optional OpenAI-compatible base URL. Use <code>null</code> for OpenAI; use <code>https://api.deepseek.com</code> for DeepSeek.</td>
+</tr>
+<tr>
+<td><code>CHAT2SKILL_LLM_AUTH_TYPE</code></td>
+<td><code>llm.auth_type</code></td>
+<td><code>api_key</code></td>
+<td>Set to <code>oauth</code> to send an OAuth bearer token instead of an API key.</td>
+</tr>
+<tr>
+<td><code>CHAT2SKILL_LLM_ACCESS_TOKEN</code></td>
+<td><code>llm.access_token</code></td>
+<td>unset</td>
+<td>Optional OAuth bearer-token fallback. An inline <code>llm.access_token</code> is checked first.</td>
+</tr>
+<tr>
+<td><code>CHAT2SKILL_LLM_ACCESS_TOKEN_FILE</code></td>
+<td><code>llm.access_token_file</code></td>
+<td>unset</td>
+<td>Host-managed JSON or text file containing the current OAuth access token.</td>
+</tr>
+<tr>
+<td><code>CHAT2SKILL_LLM_ACCESS_TOKEN_FIELD</code></td>
+<td><code>llm.access_token_field</code></td>
+<td><code>access_token</code></td>
+<td>Dot-separated JSON field used when reading <code>CHAT2SKILL_LLM_ACCESS_TOKEN_FILE</code>.</td>
+</tr>
+<tr>
+<td><code>CHAT2SKILL_LLM_PROVIDER</code></td>
+<td><code>llm.provider</code></td>
+<td>inferred</td>
+<td>Chat provider. Supported values are <code>openai</code> and <code>anthropic</code>.</td>
+</tr>
+<tr>
+<td><code>CHAT2SKILL_MODEL</code></td>
+<td><code>llm.model</code></td>
+<td><code>gpt-4.1</code></td>
+<td>Model used for detect/analyze/generate/judge calls.</td>
+</tr>
+<tr>
+<td><code>CHAT2SKILL_USER_ID</code></td>
+<td><code>user_id</code></td>
+<td>system username</td>
+<td>Base namespace for local skills and profile data. Project-specific skills use <code>&lt;user&gt;__project__&lt;slug&gt;</code>.</td>
+</tr>
+<tr>
+<td><code>CHAT2SKILL_RESPONSE_GUARD</code></td>
+<td>unset</td>
+<td><code>strict</code></td>
+<td>Stop response guard mode. <code>true</code> enables strict blocking; <code>false</code> disables it. Advanced modes are <code>adaptive</code>, <code>block-once</code>, <code>warn-only</code>, and <code>off</code>. Structured <code>response_guard.mode: evidence_based_terms</code> allows explicit evidence-gap disclosure while still blocking unsupported hedging.</td>
+</tr>
+</tbody></table>
+<h3>Agent notes: Claude Code</h3>
+<p>For local development, load the plugin for one session:</p>
+<pre><code>claude --plugin-dir ~/plugins/chat2skill
+</code></pre>
+<p>Claude Code installs hooks from the root <code>hooks/hooks.json</code> entrypoint. The
+host-specific copy is also kept at <code>hooks/claude-hooks.json</code>, and
+<code>${CLAUDE_PLUGIN_ROOT}</code> resolves to the installed plugin directory — no path
+setup needed.</p>
+<h3>Agent notes: Codex</h3>
+<p>Codex installs hooks from the root <code>hooks/hooks.json</code> entrypoint. The
+host-specific copy is also kept at <code>hooks/codex-hooks.json</code>. Codex installs
+register the configurable blocking Stop response guard. The hook
+entrypoints initialize the local data home on first hook run:</p>
+<ul>
+<li>macOS/Linux: <code>~/.chat2skill/</code></li>
+<li>Windows: <code>%USERPROFILE%\.chat2skill\</code></li>
+</ul>
+<p>For local development or manual hook generation:</p>
+<pre><code>git clone https://github.com/rxacc/chat2skill.git ~/plugins/chat2skill
+cd ~/plugins/chat2skill &amp;&amp; ./install.sh
+</code></pre>
+<p><code>install.sh</code> refreshes known local plugin cache directories with agent-specific
+hook files and creates the config file if missing.</p>
+<h3>Agent notes: Cursor</h3>
+<p>Cursor supports native plugins with <code>.cursor-plugin/plugin.json</code>.</p>
+<p>In Cursor:</p>
+<ol>
+<li>Open <strong>Settings -&gt; Plugins</strong>.</li>
+<li>Paste this repository URL into <strong>Search or Paste Link</strong>:</li>
+</ol>
+<pre><code>https://github.com/rxacc/chat2skill
+</code></pre>
+<p>The Cursor plugin uses:</p>
+<ul>
+<li><code>.cursor-plugin/hooks.json</code> for Cursor-format hooks.</li>
+<li><code>${CURSOR_PLUGIN_ROOT}</code> for installed plugin paths.</li>
+<li><code>.cursor/rules/chat2skill.mdc</code> as an always-on project rule.</li>
+<li><code>sessionStart</code> to provide the current project skill when Cursor
+accepts hook context.</li>
+<li><code>stop</code> to learn from the newest Cursor agent transcript under
+<code>~/.cursor/projects/*/agent-transcripts/</code>.</li>
+</ul>
+<p>Important Cursor limitation: Cursor plugins do support hooks and skills,
+but Cursor's <code>beforeSubmitPrompt</code> hook currently cannot inject dynamic
+per-prompt context into the model. For prompt-specific retrieval in
+Cursor, use the <code>chat2skill</code> skill. From a source checkout, you can also run:</p>
+<pre><code>python3 scripts/retrieve_for_prompt.py "your current task"
+</code></pre>
+<h3>Agent notes: OpenCode</h3>
+<p>Run OpenCode from a checkout of this repository. <code>opencode.json</code> loads
+<code>.opencode/plugins/chat2skill.mjs</code>, which calls the same retrieval CLI and
+adds relevant snippets to the system prompt.</p>
+<pre><code>{ "plugin": ["./.opencode/plugins/chat2skill.mjs"] }
+</code></pre>
+<h3>Agent notes: DeepSeek Harness</h3>
+<p>The repository root is also a DeepSeek Harness bundle. Add it to the profile
+you run:</p>
+<pre><code>dsh plugin --profile headless add /Users/sac/Desktop/Dev/Chat2Skill
+dsh --profile headless
+</code></pre>
+<p>The adapter uses Harness <code>agent/pre-step</code> for retrieval and
+<code>agent/turn-stopping</code> for the shared response guard and learning. It invokes
+the existing local Python runtime, so the algorithm project and its API do not
+need a change for this integration. See
+<a href="https://github.com/rxa3c/chat2skill/blob/HEAD/adapters/deepseek-harness/README.md"><code>adapters/deepseek-harness/README.md</code></a>
+for environment overrides.</p>
+<h3>Agent notes: Other agents</h3>
+<p>For manual integrations from a source checkout, point hook-capable agents at:</p>
+<ul>
+<li>prompt-submit: <code>python3 &lt;plugin-root&gt;/scripts/hook_user_prompt_submit.py</code></li>
+<li>session-end learning: <code>python3 &lt;plugin-root&gt;/scripts/hook_stop.py</code></li>
+<li>session-end response guard: <code>python3 &lt;plugin-root&gt;/scripts/hook_stop_response_guard.py</code></li>
+</ul>
+<p>No hooks? From a source checkout, use the CLIs:</p>
+<pre><code># after a session: learn from the newest transcript
+python3 scripts/update_from_transcript.py --latest
+
+# before a task: print a prompt snippet with relevant skills
+python3 scripts/retrieve_for_prompt.py "refactor the auth module"
+</code></pre>
+<p>For agents that only support repository instructions, copy or keep the
+matching adapter file:</p>
+<ul>
+<li>Cursor: <code>.cursor/rules/chat2skill.mdc</code></li>
+<li>Windsurf/Cascade: <code>.windsurf/rules/chat2skill.md</code></li>
+<li>Cline: <code>.clinerules/chat2skill.md</code></li>
+<li>GitHub Copilot: <code>.github/copilot-instructions.md</code></li>
+<li>Kiro: <code>.kiro/steering/chat2skill.md</code></li>
+<li>Generic agents/Aider: <code>AGENTS.md</code></li>
+</ul>
+<h2>Agent Support</h2>
+<p>Chat2Skill needs two capabilities for the full automatic loop:</p>
+<ul>
+<li><strong>Learn after a session:</strong> a stop/session-end hook that can run
+<code>scripts/hook_stop.py</code>.</li>
+<li><strong>Retrieve before work:</strong> a prompt/session-start hook or skill workflow
+that can inject or load the output of <code>scripts/retrieve_for_prompt.py</code>.</li>
+<li><strong>Enforce hard wording rules:</strong> a stop/session-end hook with access to
+the final assistant message that can run <code>scripts/hook_stop_response_guard.py</code>.
+The default <code>strict</code> mode continues every violation for correction;
+<code>CHAT2SKILL_RESPONSE_GUARD=false</code> disables it. Evidence-based rules
+distinguish verified conclusions from missing-evidence disclosures.</li>
+</ul>
+<p>The repository currently ships native final-response guard registration for
+Claude Code, Codex, Cursor, and DeepSeek Harness. The other adapters below are partial: a rule,
+retrieval plugin, or manual CLI path does not provide final-response
+interception by itself.</p>
+<table>
+<thead>
+<tr>
+<th>Agent</th>
+<th>Current support</th>
+<th>Notes</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>Claude Code</td>
+<td>Native plugin marketplace</td>
+<td>Full automatic support through <code>.claude-plugin/marketplace.json</code>, root <code>hooks/hooks.json</code>, <code>hooks/claude-hooks.json</code>, the <code>chat2skill</code> skill, <code>UserPromptSubmit</code>, Stop learning, and Stop response guard.</td>
+</tr>
+<tr>
+<td>Codex</td>
+<td>Native plugin/local installer</td>
+<td>Automatic retrieval, Stop learning, and configurable Stop response guarding through <code>.codex-plugin/plugin.json</code>, root <code>hooks/hooks.json</code>, <code>hooks/codex-hooks.json</code>, and local cache refresh through <code>install.sh</code>.</td>
+</tr>
+<tr>
+<td>DeepSeek Harness</td>
+<td>Native Cordis bundle</td>
+<td>Add the Chat2Skill repository root with <code>dsh plugin --profile &lt;name&gt; add &lt;path&gt;</code>. The adapter uses <code>agent/pre-step</code> for retrieval, <code>agent/turn-stopping</code> for the shared guard and learning, and the current Chat2Skill algorithm API without algorithm-project changes.</td>
+</tr>
+<tr>
+<td>Cursor</td>
+<td>Native plugin + project rule</td>
+<td>Supported through <code>.cursor-plugin/plugin.json</code>, <code>.cursor-plugin/hooks.json</code>, <code>.cursor/rules/chat2skill.mdc</code>, and the <code>chat2skill</code> skill. Stop learning works from Cursor transcripts, and the response guard runs when Cursor provides final response text. Dynamic per-prompt context injection is limited by Cursor's current <code>beforeSubmitPrompt</code> hook behavior.</td>
+</tr>
+<tr>
+<td>OpenCode</td>
+<td>Server plugin + command</td>
+<td><code>opencode.json</code> loads <code>.opencode/plugins/chat2skill.mjs</code>, which calls <code>retrieve_for_prompt.py</code> and appends relevant snippets to the system prompt. No final-response guard is registered.</td>
+</tr>
+<tr>
+<td>GitHub Copilot</td>
+<td>Repository instructions</td>
+<td><code>.github/copilot-instructions.md</code> provides the CLI workflow. No final-response guard is registered.</td>
+</tr>
+<tr>
+<td>Kimi Code CLI</td>
+<td>Skills/manual hooks</td>
+<td>The project ships no native Kimi hook manifest. Manual hook configuration can call the shared scripts.</td>
+</tr>
+<tr>
+<td>Windsurf / Cascade</td>
+<td>Project rule</td>
+<td><code>.windsurf/rules/chat2skill.md</code> provides instructions only. No final-response guard is registered.</td>
+</tr>
+<tr>
+<td>Kiro</td>
+<td>Steering rule</td>
+<td><code>.kiro/steering/chat2skill.md</code> provides instructions only. No final-response guard is registered.</td>
+</tr>
+<tr>
+<td>Cline</td>
+<td>Project rule</td>
+<td><code>.clinerules/chat2skill.md</code> provides instructions only. No final-response guard is registered.</td>
+</tr>
+<tr>
+<td>Aider / generic agents</td>
+<td><code>AGENTS.md</code></td>
+<td><code>AGENTS.md</code> gives portable instructions for agents that read repository guidance.</td>
+</tr>
+<tr>
+<td>Gemini CLI</td>
+<td>Manual integration</td>
+<td>A dedicated extension manifest and final-response guard registration are not included.</td>
+</tr>
+<tr>
+<td>Google Antigravity</td>
+<td>Manual integration</td>
+<td>A dedicated plugin manifest and final-response guard registration are not included.</td>
+</tr>
+<tr>
+<td>Continue</td>
+<td>Manual/partial</td>
+<td>Rules, prompts, and MCP are useful, but no verified lifecycle hook path for the full Chat2Skill loop is included.</td>
+</tr>
+<tr>
+<td>Roo Code</td>
+<td>Manual/legacy</td>
+<td>Use the CLI scripts only unless your local fork exposes compatible hooks.</td>
+</tr>
+</tbody></table>
+<p>See <a href="https://github.com/rxa3c/chat2skill/blob/HEAD/docs/agent-portability.md">docs/agent-portability.md</a> for the full
+adapter map.</p>
+<h2>Requirements</h2>
+<ul>
+<li>Python 3.10+ (standard library only — no pip installs)</li>
+<li>Node.js + npm for optional local embeddings through <code>Snowflake/snowflake-arctic-embed-xs</code></li>
+<li>A Chat2Skill API endpoint (<code>api_url</code> in config)</li>
+<li>Optional: an API key or OAuth bearer token for high-quality extraction</li>
+</ul>
+<h2>Data layout</h2>
+<pre><code>~/.chat2skill/
+├── config.json                  # endpoint + your LLM credentials
+├── c2s.db                       # conversations, skills, project_skills, profile, project memory
+├── skills/&lt;user&gt;/&lt;name&gt;/SKILL.md
+├── skills/&lt;user&gt;/PROJECT_SKILL.md   # human-readable project skill and response-guard input
+└── hook-events.log
+</code></pre>
+<p>Skills are namespaced per project (<code>&lt;user&gt;__project__&lt;slug&gt;</code>), so what
+you learn in one repo doesn't leak into another.</p>
+<h2>Privacy</h2>
+<ul>
+<li>Stop-hook transcripts are sent to the Chat2Skill API for stateless
+analysis, processed in memory, and not persisted server-side. Server logs
+contain metadata only (session id, error type) — never message content or
+API keys or OAuth access tokens.</li>
+<li>Prompt retrieval does not call the cloud API. It loads top-K project
+memory and skills from local <code>~/.chat2skill/c2s.db</code>, applies the configured
+budget, and injects the compact result into the prompt.</li>
+<li>Agent system prompts, environment banners, and tool noise are stripped
+locally before upload (see <code>scripts/chat2skill/transcripts.py</code>).</li>
+<li>To stop all uploads, remove the Stop hook or unset <code>api_url</code>.</li>
+</ul>
+<h2>License</h2>
+<p>MIT</p>

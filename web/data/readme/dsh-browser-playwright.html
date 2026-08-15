@@ -1,0 +1,192 @@
+<h1>dsh-browser-playwright</h1>
+<p>Playwright-powered browser capability for <a href="https://github.com/deepseek-ai/deepseek-harness">DeepSeek Harness</a>: the agent drives a real browser through <strong>accessibility snapshots with stable element refs</strong> — no CSS-selector guessing, no full-DOM dumps. One browser session per harness session, tabs, screenshots as durable image attachments, structured extraction, and gated JavaScript evaluation.</p>
+<h2>Install</h2>
+<pre><code>dsh plugin --profile &lt;name&gt; add dsh-browser-playwright
+</code></pre>
+<p>The bundle mounts three rows: the <code>ctx.browser</code> seam (<code>service</code>), the Playwright provider (<code>playwright</code>), and the model-facing tool family (<code>tool</code>).</p>
+<h3>Browser binary</h3>
+<p>The provider probes <code>chromium</code> → <code>chrome</code> → <code>msedge</code> → <code>edge</code> channels automatically; any installed Chromium-family browser works with <strong>zero download</strong>. To use Playwright-managed Chromium instead:</p>
+<pre><code>npx playwright-core install chromium
+# Restricted networks (e.g. mainland China):
+PLAYWRIGHT_DOWNLOAD_HOST=https://cdn.npmmirror.com/binaries/playwright npx playwright-core install chromium
+</code></pre>
+<p>Or pin a binary: <code>launch.executablePath</code> / <code>launch.channel</code> in the plugin config.</p>
+<h2>Tools</h2>
+<p>The default <code>toolPrefix</code> is <code>browser_</code>. Every action returns a fresh snapshot, so refs always come from the latest result.</p>
+<table>
+<thead>
+<tr>
+<th>Tool</th>
+<th>Purpose</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>browser_navigate</code></td>
+<td>Open a URL (http/https only) and return the snapshot</td>
+</tr>
+<tr>
+<td><code>browser_snapshot</code></td>
+<td>Snapshot the current page: URL, title, visible elements with <code>ref=</code> ids</td>
+</tr>
+<tr>
+<td><code>browser_click</code></td>
+<td>Click the element with a ref from the latest snapshot</td>
+</tr>
+<tr>
+<td><code>browser_fill</code></td>
+<td>Replace an input's value; selects match by option label</td>
+</tr>
+<tr>
+<td><code>browser_press</code></td>
+<td>Press a key (Enter, Tab, Escape, ArrowDown, …) on an element</td>
+</tr>
+<tr>
+<td><code>browser_scroll</code></td>
+<td>Scroll the page or bring a ref into view</td>
+</tr>
+<tr>
+<td><code>browser_back</code> / <code>browser_forward</code></td>
+<td>History navigation</td>
+</tr>
+<tr>
+<td><code>browser_wait</code></td>
+<td>Wait a bounded duration for lazy content</td>
+</tr>
+<tr>
+<td><code>browser_tabs</code> / <code>browser_open_tab</code> / <code>browser_switch_tab</code> / <code>browser_close_tab</code></td>
+<td>Tab management</td>
+</tr>
+<tr>
+<td><code>browser_screenshot</code></td>
+<td>PNG capture stored as a durable image attachment the model can view</td>
+</tr>
+<tr>
+<td><code>browser_extract</code></td>
+<td>Structured extraction: natural-language instruction → one parsed JSON value</td>
+</tr>
+<tr>
+<td><code>browser_evaluate</code></td>
+<td>Run one JavaScript expression in the page (disabled by default)</td>
+</tr>
+<tr>
+<td><code>browser_close</code></td>
+<td>Close the session's browser; the next call opens a fresh one</td>
+</tr>
+</tbody></table>
+<h3>Snapshot example</h3>
+<pre><code>URL: https://example.com/
+Title: Example Domain
+Refs: 12
+
+- navigation "Main"
+  - link "Home" [ref=e1] -&gt; /
+  - button "Go" [ref=e2]
+- heading "Welcome" [level=1]
+- textbox "Search" [ref=e3]
+</code></pre>
+<p>The model then calls <code>browser_click</code> with <code>ref: e2</code>. Invisible content is excluded, node and text caps bound the token cost, and truncation is flagged in the result.</p>
+<h2>Configuration</h2>
+<p>All tunables are patchable through the profile's <code>cordis.patch.yml</code> (later layers win per row).</p>
+<pre><code>- id: browser
+  config:
+    provider: playwright                # explicit provider selection
+
+- id: browser-playwright
+  config:
+    launch:
+      channel: chrome                   # or chromium / msedge / edge
+      headless: true
+      viewport: { width: 1280, height: 800 }
+      navigationTimeoutMs: 30000
+      ignoreHTTPSErrors: false
+    allowedDomains: []                  # e.g. ['github.com'] restricts navigation
+    idleTimeoutMs: 600000               # close idle contexts after 10 min; 0 = never
+    maxSessions: 8                      # LRU eviction beyond this
+    snapshot:
+      maxNodes: 500                     # token budget per snapshot tree
+      maxNameLength: 120
+      maxTextLength: 300
+
+- id: browser-tool
+  config:
+    toolPrefix: browser_                # model-facing tool name prefix
+    allowEvaluate: false                # browser_evaluate gate
+    maxWaitMs: 60000                    # browser_wait bound
+    extract:
+      provider: deepseek-official       # optional: enables browser_extract
+      model: deepseek-v4-flash
+      maxInputChars: 20000
+      maxOutputTokens: 2000
+</code></pre>
+<p><code>browser_extract</code> needs an auxiliary LLM route (<code>extract.provider</code> + <code>extract.model</code>); without one it fails with an actionable error. <code>browser_evaluate</code> stays off until <code>allowEvaluate: true</code> because it executes arbitrary page JavaScript.</p>
+<h2>Architecture</h2>
+<p>A swappable capability seam, one package:</p>
+<ul>
+<li><code>service</code> — <code>ctx.browser</code>: the provider registry with configured-or-auto selection semantics (a configured id must exist; one usable provider auto-selects; several require an explicit choice).</li>
+<li><code>playwright</code> — the provider: one shared browser, one <code>BrowserContext</code> per calling session, LRU eviction, idle disposal, URL policy, and the injected snapshot engine.</li>
+<li><code>tool</code> — the consumer: <code>defineTool</code>-built tools whose canonical values are structured JSON and whose rendered text is the snapshot tree.</li>
+</ul>
+<p>Other providers (remote browsers, Browserbase, Steel, …) can register into <code>ctx.browser</code>; the tool schemas stay unchanged. Browser sessions survive across tool calls and keep cookies, storage, and login state within one harness session.</p>
+<h2>Development</h2>
+<pre><code>pnpm install
+pnpm test          # full suite: engine/action integration on real Chrome, policy, rendering,
+                   # schema assembly, plus the realistic scenario suites below
+pnpm run build     # tsc → lib/
+</code></pre>
+<h3>Test suites</h3>
+<table>
+<thead>
+<tr>
+<th>Suite</th>
+<th>Command</th>
+<th>What it covers</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>Unit + engine integration</td>
+<td><code>pnpm test</code> (included)</td>
+<td>Snapshot rendering, schema assembly, URL policy, provider actions on real Chrome</td>
+</tr>
+<tr>
+<td>Realistic scenarios</td>
+<td><code>pnpm test:scenarios</code></td>
+<td>Scripted-agent journeys over a realistic local store fixture: guest checkout with coupon and validation, login/session persistence, multi-tab research, lazy content, infinite scroll, modal dialogs, popups, screenshots, policy, owner isolation, idle disposal, snapshot budgets — at both the <code>BrowserSession</code> level and the model-facing <code>ctx.tools.execute</code> level (with fake attachments/LLM services)</td>
+</tr>
+<tr>
+<td>Live smoke</td>
+<td><code>pnpm test:live</code></td>
+<td>Opt-in checks against the real internet (example.com, Wikipedia REST). Skipped unless <code>DSH_BROWSER_LIVE=1</code>; not part of CI</td>
+</tr>
+</tbody></table>
+<p>The scenario suites are the plugin's most realistic tests: they drive the browser the way an agent does — snapshot, find a <code>ref</code>, act, re-snapshot — and therefore double as executable documentation of the model experience.</p>
+<p>From a DeepSeek Harness source checkout, load this plugin from TypeScript:</p>
+<pre><code>pnpm dsh web --patch ./browser-plugin/dev.cordis.yml
+</code></pre>
+<h2>Model Experience</h2>
+<h3>Tool schemas</h3>
+<p>The 17 tool schemas join the system-prompt assembly through <code>ctx.tools.register()</code>; each carries a one-line task-oriented description. Snapshot results are bounded: at most <code>maxNodes</code> nodes, names capped at <code>maxNameLength</code>, and the truncation flag is explicit.</p>
+<h4>Token effect</h4>
+<p>One tool schema block per tool (small, fixed), plus per-call result text proportional to the visible page, capped by <code>snapshot.maxNodes</code> and name/text limits. Actions return a fresh snapshot, so interactive flows cost roughly one snapshot per step.</p>
+<h4>KV Cache effect</h4>
+<p>Tool schemas are static per registration and keep the prompt prefix stable. Result content varies with the page, invalidating reuse after each browser tool call, as with any tool result.</p>
+<h3>Browser state</h3>
+<p>The page state itself (DOM, cookies, storage) lives in the browser context and never enters the prompt except through snapshot or page-data results.</p>
+<h2>Known Limitations and Deferred Work</h2>
+<ul>
+<li><strong>Selector-free, not vision-free</strong> — interaction is a11y-tree based; purely visual widgets (canvas, WebGL, custom-drawn controls) may expose no refs. <code>browser_screenshot</code> + an image-capable model is the fallback.</li>
+<li><strong>Cross-origin iframes</strong> appear as leaf <code>(frame)</code> nodes without refs; same-origin frames are walked up to two levels deep.</li>
+<li><strong>Evaluate gate is config, not approval</strong> — enabling <code>allowEvaluate</code> trusts the model with arbitrary page JavaScript; compose it with the harness approval/permission policy for stricter control.</li>
+<li><strong>Chromium family only</strong> — Firefox/WebKit channels are not probed; providers are swappable if another engine is needed.</li>
+<li><strong>Extract needs a dedicated model route</strong> — it does not reuse the main request's route; misconfiguration fails loudly at call time.</li>
+<li><strong>JS-driven navigations are not statically checkable</strong> — <code>allowedDomains</code> now covers <code>browser_navigate</code>, <code>browser_open_tab</code>, and link clicks, but a button whose handler runs <code>location.href = …</code> can still leave the allowed hosts; deploy an external network guard for hard isolation.</li>
+</ul>
+<h3>Ref and lifecycle safety (fixed)</h3>
+<p>The scenario suites originally surfaced four hazards, now fixed and regression-tested:</p>
+<ul>
+<li><strong>Stale refs fail fast</strong> — refs carry a per-snapshot nonce, so after a client-side re-render a stale ref matches nothing and <code>browser_click</code> fails with <code>REF_NOT_FOUND</code> instead of silently acting on a different element.</li>
+<li><strong>Link clicks respect <code>allowedDomains</code></strong> — clicking an in-page link to a disallowed host is rejected with <code>URL_NOT_ALLOWED</code>.</li>
+<li><strong>Idle disposal defers during operations</strong> — a navigation slower than <code>idleTimeoutMs</code> completes normally; disposal only fires when the session is truly idle.</li>
+<li><strong>Mid-navigation snapshots settle</strong> — a <code>browser_snapshot</code> racing a JS navigation waits for the new document and retries instead of surfacing a raw "Execution context was destroyed" error.</li>
+</ul>
+<h2>License</h2>
+<p>MIT</p>

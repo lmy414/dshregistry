@@ -1,0 +1,384 @@
+<p><strong>English</strong> · <a href="https://github.com/green-dalii/dsh-shift-router/blob/HEAD/README.zh-CN.md">简体中文</a></p>
+
+
+<h1>dsh-shift-router</h1>
+<p><strong>A two-tier model router for DeepSeek Harness</strong> — automatic execution/judgment routing with an LLM Judge, multi-model fallback chains, exponential-backoff runtime failover, and task-level orchestration.</p>
+<p>A DSH adaptation of <a href="https://github.com/green-dalii/pi-shift-router">pi-shift-router</a>.</p>
+<p><a href="https://github.com/green-dalii/dsh-shift-router/blob/HEAD/LICENSE"><img src="https://img.shields.io/badge/License-MIT-blue.svg" alt="License"></a>
+<a href="https://nodejs.org"><img src="https://img.shields.io/badge/node-%E2%89%A522-green" alt="Node"></a>
+<a href="#development"><img src="https://img.shields.io/badge/tests-62%20passing-brightgreen" alt="Tests"></a></p>
+
+
+<p>Routine turns shouldn't cost flagship money. The turns that matter shouldn't be left to a cheap model.</p>
+<p>Before every turn of a top-level agent, a small <strong>LLM Judge</strong> (running on your Fast-tier model chain) classifies the user's message as <code>fast</code> (routine) or <code>smart</code> (consequential). The chosen tier then drives the whole turn — thinking, tool calls, code edits — through the harness's own <code>agent/request</code> pipeline. The Judge only classifies; it never does the work.</p>
+<pre><code>🦾 [deepseek-v4-flash] → fix the failing test
+🧭 judging…
+🧠 [deepseek-v4-pro]   ← "design the auth flow" → upgraded instantly
+⚠️ deepseek-v4-flash 429 → cooldown, retrying on glm-5.2 — retry in 1m
+🦾 [glm-5.2]           ← same-tier failover
+</code></pre>
+<h2>Features</h2>
+<ul>
+<li><strong>Instant upgrades, trend-gated downgrades</strong> — one <code>smart</code> verdict switches to the strong tier immediately; coming back down requires a sliding-window majority (default 5 turns, ≥60%, low-confidence votes ignored).</li>
+<li><strong>Cache-aware routing</strong> — when Fast and Smart share a provider, the router raises the downgrade threshold (0.9) and holds off while the prompt cache is warm, so switching to a cheaper model never costs more than staying put.</li>
+<li><strong>Runtime failover</strong> — 429 / 5xx / quota failures put the model into exponential-backoff cooldown (1m → 4m → 16m → 1h → 6h cap; client-side limits start at 16m) and re-resolve the same tier to the next healthy model — same-turn retry, never cross-tier.</li>
+<li><strong>Task-level orchestration</strong> — complex tasks (a <code>smart</code> verdict) run the Smart tier as a <strong>CTO</strong> that plans, delegates implementation to Fast engineer subagents via the harness's <code>subagent</code> tool, reviews each result, and iterates. The hard caps are <strong>enforced by the plugin</strong>, not just prompted: each delegation counts a round, each failed worker result counts an escalation, and once a cap is hit the <code>subagent</code> tool is denied outright and the system prompt switches to a "wrap up now" notice.</li>
+<li><strong>Cost telemetry</strong> — per-tier token/throughput tracking and an optional USD pricing table (<code>/router stats</code> shows "what this session would have cost on the Smart model").</li>
+<li><strong>Zero-config startup</strong> — a no-op until you configure tiers; then routing just works. Configuration is editable live via the GUI settings panel <strong>and</strong> <code>/router config</code> commands (persisted, no restart).</li>
+</ul>
+<h2>Install</h2>
+<h3>As a bundle (recommended)</h3>
+<pre><code>git clone https://github.com/green-dalii/dsh-shift-router.git
+cd dsh-shift-router
+npm install &amp;&amp; npm run build
+dsh plugin --profile web add /path/to/dsh-shift-router
+</code></pre>
+<p>The bundle's <code>cordis.patch.yml</code> inserts the plugin into any profile that lists it. The plugin loads without any configuration (all defaults are safe); tier models come from the settings panel or the patch row.</p>
+<p>Installing from git (<code>dsh plugin --profile &lt;name&gt; add github:green-dalii/dsh-shift-router</code>) builds <code>dist/</code> automatically via the package's <code>prepare</code> script. pnpm ≥ 10 refuses git dependencies' <code>prepare</code> scripts by default — add this to the profile's <code>pnpm-workspace.yaml</code> and re-<code>add</code> if the build is skipped:</p>
+<pre><code>allowBuilds:
+  dsh-shift-router: true
+</code></pre>
+<blockquote>
+<p>This grants the package permission to run its build script at install time. For a fully lock-down install, use <code>npm run build</code> on a source checkout (below) instead.</p>
+</blockquote>
+<h3>From source (local development)</h3>
+<p>Point the profile's patch layer at the built entry:</p>
+<pre><code># ~/.dsh/profiles/&lt;name&gt;/cordis.patch.yml
+- insert:
+    - id: shift-router
+      name: '/absolute/path/to/dsh-shift-router/dist/index.js'
+      config:
+        tiers:
+          fast:
+            models:
+              - { provider: opencode-go, model: deepseek-v4-flash, priority: 1 }
+          smart:
+            models:
+              - { provider: opencode-go, model: deepseek-v4-pro, priority: 1 }
+</code></pre>
+<h2>Hot reload</h2>
+<p>DeepSeek Harness supports hot reload through <code>@deepseek-ai/cordis-plugin-hmr</code>, but two things are worth knowing:</p>
+<ol>
+<li><p><strong>The official Web bundle ships the shared HMR row disabled</strong> (<code>packages/bundle/web-app/cordis.patch.yml</code> has <code>- id: hmr, disabled: true</code>, upstream TODO: "Re-enable shared HMR for Web after its reload lifecycle is tested"). Re-enable it in your profile patch — this is the documented override mechanism:</p>
+<pre><code># ~/.dsh/profiles/&lt;name&gt;/cordis.patch.yml
+- id: hmr
+  disabled: false
+</code></pre>
+</li>
+<li><p><strong>What hot-reloads and what doesn't</strong> (verified against the current implementation):</p>
+<ul>
+<li>✅ <strong>Configuration changes</strong> — editing this profile patch (or the home patch) re-runs the affected plugin's <code>apply()</code> with the new config, no restart. The plugin's own config is also hot through the settings namespace (<code>/router config set</code> and the GUI card apply live without HMR at all).</li>
+<li>❌ <strong>Module (code) changes</strong> — the HMR accepted-dependency graph currently covers the harness's own modules only; editing an external plugin's compiled files (e.g. <code>dist/index.js</code>) does not trigger a reload in the current release, so code changes still require a restart. This is the untested "reload lifecycle" the upstream TODO refers to, not a limitation of this plugin.</li>
+<li>❌ <strong>Client package metadata</strong> — the <code>dsh.client</code> manifest and <code>exports["./client"]</code> are cached in-process; adding/fixing them requires a profile restart (only <code>dist/client.js</code> content changes ride the client HMR rebuild chain).</li>
+</ul>
+<p>In practice: configure with <code>/router config</code> / the settings panel (always live), switch models by editing the patch (live once HMR is on), and restart only when you change plugin code.</p>
+</li>
+</ol>
+<h2>Configuration</h2>
+<p>Configuration lives in the <strong><code>shift-router</code> settings namespace</strong>: edit it in the GUI (<strong>Settings → Plugins → Plugin configuration</strong> — the "Shift-Router" card), with <code>/router config</code> commands, or via the profile patch row. All fields have safe defaults.</p>
+<table>
+<thead>
+<tr>
+<th>Field</th>
+<th>Default</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>enabled</code></td>
+<td><code>true</code></td>
+<td>Master switch</td>
+</tr>
+<tr>
+<td><code>tiers.fast.models</code></td>
+<td><code>[]</code></td>
+<td>Fast-tier chain (<code>provider/model</code> + <code>priority</code>); also the Judge's model chain</td>
+</tr>
+<tr>
+<td><code>tiers.smart.models</code></td>
+<td><code>[]</code></td>
+<td>Smart-tier chain</td>
+</tr>
+<tr>
+<td><code>routing.mode</code></td>
+<td><code>auto</code></td>
+<td><code>auto</code> (default): judge + routing + failover + orchestration; <code>manual</code>: no judge, only explicit <code>/route-force</code> overrides; <code>off</code>: fully passive for model selection (commands/telemetry still work)</td>
+</tr>
+<tr>
+<td><code>routing.judgeTimeout</code></td>
+<td><code>5000</code></td>
+<td>Judge call timeout (ms)</td>
+</tr>
+<tr>
+<td><code>routing.judgeMaxTokens</code></td>
+<td><code>4000</code></td>
+<td>Max output tokens for a single Judge call</td>
+</tr>
+<tr>
+<td><code>routing.judgePromptCap</code></td>
+<td><code>6000</code></td>
+<td>Max prompt characters sent to the Judge (bounds Judge cost)</td>
+</tr>
+<tr>
+<td><code>routing.window.size</code></td>
+<td><code>5</code></td>
+<td>Downgrade sliding window size</td>
+</tr>
+<tr>
+<td><code>routing.window.threshold</code></td>
+<td><code>0.6</code></td>
+<td>Fast-majority ratio required to downgrade</td>
+</tr>
+<tr>
+<td><code>routing.window.minConfidence</code></td>
+<td><code>0.5</code></td>
+<td>Ignore judge verdicts below this confidence</td>
+</tr>
+<tr>
+<td><code>routing.cacheAware.enabled</code></td>
+<td><code>true</code></td>
+<td>Same-provider cache protection</td>
+</tr>
+<tr>
+<td><code>routing.cacheAware.sameFamilyThreshold</code></td>
+<td><code>0.9</code></td>
+<td>Downgrade threshold when tiers share a provider</td>
+</tr>
+<tr>
+<td><code>routing.cacheAware.idleBoundaryMs</code></td>
+<td><code>300000</code></td>
+<td>Idle gap before a warm cache is considered cold</td>
+</tr>
+<tr>
+<td><code>orchestration.mode</code></td>
+<td><code>auto</code></td>
+<td><code>auto</code>: complex → Smart CTO; <code>off</code>: plain two-tier routing</td>
+</tr>
+<tr>
+<td><code>orchestration.maxRounds</code></td>
+<td><code>3</code></td>
+<td>Delegate→review rounds hard cap (<strong>enforced</strong>: each subagent delegation counts one round; at the cap the subagent tool is denied)</td>
+</tr>
+<tr>
+<td><code>orchestration.escalationThreshold</code></td>
+<td><code>2</code></td>
+<td>Failed worker results before Smart must take over the phase (<strong>enforced</strong>: each <code>isError</code> subagent result counts)</td>
+</tr>
+<tr>
+<td><code>orchestration.requireSmartModel</code></td>
+<td><code>true</code></td>
+<td>Skip orchestration if the Smart model can't be resolved</td>
+</tr>
+<tr>
+<td><code>failover.baseMs</code></td>
+<td><code>60000</code></td>
+<td>Cooldown base delay for 5xx failures (1m)</td>
+</tr>
+<tr>
+<td><code>failover.maxMs</code></td>
+<td><code>21600000</code></td>
+<td>Hard cap on the backoff ladder (6h)</td>
+</tr>
+<tr>
+<td><code>failover.startAttempts4xx</code></td>
+<td><code>3</code></td>
+<td>4xx (429/quota) failures start at this attempt (16m), client limits usually outlive server blips</td>
+</tr>
+<tr>
+<td><code>failover.speedWindowSize</code></td>
+<td><code>5</code></td>
+<td>Recent tokens/sec readings kept for the <code>/router stats</code> average</td>
+</tr>
+<tr>
+<td><code>telemetry.callLogCap</code></td>
+<td><code>1000</code></td>
+<td>Max per-message attribution records kept for baseline cost computation</td>
+</tr>
+<tr>
+<td><code>ux.routerLogVerbose</code></td>
+<td><code>false</code></td>
+<td>Print router decisions to the harness log</td>
+</tr>
+<tr>
+<td><code>pricing</code></td>
+<td><code>[]</code></td>
+<td>Optional <code>{provider, model, input, output, cacheRead?, cacheWrite?}</code> USD-per-1M-token table for cost telemetry</td>
+</tr>
+</tbody></table>
+<blockquote>
+<p>All numeric fields are range-validated by the schema (e.g. <code>window.threshold</code> must be in [0,1], <code>window.size</code> a positive integer); invalid values are rejected at load / on <code>set</code>, never silently accepted.</p>
+</blockquote>
+<h3>GUI configuration card</h3>
+<p>The package ships a browser-side (client) module that registers a <strong>"Shift-Router"</strong> card in the GUI settings page:</p>
+<ul>
+<li><strong>Where</strong>: Settings → Plugins → Plugin configuration (that page is provided by the official <code>dsh-client-ui-settings-plugins</code>; the card registers into the <code>settings.plugin.item</code> slot).</li>
+<li><strong>What</strong>: a form over every scalar leaf field (booleans, numbers, enums) <strong>plus the two tier model chains</strong>, grouped into seven sections (General / Models / Routing / Orchestration / Failover / Telemetry / Logs &amp; UX) with sub-groups for the routing section (Judge / Decision window / Cache-aware). Scalar fields use the compact settings-row pattern — label + hint on the left, control right-aligned on the same line — so each field is one tight row instead of three stacked lines. Controls use the host-plane design tokens: toggle switches (contrast-safe in light and dark themes), a styled select for enums, unit suffixes inside numeric inputs (<code>ms</code>, <code>tokens</code>, <code>0–1</code>, …), and an ordered row editor for model chains — the row order is the in-tier fallback order, so the first available model wins and the rest are its fallbacks. The provider/model dropdowns are auto-loaded from <strong>DSH's runtime model catalog</strong> (<code>llm.models</code> — the same catalog the DSH settings surface reads): only providers with a currently advertised model list appear, no dormant-directory noise, and nothing is hardcoded, so the card works with any deployment's configured models. A "Custom…" escape covers values outside the catalog. Staged saving, per-field reset to default, and override markers work exactly like the official cards.</li>
+<li><strong>Boundary</strong>: only <code>pricing</code> (the optional USD cost table) stays with <code>/router config</code> and the profile patch; the tier model chains are editable in the card.</li>
+<li><strong>Build</strong>: <code>npm run build</code> emits both the host artifact (<code>dist/index.js</code>) and the client bundle (<code>dist/client.js</code>). The client module is discovered through the <code>dsh.client</code> manifest by <code>dsh-client-modules</code>, which requires the plugin to be mounted <strong>by package name (<code>dsh-shift-router</code>)</strong> — a source-checkout patch (<code>name: '/path/dist/index.js'</code>) does not serve the card.</li>
+</ul>
+<h4>Upstream limitation: the Web settings whitelist (0.1.0-rc.6)</h4>
+<p>The current Harness Web API proxy (<code>@deepseek-ai/dsh-host-apiproxy</code>) <strong>whitelists</strong> which settings namespaces the browser may read and write (<code>WEB_SETTINGS_NAMESPACES</code>). The official cards (<code>shell</code>, <code>agent-loop</code>, <code>web-search-deepseek</code>) are on the list; a third-party namespace is filtered out of the browser's <code>settings.describe</code> response even though the plugin registered it server-side. The upstream comment explicitly calls moving that decision to <code>settings.register()</code> (letting a plugin self-expose) "deferred work", and the list is not configurable.</p>
+<p>So the card needs <code>shift-router</code> added to the whitelist (one-time, idempotent):</p>
+<pre><code>npm run build
+dsh plugin --profile web add /path/to/dsh-shift-router
+node scripts/expose-gui-settings.mjs --profile web   # adds shift-router to the whitelist
+# restart the profile (client package metadata and the apiproxy are cached in-process)
+</code></pre>
+<p><code>scripts/expose-gui-settings.mjs</code> patches the profile's installed <code>dsh-host-apiproxy/lib/index.js</code> (idempotent; re-run after upgrading/reinstalling the dependency).</p>
+<h2>Commands</h2>
+<table>
+<thead>
+<tr>
+<th>Command</th>
+<th>Effect</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>/router</code></td>
+<td>Compact status</td>
+</tr>
+<tr>
+<td><code>/router status</code> / <code>/router stats</code></td>
+<td>Full status: tiers, window, transitions, cooldowns, tokens, cost telemetry</td>
+</tr>
+<tr>
+<td><code>/router on</code> / <code>/router off</code></td>
+<td>Enable / disable (session-scoped)</td>
+</tr>
+<tr>
+<td><code>/router verbose</code></td>
+<td>Toggle verbose router logging</td>
+</tr>
+<tr>
+<td><code>/router orchestrate auto|off</code></td>
+<td>Orchestration mode</td>
+</tr>
+<tr>
+<td><code>/router config</code></td>
+<td>Interactive editor: numbered field list with current values + available providers + usage</td>
+</tr>
+<tr>
+<td><code>/router config get &lt;N|path&gt;</code></td>
+<td>Show one field's current value, e.g. <code>get 4</code> or <code>get routing.judgeTimeout</code></td>
+</tr>
+<tr>
+<td><code>/router config set &lt;N|path&gt; &lt;value&gt;</code></td>
+<td>Set one field (persisted), e.g. <code>set 4 8000</code>, <code>set tiers.fast.models [...]</code> (JSON values auto-parsed)</td>
+</tr>
+<tr>
+<td><code>/router config unset &lt;N|path&gt;</code></td>
+<td>Clear a user override — the field reverts to its composition default</td>
+</tr>
+<tr>
+<td><code>/router config diff</code></td>
+<td>List the overrides the user layer currently holds</td>
+</tr>
+<tr>
+<td><code>/router config set-fast &lt;provider/model&gt;</code></td>
+<td>Replace the Fast tier chain with one model</td>
+</tr>
+<tr>
+<td><code>/router config set-smart &lt;provider/model&gt;</code></td>
+<td>Replace the Smart tier chain with one model</td>
+</tr>
+<tr>
+<td><code>/router config reset</code></td>
+<td>Restore the composition default</td>
+</tr>
+<tr>
+<td><code>/route-force &lt;fast|smart|auto|provider/model&gt;</code></td>
+<td>Force the next turn to a tier/model (one-shot)</td>
+</tr>
+</tbody></table>
+<h2>How it works (DSH integration)</h2>
+<table>
+<thead>
+<tr>
+<th>Capability</th>
+<th>DSH mechanism</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>Turn-start classification</td>
+<td><code>agent/pre-step</code> waterfall (<code>step === 1</code>, top-level agents only)</td>
+</tr>
+<tr>
+<td>Model switching</td>
+<td><code>agent/request</code> waterfall (per-step provider/model override)</td>
+</tr>
+<tr>
+<td>Runtime failover</td>
+<td><code>agent/request-error</code> waterfall (cooldown + <code>{kind:'retry'}</code> same-tier retry)</td>
+</tr>
+<tr>
+<td>Judge LLM calls</td>
+<td><code>ctx.llm.stream()</code> — reuses the harness's adapters, credentials, and JSON-mode enforcement</td>
+</tr>
+<tr>
+<td>Orchestrator instruction</td>
+<td><code>ctx.systemPrompt.section()</code> rendered per agent while orchestration is active</td>
+</tr>
+<tr>
+<td>Orchestration hard caps</td>
+<td><code>tools/pre-execute</code> denies the <code>subagent</code> tool at the cap; <code>tools/result</code> counts failed workers; the prompt section switches to a "wrap up" notice</td>
+</tr>
+<tr>
+<td>Config (GUI + commands)</td>
+<td><code>dsh-settings</code> namespace <code>shift-router</code>; <code>/router config</code> is a numbered editor over it (<code>settings.update</code> / <code>settings.mutate</code> path ops); the GUI card is a client module binding the same namespace via <code>settingsScope</code> + the <code>settings.plugin.item</code> slot</td>
+</tr>
+<tr>
+<td>Usage telemetry / cooldown recovery</td>
+<td><code>session/event</code> <code>assistant/message</code> (TokenUsage; a successful message clears the model's cooldown)</td>
+</tr>
+<tr>
+<td>Commands</td>
+<td><code>ctx.commands.register()</code></td>
+</tr>
+<tr>
+<td>Tier-chain prompt variables</td>
+<td><code>{{shift_router_fast_chain}}</code> / <code>{{shift_router_smart_chain}}</code></td>
+</tr>
+</tbody></table>
+<p><strong>Subagents are never routed.</strong> Workers spawned by the <code>subagent</code> tool carry <code>session.header.origin === 'subagent'</code> and keep their pinned model; the router only drives top-level agents.</p>
+<h3>Orchestration and the DSH subagent tool</h3>
+<p>The original pi plugin delegated through pi-subagents with <code>agent: "worker"</code>, <code>context: "fresh"</code>, and a per-call model pin. DSH's <code>subagent</code> tool differs:</p>
+<ul>
+<li>The tool takes <code>description</code> + <code>prompt</code> (and <code>run_in_background</code>); a worker runs in its <strong>own fresh session</strong> — the prompt is its world.</li>
+<li><strong>The worker model is pinned by deployment configuration</strong> (<code>dsh-tool-subagent</code>'s <code>agentOptions</code>), not by the tool call. By default a worker inherits the parent's model.</li>
+<li>Therefore the orchestrator prompt instructs the CTO to delegate with precise task contracts, review/iterate/escalate within the hard caps, and lists the Fast-tier chain the deployment should have pinned in <code>tool-subagent.agentOptions</code> for cost parity.</li>
+</ul>
+<p>The caps are enforced by the router, not just described: every <code>subagent</code> tool call while an orchestration turn is active increments <code>orchestration.rounds</code>; every failed (<code>isError</code>) subagent result increments <code>orchestration.escalations</code>; once <code>capHit()</code> is true the <code>subagent</code> tool is <strong>denied</strong> at <code>tools/pre-execute</code> and the orchestrator prompt section is replaced by a "wrap up now" notice. <code>/router status</code> shows the live counters (<code>round x/max, esc y/threshold</code>).</p>
+<h2>Development</h2>
+<pre><code>npm run build       # tsc (host → dist/) + tsc client + tsdown (client bundle → dist/client.js)
+npm test            # vitest (95 tests: routing / failover / judge parsing / orchestration / config schema / client form model / whitelist patch)
+npm run typecheck
+</code></pre>
+<h3>End-to-end test (no credentials)</h3>
+<p><code>e2e/</code> contains a fake LLM adapter that registers the <code>fake</code> provider, so the whole routing pipeline can be exercised without any API key:</p>
+<pre><code># after creating a scratch profile with this bundle + @deepseek-ai/dsh-headless:
+dsh --profile &lt;tmp&gt; --patch e2e/overlay.yml "design a migration plan for our billing system"
+# → ROUTER-E2E: turn ran on fake/fake-smart   (judge said smart → upgraded to the Smart tier)
+</code></pre>
+<p>The e2e also verifies the settings namespace persists (<code>e2e/settings-probe.mjs</code>).</p>
+<h2>Architecture</h2>
+<pre><code>src/
+├── index.ts        # plugin entry: event wiring, per-agent state, judge, orchestration section
+├── config.ts       # Schemastery schema + deep-merge normalization
+├── types.ts        # shared types + defaults
+├── router.ts       # pure routing engine (upgrade/downgrade/window/cache-aware)
+├── judge.ts        # LLM Judge via ctx.llm.stream() + reply parsing
+├── failover.ts     # exponential-backoff cooldown state machine
+├── tier.ts         # tier model resolution + display
+├── orchestrate.ts  # orchestrator prompt + lifecycle + caps
+├── stats.ts        # telemetry snapshot (tokens / throughput / cost estimate)
+├── commands.ts     # /router and /route-force
+└── client/         # browser half (GUI settings card)
+    ├── index.tsx       # client entry: registers into the settings.plugin.item slot
+    ├── controller.ts   # staged form → settings-scope writes (one per section)
+    ├── form-model.ts   # pure logic: field registry / draft parsing / save plan
+    ├── ShiftRouterCard.tsx  # card component (DSW design tokens)
+    └── locales.ts      # zh/en dictionaries
+</code></pre>
+<p>Pure logic (router / failover / judge parsing / orchestration) is unit-tested in isolation; DSH wiring is exercised by the headless e2e.</p>
+<h2>License</h2>
+<p><a href="https://github.com/green-dalii/dsh-shift-router/blob/HEAD/LICENSE">MIT</a> © 2026 green-dalii and contributors.</p>

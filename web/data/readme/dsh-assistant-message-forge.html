@@ -1,0 +1,264 @@
+<h1>dsh-assistant-message-forge（消息锻造台）</h1>
+<p>双面（Host + Client）DSH 插件：在会话区新增一个 <strong>消息锻造台</strong> 页签，核心是
+<strong>详细上下文解析 → 记录 → 卡片化 → 动态编辑 → 开放修改</strong>：</p>
+<ol>
+<li><code>context/refresh</code> 把当前会话完整解析成一张张 <code>ContextCard</code>
+（turn/step 边界、user/assistant 消息、tool call/result、request header、
+其他 log-only 事件；<code>assistant/chunk</code> 按轮折叠计数）；</li>
+<li>解析结果连同卡片 overrides 一起 <strong>记录</strong> 到
+<code>$DSH_HOME/assistant-message-forge/context-&lt;sessionId&gt;.json</code>；</li>
+<li>页签内按轮分组 <strong>卡片化</strong> 展示，含 surface 折叠状态（原始被替换 / 替换生效中）；</li>
+<li>卡片可 <strong>动态编辑</strong>：文本/reasoning/provider/model/usage、工具名与
+arguments、工具结果文本；编辑先保存为记录，也可 <strong>保存并应用到会话</strong>
+（surface replace 直接改写当前会话中的原消息）。</li>
+</ol>
+<p>此外保留 v1 能力：创建/修改/删除/注入 assistant 草稿、上传识别
+<code>session.jsonl(.zstd)</code>；导入区还会做完整性预览，并可把安全可解释的损坏
+恢复为新的 <code>session-repaired-*</code> 会话。</p>
+<h2>能力</h2>
+<table>
+<thead>
+<tr>
+<th>能力</th>
+<th>入口</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>上下文解析+记录</td>
+<td>会话上下文 → <strong>刷新解析</strong></td>
+<td>全事件分类解析并落盘为 context 记录</td>
+</tr>
+<tr>
+<td>上下文卡片化</td>
+<td>会话上下文卡片流</td>
+<td>按轮分组，边界/消息/工具/请求/其他卡片 + surface 状态</td>
+</tr>
+<tr>
+<td>卡片动态编辑</td>
+<td>卡片 → <strong>编辑</strong> → <strong>保存记录</strong></td>
+<td>修改只写入记录 override，刷新解析不丢</td>
+</tr>
+<tr>
+<td>应用到会话</td>
+<td>卡片 → <strong>保存并应用到会话</strong> / <strong>应用到会话</strong></td>
+<td>user/assistant/tool-result 用 surface replace 替换原消息，模型上下文即时生效</td>
+</tr>
+<tr>
+<td>添加/修改/删除草稿</td>
+<td>草稿区按钮</td>
+<td>草稿持久化在 <code>drafts.json</code></td>
+</tr>
+<tr>
+<td>注入到会话</td>
+<td>草稿行 → <strong>注入到当前会话</strong></td>
+<td>完整合成轮 + flush</td>
+</tr>
+<tr>
+<td>导入识别 sessionlog</td>
+<td>底部文件选择 → <strong>导入并识别</strong></td>
+<td>zstd/JSONL 解码 + packed chunk 展开 + 事件识别</td>
+</tr>
+<tr>
+<td>修复损坏 sessionlog</td>
+<td>完整性预览 → <strong>创建修复会话</strong></td>
+<td>后写分支覆盖 + 官方 crash closer + 官方 seed 校验；原日志只读</td>
+</tr>
+<tr>
+<td>复用识别结果</td>
+<td>识别行 → <strong>存为草稿</strong> / <strong>注入</strong></td>
+<td>保留 reasoning+text/provider/model/usage</td>
+</tr>
+</tbody></table>
+<h2>架构</h2>
+<pre><code>浏览器客户端                                  DSH host (Node)
+ForgeView（conversation.view 页签）
+  ├─ ContextPanel：解析记录卡片流 + 动态编辑
+  ├─ 草稿区：添加/修改/删除/注入按钮
+  ├─ sessionlog 文件选择 + 识别/修复预览
+  └── connection.rpc.call(AMF_RPC_CHANNEL) ──▶ /dsh-assistant-message-forge
+                                                   ├─ DraftStore（drafts.json）
+                                                   ├─ ContextRecordStore（context-*.json + overrides）
+                                                   ├─ parseContext / surface replace apply
+                                                   ├─ parse/repairSessionLogBytes（node:zlib zstd）
+                                                   └─ injectMessage（session.append + flush）
+</code></pre>
+<ul>
+<li>Host 半通过 <code>ctx.connection.rpc.handle()</code> 注册通用 Connection RPC 通道（loopback 信任边界），不修改 apiproxy 允许列表。</li>
+<li>Client 半注册 <code>conversation.view</code> 页签（<code>scope: session</code>），组件经 <code>sessionId</code> 标准 prop 拿到当前会话。</li>
+</ul>
+<h2>RPC 端点</h2>
+<p>通道：<code>/dsh-assistant-message-forge</code></p>
+<table>
+<thead>
+<tr>
+<th>endpoint</th>
+<th>payload</th>
+<th>返回</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>drafts/list</code></td>
+<td><code>{}</code></td>
+<td><code>AssistantDraft[]</code></td>
+</tr>
+<tr>
+<td><code>drafts/save</code></td>
+<td><code>{ draft: { id?, title?, content, reasoning?, provider?, model? } }</code></td>
+<td>保存后的 <code>AssistantDraft</code></td>
+</tr>
+<tr>
+<td><code>drafts/delete</code></td>
+<td><code>{ id }</code></td>
+<td><code>boolean</code></td>
+</tr>
+<tr>
+<td><code>session/inject</code></td>
+<td><code>{ sessionId, message: { content, reasoning?, provider?, model?, usage? } }</code></td>
+<td><code>{ sessionId, turn, step, seq, messageId, flushed }</code></td>
+</tr>
+<tr>
+<td><code>context/load</code></td>
+<td><code>{ sessionId }</code></td>
+<td>已记录的 <code>ContextSnapshot</code> 或 <code>null</code></td>
+</tr>
+<tr>
+<td><code>context/refresh</code></td>
+<td><code>{ sessionId }</code></td>
+<td>重新解析并记录后的 <code>ContextSnapshot</code></td>
+</tr>
+<tr>
+<td><code>records/update</code></td>
+<td><code>{ sessionId, key, patch }</code></td>
+<td>合并卡片 override 后的 <code>ContextSnapshot</code></td>
+</tr>
+<tr>
+<td><code>records/reset</code></td>
+<td><code>{ sessionId }</code></td>
+<td>丢弃全部 override 后的 <code>ContextSnapshot</code> 或 <code>null</code></td>
+</tr>
+<tr>
+<td><code>context/apply</code></td>
+<td><code>{ sessionId, key }</code></td>
+<td><code>{ sessionId, replacedSeq, newSeq, type, turn?, step?, flushed }</code></td>
+</tr>
+<tr>
+<td><code>sessionlog/parse</code></td>
+<td><code>{ name, dataBase64 }</code></td>
+<td><code>SessionLogParseResponse</code></td>
+</tr>
+<tr>
+<td><code>sessionlog/repair-preview</code></td>
+<td><code>{ name, dataBase64 }</code></td>
+<td><code>SessionLogRepairReport</code></td>
+</tr>
+<tr>
+<td><code>sessionlog/repair-create</code></td>
+<td><code>{ name, dataBase64 }</code></td>
+<td><code>{ sessionId, flushed, report }</code></td>
+</tr>
+</tbody></table>
+<p>错误统一走 <code>RpcResult</code> 的 <code>{ ok:false, error:{ code:'internal', ... } }</code> 分支；参数校验失败、会话不存在、当前会话存在未闭合 turn 时都会返回可读 message。</p>
+<h2>卡片与修改语义</h2>
+<ul>
+<li><strong>卡片解析覆盖</strong>：<code>turn/start|end</code>、<code>step/start|end</code>、<code>user/message</code>、
+<code>assistant/message</code>（reasoning/text/provider/model/usage）、<code>tool/call</code>、
+<code>tool/result</code>、<code>request/header</code>、<code>request/context</code>、其余 log-only 事件。
+<code>assistant/chunk</code> 不逐条成卡，按轮统计 <code>chunkCount</code>。</li>
+<li><strong>记录优先</strong>：<code>records/update</code> 只改 override；之后 <code>context/refresh</code> 重新解析时
+会合并 override，不会丢。<code>records/reset</code> 丢弃全部记录修改。</li>
+<li><strong>应用到会话 = surface replace</strong>：对 <code>user/message</code>、<code>assistant/message</code>、
+<code>tool/result</code> 追加一个 <code>surfaceOp: {op:'replace', start:seq, end:seq}</code> 事件，
+原节点被 shadow（模型 <code>deriveMessages</code> 用新内容），原始 append 事件仍保留在
+日志与官方对话流中；卡片流会同时显示「原始已被替换」和「替换生效」两张卡。</li>
+<li><strong>tool/result 特殊限制</strong>：DSH surface 校验只允许改写 tool-result 的
+<code>content</code>；message id/source/isError/error wrapper 必须保持原值，因此
+<code>isError</code> 在记录里可改，但应用时按原值写回。</li>
+<li><strong>会话正在运行</strong>（存在未闭合 turn）时注入和应用都会拒绝，避免破坏执行边界。</li>
+<li><strong>导入识别的投影</strong>：识别结果把 content 块投影为 <code>text</code> + <code>reasoning</code> 两条；
+<code>tool-call</code>、<code>image</code> 等非文本块计数为 <code>unsupportedBlocks</code>，注入时不会携带。</li>
+<li><strong>传输上限</strong>：上传 base64 ≤ 128 MiB；解压后 ≤ 128 MiB；识别列表每批最多 200 条（<code>truncated</code> 标记）。</li>
+</ul>
+<h2>会话修复语义与边界</h2>
+<ul>
+<li><strong>后写分支覆盖</strong>：物理日志出现 <code>seq &lt; 当前逻辑长度</code> 时，从该 seq 回滚候选尾部，
+再接入后写分支；报告会列出 <code>fromSeq</code> 和丢弃事件数。</li>
+<li><strong>不猜缺口</strong>：坏 JSON、坏 packed row 或向前跳号会让扫描保守停止；不会伪造缺失业务事件。</li>
+<li><strong>官方闭合</strong>：候选前缀交给 <code>@deepseek-ai/dsh-session</code> 的
+<code>interruptedTurnClosers()</code> 补齐未完成 tool/step/turn。</li>
+<li><strong>官方终审</strong>：使用 <code>Session.create(seed)</code> 重新验证从 0 连续的 seq、事件 envelope、
+surface append/replace 引用和 JSON 可持久化约束；失败则禁用创建按钮。</li>
+<li><strong>不可覆盖</strong>：插件不截断、不重命名、不写回源 <code>session.jsonl(.zstd)</code>；只创建新的
+<code>session-repaired-*</code> 会话，并把原 session id 记录为 <code>parentSession</code>。</li>
+</ul>
+<h2>目录结构</h2>
+<pre><code>assistant-message-forge/
+├── cordis.patch.yml          # bundle patch：insert 一行，包名即 loader 行名
+├── package.json              # dsh.client + dsh.bundle + exports["./client"]
+├── tsconfig.json             # tsc：lib/index.js + lib/types（Host 半 + 中间 Client JS）
+├── tsdown.config.ts          # tsdown：lib/client.js 浏览器闭包工厂
+├── scripts/
+│   ├── check-client-bundle.mjs  # 校验 client bundle 只 require 模块表内依赖
+│   ├── test-session-repair.mjs  # 分支回退 + crash closer 纯函数回归
+│   └── e2e-smoke.mjs            # 编辑/apply/导入/修复新会话全流程冒烟
+└── src/
+    ├── index.ts              # Host 半：RPC 通道 + 全部端点路由
+    ├── store.ts              # 草稿 JSON 持久化
+    ├── context.ts            # 详细上下文解析 + context 记录 + surface replace apply
+    ├── sessionlog.ts         # zstd 帧扫描 + JSONL 解码 + 事件识别
+    ├── shared-types.ts       # 双面共享 wire 类型
+    └── client/
+        ├── index.ts          # Client 半：注册 conversation.view 页签
+        ├── ForgeView.tsx     # 锻造台三段式 UI（上下文/草稿/导入）
+        ├── ContextPanel.tsx  # 解析记录卡片流 + 动态编辑
+        ├── ForgeView.module.css
+        └── locales.ts        # zh/en + LocaleNamespaceMap 增广
+</code></pre>
+<h2>构建</h2>
+<pre><code>cd D:/codeproject/dsh-plugin/plugins/assistant-message-forge
+pnpm install
+pnpm run build          # rm -rf lib &amp;&amp; tsc &amp;&amp; tsdown
+pnpm run test:session-repair
+pnpm run test:client-bundle
+</code></pre>
+<p>产物：</p>
+<ul>
+<li><code>lib/index.js</code> — Host 半（<code>@deepseek-ai/*</code> import 保持外部，由安装 profile 解析）</li>
+<li><code>lib/client.js</code> — 浏览器闭包工厂（<code>window.__ModuleLoader__.load({id:"dsh-assistant-message-forge"})</code>）</li>
+<li><code>lib/types/**</code> — 声明文件</li>
+</ul>
+<h2>激活（Web UI 需要 bundle 安装，不能用裸 <code>--patch</code>）</h2>
+<p><code>--patch</code> 只能把 Host 源码挂进插件树；<code>dsh.client</code> 扫描器按<strong>包名</strong>经 <code>require.resolve</code> 发现 <code>exports["./client"]</code>，因此浏览器半必须作为 bundle 安装进 profile：</p>
+<pre><code>cd D:/codeproject/deepseek-harness
+
+# 独立测试 profile（第一次会只初始化 base，手动把 web-app bundle 加进 dsh.profile.bundles）
+pnpm dsh plugin --profile amf-test add D:/codeproject/dsh-plugin/plugins/assistant-message-forge
+pnpm dsh --profile amf-test --port 3090
+
+# 正式使用：装进默认 web profile，重启 dsh web 生效
+pnpm dsh plugin --profile web add D:/codeproject/dsh-plugin/plugins/assistant-message-forge
+pnpm dsh web
+</code></pre>
+<blockquote>
+<p><code>dsh web</code> 是 <code>--profile web</code> 的硬别名；给自定义 profile 启动 Web 应用要用
+<code>pnpm dsh --profile &lt;name&gt; --port &lt;port&gt;</code>，并保证该 profile 的 <code>dsh.profile.bundles</code>
+依次包含 <code>@deepseek-ai/dsh-base</code>、<code>@deepseek-ai/dsh-web-app</code>、<code>dsh-assistant-message-forge</code>。</p>
+</blockquote>
+<h2>开发期热更</h2>
+<ul>
+<li>Client 半：<code>client-hmr</code> 会 watch 所有已挂载 bundle 的 <code>lib/client.js</code>。改完 <code>src/client/**</code> 后
+<code>pnpm run build</code>，浏览器自动拉取新 rev（本插件构建约 1 秒）。</li>
+<li>Host 半：web profile 的 loader HMR 关闭；改 <code>src/index.ts</code> / <code>src/store.ts</code> /
+<code>src/sessionlog.ts</code> 后需重启 <code>dsh web</code>。</li>
+</ul>
+<h2>E2E 冒烟</h2>
+<p>对运行中的实例执行按钮级验证（创建一次性会话 → 上下文刷新解析 →
+助手卡片记录编辑/应用 → 丢弃记录修改 → 草稿添加/修改/注入 →
+导入识别 → 损坏日志预览/创建修复会话 → 删除草稿）：</p>
+<pre><code>$env:AMF_URL='http://127.0.0.1:3090'
+$env:SESSION_LOG=$env:DSH_SESSION_JSONL
+node scripts/e2e-smoke.mjs
+</code></pre>
+<p>脚本用 <code>D:/codeproject/dsh-browser/node_modules/playwright</code>（可用 <code>PLAYWRIGHT_ROOT</code> 覆盖），
+先经 RPC 创建一个 workspace-attached 的一次性会话再逐项点击中文 UI，避免污染真实会话；
+<code>PLAYWRIGHT_CHANNEL=chrome</code> 可显式使用本机 Chrome，<code>AMF_HEADED=1</code> 可打开可见浏览器窗口。</p>

@@ -1,0 +1,183 @@
+<h1>dsh-model-meta-autofill</h1>
+<p>DSH 插件：为<strong>自定义供应商</strong>（<code>llm-pi-ai</code> 设置区）里配置的模型自动预填元数据——上下文长度（contextWindow）、输出上限（maxTokens）、显示名（name）与输入模态（input）——数据来源为 <a href="https://models.dev/">models.dev</a>（Model Metadata Registry）。</p>
+<p>在「Models」页从自定义网关发现（interrogation）出来的模型、或手工录入的模型，通常只有 id。本插件把目录里已知的元数据填回该模型的配置项，让界面可直接查看、也让上游据此做容量调度；<strong>已由你手动设置过的字段一律不被覆盖</strong>。</p>
+<h2>工作原理</h2>
+<ol>
+<li><strong>离线索引</strong>：构建时把 models.dev 目录归一化去重后打进包内（<code>lib/data/models.dev.json</code>），离线立即可用。</li>
+<li><strong>实时刷新（可选，默认开）</strong>：启动时（及可选定时）拉取最新目录（models.dev/api.json）并合并到索引之上；每个数据源独立失败隔离，失败不影响其余源与离线索引。</li>
+<li><strong>设置写入</strong>：插件监听 <code>llm-pi-ai</code> 设置区的变化（模型被采纳/编辑），对「有缺的模型」生成补丁，通过设置管线的 <code>update</code> 写入——这就是「自动预填」。<ul>
+<li>只填<strong>缺失</strong>字段，绝不覆盖你设置过的值；</li>
+<li>只处理<strong>存在于你自己设置层</strong>的 provider 路由（组合 base 里仅有的 provider 不会被物化进用户文档）；</li>
+<li><code>models</code> 列表有改动时整表重述（设置合并对数组是整表替换语义，避免部分列表悄悄丢模型）；</li>
+<li>写出的文档是幂等的：填完之后没有缺失项，因此不会循环写。</li>
+</ul>
+</li>
+<li><strong>Host 服务</strong>：<code>ctx.modelMeta</code> 向其他插件暴露索引与纯函数助手（<code>lookup / stats / refresh / buildSectionPatch</code>）。</li>
+</ol>
+<blockquote>
+<p>说明：<code>fillReasoning</code>（推理属性）为保留开关，默认关闭——各供应商对推理模式的 wire 拼写不同，目录数据没有可移植的通用表达，宁可不动。</p>
+</blockquote>
+<h2>安装</h2>
+<p>插件是**宿主侧（host）**插件，需装入运行 dsh web 的 profile（例如 <code>~/.dsh/profiles/web</code>）。</p>
+<p>从 npm 安装（发布版）：</p>
+<pre><code>dsh plugin --profile web add dsh-model-meta-autofill
+</code></pre>
+<p>或从源码安装（本地构建）：</p>
+<pre><code>pnpm install          # 依赖解析需要 ../deepseek-harness checkout（见「开发」）
+pnpm build            # 生成 lib/（含打包的 lib/data/*.json）
+npm pack              # 产出 tarball
+dsh plugin --profile web add dsh-model-meta-autofill@&lt;tarball路径&gt;
+</code></pre>
+<p><code>cordis.patch.yml</code>（<code>dsh.bundle.patch</code>）会在安装时自动插入一行配置到 profile 的补丁层：</p>
+<pre><code>- insert:
+    - id: model-meta-autofill
+      name: 'dsh-model-meta-autofill'
+      config:
+        sources: [models.dev]
+        refreshOnStart: true
+        refreshIntervalMs: 0
+        timeoutMs: 15000
+        autoApply: true
+        dryRun: false
+        fillName: true
+        fillInput: true
+        fillReasoning: false
+</code></pre>
+<p>重启 dsh web（或对应管理面重载插件）后生效。首次运行时若 <code>llm-pi-ai</code> 已存在带模型的 provider，初始扫描会立即补填一次。</p>
+<h2>Web 界面操作（插件自带）</h2>
+<p>插件同时带一个<strong>客户端 half</strong>（<code>dsh.client</code> 声明，走壳的 <code>/plugins</code> 动态加载协议，零改壳代码），样式沿用设置页的设计语言（720px 栏宽、border-l2 细线卡片、胶囊按钮、<code>--dsw-alias-*</code> 令牌）。重启后，设置页出现「<strong>模型元数据</strong>」分区：</p>
+<ul>
+<li>顶部工具栏（靠前位置）：**「全部覆盖」<strong>主按钮——一次把所有已匹配模型换成 models.dev 的值；旁边是</strong>「显示名称携带厂商名」**开关（决定填充的显示名是否写成 <code>xAI: Grok 4.5</code> 这种厂商前缀形式；选择会记住），以及「刷新」与模型/匹配计数；</li>
+<li>每个自定义供应商一张卡片，<strong>点头部可折叠/展开</strong>，带「N 个模型 / 已匹配 M」标签；</li>
+<li>卡片内每个模型一行：模型 id（等宽字体）· 当前配置 · models.dev 目录值（随开关实时预览显示名）·「填充」按钮；</li>
+<li>目录没有该模型 → 按钮置灰显示「无匹配」；填充未匹配会明确提示「models.dev 没有匹配到：」；写入失败显示宿主返回的具体原因（含孤儿锁提示）。</li>
+</ul>
+<p>同一能力也开放为 HTTP 端点（本机回环，可直接 curl / 浏览器 console 调用）：</p>
+<table>
+<thead>
+<tr>
+<th>端点</th>
+<th>方法</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>/model-meta-autofill/api/status</code></td>
+<td>GET</td>
+<td>插件状态（源、索引条数）</td>
+</tr>
+<tr>
+<td><code>/model-meta-autofill/api/models</code></td>
+<td>GET</td>
+<td>全部供应商 + 模型的匹配状态与目录值</td>
+</tr>
+<tr>
+<td><code>/model-meta-autofill/api/apply</code></td>
+<td>POST</td>
+<td><code>{provider, modelId, overwrite?, nameStyle?}</code> 单模型换用目录值；返回 <code>{ok:true, applied}</code> 或 <code>{ok:false, reason:'no-match'|...}</code></td>
+</tr>
+<tr>
+<td><code>/model-meta-autofill/api/apply-all</code></td>
+<td>POST</td>
+<td><code>{nameStyle?}</code> 全部覆盖（一个补丁覆盖所有已匹配模型）；返回 <code>{ok, filled, missed}</code></td>
+</tr>
+</tbody></table>
+<h2>配置</h2>
+<table>
+<thead>
+<tr>
+<th>键</th>
+<th>类型</th>
+<th>默认</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>enabled</code></td>
+<td>boolean</td>
+<td><code>true</code></td>
+<td>总开关</td>
+</tr>
+<tr>
+<td><code>sources</code></td>
+<td>string[]</td>
+<td><code>[models.dev]</code></td>
+<td>要合并的目录源：<code>models.dev</code>（Model Metadata Registry，<a href="https://models.dev/api.json%EF%BC%89%E3%80%81PublicProviderConf">https://models.dev/api.json）、PublicProviderConf</a> 的 <code>dist/{name}.json</code> 的 <code>name</code>（如 <code>aihubmix</code>，需先 <code>pnpm gen:data &lt;name&gt;</code> 生成快照），或直接给 <code>http(s)://</code> URL。后面的源对同一模型优先生效</td>
+</tr>
+<tr>
+<td><code>refreshOnStart</code></td>
+<td>boolean</td>
+<td><code>true</code></td>
+<td>启动时拉取一次实时目录</td>
+</tr>
+<tr>
+<td><code>refreshIntervalMs</code></td>
+<td>number</td>
+<td><code>0</code></td>
+<td>&gt;0 时按此间隔定时刷新（毫秒）</td>
+</tr>
+<tr>
+<td><code>timeoutMs</code></td>
+<td>number</td>
+<td><code>15000</code></td>
+<td>单次拉取超时</td>
+</tr>
+<tr>
+<td><code>autoApply</code></td>
+<td>boolean</td>
+<td><code>true</code></td>
+<td>是否把补丁写入设置区（关掉则插件只提供 <code>ctx.modelMeta</code> 查询）</td>
+</tr>
+<tr>
+<td><code>dryRun</code></td>
+<td>boolean</td>
+<td><code>false</code></td>
+<td>试运行：只记录将补填的条目，不写设置（配合日志观察）</td>
+</tr>
+<tr>
+<td><code>fillName</code></td>
+<td>boolean</td>
+<td><code>true</code></td>
+<td>补显示名</td>
+</tr>
+<tr>
+<td><code>fillInput</code></td>
+<td>boolean</td>
+<td><code>true</code></td>
+<td>补输入模态（<code>text</code>，视觉模型再加 <code>image</code>）</td>
+</tr>
+<tr>
+<td><code>fillReasoning</code></td>
+<td>boolean</td>
+<td><code>false</code></td>
+<td>保留；当前恒为 false</td>
+</tr>
+</tbody></table>
+<h2>数据源</h2>
+<p>默认且唯一的打包上游是 <strong>models.dev</strong>（<a href="https://models.dev/">Model Metadata Registry</a>，API 为 <a href="https://models.dev/api.json%EF%BC%89%E2%80%94%E2%80%94%E6%8C%89%E5%8E%82%E5%95%86%E8%81%9A%E5%90%88%E7%9A%84%E6%A0%87%E5%87%86%E6%A8%A1%E5%9E%8B%E5%85%83%E6%95%B0%E6%8D%AE%E7%9B%AE%E5%BD%95%EF%BC%9A%60limit.context/output%60">https://models.dev/api.json）——按厂商聚合的标准模型元数据目录：`limit.context/output`</a> 一律为数字、字段口径统一（<code>modalities.input/output</code>、<code>reasoning</code>、知识截止日期、成本），覆盖包含最新型号的全量模型。如需 PublicProviderConf 网关拼写兜底，可用 <code>pnpm gen:data aihubmix</code> 生成快照并把 <code>aihubmix</code> 加进 <code>sources</code>。</p>
+<ul>
+<li>更新打包数据（在本仓库根目录）：</li>
+</ul>
+<pre><code>pnpm gen:data      # 拉取默认源并规整为 src/data/{source}.json（归一化逻辑即插件自身）
+pnpm build         # 重新打包
+</code></pre>
+<ul>
+<li>容量字段兼容两类写法：纯数字（<code>1048576</code>）与带后缀字符串（<code>128K</code>/<code>1M</code>/<code>256k</code>，按 1024 进制换算）；同一 base id 的多供应商记录自动去重并保留信息最全的一条。</li>
+<li>插件对模型 id 的别名做了兼容：精确 id、小写、<code>provider/</code> 前缀剥除、<code>~</code> 变体，均可命中。</li>
+<li>目录中未出现的（新发布/小众）模型不会被猜测——「能查到多少填多少」。</li>
+</ul>
+<h2>开发</h2>
+<p>前置：需要一份 DeepSeek Harness 源码 checkout 与本仓库同级放置于 <code>../deepseek-harness</code>——typecheck/测试所需的 <code>@deepseek-ai/*</code> 类型与实现通过 <code>tsconfig.json</code> 的 <code>paths</code> 指向该 checkout（npm 上发布的同名包版本可用于安装时的运行时依赖，但开发期以 checkout 为准）。</p>
+<pre><code>pnpm typecheck            # tsc -p tsconfig.json（src + tests）
+pnpm test                 # node 内置测试器 + tsx：dataset / enrich / api / 集成（真实 SettingsProvider）
+pnpm build                # tsc -p tsconfig.build.json + scripts/copy-data.mjs → lib/
+</code></pre>
+<p>集成测试（<code>tests/integration/settings-autofill.spec.ts</code>）用内存版 <code>SettingsProvider</code>（与 dsh 设置实现的加载/持久化接口一致）验证：初始扫描补填、事后采纳补填、用户值保留、幂等终止、dry-run 零写入、base-only provider 不被物化。</p>
+<h2>局限</h2>
+<ul>
+<li>目标设置区固定为 <code>llm-pi-ai</code>（自定义供应商）。模型发现（<code>discoverModels</code>）仍归 llm-pi-ai 自身所有，本插件不做发现。</li>
+<li>只填目录里有据可查的字段；目录条目缺容量时不下发任何猜测值。</li>
+<li>补丁按「缺失才填」生成，用户的既有值（含 <code>modelOverrides</code>）始终优先。</li>
+</ul>
+<h2>License</h2>
+<p>MIT</p>

@@ -1,0 +1,261 @@
+<h1>dsh-web-billing</h1>
+<p>DeepSeek Harness（<code>dsh web</code>）的人民币/美元 token 计费插件：<strong>按官方政策自动计价</strong>
+（内置政策时间表，含 2026-08-17 起的峰谷定价），逐条消息记账，<strong>实时显示账号余额</strong>，
+浏览器端展示费用（<strong>界面语言自动切换 ¥/$</strong>）。</p>
+<ul>
+<li><strong>记账（host 端）</strong>：订阅 <code>session/event</code>，对每条带 usage 的 <code>assistant/message</code>
+按消息时刻取价计费（CNY 与 USD 双币种，官方美元价独立发布），账本持久化到
+<code>$DSH_HOME/storages/web-billing.json</code>。</li>
+<li><strong>账号余额（host 端）</strong>：复用 provider 的 API key 调用官方 <code>GET /user/balance</code>
+（默认 60s 刷新、5s 超时、失败静默降级），CNY/USD 双币种随 <code>/billing/state</code> 返回。</li>
+<li><strong>本地模型节省统计</strong>：配置 <code>localProviders</code> 后，本地（自托管）模型的调用按官方
+价格计算「名义价值」，实际成本按 <code>localCostPerM</code>（默认 0 = 免费），差值即
+「已节省」——面板与消息角标实时显示（本地消息角标显示 <code>省¥X</code>）。</li>
+<li><strong>展示（浏览器端）</strong>：每条 assistant 消息动作条上的费用角标（悬停显示
+token 拆分与模型）；会话头部费用角标，点击展开 本会话 / 今日 / 本月 / 累计 /
+<strong>账户余额</strong> / <strong>已节省</strong> / 按模型 明细与当前计价方式。中文界面显示 ¥，英文
+界面显示 $，也可用 <code>displayCurrency</code> 强制指定。</li>
+<li><strong>查询端点（只读，默认仅回环）</strong>：<code>GET /billing/state</code>、<code>GET /billing/session/&lt;id&gt;</code>。</li>
+</ul>
+<h2>核心特性</h2>
+<h3>官方政策自动计价</h3>
+<p><code>lib/pricing.js</code> 内置官方价格时间表（<code>OFFICIAL_PRICING_POLICIES</code>），每条政策有
+生效时刻（<code>since</code>）与单价表：</p>
+<table>
+<thead>
+<tr>
+<th>生效时刻（北京）</th>
+<th>政策</th>
+<th>模型单价（¥/1M，缓存命中 / 未命中 / 输出）</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>2025-02-09</td>
+<td>deepseek-chat / deepseek-reasoner 标准价</td>
+<td>0.5/2/8 · 1/4/16</td>
+</tr>
+<tr>
+<td>2026-05-22</td>
+<td>V4 系列 75% 降价转永久</td>
+<td>v4-flash 0.02/1/2 · v4-pro 0.025/3/6</td>
+</tr>
+<tr>
+<td>2026-08-17</td>
+<td><strong>峰谷定价</strong>（高峰 09:00-12:00 / 14:00-18:00 北京时间，空闲半价）</td>
+<td>见下表</td>
+</tr>
+</tbody></table>
+<p>峰谷价格（¥/1M）：</p>
+<table>
+<thead>
+<tr>
+<th>模型</th>
+<th>空闲（缓存命中 / 未命中 / 输出）</th>
+<th>高峰（缓存命中 / 未命中 / 输出）</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>deepseek-v4-flash</td>
+<td>0.05 / 1.5 / 4.5</td>
+<td>0.10 / 3.0 / 9.0</td>
+</tr>
+<tr>
+<td>deepseek-v4-pro</td>
+<td>0.15 / 4.5 / 13.5</td>
+<td>0.30 / 9.0 / 27.0</td>
+</tr>
+</tbody></table>
+<p>计价语义：</p>
+<ul>
+<li><strong>按消息时刻取价</strong>：每条消息按其完成时刻所属的政策与峰谷时段计费；新政策
+生效后自动切换，无需改配置。</li>
+<li><strong>政策链继承</strong>：新政策未点名的模型沿用最近一次被点名的价格（下架模型的历史
+账单与平台一致）。</li>
+<li><strong>改价自愈</strong>：政策表或配置变化后，重启时按当前规则重估全部存量记录（以每条
+消息记录的 token 数为准，不丢失历史）。</li>
+<li><strong>用户覆盖</strong>：<code>prices</code> 中模型精确条目覆盖官方价；<code>*</code> 只填补官方从未点名的
+模型。<code>officialPricing: off</code> 则完全使用用户价格表。</li>
+<li><strong>可扩展时间表</strong>：官方未来调价，通过 <code>policyOverrides</code> 在配置里追加政策即可，
+无需改代码（也欢迎向 <code>lib/pricing.js</code> 提交 PR）。</li>
+</ul>
+<blockquote>
+<p>⚠️ 政策时间表策展自官方公告（<a href="https://api-docs.deepseek.com/zh-cn/quick_start/pricing/">DeepSeek API Docs</a>），
+请以官方页面为准；发现偏差欢迎 PR 修正。</p>
+</blockquote>
+<h2>安装</h2>
+<p>插件是一个标准 <strong>DSH 组合包（bundle）</strong>（<code>dsh.bundle.patch</code> 指向包内
+<code>cordis.patch.yml</code>），按官方<a href="https://github.com/deepseek-ai/deepseek-harness/blob/master/docs/user/develop/basic/publish.zh.md">打包与安装指南</a>
+分发。三种安装方式：</p>
+<pre><code># 从 GitHub 安装（git 安装运行 prepare 构建；本包为纯 JS，无需构建，开箱即用）
+dsh plugin --profile web add github:&lt;owner&gt;/dsh-web-billing
+
+# 或从 npm 安装（发布后）
+dsh plugin --profile web add dsh-web-billing
+
+# 或本地开发：链接 checkout
+powershell -ExecutionPolicy Bypass -File scripts/install.ps1 -Profile web
+</code></pre>
+<blockquote>
+<p>git 安装时 pnpm ≥10 可能要求构建授权：把提示的包键加入 profile 的
+<code>pnpm-workspace.yaml</code> 的 <code>allowBuilds</code> 后重试（本包没有 <code>prepare</code> 构建，
+通常无需授权）。</p>
+</blockquote>
+<p>安装后<strong>重启 <code>dsh web</code></strong> 生效。同一 <code>$DSH_HOME</code> 下请只运行一个实例（多个实例
+会争写同一账本文件）。</p>
+<p>需要覆盖默认配置时，在 <code>$DSH_HOME/profiles/web/cordis.patch.yml</code> 按 id 覆写整行
+（覆盖会替换整份 config，需重述所有键）：</p>
+<h2>配置参考</h2>
+<table>
+<thead>
+<tr>
+<th>键</th>
+<th>默认</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>currency</code></td>
+<td><code>CNY</code></td>
+<td>币种标识</td>
+</tr>
+<tr>
+<td><code>symbol</code></td>
+<td><code>¥</code></td>
+<td>人民币展示符号</td>
+</tr>
+<tr>
+<td><code>symbolUsd</code></td>
+<td><code>$</code></td>
+<td>美元展示符号</td>
+</tr>
+<tr>
+<td><code>displayCurrency</code></td>
+<td><code>auto</code></td>
+<td><code>auto</code>=跟随界面语言（英文界面显示 USD）；<code>CNY</code>/<code>USD</code>=强制指定</td>
+</tr>
+<tr>
+<td><code>timezone</code></td>
+<td><code>Asia/Shanghai</code></td>
+<td>峰谷时段判定时区（IANA）</td>
+</tr>
+<tr>
+<td><code>peakWindows</code></td>
+<td><code>[[9,12],[14,18]]</code></td>
+<td>高峰时段（本地小时，<code>[start,end)</code>）</td>
+</tr>
+<tr>
+<td><code>officialPricing</code></td>
+<td><code>auto</code></td>
+<td><code>auto</code>=官方政策自动计价；<code>off</code>=只用 <code>prices</code></td>
+</tr>
+<tr>
+<td><code>prices</code></td>
+<td><code>{}</code></td>
+<td>用户价格表（覆盖/兜底，单位 ¥/1M，同时作用于美元价）</td>
+</tr>
+<tr>
+<td><code>usdPrices</code></td>
+<td><code>{}</code></td>
+<td>美元价覆盖（可选，单位 $/1M）</td>
+</tr>
+<tr>
+<td><code>localProviders</code></td>
+<td><code>[]</code></td>
+<td>本地（自托管）provider 名单：调用按官方价计「名义价值」，实际成本按 <code>localCostPerM</code>，差值计入「已节省」</td>
+</tr>
+<tr>
+<td><code>localCostPerM</code></td>
+<td><code>0</code></td>
+<td>本地模型实际单价（¥/1M，所有 token 统一；默认 0 = 免费，可填电费/算力成本）</td>
+</tr>
+<tr>
+<td><code>policyOverrides</code></td>
+<td><code>[]</code></td>
+<td>追加的官方政策条目（<code>since</code> 必填，<code>prices</code> 或 <code>peak</code>+<code>offPeak</code>）</td>
+</tr>
+<tr>
+<td><code>persistPath</code></td>
+<td><code>~/.dsh/storages/web-billing.json</code></td>
+<td>账本文件路径</td>
+</tr>
+<tr>
+<td><code>maxRecent</code></td>
+<td><code>20000</code></td>
+<td>最近流水保留条数</td>
+</tr>
+<tr>
+<td><code>maxMessagesPerSession</code></td>
+<td><code>2000</code></td>
+<td>每会话消息明细保留条数</td>
+</tr>
+<tr>
+<td><code>loopbackOnly</code></td>
+<td><code>true</code></td>
+<td><code>/billing</code> 端点仅允许回环地址访问</td>
+</tr>
+<tr>
+<td><code>balance.enabled</code></td>
+<td><code>true</code></td>
+<td>是否查询并展示账号余额</td>
+</tr>
+<tr>
+<td><code>balance.endpoint</code></td>
+<td><code>https://api.deepseek.com/user/balance</code></td>
+<td>余额接口地址（<code>DEEPSEEK_BASE_URL</code> 环境变量存在时以其为前缀）</td>
+</tr>
+<tr>
+<td><code>balance.apiKeyEnv</code></td>
+<td><code>DEEPSEEK_API_KEY</code></td>
+<td>解析 API key 的凭证引用（经 <code>ctx.credentials</code> 或环境变量）</td>
+</tr>
+<tr>
+<td><code>balance.refreshMs</code></td>
+<td><code>60000</code></td>
+<td>余额刷新间隔</td>
+</tr>
+<tr>
+<td><code>balance.timeoutMs</code></td>
+<td><code>5000</code></td>
+<td>余额请求超时</td>
+</tr>
+</tbody></table>
+<p>单价字段语义：<code>input</code>=缓存未命中输入，<code>cacheRead</code>=缓存命中输入，<code>output</code>=输出
+（¥ / 百万 tokens）。</p>
+<h2>记账正确性</h2>
+<ul>
+<li><strong>幂等</strong>：以 <code>(sessionId, messageId)</code> 为主键，重复/重放事件只覆盖明细，绝不
+重复累计（多进程、多次重启实测验证）。</li>
+<li><strong>按本地时区</strong>统计「今日 / 本月」。</li>
+<li><strong>落盘</strong>：1s 防抖 + 临时文件原子替换；加载失败从空账本开始并告警；进程退出
+时补一次 flush。</li>
+<li><strong>审计字段</strong>：每条消息明细记录应用的单价（<code>unitPrice</code>）与计价模式（<code>mode</code>：
+<code>flat</code> / <code>peak</code> / <code>offPeak</code>）。</li>
+<li><strong>余额只读</strong>：余额查询只调用官方只读接口，不写任何数据；key 只存在于服务端
+解析链路，不下发浏览器。</li>
+</ul>
+<h2>开发</h2>
+<pre><code>npm run check   # 语法检查
+npm test        # 定价引擎 + 余额解析单元测试（node:test，无依赖）
+</code></pre>
+<p>结构：</p>
+<pre><code>lib/pricing.js   定价引擎（纯函数：政策时间表 / 峰谷判定 / 覆盖合并 / 费用计算）
+lib/balance.js   账号余额（响应解析纯函数 + 带缓存/容错的抓取器）
+lib/index.js     host 端：记账、账本、余额轮询、/billing 路由（cordis 插件）
+lib/client.js    浏览器端：费用角标与面板（手写 __ModuleLoader__ bundle，无需构建）
+test/            单元测试
+scripts/         安装脚本
+</code></pre>
+<p>浏览器端 bundle 为手写模块（与 DSH 官方 client 插件同格式），修改后<strong>刷新页面 +
+重启 <code>dsh web</code></strong> 生效；host 端修改需重启。</p>
+<h2>安全</h2>
+<ul>
+<li><code>/billing</code> 端点默认仅回环地址可访问（<code>loopbackOnly: true</code>）；需要从局域网查看
+时改为 <code>false</code>（与 GUI 其它路由一致，未做鉴权）。</li>
+<li>插件只读取 <code>session/event</code> 与提供只读端点，不修改任何会话数据。</li>
+</ul>
+<h2>贡献 / Contributing</h2>
+<p>欢迎 PR 与 Issue（中英皆可）。本仓库<strong>中英双语维护</strong>：文档改动需同步更新
+<code>README.md</code>（中文）与 <code>README.en.md</code>（英文），配置注释双语；完整规范见
+<a href="https://github.com/bpc-oss/dsh-web-billing/blob/HEAD/CONTRIBUTING.md">CONTRIBUTING.md</a>。</p>
+<h2>License</h2>
+<p>MIT</p>

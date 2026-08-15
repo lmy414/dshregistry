@@ -1,0 +1,95 @@
+<h1>dsh-proof</h1>
+<p>Independent read-only acceptance layer for the DeepSeek Harness.</p>
+<p><a href="https://awesome-dsh-plugin.com"><img src="https://awesome-dsh-plugin.com/badge.svg" alt="Awesome DSH Plugin"></a></p>
+<p>Before each top-level turn closes, <code>dsh-proof</code> spawns a <strong>read-only</strong> verifier
+subagent, collects its structured verdict, and steers any non-<code>pass</code> gaps back
+into the driving agent. It is the harness's missing "is the agent actually
+done" gate — no other plugin can substitute for it.</p>
+<h2>Install</h2>
+<pre><code>dsh plugin --profile &lt;name&gt; add github:EvilIrving/dsh-proof
+</code></pre>
+<p>Or, from a checkout:</p>
+<pre><code>dsh plugin --profile &lt;name&gt; add ./dsh-proof
+</code></pre>
+<p>The bundle patch inserts one plugin row (<code>dsh-proof</code>); it needs the
+<code>subagents</code> service (the official <code>dsh-subagent</code> providers), which the base
+profile already mounts.</p>
+<h2>How it works</h2>
+<table>
+<thead>
+<tr>
+<th>Step</th>
+<th>Mechanism</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>Intercept "about to close"</td>
+<td><code>agent/turn-stopping</code> (serial, awaited before the turn commits)</td>
+</tr>
+<tr>
+<td>Spawn a read-only verifier</td>
+<td><code>ctx.subagents.start('spawn', …)</code> with <code>toolFilter.deny</code> + <code>outputSchema</code></td>
+</tr>
+<tr>
+<td>Block recursion</td>
+<td><code>delegationDepthOf(agent) &gt; 0</code> filter + <code>maxDepth: 0</code></td>
+</tr>
+<tr>
+<td>Steer gaps back</td>
+<td><code>agent.inject(gap details)</code> + <code>agent.steer(followup)</code> on <code>fail</code> / <code>insufficient-evidence</code></td>
+</tr>
+</tbody></table>
+<p>The verifier inherits the parent's tool set and is narrowed by the deny list
+(see <a href="#deny-list">deny list</a>); it never sees a whitelist that could
+accidentally hide a newly added read-only tool. A verifier that ends with
+<code>stopReason !== 'completed'</code> or a missing <code>structured</code> result is treated as
+"no objection", so a failed proof never fails the user's turn.</p>
+<h2>Config</h2>
+<pre><code>export interface Config {
+  providerName: string          // default 'spawn'
+  maxAttemptsPerTurn: number    // default 3
+  denyTools: string[]           // default mutating-tool deny list
+  verifierPrompt: string        // read-only acceptance instruction
+  followupInstruction: string   // steering text after a failed verdict
+}
+</code></pre>
+<p>Set any field from <code>cordis.yml</code>:</p>
+<pre><code>plugins:
+  dsh-proof:
+    config:
+      maxAttemptsPerTurn: 2
+      denyTools: [write, edit, str_replace_editor, bash, run_code, subagent]
+</code></pre>
+<h3>Deny list</h3>
+<p><code>toolFilter.deny</code> removes tools from the verifier's <strong>inherited</strong> full set.
+<code>tools.restrict</code> validates every name loudly, so <code>denyTools</code> must name tools the
+deployment actually registers. The default is
+<code>write, edit, str_replace_editor, bash, run_code, subagent</code>, which keeps
+read-only discovery tools (<code>read</code>, <code>read_image</code>, <code>glob</code>, <code>grep</code>) available. A
+deployment that adds its own mutating tools must extend the list; a deployment
+that forbids even shell/read access should switch to an explicit <code>allow</code>
+whitelist (set <code>denyTools</code> and <code>verifierPrompt</code> to match, or extend the plugin
+for an <code>allowTools</code> field).</p>
+<h2>Model Experience</h2>
+<h3>Request context and condition</h3>
+<h4>What the model sees</h4>
+<p>The top-level agent receives an injected user message listing the verifier's
+gaps and evidence, followed by the configured <code>followupInstruction</code>. Only a
+non-<code>pass</code> verdict injects anything; a passing turn adds nothing.</p>
+<h4>Token effect</h4>
+<p>Zero-direct effect on passing turns. A failing turn adds one bounded injected
+message (gaps + evidence) plus the short follow-up line.</p>
+<h4>KV Cache effect</h4>
+<p>Append-only: the injected context and follow-up are appended as new user
+messages, never rewriting earlier request tokens.</p>
+<h2>Known Limitations and Deferred Work</h2>
+<ul>
+<li><strong>Deny list must match the deployment's tools</strong> — <code>tools.restrict</code> fails loud
+on unknown names, so a mismatched default blocks verifier startup. The exact
+mutating-tool set is deployment-specific and is resolved at first install.</li>
+<li><strong>No evidence normalization</strong> — the verifier gathers evidence itself; this
+plugin does not re-implement diff/test/typecheck/lint. A deployment wanting
+specific evidence channels should extend <code>verifierPrompt</code>.</li>
+<li><strong>Best-effort spawn</strong> — a provider that is absent or rejects the request
+degrades to a no-op (logged), rather than failing the user's turn.</li>
+</ul>

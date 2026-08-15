@@ -1,0 +1,159 @@
+<h1>tesseract-ocr</h1>
+<p><a href="https://github.com/deepseek-ai/deepseek-harness">DeepSeek Harness</a> (dsh) plugin that lets <strong>text-only models</strong> accept attached images: every image is recognized <strong>locally</strong> with <a href="https://github.com/tesseract-ocr/tesseract">Tesseract OCR</a> and only the recognized <strong>text</strong> is sent to the model API. <strong>Image bytes never leave your machine.</strong></p>
+<p>Tested on Ubuntu (primary target); works anywhere the <code>tesseract</code> CLI is installed (Linux, macOS, Windows).</p>
+<ul>
+<li>No configuration changes to your models — no <code>input: [text, image]</code> hacks in <code>settings.yaml</code>.</li>
+<li>Works with any provider/model in dsh; OCR applies only to text models.</li>
+<li>Genuine vision models (declared image capability) pass images through untouched by default.</li>
+<li>Fail-closed: if the plugin is not loaded, models stay text-only and image attachments are refused — nothing can silently leak.</li>
+</ul>
+<blockquote>
+<p>Do not enable this plugin together with <code>windows-ocr</code>: both would OCR the same image. Pick one per machine.</p>
+</blockquote>
+<h2>Quick install via an AI agent</h2>
+<p>Hand this repository to any AI agent, or paste the instruction below, and the
+agent will install and verify the plugin for you:</p>
+<blockquote>
+<p>Please install the dsh plugin in this repository by following
+<a href="https://github.com/maxwell-feng/dsh-tesseract-ocr/blob/main/agents-install.md">https://github.com/maxwell-feng/dsh-tesseract-ocr/blob/main/agents-install.md</a>.
+Run every preflight check, choose an install mode, then complete the
+mandatory verification: attach an image to a text-only model session and
+confirm the model answers with the recognized text.</p>
+</blockquote>
+<p><a href="https://github.com/maxwell-feng/dsh-tesseract-ocr/blob/HEAD/agents-install.md"><code>agents-install.md</code></a> is a step-by-step guide written for
+AI agents: preflight checks (including installing Tesseract and language
+packs), both install modes (permanent profile patch / temporary <code>--patch</code>
+overlay), mandatory functional verification, and troubleshooting for the
+failure modes you are likely to hit. Manual install instructions are below.</p>
+<h2>Why a plugin (not a skill)</h2>
+<p>dsh skills are Markdown instruction files injected into the model context — they cannot execute code, cannot hook the request pipeline, and cannot stop an image from being serialized. This feature needs exactly that, so it is a cordis plugin that hooks two public seams of the <code>llm</code> service (same design as <code>windows-ocr</code>):</p>
+<ol>
+<li><strong>Capability shim</strong> — <code>ctx.llm.resolveModelInfo</code> (also <code>listModels</code>). The host gates image attachments on <code>inputModalities.includes("image")</code> at three places: message admission, model switching, and the <code>read_image</code> tool. The shim answers "yes", so text models admit images.</li>
+<li><strong>Request rewrite</strong> — <code>registration.adapter.stream</code> (the single choke point both <code>ctx.llm.stream</code> and <code>prepareCall().stream</code> funnel through). Every <code>image</code> content block is replaced with an OCR text block before the adapter serializes the request, so the adapter's own image check never fires, no attachment bytes are read for the wire, and no <code>image_url</code> is ever built.</li>
+</ol>
+<pre><code>you attach an image
+  → admission asks ctx.llm.resolveModelInfo (shimmed: "image" ✓)
+  → image stored in the local attachment store (session log, UI preview)
+  → agent builds the request → adapter.stream (wrapped)
+  → image block read locally (ctx.attachments.readImage) → tesseract CLI
+  → block replaced with &lt;image_ocr&gt;…text…&lt;/image_ocr&gt;
+  → adapter serializes a text-only request → provider
+</code></pre>
+<h2>Requirements (Ubuntu)</h2>
+<pre><code>sudo apt update
+sudo apt install -y tesseract-ocr tesseract-ocr-chi-sim   # chi-sim = Simplified Chinese; add more packages as needed
+tesseract --version        # verify
+tesseract --list-langs     # verify installed languages
+</code></pre>
+<p>Language packs: <code>tesseract-ocr-eng</code> (usually pulled in by the base package), <code>tesseract-ocr-chi-sim</code>, <code>tesseract-ocr-chi-tra</code>, <code>tesseract-ocr-jpn</code>, … The <code>language</code> config joins multiple tags with <code>+</code>, e.g. <code>eng+chi_sim</code>.</p>
+<h2>Install into dsh</h2>
+<h3>Installing via an AI agent</h3>
+<p><a href="https://github.com/maxwell-feng/dsh-tesseract-ocr/blob/HEAD/agents-install.md"><code>agents-install.md</code></a> in this repository is a
+step-by-step installation guide written <strong>for AI agents</strong> (and careful
+humans). Give it to an agent — e.g. "install this plugin per
+<code>agents-install.md</code> from <a href="https://github.com/maxwell-feng/dsh-tesseract-ocr">https://github.com/maxwell-feng/dsh-tesseract-ocr</a>" —
+and the agent can perform the preflight checks, install, verification, and
+troubleshooting on its own. The guide covers both install modes, the
+mandatory functional verification (attach an image → model answers with the
+OCR text), and the failure modes you are likely to hit.</p>
+<h3>Manual install</h3>
+<p>Two official ways to load this plugin, both referencing the plugin file by <strong>absolute path</strong> (see <code>docs/user/develop/basic</code>). On Windows the path must be a <code>file://</code> URL — a bare <code>C:/...</code> path is parsed as the <code>c:</code> URL scheme and the loader rejects it. On Linux a plain absolute path works too:</p>
+<pre><code>name: '/home/you/tesseract-ocr/lib/index.js'
+</code></pre>
+<h3>Permanent: profile patch layer</h3>
+<p>Append to your profile's <code>cordis.patch.yml</code> (e.g. <code>~/.dsh/profiles/web/cordis.patch.yml</code>):</p>
+<pre><code>- insert:
+    - id: tesseract-ocr
+      name: '/home/you/tesseract-ocr/lib/index.js'
+      config:
+        language: eng+chi_sim
+        passthrough: true
+</code></pre>
+<p>Then restart <code>dsh web</code>. Remove the rows to uninstall — nothing else is touched.</p>
+<h3>Temporary: <code>--patch</code> overlay</h3>
+<p>Put the same rows in an overlay file and boot with it; your profile stays untouched:</p>
+<pre><code>dsh --profile web --patch /home/you/tesseract-ocr/dev.patch.yml
+</code></pre>
+<h3>Notes</h3>
+<ul>
+<li><code>dsh web</code> failing with <code>EADDRINUSE</code> means an older instance still holds the port: <code>ss -ltnp | grep 3080</code>, stop that process, start again.</li>
+<li>For a packaged install (npm / tarball / <code>github:user/repo</code>), package the plugin as a bundle (<code>dsh.bundle</code> + <code>cordis.patch.yml</code>, see <code>docs/user/develop/basic/publish</code>); a git install additionally needs a <code>prepare</code> build script and pnpm <code>allowBuilds</code> consent.</li>
+</ul>
+<h2>Configuration</h2>
+<p>All settings live in the patch row <code>tesseract-ocr</code>:</p>
+<table>
+<thead>
+<tr>
+<th>Key</th>
+<th>Default</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>language</code></td>
+<td><code>eng</code></td>
+<td>Tesseract language(s), <code>+</code>-joined, e.g. <code>eng</code>, <code>chi_sim</code>, <code>eng+chi_sim</code></td>
+</tr>
+<tr>
+<td><code>passthrough</code></td>
+<td><code>true</code></td>
+<td><code>true</code>: genuine vision models receive images untouched; <code>false</code>: OCR everything</td>
+</tr>
+<tr>
+<td><code>tesseractBin</code></td>
+<td><code>tesseract</code></td>
+<td>CLI path; space-separated prefix args allowed, e.g. <code>/usr/bin/tesseract</code></td>
+</tr>
+<tr>
+<td><code>psm</code></td>
+<td><code>3</code></td>
+<td>Page segmentation mode (<code>tesseract --psm</code>)</td>
+</tr>
+<tr>
+<td><code>timeoutMs</code></td>
+<td><code>60000</code></td>
+<td>Per-image OCR timeout</td>
+</tr>
+<tr>
+<td><code>maxCacheEntries</code></td>
+<td><code>200</code></td>
+<td>Bound on the per-run OCR cache (keyed by attachment id)</td>
+</tr>
+</tbody></table>
+<h2>How the model sees the image</h2>
+<p>Each image block becomes a text block:</p>
+<pre><code>&lt;image_ocr name="photo.png"&gt;
+…recognized lines…
+&lt;/image_ocr&gt;
+</code></pre>
+<p>Recognition text is cached per attachment id for the lifetime of the dsh process, so repeated turns do not re-run OCR.</p>
+<h2>Temp-file hygiene</h2>
+<p>Every OCR run writes its input image into a <strong>fresh temporary directory</strong>
+(<code>tesseract-ocr-*</code> under the system temp dir). The directory is removed
+automatically in <code>finally</code> — on success, on OCR error, and on timeout — so no
+per-run image file survives. At plugin start, any orphaned <code>tesseract-ocr-*</code>
+directories left behind by a previously crashed process are swept as well.
+Nothing is written outside the plugin's own temporary directory and the dsh
+attachment store.</p>
+<h2>Smoke test (no dsh needed)</h2>
+<pre><code># render a test image with text, then OCR it
+convert -size 400x120 xc:white -pointsize 36 -fill black \
+  -draw "text 20,80 'Hello OCR 123'" /tmp/ocr-test.png   # ImageMagick; any PNG works
+tesseract /tmp/ocr-test.png stdout -l eng --psm 3
+</code></pre>
+<p>Exit 0 with the recognized text means Tesseract is ready.</p>
+<h2>Verification inside dsh</h2>
+<ol>
+<li>Attach an image to a text-model session and send a message — the model should answer using the recognized text.</li>
+<li>Confirm the image never goes out: open DevTools → Network in the web UI, inspect the request to your provider base URL, and verify the payload contains only <code>text</code> content parts (no <code>image_url</code> / data URI).</li>
+</ol>
+<h2>Limitations</h2>
+<ul>
+<li>Recognition quality depends on the installed language packs and <code>psm</code>; tune <code>language</code>/<code>psm</code> per use case.</li>
+<li>Image formats depend on the Tesseract/Leptonica build: PNG/JPEG/TIFF/BMP are safe; WebP/GIF may require additional Leptonica support.</li>
+<li>Cache is per process; a long-lived session keeps OCR text cached, bounded by <code>maxCacheEntries</code>.</li>
+<li>Hot reload (HMR) replaces adapters; the plugin re-wraps new adapters on <code>llm/adapters-updated</code>, but a full restart is the safe path after any dsh update.</li>
+<li>If the plugin is removed, image attachments to text models are refused again (fail-closed), not uploaded.</li>
+</ul>
+<h2>License</h2>
+<p>MIT</p>

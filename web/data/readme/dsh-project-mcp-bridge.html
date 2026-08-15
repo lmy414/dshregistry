@@ -1,0 +1,283 @@
+<h1>dsh-project-mcp-bridge</h1>
+<p><a href="https://github.com/KYinCode/dsh-project-mcp-bridge/blob/HEAD/README.md">English</a> | <a href="https://github.com/KYinCode/dsh-project-mcp-bridge/blob/HEAD/README.zh.md">中文</a></p>
+<blockquote>
+<p><strong>TL;DR</strong> — Let each project declare its own MCP servers. Drop a
+<code>.dsh/mcp.json</code> into a project root; every session of that project then
+has those servers' tools (<code>mcp__&lt;serverName&gt;__&lt;toolName&gt;</code>), and editing
+the file takes effect <strong>live</strong> — no new session, no restart.</p>
+<p>It is a <strong>client bridge</strong> (consumes MCP servers). Not an MCP server, not
+an official DeepSeek package.</p>
+</blockquote>
+<h2>30-second demo</h2>
+<pre><code>// MyProject/.dsh/mcp.json
+{
+  "mcpServers": {
+    "github": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-github"],
+      "env": { "GITHUB_TOKEN": "${GITHUB_TOKEN}" }
+    }
+  }
+}
+</code></pre>
+<p>Then, in any session opened in <code>MyProject</code>, the model can directly call
+<code>mcp__github__create_issue</code> etc. — the same <code>mcpServers</code> JSON shape used by
+Claude Code, Cursor and VS Code. Save the file again later and running
+sessions pick the change up within ~1 s.</p>
+<p>Install once: <code>dsh plugin --profile web add dsh-project-mcp-bridge</code> (one
+restart), or see <a href="#installation">Installation</a> for the restart-free dev
+path.</p>
+<hr>
+<h2>How it works</h2>
+<pre><code>agent created (agent/created)
+  -&gt; read &lt;session cwd&gt;/.dsh/mcp.json
+  -&gt; for each server entry:
+       - if a preset/host MCP row already provides the same serverName
+         and the entry has no "override": true  -&gt; skip (log explains why)
+       - else one-shot SCHEMA SYNC: connect (stdio spawn or
+         streamable-http) + list tools + register each as
+         mcp__&lt;serverName&gt;__&lt;rawName&gt; into the AGENT scope layer only
+         (project &gt; preset &gt; host) + close again
+  -&gt; no connection is kept: an idle session holds no child process
+
+first call to a server's tool (execute)
+  -&gt; the agent's controller checks its per-server connection
+  -&gt; absent -&gt; LAZY CONNECT ("connecting..." is logged; this is the
+     first-call latency) -&gt; call
+  -&gt; every call re-arms a per-connection idle timer (default 5 min);
+     on fire the connection closes and the child process is released;
+     the next call reconnects transparently
+  -&gt; if the connection dies (onclose), this agent drops it and the next
+     call reconnects — no broadcast, no shared state
+</code></pre>
+<p>Connections are <strong>per agent, never pooled</strong>: N sessions calling the same
+server run N independent processes (isolation over sharing). Sessions that
+never call a server hold no process at all.</p>
+<h2>Installation</h2>
+<p>The package is a <strong>profile bundle</strong>: install with the dsh CLI, no manual
+patching.</p>
+<pre><code>dsh plugin --profile web add dsh-project-mcp-bridge
+</code></pre>
+<p><code>dsh plugin</code> runs pnpm in the profile directory, then reconciles
+<code>dsh.profile.bundles</code>: the package declares <code>dsh.bundle.patch</code>, so it joins
+the profile's bundle layers automatically. The bundle's own
+<code>cordis.patch.yml</code> supplies the plugin row — nothing to add by hand.</p>
+<p><strong>Restart <code>dsh web</code> once</strong> after installing: bundle layers are composed at
+startup (only the user patch layer and <code>settings.yaml</code> are hot-reloaded).
+After that, <code>.dsh/mcp.json</code> changes are hot (see Config hot-reload).</p>
+<h3>Restart-free dev path (hot install)</h3>
+<p>If you iterate on this plugin itself and want changes live without
+restarts, install it as a <strong>user patch row</strong> instead of a bundle. The row
+references the package by <strong>name</strong> (resolved from the profile's
+<code>node_modules</code>), so it is portable and hot:</p>
+<pre><code>cd ~/.dsh/profiles/web
+pnpm add dsh-project-mcp-bridge          # package into node_modules (no reconcile)
+</code></pre>
+<p>Then append to <code>~/.dsh/profiles/web/cordis.patch.yml</code>:</p>
+<pre><code>- insert:
+    - id: dsh-project-mcp-bridge
+      name: 'dsh-project-mcp-bridge'     # package name, NOT a file:// path
+</code></pre>
+<p>The user patch layer is hot-reloaded (~4 s), so the row activates without
+a restart. Note: do NOT use <code>dsh plugin add</code> for this path — it would also
+register the bundle and duplicate the row after the next restart. Prefer
+the bundle install for normal use; this path is for local iteration.</p>
+<h2>Project config</h2>
+<p>Create <code>.dsh/mcp.json</code> at the project root (the file's presence is the
+opt-in; sessions of projects without it are untouched):</p>
+<pre><code>{
+  "mcpServers": {
+    "github": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-github"],
+      "env": { "GITHUB_TOKEN": "${GITHUB_TOKEN}" },
+      "idleTimeoutMs": 300000
+    },
+    "local-api": {
+      "url": "http://localhost:3000/mcp",
+      "headers": { "Authorization": "Bearer ${MCP_TOKEN}" },
+      "override": true
+    }
+  }
+}
+</code></pre>
+<h3>Fields (same names as dsh-mcp-client)</h3>
+<table>
+<thead>
+<tr>
+<th>Field</th>
+<th>Transport</th>
+<th>Required</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>transport</code></td>
+<td>both</td>
+<td>—</td>
+<td>inferred: <code>command</code> present → stdio; <code>url</code> present → streamable-http; exactly one of the two</td>
+</tr>
+<tr>
+<td><code>serverName</code></td>
+<td>both</td>
+<td>yes</td>
+<td>tool namespace (the JSON key); <code>[A-Za-z0-9_-]{1,32}</code></td>
+</tr>
+<tr>
+<td><code>command</code></td>
+<td>stdio</td>
+<td>yes</td>
+<td>executable to spawn</td>
+</tr>
+<tr>
+<td><code>args</code></td>
+<td>stdio</td>
+<td>no</td>
+<td>arguments</td>
+</tr>
+<tr>
+<td><code>env</code></td>
+<td>stdio</td>
+<td>no</td>
+<td>extra environment, merged over the scrubbed parent env</td>
+</tr>
+<tr>
+<td><code>cwd</code></td>
+<td>stdio</td>
+<td>no</td>
+<td>child working directory (relative paths resolve against the project root)</td>
+</tr>
+<tr>
+<td><code>url</code></td>
+<td>http</td>
+<td>yes</td>
+<td>MCP server URL</td>
+</tr>
+<tr>
+<td><code>headers</code></td>
+<td>http</td>
+<td>no</td>
+<td>extra headers</td>
+</tr>
+<tr>
+<td><code>toolCallTimeoutMs</code></td>
+<td>both</td>
+<td>no</td>
+<td>per-call timeout (default 60000)</td>
+</tr>
+<tr>
+<td><code>idleTimeoutMs</code></td>
+<td>both</td>
+<td>no</td>
+<td>idle disconnect after this many ms without a call (default 300000 = 5 min; <code>0</code> = never disconnect)</td>
+</tr>
+<tr>
+<td><code>override</code></td>
+<td>both</td>
+<td>no</td>
+<td>force this project connection even if a preset/host row already provides the same serverName (default false)</td>
+</tr>
+</tbody></table>
+<p><code>${NAME}</code> placeholders in <code>env</code>/<code>headers</code> values are expanded from the
+host process environment.</p>
+<h2>Conflict semantics (project vs. preset/host MCP)</h2>
+<ul>
+<li>Tools register into the <strong>agent</strong> scope layer; the layered registry
+shadows same-named tools from the preset layer and the global layer —
+visibility priority is <strong>project &gt; preset &gt; host</strong>.</li>
+<li>A <code>serverName</code> already provided by a preset/host row is <strong>skipped by
+default</strong> (one live connection per server). Set <code>"override": true</code> to
+force the project connection instead (double connection accepted,
+project tools win).</li>
+<li><strong>Override does not disable the upper layers.</strong> The project connection is
+added on top: the upper (host/preset) connections stay alive, and the
+agent-layer copy shadows same-named tools (layered registry), so the
+model actually calls the project connection. The tool names carry no
+origin marker — the plugin logs
+<code>... shadows upper-layer registration(s); upper connections stay alive</code>
+when an override registers over existing upper registrations; process
+count is the other way to verify.</li>
+<li>Different serverNames or different tool names coexist freely.</li>
+<li><strong>Note — two bridges, two philosophies</strong>: between official
+<code>dsh-mcp-client</code> instances (host rows, preset rows), a duplicate
+<code>serverName</code> is <strong>process-wide unique and fails the mount</strong> ("pick a
+unique serverName") — that bridge prefers fail-loud over silent
+shadowing. This plugin, when its project config collides with an upper
+layer, <strong>skips</strong> instead, so the project session still starts. In
+practice: project vs host/preset duplicates → skipped (this plugin);
+preset vs host duplicates among <code>dsh-mcp-client</code> rows → rename one.</li>
+</ul>
+<h2>Config hot-reload</h2>
+<p>Saving <code>.dsh/mcp.json</code> re-resolves the config for <strong>every running session</strong>
+of that project and <strong>fully rebuilds</strong> each session's project MCP surface:</p>
+<ul>
+<li><strong>added server</strong> → schema sync + register tools (running sessions gain them)</li>
+<li><strong>removed server</strong> → unregister tools + close its connection</li>
+<li><strong>changed server</strong> → full rebuild — unregister everything, close all
+connections, re-read, re-register. No fingerprint diffing: a change simply
+rebuilds. Same serverName keeps the same public tool names, so recorded
+tool calls stay replayable</li>
+<li><strong>deleted config</strong> → all project MCP tools unload</li>
+</ul>
+<p>No new session needed. The file is polled (<code>fs.watchFile</code>, ~500 ms) with a
+300 ms debounce, fanned out to every live session of the project. An
+in-flight tool call on a server being reconfigured may be interrupted by the
+rebuild.</p>
+<p><strong>Connection death (v4)</strong>: if a server's process dies, the SDK's <code>onclose</code>
+fires and that agent drops its dead connection; the <strong>next call reconnects</strong>
+automatically (lazy) — no restart, no new session, no config change. Each
+agent is self-managed: nothing is broadcast, so a death in one session never
+disturbs another. A reconnect that fails surfaces as a tool error; the next
+call retries. Note: after a reconnect, the server's <em>internal</em> dependencies
+(e.g. a browser connection) may take a few more seconds to become ready —
+calls in that window can fail with the server's own error; this is server
+behavior, not a bridge defect.</p>
+<p><strong>Idle disconnect</strong>: connections close after <code>idleTimeoutMs</code> without a call
+(default 5 min; per-server configurable, <code>0</code> = never). An idle session holds
+no child process; the next call reconnects transparently (only latency).</p>
+<p><strong>Lazy connect caveat</strong>: tool schemas only exist on the server, so session
+creation performs a brief one-shot schema sync per accepted server (connect</p>
+<ul>
+<li>list tools + register + close). Sessions that never call a server pay only
+this brief spawn; no connection is kept afterwards. If the schema sync fails
+(server down at creation), that server's tools are not registered until the
+next config change or a new session.</li>
+</ul>
+<h2>Environment scrubbing (privilege reduction)</h2>
+<p>MCP children are spawned with the official <code>scrubbedParentEnv()</code>: the
+ambient environment minus credential-shaped names (anything matching
+<code>KEY|PASSWORD|SECRET|TOKEN</code>) and minus stale <code>DSH_*</code> names. <code>PATH</code>, <code>HOME</code>
+and locale survive, so children run normally; secrets that merely happen
+to be in the host environment are NOT inherited. Only the entry's explicit
+<code>env</code> is added back. This is not a sandbox: a malicious config can still
+execute code as your user and read your files (see Trust model).</p>
+<h2>Trust model ⚠️</h2>
+<p><code>.dsh/mcp.json</code> contains <strong>executable content</strong> — the same trust model as
+<code>package.json</code> scripts. A <code>git clone</code> can bring its own <code>.dsh/mcp.json</code>
+(just as it can bring a malicious <code>postinstall</code>), and opening the project
+will run it when a session is created. Only open projects from sources you
+trust. The plugin reduces blast radius (scrubbed env, auditable logs) but
+does not and cannot make untrusted projects safe.</p>
+<h2>Logging</h2>
+<ul>
+<li><code>ctx.logger</code> (host stdout — not persisted by this deployment)</li>
+<li><code>~/.dsh/logs/dsh-project-mcp-bridge/dsh-project-mcp-bridge.log</code>
+(append-only; every step — config read, skip reason, connect, tool
+registration, close — is recorded with a timestamp and the project path)</li>
+</ul>
+<h2>Limitations</h2>
+<ul>
+<li>Resources and prompts from MCP servers are not bridged (tools only).</li>
+<li>Connections are <strong>per agent, never pooled</strong>: N sessions calling the same
+server = N processes. Heavy servers (e.g. chrome-devtools) cost one
+process per active session — the idle timeout keeps unused ones short-
+lived. Session creation also pays one brief schema-sync spawn per server.</li>
+<li>Streaming/task-based MCP execution is not supported (call only).</li>
+</ul>
+<h2>Further reading</h2>
+<ul>
+<li><a href="https://github.com/KYinCode/dsh-project-mcp-bridge/blob/HEAD/docs/design-notes.md">Design notes: DSH philosophy and this plugin's alignment</a> ·
+<a href="https://github.com/KYinCode/dsh-project-mcp-bridge/blob/HEAD/docs/design-notes.zh.md">设计笔记（中文）</a> — why DSH is layered the way
+it is, its trust model, the hot-reload boundary, and why project-level MCP
+is a plugin's job.</li>
+</ul>

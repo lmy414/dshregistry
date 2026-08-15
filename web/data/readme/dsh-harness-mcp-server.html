@@ -1,0 +1,111 @@
+<h1>dsh-harness-mcp-server</h1>
+<blockquote>
+<p>Expose <a href="https://github.com/deepseek-ai/deepseek-harness">DeepSeek Harness</a> agent capabilities as an <strong>MCP server</strong>, letting any MCP client (e.g. <a href="https://hermes-agent.nousresearch.com/">Hermes</a>) drive Harness to execute real coding tasks.</p>
+</blockquote>
+<p><strong>Hermes is the brain (pro), Harness is the arms (flash) — 1+1&gt;2.</strong></p>
+<p><a href="https://www.npmjs.com/package/@chushixixin/dsh-harness-mcp-server"><img src="https://img.shields.io/npm/v/@chushixixin/dsh-harness-mcp-server" alt="npm version"></a>
+<a href="https://github.com/chushixixin/dsh-harness-mcp-server/blob/HEAD/LICENSE"><img src="https://img.shields.io/npm/l/@chushixixin/dsh-harness-mcp-server" alt="license"></a></p>
+<h2>Why this exists</h2>
+<p>Harness ships a powerful agent runtime (tools, LLM, agents, sessions), but it is a <strong>Cordis app</strong>, not something another agent can call. This plugin turns Harness inside-out: it starts a real <strong>MCP server</strong> (StreamableHTTP) <em>inside</em> Harness and bridges Harness's core services — <code>ctx.agents</code>, <code>ctx.agentPresets</code>, <code>ctx.tools</code> — so an external "brain" can delegate real work to Harness's "arms".</p>
+<pre><code>Hermes (MCP client, brain)
+   │  agent_run / task_inbox (HTTP)
+   ▼
+dsh-harness-mcp-server (MCP server, :8090)
+   │  ctx.agents.create → mount 'standard' preset
+   ▼
+Harness agent (flash) — full toolset: bash, fs, todo, web…
+</code></pre>
+<h2>Tools</h2>
+<table>
+<thead>
+<tr>
+<th>Tool</th>
+<th>Direction</th>
+<th>Purpose</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>echo</code></td>
+<td>—</td>
+<td>Verify MCP connectivity</td>
+</tr>
+<tr>
+<td><code>harness_list_tools</code></td>
+<td>—</td>
+<td>List Harness's registered tool names</td>
+</tr>
+<tr>
+<td><code>agent_run</code></td>
+<td>Hermes → Harness</td>
+<td>Run a task synchronously and return a structured result</td>
+</tr>
+<tr>
+<td><code>task_inbox</code></td>
+<td>Hermes → Harness</td>
+<td>Push a structured task (task + memory context + cwd) to an async queue</td>
+</tr>
+<tr>
+<td><code>task_result</code></td>
+<td>Hermes ← Harness</td>
+<td>Poll a queued task's structured result</td>
+</tr>
+</tbody></table>
+<p>Every task result is <strong>structured</strong>:</p>
+<pre><code>{
+  "sessionId": "...",
+  "assistantText": "final answer",
+  "toolCalls": [{ "name": "bash", "args": "..." }],
+  "toolResults": ["command output"],
+  "changes": "what was changed",
+  "verification": "how it was verified",
+  "leftovers": "open issues"
+}
+</code></pre>
+<p>This closes the loop between the client's persistent memory and Harness's coding: memory is fed into each task as <code>context</code>, and the result (<code>changes</code> / <code>verification</code> / <code>leftovers</code>) can be persisted back to the client's memory for the next run.</p>
+<h2>Install</h2>
+<h3>Option A — from npm (recommended)</h3>
+<pre><code>npm install @chushixixin/dsh-harness-mcp-server
+</code></pre>
+<p>Then reference the plugin from your Harness workspace (see the cordis patch below).</p>
+<h3>Option B — from source</h3>
+<p>Clone this repo inside your Harness workspace under <code>packages/mcp/harness-mcp-server/</code> (the pnpm workspace matches <code>packages/*/*</code>, two levels deep):</p>
+<pre><code>cd /path/to/deepseek-harness
+mkdir -p packages/mcp/harness-mcp-server
+# copy this repo's files there, then:
+corepack pnpm install
+</code></pre>
+<p>Register it in <code>tsconfig.host.json</code> references and <code>tsconfig.base.json</code> paths (see the Harness plugin docs), then build:</p>
+<pre><code>corepack pnpm exec tsc -b packages/mcp/harness-mcp-server
+corepack pnpm run build:lib:host
+</code></pre>
+<h2>Run</h2>
+<pre><code>export DEEPSEEK_API_KEY=...
+corepack pnpm dsh web --patch ./packages/mcp/harness-mcp-server/cordis.yml
+</code></pre>
+<p>The MCP server listens on <code>127.0.0.1:8090</code> (StreamableHTTP). Point any MCP client at <code>http://127.0.0.1:8090/mcp</code>.</p>
+<blockquote>
+<p>⚠️ <strong>Security</strong>: by default the server binds to <code>127.0.0.1</code> only. It exposes <strong>unauthenticated remote code execution</strong> — do <strong>not</strong> bind it to <code>0.0.0.0</code> or expose it to the internet/LAN without adding authentication, TLS, and a reverse proxy first.</p>
+</blockquote>
+<h3>Hermes client config</h3>
+<pre><code>printf 'n\nY\n' | hermes mcp add harness_plugin --url http://127.0.0.1:8090/mcp
+</code></pre>
+<h2>cordis.yml (patch format)</h2>
+<pre><code>- insert:
+    - id: harness-mcp-server
+      name: '@chushixixin/dsh-harness-mcp-server'
+      config:
+        http: true
+        port: 8090
+        host: 127.0.0.1        # 默认仅本机; 暴露前必须加认证
+        # authToken: 'your-secret-token'     # 可选: Bearer token 认证
+        # workspaceRoots: ['/workspace']      # 可选: cwd 白名单
+</code></pre>
+<h2>Positioning</h2>
+<p>This is best used as a <strong>fallback tool</strong>, not a daily driver: for everyday code edits, drive your primary agent directly. Reach for this when you need <strong>context isolation</strong> (huge refactors that would blow the client's context) or <strong>parallel execution</strong> of unrelated tasks.</p>
+<ul>
+<li>The agent session is <strong>reused per cwd</strong> (avoids re-loading project context on every call — roughly 15–20× cheaper than one-shot <code>dsh headless</code>).</li>
+<li>Bash runs sandboxed (<code>workspace-write</code>): install <code>bubblewrap</code> on the host, or the sandbox will refuse write commands.</li>
+<li>Each new MCP session gets its own <code>McpServer</code> + transport (an MCP <code>McpServer</code> connects to a single transport).</li>
+</ul>
+<h2>License</h2>
+<p>MIT</p>

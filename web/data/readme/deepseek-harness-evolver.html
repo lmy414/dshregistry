@@ -1,0 +1,156 @@
+<h1>plugin-evolve</h1>
+<p><a href="https://awesome-dsh-plugin.com"><img src="https://awesome-dsh-plugin.com/badge.svg" alt="Awesome DSH Plugin"></a></p>
+<p>官方 <a href="https://www.deepseek.com/harness/">创造模式</a> 的原话是：检查当前运行时、<strong>在内存中试验 Cordis 插件</strong>，并据此组合和创作新的模式。架构是 <a href="https://github.com/deepseek-ai/deepseek-harness">一切皆插件</a>。</p>
+<p>这个控制器是补充，不是替代。官方已经把热挂（<code>ctx.plugin</code>、可逆副作用）做完了。我们补的是试验之后的闭环：信号 → 提案 → 校验 → 本进程挂上 → 打分 → <strong>固化到盘上或回滚</strong>。重启还在。</p>
+<p>不是「已经自动自进化」。不会改 agent-loop / session / loader。</p>
+<p>Host-agnostic <strong>controller</strong> for evolving tool plugins, plus a DeepSeek Harness bundle that live-mounts a passing trial into the current process.</p>
+<p>状态机：</p>
+<pre><code>signals → analysis → abstract → stage → validate → mount → score → solidify | rollback
+                         ↘ rejected
+</code></pre>
+<p>CLI <code>mount</code> 只写盘。dsh 插件的 <code>evolve_mount</code> 还会 <code>ctx.plugin</code>，新工具立刻出现在本轮会话里。</p>
+<h2>Install</h2>
+<pre><code>npm install plugin-evolve
+</code></pre>
+<p>Node &gt;= 18. 零运行时依赖。</p>
+<h2>Library</h2>
+<pre><code>import { createController } from "plugin-evolve";
+
+const evolve = createController({ root: process.cwd() });
+await evolve.init();
+
+const advice = await evolve.recordSignals([
+  { kind: "tool_error", payload: { tool: "bash" } },
+]);
+const report = await evolve.analysis();
+// report.ready = points that should be evolved now
+if (advice.shouldPropose || report.ready.length &gt; 0) {
+  const draft = await evolve.abstract(); // or { stage: true }
+  await evolve.stage({
+    manifest: draft.manifest,
+    files: { "plugin.js": draft.source },
+    signalKind: draft.signalKind,
+  });
+}
+await evolve.validate();
+await evolve.mount();
+
+// next process:
+const { evolved, trial } = await evolve.loadout();
+for (const plugin of [...evolved, trial].filter(Boolean)) {
+  await import(plugin.entryPath);
+}
+
+await evolve.score({ samples: 10, successDelta: 2, retryDelta: -1 });
+await evolve.solidify({ confirm: true }); // first 3 keeps need confirm
+</code></pre>
+<h2>CLI</h2>
+<pre><code>npx plugin-evolve init --root .
+npx plugin-evolve analysis
+npx plugin-evolve abstract
+npx plugin-evolve abstract --point tool_error:web_fetch --stage
+npx plugin-evolve signal --kind tool_error --json "{\"tool\":\"bash\"}"
+npx plugin-evolve stage ./examples/retry-on-429 --signal-kind tool_error
+npx plugin-evolve validate
+npx plugin-evolve mount
+npx plugin-evolve score --samples 10 --success-delta 2 --retry-delta -1
+npx plugin-evolve solidify --confirm
+npx plugin-evolve loadout
+npx plugin-evolve events --tail 20
+npx plugin-evolve rollback
+</code></pre>
+<p>所有命令默认打印 JSON。</p>
+<h2>Layout</h2>
+<pre><code>&lt;workspace&gt;/.evolve/
+  state.json
+  events.jsonl          # append-only
+  mounted.json          # at most one in-flight trial
+  candidates/&lt;trialId&gt;/
+  abstracts/&lt;pluginId&gt;/   # last abstracted draft
+  evolved/&lt;pluginId&gt;/v&lt;n&gt;/
+</code></pre>
+<p>同时最多一个 trial。候选必须是扁平目录：<code>manifest.json</code> + 入口 + 可选 README/LICENSE。</p>
+<h2>Manifest</h2>
+<pre><code>{
+  "id": "retry-on-429",
+  "kind": "tool",
+  "purpose": "Retry idempotent HTTP calls after a 429 response",
+  "inject": ["tools"],
+  "entry": "plugin.js",
+  "constraints": { "network": false, "shell": false }
+}
+</code></pre>
+<p>入口必须导出 <code>apply</code>。控制器<strong>不执行</strong>这段代码，只做静态检查。</p>
+<h2>Policy</h2>
+<table>
+<thead>
+<tr>
+<th>规则</th>
+<th>默认</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>只允许 <code>kind: "tool"</code></td>
+<td>是</td>
+</tr>
+<tr>
+<td>允许的 <code>inject</code></td>
+<td><code>["tools"]</code></td>
+</tr>
+<tr>
+<td><code>network</code> / <code>shell</code></td>
+<td>必须 false</td>
+</tr>
+<tr>
+<td>体积</td>
+<td>32 KiB</td>
+</tr>
+<tr>
+<td>禁止</td>
+<td><code>fs</code> / <code>net</code> / <code>http</code> / <code>child_process</code> / <code>eval</code> / <code>new Function</code></td>
+</tr>
+<tr>
+<td>禁止的 id</td>
+<td><code>session</code> <code>loader</code> <code>agent-loop</code> <code>evolve</code> <code>controller</code> <code>plugin-evolve</code></td>
+</tr>
+<tr>
+<td>打分通过</td>
+<td><code>samples &gt;= 10</code> 且 <code>successDelta &gt; 0</code> 且 <code>retryDelta &lt;= 0</code></td>
+</tr>
+<tr>
+<td>人工确认</td>
+<td>前 3 次 <code>solidify</code> 必须 <code>confirm: true</code></td>
+</tr>
+<tr>
+<td>停滞</td>
+<td>同一 <code>signalKind</code> 连续失败 3 次后拒绝再 stage</td>
+</tr>
+</tbody></table>
+<h2>DeepSeek Harness plugin</h2>
+<p>This package is a <code>dsh.bundle</code>. Install it into a profile and the model gets <code>evolve_*</code> tools. <code>evolve_mount</code> calls <code>ctx.plugin</code> so the new tool is live in the current process.</p>
+<pre><code>dsh plugin --profile web add github:shinjiyu/deepseek-harness-evolver
+dsh plugin --profile headless add github:shinjiyu/deepseek-harness-evolver
+</code></pre>
+<p>本地路径也可以：<code>dsh plugin --profile web add D:\tempWorkspace\plugin-evolve</code></p>
+<p>Then, in a workspace:</p>
+<pre><code>dsh --profile headless "web_fetch 连续 429。用 evolve_signal 记两次，evolve_status 看是否该提案，再 evolve_stage 一个只 inject tools 的重试插件，validate、mount，用新工具打 10 次，evolve_score 后 evolve_solidify confirm=true"
+</code></pre>
+<p>Model-facing tools: <code>evolve_analysis</code> <code>evolve_abstract</code> <code>evolve_status</code> <code>evolve_signal</code> <code>evolve_stage</code> <code>evolve_validate</code> <code>evolve_mount</code> <code>evolve_score</code> <code>evolve_solidify</code> <code>evolve_rollback</code>.</p>
+<p><code>evolve_analysis</code> / CLI <code>analysis</code> 读最近 32 条 signal，按 <code>kind</code> + <code>payload.tool</code> 聚成进化点：<code>ready</code> 可提案，<code>watching</code> 还不够两次，<code>blocked_trial</code> 已够但有进行中的 trial，<code>stagnant</code> 被锁。</p>
+<p><code>evolve_abstract</code> / CLI <code>abstract</code> 从 ready 点抽出一个只 inject tools 的插件草稿（manifest + plugin.js），写到 <code>.evolve/abstracts/&lt;id&gt;/</code>。<code>--stage</code> / <code>stage:true</code> 会直接送进 trial。</p>
+<p>Workspace state is <code>&lt;cwd&gt;/.evolve/</code>. Override with <code>PLUGIN_EVOLVE_ROOT</code> or plugin config <code>root</code>.</p>
+<h2>What this is not</h2>
+<ul>
+<li>不是 EvoMap/evolver，也不连 Hub</li>
+<li>不会改 agent-loop / session / loader</li>
+<li>会按信号点抽象出小工具插件草稿，但不会改 agent-loop / 不会替你改业务工程</li>
+</ul>
+<h2>Case: HTTP 429</h2>
+<p>模拟宿主里 <code>web_fetch</code> 连续 429。控制器建议写工具插件；宿主挂上 <code>examples/retry-on-429</code> 后按它的 backoff 再打 10 次，用真实成功率打分并固化。</p>
+<pre><code>npm run case:429
+</code></pre>
+<h2>Develop</h2>
+<pre><code>npm install
+npm test
+</code></pre>
+<p>Repo: <a href="https://github.com/shinjiyu/deepseek-harness-evolver">shinjiyu/deepseek-harness-evolver</a> · 介绍帖：<a href="https://github.com/deepseek-ai/deepseek-harness/discussions/1720">Show and tell #1720</a></p>

@@ -1,0 +1,693 @@
+<h1>dsh-slice-agent-loop</h1>
+<p>English | <a href="https://github.com/TT-Wang/dsh-slice-agent-loop/blob/HEAD/README.zh.md">中文</a></p>
+<blockquote>
+<p><strong>Every turn, hand the model exactly the context it needs. No more, no less.</strong></p>
+</blockquote>
+<p>That sounds like common sense, but today's mainstream coding agents replay the
+entire conversation history back to the model every call: the excess is never
+trimmed, and what falls short can never be recovered. This plugin brings a
+slice loop built around that one sentence into the
+<a href="https://github.com/dsh2026">DeepSeek Harness</a>: <strong>same harness, same model,
+same tools and persistence — only the agent loop is swapped</strong>, so in every
+comparison below the loop itself is the only variable.</p>
+<p>Early beta; tracks DSH snapshot <code>20260812T172954Z</code> (rc.2; rc.1-compatible).</p>
+<h2>One sentence, two constraints</h2>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>Constraint</th>
+<th>Transcript (full-history) status quo</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong>No more</strong></td>
+<td>Context has an upper bound</td>
+<td>Context grows to the window limit, then compacts; attention dilutes, the bill grows with every turn</td>
+</tr>
+<tr>
+<td><strong>No less</strong></td>
+<td>Information stays recoverable</td>
+<td>After compaction, detail is gone and cannot be brought back</td>
+</tr>
+</tbody></table>
+<p>Three structural problems of the transcript architecture: <strong>A · Context rot</strong> —
+the longer the context, the less the model gets out of each item in it;
+<strong>B · compaction beheads the session</strong> — summaries are lossy and irreversible,
+the original text is nowhere; <strong>C · cost grows quadratically with turns</strong> —
+every call resends the full history; cache discounts delay the blow-up but
+cannot beat volume.</p>
+<h2>The design: a tape, and recall</h2>
+<p>What the model sees each turn is not the conversation history but a working
+slice rebuilt for that turn:</p>
+<table>
+<thead>
+<tr>
+<th>Zone</th>
+<th>Nature</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>system prompt · tool schemas</td>
+<td>Frozen, byte-identical for the whole session (prefix-cache friendly)</td>
+</tr>
+<tr>
+<td><strong>SESSION TAPE</strong></td>
+<td>Append-only ledger of sealed turns: what was asked and done, file baselines with patches applied, replies</td>
+</tr>
+<tr>
+<td>OPEN FILES</td>
+<td>Currently open files, with sha256 anchors and edited markers</td>
+</tr>
+<tr>
+<td>Current turn + tool observations</td>
+<td>Appended within the turn, sealed and archived at turn end</td>
+</tr>
+</tbody></table>
+<p>The <strong>tape</strong> looks like a transcript — append-only, cache-friendly — but every
+entry carries a hash and provenance. Long content is truncated at the cut with
+an exact marker, and the full text stays durable in the session log.</p>
+<p><strong>Recall</strong> is how "no less" is honored, in two tiers: <code>recall_search</code> finds
+which turn said something (scored search, tool-output flood excluded by
+default), <code>recall_turn</code> returns that turn verbatim. The tape leaves a signpost
+at every cut pointing back to the original.</p>
+<table>
+<thead>
+<tr>
+<th>Transcript's problem</th>
+<th>This plugin's answer</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>A · Context rot</td>
+<td>Bounded peak: the model always works in a small context</td>
+</tr>
+<tr>
+<td>B · Compaction loss</td>
+<td>Fold without losing: the session log is fully durable, two-tier recall retrieves verbatim</td>
+</tr>
+<tr>
+<td>C · Quadratic cost</td>
+<td>Each turn carries only what that turn needs; the tape is append-only, so the prefix cache works</td>
+</tr>
+</tbody></table>
+<h2>Measurements: two arms, head to head</h2>
+<p><strong>default</strong> = DSH's stock transcript loop (with calibrated compaction);
+<strong>slice</strong> = this plugin. Same harness, same tools, <strong>one round on each of two
+model generations</strong>: deepseek-v4-flash (0731) and deepseek-v4-pro (0813). Prices use the <strong>sheet
+effective 2026-08-16, at off-peak rates</strong>: flash miss $0.22/M · hit $0.007/M ·
+output $0.66/M; pro $0.66 / $0.022 / $1.98 (peak doubles every rate, so
+relative deltas are unchanged). The new sheet narrows both cache discounts to
+~1/30 (formerly flash 1/50, pro 1/120). Per-call ledgers kept, every number
+recomputable; results below report both rounds.</p>
+<h3>① Long-horizon loads · both arms × both models</h3>
+<p>The bounded slice's home turf is the long session — a transcript's cost and
+peak grow with every turn, a slice's do not. Two long-horizon scenarios
+(16-turn compaction amnesia · 76-turn context flood), each cell flash / pro:</p>
+<table>
+<thead>
+<tr>
+<th>Scenario</th>
+<th>Arm</th>
+<th>Verifier (flash / pro)</th>
+<th>Price (flash / pro)</th>
+<th>Peak (flash / pro)</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>s13 (16 turns)</td>
+<td>slice</td>
+<td>✓ / ✓</td>
+<td><strong>$0.0241</strong> / $0.0900</td>
+<td><strong>16K</strong> / <strong>17K</strong></td>
+</tr>
+<tr>
+<td></td>
+<td>default</td>
+<td>✓ / ✓</td>
+<td>$0.0296 / <strong>$0.0852</strong></td>
+<td>59K / 40K</td>
+</tr>
+<tr>
+<td>s10 (76-turn flood)</td>
+<td>slice</td>
+<td><strong>✓ zero loss / ✓ zero loss</strong></td>
+<td><strong>$0.1529</strong> / <strong>$0.6163</strong></td>
+<td><strong>32K</strong> / 43K</td>
+</tr>
+<tr>
+<td></td>
+<td>default</td>
+<td>✓ / <strong>✗ early timeline LOST</strong></td>
+<td>$0.3755 / $0.7682</td>
+<td>378K / 42K</td>
+</tr>
+</tbody></table>
+<blockquote>
+<p><strong>The two s10 rounds together are the transcript dilemma caught whole.</strong>
+Flash round: default's compaction can't keep up with the flood, the peak
+ratchets to 378K — everything stays in context, every quiz passes, but the
+context is out of control. Pro round: compaction works properly (peak
+sawtooths 40→34→39→40, bounded at the threshold) — and it costs the early
+timeline that lived only in history: <strong>the verifier fails the run.</strong>
+Unbounded peak or lossy forgetting: a transcript must pick one. Slice, both
+rounds: bounded peak + zero loss, at 59% / 20% lower price. The short s13
+scenario's price swings with the pricing structure (slice -18% under flash,
++6% under pro); the peak advantage (2.4–3.7×) does not.</p>
+</blockquote>
+<h3>② Amnesia re-enactment · both arms · eviction-verified</h3>
+<p>24 benchmark numbers produced by the agent's own script run, existing only in
+tool output — before the exam: the numbers never enter any reply (turn 1
+explicitly asks only to confirm the run), the source samples are deleted on
+first run (nothing on disk), and a dilution flood forces default's compaction
+to rewrite history multiple times. The exam has two tiers: first no hint at
+all, then an explicit "you produced these numbers yourself in this session —
+go check the records."</p>
+<table>
+<thead>
+<tr>
+<th>Model</th>
+<th>Arm</th>
+<th>Eviction</th>
+<th align="right">No-hint tier</th>
+<th align="right">Explicit tier</th>
+<th>Trap</th>
+<th align="right">Peak</th>
+<th align="right">Price</th>
+<th align="right">Wall</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>flash</td>
+<td>slice</td>
+<td>✓ 0/16</td>
+<td align="right"><strong>24/24</strong></td>
+<td align="right">24/24</td>
+<td>no fabrication ✓</td>
+<td align="right"><strong>21.5K</strong></td>
+<td align="right"><strong>$0.0521</strong></td>
+<td align="right"><strong>222s</strong></td>
+</tr>
+<tr>
+<td></td>
+<td>default</td>
+<td>✓ 0/16</td>
+<td align="right"><strong>0/24</strong></td>
+<td align="right">24/24</td>
+<td>no fabrication ✓</td>
+<td align="right">51.9K</td>
+<td align="right">$0.0910</td>
+<td align="right">569s</td>
+</tr>
+<tr>
+<td>pro</td>
+<td>slice</td>
+<td>✓ 0/16</td>
+<td align="right"><strong>24/24</strong></td>
+<td align="right">24/24</td>
+<td>no fabrication ✓</td>
+<td align="right"><strong>22.1K</strong></td>
+<td align="right"><strong>$0.1692</strong></td>
+<td align="right"><strong>383s</strong></td>
+</tr>
+<tr>
+<td></td>
+<td>default</td>
+<td>✓ 0/16</td>
+<td align="right">24/24</td>
+<td align="right">24/24</td>
+<td>no fabrication ✓</td>
+<td align="right">33.4K</td>
+<td align="right">$0.4612</td>
+<td align="right">2014s</td>
+</tr>
+</tbody></table>
+<blockquote>
+<p>Both arms share the same durable substrate — DSH persists the full session
+log, so recovery is possible <em>in principle</em> for either. The difference is
+<strong>affordance</strong>, and it changes shape with model strength. On flash: given
+the neutral exam, slice <strong>spontaneously</strong> ran <code>recall_search → recall_turn</code>
+(the tape leaves signposts at every cut) and recovered within the turn;
+default searched the workspace, found nothing, and wrote UNKNOWN as
+instructed (<strong>zero fabrication, duly recorded</strong>) — until the explicit tier,
+where it zstd-decompressed its own session jsonl and dug the values out.
+Pro is strong enough that default performs that forensic dig unprompted —
+so the gap moves from <em>whether</em> recovery happens to <strong>what it costs</strong>: the
+same 24/24 takes slice <strong>3 requests</strong> (383s / $0.169) and default <strong>32
+requests</strong> (2014s / $0.461) — 2.7× the price, 5.2× the wall clock.
+"Recoverable" and "goes and recovers" are separated by one layer of tools
+and signposts; the stronger the model, the more that layer shows up as pure
+efficiency.</p>
+</blockquote>
+<h3>③ CB-20 precision retrieval · both arms</h3>
+<p>ContextBench (given a real issue, the agent retrieves the code locations the
+fix depends on): a 20-question subset of the official 50-question benchmark.
+Paired comparison n=19 — default timed out (20 min) on one question in each
+round (different questions; both finished by slice in minutes):</p>
+<table>
+<thead>
+<tr>
+<th>Metric (19-question paired mean)</th>
+<th align="right">slice flash</th>
+<th align="right">default flash</th>
+<th align="right">slice pro</th>
+<th align="right">default pro</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>fileRecall</td>
+<td align="right"><strong>0.816</strong></td>
+<td align="right">0.761</td>
+<td align="right">0.752</td>
+<td align="right"><strong>0.780</strong></td>
+</tr>
+<tr>
+<td>spanRecall</td>
+<td align="right"><strong>0.847</strong></td>
+<td align="right">0.772</td>
+<td align="right">0.794</td>
+<td align="right"><strong>0.811</strong></td>
+</tr>
+<tr>
+<td>filePrecision</td>
+<td align="right">0.227</td>
+<td align="right">0.229</td>
+<td align="right"><strong>0.244</strong></td>
+<td align="right">0.212</td>
+</tr>
+<tr>
+<td>F1 · file-level (from means)</td>
+<td align="right"><strong>0.355</strong></td>
+<td align="right">0.353</td>
+<td align="right"><strong>0.368</strong></td>
+<td align="right">0.333</td>
+</tr>
+<tr>
+<td>F1 · file-level (macro)</td>
+<td align="right"><strong>0.342</strong></td>
+<td align="right">0.323</td>
+<td align="right"><strong>0.343</strong></td>
+<td align="right">0.327</td>
+</tr>
+<tr>
+<td>total price</td>
+<td align="right">$0.6021</td>
+<td align="right"><strong>$0.5414</strong></td>
+<td align="right"><strong>$1.3603</strong></td>
+<td align="right">$1.7318</td>
+</tr>
+<tr>
+<td>completion</td>
+<td align="right"><strong>20/20</strong></td>
+<td align="right">19/20</td>
+<td align="right"><strong>20/20</strong></td>
+<td align="right">19/20</td>
+</tr>
+</tbody></table>
+<blockquote>
+<p>The two generations swap the recall lead (slice +5.5pp under flash, default
++2.8pp under pro), but <strong>slice wins F1 and completion on both</strong>, and pulls
+ahead on precision under pro (+3.2pp); price flips from +11% under flash to
+<strong>-21%</strong> under pro — pro's output is expensive ($1.98/M), and default's
+longer sessions and extra steps cost more on an expensive model. The
+re-read discipline a bounded slice forces stays an advantage on retrieval
+across both generations.</p>
+</blockquote>
+<details>
+<summary>Per-question detail · flash (19 paired: recall / span / F1 / price)</summary>
+
+<table>
+<thead>
+<tr>
+<th>Question (Multi-SWE-Bench)</th>
+<th>slice R/span/F1</th>
+<th>default R/span/F1</th>
+<th align="right">slice $</th>
+<th align="right">default $</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>c__0f94ce4d</td>
+<td>1.00/1.00/0.36</td>
+<td>1.00/1.00/0.26</td>
+<td align="right">0.0601</td>
+<td align="right">0.0597</td>
+</tr>
+<tr>
+<td>c__1ac60ce9</td>
+<td>1.00/1.00/0.25</td>
+<td>1.00/1.00/0.20</td>
+<td align="right">0.0160</td>
+<td align="right">0.0237</td>
+</tr>
+<tr>
+<td>c__b9b45262</td>
+<td>0.33/0.30/0.17</td>
+<td>0.33/0.30/0.13</td>
+<td align="right">0.1118</td>
+<td align="right">0.0627</td>
+</tr>
+<tr>
+<td>c__cdbc5890</td>
+<td>1.00/1.00/0.22</td>
+<td>1.00/1.00/0.18</td>
+<td align="right">0.0300</td>
+<td align="right">0.0267</td>
+</tr>
+<tr>
+<td>cpp__6a4e21e9</td>
+<td>0.67/0.63/0.22</td>
+<td>0.67/0.25/0.40</td>
+<td align="right">0.0363</td>
+<td align="right">0.0283</td>
+</tr>
+<tr>
+<td>cpp__7c9ef76c</td>
+<td>0.67/0.97/0.33</td>
+<td>0.33/0.93/0.18</td>
+<td align="right">0.0194</td>
+<td align="right">0.0276</td>
+</tr>
+<tr>
+<td>cpp__bca55dea</td>
+<td>1.00/1.00/0.64</td>
+<td>0.29/0.14/0.21</td>
+<td align="right">0.0438</td>
+<td align="right">0.0206</td>
+</tr>
+<tr>
+<td>cpp__fe080aac</td>
+<td>0.50/0.87/0.33</td>
+<td>0.50/0.87/0.25</td>
+<td align="right">0.0258</td>
+<td align="right">0.0342</td>
+</tr>
+<tr>
+<td>go__0498ad7f</td>
+<td>1.00/1.00/0.29</td>
+<td>1.00/1.00/0.18</td>
+<td align="right">0.0175</td>
+<td align="right">0.0341</td>
+</tr>
+<tr>
+<td>go__0b78ed50</td>
+<td>1.00/1.00/0.67</td>
+<td>1.00/1.00/1.00</td>
+<td align="right">0.0150</td>
+<td align="right">0.0095</td>
+</tr>
+<tr>
+<td>go__0f79e39c</td>
+<td>1.00/1.00/0.50</td>
+<td>1.00/1.00/0.50</td>
+<td align="right">0.0135</td>
+<td align="right">0.0094</td>
+</tr>
+<tr>
+<td>go__1384380d</td>
+<td>0.67/0.39/0.42</td>
+<td>0.67/0.51/0.32</td>
+<td align="right">0.0302</td>
+<td align="right">0.0764</td>
+</tr>
+<tr>
+<td>go__1ba303a5</td>
+<td>0.67/0.92/0.36</td>
+<td>0.67/0.92/0.44</td>
+<td align="right">0.0365</td>
+<td align="right">0.0389</td>
+</tr>
+<tr>
+<td>go__250649eb</td>
+<td>1.00/1.00/0.50</td>
+<td>1.00/1.00/0.57</td>
+<td align="right">0.0099</td>
+<td align="right">0.0129</td>
+</tr>
+<tr>
+<td>go__2a889a1d</td>
+<td>1.00/1.00/0.29</td>
+<td>1.00/1.00/0.29</td>
+<td align="right">0.0299</td>
+<td align="right">0.0088</td>
+</tr>
+<tr>
+<td>go__2c512ec3</td>
+<td>0.00/0.00/0.00</td>
+<td>0.00/0.00/0.00</td>
+<td align="right">0.0315</td>
+<td align="right">0.0171</td>
+</tr>
+<tr>
+<td>go__3d1b3145</td>
+<td>1.00/1.00/0.50</td>
+<td>1.00/1.00/0.29</td>
+<td align="right">0.0137</td>
+<td align="right">0.0270</td>
+</tr>
+<tr>
+<td>go__3d85271b</td>
+<td>1.00/1.00/0.22</td>
+<td>1.00/1.00/0.22</td>
+<td align="right">0.0162</td>
+<td align="right">0.0106</td>
+</tr>
+<tr>
+<td>go__3deeea9c</td>
+<td>1.00/1.00/0.22</td>
+<td>1.00/0.75/0.50</td>
+<td align="right">0.0449</td>
+<td align="right">0.0131</td>
+</tr>
+</tbody></table>
+<p>Unpaired timeout: c__8bffb1b1 (default timed out at 20 minutes; slice finished
+in 137s, R/span 1.00/1.00, $0.0213).</p>
+</details>
+
+<details>
+<summary>Per-question detail · pro (19 paired: recall / span / F1 / price)</summary>
+
+<table>
+<thead>
+<tr>
+<th>Question (Multi-SWE-Bench)</th>
+<th>slice R/span/F1</th>
+<th>default R/span/F1</th>
+<th align="right">slice $</th>
+<th align="right">default $</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>c__0f94ce4d</td>
+<td>0.40/0.65/0.17</td>
+<td>0.80/0.85/0.33</td>
+<td align="right">0.1446</td>
+<td align="right">0.1326</td>
+</tr>
+<tr>
+<td>c__8bffb1b1</td>
+<td>1.00/1.00/0.44</td>
+<td>1.00/1.00/0.36</td>
+<td align="right">0.0485</td>
+<td align="right">0.0906</td>
+</tr>
+<tr>
+<td>c__b9b45262</td>
+<td>0.33/0.30/0.40</td>
+<td>0.33/0.30/0.20</td>
+<td align="right">0.0501</td>
+<td align="right">0.1579</td>
+</tr>
+<tr>
+<td>c__cdbc5890</td>
+<td>1.00/1.00/0.20</td>
+<td>1.00/1.00/0.18</td>
+<td align="right">0.0515</td>
+<td align="right">0.1199</td>
+</tr>
+<tr>
+<td>cpp__6a4e21e9</td>
+<td>0.67/0.49/0.16</td>
+<td>0.33/0.15/0.13</td>
+<td align="right">0.1411</td>
+<td align="right">0.0947</td>
+</tr>
+<tr>
+<td>cpp__7c9ef76c</td>
+<td>0.33/0.93/0.12</td>
+<td>0.67/0.97/0.27</td>
+<td align="right">0.1240</td>
+<td align="right">0.1051</td>
+</tr>
+<tr>
+<td>cpp__bca55dea</td>
+<td>0.71/0.56/0.45</td>
+<td>0.86/0.86/0.36</td>
+<td align="right">0.1144</td>
+<td align="right">0.1728</td>
+</tr>
+<tr>
+<td>cpp__fe080aac</td>
+<td>0.50/0.87/0.36</td>
+<td>0.50/0.71/0.29</td>
+<td align="right">0.0648</td>
+<td align="right">0.0763</td>
+</tr>
+<tr>
+<td>go__0498ad7f</td>
+<td>1.00/1.00/0.40</td>
+<td>1.00/1.00/0.29</td>
+<td align="right">0.0486</td>
+<td align="right">0.0551</td>
+</tr>
+<tr>
+<td>go__0b78ed50</td>
+<td>1.00/1.00/0.67</td>
+<td>1.00/1.00/0.40</td>
+<td align="right">0.0415</td>
+<td align="right">0.1038</td>
+</tr>
+<tr>
+<td>go__0f79e39c</td>
+<td>1.00/1.00/0.40</td>
+<td>1.00/1.00/0.50</td>
+<td align="right">0.0346</td>
+<td align="right">0.0257</td>
+</tr>
+<tr>
+<td>go__1384380d</td>
+<td>0.67/0.36/0.47</td>
+<td>0.67/0.66/0.44</td>
+<td align="right">0.0976</td>
+<td align="right">0.0872</td>
+</tr>
+<tr>
+<td>go__1ba303a5</td>
+<td>0.67/0.92/0.44</td>
+<td>0.67/0.92/0.36</td>
+<td align="right">0.0604</td>
+<td align="right">0.1281</td>
+</tr>
+<tr>
+<td>go__250649eb</td>
+<td>1.00/1.00/0.57</td>
+<td>1.00/1.00/0.50</td>
+<td align="right">0.0630</td>
+<td align="right">0.0348</td>
+</tr>
+<tr>
+<td>go__2a889a1d</td>
+<td>1.00/1.00/0.22</td>
+<td>1.00/1.00/0.40</td>
+<td align="right">0.0393</td>
+<td align="right">0.0603</td>
+</tr>
+<tr>
+<td>go__2c512ec3</td>
+<td>0.00/0.00/0.00</td>
+<td>0.00/0.00/0.00</td>
+<td align="right">0.0643</td>
+<td align="right">0.0902</td>
+</tr>
+<tr>
+<td>go__3d1b3145</td>
+<td>1.00/1.00/0.29</td>
+<td>1.00/1.00/0.29</td>
+<td align="right">0.0545</td>
+<td align="right">0.0501</td>
+</tr>
+<tr>
+<td>go__3d85271b</td>
+<td>1.00/1.00/0.40</td>
+<td>1.00/1.00/0.40</td>
+<td align="right">0.0259</td>
+<td align="right">0.0266</td>
+</tr>
+<tr>
+<td>go__3deeea9c</td>
+<td>1.00/1.00/0.33</td>
+<td>1.00/1.00/0.50</td>
+<td align="right">0.0915</td>
+<td align="right">0.1201</td>
+</tr>
+</tbody></table>
+<p>Unpaired timeout: c__1ac60ce9 (default timed out at 20 minutes; slice finished
+in 949s, R/span 1.00/1.00, $0.1222).</p>
+</details>
+
+<h2>Defects and directions</h2>
+<table>
+<thead>
+<tr>
+<th>Defect</th>
+<th>What it is, measured</th>
+<th>Direction</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong>1 · Cache hits are structurally fewer than a transcript loop's</strong></td>
+<td>The slice is rebuilt every turn; when bytes move, cache entries die, so the fresh-input share is high (2–3× on short coding tasks). DeepSeek's cache discounts favor append-only transcripts (both ~1/30 under the sheet effective 2026-08-16; formerly flash 1/50, pro 1/120) — short and mid-length tasks may show no price advantage (measured +10–65% on some flash scenarios, though long-horizon debug now flips to -38%; +6% on s13 under pro).</td>
+<td>Two byte-hygiene optimizations (stable rendering, freeze-on-second-read) are scheduled; long-session and retrieval loads win under both pricings (s10: -59%/-20%; CB-20 pro: -21%); shallower cache discounts (Claude / OpenAI) move the crossover earlier.</td>
+</tr>
+<tr>
+<td><strong>2 · The recall channel depends on the model reaching for it</strong></td>
+<td>History is byte-recoverable, and spontaneous recall under controlled pressure is proven (test ②); but on everyday coding loads active recall is near zero (most information fits tape capacity and push covers it), and cross-session "continue from yesterday" cold starts remain a risk.</td>
+<td>Make recall habitual on everyday loads and cold starts; agent memory is still frontier territory, work scheduled.</td>
+</tr>
+<tr>
+<td><strong>3 · Retrieval breadth vs. the frugal kernel is still being balanced</strong></td>
+<td>The current kernel buys precision and price at some recall-breadth regression against the previous build.</td>
+<td>Kernel A/B iteration continues.</td>
+</tr>
+<tr>
+<td><strong>4 · Still an early plugin overall</strong></td>
+<td>Covers the web profile's agent-loop surface today; settings-panel alignment, the subagent ecosystem, and TUI are catching up. The core mechanisms (sealing, audit events, two-tier recall) are validated by the three test groups above.</td>
+<td>An engineering-coverage problem, not a technical-difficulty one.</td>
+</tr>
+</tbody></table>
+<h2>Install</h2>
+<pre><code>dsh plugin --profile web add "github:TT-Wang/dsh-slice-agent-loop#main"
+</code></pre>
+<p>Or from a local checkout: <code>git clone</code> then <code>dsh plugin --profile web add .</code>
+Restart web afterwards — bundles are composed at boot.</p>
+<p>The bundled patch disables the stock loop and compaction — the bounded rebuild
+replaces both. If your composition carries an <code>agent-loop-invariant</code> row,
+remove it: a rebuilt slice cannot equal the derived history byte-for-byte, and
+this plugin refuses to load beside that assertion.</p>
+<h2>Configuration</h2>
+<table>
+<thead>
+<tr>
+<th>key</th>
+<th align="right">default</th>
+<th></th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>kernel</code></td>
+<td align="right"><code>'slice'</code></td>
+<td>system-prompt kernel; <code>'ported'</code> swaps in the verbatim Python prompt (A/B arm)</td>
+</tr>
+<tr>
+<td><code>maxStepsPerTurn</code></td>
+<td align="right"><code>50</code></td>
+<td>hard ceiling on continuation steps per turn</td>
+</tr>
+<tr>
+<td><code>maxParallelToolCalls</code></td>
+<td align="right"><code>10</code></td>
+<td>parallel tool bodies per step; since DSH 0811 this also caps subagent fan-out</td>
+</tr>
+</tbody></table>
+<p>Set them from your profile's <code>cordis.patch.yml</code>, targeting the existing row by
+id (<code>- id: slice-agent-loop</code> + <code>config:</code>).</p>
+<h2>Development</h2>
+<pre><code>npm install --legacy-peer-deps   # the @deepseek-ai/* peers are unpublished
+npm run link:dsh                 # symlink them from your dsh checkout
+npm run typecheck &amp;&amp; npm test
+</code></pre>
+<p><code>lib/</code> is committed (git-source installs run no build) — <code>npm run build</code>
+before pushing. Real-model smoke: <code>npm run e2e:recall</code> (needs
+<code>DEEPSEEK_API_KEY</code> in env).</p>
+<h2>License</h2>
+<p>BSD-3-Clause — see <a href="https://github.com/TT-Wang/dsh-slice-agent-loop/blob/HEAD/LICENSE">LICENSE</a>.</p>

@@ -1,0 +1,137 @@
+<h1>dsh-stall-guard</h1>
+<p>DeepSeek Harness（DSH）<strong>任务看门狗插件</strong>：监控任务执行状态，判断是否真正卡死，并通过"排查→修复→换方向"的阶梯式引导帮助任务恢复——<strong>全程不终止任何任务</strong>。</p>
+<h2>核心流程（监控 → 判断 → 继续 / 修复 / 换方向）</h2>
+<pre><code>agent/status (running/idle) ─┐
+session/event (turn/step/tool/llm) ─┼─→ 追踪每个会话的"最后活动时间"与"在飞操作"
+                                  │
+周期扫描（checkIntervalMs）──→ 运行中且 静默 &gt; stallThresholdMs ？
+                                  │
+          ├─ 有在飞操作（busy&gt;0）或持续有事件 → 判定"推进中" → 继续执行，不干预
+          │       （超 busyTimeoutMs 仅记一条 LONG_RUNNING 日志）
+          │
+          └─ 真静默（无事件 + 无在飞）→ 阶梯式引导（注入提示消息）：
+               第1级 诊断（DIAGNOSED）  ：请 Agent 排查当前状态、说明卡住原因（附看门狗诊断现场）
+               第2级 修复（FIXING）     ：请 Agent 针对卡点重试/完成/修复后继续
+               第3级+ 换方向（REDIRECTING）：请 Agent 放弃当前方法、改用替代方案持续推进
+               （每级按冷却间隔推进，第3级后循环；任何活动事件都会重置回第1级）
+                                  │
+                        事件写入 $DSH_HOME/stall-guard/events.jsonl
+                        状态查询 GET /api/dsh-stall-guard/status
+</code></pre>
+<p><strong>关键承诺：插件永不终止任务。</strong> 它只通过注入消息引导 Agent 自己排查、修复、换方向；没有 <code>terminate</code> 选项，也没有任何终止指令。</p>
+<h2>安装</h2>
+<pre><code>npx -p @deepseek-ai/dsh dsh plugin --profile web add github:akira399/dsh-stall-guard
+</code></pre>
+<p>安装后重启 DSH。插件<strong>默认启用</strong>。</p>
+<h2>配置（settings.yaml 的 <code>stall-guard</code> 命名空间）</h2>
+<table>
+<thead>
+<tr>
+<th>键</th>
+<th>默认值</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>enabled</code></td>
+<td><code>true</code></td>
+<td>总开关</td>
+</tr>
+<tr>
+<td><code>stallThresholdMs</code></td>
+<td><code>120000</code></td>
+<td><strong>真静默</strong>阈值（毫秒）：运行中、无任何事件、且<strong>无在飞操作</strong>时，静默超过该值判定卡顿</td>
+</tr>
+<tr>
+<td><code>checkIntervalMs</code></td>
+<td><code>5000</code></td>
+<td>扫描间隔（毫秒）</td>
+</tr>
+<tr>
+<td><code>busyTimeoutMs</code></td>
+<td><code>600000</code></td>
+<td><strong>在飞操作</strong>观察窗口（毫秒）：有工具调用 / LLM 请求在飞 = 任务在推进，<strong>永不引导</strong>；仅静默超过该值后记录一条 <code>LONG_RUNNING</code>；<code>0</code> 关闭该记录</td>
+</tr>
+<tr>
+<td><code>stallRecordIntervalMs</code></td>
+<td><code>60000</code></td>
+<td><code>STALL</code> 记录节流间隔（毫秒），防止持续卡顿时日志刷屏</td>
+</tr>
+<tr>
+<td><code>policy</code></td>
+<td><code>"auto"</code></td>
+<td><code>auto</code>（诊断→修复→换方向阶梯）/ <code>report</code>（仅记录不引导）</td>
+</tr>
+<tr>
+<td><code>nudgeCooldownMs</code></td>
+<td><code>30000</code></td>
+<td>阶梯消息的冷却间隔（毫秒）</td>
+</tr>
+<tr>
+<td><code>diagnoseMessage</code></td>
+<td>内置默认</td>
+<td>第 1 级：排查指令（自动附加诊断现场：最后活动、位置、静默时长）</td>
+</tr>
+<tr>
+<td><code>fixMessage</code></td>
+<td>内置默认</td>
+<td>第 2 级：修复指令</td>
+</tr>
+<tr>
+<td><code>redirectMessage</code></td>
+<td>内置默认</td>
+<td>第 3 级+：换方向指令</td>
+</tr>
+</tbody></table>
+<p>示例：</p>
+<pre><code>stall-guard:
+  stallThresholdMs: 60000
+  checkIntervalMs: 3000
+  policy: auto
+</code></pre>
+<p>修改后<strong>热生效</strong>（无需重启）。</p>
+<h2>防误杀：什么才算"卡住"</h2>
+<table>
+<thead>
+<tr>
+<th>任务情况</th>
+<th>判定</th>
+<th>行为</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>持续有事件（步骤/工具/LLM 流在动）</td>
+<td>推进中</td>
+<td>不动（计时持续刷新，任何活动都会把阶梯重置回第 1 级）</td>
+</tr>
+<tr>
+<td>单个长操作在飞（如 10 分钟构建、长文本生成）</td>
+<td><strong>推进中</strong>（<code>busy &gt; 0</code>）</td>
+<td><strong>不引导、不干预</strong>；超过 <code>busyTimeoutMs</code> 仅记一条 <code>LONG_RUNNING</code></td>
+</tr>
+<tr>
+<td>无任何事件 + 无在飞操作，静默超 <code>stallThresholdMs</code></td>
+<td><strong>真卡死</strong></td>
+<td>阶梯式引导（诊断 → 修复 → 换方向循环）</td>
+</tr>
+</tbody></table>
+<p>"任务执行时间长"≠"卡住"：只要项目有推进（事件或在飞操作），看门狗就不会碰它。</p>
+<h2>查看状态</h2>
+<ul>
+<li>事件日志：<code>~/.dsh/stall-guard/events.jsonl</code>（每行一个 JSON 事件：<code>STALL</code> / <code>LONG_RUNNING</code> / <code>DIAGNOSED</code> / <code>FIXING</code> / <code>REDIRECTING</code>；<strong>永远没有终止类事件</strong>）</li>
+<li>实时状态：<code>GET http://127.0.0.1:3080/api/dsh-stall-guard/status</code>（当前配置、各会话看门状态含 <code>ladderStage</code>、最近 50 条事件）</li>
+</ul>
+<h2>设计边界（重要）</h2>
+<ul>
+<li><strong>检测</strong>：基于"运行中 + 无活动事件 + 无在飞操作"判定卡顿，覆盖：LLM 调用挂起、工具调用挂起、循环空转等无进展场景。<code>turn/start</code>/<code>turn/end</code> 驱动运行状态，插件从 turn 打开即开始监视（即使错过 <code>agent/status</code> 事件）。</li>
+<li><strong>在飞豁免</strong>：<code>tool/call→tool/result</code>、<code>request/header→assistant/message</code>、<code>tool-workflow/run-*</code> 维护在飞计数；有操作在飞 = 推进中，绝不引导。</li>
+<li><strong>引导方式</strong>：通过注入 <code>user/message</code> 事件生效（这是外部向 Agent 输入消息的合法通道）；若 Agent 卡死在一个永不返回的 await 上，注入消息会排队到该步骤结束后才被处理——此时继续等待下一级引导，永不终止。</li>
+<li><strong>诊断信息</strong>：每条阶梯消息都附带看门狗自己的诊断（最后活动事件、turn/step 位置、静默时长），帮助 Agent 快速定位卡点。</li>
+<li><strong>上报</strong>：事件落盘 + 状态路由 + 插件日志。GUI 通知可作为后续增强。</li>
+</ul>
+<h2>验证</h2>
+<pre><code>pnpm verify
+</code></pre>
+<p>覆盖：语法、默认配置、活动追踪、在飞豁免（长工具不引导、在飞 LLM 永不引导）、真静默检测、诊断→修复→换方向阶梯、换方向循环不终止、活动重置阶梯、STALL 节流防刷屏、turn/start 独立触发监视、<strong>无任何终止事件</strong>、事件落盘、状态路由、隐私扫描。</p>
+<h2>许可</h2>
+<p>MIT © 2026 dsh-stall-guard contributors</p>

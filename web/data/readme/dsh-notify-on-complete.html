@@ -1,0 +1,309 @@
+<h1>dsh-notify-on-complete — Desktop Notifications for DeepSeek Harness · DeepSeek Harness 桌面通知插件</h1>
+<p align="center"><img src="https://raw.githubusercontent.com/pitetow/dsh-notify-on-complete/HEAD/assets/notify-cover.jpg" alt="dsh-notify-on-complete — 运行结束通知与系统提示音"></p>
+
+<p>Send desktop notifications from <a href="https://github.com/deepseek-ai/deepseek-harness">DeepSeek Harness</a> (<code>dsh</code>): get a system notification when a run finishes, and an immediate one when the model asks you a question (<code>ask_user_question</code>) or waits for approval (sandbox escalation / tool permission). The body reflects the result (completed / error / aborted / max-tokens).</p>
+<p>DeepSeek Harness（<code>dsh</code>）桌面通知插件：运行结束时向系统发送桌面通知；会话进行中模型提问（<code>ask_user_question</code>）或等待审批（沙箱提权 / 工具权限）时也会即时提醒你回来处理。正文按结果区分（成功 / 失败 / 中止 / 达到 token 上限）。</p>
+<blockquote>
+<p>Author: <a href="https://github.com/pitetow">Luozy</a> · License: <a href="https://github.com/pitetow/dsh-notify-on-complete/blob/HEAD/LICENSE">MIT</a> · 中文文档：<a href="https://github.com/pitetow/dsh-notify-on-complete/blob/HEAD/README.zh.md">README.zh.md</a></p>
+</blockquote>
+<ul>
+<li><strong>Zero runtime dependencies</strong>: no <code>dsh</code> internal packages, no <code>ctx.shell</code>. Notifications are fired via <code>child_process.spawn</code> as a detached child process — <strong>non-blocking and unaffected by the harness exit path</strong>.</li>
+<li><strong>Cross-platform</strong>: the notifier command is picked from <code>process.platform</code> (macOS <code>osascript</code> / Linux <code>notify-send</code> → <code>kdialog</code> / Windows PowerShell). Unsupported platforms are skipped at load with a warning, never throwing per-event.</li>
+<li><strong>System sound</strong>: macOS system sound (<code>sound name "Glass"</code>), Windows .NET <code>SystemSounds</code>, Linux <code>canberra-gtk-play</code> (falls back to <code>paplay</code>); disable with <code>sound: false</code>.</li>
+<li><strong>In-session blocking notifications</strong>: fires immediately when the model calls <code>ask_user_question</code>, or when a sandbox escalation / tool permission waits for approval — so you know to come back. Controlled by <code>onBlocked</code> / <code>onQuestion</code> / <code>onApproval</code>.</li>
+<li><strong>Top-level runs only</strong>: subagent sessions are filtered out (<code>header.origin === 'subagent'</code>), so a single CLI run produces a single notification.</li>
+</ul>
+<h2>功能特性（中文）</h2>
+<ul>
+<li><strong>零运行时依赖</strong>：不依赖 dsh 内部包，通知用 <code>child_process.spawn</code> 以 detached 子进程发出，不阻塞、不受 harness 退出影响。</li>
+<li><strong>跨平台</strong>：macOS <code>osascript</code> / Linux <code>notify-send</code> → <code>kdialog</code> / Windows PowerShell 自动选择；不支持的平台加载时跳过并警告。</li>
+<li><strong>系统提示音</strong>：macOS <code>sound name "Glass"</code> / Windows SystemSounds / Linux <code>canberra-gtk-play</code>（回退 <code>paplay</code>）；可用 <code>sound: false</code> 关闭。</li>
+<li><strong>会话中阻塞即时通知</strong>：模型提问或等待审批时立即提醒你回来；可用 <code>onBlocked</code> / <code>onQuestion</code> / <code>onApproval</code> 精细控制。</li>
+<li><strong>只通知顶层运行</strong>：过滤子代理（<code>header.origin === 'subagent'</code>），一次 CLI 运行只弹一条。</li>
+</ul>
+<p>完整中文文档见 <a href="https://github.com/pitetow/dsh-notify-on-complete/blob/HEAD/README.zh.md">README.zh.md</a>。</p>
+<h2>How it works</h2>
+<p>The plugin listens to two events to decide when "a run has ended":</p>
+<ol>
+<li><strong><code>session/event</code> → <code>turn/end</code></strong>: records the latest <code>reason.kind</code> of a root session (<code>origin !== 'subagent'</code>). A run can span many turns (goal rounds, follow-ups, steering), each with its own <code>turn/end</code>; the plugin only remembers the <strong>last</strong> one.</li>
+<li><strong><code>agent/status</code> → <code>'idle'</code></strong>: the harness's own "run ended" signal (the web UI's running indicator and <code>agent.whenIdle()</code> both derive from it). When the root agent returns to idle, the whole activity has converged, so the plugin sends the recorded final result once and clears it.</li>
+</ol>
+<p>So <strong>one notification per complete run</strong>, not per turn: a multi-round goal run fires once at the end, with the final result; intermediate "task completed" moments never fire early. Body format: <code>result — session title (session: sessionId)</code>, e.g. <code>任务已完成 — 修复登录bug (session: 3f9a…)</code>; if the title hasn't been generated yet it degrades to <code>result (session: sessionId)</code>. The title comes from the last <code>session/title</code> event in the session log — an async projection, so very early notifications (e.g. a question right at session start) may not have one yet. Notification commands run with <code>detached: true</code> + <code>unref()</code>, so a normal exit or crash never affects delivery.</p>
+<table>
+<thead>
+<tr>
+<th><code>reason.kind</code></th>
+<th>Notification body</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>completed</code></td>
+<td>任务已完成 (Task completed)</td>
+</tr>
+<tr>
+<td><code>error</code></td>
+<td>任务失败 (Task failed)</td>
+</tr>
+<tr>
+<td><code>aborted</code></td>
+<td>任务已中止 (Task aborted)</td>
+</tr>
+<tr>
+<td><code>max-tokens</code></td>
+<td>任务达到 token 上限 (Task hit the token limit)</td>
+</tr>
+<tr>
+<td>other (unknown)</td>
+<td>任务结束 (Task ended)</td>
+</tr>
+</tbody></table>
+<h2>Requirements</h2>
+<ul>
+<li>Node.js ^22 (same as DeepSeek Harness)</li>
+<li>An installed <code>dsh</code> CLI (any version — the plugin registers via Cordis events and does not depend on a specific CLI version)</li>
+<li>Peer dependency <code>@deepseek-ai/cordis@^4.0.1</code> (provided by the <code>dsh</code> CLI itself; pnpm resolves it automatically on install)</li>
+</ul>
+<hr>
+<h2>Installation (one-liner, GitHub source distribution, no npm)</h2>
+<p><strong>Prerequisite</strong>: DSH installed (<code>dsh web</code> runs), Node.js ^22 + pnpm.</p>
+<p><strong>macOS / Linux / Windows (Git Bash or WSL)</strong>:</p>
+<pre><code>curl -fsSL https://raw.githubusercontent.com/pitetow/dsh-notify-on-complete/main/scripts/install.sh | bash
+</code></pre>
+<p>Other profiles (default <code>web</code>):</p>
+<pre><code>curl -fsSL https://raw.githubusercontent.com/pitetow/dsh-notify-on-complete/main/scripts/install.sh | bash -s -- --profile headless
+</code></pre>
+<p>The script does 4 things (all idempotent, safe to re-run):</p>
+<ol>
+<li>Downloads the source to <code>~/.dsh/plugins/dsh-notify-on-complete/</code> (skips if it exists — <strong>never overwrites</strong>; add <code>--force</code> to overwrite/update, which asks for confirmation first, or <code>--yes</code> to skip it);</li>
+<li>Runs <code>pnpm install &amp;&amp; pnpm build</code>;</li>
+<li>Runs <code>dsh plugin --profile &lt;name&gt; add link:&lt;dir&gt;</code>: the CLI reads the package's <code>dsh.bundle.patch</code> declaration (<code>cordis.patch.yml</code>) and <strong>auto-registers it into the profile's bundle stack</strong>, so it mounts on the next start — no manual config file edits;</li>
+<li>Idempotently removes any leftover manual mount lines to avoid double-mounting (two notifications per run).</li>
+</ol>
+<p><code>curl | bash</code> runs remote code — the script is open source (<code>scripts/install.sh</code>); download and review it first if you like.</p>
+<h3>Verify</h3>
+<pre><code>dsh --profile web --dump-config | grep -n notify-on-complete
+</code></pre>
+<p>Seeing <code>- id: notify-on-complete</code> followed by <code>name: dsh-notify-on-complete</code> means the plugin is in the composed tree. Run a real task and watch for a desktop notification to confirm.</p>
+<p>Restart to take effect:</p>
+<ul>
+<li><strong>CLI one-shot runs</strong>: the next <code>dsh --profile headless "task"</code> just works, no extra step.</li>
+<li><strong>Web GUI</strong>: restart the web process (stop the current <code>dsh web</code>, then start it again). If HMR is enabled, saving files also picks it up automatically.</li>
+</ul>
+<h3>Update</h3>
+<pre><code>curl -fsSL https://raw.githubusercontent.com/pitetow/dsh-notify-on-complete/main/scripts/install.sh | bash -s -- --force
+</code></pre>
+<blockquote>
+<p><code>--force</code> deletes and re-downloads the source (local edits in that directory are lost) and <strong>asks for confirmation first</strong>; add <code>--yes</code> to skip it:
+<code>bash -s -- --force --yes</code></p>
+</blockquote>
+<p>Or manually: <code>cd ~/.dsh/plugins/dsh-notify-on-complete &amp;&amp; git pull &amp;&amp; pnpm install &amp;&amp; pnpm run build</code>, then re-run <code>dsh plugin --profile web add link:.</code>.</p>
+<h3>Uninstall</h3>
+<pre><code>dsh plugin --profile web remove dsh-notify-on-complete
+rm -rf ~/.dsh/plugins/dsh-notify-on-complete
+</code></pre>
+<p>Then restart dsh.</p>
+<details>
+<summary>Manual install (from source / local development — alternative to the one-liner)</summary>
+
+<p>Point the dependency at local source (<code>link:</code> is a symlink, so rebuild after edits; good for debugging):</p>
+<pre><code>cd /path/to/dsh-notify-on-complete
+pnpm install
+pnpm run build                              # emits to lib/
+dsh plugin --profile web add link:/path/to/dsh-notify-on-complete
+</code></pre>
+<p>Then check <code>~/.dsh/profiles/web/package.json</code> — <code>dsh-notify-on-complete</code> should appear in <code>dependencies</code>:</p>
+<pre><code>grep dsh-notify ~/.dsh/profiles/web/package.json
+</code></pre>
+<blockquote>
+<p>If the CLI says <code>declares no dsh.bundle — installed as a plain dependency</code>, it wasn't auto-mounted; declare it manually in the profile user layer. Edit <code>~/.dsh/profiles/web/cordis.patch.yml</code>:</p>
+</blockquote>
+<pre><code># your profile user layer (cordis.patch.yml)
+- id: notify-on-complete
+  name: dsh-notify-on-complete
+  config:
+    enabled: true              # default true, omit to keep the default
+    title: DeepSeek Harness    # notification title, omit to keep the default
+</code></pre>
+<blockquote>
+<p>If you previously installed with the one-liner, manual mounting would double-mount (two notifications per run) — run <code>dsh plugin --profile web remove dsh-notify-on-complete</code> before switching channels.</p>
+</blockquote>
+</details>
+
+<hr>
+<h2>Configuration</h2>
+<p>Configuration lives in the <strong>profile's <code>cordis.patch.yml</code></strong> (the user layer, applied last, wins per row):</p>
+<table>
+<thead>
+<tr>
+<th>profile</th>
+<th>config file path</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>web</code> (default, <code>dsh web</code>)</td>
+<td><code>~/.dsh/profiles/web/cordis.patch.yml</code></td>
+</tr>
+<tr>
+<td><code>headless</code> (<code>dsh --profile headless</code>)</td>
+<td><code>~/.dsh/profiles/headless/cordis.patch.yml</code></td>
+</tr>
+<tr>
+<td>other <code>&lt;name&gt;</code></td>
+<td><code>~/.dsh/profiles/&lt;name&gt;/cordis.patch.yml</code></td>
+</tr>
+</tbody></table>
+<blockquote>
+<p>You can also use the home-level <code>$DSH_HOME/cordis.patch.yml</code> (default <code>~/.dsh/cordis.patch.yml</code>), shared by every profile.</p>
+</blockquote>
+<p>Configure by <strong>declaring/overriding the row with <code>id: notify-on-complete</code></strong>. Notes:</p>
+<ul>
+<li>A later layer <strong>replaces the whole <code>config</code></strong> of the same-<code>id</code> row (no per-key deep merge), so either write the full <code>id</code> + <code>name</code> + <code>config</code>, or write only the keys you want to change and let the defaults fill the rest.</li>
+<li><code>cordis.patch.yml</code> must be a <strong>top-level YAML array</strong> (start with <code>-</code>); if you delete everything, write <code>[]</code>.</li>
+</ul>
+<p>Full example (all fields with defaults):</p>
+<pre><code># ~/.dsh/profiles/web/cordis.patch.yml
+- id: notify-on-complete
+  name: dsh-notify-on-complete
+  config:
+    enabled: true        # master switch; false disables everything
+    title: DeepSeek Harness
+    sound: true          # play a sound; false = notification only
+    onBlocked: true      # master switch for blocking notifications (question + approval)
+    onQuestion: true     # question notifications (only when onBlocked: true)
+    onApproval: true     # approval/permission notifications (only when onBlocked: true)
+</code></pre>
+<p>Common scenarios:</p>
+<pre><code># notify only, no sound
+- id: notify-on-complete
+  name: dsh-notify-on-complete
+  config:
+    sound: false
+
+# only notify when a run completes — no blocking (question/approval) notifications
+- id: notify-on-complete
+  name: dsh-notify-on-complete
+  config:
+    onBlocked: false
+
+# complete + question notifications, but not approval (sandbox escalation / tool permission)
+- id: notify-on-complete
+  name: dsh-notify-on-complete
+  config:
+    onApproval: false
+</code></pre>
+<h3>Fields</h3>
+<table>
+<thead>
+<tr>
+<th>Field</th>
+<th>Type</th>
+<th>Default</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>enabled</code></td>
+<td>boolean</td>
+<td><code>true</code></td>
+<td>When <code>false</code>, the plugin registers no listeners at all — fully off</td>
+</tr>
+<tr>
+<td><code>title</code></td>
+<td>string</td>
+<td><code>DeepSeek Harness</code></td>
+<td>Notification title</td>
+</tr>
+<tr>
+<td><code>sound</code></td>
+<td>boolean</td>
+<td><code>true</code></td>
+<td>Play a system sound with the notification; <code>false</code> shows only the notification</td>
+</tr>
+<tr>
+<td><code>onBlocked</code></td>
+<td>boolean</td>
+<td><code>true</code></td>
+<td>Master switch for blocking notifications; <code>false</code> disables question + approval notifications</td>
+</tr>
+<tr>
+<td><code>onQuestion</code></td>
+<td>boolean</td>
+<td><code>true</code></td>
+<td>Question (<code>ask_user_question</code>) notifications; only applies when <code>onBlocked: true</code></td>
+</tr>
+<tr>
+<td><code>onApproval</code></td>
+<td>boolean</td>
+<td><code>true</code></td>
+<td>Approval/permission notifications; only applies when <code>onBlocked: true</code></td>
+</tr>
+</tbody></table>
+<p>Config is validated at load time (fail loud): a type error fails startup instead of being silently ignored.</p>
+<p>Restart after changing config: one-shot CLI runs pick it up next run; <code>dsh web</code> needs a web-process restart.</p>
+<p>Verify it took effect:</p>
+<pre><code>dsh --profile web --dump-config | grep -n -A 10 notify-on-complete
+</code></pre>
+<p>If the output shows your <code>config:</code> values, it's applied.</p>
+<h2>Platform commands</h2>
+<table>
+<thead>
+<tr>
+<th>Platform</th>
+<th>Command</th>
+<th>Notes</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>macOS</td>
+<td><code>osascript -e 'display notification …'</code></td>
+<td>native Notification Center, with system sound (<code>sound name "Glass"</code>)</td>
+</tr>
+<tr>
+<td>Linux</td>
+<td><code>notify-send</code></td>
+<td>falls back to <code>kdialog --passivepopup</code> when missing; sound via <code>canberra-gtk-play</code> (falls back to <code>paplay</code>)</td>
+</tr>
+<tr>
+<td>Windows</td>
+<td>PowerShell <code>WScript.Shell.Popup</code></td>
+<td>no extra modules, auto-closes after 5 s, with .NET <code>SystemSounds</code></td>
+</tr>
+</tbody></table>
+<blockquote>
+<p>On macOS you may need to grant the terminal app notification permission (System Settings → Notifications).</p>
+</blockquote>
+<h2>FAQ</h2>
+<p><strong>Q: Two notifications per run?</strong>
+Double mount: the profile's <code>cordis.patch.yml</code> still has an old manual mount line. Delete that <code>- id: notify-on-complete</code> entry (the one-liner cleans it up automatically) and keep only the bundle auto-mount. <code>cordis.patch.yml</code> must stay a top-level YAML array — if you delete everything, write <code>[]</code>.</p>
+<p><strong>Q: Installed but no notification?</strong></p>
+<ol>
+<li>Confirm it loaded: <code>dsh --profile web --dump-config | grep notify-on-complete</code>.</li>
+<li>Confirm it's a root-session run (CLI one-shots always qualify; subagent/background subtasks don't trigger).</li>
+<li>macOS: check notification permission; Linux: make sure <code>notify-send</code> or <code>kdialog</code> exists; Windows: make sure PowerShell works.</li>
+<li>Notifications are fire-and-forget — failures don't error out; run the platform command manually to verify the system side.</li>
+</ol>
+<p><strong>Q: Why only root sessions, not subagents?</strong>
+One CLI run can contain several subagent sessions, each with its own <code>turn/end</code> and <code>agent/status</code>. The plugin filters subagents via <code>session.header.origin === 'subagent'</code> (the harness's own idiom) to notify only the top-level run.</p>
+<p><strong>Q: How many notifications per run?</strong>
+One. It fires only when the root agent returns to <code>idle</code> (the whole activity has converged, all turns done), so multi-round goal runs don't spam; intermediate turns never fire "task completed" early.</p>
+<p><strong>Q: Does it notify in the Web GUI?</strong>
+Yes. In the Web GUI each task (one run) ends with the root agent's <code>idle</code> state, same as the CLI; a multi-round goal run fires once when the whole run finishes.</p>
+<p><strong>Q: <code>dsh plugin add</code> reports a peer dependency error?</strong>
+The plugin peers on <code>@deepseek-ai/cordis@^4.0.1</code>, which must be resolvable from npm. If your environment can't reach the npm registry, use <code>--offline</code> or pre-install cordis in the profile.</p>
+<p><strong>Q: Will it also fire "needs approval" under headless / <code>never</code> approval policy?</strong>
+Possibly. <code>approval/asked</code> is logged even under the <code>never</code> policy or with no answerer (headless/CI), where it is actually rejected immediately rather than waiting for a human — a pure plugin cannot tell these apart from session events. In the Web GUI the answerer is always present and the policy defaults to <code>ask</code>, so the signal is reliable; in headless, use <code>onApproval: false</code> or <code>onBlocked: false</code>.</p>
+<h2>Development</h2>
+<pre><code>pnpm install
+pnpm run test        # vitest unit tests (result mapping / platform commands / run-end state machine / plugin entry)
+pnpm run typecheck   # tsc --noEmit
+pnpm run build       # tsc output to lib/ (the prepare hook runs this automatically on install)
+</code></pre>
+<p>Source layout:</p>
+<pre><code>src/index.ts     plugin entry: name / Config validation / platform gate / event wiring
+src/notifier.ts  run-end state machine: records the final turn/end result, fires once at idle
+src/notify.ts    result mapping, platform command building, detached spawn (incl. Linux fallback)
+src/types.ts     structural event types (zero dependencies, no dsh internal packages)
+cordis.patch.yml bundle auto-mount declaration (dsh.bundle.patch)
+scripts/install.sh one-liner install script (GitHub source distribution)
+tests/           vitest unit tests (result mapping / platform commands / state machine / plugin entry)
+</code></pre>

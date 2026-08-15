@@ -1,0 +1,134 @@
+<h1>🐳 dsh-image-unlock</h1>
+<p align="center">
+  <img src="https://raw.githubusercontent.com/FrostLeafKEE/dsh-image-unlock/HEAD/assets/hero-banner.jpg" alt="鲸鱼娘为你解锁图片输入">
+</p>
+
+
+
+<p><strong>解除 DeepSeek Harness Web GUI 的图片输入限制，让图片附件在不支持图片的上游（Console Go）下可用。</strong></p>
+<p><a href=""><img src="https://img.shields.io/badge/version-0.0.3-22b8cf" alt="version"></a>
+<a href=""><img src="https://img.shields.io/badge/license-MIT-1c7ed6" alt="license"></a>
+<a href=""><img src="https://img.shields.io/badge/platform-DeepSeek%20Harness-748ffc" alt="platform"></a>
+<a href=""><img src="https://img.shields.io/badge/whale_girl-approved-339af0" alt="whale girl approved"></a></p>
+
+
+<hr>
+<h2>✨ 一张图看懂</h2>
+<pre><code> 🖼️ 上传图片
+   │
+   ▼
+ 🚪 准入闸门   ←── bundle patch：defaultInput: [text, image]
+   │               （未声明 input 的模型继承图片能力，不再被拒）
+   ▼
+ 🔧 图片文本化  ←── code patch：textifyImageBlocks()
+   │               （图片块 → [图片附件: &lt;路径&gt;] 文本标记）
+   ▼
+ 🤖 agent 看到标记 → 👁️ vision skill 识图（vision.js 魔数嗅探 MIME）
+</code></pre>
+<hr>
+<h2>🧩 问题</h2>
+<p>Harness 在 API 层（<code>dsh-host-apiproxy</code>）、LLM 层（<code>dsh-llm-pi-ai</code>）都根据模型的
+<code>inputModalities</code>（来自 llm-pi-ai 的模型 <code>input</code> 声明）判断能否接收图片。
+默认声明只有 <code>text</code>，因此未声明 <code>input</code> 的模型（如 <code>deepseek-v4-flash</code>）在发图时
+会被拒绝（<code>"Model does not support image input"</code>）。</p>
+<p>但只放行还不够：<code>dsh-llm-pi-ai</code> 会把 durable 图片块转成
+<code>{ type: "image", data: base64 }</code> 部件，pi-ai SDK 序列化为 <code>image_url</code> 发送给
+上游。Console Go 上游协议只接受 <code>text</code>，于是报：</p>
+<pre><code>400 invalid_request_error: Failed to deserialize the JSON body into the
+target type: messages[605]: unknown variant `image_url`, expected `text`
+</code></pre>
+<p>也就是说：<strong>声明图片能力是"准入"，但上游根本不收图片</strong>。正确做法是准入后把
+图片块转成带附件路径的文本标记，识别交给 vision skill。</p>
+<hr>
+<h2>⚙️ 方案（两部分）</h2>
+<h3>1. Bundle patch：准入（<code>cordis.patch.yml</code>）</h3>
+<p>给 <code>llm-pi-ai</code> 的 <code>opencode-go</code> provider 加上 <code>defaultInput: [text, image]</code>，
+让未显式声明 <code>input</code> 的模型继承 image 输入能力，从而通过 API 层 / LLM 层的
+图片闸门。显式声明 <code>input: [text]</code> 的模型保持原样（用户层优先）。</p>
+<h3>2. 代码 patch：图片文本化（<code>scripts/patch-pi-ai.mjs</code>）</h3>
+<p><code>dsh-llm-pi-ai</code> 的序列化没有配置开关，请求对象又是深度冻结的（<code>llm/stream</code>
+waterfall 无法改写），所以对本地安装的包做一次代码补丁（已用
+<code>[dsh-plugin-image-unlock]</code> 标记注释标注）：</p>
+<ul>
+<li><p>在 <code>stream()</code> 中，对 <code>opencode-go</code> 路由先调用 <code>textifyImageBlocks()</code>：
+把 durable 图片块（含 tool-result 内嵌套的）替换为文本标记；是否执行由
+运行时开关 <code>globalThis.__dsh_image_unlock_textify</code> 控制（见下节）。</p>
+<pre><code>[图片附件: &lt;名称&gt;] 附件已保存到 &lt;DSH_HOME&gt;/attachments/v1/objects/&lt;xx&gt;/&lt;sha256&gt;（当前模型不能直接查看图片，请用 claude-vision-skill 识别该路径；无法访问时用 --clipboard 回退）
+</code></pre>
+</li>
+<li><p>附件对象文件没有扩展名，<code>claude-vision-skill/vision.js</code> 已支持按魔数嗅探
+MIME（png/jpeg/webp/gif），可直接识读该路径；剪贴板回退仍然可用。</p>
+</li>
+</ul>
+<p>这样：上传不再被拒（第 1 部分）、请求不再 400（第 2 部分）、agent 看到
+<code>[图片附件: ...]</code> 标记后按 vision skill 流程识别（配套 skill 已更新文档）。</p>
+<hr>
+<h2>📦 安装</h2>
+<p><strong>方式一：本地目录（开发调试用）</strong></p>
+<pre><code>dsh plugin --profile web add &lt;本插件目录&gt;
+</code></pre>
+<p><strong>方式二：从 GitHub 直接安装</strong></p>
+<pre><code>dsh plugin --profile web add https://github.com/FrostLeafKEE/dsh-image-unlock.git
+</code></pre>
+<blockquote>
+<p><code>dsh plugin</code> 会把参数转发给 profile 目录里的 pnpm，两种方式等价；安装后
+<code>dsh.profile.bundles</code> 会自动登记 <code>@dsh-external/dsh-image-unlock</code>。</p>
+</blockquote>
+<p>安装后还需要在 profile 的 <code>cordis.patch.yml</code> 中插入插件条目（见下节），
+并打一次代码补丁（见"重装/升级后重新打补丁"）。</p>
+<hr>
+<h2>🎛️ 开关（skill 驱动：禁用 skill = 原生视觉模型）</h2>
+<p>开关与 <strong>claude-vision-skill 的启停绑定</strong>，全部即时生效、无需重启：</p>
+<ul>
+<li><strong>启用 skill（默认）</strong>：<code>claude-vision-skill</code> 目录在 <code>.agents/skills</code> 下 →
+文本化开启，图片转成文本标记，agent 走 vision.js 识图流程
+（适合当前 text-only 的 opencode-go 模型）。</li>
+<li><strong>禁用 skill（用原生视觉模型）</strong>：把 <code>&lt;工作区&gt;/.agents/skills/claude-vision-skill</code>
+目录移出（例如移到 <code>&lt;工作区&gt;/.dshskin/</code> 下）→ 文本化自动关闭，
+模型收到真实图片部件。想切回 vision-skill 流程就放回原处。</li>
+</ul>
+<p>插件会监视 skills 目录，目录移动即刻切换，无需重启。</p>
+<p>附加覆盖（profile 的 <code>cordis.patch.yml</code> 插件条目）：</p>
+<pre><code>- insert:
+    - id: image-unlock
+      name: '@dsh-external/dsh-image-unlock'
+      # disabled: true            # 整体关闭：取消注释这一行
+      config:
+        textifyImages: true       # 强制关文本化：改成 false（即使 skill 在）
+        # skillDir: '&lt;绝对路径&gt;'  # 自定义 skill 目录位置（默认自动探测）
+</code></pre>
+<blockquote>
+<p><strong>注意</strong>：bundle patch 的 <code>defaultInput</code> 声明不受上述开关影响（只影响未声明
+<code>input</code> 的模型；视觉模型应通过 settings 声明自己的 <code>input: [text, image]</code>，
+其声明优先于 defaultInput）。</p>
+</blockquote>
+<p>运行时标志：插件把开关写入 <code>globalThis.__dsh_image_unlock_textify</code>；
+<code>dsh-llm-pi-ai</code> 补丁代码在每次请求时读取它（<code>=== true</code> 才文本化）。条目被
+禁用、插件被移除、或 skill 目录不存在时标志被清除，文本化随之关闭。</p>
+<hr>
+<h2>🔄 重装/升级后重新打补丁</h2>
+<p>第 2 部分是针对 node_modules 的代码补丁，<code>pnpm install</code> / 升级 <code>@deepseek-ai/dsh</code>
+会把它冲掉。重装后执行（幂等，已打补丁会直接跳过）：</p>
+<pre><code>node scripts/patch-pi-ai.mjs
+</code></pre>
+<p>默认在以下位置寻找目标文件（也可用参数指定绝对路径）：</p>
+<ul>
+<li><code>&lt;本插件目录&gt;/../../DeepSeekHarness/node_modules/@deepseek-ai/dsh-llm-pi-ai/lib/index.js</code></li>
+<li><code>&lt;本插件目录&gt;/../DeepSeekHarness/node_modules/@deepseek-ai/dsh-llm-pi-ai/lib/index.js</code></li>
+<li><code>&lt;本插件目录&gt;/../../../node_modules/@deepseek-ai/dsh-llm-pi-ai/lib/index.js</code></li>
+</ul>
+<hr>
+<h2>⚠️ 注意</h2>
+<ul>
+<li>这只<strong>放行图片附件并文本化</strong>；模型本身不支持图像输入。实际识图请配合
+vision skill（<code>claude-vision-skill</code>，通过 vision.js 调用外部 vision API）。</li>
+<li>文本化只影响 <code>opencode-go</code> 路由，其它 pi-ai 路由行为不变。</li>
+<li>若某天 opencode-go 路由真的挂上了原生视觉模型，用上面的开关关闭文本化即可；
+彻底移除的话：删掉插件条目、<code>dsh plugin remove</code>、并手动删除
+<code>dsh-llm-pi-ai/lib/index.js</code> 中两处 <code>[dsh-plugin-image-unlock]</code> 标记的代码。</li>
+</ul>
+<hr>
+<p align="center">
+  🐳 头图由 <code>wan2.7-image-pro</code> 生成 · DeepSeek 鲸鱼娘风格<br>
+  <sub>MIT License · dsh-plugin · deepseek-harness</sub>
+</p>

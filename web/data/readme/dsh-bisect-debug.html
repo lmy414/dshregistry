@@ -1,0 +1,122 @@
+<h1>dsh-bisect-debug</h1>
+<blockquote>
+<p>DeepSeek Harness 插件 · 二分定位 / DSH plugin for bisecting bugs</p>
+</blockquote>
+<p>"bug 在当前代码里，但不知道具体在哪"——用<strong>二分法把搜索范围每轮砍一半</strong>，快速锁定到具体函数/边界/commit。</p>
+<p>"Bugs live somewhere in this code, but where?" — <strong>halve the search space every round</strong> with bisection, down to the exact function, boundary, or commit.</p>
+<h2>三种二分法 Three modes</h2>
+<table>
+<thead>
+<tr>
+<th>模式</th>
+<th>切什么</th>
+<th>适用场景</th>
+<th>需要什么</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong>① 代码二分</strong></td>
+<td>注释/disable 一半代码</td>
+<td>"bug 在当前代码里，缩小到具体函数/组件"</td>
+<td>当前代码 + 可复现的 bug</td>
+</tr>
+<tr>
+<td><strong>② 边界二分</strong></td>
+<td>curl/log 沿数据流逐层验证</td>
+<td>"不知道是前端还是后端的锅"</td>
+<td>数据流节点图（≥3 层）</td>
+</tr>
+<tr>
+<td><strong>③ commit 二分</strong></td>
+<td>git bisect 切提交历史</td>
+<td>"之前还好好的，不知道哪次改坏的"</td>
+<td>git 历史 + 好/坏 commit</td>
+</tr>
+</tbody></table>
+<p><strong>先判断用哪种</strong>：有明确好/坏时间点 → ③；跨层问题不确定哪层 → ②；确定在当前代码里 → ①（最常用）。</p>
+<h2>① 代码二分（注释/disable，最常用）</h2>
+<pre><code>范围里有 N 个候选（函数/组件/中间件/import）
+→ 注释掉后半 N/2 个
+→ bug 消失 → 根因在被注释的后半里，继续二分后半
+→ bug 还在 → 根因在前半里，继续二分前半
+→ 反复直到缩小到具体函数/具体行
+</code></pre>
+<p>标记法（方便恢复，不丢原代码）：</p>
+<pre><code>// [bisect-disabled] &lt;OriginalComponent /&gt;
+// &lt;OriginalComponent /&gt;
+</code></pre>
+<p>注意：有依赖关系的模块不能乱注释（会引入新报错）；注释后验证的是"bug 还在不在"而不是"有没有新报错"；<strong>每轮只注释一半</strong>。</p>
+<h2>② 边界二分（curl/log 沿数据流）</h2>
+<p>任何 bug 都是"数据在某个环节不再正确"。<strong>沿数据流逐跳验证</strong>，找到数据正确到达的最后一站：</p>
+<pre><code>上游 ──→ 节点A ──→ 节点B ──→ 节点C ──→ 下游（用户看到的现象）
+</code></pre>
+<p>从中间节点验证——midpoint 正确则 bug 在下游，错误则 bug 在上游。不同架构的验证方式：</p>
+<table>
+<thead>
+<tr>
+<th>架构</th>
+<th>验证方式</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>HTTP 前后端</td>
+<td><code>curl</code> 直连后端 API，绕过前端</td>
+</tr>
+<tr>
+<td>微服务链</td>
+<td>逐服务 curl 或查日志</td>
+</tr>
+<tr>
+<td>数据库</td>
+<td>DB 客户端直接查</td>
+</tr>
+<tr>
+<td>浏览器渲染</td>
+<td>DevTools Network + Console</td>
+</tr>
+<tr>
+<td>函数调用链</td>
+<td>调用方/被调用方各加 log</td>
+</tr>
+</tbody></table>
+<p>真实案例：点击授权报 405 → 3 个 curl（MCP 登录 200 ✅ / 网关 POST 405 / 下游 API 422 ✅）→ 结论：网关 nginx 拦截 POST。<strong>全程 3 个 curl，0 行代码改动。</strong></p>
+<p>先用<strong>边界二分定层</strong>，再在该层内用<strong>代码二分定函数</strong>。</p>
+<h2>③ commit 二分（git bisect run）</h2>
+<p>把"好/坏判定"固化成<strong>退出码脚本</strong>（exit 0=好，exit 1=坏，exit 125=跳过），交给 <code>git bisect run</code> 全自动收敛：</p>
+<pre><code># 1. 确认好/坏 commit（good 从 tag/log 推断，不问用户）
+git merge-base --is-ancestor &lt;good&gt; &lt;bad&gt;   # 校验 good 在 bad 祖先链上
+
+# 2. 写判定脚本 .temp/bisect-judge.sh
+npm run build &gt;/dev/null 2&gt;&amp;1 || exit 125
+code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 30 "http://localhost:8080/")
+[ "$code" = "200" ] &amp;&amp; exit 0 || exit 1
+
+# 3. 全自动跑
+git bisect start
+git bisect bad &lt;bad-commit&gt;
+git bisect good &lt;good-commit&gt;
+git bisect run bash .temp/bisect-judge.sh
+
+# 4. 收尾（必做）
+git bisect reset
+</code></pre>
+<p>注意：base 过期要校验（upstream 合入新文件会误导二分）；启动前工作区必须干净；<code>git bisect reset</code> 必做。</p>
+<h2>执行纪律 Discipline</h2>
+<ol>
+<li><strong>连续改了 ≥2 处还没解决 → 停下，回到二分</strong>（最强反偷懒规则）。</li>
+<li><strong>每轮只切一半，测完再切下一半</strong>——禁止一次改多处再测。</li>
+<li><strong>现象优先，代码最后</strong>——先用 curl/log/ping 确认现象和边界，不要一上来就读代码。</li>
+<li>bug 不可复现时调整策略：总是复现 → 直接二分；间歇复现 → 加诊断日志等下一次；只发生一次 → 最大日志注入 + 部署监控。</li>
+<li>不好结果也有参考价值——宁可跑完次优解留数据，不中途停下等拍板。</li>
+</ol>
+<h2>跳过二分的情况 When to skip</h2>
+<p>从现象到根因 ≤ 2 步，不进二分：编译器已指出文件+行号 / 用户明确说了根因 / 改一行就能验证 / 已知版本依赖问题。</p>
+<h2>安装 Install</h2>
+<pre><code># 发布到 npm 后
+dsh plugin --profile demo add dsh-bisect-debug
+
+# 或从 GitHub 安装
+dsh plugin --profile demo add github:PangYiMing/dsh-bisect-debug
+</code></pre>
+<h2>许可证 License</h2>
+<p><a href="https://github.com/PangYiMing/dsh-bisect-debug/blob/HEAD/LICENSE">MIT</a></p>

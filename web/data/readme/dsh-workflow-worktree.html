@@ -1,0 +1,118 @@
+<h1>dsh-workflow-worktree</h1>
+<p>Git worktree isolation for <strong>DeepSeek Harness workflows</strong> — every write-capable
+workflow agent gets its own checkout that cannot touch your working tree, and
+survives a crash.</p>
+<h2>The gap this fills</h2>
+<p><a href="https://github.com/icetomoyo/dsh_workflow"><code>@dsh-external/workflow</code></a> reserves a
+seam for worktree isolation and deliberately ships no implementation. Its README
+is explicit: <em>"worktree 通过 <code>registerIsolationAdapter()</code> 接入，未注册时明确失败."</em></p>
+<p>So a workflow task declaring <code>isolation: 'worktree'</code> fails today:</p>
+<pre><code>workflow worktree isolation requested but no isolation adapter is configured
+</code></pre>
+<p>This plugin is that adapter.</p>
+<h2>Not another worktree manager</h2>
+<p>Several plugins manage git worktrees. This one is not for you to use — it is for
+the workflow engine to use.</p>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>manual worktree plugins</th>
+<th>dsh-workflow-worktree</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>who creates it</td>
+<td>you, or the model, on request</td>
+<td>the workflow engine, per task</td>
+</tr>
+<tr>
+<td>bound to</td>
+<td>a name you pick</td>
+<td><code>runId</code> + <code>taskId</code> + session</td>
+</tr>
+<tr>
+<td>lifetime</td>
+<td>permanent until you delete it</td>
+<td>the task's, with dirty-lane retention</td>
+</tr>
+<tr>
+<td>entry point</td>
+<td>agent tools / chat commands</td>
+<td><code>registerIsolationAdapter()</code></td>
+</tr>
+</tbody></table>
+<p>If you want to fork a workspace and keep working in it, use a manual plugin such
+as <a href="https://github.com/FlashingChen/dsh-worktree"><code>dsh-worktree</code></a>. If you want
+<code>spawnAgent({ isolation: 'worktree' })</code> to work, use this one. They coexist.</p>
+<h2>Install</h2>
+<pre><code>dsh plugin --profile web add @dsh-external/workflow
+dsh plugin --profile web add dsh-workflow-worktree
+</code></pre>
+<p>Then a workflow task can ask for isolation:</p>
+<pre><code>await wf.spawnAgent({
+  name: 'refactor-auth',
+  prompt: '…',
+  isolation: 'worktree',      // ← previously a hard failure
+})
+</code></pre>
+<h2>What a lane is</h2>
+<pre><code>&lt;repo&gt;/.dsh-worktrees/wf-&lt;runId&gt;-&lt;taskId&gt;     the checkout
+dsh/wf-&lt;runId&gt;-&lt;taskId&gt;                       its branch
+&lt;repo&gt;/.dsh-worktrees/lanes.json              the manifest
+</code></pre>
+<p>The manifest records <code>runId</code>, <code>taskId</code>, worktree path, branch, base commit,
+session id, and status. Git already knows which worktrees exist; it does not
+know which workflow task owned one. That binding is what survives a crash.</p>
+<p>Inspect lanes with the <code>worktree_lanes</code> tool:</p>
+<pre><code>run-7/task-3  dirty
+  worktree: /repo/.dsh-worktrees/wf-run-7-task-3
+  branch:   dsh/wf-run-7-task-3
+  base:     d1015c2e…
+  changed:  ?? agent-work.txt
+</code></pre>
+<h2>Design commitments</h2>
+<p><strong>Never degrade to the shared checkout.</strong> If the directory is not a git working
+tree, or the worktree cannot be created, <code>prepare()</code> rejects. The engine then
+fails the task loudly. An isolation backend that quietly runs the agent in your
+tree is worse than one that refuses, because the failure is invisible until the
+damage is done.</p>
+<p><strong>The returned agent is a new agent.</strong> The engine does
+<code>parent = isolation.parent</code> and reads <code>cwdOf(parent)</code> afterwards, so the
+returned agent's session must be created <em>in</em> the worktree. Returning the
+caller's parent unchanged type-checks and silently defeats the whole plugin —
+<code>verify-contract.mjs</code> asserts this binding directly.</p>
+<p><strong>Uncommitted work is never discarded.</strong> A lane that still has changes when the
+task ends is retained and marked <code>retained-dirty</code>, with its path and branch
+logged. Git refuses to remove a dirty worktree; so does this.</p>
+<p><strong>Your <code>git status</code> stays clean.</strong> The lane directory is added to
+<code>.git/info/exclude</code>, not to a tracked <code>.gitignore</code> — an isolation backend must
+not author changes in the tree it protects. Without this the directory reads as
+<code>?? .dsh-worktrees/</code> and perturbs the workspace fingerprints workflow
+verification takes around each task.</p>
+<p><strong><code>dispose()</code> is idempotent.</strong> The engine calls it on task settle, run failure,
+and explicit stop.</p>
+<h2>Verified against</h2>
+<p><code>@deepseek-ai/dsh@0.1.0-rc.6</code>, <code>@dsh-external/workflow@0.1.2</code>, git 2.47, Node 24,
+Windows.</p>
+<p><code>verify-contract.mjs</code> runs the adapter against a real repository and asserts the
+load-bearing invariants:</p>
+<pre><code>CONTRACT cwd bound to worktree : true
+CONTRACT not the main checkout : true
+main tree after agent write    : []
+dirty lane retained on dispose : retained-dirty
+clean lane removed             : true
+double dispose survived        : true
+</code></pre>
+<h2>Known limitations</h2>
+<ul>
+<li><strong>No merge.</strong> This creates and recovers isolated workspaces; deciding what to
+do with the result is the operator's. Diff/merge-preflight are deliberately
+out of scope for v1.</li>
+<li><strong>Dirty lanes accumulate.</strong> Retention is the safe default; <code>recoverLanes()</code>
+prunes only lanes git no longer knows about, never live ones.</li>
+<li><strong>One repository per lane.</strong> A task whose cwd is outside the repository root
+is refused rather than isolated somewhere surprising.</li>
+</ul>
+<h2>License</h2>
+<p>MIT</p>

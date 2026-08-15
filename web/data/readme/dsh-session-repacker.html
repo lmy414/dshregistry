@@ -1,0 +1,69 @@
+<h1>dsh-session-repacker</h1>
+<p>把 DSH 会话日志中成千上万个独立 zstd 帧重打包为官方原生两帧形态，大幅加快旧会话打开速度。</p>
+<h2>背景：为什么会话打开慢</h2>
+<p>DSH 的 JSONL 会话后端（<code>dsh-session-persistence-jsonl</code>）<strong>每次写入批处理都单独压缩成一个 zstd 帧</strong>再追加到 <code>session.jsonl.zstd</code> 尾部。流式输出期间每 ~200ms 一批，一个长会话动辄上万帧；而读取时必须<strong>逐帧解压</strong>（且后端没有 seek 式后缀读取，无论只要尾部还是全部都要解码整个文件）。</p>
+<p>实测（2026-08-14）：本机最大会话 <strong>5.49MB 压缩 = 14,467 帧 / 19,310 事件</strong>，纯解压 <del>660ms，真实读取路径约 1.5</del>3s。</p>
+<table>
+<thead>
+<tr>
+<th>会话</th>
+<th>重打包前</th>
+<th>重打包后</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>最大会话</td>
+<td>14,467 帧 / 5.49MB / ~661ms</td>
+<td><strong>2 帧</strong> / 2.09MB / <strong>~126ms（6 倍）</strong></td>
+</tr>
+<tr>
+<td>全量 24 个旧会话</td>
+<td>39,911 帧 / 20.08MB</td>
+<td>48 帧 / 10.67MB</td>
+</tr>
+</tbody></table>
+<p>重打包同时把压缩体积减半（单大帧压缩率远好于万个小帧）。</p>
+<h2>原理</h2>
+<p>把"万帧"日志重打包成官方写入时的原生形态——<strong>头部帧（恰好一行 header）+ 单个事件帧</strong>（其余全部明文拼接后重压一帧）。明文<strong>逐字节不变</strong>，dsh 读取路径完全兼容（<code>assertZstdHeaderFrame</code> 只要求第一帧恰为一行 header）。</p>
+<p>覆盖一切从磁盘读旧会话的路径：GUI 打开、新对话接续/分支（fork 前需全量解码父会话）、子会话继承。</p>
+<h2>安装</h2>
+<pre><code># 作为 DSH 插件（推荐）：
+dsh plugin --profile web add dsh-session-repacker
+# 或克隆到 plugins/ 目录 + link 进 profile（见 DSH 插件开发手册）
+</code></pre>
+<p>配置（<code>profiles/&lt;profile&gt;/cordis.patch.yml</code>）：</p>
+<pre><code>- id: session-repacker
+  config:
+    root: 'E:\DeepSeekHarness\sessions'   # 会话根目录（必填）
+    minFrames: 200        # 帧数低于此值不处理（默认 200）
+    minAgeMs: 600000      # mtime 距今不足此值不处理，避开活跃写入（默认 10 分钟）
+    intervalMs: 3600000   # 周期维护间隔毫秒（默认 1 小时）
+</code></pre>
+<p>重启服务器后生效：启动时全量扫描一次，之后按 <code>intervalMs</code> 周期维护。</p>
+<h2>独立 CLI（无需 DSH 服务）</h2>
+<pre><code>node tools/repack.mjs &lt;root&gt;                  # 扫描并重打包
+node tools/repack.mjs &lt;root&gt; --dry-run        # 只统计不落盘
+node tools/repack.mjs &lt;root&gt; --file &lt;path&gt;    # 只处理指定文件（可多次）
+node tools/repack.mjs &lt;root&gt; --min-frames 64 --min-age-ms 60000
+</code></pre>
+<h2>安全设计</h2>
+<ol>
+<li>只处理 <code>.jsonl.zstd</code>；跳过 mtime 距今 &lt; <code>minAgeMs</code> 的文件（避开活跃写入）</li>
+<li>跳过当前 live 会话（注入 <code>sessions</code> 服务时用 <code>ctx.sessions.list()</code>）</li>
+<li>替换前做<strong>字节级等价校验</strong>（新文件解压明文 == 原始明文）</li>
+<li>替换前再次 stat 比对 size/mtime，文件被并发追加则放弃本次</li>
+<li>torn tail（未完成帧）跳过，交给 dsh 自身的修复路径</li>
+<li>临时文件 + fsync + 原子 rename（Windows 下与官方后端同构）</li>
+</ol>
+<p>服务器对重打包后的文件追加新帧（<code>session/end-seed</code> 等）实测兼容，后续可被再次重打包（幂等）。</p>
+<h2>构建</h2>
+<pre><code>npm i
+npx -y tsdown@0.22.2 --config ./tsdown.config.ts   # 产物 lib/index.mjs
+</code></pre>
+<h2>注意事项</h2>
+<ul>
+<li>已产生的旧文件帧数定形后无法回溯压缩，只能靠本插件/CLI 重打包；<code>writeBatchMaxDelayMs</code> 调大可减少未来日志的帧数（默认 200ms，属耐久性权衡）</li>
+<li>插件只做维护，不改变任何读取 API 与数据语义</li>
+</ul>
+<h2>License</h2>
+<p>MIT</p>

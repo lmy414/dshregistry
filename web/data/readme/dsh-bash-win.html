@@ -1,0 +1,147 @@
+<h1>dsh-bash-win</h1>
+<p>在 Windows 上为 DeepSeek Harness(DSH)提供 <strong>Git Bash</strong> 与 <strong>WSL2</strong> 两个 bash 工具的
+Cordis 插件。</p>
+<h2>这个项目解决什么</h2>
+<ul>
+<li>DSH 在 Windows 上<strong>禁用了官方 bash 工具</strong>(只有 pwsh)</li>
+<li></li>
+</ul>
+<p>本插件通过 <code>ctx.subprocess</code> 直接 spawn <code>bash.exe</code> / <code>wsl.exe</code>，绕开受限令牌层，
+把 Git Bash 或者 WSL2 带进 DSH，并<strong>自建有效沙箱</strong>(WSL 内 bwrap)与<strong>审批请求</strong>。</p>
+<h2>安全模型</h2>
+<table>
+<thead>
+<tr>
+<th>维度</th>
+<th>机制</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong>默认执行</strong></td>
+<td>无沙箱，全权限</td>
+<td><code>git_bash</code> / <code>wsl_bash</code> 默认直接跑，可读写任意路径(绕开沙箱的代价)</td>
+</tr>
+<tr>
+<td><strong>沙箱</strong></td>
+<td>WSL 内 bwrap(<code>sandbox: true</code>)</td>
+<td>系统目录只读、workspace 可写、<code>/mnt/c</code> 其余只读;越界写入被拒并报 <code>[sandbox: file access denied under workspace-write mode]</code></td>
+</tr>
+<tr>
+<td><strong>审批</strong></td>
+<td><code>ctx.approval</code></td>
+<td><code>require_approval: true</code> 执行前弹窗;升权请求(<code>sandbox_permissions</code> + <code>justification</code>)弹窗;<code>ask</code> 策略弹窗、<code>never</code> 自动拒绝</td>
+</tr>
+</tbody></table>
+<p>关键概念:</p>
+<ul>
+<li><strong>操作路径本身不触发审批</strong>——沙箱对越界的处理是"拒绝"(报错，不弹窗);</li>
+<li><strong>审批只出现在两处</strong>:显式批准模式(<code>require_approval</code>)和越界后的升权请求;</li>
+<li><strong>升权阶梯</strong>:<code>workspace-write</code>(bwrap 受限)→ <code>danger-full-access</code>(去掉 bwrap)，
+走官方 <code>approveEscalation</code> 流程，必须严格加宽且经用户批准。</li>
+</ul>
+<h2>工具</h2>
+<table>
+<thead>
+<tr>
+<th>工具</th>
+<th>后端</th>
+<th>UI 标题</th>
+<th>能力</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>git_bash</code></td>
+<td>本地 Git Bash(MSYS2)</td>
+<td>Git Bash</td>
+<td>批准模式(<code>require_approval</code>)、官方沙箱接入(<code>sandbox</code>，Windows 受限模式报 Cygwin 限制)、后台任务</td>
+</tr>
+<tr>
+<td><code>wsl_bash</code></td>
+<td>WSL2(Linux)</td>
+<td>WSL Bash</td>
+<td><strong>bwrap 真沙箱</strong>(<code>sandbox: true</code>)、升权审批(<code>sandbox_permissions</code> + <code>justification</code>)、后台任务</td>
+</tr>
+</tbody></table>
+<p>共性能力:</p>
+<ul>
+<li>前台执行:<code>timeoutMs</code> 超时终止整个进程树、调用取消</li>
+<li>后台任务:<code>run_in_background: true</code> 返回 job id，配合 <code>job_output</code> / <code>job_kill</code>
+(非零退出码如实上报，kill 分类为 <code>killed</code>)</li>
+<li>输出收集:内存上限 256 KiB，超限截断并落 spill 文件</li>
+<li>Web 终端卡片:终端图标、可展开输出、退出码状态，与内置 bash/pwsh 卡片一致</li>
+</ul>
+<h2>支持与限制</h2>
+<h3>Git Bash(<code>git_bash</code>)</h3>
+<ul>
+<li>自动探测安装位置:<code>C:\Program Files\Git\bin\bash.exe</code>、
+<code>C:\Program Files\Git\usr\bin\bash.exe</code>、<code>C:\Program Files (x86)\Git\bin\bash.exe</code></li>
+<li>MSYS2 完整语义(管道、重定向、Unix 风格命令)，Windows/Unix 路径混用</li>
+<li>每次调用全新进程，状态不跨调用</li>
+<li><strong>无文件沙箱</strong>:受限令牌下 Cygwin 无法启动，默认以完整权限运行;
+<code>sandbox: true</code> 会尝试走 windows-acl 沙箱，受限模式下如实报告 runner 失败
+(这是平台限制，不是绕过)</li>
+<li>适合:需要 Windows 侧工具、msys 语义、或"全权限 + 人工批准把关"的场景</li>
+</ul>
+<h3>WSL2(<code>wsl_bash</code>)</h3>
+<ul>
+<li>自动探测 <code>C:\Windows\System32\wsl.exe</code>;发行版默认 <code>Ubuntu</code>(可指定)</li>
+<li><code>--cd</code> 自动转换 Windows 路径(<code>C:\Users\...</code> → <code>/mnt/c/Users/...</code>)，也可直接传 Linux 路径</li>
+<li>真 Linux 环境:apt、gcc、python 等，Linux 退出码语义;以 WSL 默认用户身份运行</li>
+<li>VM 未启动时首次调用有数秒冷启动延迟(可用 <code>timeoutMs</code> 控制等待)</li>
+<li>默认无沙箱(ext4 不受 Windows ACL 约束，Windows 侧沙箱管不住它)</li>
+<li><code>sandbox: true</code> 时在 WSL 内用 <strong>bwrap</strong> 包装命令:系统目录(<code>/usr</code> <code>/lib</code>
+<code>/bin</code> <code>/etc</code> 等)只读、<code>/tmp</code> 临时可写、workspace 可写、<code>/mnt/c</code> 其余只读;
+要求发行版已安装 <code>bubblewrap</code>(<code>apt install bubblewrap</code>)</li>
+<li>实现细节:bwrap 参数<strong>逐个传递</strong>(避免 wsl.exe 的 Windows→Linux 参数字符串
+序列化损坏引号);命令经 base64 编码传递(避免引号注入)</li>
+</ul>
+<h2>程序检测与配置</h2>
+<p>定位优先级:插件 <code>config</code> &gt; 环境变量 &gt; 自动探测。</p>
+<pre><code># cordis.patch.yml
+- insert:
+    - id: tool-bashx
+      name: '@zimzaza4/dsh-bash-win'
+      config:
+        bashPath: 'D:\tools\Git\bin\bash.exe'   # 自定义 Git Bash
+        wslPath: 'C:\Windows\System32\wsl.exe'  # 自定义 WSL
+        wslDistro: 'Debian'                     # 默认发行版
+</code></pre>
+<p>环境变量:<code>DSH_BASHX_BASH_PATH</code> / <code>DSH_BASHX_WSL_PATH</code> / <code>DSH_BASHX_WSL_DISTRO</code>。</p>
+<h2>安装</h2>
+<p>插件已发布到 npm。通过 DSH 官方 <code>dsh plugin</code> 命令安装进 <strong>profile</strong>(<code>dsh web</code>
+对应 <code>web</code> profile)。</p>
+<h3>从 npm 安装(推荐)</h3>
+<pre><code>dsh plugin --profile web add @zimzaza4/dsh-bash-win
+</code></pre>
+<p>装完<strong>重启 <code>dsh web</code></strong> 生效。包内 <code>cordis.patch.yml</code>(经 <code>dsh.bundle.patch</code>
+声明)自动挂载插件行，重启后即可在对话中使用 <code>git_bash</code> / <code>wsl_bash</code>。</p>
+<h3>从本地目录安装(开发调试)</h3>
+<pre><code>dsh plugin --profile web add link:D:/Develop/ToolDev/dsh-bash-win
+</code></pre>
+<p><code>link:</code> 仅适用于本机开发目录;装完同样需要重启 <code>dsh web</code>。</p>
+<h3>验证</h3>
+<ul>
+<li>重启后新会话中应出现 <code>git_bash</code> / <code>wsl_bash</code> 两个工具;</li>
+<li>或用 <code>dsh --profile web --dump-config</code> 确认插件配置层已挂载;</li>
+<li>若工具未出现，多半是安装后没有重启 <code>dsh web</code>。</li>
+</ul>
+<h3>卸载</h3>
+<pre><code>dsh plugin --profile web remove @zimzaza4/dsh-bash-win
+</code></pre>
+<p>然后重启 <code>dsh web</code>。</p>
+<h3>注意事项</h3>
+<ul>
+<li><strong>改代码后必须重启 DSH</strong>——本插件的 HMR 热加载在此部署中不可靠，重启是唯一
+可靠加载路径;</li>
+<li>通过 UI 卸载插件会删除 profile 的 <code>cordis.patch.yml</code>;重新安装时重建该文件即可</li>
+</ul>
+<h2>依赖</h2>
+<ul>
+<li><code>@deepseek-ai/dsh-tools</code>、<code>@deepseek-ai/dsh-sandbox</code>(peer，宿主提供)</li>
+<li>运行时服务:<code>tools</code>(硬依赖);<code>subprocess</code> / <code>fs</code> / <code>timer</code> / <code>jobs</code> /
+<code>approval</code> / <code>sandbox</code> / <code>sandboxPolicy</code>(可选 <code>ctx.get</code>)</li>
+<li>本机程序(按需):Git for Windows、WSL + 发行版;沙箱模式另需发行版内 <code>bubblewrap</code></li>
+</ul>
+<h2>License</h2>
+<p>MIT</p>

@@ -1,0 +1,134 @@
+<h1>dsh-image-vision-bridge</h1>
+<p>DSH 宿主插件:你发送的图片<strong>照常显示在聊天记录里</strong>,插件在 <code>llm/stream</code>
+水线上把发给主模型的请求里的图片块悄悄替换成视觉模型 <strong>mimo-v2.5</strong>
+(默认走你已配置的 <code>opencode-go</code> 路由,复用现有 <code>OPENCODE_GO_API_KEY</code>)
+生成的<strong>文本描述</strong>。描述只进模型、不进聊天:DeepSeek 基于描述回复你,
+聊天里看不到任何"图片解析"文本。</p>
+<h2>工作原理</h2>
+<ol>
+<li>图片消息原样进入 agent、原样写入会话日志——聊天框显示的就是你发的图。</li>
+<li>主循环(以及压缩、标题生成等)发出的任何模型请求都会经过 <code>llm/stream</code>
+水线。插件检查请求消息里是否含 image 块:<ul>
+<li>不含图片 → 直接放行;</li>
+<li>目标是插件配置的视觉模型本身(自己的调用,或某会话本来就选用了
+视觉模型)→ 放行,让视觉模型直接看图;</li>
+<li>其他情况 → 构造一份<strong>重写后的请求</strong>:消息里的 image 块(含 tool-result
+嵌套)替换为描述文本,再以这份请求实际流式调用。原请求对象与
+会话日志完全不被修改。</li>
+</ul>
+</li>
+<li>描述结果按附件 id 在进程内缓存(重试/后续轮次不重复调用);视觉调用
+失败时降级为一段失败说明文本,不打断对话;用户取消时错误照常抛出。</li>
+</ol>
+<h2>安装(标准 bundle 方式)</h2>
+<p>本包声明了 <code>dsh.bundle</code>,是标准的可分发 bundle:安装时自动插入插件行,
+无需手改 cordis.patch.yml。</p>
+<pre><code># 本地目录 / tarball / npm / GitHub 均可:
+dsh plugin --profile web add ./dsh-image-vision-bridge
+dsh plugin --profile web add ./dsh-image-vision-bridge-0.1.0.tgz
+dsh plugin --profile web add dsh-image-vision-bridge      # 发布到 npm 后
+dsh plugin --profile web add github:Icestab/dsh-image-vision-bridge#&lt;commit-sha&gt;
+</code></pre>
+<p>仍有两步手工操作(插件无法替用户完成):</p>
+<ol>
+<li><p><strong>让主模型声明可接收图片</strong>(必做):主机的 API 边界
+(<code>dsh-host-apiproxy</code>)会在图片消息进入 agent 之前用当前模型的
+<code>inputModalities</code> 做校验,主模型若不声明 image 会被直接拒绝
+(客户端提示"当前模型不支持图片")。在
+<code>/home/dy/.dsh/settings.yaml</code> 的 <code>llm-pi-ai.providers.&lt;路由&gt;</code> 下为
+主模型加 <code>modelOverrides</code>(该文件热重载,免重启):</p>
+<pre><code>llm-pi-ai:
+  providers:
+    opencode-go:
+      apiKeyEnv: OPENCODE_GO_API_KEY
+      modelOverrides:
+        deepseek-v4-pro:
+          input: [text, image]
+</code></pre>
+<p>插件会在请求水线上把图片换成文本描述,主模型请求里永远不会真的出现
+图片块,所以这个声明只是放行边界,不会把图片发给 deepseek。</p>
+</li>
+<li><p>重启 <code>dsh web</code>(web profile 已禁用 HMR,必须重启才生效)。</p>
+</li>
+</ol>
+<p>bundle 默认配置(provider: <code>opencode-go</code>,model: <code>mimo-v2.5</code>)可被用户覆盖:
+在 profile 自己的 <code>cordis.patch.yml</code> 里按行 id <code>image-vision-bridge</code> 重写
+config 即可(后层胜出)。</p>
+<h2>安装(手工平铺方式,当前环境所用)</h2>
+<ol>
+<li><p>把本包复制到 profile 的解析路径(裸名从 profile 目录向上找 node_modules):</p>
+<pre><code>cp -r /home/dy/.dsh/plugins/dsh-image-vision-bridge \
+      /home/dy/.dsh/profiles/node_modules/dsh-image-vision-bridge
+</code></pre>
+<blockquote>
+<p>注:以后若在 profile 里运行过 <code>dsh plugin --profile web add/install …</code>,
+pnpm 可能清掉这个手工放置的目录,重新执行上面这条命令即可恢复。</p>
+</blockquote>
+</li>
+<li><p>在 <code>/home/dy/.dsh/profiles/web/cordis.patch.yml</code> 中加入一行(同
+"标准 bundle 方式"里的 settings.yaml 配置一样,是插件无法替用户完成的
+前提):</p>
+<pre><code>- insert:
+    - id: image-vision-bridge
+      name: 'dsh-image-vision-bridge'
+      config:
+        provider: opencode-go
+        model: mimo-v2.5
+</code></pre>
+</li>
+<li><p>同样需要上面的 settings.yaml <code>modelOverrides</code> 配置,然后重启 <code>dsh web</code>。</p>
+</li>
+</ol>
+<h2>配置</h2>
+<table>
+<thead>
+<tr>
+<th>键</th>
+<th>默认值</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>enabled</code></td>
+<td><code>true</code></td>
+<td><code>false</code> 时完全透传,不做桥接</td>
+</tr>
+<tr>
+<td><code>provider</code></td>
+<td><code>opencode-go</code></td>
+<td>视觉模型所在 LLM 路由(必须已注册,即 settings.yaml 里 <code>llm-pi-ai.providers</code> 已配置)</td>
+</tr>
+<tr>
+<td><code>model</code></td>
+<td><code>mimo-v2.5</code></td>
+<td>视觉模型 id</td>
+</tr>
+<tr>
+<td><code>maxTokens</code></td>
+<td><code>2048</code></td>
+<td>视觉调用最大输出 token</td>
+</tr>
+<tr>
+<td><code>maxDescriptionChars</code></td>
+<td><code>6000</code></td>
+<td>注入主模型前的描述长度上限</td>
+</tr>
+<tr>
+<td><code>prompt</code></td>
+<td>内置中文提示词</td>
+<td>发给视觉模型的指令(用户原文会自动拼在前面)</td>
+</tr>
+</tbody></table>
+<p>示例(自定义):</p>
+<pre><code>- insert:
+    - id: image-vision-bridge
+      name: 'dsh-image-vision-bridge'
+      config:
+        model: mimo-v2.5
+        maxTokens: 4096
+        prompt: 'Describe this image in English, including all visible text.'
+</code></pre>
+<h2>自测</h2>
+<pre><code>cd /home/dy/.dsh/profiles
+node node_modules/dsh-image-vision-bridge/test/transform.test.mjs
+</code></pre>

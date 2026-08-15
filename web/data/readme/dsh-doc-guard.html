@@ -1,0 +1,185 @@
+<h1>dsh-doc-guard（文档-代码一致性守护）</h1>
+<blockquote>
+<p><strong>Document-Code Consistency Guard for DeepSeek Harness.</strong>
+A read-only DSH plugin that audits your versioned Markdown design docs against the
+actual repository: header version numbers, changelog tables, directory-structure trees,
+module/test counts, and cross-document references. It detects drift (docs saying one
+thing, code being another) and outputs actionable, severity-sorted fix suggestions.
+Install with: <code>dsh plugin --profile web add "github:&lt;your-github-user&gt;/dsh-doc-guard#main"</code>.</p>
+</blockquote>
+<p>很多仓库用「版本化 Markdown 文档」记录设计：<code>doc/</code> 下多份文档，头部有 <code>文档版本：vX.Y</code>，
+更新记录是 Markdown 表格，正文含目录结构树、模块/系统清单、测试计数、验收数字与文档间互相引用。
+代码改完后文档极易漂移：改了代码没加更新记录行、版本号没递增、结构树与真实文件树不符、
+测试数与验收记录对不上、文档间引用版本不一致。</p>
+<p><code>dsh-doc-guard</code> 用<strong>纯启发式、全程只读</strong>地审计这些维度，检测漂移并按严重度输出可直接执行的修复建议。
+是 DSH 生态中第一个做「文档漂移审计」的插件（context-doctor 只审上下文注入成本，不审文档漂移）。</p>
+<h2>特性</h2>
+<table>
+<thead>
+<tr>
+<th>审计维度</th>
+<th>说明</th>
+<th>漂移类型</th>
+<th>严重度</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>版本号一致性</td>
+<td>头部 <code>**文档版本：vX.Y**</code>（或 <code>&gt; - 文档版本：vX.Y</code>）与更新记录表最新行版本比对；文档间 <code>对应技术设计 vX</code> 引用值与目标文档当前版本比对</td>
+<td><code>version_mismatch</code></td>
+<td>high</td>
+</tr>
+<tr>
+<td>更新记录表</td>
+<td>解析 <code>| 版本 | 日期 | 更新内容 |</code> 表格：最新版本≠头部版本、更新内容为空（禁止只改版本号不记内容）</td>
+<td><code>version_mismatch</code> / <code>missing_record</code></td>
+<td>high / medium</td>
+</tr>
+<tr>
+<td>代码变更未记录</td>
+<td>最近代码文件 mtime 晚于记录表最新日期超过窗口 → 「可能有未记录的代码变更」（mtime 启发式，安全边界内不执行 git）</td>
+<td><code>stale_record</code></td>
+<td>low</td>
+</tr>
+<tr>
+<td>结构树漂移</td>
+<td>代码块中 <code>├──</code>/<code>└──</code> 目录树 vs 真实文件系统（自动排除构建/VCS 目录；目录级摘要树只比目录层级）</td>
+<td><code>tree_missing</code> / <code>tree_extra</code></td>
+<td>medium / low</td>
+</tr>
+<tr>
+<td>模块/系统清单</td>
+<td><code>N 个 System</code> / <code>N 份文档</code> / <code>N 个测试文件</code> 等计数声明 vs 真实计数（目录条目/文档数/测试数）</td>
+<td><code>count_mismatch</code></td>
+<td>low</td>
+</tr>
+<tr>
+<td>测试计数</td>
+<td><code>Core 199/199</code>、<code>Net 91 通过/4 跳过</code> 等验收数字 vs 测试源文件静态统计（按扩展名识别 <code>[Fact]</code>/<code>it(</code>/<code>#[test]</code>/<code>def test_</code>/<code>@Test</code>/<code>func Test</code>，不执行测试）</td>
+<td><code>count_mismatch</code></td>
+<td>low</td>
+</tr>
+<tr>
+<td>文档间交叉引用</td>
+<td><code>详见 §X</code> / <code>见实现文档 §X</code> → 被引文档是否存在；<code>对应技术设计 vX</code> → 版本值是否等于被引文档当前版本</td>
+<td><code>cross_ref</code> / <code>version_mismatch</code></td>
+<td>high</td>
+</tr>
+</tbody></table>
+<p>全部启发式可配置、可忽略；<strong>误报宁可少</strong>——无法确定性解析的目标一律跳过，不猜测。</p>
+<h2>快速安装</h2>
+<pre><code># GitHub 源（构建产物 lib/ 已入库，无需构建）
+dsh plugin --profile web add "github:&lt;your-github-user&gt;/dsh-doc-guard#main"
+</code></pre>
+<p>安装后重启 dsh web，<code>doc_guard</code> 工具即出现在模型工具列表；<code>dsh --profile web --dump-config | grep doc-guard</code>
+应输出含 <code>id: doc-guard</code> 的挂载记录。</p>
+<h2>工具用法</h2>
+<pre><code>doc_guard
+  参数：
+    cwd?: string          审计起点目录（默认当前会话工作目录）
+    docs?: string[]       要审计的文档路径（默认自动发现 cwd 下 doc*/ 目录 + 根目录含版本头的 *.md）
+    includeCounts?: boolean  是否做测试计数/模块计数启发式（默认 true）
+    detail?: 'summary' | 'developer'  默认 summary；developer 附可定位 receipt（路径+行号）
+  输出：canonical JSON 报告（见下），渲染为分节文本
+</code></pre>
+<h3>canonical JSON</h3>
+<pre><code>{
+  "tool": "doc_guard",
+  "version": 1,
+  "cwd": "/path/to/repo",
+  "docs": [
+    { "path": "doc/实现文档.md", "headerVersion": "v1.43",
+      "records": [{ "version": "v1.43", "date": "2026-08-15", "hasSummary": true }] }
+  ],
+  "drifts": [
+    { "severity": "high",
+      "kind": "version_mismatch",
+      "doc": "doc/实现文档.md",
+      "detail": "头部文档版本 v1.43 与更新记录表最新行版本 v1.42（第 8 行）不一致",
+      "evidence": "文档版本：v1.43；更新记录 v1.42 / 2026-08-14",
+      "fix": "在 doc/实现文档.md 更新记录表追加 v1.43 行（含日期与更新内容），或把头部版本改回 v1.42" }
+  ],
+  "stats": { "docsScanned": 3, "driftCount": 1 },
+  "suggestions": [ { "severity": "high", "text": "…" } ]
+}
+</code></pre>
+<p><code>detail=developer</code> 时附加 <code>receipt</code>：每份文档的版本头/记录表行号、每条漂移所在行号、
+测试文件静态统计明细（路径+标记数）——供 Agent 定点修复。</p>
+<h2>配置（cordis 配置节）</h2>
+<pre><code># ~/.dsh/profiles/web/cordis.patch.yml 或 cordis.yml 中
+- insert:
+    - id: doc-guard
+      name: 'dsh-doc-guard'
+      config:
+        docsPatterns: ["doc/**/*.md", "*.md"]     # 自动发现的文档 glob
+        ignoreTreePaths: [".git", "bin", "obj", "node_modules", "dist", "lib", ".dsh"]  # 结构树忽略
+        countTolerance: 1                          # 计数对比容差（±N 内算一致）
+        staleCommitWindow: 5                       # "代码改了文档没动"窗口（天，mtime 启发式）
+        maxEvidenceLen: 200                        # 报告 evidence 片段最大长度（字符）
+        maxFileBytes: 524288                       # 单文件大小硬上限（字节），超限跳过
+</code></pre>
+<blockquote>
+<p><code>staleCommitWindow</code> 语义为「最近 N 天内有代码变更但文档记录未跟进」。
+因安全边界禁止执行 git（见下），实现为只读 mtime 启发式而非提交数。</p>
+</blockquote>
+<h2>安全边界（硬性要求）</h2>
+<ul>
+<li><strong>全程只读</strong>：只用 <code>ctx.fs</code> 的 <code>resolve</code>/<code>stat</code>/<code>readText</code>/<code>listDir</code> 子集；
+唯一的 <code>node:fs</code> 使用是<strong>只读 <code>stat</code></strong> 取文件 mtime（陈旧度启发式），不写、不删、不执行；</li>
+<li><strong>单文件 &gt; 512 KB 跳过</strong>（<code>maxFileBytes</code> 可配，硬上限）；</li>
+<li><strong>报告不含完整文件内容</strong>：只含路径、统计与 ≤200 字符的证据片段；</li>
+<li><strong>不执行测试、不跑构建</strong>：测试计数用静态扫描（按扩展名匹配测试标记）；</li>
+<li>不修改任何文件：审计前后仓库内容逐字节不变（有测试断言）。</li>
+</ul>
+<h2>防误报设计（误报宁可少）</h2>
+<ul>
+<li>更新记录表区域（历史快照）不参与当前状态判定：<code>v1.42：对应实现文档 v1.41</code> 是历史事实，不是当前引用；</li>
+<li>里程碑/作用域验收数字（<code>M3 83/83 全绿</code>、<code>Core 153/153 + Net 24/24</code>）不与全局总数对比——
+仅当全文是单一通用标签（<code>tests 290/290</code> 等）且声明数 ≤3 时才与静态统计对比；</li>
+<li>目录级摘要树（无文件名明细）只比对目录层级，不报 <code>tree_extra</code>；</li>
+<li>树中未展开的目录（列出但无子行）不报其内容为 extra；隐藏/临时文件（<code>.env</code>、<code>*.tmpdir</code>）忽略；</li>
+<li>流程图/时序图/ASCII 框图（<code>└──▶ M5 ──▶ M6</code>、<code>───┬───┘</code>）不会被误判为结构树；</li>
+<li>多树块文档只取行数最多的主结构树；<code>game01.slnx</code> 这类文件标签不会当目录根。</li>
+</ul>
+<h2>工程结构</h2>
+<pre><code>dsh-doc-guard/
+├── package.json          # name=dsh-doc-guard, type=module, main=./lib/index.js,
+│                         # dsh.bundle.patch=./cordis.patch.yml; peerDeps: @deepseek-ai/cordis
+├── cordis.patch.yml      # - insert: [{ id: doc-guard, name: 'dsh-doc-guard' }]
+├── tsconfig.json         # 编译到 lib/types/（纯 tsc，无打包器）
+├── scripts/
+│   ├── setup-dsh-deps.mjs    # 定位本机 DSH 安装并链接 @deepseek-ai/* 依赖（junction/symlink）
+│   ├── build.sh              # setup + tsc（POSIX）
+│   ├── build-win.mjs         # 等效 Windows 构建（无 bash 依赖）
+│   ├── self-test.mjs         # 对任意仓库跑审计引擎
+│   └── verify-drift.mjs      # 注入漂移验证（真实仓库拷贝 + 篡改版本号）
+├── src/
+│   ├── index.ts          # apply(ctx)：注册 doc_guard 工具 + 配置读取
+│   ├── audit.ts          # 编排：runAudit 全链路 + developer receipt
+│   ├── scan.ts           # 文档发现、版本头/更新记录表/结构树/计数/交叉引用解析、测试静态统计
+│   ├── diff.ts           # 结构树 vs 磁盘对比（虚拟根/摘要树/穷尽目录处理）
+│   ├── analyze.ts        # 六类漂移判定 + 严重度分级 + 修复建议 + 分节渲染
+│   └── types.ts          # canonical 类型 + 配置 + fs 服务面子集
+└── tests/                # node --test（54 用例，零测试依赖，真实临时目录端到端）
+</code></pre>
+<h2>开发 / 测试 / 构建</h2>
+<pre><code>npm install                 # 安装 typescript/@types/node（devDeps）
+npm run setup               # 定位本机 DSH 安装，链接 @deepseek-ai/* 依赖
+npm test                    # node --test 'tests/*.test.ts'（54 用例）
+npm run build:win           # Windows 构建；POSIX 用 npm run build（scripts/build.sh）
+node scripts/self-test.mjs /path/to/repo    # 对真实仓库跑审计引擎
+</code></pre>
+<p>构建产物 <code>lib/</code>（<code>lib/index.js</code> + <code>lib/types/*</code>）<strong>入库提交</strong>——GitHub 源安装依赖它，用户无需构建即可 <code>dsh plugin add</code>。</p>
+<h2>FAQ</h2>
+<p><strong>Q: 为什么不执行 <code>git log</code> 判断「代码改了文档没动」？</strong>
+安全边界禁止执行任何命令（含 git）。实现为只读 mtime 启发式：最近代码文件修改时间 vs 更新记录最新日期。</p>
+<p><strong>Q: 测试计数为什么有时不报？</strong>
+只有「全文单一通用标签（tests/测试/全部）且声明 ≤3」的验收数字才与全局静态统计对比；
+<code>Core 199/199</code>、<code>M3 83/83</code> 这类带作用域的里程碑数字无法静态映射，宁可少报。</p>
+<p><strong>Q: 报告会泄露文档内容吗？</strong>
+不会。报告只含路径、统计与 ≤200 字符证据片段（<code>maxEvidenceLen</code> 可调）。</p>
+<p><strong>Q: 支持哪些测试框架标记？</strong>
+按扩展名静态匹配：C# <code>[Fact]</code>/<code>[Theory]</code>、JS/TS <code>it(</code>/<code>test(</code>、Rust <code>#[test]</code>、
+Python <code>def test_</code>、Java/Kotlin <code>@Test</code>、Go <code>func Test</code>。</p>
+<h2>License</h2>
+<p>BSD-3-Clause。见 <a href="https://github.com/lucky8197/dsh-doc-guard/blob/HEAD/LICENSE">LICENSE</a>。</p>

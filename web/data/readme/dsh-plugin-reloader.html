@@ -1,0 +1,129 @@
+<h1>dsh-plugin-reloader</h1>
+<p>English | <a href="https://github.com/deepforce/dsh-plugin-reloader/blob/HEAD/README.zh.md">中文</a></p>
+<p>Hot-reload installed <a href="https://github.com/deepseek-ai/deepseek-harness">DeepSeek Harness</a>
+plugins <strong>without restarting <code>dsh web</code></strong>. After you upgrade a plugin (e.g. <code>dsh plugin add github:...</code>), the new code takes effect in place; only a dependency-tree change restarts the
+process (through an external supervisor script).</p>
+<p>It reuses the same reload pipeline dsh's built-in HMR uses for user code — clear the module
+caches, re-import the plugin entry, dispose the old fibers, mount fresh ones, roll back on
+failure — minus the <code>node_modules</code> exclusion that keeps the built-in HMR away from installed
+plugins. The loader's internal module cache is reachable through dsh's vendored loader
+without any special flag.</p>
+<h2>Features</h2>
+<ul>
+<li><strong>Auto hot-reload</strong> — polls the installed plugins' entry and <code>package.json</code> files (every
+<code>pollIntervalMs</code>, default 2s) and hot-reloads a plugin in place when its code changes.
+Polling (<code>stat</code> mtime+size) is used instead of a file-watcher library: chokidar's fs-watch
+never reached ready inside the long-lived dsh web process on Windows, and polling is
+immune to pnpm's whole-directory replacements (the stat simply sees the new files on the
+next tick). Plugin upgrades are low-frequency, so a 2-second stat of a handful of files is
+negligible.</li>
+<li><strong><code>/reload &lt;plugin&gt;</code> command</strong> — manually hot-reload one installed plugin; with no
+argument it lists the loaded plugins, marking non-reloadable ones (<code>[official]</code>,
+<code>[service]</code>, <code>[self]</code>).</li>
+<li><strong><code>/watch-status</code> command</strong> — prints live watch diagnostics: watched scopes, event count,
+the last observed change, reload count, skipped reloads, and any startup error. Read it
+after upgrading a plugin to confirm the auto-reload fired (<code>events</code> and <code>reloads</code>
+incremented).</li>
+<li><strong>Dependency-change restart</strong> — if a plugin's <code>package.json</code> changes its
+<code>dependencies</code>/<code>peerDependencies</code>, the process exits with code <code>42</code> (configurable) so a
+supervisor relaunches it.</li>
+<li><strong>Reloadability guard</strong> — official <code>@deepseek-ai</code> plugins and plugins that provide
+services other plugins depend on are <strong>not</strong> hot-reloaded by default: the attempt is
+skipped, logged, and counted in <code>/watch-status</code>. Reloading a service provider would
+cascade restarts through every plugin that injects its services, and reloading an
+official plugin is equivalent to patching dsh itself mid-session. Override per category
+with <code>allowOfficial</code> / <code>allowServiceProviders</code>.</li>
+<li><strong>Rollback on failure</strong> — a failed re-import or mount restores the module caches and the
+previous plugin; the session keeps running.</li>
+</ul>
+<h2>Install</h2>
+<pre><code>dsh plugin --profile web add github:deepforce/dsh-plugin-reloader
+</code></pre>
+<p>Restart <code>dsh web</code> once so the plugin loads. For the dependency-change restart to be useful,
+start dsh through the supervisor instead of directly:</p>
+<pre><code># Windows (cmd)
+scripts\dsh-restart.cmd web
+
+# Windows (PowerShell)
+powershell -File scripts\dsh-restart.ps1 web
+</code></pre>
+<h2>Usage</h2>
+<p>After upgrading an installed plugin:</p>
+<pre><code>dsh plugin --profile web add github:deepforce/dsh-balance   # upgrade
+</code></pre>
+<p>The watcher notices the changed <code>lib/</code> files and hot-reloads it — no restart. To force it
+manually, type <code>/reload @deepforce/dsh-balance</code> in a session, or <code>/reload</code> with no argument
+to list candidates.</p>
+<p>If the upgrade also changed the plugin's dependency tree, the process exits <code>42</code> and the
+supervisor relaunches <code>dsh web</code> automatically (a supervisor is required — a plain <code>dsh web</code>
+just exits).</p>
+<h2>Configuration</h2>
+<table>
+<thead>
+<tr>
+<th>Field</th>
+<th>Default</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>watchEnabled</code></td>
+<td><code>true</code></td>
+<td>Poll installed plugins and hot-reload on code changes</td>
+</tr>
+<tr>
+<td><code>watchRoots</code></td>
+<td><code>["@deepseek-ai", "@deepforce"]</code></td>
+<td>Scoped directories under the profile's <code>node_modules</code> to consider</td>
+</tr>
+<tr>
+<td><code>debounceMs</code></td>
+<td><code>400</code></td>
+<td>Change coalescing window before a reload fires</td>
+</tr>
+<tr>
+<td><code>pollIntervalMs</code></td>
+<td><code>2000</code></td>
+<td>Polling interval for change detection</td>
+</tr>
+<tr>
+<td><code>restartExitCode</code></td>
+<td><code>42</code></td>
+<td>Exit code used when a dependency tree changed (supervisor restarts on it)</td>
+</tr>
+<tr>
+<td><code>allowOfficial</code></td>
+<td><code>false</code></td>
+<td>Also hot-reload official <code>@deepseek-ai</code> plugins (not recommended)</td>
+</tr>
+<tr>
+<td><code>allowServiceProviders</code></td>
+<td><code>false</code></td>
+<td>Also hot-reload plugins that provide services other plugins depend on (not recommended)</td>
+</tr>
+</tbody></table>
+<p>Example overlay:</p>
+<pre><code># reloader.cordis.yml
+- patch:
+    - id: plugin-reloader
+      config:
+        debounceMs: 600
+        restartExitCode: 50
+</code></pre>
+<h2>Compatibility</h2>
+<p>Tested against DeepSeek Harness <code>0.1.0-rc.6</code> (web profile, Windows 11, Node 24). It depends
+on the loader's internal module cache (<code>loader.internal</code>), which the vendored loader exposes
+by default; if a future dsh removes that surface, the plugin degrades to <code>/reload</code> reporting
+"loader internal is unavailable".</p>
+<h2>Security</h2>
+<ul>
+<li>The watcher only reads files; it never executes anything itself.</li>
+<li>A reload failure rolls back instead of leaving a half-mounted plugin.</li>
+<li>The dependency-change exit is intentional and announced in the log before exiting.</li>
+</ul>
+<h2>Building locally</h2>
+<pre><code>pnpm install        # uses pnpm-workspace.yaml overrides for upstream npm gaps
+pnpm run build      # tsc emits lib/index.js
+</code></pre>
+<h2>License</h2>
+<p>MIT</p>

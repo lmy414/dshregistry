@@ -1,0 +1,58 @@
+<h1>agent-compact</h1>
+<p>English · <a href="https://github.com/MimicHunterZ/dsh-agent-compact/blob/HEAD/README.zh-CN.md">简体中文</a></p>
+<p>Context compression for <a href="https://github.com/deepseek-ai/deepseek-harness">DeepSeek Harness</a>: lets the <strong>agent autonomously call</strong> <code>context_compact</code> to compress a span of the conversation it chooses — the finished, no-longer-needed middle — and replace it with a checkpoint the agent writes itself.</p>
+<h2>Why</h2>
+<p>Compaction is normally a full-context sweep: the official engine only ever compresses from the start of the conversation, so the opening's task plan and direction are <strong>partially lost along with the compressed information</strong>. <code>context_compact</code> compresses <strong>only the span the agent selects</strong> — a finished step, a debugged log exchange, an off-track discussion — while the important opening and the recent context stay intact. Span compaction keeps <strong>information loss from compaction as small as possible</strong> — like human memory, the middle is not compressed indiscriminately: what can be summarized is consolidated into a checkpoint, and important details stay word-for-word — the agent decides what is truly dead, and only that gets condensed.</p>
+<p>Typical moments to use it:</p>
+<ul>
+<li>a task step is done — compress it, keep the remaining steps and the active instruction live;</li>
+<li>a bug hunt or a wrong research direction is over — compress that exchange into a short "what went wrong / root cause / fix" note;</li>
+<li>the opening requirements are stale — compress the start and restate the current intent.</li>
+</ul>
+<h2>What it does</h2>
+<ul>
+<li>The agent picks the span via <code>startAnchor</code> / <code>endAnchor</code> (unique-prefix matching, CJK punctuation-width tolerant) and passes a <strong>required</strong> <code>summary</code> — the Markdown checkpoint it wrote itself.</li>
+<li>The raw span is archived to the spill store first (<code>~/.dsh/spill/session-&lt;hash&gt;/&lt;hex&gt;-&lt;seq&gt;.txt</code>, sequential naming, restart-safe); the path is echoed in the shadow message so the model can read the raw text back.</li>
+<li>The host engine runs the stock transaction — boundary validation, tool-pair balance, surface replacement — with <strong>no separate LLM summarizer request</strong>.</li>
+</ul>
+<p>The tool call itself happens inside the agent's normal turn and is billed like any other turn; what is avoided is only the <em>extra</em> summarizer request the official engine would make for the same span.</p>
+<h2>Install</h2>
+<pre><code># from a published registry package
+dsh plugin --profile web add @mimichunterz/agent-compact
+
+# or from a local checkout
+dsh plugin --profile web add ./agent-compact
+</code></pre>
+<p><code>dsh plugin</code> forwards to pnpm in the profile directory and appends the bundle to <code>dsh.profile.bundles</code> (see the official <a href="https://github.com/deepseek-ai/deepseek-harness/blob/master/docs/user/develop/basic/publish.md">publish guide</a>). <strong>Restart the profile</strong> — every session then sees the <code>context_compact</code> tool.</p>
+<p>The bundle's own <code>cordis.patch.yml</code> pins the spill archive root to <code>~/.dsh/spill</code> (deployments can override it again through the profile's <code>cordis.patch.yml</code>).</p>
+<h2>Configuration</h2>
+<table>
+<thead>
+<tr>
+<th>field</th>
+<th>default</th>
+<th>meaning</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>autoArchive</code></td>
+<td><code>true</code></td>
+<td><code>context_compact</code> saves the full raw span to a spill artifact before replacing it</td>
+</tr>
+</tbody></table>
+<p>Pass through the inserted row in the profile's <code>cordis.patch.yml</code> or a bundle patch.</p>
+<h2>How it works</h2>
+<ul>
+<li><strong>Agent-written checkpoint</strong>: <code>summary</code> is mandatory, so the tool path always uses the checkpoint the agent wrote. <code>patchEngine()</code> (see <code>src/optimizer.ts</code>) wraps the engine's <code>summarize()</code>: when an <code>_externalSummary</code> is present (one-shot, keyed per session id), it returns that text directly; only when none is present does it forward to the stock implementation — a branch that serves the automatic compaction path and keeps official behavior intact.</li>
+<li><strong>Anchor matching</strong> (<code>src/normalize.ts</code>): <code>normText</code> collapses whitespace and maps CJK full-width punctuation to half-width (，→, etc.), applied to both anchors and node text. Matching keeps <strong>unique-prefix</strong> semantics: zero hits → "not found" with closest-node hints; more than one hit → "AMBIGUOUS".</li>
+<li><strong>Restart-safe sequential archives</strong>: the next number is derived by scanning the session's spill directory (<code>max+1</code>) — gap-free; the backend's random hex prefix makes filename collisions impossible.</li>
+<li><strong>Paired cleanup</strong>: the tool-call message (carrying the full <code>summary</code> argument) and its tool/result are each replaced by one tiny shadow message, so the checkpoint text never appears twice on the surface (skipped when the message holds more than one tool call).</li>
+</ul>
+<h2>Compatibility</h2>
+<ul>
+<li>Built and verified against DeepSeek Harness <code>0.1.0-rc.6</code> (<code>@deepseek-ai/dsh-compaction-basic@0.1.0-rc.6</code>).</li>
+<li>Only <strong>one compaction per session at a time</strong> (the engine transaction is serialized); anchors re-resolve on every call, so later compactions never go stale after earlier checkpoints replaced old nodes.</li>
+<li>With a local spill backend the root is fixed; other backends degrade gracefully (no <code>root</code> field → in-memory counter), and compaction itself is unaffected.</li>
+</ul>
+<h2>License</h2>
+<p>MIT. The patch derives from <code>@deepseek-ai/dsh-compaction-basic</code> and related DeepSeek Harness packages (MIT, Copyright DeepSeek) — see <a href="https://github.com/MimicHunterZ/dsh-agent-compact/blob/HEAD/LICENSE"><code>LICENSE</code></a>.</p>

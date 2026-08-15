@@ -1,0 +1,68 @@
+<h1>dsh-trace-repeat</h1>
+<p>任务 Trace 记录/回放插件（DSH Web）：<strong>原子、版本化</strong>地记录任意会话的执行 trace——每次<strong>推理完成</strong>（assistant 消息收齐所有 chunk 后的最终消息）或 <strong>tool 执行完成</strong> 就是一个<strong>不可变版本</strong>，含完整可复现元数据（provider/model/reasoningEffort/maxTokens/token 用量/输入输出）；支持<strong>回放</strong>（版本时间线 + 详情）与<strong>从历史版本恢复执行</strong>；与 <strong>task-control 暂停/恢复</strong> 衔接；多版本经 <strong>git commit + worktree</strong> 物化。</p>
+<h2>功能</h2>
+<table>
+<thead>
+<tr>
+<th>环节</th>
+<th>行为</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong>记录</strong></td>
+<td>宿主订阅 <code>session/event</code>（post-commit 馈送，按序）：<code>assistant/message</code> → <code>reasoning</code> 版本；<code>tool/call</code>+<code>tool/result</code> → <code>tool</code> 版本（含工具名/参数/结果）；普通用户输入 → <code>user</code> 版本；不记 chunk 增量，只记收齐后的最终消息</td>
+</tr>
+<tr>
+<td><strong>原子性</strong></td>
+<td>每版本一个不可变 JSON（tmp 写 + rename 原子落盘），<code>trace.json</code> 索引同样原子更新；按源事件 seq 幂等去重</td>
+</tr>
+<tr>
+<td><strong>可复现元数据</strong></td>
+<td>provider/model/reasoningEffort/maxTokens/usage/完整 content（推理）；工具名/callId/参数/结果/isError（工具）；会话头记 workspace/cwd/preset/agentOptions</td>
+</tr>
+<tr>
+<td><strong>git 版本化</strong></td>
+<td>默认开启：trace 根（<code>.dsh-trace/</code>）即专用 git 仓库（自动 init，不污染工作区），每版本一个 commit；worktree 物化在 <code>.dsh-trace-worktrees/&lt;session&gt;-v&lt;seq&gt;</code>（git 不允许 worktree 建在仓库内）</td>
+</tr>
+<tr>
+<td><strong>暂停/恢复</strong></td>
+<td>通过 <code>taskControl</code> 服务（task-control 自管的持久化状态，Route A：不再写 <code>task-control/*</code> 会话事件）在<strong>每个会话事件上对账</strong>：安全暂停（延迟语义）下 tool 运行期间 trace 持续记录、<code>tool/result</code> 落地后（安全界限）才暂停；<strong>强制暂停</strong>的 paused 版本记录 <code>forced</code> 与 <code>interruptedTool</code> 详情；恢复时记 <code>resumed</code> 标记版本并续记；与 task-control 通过服务解耦</td>
+</tr>
+<tr>
+<td><strong>回放</strong></td>
+<td><code>/trace</code> 命令族：会话选择 → 版本时间线（类型/时间/git commit）→ 详情（完整输入输出 + 元数据）→ 从该版本恢复（自动物化 worktree）</td>
+</tr>
+<tr>
+<td><strong>恢复执行</strong></td>
+<td><code>/trace resume &lt;session&gt; &lt;vN&gt;</code>：以 vN 前 trace 重建<strong>平衡上下文</strong>（自动截断到最近一个无悬挂 tool 调用的「推理完成」版本），在对应 worktree 里<strong>新开会话</strong>继续执行，新会话自身继续被记录</td>
+</tr>
+</tbody></table>
+<h2>限制</h2>
+<ul>
+<li>只记录<strong>收齐后</strong>的最终消息（不含流式增量）。</li>
+<li>恢复执行只能在「推理完成」版本（无悬挂 tool 调用）进行；回合中间版本会报错并提示更早的平衡版本。</li>
+<li>回放/恢复不修改原会话 trace；新会话产生独立 trace。</li>
+<li>git 物化只覆盖 trace 文件（不含该时刻工作区文件快照）。</li>
+<li>暂停/恢复标记版本在「暂停/恢复后的下一个会话事件」时写入（状态来自 <code>taskControl</code> 服务对账）；纯暂停+恢复且中间无任何事件时不会产生标记版本。</li>
+</ul>
+<h2>安装</h2>
+<p>包内已含 <code>dsh.bundle</code> manifest，安装后自动激活（无需手动修改任何配置）：</p>
+<pre><code># 从 GitHub 安装
+dsh plugin --profile web add github:p2coder/dsh-trace-repeat
+# 发布 npm 后亦可：dsh plugin --profile web add dsh-trace-repeat
+</code></pre>
+<p>安装后<strong>完整重启 dsh web</strong>（宿主插件不支持运行时热装），并在浏览器中刷新页面。</p>
+<h2>使用</h2>
+<ul>
+<li>任意会话运行即自动记录（无需开启）。</li>
+<li>命令：<code>/trace</code>（列会话）、<code>/trace show &lt;session&gt; [vN]</code>（版本时间线/详情）、<code>/trace resume &lt;session&gt; &lt;vN&gt;</code>（从该版本恢复执行）。</li>
+</ul>
+<h2>结构</h2>
+<pre><code>dsh-trace-repeat/
+├── package.json          # dsh.bundle.patch 声明（纯宿主端，无浏览器半）
+├── cordis.patch.yml      # 一行：- id: trace-repeat / name: dsh-trace-repeat
+├── lib/
+│   └── index.js          # 宿主端：记录器 + 原子存储 + git/worktree + /trace 命令 + 恢复执行（零外部 import）
+└── test/
+    └── host-smoke.mjs    # 宿主端逻辑冒烟测试（node test/host-smoke.mjs）
+</code></pre>

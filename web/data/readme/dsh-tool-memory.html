@@ -1,0 +1,248 @@
+<h1>dsh-tool-memory —— DeepSeek Harness 跨会话持久记忆插件</h1>
+<blockquote>
+<p>把 <a href="https://github.com/NousResearch/hermes-agent/blob/main/tools/memory_tool.py">Hermes Agent 的 memory 工具</a>
+的机制移植到 DeepSeek Harness：<strong>有界、纯文本、跨会话</strong>的记忆。
+插件加载与每个新会话开始时，把记忆以<strong>冻结快照</strong>注入 system prompt；
+会话中途的写入立即落盘，但不改变 system prompt——保住 LLM prefix cache。</p>
+</blockquote>
+<h2>记忆机制（与 Hermes 对齐）</h2>
+<table>
+<thead>
+<tr>
+<th>机制</th>
+<th>Hermes</th>
+<th>本插件（DSH）</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>存储</td>
+<td><code>~/.hermes/memories/MEMORY.md</code> + <code>USER.md</code></td>
+<td><code>&lt;root&gt;/MEMORY.md</code> + <code>USER.md</code>（默认 <code>$DSH_HOME/memories</code>）</td>
+</tr>
+<tr>
+<td>条目格式</td>
+<td><code>§</code> 分隔的纯文本列表，可多行</td>
+<td>同左（分隔符 <code>\n§\n</code>，与 Hermes 逐字符一致）</td>
+</tr>
+<tr>
+<td>两个存储</td>
+<td>MEMORY=代理笔记；USER=用户画像</td>
+<td>同左</td>
+</tr>
+<tr>
+<td>字符预算</td>
+<td>2200 / 1375 字符（按字符数，模型无关）</td>
+<td>同左（可用配置覆盖）</td>
+</tr>
+<tr>
+<td>冻结快照</td>
+<td>会话开始时注入 system prompt；中途写入不改快照</td>
+<td>同左：插件加载 + <code>session/created</code> 时重建快照，经 <code>ctx.systemPrompt.section()</code> 注入</td>
+</tr>
+<tr>
+<td>工具面</td>
+<td>单工具 <code>memory</code> + <code>action</code> 参数</td>
+<td>DSH 惯例拆分：<code>memory_add/replace/remove/batch/show/refresh</code></td>
+</tr>
+<tr>
+<td>定位</td>
+<td>replace/remove 用短唯一子串匹配，非 ID</td>
+<td>同左；歧义报错引导更具体</td>
+</tr>
+<tr>
+<td>预算超限</td>
+<td>返回合并引导错误（列出当前条目），本轮内合并后重试</td>
+<td>同左（错误信息含条目清单与占用）</td>
+</tr>
+<tr>
+<td>批量</td>
+<td><code>apply_batch</code> 原子、对最终预算校验</td>
+<td>同左（all-or-nothing）</td>
+</tr>
+<tr>
+<td>写安全</td>
+<td>锁文件 + 原子写 + 漂移保护（外部内容不 round-trip → 拒写 + <code>.bak</code> 快照）</td>
+<td>进程内互斥 + 原子 rename + 同款漂移保护</td>
+</tr>
+<tr>
+<td>威胁扫描</td>
+<td>写前扫描（strict 作用域）+ 快照构建时屏蔽毒条目</td>
+<td>同左（英文模式移植 + 3 条保守中文模式 + 不可见 Unicode）</td>
+</tr>
+<tr>
+<td>成功响应</td>
+<td>终态：报占用、不回显条目（防重复调用）</td>
+<td>同左（<code>note: 写入已完成，不要重复执行</code>）</td>
+</tr>
+</tbody></table>
+<h2>安装</h2>
+<pre><code># 在 deepseek-harness 环境内
+dsh plugin add dsh-tool-memory
+</code></pre>
+<p>插件注册 3 个 system-prompt section（笔记快照 / 画像快照 / 首次使用引导）与 6 个工具，用自然语言直接指挥即可：</p>
+<table>
+<thead>
+<tr>
+<th>工具</th>
+<th>参数</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>memory_add</code></td>
+<td><code>content</code>（必填）, <code>target?</code></td>
+<td>追加一条记忆（默认 memory=我的笔记；user=用户画像）</td>
+</tr>
+<tr>
+<td><code>memory_replace</code></td>
+<td><code>old_text</code>, <code>new_content</code>, <code>target?</code></td>
+<td>替换「包含 old_text 子串」的条目</td>
+</tr>
+<tr>
+<td><code>memory_remove</code></td>
+<td><code>old_text</code>, <code>target?</code></td>
+<td>删除「包含 old_text 子串」的条目</td>
+</tr>
+<tr>
+<td><code>memory_batch</code></td>
+<td><code>operations</code>（必填）, <code>target?</code></td>
+<td>原子批量（删旧加新一次完成）</td>
+</tr>
+<tr>
+<td><code>memory_show</code></td>
+<td><code>target?</code></td>
+<td>查看活状态条目与占用</td>
+</tr>
+<tr>
+<td><code>memory_refresh</code></td>
+<td>—</td>
+<td>手动重读磁盘并重建快照（通常无需调用）</td>
+</tr>
+</tbody></table>
+<h2>初始化模式（首次使用）</h2>
+<p>用户画像（USER.md）为空时，system prompt 会自动注入一段<strong>首次使用引导</strong>，
+由模型主动向用户提问（怎么称呼、做什么工作/项目、沟通偏好等）：</p>
+<ul>
+<li>用户回答后，模型把信息整理成条目写入 USER.md；</li>
+<li>画像一旦有内容，引导 section 返回空——<strong>引导自动消失，无需删除任何文件</strong>
+（判据就是「USER.md 是否为空」，清空画像即重新初始化）；</li>
+<li>不想介绍可直接回复「跳过」，引导会在下次会话再次出现。</li>
+</ul>
+<p>示例对话：</p>
+<blockquote>
+<ul>
+<li>“记住：这个项目的文档任务用反向工作流”</li>
+<li>“把『codex CLI』那条更新为 v0.148”</li>
+<li>“删掉『临时备注』那条”</li>
+<li>“我改过 MEMORY.md 了，刷新一下记忆”</li>
+<li>“你记得我有什么工作习惯吗？”（模型从 system prompt 快照回答）</li>
+</ul>
+</blockquote>
+<h2>后台记忆自动沉淀（后台记忆评审）</h2>
+<blockquote>
+<p>机制对齐 <a href="https://github.com/NousResearch/hermes-agent/blob/main/agent/background_review.py">Hermes 的后台自改进循环</a>：
+对话中自然暴露的用户偏好、纠正、环境事实（“别这么啰嗦”“记住这个项目用反向工作流”）
+不再需要模型主动 <code>memory_add</code>——插件每 N 条用户消息自动跑一次<strong>隔离子代理评审</strong>，
+把值得长期记住的信息沉淀进 MEMORY.md / USER.md。</p>
+</blockquote>
+<p><strong>机制：</strong></p>
+<ol>
+<li>插件监听 <code>session/event</code> 事件流，<strong>只对用户消息</strong>（<code>user/message</code>）计数；
+纯工具回合是执行细节，不计入（评审信息来源是用户消息，避免高频空转）。
+会话恢复/续接时从历史事件流对齐取模，续上原来的 N 节奏。</li>
+<li>每 N 条（默认 10）触发一次评审：把<strong>最近 24 条</strong>对话 verbatim 转写
+（<code>USER:</code> / <code>ASSISTANT:</code>，工具调用只列名字、正文截 200 字符）打包，
+用 <code>ctx.subagents</code> 程序化拉起一个<strong>隔离子代理</strong>执行：<ul>
+<li>评审代理<strong>只拥有 memory_* 工具</strong>（<code>toolFilter</code> 白名单），
+无法执行 shell、读写文件或调用其他工具，不污染主会话；</li>
+<li>提示词要求评审代理<strong>先 <code>memory_show</code> 读活状态</strong>再决定增删改
+（system prompt 里的 MEMORY/USER 块是会话开始时冻结的，可能已过时）；</li>
+<li>容量超限时用 <code>memory_replace</code>/<code>memory_remove</code> 合并腾出空间，
+或一次 <code>memory_batch</code> 完成“删旧 + 加新”；</li>
+<li>评审与主会话共用同一个 MemoryStore 实例，写路径的进程内互斥 +
+锁内重读天然串行化并发写。</li>
+</ul>
+</li>
+<li>评审结束后按 <code>reviewNotify</code> 三档发通知（投递走 agent 的 inbox：
+空闲时唤醒、忙碌时排队到下一步；<code>form: 'notice'</code>，GUI 折叠展示）：<ul>
+<li><code>off</code>：不发通知；</li>
+<li><code>on</code>（默认）：<code>💾 Memory updated（+n 条）</code> 或 <code>Nothing to save</code>；</li>
+<li><code>verbose</code>：追加具体增删改条目摘要。</li>
+</ul>
+</li>
+<li>同一会话<strong>并发防抖</strong>：一个评审未结束时不会启动第二个（计数继续，
+到下一个 N 的倍数再触发）。</li>
+<li>评审子代理的传输默认用标准进程内 <code>spawn</code> provider（未注册或不支持工具过滤时
+回退到第一个支持 <code>toolFilter</code> 的 provider）；<code>reviewProvider</code>/<code>reviewModel</code>
+只控制评审子代理的<strong>模型路由</strong>（留空=跟随主 agent 的 provider/model，
+可配便宜模型省成本）。</li>
+</ol>
+<p><strong>降级说明</strong>（配置保留、功能跳过、不崩溃）：运行时未注册 subagent provider、
+没有支持 <code>toolFilter</code> 能力的 provider、或会话没有关联的活 agent 时，
+评审自动跳过并 <code>console.log</code> 说明原因，三档通知配置仍保留；
+没有任何活 agent 可投递时通知降级为 <code>console.log</code>。</p>
+<pre><code>- id: memory
+  name: dsh-tool-memory
+  config:
+    nudgeInterval: 10      # 每 N 条用户消息触发一次后台评审；0=关闭自动评审
+    reviewProvider: ''     # 评审子代理的 LLM provider（路由）；留空=主 agent 的
+    reviewModel: ''        # 评审子代理的 LLM model；留空=主 agent 的
+    reviewNotify: 'on'     # 评审完成通知：off / on / verbose
+</code></pre>
+<h2>插件配置</h2>
+<p>在 profile / 组合包层的 <code>cordis.patch.yml</code> 中按需覆盖：</p>
+<pre><code>- id: memory
+  name: dsh-tool-memory
+  config:
+    root: '/abs/path/to/memories'   # 默认：$DSH_HOME/memories（DSH_HOME 或 ~/.dsh）
+    memoryCharLimit: 2200           # MEMORY.md 字符预算
+    userCharLimit: 1375             # USER.md 字符预算
+    nudgeInterval: 10               # 每 N 条用户消息触发一次后台评审；0=关闭
+    reviewProvider: ''              # 评审子代理的 LLM provider（路由）；留空=主 agent 的
+    reviewModel: ''                 # 评审子代理的 LLM model；留空=主 agent 的
+    reviewNotify: 'on'              # 评审完成通知：off / on / verbose
+</code></pre>
+<h2>记忆文件格式</h2>
+<p><code>MEMORY.md</code> 就是纯文本条目列表，可随时用编辑器查看/修改：</p>
+<pre><code>codex CLI 已装 ~/.local/bin/codex(v0.147.0)，登录态有效
+§
+流水线工具 wf 在 ~/work/bao/baoagent/workflow/wf，命令: init/start/done
+§
+用户网络位置上海：依赖库/大文件下载优先国内镜像
+</code></pre>
+<ul>
+<li><strong>手动编辑会被尊重</strong>：写入前插件会重新读盘；无法 round-trip 的内容触发<strong>漂移保护</strong>
+——拒绝写入并保存 <code>MEMORY.md.bak.&lt;时间戳&gt;</code> 快照，绝不静默丢弃你的手改。</li>
+<li>编辑后想让新会话之外、当前会话也立即生效，调用一次 <code>memory_refresh</code>。</li>
+</ul>
+<h2>设计说明（与 Hermes 的有意差异）</h2>
+<ol>
+<li><strong>冻结快照的时机</strong>：Hermes 在会话开始冻结；本插件在<strong>插件加载</strong>与
+<code>session/created</code> 时重建快照（DSH 的会话事件），语义等价；另提供
+<code>memory_refresh</code> 工具覆盖「手动编辑后立即生效」的场景（会打破 prefix cache，属有意操作）。</li>
+<li><strong>跨进程并发</strong>：Hermes 用 fcntl 锁文件；Node 无标准等价物，本插件用
+<strong>进程内 promise 互斥</strong>（同一 DSH 进程内多 agent 并发写串行化）+
+<strong>原子 rename</strong>（读者永远看到完整文件）+ <strong>漂移保护</strong>（跨进程外部写入不被覆盖）。
+单进程 DSH 部署下三者已闭环。</li>
+<li><strong><code>{{变量}}</code> 转义</strong>：DSH 的 system prompt 装配会对 section 做 <code>{{name}}</code>
+插值，未注册变量会直接抛错。记忆内容里的模板/代码片段（如 <code>{{user}}</code>）
+会被自动转义为 <code>{​{</code>（零宽空格分隔），保证装配永不被打断。</li>
+<li><strong>威胁扫描</strong>：移植 Hermes strict 作用域模式（注入/越狱/回连/外传/后门/硬编码密钥）
+并补了 3 条保守的中文模式；命中即拒写；历史毒条目在快照中替换为
+<code>[BLOCKED: …]</code> 占位符，原文保留在文件里供检查删除。</li>
+<li><strong>每回合合并失败上限</strong>（Hermes issue #42405 的循环保护）未移植——
+DSH 工具调用模型侧自带预算约束；成功响应保持终态防抖。</li>
+</ol>
+<h2>开发与测试</h2>
+<pre><code>pnpm install
+pnpm typecheck   # tsc --noEmit
+pnpm test        # vitest：MemoryStore 单元测试 + 插件装配/快照语义测试 + 后台评审测试
+pnpm build       # tsdown → lib/
+</code></pre>
+<p>测试覆盖：§ 分隔持久化、预算与合并引导、批量原子性、漂移保护与 <code>.bak</code>、
+威胁拦截与快照屏蔽、读失败保护、冻结快照语义（中途写入不改 prompt、
+<code>session/created</code> 与 <code>memory_refresh</code> 重建快照）、<code>{{变量}}</code> 转义、
+后台评审（计数触发、取模对齐、纯工具回合不计入、并发防抖、对话打包格式、
+子代理 toolFilter 白名单与提示词、通知三档、provider/agent 缺失降级）。</p>
+<h2>License</h2>
+<p>MIT</p>

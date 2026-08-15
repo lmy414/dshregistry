@@ -1,0 +1,126 @@
+<h1>dsh-messages-sanitizer</h1>
+<p><a href="https://github.com/Leeminjing/dsh-messages-sanitizer/blob/HEAD/README.en.md"><img src="https://img.shields.io/badge/English-README.en.md-2ea44f" alt="English"></a></p>
+<blockquote>
+<p><strong>🔧 你在 DeepSeek Harness 里创建 / 加载插件，对话崩了吗？本插件专治这个。</strong></p>
+<p>开发或加载本地插件时，一次工具调度崩溃（<code>Cannot read properties of undefined (reading 'prepare')</code>）就会在会话里留下孤儿 <code>tool_calls</code>，之后<strong>每一轮</strong>都被
+<code>400 INVALID_REQUEST</code> 拒绝、重试无效、会话卡死。<strong>本插件自动把 messages 数组修回
+合法，让对话继续，不再卡死。</strong></p>
+</blockquote>
+<pre><code>💥 Before                                ✅ After (安装本插件后)
+插件崩溃                                  插件崩溃
+   ↓                                        ↓
+留下孤儿 tool_calls                       messages 自动修复
+   ↓                                        ↓
+400 INVALID_REQUEST 死循环                对话继续
+   ↓
+对话卡死
+</code></pre>
+<p>DeepSeek Harness 消息数组自动矫正插件：<strong>防止一切因 messages 数组不合法导致的聊天崩溃</strong>。</p>
+<h2>背景：你遇到的那个崩溃</h2>
+<p>OpenAI 兼容协议要求工具调用成对出现，且 tool 消息必须<strong>紧邻</strong>其 assistant
+tool_calls 消息（中间不能插入任何 user / assistant 消息）：</p>
+<pre><code>assistant  { content: ..., tool_calls: [{ id: "call_A", ... }] }
+tool       { tool_call_id: "call_A", ... }   ← 必须紧跟覆盖每个 id
+</code></pre>
+<p>当一次工具调度在「记录 assistant tool_calls / tool/call 之后、产出 tool 结果之前」
+崩溃时（例如 <code>ctx.tools[symbol].prepare</code> 抛 <code>Cannot read properties of undefined</code>），
+会话日志会留下一个<strong>没有 tool 消息响应的孤儿 tool_calls</strong>。下一轮请求把历史拼成：</p>
+<pre><code>[..., assistant{tool_calls:[write]}, user{...}]        ← 非法
+</code></pre>
+<p>API 直接返回 <code>400 INVALID_REQUEST</code>，且重试时历史原封不动，反复被拒，会话卡死。
+如果崩溃后还有多次失败重试，日志里还会留下<strong>多条重复的 user 消息</strong>横在孤儿
+assistant 与注入点之间，让"补插 tool 消息"也无法满足紧邻约束。</p>
+<h2>插件如何修复（三层防御）</h2>
+<ol>
+<li><p><strong>预防（agent/pre-step，主路径）</strong>：追踪每个会话中「已声明但从未被 tool/result
+响应」的调用；<strong>仅当</strong>其声明所在的 assistant 消息就是 surface 的最后一个节点时
+（新崩溃的典型形态），在模型请求构建前把合成 error tool-result 消息插到该步消息
+最前面。合成消息随 decision.messages 以 <code>user/message</code> 事件落盘，
+<code>deriveMessages()</code> 从根上恢复合法——循环构建的请求（deep-frozen、不可改写）
+自然就合法了，<strong>从源头杜绝 400</strong>。</p>
+</li>
+<li><p><strong>治愈（agent/request-error）</strong>：若 API 仍因 tool_calls 配对/紧邻违规返回 400
+（例如旧版本已污染的会话、或孤儿 assistant 后面已横着过期消息），用 <strong>surface
+替换</strong>完成修复，然后<strong>强制重试一次</strong>（重试基于修复后的日志重建请求，一次成功）：</p>
+<ul>
+<li>把悬空 assistant 消息改写成<strong>不含 tool_calls</strong> 的版本（剥离无响应的调用）；</li>
+<li>把孤儿 tool 消息（无前置 tool_calls 的 tool-result）<strong>中和</strong>成纯文本 user 消息；</li>
+<li><strong>恢复</strong>被误剥但结果仍紧邻的 assistant（还原 tool_calls，保留历史工具上下文）；</li>
+<li>折叠崩溃重试留下的<strong>重复 user 消息</strong>。
+修复幂等：第二次遇到同一违规时无事可做，自然回退下游策略，不会无限重试。</li>
+</ul>
+</li>
+<li><p><strong>兜底（llm/stream）</strong>：对每个请求做纯数组矫正（配对 + 紧邻重排 + 孤儿/重复
+丢弃 + 空 assistant 丢弃）。循环构建的请求是冻结的，只告警不改写；
+compaction、session-title 等自建 messages 的非冻结请求直接原地替换。</p>
+</li>
+</ol>
+<h2>安装</h2>
+<pre><code>dsh plugin --profile web add github:Leeminjing/dsh-messages-sanitizer
+</code></pre>
+<p>重启 harness 即生效（插件随 profile 层栈自动加载）。</p>
+<h2>配置</h2>
+<table>
+<thead>
+<tr>
+<th>键</th>
+<th>类型</th>
+<th>默认</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>enabled</code></td>
+<td>boolean</td>
+<td><code>true</code></td>
+<td>总开关</td>
+</tr>
+</tbody></table>
+<p>停用方式：删除 cordis.patch.yml 中的插入行，或改为：</p>
+<pre><code>- insert:
+    - id: messages-sanitizer
+      name: 'dsh-messages-sanitizer'
+      disabled: true
+</code></pre>
+<h2>验证</h2>
+<pre><code>cd dsh-messages-sanitizer
+node --test        # 40 个用例：纯函数矫正 + 会话追踪 + 请求失败修复 + 真实 cordis/Session 集成
+</code></pre>
+<p>测试覆盖（均用真实 <code>@deepseek-ai/dsh-session</code> 的 foldSurface / Session 校验）：</p>
+<ul>
+<li>真实崩溃序列端到端：<code>assistant/message{tool_calls}</code> → <code>tool/call</code> → 崩溃 →
+<code>step/end</code> → <code>turn/end error</code> → 下一回合注入后 wire 合法；</li>
+<li>真实污染日志（孤儿 + 过期重复 user 消息）经修复后纯 user/assistant，无任何
+tool 消息，且修复幂等；</li>
+<li>真实 Session 上执行 surface 替换（通过 Session 自带校验）；</li>
+<li>请求失败修复只在 tool_calls 配对 400 时干预、修复后强制重试一次、且不会无限重试。</li>
+</ul>
+<h2>目录结构</h2>
+<pre><code>dsh-messages-sanitizer/
+├── package.json      # 声明 dsh.bundle（dsh plugin add 的安装入口）
+├── cordis.patch.yml  # bundle 补丁层（挂载 messages-sanitizer）
+├── LICENSE
+├── README.md
+├── README.en.md
+├── lib/
+│   ├── index.js      # 插件入口（name / inject / Config / apply）
+│   ├── sanitize.js   # 纯函数消息数组矫正器（配对/紧邻/孤儿/重复/空消息）
+│   └── repair.js     # 孤儿追踪 + 预步预防 + surface 替换治愈 + 请求失败强制重试
+└── tests/
+    ├── sanitize.test.mjs            # 纯函数矫正用例
+    ├── repair.test.mjs              # 追踪器 + 预步修复 + 请求失败修复（假 ctx）
+    ├── integration.test.mjs         # 真实崩溃序列端到端模拟
+    ├── heal.test.mjs                # 治愈路径：正常回合不误判 / 孤儿中和 / 误剥恢复
+    └── cordis-integration.test.mjs  # 真实 cordis + 真实 Session 集成
+</code></pre>
+<h2>说明</h2>
+<ul>
+<li>插件是零构建的纯 ESM，直接可被 cordis 加载器加载；运行期依赖
+<code>@deepseek-ai/dsh-llm</code>（合成消息）、<code>@deepseek-ai/dsh-session</code>（surface 折叠）、
+<code>@deepseek-ai/cordis</code>、<code>@deepseek-ai/schemastery</code>（配置 schema），与 harness 运行时同源。</li>
+<li>已崩溃的旧会话在重启后继续聊天时，会被<strong>治愈路径</strong>自动修复（第一次请求失败时
+自动剥离悬空调用并重试成功）。</li>
+<li>本目录下的 <code>node_modules</code> 是一个指向 harness 运行时 <code>~/.dsh/profiles/node_modules</code>
+的 junction，仅为本地 <code>node --test</code> 提供依赖解析；harness 运行期不依赖它。</li>
+<li>修改插件代码后无需重新构建；<strong>重启 harness</strong>（或让 cordis HMR 重载）即生效。</li>
+</ul>

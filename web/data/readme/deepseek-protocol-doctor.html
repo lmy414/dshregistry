@@ -1,0 +1,76 @@
+<h1>DeepSeek Protocol Doctor</h1>
+<p><a href="https://github.com/Whning0513/deepseek-protocol-doctor/blob/HEAD/README.en.md">English</a> | 中文</p>
+<p><a href="https://github.com/Whning0513/deepseek-protocol-doctor/actions/workflows/test.yml"><img src="https://github.com/Whning0513/deepseek-protocol-doctor/actions/workflows/test.yml/badge.svg" alt="test"></a></p>
+<p>我在接 DeepSeek tool calling 时碰到过几类很像“模型抽风”的问题：工具结果明明传回去了，请求还是 400；流式输出看着正常，最后拼出来的参数却不是 JSON；同一段 history 在关掉 thinking 后能跑，打开就报错。</p>
+<p>最后发现不少问题都出在请求和响应的拼接上。于是写了这个小工具，把 request JSON 或 SSE 录制丢进去，先排查这些常见坑。它只看你给它的内容，不会调用模型。</p>
+<h2>装到 DSH 里</h2>
+<p><code>demo</code> 换成你正在用的 profile：</p>
+<pre><code>dsh plugin --profile demo add github:Whning0513/deepseek-protocol-doctor
+</code></pre>
+<p>重启 DSH 后会多出两个工具：</p>
+<ul>
+<li><code>deepseek_protocol_check</code>：检查请求和消息历史。</li>
+<li><code>deepseek_stream_check</code>：检查保存下来的 SSE / JSONL 流。</li>
+</ul>
+<p>比如可以直接对 DSH 说：</p>
+<pre><code>用 deepseek_protocol_check 看看这个请求里的工具调用哪里不对：{ ... }
+</code></pre>
+<p>插件需要 Python 3.10+。一般能在终端里运行 <code>python3</code> 就行；如果 Python 装在别处，可以设置 <code>DSV4_DOCTOR_PYTHON</code>。</p>
+<h2>当作 Agent Skill 用</h2>
+<p>仓库里也带了一个标准 <code>SKILL.md</code>：<a href="https://github.com/Whning0513/deepseek-protocol-doctor/blob/HEAD/skills/deepseek-protocol-doctor"><code>skills/deepseek-protocol-doctor</code></a>。DSH 会从项目的 <code>.agents/skills/</code>、<code>.dsh/skills/</code>，以及用户目录下的对应位置自动发现它。其他兼容 Agent Skills 的客户端也可以直接复制这个目录。</p>
+<p>例如装到当前项目的共享目录：</p>
+<pre><code>mkdir -p .agents/skills
+cp -R /path/to/deepseek-protocol-doctor/skills/deepseek-protocol-doctor .agents/skills/
+</code></pre>
+<p>Skill 只负责把排查步骤组织好，实际协议检查仍调用同一套 <code>dsv4-doctor</code>，没有第二份实现。</p>
+<h2>命令行用法</h2>
+<pre><code>python3 -m venv .venv
+. .venv/bin/activate
+python -m pip install -e .
+
+dsv4-doctor check fixtures/valid_tool_loop.json
+dsv4-doctor check fixtures/invalid_tool_loop.json
+dsv4-doctor stream fixtures/stream_interleaved.jsonl
+</code></pre>
+<p>不想安装也可以直接跑：</p>
+<pre><code>PYTHONPATH=src python -m dsv4doctor check fixtures/valid_tool_loop.json
+</code></pre>
+<p><code>check</code> 接受完整的 OpenAI-compatible 请求，也接受单独的 <code>messages</code> 数组。<code>stream</code> 接受 SSE 和 JSONL。</p>
+<p>退出码 1 表示查到了 error。warning 默认不拦 CI；需要严格一点时加 <code>--fail-on-warning</code>。</p>
+<h2>现在能查什么</h2>
+<ul>
+<li>tool message 找不到对应的 <code>tool_call_id</code>，或者一轮调用还没收齐结果就开始了下一轮；</li>
+<li>thinking 工具循环里，assistant 原样返回的 <code>reasoning_content</code> 被客户端丢掉；</li>
+<li><code>function.arguments</code> 还没拼完就被当成 JSON 解析；</li>
+<li>流片段显式给出 <code>function.arguments: null</code> 时，记录 <code>SSE_TOOL_ARGUMENTS_NULL</code> 信息，不把这个片段单独判为错误；</li>
+<li>多个流式 tool call 的 delta 交错到达，客户端却按到达顺序直接追加；</li>
+<li>strict schema 漏了 <code>required</code> 或 <code>additionalProperties: false</code>；</li>
+<li><code>max_tokens</code>、thinking mode 和 <code>/beta</code> 路由里几个容易忽略的配置。</li>
+</ul>
+<p>报告里每条问题都有固定 code，方便在 CI 里处理。输出支持 text、JSON 和 SARIF：</p>
+<pre><code>dsv4-doctor check request.json --format json
+dsv4-doctor check request.json --format sarif &gt; result.sarif
+</code></pre>
+<p>工具不会替你补一段假的 <code>reasoning_content</code>。这个字段应该保存模型原始返回值；伪造一个字符串虽然可能绕过一次检查，但会把错误内容写回会话。</p>
+<h2>目前的限制</h2>
+<ul>
+<li>这是请求检查器，不是 benchmark，也不会判断回答质量。</li>
+<li>没有内置 tokenizer，所以只做静态的 <code>max_tokens</code> 检查，不给出假装精确的 token 数。</li>
+<li>OpenRouter、vLLM、SGLang 和其他兼容接口可能有自己的行为，目前还没有完整覆盖。</li>
+<li>DSH 还在 developer preview；如果上游插件接口变化，这里的包装也需要跟着改。</li>
+</ul>
+<h2>开发</h2>
+<pre><code>PYTHONPATH=src python -m unittest discover -s tests -v
+npm test
+npm pack --dry-run
+</code></pre>
+<p>如果你手上有真实失败记录，欢迎先脱敏，再放进 <code>fixtures/</code> 提 issue。最想补的是 Open WebUI、Cline、OpenCode 和本地推理后端的案例。具体要求写在 <a href="https://github.com/Whning0513/deepseek-protocol-doctor/blob/HEAD/CONTRIBUTING.md">CONTRIBUTING.md</a>。</p>
+<p>公开但缺少协议 capture 的兼容性报告记录在 <a href="https://github.com/Whning0513/deepseek-protocol-doctor/blob/HEAD/COMPATIBILITY.md">COMPATIBILITY.md</a>。这些报告不能直接转成 finding 或 fixture。</p>
+<h2>相关链接</h2>
+<ul>
+<li><a href="https://github.com/deepseek-ai/deepseek-harness">DeepSeek Harness / DSH</a></li>
+<li><a href="https://github.com/deepseek-ai/deepseek-harness/discussions">DSH Discussions</a></li>
+<li><a href="https://api-docs.deepseek.com/guides/tool_calls/">DeepSeek Tool Calls 文档</a></li>
+<li><a href="https://api-docs.deepseek.com/news/news260424/">DeepSeek V4 Preview Release</a></li>
+</ul>
+<p>这是第三方项目，不是 DeepSeek 官方组件。MIT License。</p>

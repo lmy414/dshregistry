@@ -1,0 +1,141 @@
+<h1>dsh-file-path</h1>
+<p><a href="https://github.com/dkjsiogu/dsh-file-path/blob/HEAD/README.zh-CN.md">中文说明</a></p>
+<p>A DeepSeek Harness (<code>dsh</code>) plugin that lets the Web composer accept files and
+folders the built-in attachment path does not support — PDFs, archives, Office
+documents, large files, whole directories — by inserting their <strong>absolute
+paths</strong> as plain text instead of uploading them as message attachments.</p>
+<p>This is a community plugin. It is not an official DeepSeek plugin and is not
+affiliated with or endorsed by DeepSeek.</p>
+<h2>Why</h2>
+<p>dsh's version-one attachment path accepts PNG, JPEG, WebP, and GIF only.
+Dropping a PDF into the composer currently announces "only images are
+supported" and drops the file. Browsers do not expose the absolute host path of
+a dragged <code>File</code> for security reasons, so a web page cannot read the path out
+of the drag event — even when the page is served by a local CLI.</p>
+<p><code>dsh-file-path</code> recovers the original path using the local dsh host itself:</p>
+<ol>
+<li>You drag or paste a non-image file into the composer.</li>
+<li>The browser half computes the file's SHA-256 and calls the local
+<code>filePathBridge/resolvePath</code> RPC on the dsh process.</li>
+<li>The host half searches the session workspace and configured roots
+(<code>~</code> by default) for a same-name, same-size, same-hash file and returns its
+<strong>original absolute path</strong>. Nothing is copied or written.</li>
+<li>The composer inserts that absolute path directly. If no original is found
+(for example the file lives on another drive outside the search roots), a
+dialog asks for the absolute path manually, with an explicit
+"Copy to workspace" fallback available as a second action — never automatic.</li>
+</ol>
+<p>A paperclip button in the composer tool row also opens a dialog for manually
+typing an absolute or workspace-relative path.</p>
+<h2>Install</h2>
+<p>Pack and install the built tarball:</p>
+<pre><code>npm run build
+npm pack
+dsh plugin --profile web add ./dsh-file-path-0.1.x.tgz
+</code></pre>
+<p>Or install a published version:</p>
+<pre><code>dsh plugin --profile web add dsh-file-path
+</code></pre>
+<p>Or install from git (the <code>prepare</code> script builds the artifacts; pnpm ≥10 asks
+you to allow that build once, and dsh prints the exact <code>allowBuilds</code> snippet):</p>
+<pre><code>dsh plugin --profile web add github:&lt;you&gt;/dsh-file-path#&lt;commit-sha&gt;
+</code></pre>
+<p>Then boot dsh web as usual:</p>
+<pre><code>dsh --profile web --port 3080
+</code></pre>
+<blockquote>
+<p>The Web profile already contains the Web app bundle. For a custom profile,
+make sure <code>@deepseek-ai/dsh-web-app</code> is in <code>dsh.profile.bundles</code> before
+<code>dsh-file-path</code>.</p>
+</blockquote>
+<h2>Usage</h2>
+<ul>
+<li><strong>Drag or paste</strong> a non-image file anywhere on the page. The plugin looks up
+its original absolute path by name + size + head/tail SHA-256 samples
+(64KB each) and inserts that path directly. Large files are never read in
+full, so an 800MB archive resolves in milliseconds.</li>
+<li><strong>Drag a folder</strong> (Chromium/Edge File System Access): the plugin walks the
+dropped directory, builds a directory fingerprint, and inserts the matched
+<strong>absolute folder path</strong>. Nothing is copied.</li>
+<li>If the original path is outside the search roots, a dialog asks for the
+absolute path manually. A secondary "Copy to workspace" action is available
+for unresolved FILES, but it is never triggered automatically.</li>
+<li>Click the <strong>paperclip button</strong> in the composer tool row to insert a manually
+typed path (absolute or relative to the session workspace).</li>
+<li>Supported images (PNG/JPEG/WebP/GIF) keep the normal dsh image behavior. A
+mixed drop routes images to the default composer intake and resolves only the
+rest.</li>
+<li>The plugin clears dsh's full-page drop overlay when it takes over a drop, so
+the "drag images here" screen never remains stuck.</li>
+</ul>
+<h2>Configuration</h2>
+<p>The bundle patch inserts one host row. Override its config in the profile's
+<code>cordis.patch.yml</code> or any later layer:</p>
+<pre><code>- id: file-path
+  config:
+    importSubdir: .dsh-files          # fallback copy location
+    maxFileBytes: 104857600           # decoded bytes per fallback import
+    searchRoots:                      # original-path search roots
+      - '~'
+      # - /mnt
+    searchMaxEntries: 50000           # directory entries visited per lookup
+    searchSkipNames:                  # directory basenames skipped
+      - .git
+      - node_modules
+      - .npm
+      - .cache
+      - .dsh
+      - .Trash
+    maxResolveBytes: 4294967296        # max file size for hash lookup
+</code></pre>
+<ul>
+<li><code>searchRoots</code> entries must be absolute or start with <code>~</code>. The session
+workspace is always searched first. Symlinks are not followed.</li>
+<li><code>importSubdir</code> must be one relative segment (no <code>/</code>, <code>\</code>, <code>..</code>). Invalid
+values fail the plugin load loudly.</li>
+<li>Lookup caps are per call: <code>searchMaxEntries</code> bounds traversal and
+<code>maxResolveBytes</code> bounds the hashed candidate size.</li>
+</ul>
+<h2>How it is built</h2>
+<ul>
+<li><strong>Host half</strong> (<code>lib/index.js</code>): a self-contained Cordis service registered as
+<code>ctx.filePathBridge</code>. It registers strict Typert Remote descriptors for
+<code>filePathBridge/resolvePath</code>, <code>filePathBridge/importFile</code>, and
+<code>filePathBridge/describe</code>, so wire input is schema-validated on both sides.
+<code>resolvePath</code> walks the search roots for a content-identical file and returns
+its absolute path. <code>importFile</code> is the explicit fallback: it writes the
+decoded base64 payload below <code>importSubdir</code> with a
+temporary-file-plus-rename publication path.</li>
+<li><strong>Browser half</strong> (<code>lib/client.js</code>): a <code>dsh.client</code> module that mounts the
+three Remote methods, registers locale dictionaries, and contributes a small
+control to the <code>conversation.input.right</code> slot. Capture-phase document
+listeners take over drops and file-only pastes that contain a non-image;
+all-image batches pass through untouched, images inside a mixed batch are
+re-dispatched to the default composer listener, and a synthetic <code>dragend</code>
+resets the default drop overlay.</li>
+</ul>
+<h2>Security notes</h2>
+<ul>
+<li><code>resolvePath</code> only reports the path of a file whose exact bytes the browser
+already sent as the lookup digest; it never writes and never returns a path
+that does not match the dropped content.</li>
+<li>The explicit fallback import only writes into the live session's own
+workspace, under the configured single-segment <code>importSubdir</code>; path
+traversal through the file name is stripped.</li>
+<li>The dsh Web transport's loopback/browser-trust fence still applies to
+<code>/api/filePathBridge/*</code>.</li>
+<li>Installing a plugin means executing its code inside the local dsh process.
+Review the source and pin versions just as you would for any plugin.</li>
+</ul>
+<h2>Development</h2>
+<p>Requires Node <code>&gt;=22.19</code>.</p>
+<pre><code>npm install
+npm run check        # typecheck + tests + build
+npm test             # host service and composer control tests
+npm pack             # built tarball
+</code></pre>
+<p>The build script (<code>scripts/build.mjs</code>) emits the ESM host half and the
+<code>window.__ModuleLoader__.load</code> CJS-factory browser half; <code>tsc</code> emits the
+declaration files under <code>lib/types</code>.</p>
+<h2>License</h2>
+<p><a href="https://github.com/dkjsiogu/dsh-file-path/blob/HEAD/LICENSE">MIT</a></p>

@@ -1,0 +1,139 @@
+<h1>DSH-changeproof（变更证明 ChangeProof）</h1>
+<p>DeepSeek Harness（DSH）插件：代码改动后，确认改动的行真的被测试覆盖到。</p>
+<h2>解决的问题</h2>
+<p>"测试通过"不等于"改动被验证"：</p>
+<ul>
+<li>改的是 A 文件，测试跑的是 B 文件，全绿但改动没被测到；</li>
+<li>测试跑了，但只执行到改动行的一部分，剩余行没测到，照样报通过；</li>
+<li>验证完成后代码又被修改，旧结论仍然有效，无人察觉。</li>
+</ul>
+<p>插件做三件事：</p>
+<ol>
+<li><strong>关联测试</strong>：根据代码引用关系，找出与本次改动相关的测试（不是全量跑，也不是猜）；</li>
+<li><strong>行级核对</strong>：执行测试后逐行核对，改动行未被执行到则不予通过，并明确指出未覆盖的行；</li>
+<li><strong>结论过期</strong>：证据绑定代码指纹，代码一变，旧结论自动失效。</li>
+</ol>
+<p>结论状态：<code>VERIFIED</code>（通过）、<code>PARTIAL</code>（部分覆盖）、<code>FAILED</code>（测试失败）、<code>STALE</code>（结论过期）、<code>UNVERIFIED</code>（无有效证据）、<code>NOT_APPLICABLE</code>（无可验证内容）。</p>
+<p>底线：<strong>没有覆盖证据，或证据与当前代码不一致，一律不给 VERIFIED。</strong></p>
+<h2>部署到 DSH</h2>
+<p>以下步骤在 Windows 实测通过（macOS / Linux 命令相同）。</p>
+<h3>前提</h3>
+<ul>
+<li>Node.js ≥ 24（DSH 要求 <code>^22.19 || &gt;=24</code>）</li>
+<li>pnpm 11.7（<code>npm install -g pnpm@11.7.0</code>）</li>
+<li>Git</li>
+</ul>
+<h3>1. 获取 DSH 源码</h3>
+<pre><code>git clone --depth 1 https://gitee.com/mirrors/deepseek-harness.git DSH
+# GitHub 直连：git clone --depth 1 https://github.com/deepseek-ai/deepseek-harness.git DSH
+cd DSH
+</code></pre>
+<h3>2. 构建 DSH</h3>
+<pre><code>pnpm install
+pnpm run build:lib
+pnpm run build:web   # 仅使用 headless 可跳过
+</code></pre>
+<h3>3. 构建插件</h3>
+<pre><code>cd &lt;插件目录&gt;        # 如 E:\agent\dsh-changeproof
+npm install
+npm run build        # 产物在 dist/
+</code></pre>
+<h3>4. 安装到 profile</h3>
+<pre><code>cd &lt;DSH 目录&gt;
+pnpm dsh plugin --profile web add &lt;插件目录&gt;
+# 需要命令行模式再加：pnpm dsh plugin --profile headless add &lt;插件目录&gt;
+</code></pre>
+<h3>5. 验证安装</h3>
+<pre><code>pnpm dsh --profile web --dump-config | grep changeproof
+# 输出包含 "# == dsh-changeproof" 即安装成功
+</code></pre>
+<h3>6. 使用</h3>
+<pre><code># 图形界面
+pnpm dsh web    # 访问 http://localhost:3080，设置中填入 API Key
+
+# 命令行（需 DEEPSEEK_API_KEY 环境变量）
+export DEEPSEEK_API_KEY=sk-xxxxxxxx
+pnpm dsh --profile headless "修改 src/calc.ts 的折扣为 75 折并验证"
+</code></pre>
+<p>模型修改代码后会自动调用 <code>changeproof_verify</code> 验证（插件自带工作流规则，无需手动触发）。</p>
+<h3>卸载</h3>
+<pre><code>pnpm dsh plugin --profile web remove dsh-changeproof
+</code></pre>
+<h3>分发</h3>
+<ul>
+<li>对方获得插件目录后按步骤 4 <code>add</code> 本地路径；</li>
+<li>发布到 npm 后（暂未发布）：<code>pnpm dsh plugin add dsh-changeproof</code>。</li>
+</ul>
+<h2>独立使用（不装 DSH）</h2>
+<pre><code>cd &lt;插件目录&gt;
+npm install &amp;&amp; npm run build
+
+node dist/host/cli.mjs plan   --workspace &lt;项目路径&gt;   # 仅分析
+node dist/host/cli.mjs verify --workspace &lt;项目路径&gt; --yes   # 执行测试
+node dist/host/cli.mjs status --workspace &lt;项目路径&gt;   # 结论是否过期
+</code></pre>
+<p><code>verify</code> 不带 <code>--yes</code> 仅打印将执行的命令，确认后加 <code>--yes</code> 才执行。</p>
+<h2>被验证项目的配置</h2>
+<p>项目根目录放置 <code>.changeproof.yml</code>：</p>
+<pre><code>schemaVersion: 1
+packages:
+  - id: web
+    root: packages/web
+    languages: [typescript]
+    include: [packages/web/src/**/*.ts]
+    test:
+      adapter: vitest-istanbul    # 支持 vitest / jest / pytest
+      argv: [pnpm, vitest, run, --coverage]
+      cwd: packages/web
+      timeoutMs: 120000
+      coverageFile: packages/web/coverage/coverage-final.json
+thresholds: { changedLines: 1.0, minimumImpactConfidence: MEDIUM }
+exclude: ["**/generated/**", "**/*.d.ts"]
+</code></pre>
+<p>字段说明见 <a href="https://github.com/Apageoflove/DSH-changeproof/blob/HEAD/docs/configuration.md">docs/configuration.md</a>。</p>
+<h2>技术要点</h2>
+<ul>
+<li><strong>技术栈</strong>：TypeScript / Node.js（≥20.11）/ ESM；测试用 vitest + fast-check；覆盖率适配 Istanbul（vitest/jest）与 coverage.py（pytest）</li>
+<li><strong>架构</strong>：Host（分析、执行、证据存储）与 DSH 绑定层分离——绑定层在 <code>src/host/adapters/dsh/</code> 单目录，其余代码零 DSH 依赖；同时提供独立 CLI，不装 DSH 也能用</li>
+<li><strong>影响解析</strong>：四级来源（配置显式映射 → 历史覆盖记录 → 静态 import graph → 命名约定），按 (包, 测试集) 合并，置信度取最高可信值</li>
+<li><strong>覆盖率口径</strong>：分母 = 本次改动行中 adapter 可靠识别为可执行的行；删除行不计入分母，单独记为风险</li>
+<li><strong>证据与过期</strong>：workspace 指纹覆盖源文件/测试/lockfile/runner 配置/插件配置；证据绑定指纹，代码一变自动判 STALE</li>
+<li><strong>执行安全</strong>：argv-only（禁止 shell 字符串）、cwd 路径牢笼（realpath 二次校验）、环境变量白名单、超时 + 进程树终止、输出上限 + digest</li>
+<li><strong>判定底线</strong>：exit 0 但无覆盖产物 / 解析错误 / 低置信度映射 → 一律不给 VERIFIED</li>
+</ul>
+<h3>执行安全模型</h3>
+<p>插件会执行用户配置的测试命令，因此对子进程执行做了显式加固（不是依赖"信任配置"）：</p>
+<ul>
+<li><strong>argv-only</strong>：命令是 argv 数组，直接 <code>spawn</code> 执行，不经 shell，绝不拼接 shell 字符串；空参数、含 NUL 的参数一律拒绝</li>
+<li><strong>配置防御</strong>：校验配置时默认拒绝长得像 shell 命令行（含 <code>&amp;&amp;</code>、<code>||</code>、<code>; </code>、换行等）的 argv 条目；<code>CP_ALLOW_SHELLY_ARGV=1</code> 是显式的逃生开关，默认关闭</li>
+<li><strong>环境变量白名单</strong>：子进程只拿到显式传入的白名单环境，不继承宿主完整环境</li>
+<li><strong>cwd 路径牢笼</strong>：工作目录经 realpath 二次校验，防止软链接逃逸到预期目录之外</li>
+<li><strong>超时 + 进程树终止</strong>：超时或取消时 Windows 用 <code>taskkill /T /F</code>、POSIX 用负进程组 SIGKILL，回收整棵进程树，不留孤儿进程</li>
+<li><strong>输出上限</strong>：stdout/stderr 有字节上限，超限截断并记录 digest，防止失控输出撑爆内存</li>
+</ul>
+<p>代码位置：<code>src/host/config/schema.ts</code>（argv 校验）、<code>src/host/execution/process-tree.ts</code>（进程树终止）、<code>src/host/adapters/dsh/subprocess-port.ts</code>（受控执行）。</p>
+<h2>测试</h2>
+<pre><code>npm test            # 163 项测试
+npm run benchmark   # 31 个基准用例（12 个"假绿"场景全部被识破）
+npm run verify-package
+</code></pre>
+<h2>目录结构</h2>
+<pre><code>src/shared/      核心模型与状态机（不依赖 DSH）
+src/host/        工具、分析引擎、执行器、证据存储
+src/host/adapters/dsh/   DSH 绑定层
+src/client/      界面组件（预留，未启用）
+tests/           测试
+fixtures/        测试用真实产物样本
+docs/            文档
+</code></pre>
+<h2>仓库</h2>
+<p><a href="https://github.com/Apageoflove/DSH-changeproof">https://github.com/Apageoflove/DSH-changeproof</a></p>
+<h2>License</h2>
+<p>MIT</p>
+<h2>dsh.so 提交说明</h2>
+<p>针对 <a href="https://www.dsh.so/zh/submit/">dsh.so 插件提交页</a> 的静态扫描报告：</p>
+<ul>
+<li>扫描中的 Critical 均为 Node.js 内置子进程模块的用法——插件运行 git 与测试进程的核心功能，实现为 argv-only 安全模式（见上文「执行安全模型」），无 shell 拼接，无法也不应移除；</li>
+<li>已将 README 示例中的硬编码回环地址改为 localhost 写法；</li>
+<li>该扫描为静态启发式检查，非安全审计；审阅请以「执行安全模型」一节为准。</li>
+</ul>

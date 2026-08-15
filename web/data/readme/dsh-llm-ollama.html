@@ -1,0 +1,84 @@
+<h1>dsh-llm-ollama</h1>
+<p>English | <a href="https://github.com/NOirBRight/dsh-llm-ollama/blob/HEAD/README.zh.md">中文</a></p>
+<p>Ollama Cloud integration for DeepSeek Harness. Chat uses Ollama's OpenAI-compatible Chat Completions endpoint through the shared pi-ai-backed adapter. Model discovery and the Web Search/Fetch providers remain on Ollama-native APIs because those independent capabilities are not part of the chat protocol.</p>
+<p>The package root exposes the Cordis plugin contract and OllamaAdapter. The same artifact exports ./client, which contributes the Ollama Cloud card under Settings → Plugins → Plugin configuration. The protocol and capability split is recorded in <a href="https://github.com/NOirBRight/dsh-llm-ollama/blob/HEAD/docs/adr/0001-separate-chat-protocol-from-ollama-capabilities.md">ADR 0001</a>.</p>
+<h2>Installation</h2>
+<p>DeepSeek Harness 0.1.0-rc.6 or later is required. Install directly from GitHub:</p>
+<pre><code>dsh plugin --profile web add github:NOirBRight/dsh-llm-ollama
+dsh web
+</code></pre>
+<p>The repository tracks release-ready lib artifacts, so GitHub installation needs no build-script allowlist. A source checkout can use a link installation after running pnpm run build.</p>
+<h2>Web configuration</h2>
+<p>Open Settings → Plugins → Plugin configuration → Ollama Cloud. The card stores the API key through the Harness credentials API under OLLAMA_API_KEY; the Host never returns the stored literal. It saves the native base URL and model catalog together as one revision-fenced llm-ollama settings mutation.</p>
+<p>Fetch available models opens the picker immediately and calls the package's loopback-only RPC with the unsaved endpoint and one-shot key. The Host reads /api/tags, deduplicates native ids, and enriches up to six models concurrently through /api/show. The native metadata supplies context windows plus vision, thinking, and tools flags that /v1/models does not expose. The picker starts from the current draft selection, preserves current-only models, and replaces the draft catalog when applied.</p>
+<p>The Models page lists saved ollama-cloud models and can select them. Current Harness releases do not expose a third-party editor slot inside that page, so this package owns its editor under Plugin configuration.</p>
+<h2>Capability and protocol split</h2>
+<p>Chat uses:</p>
+<pre><code>POST &lt;openai-base&gt;/chat/completions
+</code></pre>
+<p>The configured baseURL remains the native Ollama API address. The plugin maps chat to its /v1 sibling:</p>
+<pre><code>https://ollama.com/api  -&gt;  https://ollama.com/v1
+http://localhost:11434/api  -&gt;  http://localhost:11434/v1
+</code></pre>
+<p>The Ollama-native independent capabilities remain:</p>
+<pre><code>model discovery  -&gt;  GET /api/tags + POST /api/show
+web search       -&gt;  POST /api/web_search
+web fetch        -&gt;  POST /api/web_fetch
+</code></pre>
+<p>Search and Fetch are ctx.web providers, so they work with any selected chat model. A DeepSeek, Codex, Kimi, or OpenAI-compatible chat model can still call the Ollama-backed web_search tool when the profile selects ollama-cloud.</p>
+<p>OpenAI Responses is not the default because Ollama supports only the non-stateful flavor. Anthropic Messages is not the default because Ollama Cloud needs an extra Bearer header and that compatibility surface has no model listing or prompt caching.</p>
+<h2>Web search and fetch</h2>
+<p>The Host plugin registers both Web providers under ollama-cloud. Registration alone does not change deployment policy; pin the desired providers in the profile patch:</p>
+<pre><code>- id: web
+  config:
+    searchProvider: ollama-cloud
+    fetchProvider: ollama-cloud
+</code></pre>
+<p>Omit fetchProvider to keep the built-in HTTP fetcher while moving only search. Both providers reject redirects before following them. Each attempt has a 15-second default budget and one transient timeout or pre-response transport failure is retried. HTTP errors, malformed replies, missing credentials, redirects, and caller cancellation are not retried.</p>
+<h2>Config</h2>
+<pre><code>- id: llm-ollama
+  name: 'dsh-llm-ollama'
+  config:
+    apiKeyEnv: OLLAMA_API_KEY
+    baseURL: https://ollama.com/api
+    maxTokens: 4096
+    defaultContextWindow: 262144
+    streamIdleTimeoutMs: 300000
+    webRequestTimeoutMs: 15000
+    retryPolicy:
+      mode: normal
+      backoff:
+        initialDelayMs: 500
+        maxDelayMs: 10000
+        jitterRatio: 0.1
+    models:
+      - id: gpt-oss:20b
+        name: GPT-OSS 20B
+        contextWindow: 131072
+        thinking: true
+      - id: llava
+        name: LLaVA
+        contextWindow: 4096
+        vision: true
+</code></pre>
+<p>The provider route remains ollama-cloud and the settings namespace remains llm-ollama. Only configured catalog models are accepted for chat. Entry maxTokens wins over the route value; without either value, the adapter does not install a request default. Ollama does not publish per-model output limits, so discovery leaves maxTokens unset.</p>
+<p>The fallback context window is 262,144 tokens. Discovery should normally provide an exact model value; the fallback also leaves room for pi-ai's context-safety reserve when metadata is unavailable.</p>
+<h3>Model capabilities</h3>
+<p>vision controls text/image input modalities. thinking enables selectable reasoning efforts. General thinking models expose off, low, medium, high, and max. GPT-OSS exposes low, medium, and high. tools records discovery metadata; the actual request carries the current DSH tool definitions.</p>
+<p>The OpenAI Chat Completions profile is pinned for Ollama: it sends max_tokens, reasoning_effort, and streaming usage, preserves system-role messages, and does not send store, max_completion_tokens, or prompt_cache fields.</p>
+<h2>Model Experience</h2>
+<h3>Prompt effects</h3>
+<p>The system prompt and all provider-neutral messages are translated by PiAiAdapter into OpenAI Chat Completions messages. Tool calls retain provider-issued ids and tool results return with the matching tool_call_id. Images are encoded as base64 data URLs only for models marked vision-capable.</p>
+<h3>Token effects</h3>
+<p>Usage maps to Harness input/output counts. maxTokens is clamped against the configured context capacity by pi-ai, leaving a safety reserve. Ollama does not currently expose cache-read/cache-write accounting through this endpoint.</p>
+<h3>KV-cache effects</h3>
+<p>Stable model, system prompt, history, tool definitions, and request options preserve a stable serialized prefix. Tool-call ids are provider-issued protocol fields and are replayed unchanged. Changing earlier messages, tools, images, model id, or reasoning/output options can invalidate provider-side reuse.</p>
+<h2>Known limitations and deferred work</h2>
+<ul>
+<li>GenerateOptions.stop is not supported by the shared PiAiAdapter.</li>
+<li>Models absent from the saved catalog are rejected; the old native adapter's pass-through behavior is removed.</li>
+<li>/api/show reports thinking capability but not the exact accepted effort set, so the plugin applies Ollama's general rule and the GPT-OSS exception.</li>
+<li>Ollama does not publish per-model output limits.</li>
+<li>Logs written by v0.2.2 and earlier can contain duplicate ollama-call-0 values; existing logs are not migrated.</li>
+<li>Structured-output format configuration is not exposed by this package.</li>
+</ul>

@@ -1,0 +1,203 @@
+<h1>dsh-requirements-alignment</h1>
+<blockquote>
+<p>Lightweight requirement alignment for DeepSeek Harness.</p>
+</blockquote>
+<h2>Overview</h2>
+<p><code>dsh-requirements-alignment</code> adds a lightweight alignment layer before <a href="https://github.com/deepseek-ai/deepseek-harness">DeepSeek Harness</a> agents execute ambiguous or high-impact requests. It asks only when a decision materially affects direction, remembers resolved choices within the session, and stays out of the way once the intent is clear.</p>
+<p><strong>You decide the direction. The agent decides the engineering.</strong></p>
+<h2>Why this plugin exists</h2>
+<p>An agent can produce technically sound work in the wrong product direction when a request leaves a high-impact choice unresolved. This plugin applies the minimum intervention needed to surface that choice before execution: one focused question at a time, followed by autonomous implementation once the direction is coherent. It re-aligns only when the task direction materially changes.</p>
+<h2>Focused scope</h2>
+<p><code>dsh-requirements-alignment</code> intentionally focuses only on requirement direction alignment. It does not impose a complete engineering workflow and it does not change the user's normal DSH workflow.</p>
+<p>It is <strong>not</strong>:</p>
+<ul>
+<li>a spec, TDD, code-review, or delivery-verification framework;</li>
+<li>a complete software development methodology;</li>
+<li>an interview bot (it asks 1 question at a time, then stops);</li>
+<li>a replacement for plan mode (<code>/plan</code> reviews a plan; this plugin aligns <em>direction</em> before implementation);</li>
+<li>a Web dashboard, database, or RAG system;</li>
+<li>a modification of DSH Core — it is a plain profile bundle.</li>
+</ul>
+<h2>How it works</h2>
+<table>
+<thead>
+<tr>
+<th>Mechanism</th>
+<th>What it does</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>System-prompt policy section</td>
+<td>In <code>auto</code> mode (default) the alignment policy is contributed to every agent's prompt at order 60. After the first question round in a session, a no-repeat guard is appended ("do not re-run alignment for settled decisions; only re-align when a NEW direction-defining decision appears").</td>
+</tr>
+<tr>
+<td>Native user questions</td>
+<td>The model asks through the shipped <code>ask_user_question</code> tool over the <code>ctx.userQuestions</code> seam — the same UI channel the Web client renders. The plugin's bundle also mounts <code>@deepseek-ai/dsh-tool-ask-user</code> so the tool exists in compositions without agent presets (e.g. headless).</td>
+</tr>
+<tr>
+<td><code>/align</code> command</td>
+<td>Manual entry: records a durable <code>alignment/status</code> check, reports the session's folded status, and steers a compact alignment-check instruction into the agent for the actual analysis.</td>
+</tr>
+<tr>
+<td>Durable session state</td>
+<td><code>alignment/status</code> events plus folded <code>ask_user_question</code> tool calls give per-session alignment state that survives resume, fork, and compaction (read straight from the session log — no live mirror).</td>
+</tr>
+</tbody></table>
+<h2>Installation</h2>
+<pre><code># from anywhere; path is anchored to your invoking directory
+dsh plugin --profile web add &lt;path-to-this-checkout&gt;
+# or from the registry once published
+dsh plugin --profile web add dsh-requirements-alignment
+</code></pre>
+<p>The plugin is a <strong>profile bundle</strong> (<code>dsh.bundle.patch</code> + <code>cordis.patch.yml</code>), so it installs through the standard plugin mechanism and adds two rows:</p>
+<ul>
+<li><code>requirements-alignment</code> — the controller (<code>mode: auto</code> by default);</li>
+<li><code>requirements-alignment-ask-user</code> — the model-facing question tool.</li>
+</ul>
+<h2>Quick Start</h2>
+<p>Install the bundle, start a normal DSH task, and answer only if DSH surfaces a direction-defining choice. Auto mode is enabled by default; no separate command or workflow is required.</p>
+<pre><code>dsh plugin --profile web add dsh-requirements-alignment
+</code></pre>
+<p>Use <code>/align</code> when you want to request the same structured alignment check manually.</p>
+<h2>Enable / disable / uninstall</h2>
+<pre><code># disable the controller only (leaves the ask-user tool mounted)
+#   in the profile's cordis.patch.yml:
+#   - id: requirements-alignment
+#     disabled: true
+</code></pre>
+<pre><code># full uninstall — DSH returns to its previous behavior
+dsh plugin --profile web rm dsh-requirements-alignment
+</code></pre>
+<p>Every registration is a Cordis effect disposer owned by the plugin's fiber: unloading removes the policy section, the <code>/align</code> command, and the tool row. Session history keeps the <code>alignment/status</code> events it appended (like every other plugin event, e.g. <code>plan/mode</code>).</p>
+<h2>Behavior and decision logic</h2>
+<ul>
+<li>Clear, repository-established work proceeds without an alignment question.</li>
+<li>Ambiguous or high-impact work asks about the highest-priority unresolved direction decision.</li>
+<li>Resolved direction choices are not repeatedly re-asked within the same session.</li>
+<li>A material direction change can trigger a new alignment round.</li>
+<li>Disabling or unloading the plugin removes its active registrations.</li>
+</ul>
+<h2>Auto mode (default)</h2>
+<p>No setup needed. The policy section is present in every agent's system prompt:</p>
+<ul>
+<li><strong>Greenfield or vague work</strong> (blank project, new product, undefined form / scope / interaction) triggers the <em>Greenfield Alignment Gate</em>: the agent confirms product goal, MVP scope, and primary interaction before substantive implementation — asking <strong>one question at a time</strong> via <code>ask_user_question</code>, highest-priority decision first, 2–3 distinct options, a clear recommendation first.</li>
+<li><strong>Explicit work</strong> (repository establishes direction, or a clear local change like a bug fix) proceeds without questions. The agent never asks about filenames, helper placement, library choice, formatting, or anything the repository already establishes.</li>
+<li><strong>Delegated direction</strong> ("pick whatever makes sense") does <strong>not</strong> waive the gate: the agent still asks the one highest-priority direction question before the first substantive implementation, then decides everything else itself.</li>
+<li><strong>Re-alignment</strong>: when a NEW direction-defining decision appears mid-work (multi-user accounts, cloud sync, a new product form, …), the agent asks again — but never re-runs alignment for settled decisions.</li>
+</ul>
+<p>Auto mode's judgment is the model's (it is a policy, not a gate). That is the honest limit of the mechanism; see <em>Limitations</em>.</p>
+<h2>Manual <code>/align</code></h2>
+<pre><code># profile cordis.patch.yml (or a --patch overlay):
+- id: requirements-alignment
+  config:
+    mode: manual
+</code></pre>
+<p>Manual mode contributes no policy section — the agent works normally until you invoke the command:</p>
+<pre><code>/align
+</code></pre>
+<p><code>/align</code> records the check, reports the session's alignment status (question rounds so far, last manual check), and hands the actual analysis to the agent, which then behaves exactly as in auto mode for that step. It never takes over the workflow.</p>
+<h2>Example interaction</h2>
+<pre><code>User: Build me a personal task manager.
+Agent: Where should the first version run: local web app, desktop app, or mobile app?
+User: Local web app.
+Agent: [implements without continuing a requirements interview]
+</code></pre>
+<table>
+<thead>
+<tr>
+<th>User request</th>
+<th>Behavior</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>"Build me a personal task manager."</td>
+<td>Asks about product form / primary usage first, then implements.</td>
+</tr>
+<tr>
+<td>"Fix the typo in README.md."</td>
+<td>No questions; fixes it.</td>
+</tr>
+<tr>
+<td>"The submit button throws TypeError when form.email is undefined. Fix it without changing the UI."</td>
+<td>No interview; fixes the bug.</td>
+</tr>
+<tr>
+<td>"Build me an AI tool that can make money. Pick whatever makes sense."</td>
+<td>Still asks the one highest-priority direction question (which product / which user), then decides the rest itself.</td>
+</tr>
+<tr>
+<td>"Now make it support multiple users across devices." (existing local app)</td>
+<td>Re-aligns: asks about identity / sync / backend ownership, then implements.</td>
+</tr>
+</tbody></table>
+<h2>Configuration</h2>
+<table>
+<thead>
+<tr>
+<th>Key</th>
+<th>Default</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>mode</code></td>
+<td><code>auto</code></td>
+<td><code>auto</code> — policy section + command; <code>manual</code> — command only; <code>off</code> — inert (row loaded, nothing registered).</td>
+</tr>
+<tr>
+<td><code>section</code></td>
+<td>shipped policy</td>
+<td>Deployment-owned policy text replacing the shipped one (auto mode). Must be non-empty when provided.</td>
+</tr>
+</tbody></table>
+<p>Unknown config keys fail at load (same stance as <code>dsh-plan-mode</code>).</p>
+<h2>Safety boundary</h2>
+<ul>
+<li><strong>No Core modifications.</strong> Zero changes to <code>@deepseek-ai/*</code> packages; the only host-side file touched is the profile's bundle list / patch, which is exactly the mechanism DSH provides for installing plugins.</li>
+<li><strong>Question channel only.</strong> The plugin never reads or writes the user's data; it appends two log-only session events and steers one user message on <code>/align</code>.</li>
+<li><strong>No file access.</strong> It does not inspect the filesystem itself; the agent does that with its own tools under the normal sandbox.</li>
+<li><strong>No background monitoring.</strong> Re-alignment is triggered by the model noticing new direction-defining decisions, not by a watcher; there is no repeated interruption loop.</li>
+</ul>
+<h2>Limitations</h2>
+<ul>
+<li><strong>Auto mode is policy, not enforcement.</strong> Whether a decision is direction-defining is the model's judgment (that is also the product design: "user decides direction, agent decides engineering"). A model can still under- or over-ask; the no-repeat guard and the one-question-at-a-time rule reduce over-asking, and the delegated-direction rule reduces under-asking, but neither is a hard gate. For a hard gate, run alignment manually via <code>/align</code>.</li>
+<li><strong><code>/align</code> needs a command adapter.</strong> UI-less spines (the headless profile, ACP automation) do not dispatch slash commands; the command is exercised by the Web client and by the unit tests / dogfood driver.</li>
+<li><strong>Subagents cannot ask the user.</strong> DSH rejects <code>ask_user_question</code> from owned children; the policy tells child agents to surface unresolved direction decisions in their final report instead.</li>
+<li><strong>One question round = one <code>ask_user_question</code> call.</strong> The no-repeat guard counts tool calls; other plugins' questions to the user count the same way.</li>
+<li><strong>Question rounds are counted per session log</strong>, so a resumed session inherits its alignment state — by design.</li>
+</ul>
+<h2>Testing and verification</h2>
+<p>The release gate runs type checking, linting, a production build, and the Node test suite:</p>
+<pre><code>pnpm run check
+</code></pre>
+<p>Real DSH dogfooding covers clear requests, ambiguous direction choices, duplicate-question suppression, direction-change re-alignment, manual <code>/align</code>, and plugin load/unload behavior:</p>
+<pre><code>powershell -File scripts/dogfood.ps1
+</code></pre>
+<p>The v0.1.1 release gate verified:</p>
+<ul>
+<li>Core modifications: <strong>0</strong></li>
+<li>Node tests: <strong>31/31 passing</strong></li>
+<li>Real DSH dogfood scenarios: <strong>6/6 passing</strong></li>
+<li>Packed plugin load/unload: <strong>verified</strong></li>
+</ul>
+<p>Detailed evidence and the bounded-run caveat are recorded in <code>ACCEPTANCE.md</code>; the release notes report the same layers without treating a build as runtime proof.</p>
+<h2>Development</h2>
+<pre><code>pnpm install          # dependencies
+pnpm run typecheck    # tsc (src + test)
+pnpm run lint         # eslint (src + test)
+pnpm run build        # tsc → lib/
+pnpm test             # node:test (31 tests)
+pnpm run check        # all of the above
+</code></pre>
+<p>Real dogfooding (boots real <code>dsh</code> profiles with an isolated <code>DSH_HOME</code>, runs the five behavioral scenarios plus a <code>/align</code> driver, and asserts the question records):</p>
+<pre><code>powershell -File scripts/dogfood.ps1
+</code></pre>
+<p>See <code>docs/ARCHITECTURE.md</code> for the design decisions and the exact capability seams used.</p>
+<h2>Compatibility</h2>
+<ul>
+<li>DeepSeek Harness <code>0.1.0-rc.6</code> (verified against the local profile bundle set and the npm registry releases of the same version).</li>
+<li><code>@deepseek-ai/cordis</code> 4.x, <code>@deepseek-ai/dsh-*</code> <code>^0.1.0-rc.6</code>.</li>
+<li>Windows (verified) and POSIX (no platform-specific code).</li>
+</ul>
+<h2>License</h2>
+<p>MIT. See <code>LICENSE</code>.</p>

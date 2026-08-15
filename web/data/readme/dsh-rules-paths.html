@@ -1,0 +1,107 @@
+<h1>dsh-rules-paths</h1>
+<p>Claude Code-style <code>paths:</code> rule injection for <a href="https://github.com/deepseek-ai/deepseek-harness">DeepSeek Harness (DSH)</a>: when the model successfully <code>read</code>s a file that matches a rule's <code>paths:</code> glob, the rule body is injected into the model context at the next step boundary. It follows the official <code>@deepseek-ai/dsh-agent-instructions</code> mechanics (<code>tools/result</code> hook, <code>agent.inbox.nextStep</code> inbox, <code>agent/pre-step</code> folding, SHA-1 dedup, byte budget).</p>
+<h2>Features</h2>
+<ul>
+<li><strong>Path rules</strong> — a rule file declares <code>paths:</code> glob patterns; a successful <code>read</code> of a matching file injects the rule body at the next step boundary.</li>
+<li><strong>Global rules</strong> — a rule without <code>paths</code> (or with no frontmatter at all) is injected into the first entering step of the session, independent of any file read (like <code>AGENTS.md</code>).</li>
+<li><strong>Project rules</strong> — optional scan of <code>&lt;projectRoot&gt;/.dsh/rules</code> <strong>and</strong> <code>&lt;projectRoot&gt;/.claude/rules</code> (Claude Code convention), keyed on the <code>.git</code> project root.</li>
+<li><strong>Dedup &amp; budget</strong> — each rule is injected once per session unless its content changes (SHA-1 digest → <code>replace</code>); the rendered message never exceeds <code>maxBytes</code> and reports <code>Rules budget …</code> when rules are dropped or truncated.</li>
+<li><strong>Guidance, not authority</strong> — injected content is a user-role message that does not override system, developer, or direct user instructions; literal <code>&lt;/system-reminder&gt;</code> is escaped.</li>
+</ul>
+<h2>Install</h2>
+<blockquote>
+<p>Requires DSH 0.1.0-rc.x (Web profile).</p>
+</blockquote>
+<h3>From GitHub</h3>
+<pre><code>dsh plugin --profile web add git+https://github.com/Temoa/dsh-rules-paths.git
+</code></pre>
+<p>pnpm pins the package by commit with a full integrity hash. Because the package declares <code>dsh.bundle.patch</code> (<code>cordis.patch.yml</code>), the reconciler appends it to the profile's <code>dsh.profile.bundles</code> automatically — the plugin mounts at the PROFILE level and rules apply to <strong>every session on that profile</strong>, no preset edit needed.</p>
+<p>To scope the rules to one agent preset instead, add this row to a user preset (a copy of <code>standard</code>):</p>
+<pre><code>- id: rules-paths
+  name: '@temoa/dsh-rules-paths'
+  config:
+    rulesDir: "~/.dsh/rules"
+    rulesDirProject: true
+</code></pre>
+<h3>From a local checkout</h3>
+<pre><code>dsh plugin --profile web add ./dsh-rules-paths
+</code></pre>
+<blockquote>
+<p><strong>After changing plugin code, fully restart the harness</strong> — the module is cached per process URL; preset <em>config</em> is re-read per session mount, but the plugin <em>file</em> is not re-imported. Rule files themselves never need a restart. Never edit the shipped presets (<code>standard</code>/<code>code</code>/<code>minimal</code>/<code>cordis</code>); add the preset row above to a copy instead.</p>
+</blockquote>
+<h2>Uninstall</h2>
+<pre><code>dsh plugin --profile web remove @temoa/dsh-rules-paths
+</code></pre>
+<p>Restart dsh after removing. The hook is torn down with the plugin; rule files under <code>~/.dsh/rules</code> and the project rule directories are left untouched.</p>
+<h2>How it works</h2>
+<p>Rules live in <code>~/.dsh/rules/*.md</code> (configurable via <code>rulesDir</code>), one rule per file:</p>
+<pre><code>---
+paths:
+  - "**/*.dart"
+  - "lib/**/*.ts"
+description: Dart conventions (optional, metadata only)
+---
+
+Rule body: guidance the model follows after reading a matching file.
+</code></pre>
+<p>On every successful <code>read</code> (and once at session start for global rules), the plugin:</p>
+<ol>
+<li>Lists the configured rule directories — the user-level <code>rulesDir</code>, plus <code>&lt;projectRoot&gt;/.dsh/rules</code> and <code>&lt;projectRoot&gt;/.claude/rules</code> when <code>rulesDirProject</code> is on.</li>
+<li>Matches the read path against each rule's <code>paths</code> globs, against both the absolute path and the cwd-relative path (Windows <code>\</code> normalized to <code>/</code>), so <code>**/*.dart</code> matches both <code>D:/lab/proj/lib/main.dart</code> and <code>lib/main.dart</code>. Rules without <code>paths</code> (or without frontmatter) are treated as global.</li>
+<li>Renders the matched bodies into a single user-role message — SHA-1 dedup per session, unchanged rules never re-sent, changed ones sent as <code>replace</code> — bounded by <code>maxBytes</code>, then folds it into the entering <code>agent/pre-step</code> right after the last claimed message.</li>
+</ol>
+<p><code>paths</code> present but neither a string nor a list skips the file with a warning; files over <code>maxSourceBytes</code> are skipped. Rule bodies are untrusted input: text only, delimiters escaped, never executed. No file watcher: rule edits take effect at the next reconciliation (global) or the next successful <code>read</code> (path rules).</p>
+<table>
+<thead>
+<tr>
+<th>Key</th>
+<th>Default</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>rulesDir</code></td>
+<td><code>~/.dsh/rules</code></td>
+<td>User-level rules directory (<code>~</code> expands)</td>
+</tr>
+<tr>
+<td><code>maxBytes</code></td>
+<td><code>65536</code></td>
+<td>Byte budget per injected message</td>
+</tr>
+<tr>
+<td><code>maxSourceBytes</code></td>
+<td><code>1048576</code></td>
+<td>Max bytes read per rule file (larger files skipped)</td>
+</tr>
+<tr>
+<td><code>triggerTools</code></td>
+<td><code>["read"]</code></td>
+<td>Tool names whose successful executions trigger matching</td>
+</tr>
+<tr>
+<td><code>rulesDirProject</code></td>
+<td><code>false</code></td>
+<td>Also scan <code>&lt;projectRoot&gt;/.dsh/rules</code> and <code>&lt;projectRoot&gt;/.claude/rules</code></td>
+</tr>
+</tbody></table>
+<h2>Repository layout</h2>
+<pre><code>dsh-rules-paths/
+├── package.json        # dsh.bundle.patch manifest
+├── cordis.patch.yml    # composition layer: appends the plugin to profile bundles
+├── lib/
+│   ├── index.js        # Host half: rule loading, matching, injection
+│   └── types/index.d.ts
+├── test/
+│   └── index.mjs       # 50-assertion test suite
+├── README.md
+├── README.zh.md
+└── LICENSE
+</code></pre>
+<h2>Development</h2>
+<pre><code>npm install   # fetches the devDependencies (peers + js-yaml + picomatch)
+npm test      # node test/index.mjs — 50 assertions
+</code></pre>
+<p>Tests cover: config validation, frontmatter parsing, budget rendering (omit/truncate/escape), message construction, dedup + <code>replace</code>, zero injection, global rules, project rules (<code>.dsh/rules</code> + <code>.claude/rules</code>), and the pre-step fold position.</p>
+<h2>License</h2>
+<p><a href="https://github.com/Temoa/dsh-rules-paths/blob/HEAD/LICENSE">MIT</a></p>

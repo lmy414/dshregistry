@@ -1,0 +1,113 @@
+<h1>dsh-goodmemory</h1>
+<p><a href="https://github.com/hjqcan/dsh-goodmemory/blob/HEAD/README.zh-CN.md">中文</a></p>
+<p>Automatic, durable, cross-session memory for <a href="https://github.com/deepseek-ai/deepseek-harness">DeepSeek Harness</a>, backed by <a href="https://github.com/hjqcan/GoodMemory">GoodMemory</a>.</p>
+<p>The plugin recalls relevant memory before a DSH model step and writes the completed human/assistant exchange after a successful turn. Recalled context is an identified DSH <code>user/message</code>, so everything visible to the model remains reconstructable from the session log.</p>
+<pre><code>completed DSH turn -&gt; GoodMemory remember -&gt; later DSH pre-step
+                   -&gt; GoodMemory recall -&gt; durable user/message -&gt; model
+</code></pre>
+<h2>Compatibility</h2>
+<table>
+<thead>
+<tr>
+<th>Package/runtime</th>
+<th>Supported version</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>@deepseek-ai/dsh</code></td>
+<td><code>0.1.0-rc.6</code></td>
+</tr>
+<tr>
+<td><code>goodmemory</code></td>
+<td><code>0.7.4</code></td>
+</tr>
+<tr>
+<td>Node.js</td>
+<td><code>^22.19.0</code> or <code>&gt;=24.0.0</code></td>
+</tr>
+<tr>
+<td>Bun, managed mode only</td>
+<td><code>&gt;=1.3.14</code></td>
+</tr>
+</tbody></table>
+<p>DSH is still an RC. This package deliberately pins its DSH peers; a new RC is unsupported until the integration suite passes against it.</p>
+<h2>Install</h2>
+<p>Install from npm:</p>
+<pre><code>dsh plugin --profile web add dsh-goodmemory@0.1.0
+dsh --profile web --dump-config
+dsh --profile web
+</code></pre>
+<p>For a local checkout:</p>
+<pre><code>pnpm install
+pnpm pack
+dsh plugin --profile web add ./dsh-goodmemory-0.1.0.tgz
+</code></pre>
+<p>Use <code>--profile headless</code> instead of <code>web</code> for the headless composition. The bundle inserts one <code>goodmemory</code> row; later profile, home, and CLI patch layers can replace its complete config.</p>
+<h2>Managed mode</h2>
+<p>Managed mode is the default. It starts the published <code>goodmemory-http-bridge</code> on a random loopback port, creates an in-memory bearer token, enables the recommended retrieval preset, and stores SQLite data at <code>$DSH_HOME/goodmemory/memory.sqlite</code>.</p>
+<p>Install Bun first. <code>GOODMEMORY_BUN_BINARY</code> may name a non-default Bun executable. To choose a different database path, override the row in the profile's <code>cordis.patch.yml</code>:</p>
+<pre><code>- id: goodmemory
+  name: dsh-goodmemory
+  config:
+    mode: managed
+    databasePath: /absolute/path/to/memory.sqlite
+</code></pre>
+<p>The plugin waits for in-flight writeback during normal HMR or process teardown, then terminates the managed sidecar. It does not automatically restart a sidecar that crashes after activation; DSH keeps running without memory and logs the failure until the plugin is reloaded.</p>
+<h2>External mode</h2>
+<p>External mode connects to an existing GoodMemory HTTP bridge. Keep the token in an environment variable, not in DSH config:</p>
+<pre><code>export GOODMEMORY_HTTP_BRIDGE_TOKEN='replace-with-a-secret'
+goodmemory-http-bridge --recommended
+</code></pre>
+<pre><code>- id: goodmemory
+  name: dsh-goodmemory
+  config:
+    mode: external
+    baseUrl: http://127.0.0.1:8739
+    tokenEnv: GOODMEMORY_HTTP_BRIDGE_TOKEN
+</code></pre>
+<p>Activation verifies health, the exact <code>phase-39.http-memory.v1</code> contract, and authenticated recall. Invalid config, a missing token, failed authorization, or a contract mismatch fails plugin activation.</p>
+<h2>Behavior and configuration</h2>
+<pre><code>type Config = {
+  recall?: boolean              // default true
+  writeback?: boolean           // default true
+  maxRecallTokens?: number      // default 256
+  requestTimeoutMs?: number     // default 10000
+  scope?: {
+    userId?: string
+    workspaceId?: string | null
+    agentId?: string | null
+  }
+} &amp; (
+  | { mode?: 'managed'; databasePath?: string; startupTimeoutMs?: number }
+  | { mode: 'external'; baseUrl: string; tokenEnv?: string }
+)
+</code></pre>
+<ul>
+<li>Recall runs only when the final <code>agent/pre-step</code> batch contains direct <code>source.kind === "user"</code> text. Tool-only continuations and plugin context do not trigger another lookup.</li>
+<li>Completed-turn writeback contains all direct user text and the final assistant text. Tool calls/results, reasoning, images, recalled memory, and other injected context are excluded.</li>
+<li>Writeback uses GoodMemory's normal extraction and policy. The plugin sends no annotations and does not force content to become durable memory.</li>
+<li>Runtime recall/writeback failures are logged with phase, session, and turn identity, then the DSH turn continues. Startup failures remain fatal.</li>
+<li>The next recall for the same durable scope waits for pending writeback, including a new session created immediately after the preceding turn.</li>
+</ul>
+<h2>Scope</h2>
+<p>Defaults are deliberately DSH-isolated:</p>
+<ul>
+<li><code>userId</code>: DSH's persisted anonymous user id under <code>$DSH_HOME</code>;</li>
+<li><code>workspaceId</code>: SHA-256 of the normalized session working directory, or <code>dsh-workspace:global</code> without a working directory;</li>
+<li><code>agentId</code>: <code>dsh</code>;</li>
+<li><code>sessionId</code>: the current DSH session id.</li>
+</ul>
+<p>GoodMemory's durable scope excludes <code>sessionId</code>, so different DSH sessions in the same user/workspace/agent scope share long-term memory. To share with another GoodMemory host, explicitly configure the same <code>userId</code>, <code>workspaceId</code>, and <code>agentId</code>; set nullable workspace/agent fields to <code>null</code> when the other host omits them.</p>
+<h2>Privacy and management</h2>
+<p>The plugin does not copy DSH JSONL logs or create a second memory schema. It sends only selected text to GoodMemory: direct human text plus the final assistant text. GoodMemory remains the sole memory/storage truth.</p>
+<p>The first release intentionally adds no model tools, MCP server, DSH command, or management UI. Use GoodMemory's existing CLI and Inspector for health, review, revision, export, and forgetting:</p>
+<pre><code>goodmemory inspector serve
+</code></pre>
+<h2>Development</h2>
+<pre><code>pnpm test
+pnpm typecheck
+pnpm build
+pnpm test:e2e   # real Bun + GoodMemory SQLite restart proof
+pnpm pack
+</code></pre>
+<p>The deterministic integration suite uses a scripted DSH model adapter. It verifies logged recall context, completed-only writeback, tool/reasoning exclusion, scope isolation, write-after-read ordering, runtime degradation, and strict startup validation. No benchmark uplift claim is made.</p>

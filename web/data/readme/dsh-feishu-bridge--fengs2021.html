@@ -1,0 +1,255 @@
+<h1>dsh-feishu-bridge</h1>
+<p>通过飞书机器人与 <a href="https://github.com/deepseek-ai/deepseek-harness">DeepSeek Harness（DSH）</a> 对话的桥接插件。</p>
+<p>在飞书里给机器人发消息 → 消息进入 DSH 会话由 AI 处理 → 回复以<strong>流式交互卡片</strong>实时发回：思维链、正文、工具链分区展示，打字机效果逐字更新。<strong>无需公网 webhook</strong>（使用飞书开放平台长连接）。</p>
+<blockquote>
+<p>效果示例（交互卡片，随生成实时更新）：</p>
+<pre><code>┌──────────────────────────────────┐
+│ 🤖 DSH 助手                        │
+├──────────────────────────────────┤
+│ 🧠 思维链                          │
+│ 用户想查 /root/dsh 目录…            │
+│ ──────────────────────────────── │
+│ 好的，我来查看一下目录内容…          │
+│ ──────────────────────────────── │
+│ 🔧 工具链（2）                      │
+│ - ✅ bash  ls -la /root/dsh        │
+│ - ✅ memory 写入今日日志            │
+│ ──────────────────────────────── │
+│ ✅ 已完成                          │
+└──────────────────────────────────┘
+</code></pre>
+</blockquote>
+<h2>功能特性</h2>
+<table>
+<thead>
+<tr>
+<th>能力</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>私聊对话</td>
+<td>与机器人单聊，消息直达 DSH，多轮上下文连续</td>
+</tr>
+<tr>
+<td>群聊 @</td>
+<td>群聊中 @ 机器人即响应（需配置 <code>botOpenId</code>）</td>
+</tr>
+<tr>
+<td><strong>流式卡片</strong></td>
+<td>AI 回复以交互卡片实时更新：思维链 + 正文 + 工具链分区，token 级打字机效果</td>
+</tr>
+<tr>
+<td>多轮上下文</td>
+<td>同一飞书会话固定复用同一 DSH 会话；DSH 重启后自动恢复（<code>agents.resume</code>）</td>
+</tr>
+<tr>
+<td>斜杠命令</td>
+<td><code>/help</code> 帮助、<code>/reset</code> 清空上下文、<code>/status</code> 会话状态</td>
+</tr>
+<tr>
+<td>长回复分段</td>
+<td>超过卡片预览上限（8000 字）自动补发文本消息</td>
+</tr>
+<tr>
+<td>断线重连</td>
+<td>consume 子进程异常退出自动退避重连（2s 起、30s 封顶）</td>
+</tr>
+<tr>
+<td>白名单</td>
+<td>只允许指定 open_id 对话</td>
+</tr>
+<tr>
+<td>幂等去重</td>
+<td>按 message_id 去重，避免事件重放导致重复处理</td>
+</tr>
+</tbody></table>
+<h2>架构原理</h2>
+<pre><code>飞书 App ──长连接──&gt; lark-cli event consume im.message.receive_v1 --as bot（子进程）
+                          │ NDJSON（chat_id / sender_id / content / mentions …）
+                          ▼
+              feishu-bridge 插件（DSH host 进程内，cordis 插件）
+                          │ agents.create / agents.resume（chat_id → sessionId 映射）
+                          ▼
+                    DSH agent 会话（模型、工具与 GUI 同款）
+                          │ llm/stream waterfall（按 sessionId 匹配，token 级 delta）
+                          ▼
+              流式累积器（text-delta / reasoning-delta / tool-call-delta）
+                          │ 节流 PATCH（默认 ≥1.2s 一次）
+                          ▼
+        lark-cli api patch im/v1/messages/:id ──&gt; 交互卡片实时更新（打字机效果）
+                          │
+                          └── turn 结束 ──&gt; 最终态卡片（✅ 已完成）+ sessions.flush 持久化
+</code></pre>
+<ul>
+<li><strong>事件监听</strong>：<code>lark-cli event consume im.message.receive_v1 --as bot</code>（飞书长连接 WebSocket，无公网要求）</li>
+<li><strong>流式接入</strong>：DSH 的 <code>llm/stream</code> waterfall 事件（每次模型调用都会经过），按请求携带的 <code>sessionId</code> 匹配到飞书 turn，拦截增量 chunk</li>
+<li><strong>卡片更新</strong>：<code>PATCH /open-apis/im/v1/messages/:message_id</code>，<code>content</code> 为交互卡片 JSON 字符串</li>
+<li><strong>会话映射</strong>：<code>&lt;stateFile&gt;</code>（默认 <code>~/.dsh/plugins/dsh-feishu-bridge/state.json</code>），记录 <code>chat_id → sessionId</code></li>
+</ul>
+<h2>前置条件</h2>
+<table>
+<thead>
+<tr>
+<th>依赖</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>DeepSeek Harness</td>
+<td>已安装并运行 <code>dsh web</code>（插件运行在 host 进程内）</td>
+</tr>
+<tr>
+<td>lark-cli</td>
+<td>已安装并完成飞书应用配置（<code>~/.lark-cli/config.json</code>），<strong>bot 身份可用</strong></td>
+</tr>
+<tr>
+<td>飞书自建应用</td>
+<td>具备机器人能力，可用范围包含目标用户/群</td>
+</tr>
+</tbody></table>
+<p>lark-cli 安装与授权：</p>
+<pre><code>npm install -g @larksuite/cli
+lark-cli auth login          # 选择 bot 身份（tenant_access_token）
+lark-cli auth status         # bot: ready
+</code></pre>
+<blockquote>
+<p>bot 身份要求应用具备 <code>im:message</code>（收发消息）权限；消息事件走长连接订阅，无需在开放平台配置回调地址。</p>
+</blockquote>
+<h2>安装</h2>
+<pre><code># 1. 获取插件源码（二选一）
+git clone https://github.com/fengs2021/dsh-feishu-bridge.git ~/.dsh/plugins/dsh-feishu-bridge
+# 或手动放置到 ~/.dsh/plugins/dsh-feishu-bridge/
+
+# 2. 安装插件依赖（@deepseek-ai/dsh-agent 等）
+cd ~/.dsh/plugins/dsh-feishu-bridge
+npm install
+
+# 3. 注册进 web profile
+cd ~/.dsh/profiles/web
+# 编辑 package.json：
+#   - dependencies 增加  "dsh-feishu-bridge": "link:/root/.dsh/plugins/dsh-feishu-bridge"
+#   - dsh.profile.bundles 数组增加 "dsh-feishu-bridge"
+pnpm install
+
+# 4. 重启 dsh web（插件在 host 进程内启动 consume 子进程）
+systemctl restart dsh-web      # systemd 托管
+# 或手动重启你的 dsh web 进程
+</code></pre>
+<blockquote>
+<p>安装成功后，在飞书中给机器人发一条消息测试；回复以卡片形式出现即成功。
+若 <code>~/.dsh/plugins/</code> 下已有其他插件（如 dsh-novel-studio），参照其安装方式即可。</p>
+</blockquote>
+<h2>配置</h2>
+<p>在 <code>~/.dsh/profiles/web/cordis.patch.yml</code> 中覆盖配置（全部可选，均有默认值）：</p>
+<pre><code>- id: feishu-bridge
+  config:
+    botOpenId: 'ou_xxxxxx'     # 机器人 open_id（群聊 @ 判断用；见下方获取方式）
+    allowlist: ['ou_xxxxxx']   # open_id 白名单；空数组 = 允许所有人
+    cwd: '~'                   # 新会话工作目录（默认用户主目录）
+    enableGroup: true          # 是否响应群聊中 @ 机器人的消息
+    maxReplyChars: 3500        # 文本模式单条回复上限（超出分段）
+    typingHint: true           # 文本模式下收到先回「思考中」提示
+    replyMarkdown: true        # 文本模式回复使用 markdown 排版
+    streamCard: true           # 流式卡片模式（默认开；关闭则退回文本分段回复）
+    cardPollMs: 600            # 流式轮询间隔（毫秒，兜底检测 turn 结束）
+    cardMinIntervalMs: 1200    # 卡片更新最小间隔（毫秒，飞书接口限频保护）
+    maxTurnMs: 600000          # 单轮最长等待（毫秒），超时停止更新并提示
+    larkBin: 'lark-cli'        # lark-cli 可执行文件路径
+    stateFile: '~/.dsh/plugins/dsh-feishu-bridge/state.json'
+</code></pre>
+<h3>botOpenId 获取方式</h3>
+<ol>
+<li>插件启动时自动探测（<code>/open-apis/bot/v3/info</code>；部分应用权限下返回为空）；</li>
+<li>在任意群里 @ 机器人发一条消息，插件日志会打印
+<code>learned botOpenId=ou_xxx from group mention</code>，填入配置即可；</li>
+<li>飞书开放平台后台 → 应用 → 机器人，查看机器人 open_id。</li>
+</ol>
+<h2>使用</h2>
+<ol>
+<li>在飞书中搜索并打开机器人会话（或让管理员把机器人拉进群聊）；</li>
+<li>直接发消息即可对话；群聊中需 @ 机器人；</li>
+<li>命令：<ul>
+<li><code>/help</code> — 帮助</li>
+<li><code>/reset</code> — 清空当前对话上下文，重新开始</li>
+<li><code>/status</code> — 查看会话状态（sessionId / 模型 / 已处理消息数）</li>
+</ul>
+</li>
+</ol>
+<h2>运维</h2>
+<table>
+<thead>
+<tr>
+<th>事项</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>插件日志</td>
+<td><code>~/.dsh/plugins/dsh-feishu-bridge/bridge.log</code>（事件接收 / 会话创建 / 流式匹配 / 错误）</td>
+</tr>
+<tr>
+<td>会话映射</td>
+<td><code>state.json</code>；删除某条映射并重启即与该飞书会话「断连」（也可在飞书里发 <code>/reset</code>）</td>
+</tr>
+<tr>
+<td>consume 异常</td>
+<td>子进程自动退避重连；<code>kill -9</code> 可能泄漏服务端订阅，勿用</td>
+</tr>
+<tr>
+<td>卸载</td>
+<td>从 profile <code>package.json</code> 的 dependencies/bundles 移除，<code>pnpm install</code> 后重启</td>
+</tr>
+<tr>
+<td>升级</td>
+<td><code>git -C ~/.dsh/plugins/dsh-feishu-bridge pull</code> 后重启 dsh web</td>
+</tr>
+</tbody></table>
+<h2>常见问题（FAQ）</h2>
+<p><strong>Q：飞书里一直显示「思考中」，卡片不更新？</strong>
+检查 <code>bridge.log</code>：若出现 <code>patchCard failed</code>，确认飞书应用权限与卡片消息是否可更新；
+若出现 <code>target=miss</code>，确认消息对应会话的 <code>sessionId</code> 与 <code>state.json</code> 一致（重启后会自动恢复）。</p>
+<p><strong>Q：收到「stream is not async iterable」？</strong>
+历史版本的已知 bug（<code>llm/stream</code> listener 误用 async 函数），升级到 1.0.0 即可。
+⚠️ 该 listener 影响所有 LLM 调用，请勿改回 async 函数。</p>
+<p><strong>Q：群聊里 @ 机器人没反应？</strong>
+确认 <code>botOpenId</code> 已配置正确（见上文获取方式），且应用已在群内、可用范围包含该群。</p>
+<p><strong>Q：卡片更新失败（230001 / 230099）？</strong>
+卡片更新接口固定为 <code>PATCH /open-apis/im/v1/messages/:id</code>（body 为
+<code>{"content": "&lt;卡片JSON字符串&gt;"}</code>）；<strong>不要改用 <code>PUT</code> + <code>msg_type</code></strong>（会返回 230001）。</p>
+<p><strong>Q：重启 DSH 后上下文丢失？</strong>
+重启后插件会 <code>agents.resume</code> 恢复持久化会话（日志可见 <code>preloaded session ...</code>）。
+若 <code>resume</code> 失败（如会话文件损坏），映射会被保留，下次消息到来时自动重建。</p>
+<h2>开发</h2>
+<pre><code># 单元测试（纯函数：流式累积器 / 事件聚合 / 卡片构建 / 辅助函数）
+npm test
+
+# 静态检查
+npm run check
+</code></pre>
+<h3>目录结构</h3>
+<pre><code>dsh-feishu-bridge/
+├── lib/index.js            # 插件主体（cordis 插件）
+├── cordis.patch.yml        # bundle patch（插入 web profile roster）
+├── test/functions.test.mjs # 纯函数单元测试
+├── package.json
+├── README.md
+├── CHANGELOG.md
+└── LICENSE
+</code></pre>
+<h3>设计要点（贡献者必读）</h3>
+<ul>
+<li><code>lib/index.js</code> 导出全部纯函数（<code>collectReply</code> / <code>buildCard</code> / <code>createStreamAccumulator</code> /
+<code>toolSummary</code> / <code>splitChunks</code> / <code>cleanContent</code> / <code>shouldHandle</code>），便于测试与复用；</li>
+<li><code>llm/stream</code> 是 cordis <strong>waterfall</strong> 事件：listener 必须为<strong>同步函数</strong>且返回
+<code>AsyncIterable</code>（包装流时逐 chunk <code>yield</code> 透传，不得吞异常）；</li>
+<li>所有 <code>lark-cli</code> 子进程调用走 <code>runLark()</code>（超时 + 输出捕获），失败均有降级路径；</li>
+<li>同一持久化会话的并发 <code>resume</code> 通过 per-session promise 协调锁去重。</li>
+</ul>
+<h2>许可证</h2>
+<p><a href="https://github.com/fengs2021/dsh-feishu-bridge/blob/HEAD/LICENSE">MIT</a></p>
+<h2>相关项目</h2>
+<ul>
+<li><a href="https://github.com/deepseek-ai/deepseek-harness">DeepSeek Harness</a> — 本插件运行的宿主</li>
+<li><a href="https://github.com/larksuite/cli">@larksuite/cli</a> — 飞书开放平台 CLI（事件订阅 / 消息收发 / 卡片更新）</li>
+</ul>

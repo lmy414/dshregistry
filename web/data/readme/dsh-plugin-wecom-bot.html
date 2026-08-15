@@ -1,0 +1,233 @@
+<h1>dsh-plugin-wecom-bot</h1>
+<p>DeepSeek Harness（DSH）插件：通过企业微信「智能机器人」<strong>长连接</strong>收发消息，
+把发给机器人的文本当作任务下发给 DSH agent 执行，并把结果回传到企业微信。</p>
+<ul>
+<li><strong>零公网依赖</strong>：长连接模式由插件主动连出到企业微信网关（WebSocket），
+不需要公网 URL、不需要消息加解密、不需要可信 IP 白名单。</li>
+<li><strong>仅一个运行时依赖</strong>（<code>ws</code>）：Node 内置 WebSocket 不带 ALPN 扩展，
+会被企业微信网关 400 拒绝（详见「常见问题」），因此使用 <code>ws</code> 库。</li>
+<li>支持<strong>私聊</strong>与<strong>群聊 @机器人</strong>，多轮上下文（per-user 会话）或一次性任务（per-message）。</li>
+</ul>
+<h2>工作原理</h2>
+<pre><code>企业微信成员 ──私聊/群聊──▶ 智能机器人 ──wss://openws.work.weixin.qq.com──▶ 本插件
+                                                                             │
+         ◀── aibot_respond_msg（stream 流式回复）◀── agent 任务结果 ─────────┤
+                                                                             ▼
+                                                              DSH agents.create → followup
+                                                              → whenIdle → 汇总文本
+</code></pre>
+<p>协议实现基于官方文档
+<a href="https://developer.work.weixin.qq.com/document/path/101463">《智能机器人长连接》</a>，
+并与 <a href="https://github.com/chenhg5/cc-connect">cc-connect</a>、
+<a href="https://github.com/zhayujie/CowAgent">CowAgent</a> 两个开源实现交叉验证。</p>
+<h2>一、企业微信后台：创建智能机器人</h2>
+<ol>
+<li><p>登录 <a href="https://work.weixin.qq.com/wework_admin/frame">企业微信管理后台</a>。</p>
+</li>
+<li><p>进入 <strong>应用管理 → 智能机器人 → 创建智能机器人</strong>。</p>
+</li>
+<li><p>填写名称、头像等信息，创建完成后记录两个凭证：</p>
+<pre><code>BotID:  xxxxxxxxxxxxxxxx
+Secret: xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+</code></pre>
+<blockquote>
+<p>⚠️ <strong>Secret 只显示一次</strong>，请立即保存。</p>
+</blockquote>
+</li>
+<li><p>把机器人添加到会话：创建后在企业微信 App 里搜索该机器人，即可直接<strong>私聊</strong>；
+也可以把它拉进群聊，群成员 <code>@机器人</code> 发任务。</p>
+</li>
+</ol>
+<h2>二、安装插件</h2>
+<p>在插件源码目录（本目录）执行：</p>
+<pre><code># 1. 先装插件自身的依赖（link: 安装方式要求插件自带 node_modules）
+pnpm install
+
+# 2. 装进 web profile
+dsh plugin --profile web add .
+</code></pre>
+<p>这会用 pnpm 把插件装进 <code>~/.dsh/profiles/web</code>，并把 <code>dsh-plugin-wecom-bot</code>
+追加到该 profile 的 <code>dsh.profile.bundles</code>（bundle 层）。重启 <code>dsh web</code> 生效。</p>
+<blockquote>
+<p>本机没有 pnpm 时可用 corepack 启用，或在工作区内安装：
+<code>npm install --prefix .tools/pnpm pnpm --cache .npm-cache</code>，
+然后把 <code>.tools/pnpm/node_modules/.bin</code> 加入 PATH。</p>
+</blockquote>
+<h2>三、配置凭证</h2>
+<p>两种方式任选其一：</p>
+<p><strong>方式 A：环境变量（默认，推荐）</strong></p>
+<pre><code>export WECOM_BOT_ID="wwxxxxxxxxxxxxxx"
+export WECOM_BOT_SECRET="xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+dsh web
+</code></pre>
+<p><strong>方式 B：profile patch 覆盖</strong>（<code>~/.dsh/profiles/web/cordis.patch.yml</code>）：</p>
+<pre><code>- id: wecom-bot
+  config:
+    botId: wwxxxxxxxxxxxxxx
+    botSecret: xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+</code></pre>
+<blockquote>
+<p>patch 覆盖的是整行 <code>config</code>，覆盖时如需保留其他选项要一并写全
+（完整选项见下表）。</p>
+</blockquote>
+<p>未配置时插件保持空闲、仅打印提示，不影响 <code>dsh web</code> 启动。</p>
+<h2>四、启动验证</h2>
+<pre><code>dsh web
+</code></pre>
+<p>日志里应出现：</p>
+<pre><code>wecom-bot: connecting
+wecom-bot: subscribed
+wecom-bot: connected
+</code></pre>
+<p>然后在企业微信里私聊机器人发一条消息，例如：</p>
+<pre><code>帮我总结一下这个目录下 README.md 的主要内容
+</code></pre>
+<p>机器人先回复「✅ 已收到任务，agent 处理中…」，agent 跑完后回传最终结果。</p>
+<h2>五、bot 工作区命令</h2>
+<p>企业微信里给机器人发以下命令可以<strong>查看/切换工作区</strong>（决定 agent 在哪个
+目录干活；每个企业微信成员独立记住自己的目录，多轮会话有效）：</p>
+<table>
+<thead>
+<tr>
+<th>命令</th>
+<th>作用</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>查看工作区</code> / <code>#ws</code> / <code>#工作区</code></td>
+<td>列出全部已注册工作区 + 当前目录</td>
+</tr>
+<tr>
+<td><code>切换工作区 &lt;名称或路径&gt;</code> / <code>#ws &lt;名称或路径&gt;</code></td>
+<td>切换到指定工作区（按标题或绝对/相对路径），下一条消息在新目录执行</td>
+</tr>
+<tr>
+<td><code>#cwd</code> / <code>查看目录</code></td>
+<td>显示当前工作目录</td>
+</tr>
+<tr>
+<td><code>#cwd &lt;路径&gt;</code></td>
+<td>直接设置工作目录</td>
+</tr>
+</tbody></table>
+<p>示例：</p>
+<pre><code>查看工作区
+#ws productv4-web
+切换工作区 /Users/zhaohanghang/work/java/bp_product_web
+#cwd /Users/zhaohanghang/work/java/plug
+</code></pre>
+<p>说明：</p>
+<ul>
+<li>切换命令会<strong>持久化销毁旧目录的 agent 会话</strong>，下一条任务用新目录重建
+agent（旧会话结果已 flush 保存）。</li>
+<li>路径不存在/不是目录会返回错误提示；按标题匹配到多个工作区时需用完整路径。</li>
+<li>需要 <code>sessionMode: per-user</code>（默认值）才支持切换；<code>per-message</code> 模式下
+每条消息都新建 agent，切换不持久。</li>
+</ul>
+<h2>六、配置项</h2>
+<table>
+<thead>
+<tr>
+<th>配置键</th>
+<th>默认值</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>botId</code></td>
+<td>环境变量 <code>WECOM_BOT_ID</code></td>
+<td>智能机器人 BotID</td>
+</tr>
+<tr>
+<td><code>botSecret</code></td>
+<td>环境变量 <code>WECOM_BOT_SECRET</code></td>
+<td>智能机器人 Secret</td>
+</tr>
+<tr>
+<td><code>wsEndpoint</code></td>
+<td><code>wss://openws.work.weixin.qq.com</code></td>
+<td>长连接网关</td>
+</tr>
+<tr>
+<td><code>heartbeatIntervalMs</code></td>
+<td><code>30000</code></td>
+<td>心跳间隔（毫秒）</td>
+</tr>
+<tr>
+<td><code>reconnectBaseDelayMs</code></td>
+<td><code>1000</code></td>
+<td>重连初始退避（毫秒）</td>
+</tr>
+<tr>
+<td><code>reconnectMaxDelayMs</code></td>
+<td><code>30000</code></td>
+<td>重连最大退避（毫秒）</td>
+</tr>
+<tr>
+<td><code>sessionMode</code></td>
+<td><code>per-user</code></td>
+<td><code>per-user</code> 每个成员一个 agent 会话（多轮上下文）；<code>per-message</code> 每条消息新建 agent</td>
+</tr>
+<tr>
+<td><code>cwd</code></td>
+<td>进程 cwd</td>
+<td>agent 的工作目录</td>
+</tr>
+<tr>
+<td><code>provider</code> / <code>model</code></td>
+<td>默认模型选择</td>
+<td>覆盖 agent 使用的模型（留空用 <code>agentDefaultModel</code>）</td>
+</tr>
+<tr>
+<td><code>reasoningEffort</code></td>
+<td>默认</td>
+<td>推理档位（如 <code>high</code>/<code>medium</code>/<code>low</code>）</td>
+</tr>
+<tr>
+<td><code>agentPreset</code></td>
+<td>部署默认（<code>standard</code>）</td>
+<td>agent 装配预设：决定工具/提示。留空用部署默认（web profile 为 <code>standard</code>，含 bash/fs 等完整工具）；可选 <code>code</code> / <code>minimal</code>。<strong>缺失 preset 时 agent 无工具，任务会"假执行"（模型输出伪工具调用文本）</strong></td>
+</tr>
+<tr>
+<td><code>ignoreOlderThanSec</code></td>
+<td><code>300</code></td>
+<td>忽略超过该秒数的历史消息（重连补发防抖）</td>
+</tr>
+<tr>
+<td><code>maxReplyChars</code></td>
+<td><code>6000</code></td>
+<td>最终回复最大字符数，超出截断</td>
+</tr>
+<tr>
+<td><code>ackOnReceive</code></td>
+<td><code>true</code></td>
+<td>先推一条「已收到」中间态</td>
+</tr>
+<tr>
+<td><code>stripGroupMentions</code></td>
+<td><code>true</code></td>
+<td>群聊消息去掉 <code>@机器人</code> 提及前缀</td>
+</tr>
+</tbody></table>
+<h2>七、开发与测试</h2>
+<pre><code>npm test        # node --test，跑协议/客户端/命令层单测
+</code></pre>
+<p>代码结构：</p>
+<pre><code>lib/wecom.js     # 协议纯函数：帧构建/解析、消息提取、@提及剥离、字节分块、事件汇总
+lib/client.js    # 长连接客户端：订阅/心跳/重连/应答，socket 工厂可注入
+lib/commands.js  # 工作区命令层：命令解析、目标目录解析、列表格式化（纯函数可单测）
+lib/index.js     # Cordis 插件：配置 schema、agent 任务调度、消息流、工作区命令集成
+test/            # node:test 单测（FakeSocket 回放协议帧 + 命令解析用例）
+</code></pre>
+<h2>八、已知限制</h2>
+<ul>
+<li><strong>必须带 ALPN 握手（已处理）</strong>：企业微信长连接网关要求 TLS ClientHello
+携带 ALPN <code>http/1.1</code>，Node 内置 WebSocket（undici）与 <code>http.request</code> 默认
+都不带，握手会被网关以 400 拒绝。本插件用 <code>ws</code> 库 + 显式 ALPN 的
+<code>https.Agent</code> 建连解决；若改用其他客户端，请注意同样的问题。</li>
+<li>同一机器人同时只允许一个长连接：另一处连上时本连接会收到
+<code>disconnected_event</code> 并被网关断开。</li>
+<li>消息频率受企业微信限制（约 30 条/分钟）。</li>
+<li>语音消息按转写文本处理；图片/文件消息暂不处理（会被忽略）。</li>
+<li>最终回复超过 <code>maxReplyChars</code> 会被截断。</li>
+</ul>

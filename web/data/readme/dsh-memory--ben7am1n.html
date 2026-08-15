@@ -1,0 +1,107 @@
+<h1>dsh-memory</h1>
+<p>Durable cross-session memory for <a href="https://github.com/deepseek-ai/deepseek-harness">DeepSeek Harness</a>.</p>
+<p>The harness ships no memory plugin. Its <code>extension-cookbook</code> names the mechanism — a prompt section plus tools — but nothing implements it, so every session starts blank. This package fills that gap with one local SQLite file: <strong>no embedding service, no API key, no sidecar process.</strong></p>
+<h2>Install</h2>
+<pre><code>dsh plugin --profile web add dsh-memory
+</code></pre>
+<p>The shipped bundle row stores memories at <code>$DSH_HOME/memory/memory.db</code>, shared by every profile on the machine.</p>
+<h2>What it gives the model</h2>
+<table>
+<thead>
+<tr>
+<th>Tool</th>
+<th>Purpose</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>memory_write</code></td>
+<td>Store one self-contained durable fact, optionally tagged and pinned</td>
+</tr>
+<tr>
+<td><code>memory_search</code></td>
+<td>Keyword search over memory text and tags</td>
+</tr>
+<tr>
+<td><code>memory_forget</code></td>
+<td>Delete a memory that is now wrong or obsolete</td>
+</tr>
+</tbody></table>
+<p>Plus a <code>memory:recall</code> prompt section that renders <strong>pinned memories first, then the most recently updated</strong>, under a character budget. Recall therefore does not depend on the model remembering to search — what it stored is already in front of it, and search is for anything older than the budget allows.</p>
+<p>The <code>memory_write</code> description steers the model away from the common failure modes: transient task state (that is what the todo list is for), secrets, and facts the repository already records.</p>
+<h2>Configuration</h2>
+<pre><code>- id: memory
+  name: dsh-memory
+  config:
+    path: !!js dshHomePath('memory/memory.db')
+    promptRecentCount: 10
+    promptMaxChars: 2000
+    maxTextChars: 2000
+    searchLimitDefault: 10
+    searchLimitMax: 50
+    promptOrder: 50
+</code></pre>
+<table>
+<thead>
+<tr>
+<th>Field</th>
+<th>Default</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>path</code></td>
+<td>— (required)</td>
+<td>SQLite file, or <code>:memory:</code> for an ephemeral store</td>
+</tr>
+<tr>
+<td><code>promptRecentCount</code></td>
+<td><code>10</code></td>
+<td>Unpinned recent memories offered to the prompt section</td>
+</tr>
+<tr>
+<td><code>promptMaxChars</code></td>
+<td><code>2000</code></td>
+<td>Budget for the rendered section; overflow is reported as a count, and pinned memories are emitted first so they survive a tight budget</td>
+</tr>
+<tr>
+<td><code>maxTextChars</code></td>
+<td><code>2000</code></td>
+<td>Maximum characters accepted for one memory</td>
+</tr>
+<tr>
+<td><code>searchLimitDefault</code></td>
+<td><code>10</code></td>
+<td><code>memory_search</code> limit when the model omits it</td>
+</tr>
+<tr>
+<td><code>searchLimitMax</code></td>
+<td><code>50</code></td>
+<td>Hard cap, whatever the model asks for</td>
+</tr>
+<tr>
+<td><code>promptOrder</code></td>
+<td><code>50</code></td>
+<td>Section order; <code>-100</code> is the harness identity, <code>0</code> the persona</td>
+</tr>
+</tbody></table>
+<p><code>path</code> has <strong>no code-side default on purpose</strong>: a default would scatter durable user facts into whatever directory the harness happened to start in. The deployment value lives in the patch row.</p>
+<h2>Storage</h2>
+<p>One SQLite file: a <code>memories</code> table plus an external-content FTS5 index kept in sync by triggers. Parent directories are created on open, and the store survives process restarts.</p>
+<p>Search compiles the query by <strong>quoting every token</strong>, so FTS5 operators a model happens to type (<code>OR</code>, <code>*</code>, <code>-</code>, <code>"</code>) are matched literally instead of changing the query's meaning or raising a syntax error mid-tool-call. Surviving tokens combine with FTS5's implicit AND: every token must appear, and a query whose tokens include a word you did not store legitimately matches nothing.</p>
+<p><code>node:sqlite</code> is still flagged experimental in Node 22/24, so running the harness prints one <code>ExperimentalWarning</code>. The harness's own <code>dsh-session-query-sqlite</code> uses the same module.</p>
+<h2>Failure behavior</h2>
+<p>Load-time misconfiguration fails loud: an empty <code>path</code>, a non-positive bound, or a <code>searchLimitDefault</code> above <code>searchLimitMax</code> throws at plugin load.</p>
+<p>At call time, a blank fact or one over <code>maxTextChars</code> is a tool error the model can correct. A <code>memory_forget</code> for an id that does not exist is a <strong>successful</strong> result reporting <code>forgotten: false</code> — the model asked for a state that already holds, which is not an infrastructure failure.</p>
+<h2>Extension points</h2>
+<p><code>ctx.tools.register()</code> for the three tools and <code>ctx.systemPrompt.section()</code> for recall. Every registration is a Cordis effect, so unloading the plugin removes the tools and the section together and closes the database.</p>
+<h2>Development</h2>
+<pre><code>pnpm install --ignore-workspace
+pnpm run typecheck
+pnpm test
+pnpm run build
+</code></pre>
+<p>Tests cover the store directly (FTS retrieval, the literal-token query contract, prompt ordering, durability across reopens) and the plugin against the <strong>real</strong> tool registry and prompt service (registration, disposal, the write→recall round trip, bounds, fail-loud config).</p>
+<h2>License</h2>
+<p>MIT</p>
+<h2>Prior art</h2>
+<p>The idea comes from <a href="https://github.com/guchengod/pi-mentis">pi-mentis</a> (MIT) in the Pi ecosystem. This is an independent implementation against Harness extension points and shares no code with it. It deliberately drops pi-mentis's sidecar process, Zvec vector store, and required SiliconFlow embedding key in favour of one local FTS5 file — smaller, keyless, and offline, at the cost of lexical rather than semantic retrieval.</p>

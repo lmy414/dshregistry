@@ -1,0 +1,333 @@
+<h1>dsh-api-gateway</h1>
+<p>English | <a href="https://github.com/litestartup-com/dsh-api-gateway/blob/HEAD/README.zh.md">中文</a></p>
+<p>A plugin for <a href="https://github.com/deepseek-ai/deepseek-harness">DeepSeek Harness</a> that turns a running Harness into an HTTP API: any third-party client — curl, Python, a browser, an IM bridge — can create agent sessions, stream replies token-by-token over SSE, and continue conversations started in the Web UI, all behind API-key authentication. API sessions drive the same agent machine the GUI drives (inbox + session log), so both worlds stay in sync.</p>
+<pre><code>dsh plugin --profile web add dsh-api-gateway
+</code></pre>
+<h2>Features</h2>
+<ul>
+<li><strong>REST + SSE</strong>: 9 endpoints; token-level streaming (<code>assistant/chunk</code>), server closes the stream at <code>turn_end</code></li>
+<li><strong>GUI settings card</strong>: Settings → Plugins → Configurable → API Gateway (status, soft on/off, key rotation)</li>
+<li><strong>Workspace membership</strong>: API sessions land in real workspaces and show grouped in the sidebar, never under "ungrouped"</li>
+<li><strong>Session discovery &amp; adoption</strong>: list all sessions, read any session's full history (read-only), and adopt a GUI session to keep driving it over the API — live co-driving or cold resume with full context</li>
+<li><strong>Reasoning split</strong>: replies separate <code>text</code> (visible answer) from <code>reasoning</code> (thinking), never concatenated</li>
+<li><strong>Extensible</strong>: publishes <code>gateway/session-created</code> / <code>gateway/message</code> / <code>gateway/turn-end</code> on the Cordis event bus for other host plugins</li>
+<li><strong>Any language client</strong>: works from Linux/macOS/Windows, PowerShell included (UTF-8 aware, GBK-tolerant server side)</li>
+</ul>
+<h2>Install</h2>
+<h3>Recommended: <code>dsh plugin add</code></h3>
+<pre><code># npm (prebuilt — no build approval needed)
+dsh plugin --profile web add dsh-api-gateway
+
+# straight from GitHub (sources)
+dsh plugin --profile web add github:litestartup-com/dsh-api-gateway
+
+# from a packed tarball
+dsh plugin --profile web add ./dsh-api-gateway-0.1.0.tgz
+</code></pre>
+<blockquote>
+<p>Git installs fetch sources and run this package's <code>prepare</code> (build) script. pnpm ≥ 10 refuses that until you allow it: copy the exact package key pnpm prints into the profile's <code>pnpm-workspace.yaml</code> under <code>allowBuilds</code> and re-run the add. That allowance means "execute this package's code at install time" — only allow sources you trust, and pin a commit when in doubt.</p>
+</blockquote>
+<p>Uninstall: <code>dsh plugin --profile web remove dsh-api-gateway</code>.</p>
+<h3>Manual composition row (no CLI)</h3>
+<p>The plugin is an ordinary Cordis row; you can also compose it by hand. It publishes a cross-session HTTP surface, so it belongs in the <strong>host composition</strong> (or the profile's patch layer) — never inside an agent preset:</p>
+<pre><code>- id: api-gateway
+  name: dsh-api-gateway
+  config:
+    prefix: /api-gw/v1          # route prefix
+    enabled: true               # master switch (also toggleable at runtime)
+    apiKeys: []                 # pre-provisioned static API keys
+    allowKeyProvision: true     # one-time POST /key bootstrap
+    adminKey: change-me         # enables admin endpoints + card controls
+    maxSessions: 20             # concurrent session cap
+    workspaceMode: auto         # auto (join a workspace) | ungrouped
+    defaultWorkspacePath: ''    # fallback directory for auto mode
+    allowDiscover: true         # GET /sessions/discover
+    allowAdopt: true            # POST /sessions/:id/adopt
+    corsOrigin: '*'             # '*' or an explicit origin / list
+    exposeErrors: true          # include internal details in error responses
+    sseHeartbeatMs: 30000       # SSE heartbeat interval (0 disables)
+    bodyTimeoutMs: 30000        # request body read timeout
+</code></pre>
+<p>Every key has a schema default — see <code>examples/cordis.yml</code> for the annotated row.</p>
+<h2>Quick start</h2>
+<pre><code>BASE=http://127.0.0.1:3080/api-gw/v1
+KEY=$(curl -s -X POST $BASE/key | jq -r .apiKey)              # first call claims the key, once
+SID=$(curl -s -X POST $BASE/sessions -H "Authorization: Bearer $KEY" | jq -r .sessionId)
+curl -N $BASE/sessions/$SID/stream -H "Authorization: Bearer $KEY" &amp;    # SSE
+curl -s -X POST $BASE/sessions/$SID/messages \
+  -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \
+  -d '{"content":"你好，介绍一下你自己"}'
+</code></pre>
+<p>Windows PowerShell (no extra tools; UTF-8 safe):</p>
+<pre><code>$BASE = 'http://127.0.0.1:3080/api-gw/v1'
+$KEY  = (Invoke-RestMethod -Method Post "$BASE/key").apiKey
+$SID  = (Invoke-RestMethod -Method Post "$BASE/sessions" -Headers @{ Authorization = "Bearer $KEY" }).sessionId
+$json  = '{"content":"你好，介绍一下你自己"}'
+$bytes = [System.Text.Encoding]::UTF8.GetBytes($json)
+Invoke-RestMethod -Method Post "$BASE/sessions/$SID/messages" `
+  -Headers @{ Authorization = "Bearer $KEY" } -ContentType 'application/json; charset=utf-8' -Body $bytes
+</code></pre>
+<blockquote>
+<p>PowerShell 5.1 sends ANSI/GBK by default → garbled Chinese. Use the UTF-8 byte form above (or declare <code>charset=utf-8</code>); PowerShell 7 is UTF-8 by default. The server honors the request <code>Content-Type</code> charset (default UTF-8, GBK-tolerant). No <code>jq</code>? <code>brew install jq</code>, or use the Python/PowerShell examples.</p>
+</blockquote>
+<p>Python (httpx):</p>
+<pre><code>import httpx, json
+base = "http://127.0.0.1:3080/api-gw/v1"
+key = httpx.post(f"{base}/key").json()["apiKey"]
+h = {"Authorization": f"Bearer {key}"}
+sid = httpx.post(f"{base}/sessions", headers=h).json()["sessionId"]
+httpx.post(f"{base}/sessions/{sid}/messages", headers=h, json={"content": "你好，介绍一下你自己"})
+with httpx.stream("GET", f"{base}/sessions/{sid}/stream", headers=h) as r:
+    for line in r.iter_lines():
+        if line.startswith("data: "):
+            print(json.loads(line[6:])["kind"])
+</code></pre>
+<h2>Endpoints</h2>
+<table>
+<thead>
+<tr>
+<th>Method</th>
+<th>Path</th>
+<th>Auth</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>GET</td>
+<td><code>/health</code></td>
+<td>none</td>
+<td>Status (reachable while disabled)</td>
+</tr>
+<tr>
+<td>POST</td>
+<td><code>/key</code></td>
+<td>first call only</td>
+<td>One-time API key bootstrap</td>
+</tr>
+<tr>
+<td>POST</td>
+<td><code>/sessions</code></td>
+<td>API key</td>
+<td>Create a session (<code>provider/model/maxTokens/cwd/workspace</code>)</td>
+</tr>
+<tr>
+<td>GET</td>
+<td><code>/sessions/discover</code></td>
+<td>API key</td>
+<td>List sessions (id/title/cwd/live/persisted) — no content</td>
+</tr>
+<tr>
+<td>POST</td>
+<td><code>/sessions/:id/adopt</code></td>
+<td>API key</td>
+<td>Adopt an existing session (<code>live</code> co-drive / <code>resumed</code> cold-resume); returns full history</td>
+</tr>
+<tr>
+<td>POST</td>
+<td><code>/sessions/:id/messages</code></td>
+<td>API key</td>
+<td>Send a message (string or block array)</td>
+</tr>
+<tr>
+<td>GET</td>
+<td><code>/sessions/:id/stream</code></td>
+<td>API key</td>
+<td>SSE: hello(replay)→chunk→message→tool_call/tool_result→turn_end</td>
+</tr>
+<tr>
+<td>GET</td>
+<td><code>/sessions/:id/history</code></td>
+<td>API key</td>
+<td>Full history of <strong>any</strong> session (read-only)</td>
+</tr>
+<tr>
+<td>POST</td>
+<td><code>/sessions/:id/cancel</code></td>
+<td>API key</td>
+<td>Cancel the active turn</td>
+</tr>
+<tr>
+<td>POST</td>
+<td><code>/admin/enable</code></td>
+<td>Admin key</td>
+<td>Runtime soft switch <code>{"enabled": bool}</code></td>
+</tr>
+<tr>
+<td>POST</td>
+<td><code>/admin/rotate-key</code></td>
+<td>Admin key</td>
+<td>Rotate the provisioned key</td>
+</tr>
+</tbody></table>
+<p>Auth headers, either form: <code>Authorization: Bearer &lt;key&gt;</code> (recommended, RFC 6750) or <code>X-API-Key: &lt;key&gt;</code>.</p>
+<p>Full spec: <a href="https://github.com/litestartup-com/dsh-api-gateway/blob/HEAD/openapi.yaml">openapi.yaml</a>.</p>
+<h2>Security model</h2>
+<p><strong>Why can <code>POST /key</code> just hand out a key?</strong> It's a first-call bootstrap, not an open mint:</p>
+<ul>
+<li>Only when <strong>no key exists yet</strong> does <code>POST /key</code> generate a 32-char random key — exactly once. Afterwards the endpoint is locked (401 without a valid key).</li>
+<li>By default the gateway listens on loopback, so the only possible "first caller" is you, the deployer — equivalent to setting a password at first boot.</li>
+<li>Don't trust the window? Close it: <code>allowKeyProvision: false</code>, keys only from <code>apiKeys: [...]</code>.</li>
+</ul>
+<p>Defense in depth (production checklist):</p>
+<ol>
+<li><code>allowKeyProvision: false</code> + pre-provisioned <code>apiKeys</code></li>
+<li>Keep the gateway loopback-bound; put a reverse proxy + TLS in front if exposed</li>
+<li>Separate <code>adminKey</code> from API keys</li>
+<li>Per-session agent contexts; session ids are cryptographically random</li>
+<li><code>Authorization: Bearer</code> as the canonical header (<code>X-API-Key</code> kept as an alias)</li>
+<li>Constant-time key comparison (<code>crypto.timingSafeEqual</code>), CSPRNG key generation</li>
+</ol>
+<p>Known gaps (public, see roadmap): no per-key rate limiting/quotas, no revocation list, no multi-key management UI, no audit. For hostile multi-tenant scenarios wait for v0.2+, or front the gateway yourself. Holding an API key can discover/read/adopt <strong>all</strong> sessions — a feature for single-owner setups, a risk otherwise; disable via <code>allowDiscover</code>/<code>allowAdopt</code> (per-key allowlists land in v0.2.0).</p>
+<h2>Workspace membership</h2>
+<p>API sessions join workspaces just like GUI sessions — sidebar shows them grouped, never "ungrouped". <code>POST /sessions</code> accepts <code>workspace</code> in three forms:</p>
+<pre><code>{ "workspace": "C:\\projects\\team-a" }                                // path string
+{ "workspace": { "path": "C:\\projects\\team-a", "title": "Team A" } } // + title on create
+{ "workspace": { "id": "ws-xxx" } }                                    // existing workspace id
+</code></pre>
+<p>Rules (deterministic, server-side):</p>
+<ul>
+<li>Path resolves to an existing workspace → reused; otherwise <strong>auto-created</strong> (title defaults to the basename)</li>
+<li>Unknown <code>id</code> → 400 with the current workspace list (id/title/path)</li>
+<li>No <code>workspace</code> → <code>workspaceMode</code>: <code>auto</code> (default — resolve-or-create for the session cwd / <code>defaultWorkspacePath</code>) or <code>ungrouped</code></li>
+<li>Both <code>cwd</code> and <code>workspace</code> given → workspace wins; session cwd is forced to the workspace canonical path (the durable membership invariant: header cwd == workspace path)</li>
+<li>Path pointing at a missing directory → 400 (the gateway never creates directories)</li>
+</ul>
+<p>Responses and <code>history</code> include <code>workspace: { id, path, title }</code>. Shared collaborative workspaces (multiple keys on one path) arrive in v0.2.0.</p>
+<h2>Session discovery &amp; adoption (continue GUI sessions over the API)</h2>
+<pre><code># ① discover sessions
+curl -s $BASE/sessions/discover -H "Authorization: Bearer $KEY"
+
+# ② adopt one: live co-driving, or cold resume; returns the full history
+curl -s -X POST $BASE/sessions/$SID/adopt -H "Authorization: Bearer $KEY"
+# → { "mode": "live" | "resumed", "history": [...] }
+
+# ③ keep chatting — identical to gateway-created sessions
+curl -s -X POST $BASE/sessions/$SID/messages \
+  -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \
+  -d '{"content":"continue where we left off"}'
+</code></pre>
+<table>
+<thead>
+<tr>
+<th>mode</th>
+<th>Meaning</th>
+<th>Lifecycle</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>created</code></td>
+<td>Gateway-created session</td>
+<td>Owned by the gateway</td>
+</tr>
+<tr>
+<td><code>live</code></td>
+<td><strong>Co-driving</strong> a GUI-open session: API messages appear in the GUI flow, turns queue from both sides</td>
+<td>Borrowed only — plugin stop just untracks it</td>
+</tr>
+<tr>
+<td><code>resumed</code></td>
+<td>Cold-resume of an offline session (needs <code>sessionPersistence</code>)</td>
+<td>Owned by the gateway after resume</td>
+</tr>
+</tbody></table>
+<p><code>GET /sessions/:id/history</code> works for <strong>any</strong> session (read-only, no adoption needed); <code>/messages</code>, <code>/stream</code>, <code>/cancel</code> require adoption first.</p>
+<h2>vs the official Python SDK</h2>
+<p>DeepSeek Harness also ships an official <strong>Python SDK</strong> (<a href="https://deepseek-harness.github.io/deepseek-harness/guide/python-sdk">tutorial</a> / <a href="https://github.com/deepseek-ai/deepseek-harness/blob/master/python/sdk/README.md">SDK reference</a>). The two are <strong>not the same thing and not substitutes</strong>:</p>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>Official Python SDK</th>
+<th>This gateway</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>Nature</td>
+<td><strong>Embedded runtime</strong>: <code>pip install deepseek-harness-sdk</code> ships a platform wheel and drives a bundled <code>dsh-jsonrpc-agent</code> <strong>subprocess</strong> over JSON-RPC stdio</td>
+<td><strong>A door into a running Harness</strong>: a host-composition plugin exposing REST + SSE</td>
+</tr>
+<tr>
+<td>Model credentials</td>
+<td>DeepSeek API keys (<code>DEEPSEEK_API_KEY</code> / <code>DEEPSEEK_BASE_URL</code>)</td>
+<td>Gateway's own API keys (independent of model credentials)</td>
+</tr>
+<tr>
+<td>Sessions</td>
+<td>Private JSONL under <code>session_root</code>, unrelated to any deployment or GUI</td>
+<td>The deployment's shared session corpus: GUI-visible, workspace-grouped, adoptable</td>
+</tr>
+<tr>
+<td>Capabilities</td>
+<td>Minimal default composition (local bash etc., no skills, no compaction; customizable via <code>cordis</code>)</td>
+<td>The deployment's default agent preset (tools/skills/sandbox policy)</td>
+</tr>
+<tr>
+<td>Platforms</td>
+<td>Linux x64/arm64, macOS 14+ arm64; <strong>no Windows</strong></td>
+<td>Any client language/platform, Windows PowerShell included</td>
+</tr>
+<tr>
+<td>Isolation</td>
+<td><code>danger-full-access</code>; run in disposable environments/containers</td>
+<td>Inherits the deployment sandbox and approval policy</td>
+</tr>
+<tr>
+<td>Best for</td>
+<td>One-off isolated tasks from Python scripts without a long-running deployment</td>
+<td>Third parties connecting to <strong>your running deployment</strong>, multi-language, unified auth/limits/audit, continuing GUI sessions</td>
+</tr>
+</tbody></table>
+<p>Choose the SDK for disposable Python tasks; choose this gateway for everything that needs a persistent, shared, cross-language door. Don't mix the two: DeepSeek <code>sk-…</code> keys don't open this gateway, and <code>pip install deepseek-harness-sdk</code> does not connect to it.</p>
+<h2>Extensibility (for other plugins)</h2>
+<p>The gateway publishes three events on the Cordis event bus; other host plugins subscribe with <code>ctx.on(...)</code> (listeners are fiber-owned and can never break the gateway):</p>
+<ul>
+<li><code>gateway/session-created</code> → <code>{ sessionId, mode: 'created' | 'live' | 'resumed', workspace, cwd }</code></li>
+<li><code>gateway/message</code> → <code>{ sessionId, messageId, text }</code> (on each committed assistant reply)</li>
+<li><code>gateway/turn-end</code> → <code>{ sessionId, turn, reason, detail }</code></li>
+</ul>
+<p>Typical uses: audit persistence, external alerting, forwarding to IM/webhooks, custom rate-limit sidecars.</p>
+<h2>Development &amp; testing</h2>
+<pre><code>pnpm install
+pnpm build        # tsc
+pnpm smoke        # end-to-end smoke against a running gateway
+</code></pre>
+<p>Smoke env: <code>DSH_AGW_BASE</code> (default <code>http://127.0.0.1:3080/api-gw/v1</code>), <code>DSH_AGW_KEY</code> (optional — claims a key if absent), <code>DSH_AGW_PROMPT</code>. CI (<code>.github/workflows/ci.yml</code>) runs build + syntax checks, with an optional smoke job activated by repository variables.</p>
+<h2>Roadmap</h2>
+<p>Milestones ordered by "security first, then experience, then ecosystem"; each version ships independently.</p>
+<table>
+<thead>
+<tr>
+<th>Version</th>
+<th>Theme</th>
+<th>Contents</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong>v0.1.0</strong></td>
+<td>Baseline (current)</td>
+<td>REST + SSE, settings card, reasoning/text split, workspace membership, session adopt, cross-platform docs</td>
+</tr>
+<tr>
+<td><strong>v0.2.0</strong></td>
+<td>Multi-tenant security ★</td>
+<td>Multi-key CRUD/revocation, per-key rate limiting (429 + <code>Retry-After</code>), <strong>workspace model: per-key isolated + shared collaborative workspaces (<code>shared</code>/<code>isolated</code>)</strong>, per-key approval policy, audit (requests/sessions/token usage per key), session persistence (resume after restart)</td>
+</tr>
+<tr>
+<td><strong>v0.3.0</strong></td>
+<td>Admin UI</td>
+<td>Full admin settings page (keys/limits/workspace bindings, session monitor, usage audit, soft switch) + typert <code>@Remote</code> config surface (the admin page's foundation) + per-key agent preset selection</td>
+</tr>
+<tr>
+<td><strong>v0.4.0</strong></td>
+<td>Duplex streaming</td>
+<td><code>webServer.registerUpgrade</code> WebSocket full-duplex (send/stream/cancel on one connection); SSE stays as the lightweight option</td>
+</tr>
+<tr>
+<td><strong>v0.5.0</strong></td>
+<td>Ecosystem &amp; ops</td>
+<td>Python/Node HTTP thin clients (OpenAPI-generated — <strong>not</strong> the official embedded SDK, see above), deployment guide (reverse proxy + TLS, Docker Compose), metrics/telemetry export, OpenAPI generation in CI</td>
+</tr>
+</tbody></table>
+<p><strong>Out of scope / deferred</strong>: horizontal multi-process scaling, built-in TLS termination (a reverse proxy's job), OAuth/OIDC (revisit after the key-based model settles).</p>
+<h2>License</h2>
+<p>MIT</p>

@@ -1,0 +1,116 @@
+<h1>dsh-plugin-judge · Plugin Value Auditor for DeepSeek Harness</h1>
+<blockquote>
+<p>Judge whether a DeepSeek Harness plugin is worth using: pre-install review,
+post-install audit, and re-audit reminders when the model changes.</p>
+</blockquote>
+<p><a href="https://github.com/pengxuding/dsh-plugin-judge/blob/HEAD/README.zh.md">中文文档</a></p>
+<h2>The problem this plugin solves</h2>
+<p>Plugins fall into two natures:</p>
+<ul>
+<li><strong>Capability plugins</strong> give the model new abilities (new tools, skills, MCP
+servers, services, commands) — like giving the model "an extra hand".</li>
+<li><strong>Constraint plugins</strong> impose rules and guardrails on the model (injecting
+system prompt sections, personas, AGENTS.md rules, intercepting
+<code>agent/pre-step</code> / <code>tools/pre-execute</code>, <code>restrict</code> / <code>guard</code> on tools, or
+<code>complete: true</code> wholesale prompt replacement) — like putting the model
+"in a cage".</li>
+</ul>
+<p>Constraint plugins carry a hidden cost: the model will follow the rules
+faithfully (compliance looks great), but it performs <em>worse</em> on the task you
+actually care about — rules crowd the context and suppress the model's own
+judgment, putting a low ceiling over a capable model. Worse, as models get
+upgraded, many "patch rules for the old model" turn from patches into
+ceilings, and the plugin becomes obsolete or even harmful.</p>
+<p><strong>So a plugin's value is not a property of the plugin alone — it is a binary
+relation of "plugin × current model".</strong> That is exactly what this plugin
+evaluates.</p>
+<h2>Features</h2>
+<table>
+<thead>
+<tr>
+<th>Feature</th>
+<th>When</th>
+<th>How</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>Pre-install review</td>
+<td>Before installing</td>
+<td><code>/plugin-audit &lt;github:owner/repo or npm:pkg&gt;</code> command, the <code>judge_plugin</code> tool, or the settings-page input. Fetches the plugin source → static scan + LLM judge → a "worth installing?" verdict</td>
+</tr>
+<tr>
+<td>Post-install audit</td>
+<td>Already installed</td>
+<td>Enumerates installed bundles from the profile → scans and classifies each (capability / constraint / cosmetic / hybrid) → constraint-risk score → settings-page report panel</td>
+</tr>
+<tr>
+<td>Model-switch reminders</td>
+<td>When the model changes</td>
+<td>Watches the default model → flags plugins whose verdict depended on the old model → overlay popup reminder to re-audit</td>
+</tr>
+</tbody></table>
+<h2>How it judges (two layers combined)</h2>
+<ol>
+<li><strong>Rule heuristics (free, deterministic)</strong>: scans the plugin source and its
+injected content for signals, weights them into a 0–100 constraint-risk
+score, and classifies the plugin as capability / constraint / cosmetic /
+hybrid.</li>
+<li><strong>LLM judge (fine-grained, on demand)</strong>: hands the scan result, the injected
+content summary, and <strong>the current model's identity</strong> to a model and asks
+whether these rules <em>help or suppress this specific model</em>, returning a
+verdict with reasons.</li>
+</ol>
+<h2>Usage</h2>
+<pre><code># Install (requires an existing web profile)
+dsh plugin --profile web add dsh-plugin-judge
+
+# Or install from source
+dsh plugin --profile web add &lt;path-to-this-repo&gt;
+</code></pre>
+<p>After installing and restarting the harness:</p>
+<ul>
+<li>Type <code>/plugin-audit github:some/repo</code> in chat for a pre-install review;</li>
+<li>Or let the model call the <code>judge_plugin</code> tool directly;</li>
+<li>The settings panel gains a <strong>Plugin Judge</strong> page: scan reports for every
+installed plugin, a pre-install review input, and audit history;</li>
+<li>After a model switch, if any plugins need re-auditing, a floating reminder
+pops up on the page.</li>
+</ul>
+<h2>Design</h2>
+<h3>Data flow</h3>
+<pre><code>Installed plugins: profile manifest (~/.dsh/profiles/&lt;profile&gt;/package.json → dsh.profile.bundles)
+                   + each package's package.json / lib source (read locally via node:fs)
+Candidate plugins: package.json + entry source fetched from npm registry / jsDelivr / GitHub raw (Node fetch)
+Heuristic scan:   capability signals (+) vs constraint signals (−), weighted → class + risk score
+LLM judge:        llm.stream (generative verdict, carrying the current model identity) → verdict + reasons
+Model watch:      agentDefaultModel.currentSelection() polling (fallback: agent/request waterfall observation)
+Persistence:      ~/.dsh/plugin-judge/audits.json (audit history + model fingerprint)
+Bridge:           Host ctx.connection.rpc.handle('/plugin-judge', …) ← Client rpc.call polling
+Reminders:        Host produces pending-reminders → Client polls → shell.overlay popup
+Reports:          Client settings.section "Plugin Judge" page + judge_plugin tool card
+</code></pre>
+<h3>Signal table (heuristics)</h3>
+<p>Capability signals: <code>tools.register</code> / <code>defineTool</code> / skills / MCP /
+<code>webServer.register</code> / <code>registerFetchProvider</code> / <code>commands.register</code> /
+<code>provide(</code> …</p>
+<p>Constraint signals: <code>systemPrompt.section</code> / <code>ctx.systemPrompt</code> / persona /
+writing AGENTS.md / <code>agent/pre-step</code> / <code>tools/pre-execute</code> / <code>tools/execute</code>
+waterfall listeners / <code>restrict(</code> / <code>guard(</code> / <code>complete: true</code> wholesale
+replacement / strong-directive density (must, never, always, MUST, NEVER,
+必须、不得、禁止) / fixed-template instructions (strictly follow, exact
+format, 严格按照、按以下格式) …</p>
+<h3>Layout</h3>
+<pre><code>judgePlugin/
+├── package.json          # dsh.bundle.patch + dsh.client.inject + exports (Node &gt;= 18)
+├── cordis.patch.yml      # insert: plugin-judge
+├── lib/
+│   └── index.js          # Host half: inventory / source fetching / heuristic scan / LLM judge /
+│                         # model watch &amp; reminders / tool &amp; command / connection RPC bridge / persistence
+└── client/
+    └── client.js         # Client half (__ModuleLoader__ format, no build step):
+                          # settings.section report panel + shell.overlay model-switch reminder popup
+</code></pre>
+<h3>Disclaimer</h3>
+<p>Verdicts are advisory opinions produced by heuristics plus a model judge —
+not a security audit. Installing any plugin runs third-party code on your
+machine with your own permissions; read the source before you install.</p>

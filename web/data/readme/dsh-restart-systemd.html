@@ -1,0 +1,177 @@
+<h1>dsh-restart-systemd</h1>
+<blockquote>
+<p><strong><em>English summary.</em></strong>
+A DeepSeek Harness WebUI <strong>restart button</strong> (systemd edition). Adds a sidebar‑footer
+restart trigger <strong>next to the remote‑web‑ui phone icon</strong> plus a <code>/restart</code> command.
+Clicking schedules <code>systemctl --user restart dsh-web</code> (~3s later, so the browser
+gets its 202 first), dups are refused (<strong>409</strong>), non‑loopback callers are refused
+(<strong>403</strong>), a flag‑file + residual‑window design prevents restart loops, and after the
+service comes back up the browser <strong>auto‑reconnects without a manual refresh</strong>
+(ConnectionController exponential backoff 500ms→10s) while interrupted agent turns
+are <strong>auto‑resumed</strong>. Platform: <strong>WSL/Linux → systemctl --user</strong> (primary, tested);
+<strong>Windows → detached helper</strong> branch is present but unused on WSL.</p>
+</blockquote>
+<p><strong>GitHub topics</strong>（主代理创建仓库时使用）: <code>dsh</code> · <code>dsh-plugin</code> · <code>restart</code> · <code>systemd</code></p>
+<hr>
+<h2>设计总览</h2>
+<p>双面插件（与 <code>dsh-client-ui-aionui-panel</code> 同构）：</p>
+<table>
+<thead>
+<tr>
+<th>半边</th>
+<th>entry（exports）</th>
+<th>运行环境</th>
+<th>职责</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>host</td>
+<td><code>"."</code> → <code>lib/index.js</code></td>
+<td>node（宿主导进）</td>
+<td><code>/api/restart-dsh</code> 路由、<code>/restart</code> 命令、flag/resume 状态、restart-recover</td>
+</tr>
+<tr>
+<td>client</td>
+<td><code>"./client"</code> → <code>lib/client.js</code></td>
+<td>浏览器（WebUI）</td>
+<td>侧边栏 footer 重启按钮 + 二次确认 + 状态反馈</td>
+</tr>
+</tbody></table>
+<pre><code>src/
+  index.ts               # host apply()：串联路由 + 命令 + boot 消费/resume
+  host/gate.ts           # loopback fence（照抄 dsh-aionui-panel 的 gate）
+  host/restart.ts        # 调度 + 延迟 spawn + 平台分支 + flag/单飞锁
+  host/recover.ts        # agent/created -&gt; lastTurnInterrupted -&gt; followup continue
+  client/index.ts        # client apply()：locale + sidebar.footer.action 注入
+  client/RestartButton.tsx   # 按钮 + 确认对话框（内联样式，无需 CSS bundle）
+  client/api.ts          # POST 助手 + 重连探活
+</code></pre>
+<p>内部依赖：官方 socket <code>sidebar.footer.action</code>（list/root additive，remote-web-ui 电话图标同座）+ 备选 <code>conversation.session.header.utilities</code>。</p>
+<h3>重启流程</h3>
+<ol>
+<li>点按钮（或输入 <code>/restart</code>）→ 二次确认：“进行中的 agent 任务将中断并自动续接，页面约几秒后自动重连。”</li>
+<li>确认 → <code>POST /api/restart-dsh</code>（或命令回调）。</li>
+<li>host 把<strong>当前 running</strong> 的 agent id 快照到 <code>$DSH_HOME/dsh-restart-resume.json</code>，写 flag <code>$DSH_HOME/dsh-restart.flag</code>，随即回 <strong>202 <code>{scheduled:true, delayMs:3000}</code></strong>。</li>
+<li>3s 后 host 用<strong>白名单 argv</strong>（无 shell 拼串）spawn <code>systemctl --user restart dsh-web</code>。服务重启；浏览器靠 ConnectionController 指数退避（500ms→10s）<strong>自动重连，无需手动刷新</strong>。</li>
+<li>重启后插件消费（删除）flag token，装上 <code>agent/created</code> 监听，读 resume 列表——对每个<strong>最后 turn 被中断</strong>（存在未闭合 <code>turn/start</code> 或最近的 <code>turn/end.reason === 'interrupted'</code>）的会话，<code>agent.followup("Continue.")</code> 自动续接；idle/正常结束的会话绝不打扰。</li>
+</ol>
+<h3>平台三态</h3>
+<table>
+<thead>
+<tr>
+<th>平台</th>
+<th>行为</th>
+<th>代码位置</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong>WSL</strong></td>
+<td><code>process.platform === 'linux'</code> → <code>systemctl --user restart dsh-web</code>（<strong>本机主场景，已实测</strong>）</td>
+<td><code>restartArgv()</code> / <code>platformSupported()</code></td>
+</tr>
+<tr>
+<td><strong>Linux</strong></td>
+<td>同上（systemd 用户态）</td>
+<td>同上</td>
+</tr>
+<tr>
+<td><strong>Windows（原生 win32，非 WSL）</strong></td>
+<td><code>spawn(process.execPath, [helper, 'win-restart.mjs'])</code> detached helper，重启可脱离当前进程存活（机器相关，WSL 场景不走此分支）</td>
+<td>同上</td>
+</tr>
+</tbody></table>
+<h2>安全（三合一 + 单飞）</h2>
+<ul>
+<li><strong>flag 文件</strong> <code>$DSH_HOME/dsh-restart.flag</code>：spawn 前写入，boot 消费一次即删，绝不自行触发重启 → 残留 flag 无法造成二次重启。</li>
+<li><strong>残留窗口</strong>：插件驱动的 boot（flag 被消费）后 15s 内再次点击 → <strong>429</strong>，防重试乒乓。</li>
+<li><strong>单飞锁</strong>：已有一发在途时重复 POST → <strong>409</strong>。</li>
+<li><strong>loopback fence</strong>：socket/Host 非 127.0.0.1/::1 或 <code>sec-fetch-site === 'cross-site'</code> 或 Origin 不同源 → <strong>403</strong>；<code>X-Forwarded-For</code> 永不被信任。</li>
+</ul>
+<h3>状态文件（<code>$DSH_HOME</code> → <code>~/.dsh</code>）</h3>
+<table>
+<thead>
+<tr>
+<th>文件</th>
+<th>用途</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>dsh-restart.flag</code></td>
+<td>一次性 boot token <code>{ reason, ts, sessionIds }</code></td>
+</tr>
+<tr>
+<td><code>dsh-restart-resume.json</code></td>
+<td>续接列表 <code>{ ts, reason, sessionIds }</code></td>
+</tr>
+</tbody></table>
+<hr>
+<h2>独立仓库 / 发布形态</h2>
+<p>本目录即一个<strong>独立 Git + npm 包</strong>（社区格式 <code>dsh-&lt;feature&gt;</code>，systemd 版包名唯一且表意）：</p>
+<ul>
+<li><code>package.json</code> 已补全：<code>name: dsh-restart-systemd</code>、<code>version: 0.1.0</code>、<code>license: MIT</code>、
+<code>repository</code>（GitHub 占位 <code>https://github.com/&lt;your-org&gt;/dsh-restart-systemd.git</code>，主代理稍后创建）、
+<code>keywords</code>（<code>['dsh','dsh-plugin','deepseek-harness','restart','systemd','systemctl','wsl','webui']</code>）、
+<code>files</code>（<code>lib, src, cordis.patch.yml, README.md, LICENSE</code>）、<code>dsh.bundle.patch</code> ⇒ <code>./cordis.patch.yml</code>。</li>
+<li><code>LICENSE</code> 已就位（MIT，2026 contributors）。</li>
+<li><code>cordis.patch.yml</code> 注入一行双面插件，安装后 host+client 同时挂载，无需手改 bundle：<pre><code>- insert:
+    - id: ui-dsh-restart-systemd
+      name: dsh-restart-systemd
+</code></pre>
+</li>
+</ul>
+<p><strong>创建 GitHub 仓库时建议 topics</strong>：<code>dsh</code>、<code>dsh-plugin</code>、<code>restart</code>、<code>systemd</code>。</p>
+<h2>安装</h2>
+<pre><code># 1) 构建（需 devDependencies）
+cd dsh-restart-systemd
+npm install
+npm run build          # tsc -b → lib/（host=lib/index.js，client=lib/client.js，内联样式无需 CSS bundle）
+
+# 2) 装入 web profile（注册 bundle + 补丁插件行）
+dsh plugin --profile web add /tmp/dsh-restart-systemd
+#    或 pnpm add /tmp/dsh-restart-systemd + 手补 cordis.patch.yml 行到 profile bundle 列表
+
+# 3) 无热重载，需重启生效
+systemctl --user restart dsh-web
+</code></pre>
+<p><code>exports."."</code> → <code>lib/index.js</code>，<code>exports."./client"</code> → <code>lib/client.js</code>；<code>main</code>/<code>types</code> 与之对应。</p>
+<h2>验证</h2>
+<ol>
+<li><strong>插件加载</strong>：新会话打开；<code>journalctl --user -u dsh-web</code> 出现 <code>dsh-restart-systemd: ...</code>。</li>
+<li><strong>侧边栏按钮</strong>：设置按钮旁的 footer 行出现重启图标（在 remote-web-ui 电话图标旁边），悬停标题“重启 DeepSeek Harness”。</li>
+<li><strong>点击→确认→202→重启</strong>：确认后页面短暂显示“正在重启…”，~3s 后服务重启，页面自动重连：<ul>
+<li>journald 依次出现 <code>restart scheduled … delayMs=3000</code> → <code>spawning restart for dsh-web …</code> → 新 boot 的 <code>consumed leftover restart flag</code>。</li>
+</ul>
+</li>
+<li><strong><code>/restart</code> 命令</strong>：聊天输入 <code>/restart</code> → 返回确认文本。</li>
+<li><strong>会话自动续接</strong>：重启前若有 running agent，boot 后 journald 出现 <code>recovery armed for N session(s)</code> 与 <code>resuming interrupted agent &lt;id&gt;</code>，agent 自动继续。</li>
+<li><strong>单飞</strong>：快速点两次 → 第二次返回 <strong>409</strong> <code>already-scheduled</code>。</li>
+<li><strong>loopback</strong>：<code>curl -H 'Host: evil.example' -X POST http://127.0.0.1:3080/api/restart-dsh</code> → <strong>403</strong> <code>forbidden: loopback-only</code>。</li>
+<li>失败兜底：<code>systemctl --user status dsh-web</code> 确认单元存活。</li>
+</ol>
+<h2>回滚</h2>
+<pre><code>dsh plugin --profile web remove ui-dsh-restart-systemd
+# 或手删包 + bundle 行后
+systemctl --user restart dsh-web
+# 清理残留状态（随时可删）
+rm -f ~/.dsh/dsh-restart.flag ~/.dsh/dsh-restart-resume.json
+</code></pre>
+<p>重启后按钮与命令即消失，不改动其它配置。</p>
+<h2>平台说明</h2>
+<ul>
+<li><strong>WSL/Linux</strong>：<code>systemctl --user restart dsh-web</code>，主目标已实测。</li>
+<li><strong>Windows（原生，非 WSL）</strong>：<code>restartArgv()</code> 走 detached <code>spawn(process.execPath, [helper])</code>
+<code>win-restart.mjs</code>（未随包附带；参考 anweat/dsh-restart 的 detached helper、
+LnsiAxe/dsh-web-restart 的 WMI <code>Win32_Process.Create</code>、shaoyi1991 的 lsof 杀端口+spawn）。
+路由、单飞、flag、loopback fence、restart-recover 均平台无关。WSL 本机场景不进入此分支。</li>
+<li>重启后<strong>前端自动重连，无需手动刷新</strong>（ConnectionController 指数退避 500ms→10s）。</li>
+</ul>
+<h2>已知限制</h2>
+<ul>
+<li><strong>单一服务单元</strong>：systemctl 命令固定 <code>dsh-web</code>（<code>SYSTEMD_UNIT</code>）。</li>
+<li><strong>非 systemctl 启动则不生效</strong>：若以 <code>node …</code> 手跑，spawn systemctl 会失败并记日志，不产生重启。</li>
+<li><strong>恢复为尽力而为</strong>：60s <code>RECOVERY_TIMEOUT_MS</code> 窗口内未重建的 agent 会被丢弃；无法判定“最后 turn 被中断”的会话会被跳过（clean 会话永不被主动续接）。</li>
+<li><strong>Windows helper 为占位</strong>：仅提供 spawn 目标，helper 本体机器相关，超出 WSL 主目标范围。</li>
+<li>路由避开 <code>/plugins</code>（官方 client-modules 拥有该前缀），仅注册 <code>/api/restart-dsh</code>，无 bundle 供数冲突。</li>
+</ul>
+<h2>License</h2>
+<p>MIT — see <a href="https://github.com/RoyougiShiki/dsh-restart-systemd/blob/HEAD/LICENSE">LICENSE</a>.</p>

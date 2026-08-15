@@ -1,0 +1,230 @@
+<h1>dsh-remote-tunnel</h1>
+<p><a href="https://github.com/Linjiangxian0203/dsh-remote-tunnel/blob/HEAD/README.zh.md">中文</a> | English</p>
+<p><strong>Remote Host Tunnel Manager</strong>: automates the "local browser → dsh web on a remote Linux server" link — remote port allocation with a registry, systemd supervision, resilient SSH tunneling, local URL output, and full lifecycle management. Built for single users and for teams sharing one server.</p>
+<ul>
+<li>Sessions and files live <strong>on the server</strong> (the remote dsh web's workspace = server directories); the local machine only keeps a tunnel</li>
+<li>Each user automatically gets a <strong>dedicated remote port</strong>, double-checked on the server (real occupancy + registry) before allocation — safe under concurrency</li>
+<li>Every allocation is <strong>recorded in a registry on the server</strong> (<code>/etc/dsh-ports.tsv</code>, or a per-user fallback depending on permissions) — <code>audit</code> compares the registry against real occupancy at any time</li>
+<li>The tunnel <strong>auto-reconnects</strong> after network drops (backoff respawn), and heartbeats keep the registry fresh</li>
+<li>Occupied local ports shift automatically, with the occupying process reported</li>
+</ul>
+<h2>If you're just a user (not developing)</h2>
+<pre><code># 1. Install (published npm package)
+dsh plugin --profile remote add dsh-remote-tunnel
+
+# 2. Confirm your server is visible (Host aliases from ~/.ssh/config are auto-discovered)
+dsh --profile remote hosts
+#    not there? define one:
+dsh --profile remote hosts add lab --host 192.0.2.10 --user alice --workspace /home/alice/project
+
+# 3. First run: a health check tells you step by step what's missing
+#    (keys / Node / dsh / registry / systemd)
+dsh --profile remote check lab
+
+# 4. Bring the tunnel up; the browser opens the remote dsh web
+dsh --profile remote up lab --open
+
+# Everyday: status / down / logs / audit
+dsh --profile remote down lab
+</code></pre>
+<p>The remote server needs: Node ≥ 22.19, dsh, systemd, and key-based ssh login. One command initializes it:
+<code>ssh &lt;host&gt; 'sh -s' &lt; scripts/bootstrap-remote.sh</code>. Everything else lives in <code>$DSH_HOME/remote-tunnel/config.yaml</code> — sensible defaults, no changes needed.</p>
+<h2>Requirements</h2>
+<ul>
+<li>Local: Windows/macOS/Linux with the built-in OpenSSH client (Windows 10+ ships it), <strong>Node ≥ 22.19</strong></li>
+<li>Remote: Linux, Node ≥ 22.19 + dsh (installable via <code>scripts/bootstrap-remote.sh</code>), systemd (user-level is enough — no root needed)</li>
+<li>Recommended: passwordless ssh key login (<code>ssh &lt;alias&gt;</code> connects without prompts)</li>
+</ul>
+<h2>Install (development)</h2>
+<pre><code># 1. Install into a dedicated CLI profile (initializes the profile on first use)
+cd &lt;plugin checkout&gt;       # or the npm package name: dsh-remote-tunnel
+dsh plugin --profile remote add .
+
+# 2. Optional: install into the web profile to get the /remote slash commands
+dsh plugin --profile web add .
+</code></pre>
+<h2>Quick start</h2>
+<pre><code># Hosts from ~/.ssh/config are auto-discovered
+dsh --profile remote hosts
+
+# Or define one manually (when there is no ~/.ssh/config entry)
+dsh --profile remote hosts add lab --host 192.0.2.10 --user alice --workspace /home/alice/project
+
+# Readiness diagnostics: keys / Node / dsh / registry / systemd, item by item
+dsh --profile remote check lab
+
+# One command: allocate remote port → register → write systemd unit → start
+# remote dsh web → open the local tunnel
+dsh --profile remote up lab --open
+
+# Example output:
+#   allocated remote port 3081 (range 3080-3119, registered for alice)
+#   ✓ tunnel up — http://127.0.0.1:3083 (remote lab:3081)
+#   stop: dsh --profile remote down lab   (or Ctrl+C)
+
+# Inspect / stop / review
+dsh --profile remote status lab
+dsh --profile remote logs lab            # remote dsh web logs (journalctl)
+dsh --profile remote audit lab           # registry vs. real occupancy
+dsh --profile remote down lab            # stop tunnel + registry released + stop unit + verify port freed
+</code></pre>
+<p>The local URL opens the dsh web <strong>on the server</strong>: chat and read/write server files. Configure the API key in the remote web's Settings → Models (written to the server's <code>~/.dsh/.credentials.yaml</code> — this plugin and the tunnel never touch credentials).</p>
+<h2>Commands</h2>
+<pre><code>hosts / hosts add &lt;alias&gt; --host H [--port 22] [--user U] [--workspace DIR] / hosts rm &lt;alias&gt;
+check &lt;host&gt;                     readiness diagnostics (usable as a CI probe: nonzero exit = broken)
+provision &lt;host&gt; [--port N]      remote side only: allocate + systemd unit + start + register (no tunnel)
+up &lt;host&gt; [--port N] [--local-port N] [--open] [--heartbeat seconds]
+down [host] [--keep-service]     stop tunnel + released + stop unit + verify port freed
+status [host] [--json]
+list
+logs &lt;host&gt; [--lines N] [--follow] [--local]
+audit &lt;host&gt; [--json] [--release &lt;port&gt;] [--clean-stale]
+open [host]
+config show / config path
+</code></pre>
+<h2>How it works</h2>
+<ol>
+<li><strong>Remote port allocation (atomic)</strong>: one remote script runs under a <code>flock</code> lock — read the registry's in-use set + probe every port in the range with a real bind → pick the first port free on both sides → append a TSV row → echo the port. Concurrent allocators can never hand out the same port.</li>
+<li><strong>Remote supervision</strong>: writes a systemd unit and <code>enable --now</code>s it. With passwordless sudo it uses a <strong>system</strong> unit (<code>/etc/systemd/system/dsh-web-&lt;user&gt;.service</code>); without sudo it automatically falls back to a <strong>user</strong> unit (<code>~/.config/systemd/user/dsh-web.service</code>) plus <code>loginctl enable-linger</code> — no root required at all. Survives reboots and crashes.</li>
+<li><strong>TOCTOU fallback</strong>: if dsh loses a bind race at startup (<code>EADDRINUSE</code> shows up in the unit journal), the port is added to the exclusion set and the next free port is retried (up to 5 rounds by default).</li>
+<li><strong>Local tunnel</strong>: <code>ssh -N -L 127.0.0.1:&lt;local&gt;:127.0.0.1:&lt;remote&gt; &lt;alias&gt;</code>; the local port is checked first (shifts automatically when occupied, with <code>netstat</code>+<code>tasklist</code> naming the occupier). When the ssh process exits, it respawns with a backoff sequence (1s→2s→4s→8s→15s→30s cap), forever by default (<code>maxAttempts</code> configurable). The tunnel deliberately does <strong>not</strong> pass <code>ClearAllForwardings</code> (Windows OpenSSH would clear the command-line <code>-L</code> along with it); exec sessions still clear config forwards.</li>
+<li><strong>Heartbeat</strong>: while the tunnel lives, the registry's <code>last_heartbeat</code> is refreshed in-place under the lock every <code>heartbeatSeconds</code> (default 120).</li>
+<li><strong>Release</strong>: <code>down</code> (or Ctrl+C on <code>up</code>) runs in order: stop tunnel → remove local state → registry <code>released</code> → stop the remote unit → verify the port is really free. An <code>up</code> supervisor in another process notices the removed state file and stops reconnecting — no resurrection. Closing the terminal hard (without Ctrl+C) leaves the remote service running and the registry row <code>in-use</code> — which is accurate, not a leak: the next <code>up</code> cleans the stale local state and <strong>reuses the same registered port</strong> (no accumulation).</li>
+</ol>
+<h2>Configuration</h2>
+<p><code>$DSH_HOME/remote-tunnel/config.yaml</code> (<code>dsh --profile remote config path</code> prints the path):</p>
+<pre><code>hosts:
+  lab:                      # manually defined hosts (merged with ~/.ssh/config aliases; wins on name collision)
+    host: 192.0.2.10
+    port: 22
+    user: alice
+    workspace: /home/alice/project
+    remotePortRange: [3080, 3119]   # optional per-host override
+defaults:
+  remotePortRange: [3080, 3119]     # remote dsh port range (occupancy-checked before allocation)
+  localPortRange: [3081, 3140]      # local tunnel port range
+  registry:
+    path: /etc/dsh-ports.tsv
+    lockPath: /etc/dsh-ports.lock
+    sudo: auto                      # auto | always | never
+    fallbackPath: .dsh-ports.tsv    # used when the shared registry is not writable (relative = remote home)
+  unit:
+    prefix: dsh-web-
+    restartSec: 5
+    type: auto                      # auto | system | user
+  heartbeatSeconds: 120             # 0 = disable heartbeats
+  remoteWaitSeconds: 60             # wait for the remote port to listen
+  localWaitSeconds: 15              # wait for the local URL to respond
+  reconnect:
+    delaysMs: [1000, 2000, 4000, 8000, 15000, 30000]
+    maxAttempts: 0                  # 0 = never give up
+  allocateRetries: 5
+  ssh:
+    connectTimeout: 0               # 0 = do not pass -o ConnectTimeout (see Troubleshooting)
+    extraArgs: []
+</code></pre>
+<h2>Sharing one server (multi-user)</h2>
+<table>
+<thead>
+<tr>
+<th>Server setup</th>
+<th>Registry</th>
+<th>Supervision</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>Members have passwordless sudo</td>
+<td><code>/etc/dsh-ports.tsv</code> (sudo writes)</td>
+<td>system unit, one port per user</td>
+</tr>
+<tr>
+<td>No sudo, admin created a dshports group</td>
+<td><code>/etc/dsh-ports.tsv</code> (group 0664, no sudo)</td>
+<td>user unit + linger</td>
+</tr>
+<tr>
+<td>Nothing configured (default)</td>
+<td>falls back to <code>~/.dsh-ports.tsv</code> (own rows only; <code>check</code> points at the admin setup)</td>
+<td>user unit + linger</td>
+</tr>
+</tbody></table>
+<p>One-time admin setup for the shared registry (either):</p>
+<pre><code># A. every member has passwordless sudo
+sudo install -m 0644 -o root -g root /dev/null /etc/dsh-ports.tsv
+
+# B. members have no sudo: shared group writes
+sudo groupadd dshports &amp;&amp; sudo usermod -aG dshports alice bob ...
+sudo install -m 0664 -o root -g dshports /dev/null /etc/dsh-ports.tsv
+# each member's plugin config: registry.sudo: never
+</code></pre>
+<p>Each user runs <code>up</code> independently and gets a different remote port; <code>audit</code> shows who holds which port and flags stale/conflicting rows.</p>
+<h2>Remote bootstrap (optional)</h2>
+<p><code>scripts/bootstrap-remote.sh</code> installs Node (when missing) / dsh (into <code>~/.npm-global</code>) / creates <code>~/.dsh</code> / enables linger:</p>
+<pre><code>ssh &lt;host&gt; 'sh -s' &lt; scripts/bootstrap-remote.sh
+</code></pre>
+<h2>Troubleshooting</h2>
+<table>
+<thead>
+<tr>
+<th>Symptom</th>
+<th>Cause and fix</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>Error: listen EADDRINUSE ... 127.0.0.1:3080</code></td>
+<td>Someone (or your previous instance) holds the port. This plugin double-checks before allocation and retries the next port automatically on a startup race; you only see this when starting dsh by hand.</td>
+</tr>
+<tr>
+<td><code>Could not resolve hostname &lt;alias&gt;</code></td>
+<td>The alias is neither in <code>~/.ssh/config</code> nor in the plugin config. <code>hosts add</code> or add it to ssh config.</td>
+</tr>
+<tr>
+<td><code>Connection refused</code> / <code>remote port forwarding failed</code></td>
+<td>The remote dsh web is down or on the wrong port. <code>check &lt;host&gt;</code> → "web port listening"; <code>logs &lt;host&gt;</code> for the remote journal; <code>ss -tln | grep &lt;port&gt;</code> on the server.</td>
+</tr>
+<tr>
+<td><code>channel_setup_fwd_listener_tcpip: cannot listen to port</code></td>
+<td>The local port is taken (common: two dsh web instances). The plugin shifts automatically and names the occupying process; or pass <code>--local-port</code>.</td>
+</tr>
+<tr>
+<td><code>Permission denied (publickey)</code> / <code>sudo: a password is required</code></td>
+<td>Keys not set up / no NOPASSWD sudo. <code>ssh-copy-id</code> for the former; the latter is optional — the user-unit + fallback-registry path works without sudo.</td>
+</tr>
+<tr>
+<td><code>Could not create directory '/home/xxx/.ssh'</code> + host key prompt</td>
+<td>First connection needs the host key accepted; the plugin passes <code>accept-new</code> (TOFU) by default.</td>
+</tr>
+<tr>
+<td>Tunnel does not come back after a network drop</td>
+<td>Reconnection is infinite by default; <code>status</code> shows whether the ssh pid is alive and <code>logs &lt;host&gt; --local</code> shows reconnect activity. If <code>reconnect.maxAttempts</code> is set, it stops at the cap.</td>
+</tr>
+<tr>
+<td>Tunnel stays connected but the local URL stays <code>not reachable</code></td>
+<td>On Windows OpenSSH 8.1, <code>-o ClearAllForwardings=yes</code> also clears the command-line <code>-L</code>, so the tunnel connected without forwarding. Fixed: the tunnel no longer passes that option (exec sessions still do). Upgrade to a build that includes <code>fix: don't clear the tunnel's own -L forward on Windows</code>.</td>
+</tr>
+<tr>
+<td>Registry unreadable (<code>/etc/dsh-ports.tsv missing</code>)</td>
+<td>Created automatically on first allocation (requires write permission); without it the plugin falls back to <code>~/.dsh-ports.tsv</code> and <code>check</code> prints the admin setup command.</td>
+</tr>
+<tr>
+<td>Every ssh command is slow (~N seconds each)</td>
+<td>On some servers, passing <code>ConnectTimeout</code> to ssh makes every connection wait out the full timeout even when the connect is instant. The default no longer passes it (<code>ssh.connectTimeout: 0</code>); enable it explicitly if you need it.</td>
+</tr>
+</tbody></table>
+<h2>Development and testing</h2>
+<pre><code>pnpm install            # plugin dependencies
+npm test                # unit tests + mock-ssh integration tests (no real server needed)
+</code></pre>
+<p>The integration suite uses a fake <code>ssh</code> that interprets the plugin's remote commands against a temp "server" (with real TCP forwarding for the tunnel), covering: allocate/register/release, concurrent allocation by multiple users, TOCTOU retry, local port conflict shift, auto-reconnect, cross-process down cancellation, audit stale/orphan/clean.</p>
+<h2>Security notes</h2>
+<ul>
+<li>The tunnel and the remote dsh bind <code>127.0.0.1</code> only (dsh itself rejects <code>--host 0.0.0.0</code>)</li>
+<li>The plugin never stores or transmits passwords, keys, or API keys; ssh always uses existing keys (BatchMode — no password prompts, no hangs)</li>
+<li>The registry records no sensitive information (see <code>docs/registry-format.md</code>)</li>
+<li>Remote scripts only append/rewrite the registry and the systemd unit under <code>flock</code>; no other writes</li>
+</ul>
+<h2>Non-goals</h2>
+<ul>
+<li>No SSH/SFTP/remote-mount implementation: the design is "run dsh on the server"; the tunnel only brings HTTP back locally</li>
+<li>No new TUI: CLI subcommands + the web profile's <code>/remote</code> slash commands</li>
+</ul>

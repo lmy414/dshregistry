@@ -1,0 +1,286 @@
+<h1>dsh-tier-router — Tiered model routing for DeepSeek Harness</h1>
+<p><a href="https://github.com/BruceLanLan/dsh-tier-router/blob/HEAD/LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="license"></a>
+<a href="https://github.com/topics/dsh-plugin"><img src="https://img.shields.io/badge/dsh-plugin-ready-4B32C3" alt="dsh-plugin"></a></p>
+<p>Routes model steps by task difficulty: a <strong>strong tier (deepseek-v4-pro by default)
+handles planning / architecture / review</strong>, while a <strong>cheap tier (deepseek-v4-flash by
+default) handles day-to-day implementation</strong>. Inspired by Claude Code's <code>/advisor</code>
+(consult a stronger model for hard decisions) and <code>opusplan</code> (strong model in plan mode,
+cheap model for execution), implemented on DeepSeek Harness through its official seams,
+with an escalation gate, failure auto-escalation, and subagent tiering on top.</p>
+<p>English · <a href="https://github.com/BruceLanLan/dsh-tier-router/blob/HEAD/README.zh.md">中文</a></p>
+<h2>How it works</h2>
+<pre><code>flowchart LR
+    subgraph main["Main session (header-driven)"]
+      U["User message"] --&gt; IN["agent/inbox/inserted"]
+      IN --&gt;|"auto mode"| HW["write session request/header"]
+      PM["plan/mode flip"] --&gt; HW
+      HW --&gt; API["api-proxy selection layer"]
+      API --&gt; STEP["each step's model = header tier"]
+    end
+    subgraph child["Subagents (agent/request swap)"]
+      W["tier_worker dispatch"] --&gt;|"agentOptions injection"| C["subagent"]
+      C --&gt; AR["agent/request waterfall"]
+      AR --&gt;|"swap provider/model per tier"| STEP2["subagent steps"]
+    end
+    G["tools/pre-execute guard"] -.-&gt;|"cheap tier + high-impact pattern"| DENY["deny + escalation hint"]
+    E["agent/error failures"] -.-&gt;|"within window"| ESC["temporary strong tier (TTL)"]
+</code></pre>
+<pre><code>sequenceDiagram
+    participant U as User
+    participant S as Session (main agent)
+    participant A as Strong v4-pro
+    participant C as Cheap v4-flash
+    U-&gt;&gt;S: /tier plan (enter plan mode)
+    S-&gt;&gt;S: write header -&gt; strong
+    S-&gt;&gt;A: planning / architecture / design
+    U-&gt;&gt;S: approve plan, leave plan mode
+    S-&gt;&gt;S: write header -&gt; cheap
+    S-&gt;&gt;C: routine implementation
+    S-&gt;&gt;A: tier_advisor (hard decisions) / tier_review (final review)
+    Note over S,C: high-impact actions (rm -rf / credential files) are denied by the guard until the strong tier is selected
+</code></pre>
+<h2>Features</h2>
+<ul>
+<li><strong>Automatic tiered routing (auto mode, opusplan-style)</strong>: steps run on the strong tier
+while plan mode is active and on the cheap tier during execution. Main sessions are
+routed by writing the session <code>request/header</code> (the official seam the api-proxy selection
+layer reads, as community plugins like <code>dsh-model-router</code> do); subagents are switched
+per step at the <code>agent/request</code> waterfall.</li>
+<li><strong>Per-session scoping</strong>: <code>/tier strong|cheap|auto|off</code> affects <strong>only the current
+session</strong>; other sessions in the process keep their own tier (global default <code>auto</code>).
+Sessions that should not be managed can opt out with a single <code>/tier off</code>.</li>
+<li><strong>On-demand advice (advisor-style)</strong>: the <code>/advisor &lt;question&gt;</code> command and the
+<code>tier_advisor</code> tool hand one decision question plus gathered evidence to the strong
+tier and return advice / evidence / risks / acceptance criteria; implementation stays
+on the current tier.</li>
+<li><strong>Review phase</strong>: the <code>tier_review</code> tool and <code>/tier review &lt;focus&gt;</code> ask the strong tier
+to review a change set and return an <code>APPROVE / NEEDS-CHANGES / BLOCKED</code> verdict with
+issues ranked by severity.</li>
+<li><strong>Failure auto-escalation</strong>: repeated step errors within a window (default 2 errors /
+60s) temporarily escalate the session to the strong tier (default 180s), expiring via
+TTL; sessions in <code>off</code> mode never escalate.</li>
+<li><strong>Configurable tiers (durable)</strong>: <code>/tier set &lt;strong|cheap&gt; &lt;provider&gt; &lt;model&gt; [effort]</code> or the
+<code>tier_configure</code> tool can point either tier at any registered provider/model (defaults:
+<code>deepseek-official/deepseek-v4-pro(max)</code> and <code>deepseek-official/deepseek-v4-flash(high)</code>).
+Configuration persists in the <code>tier-router</code> settings namespace and survives restarts
+(pass <code>sessionOnly: true</code> for a transient change).</li>
+<li><strong>High-impact escalation gate (deterministic guard)</strong>: while the cheap tier executes,
+<code>tools/pre-execute</code> denies high-impact tool calls and requires switching to the strong
+tier first — no reliance on model self-discipline. Guard rules (pure logic in
+<code>lib/pure.js</code>, unit-tested):<ul>
+<li>every <code>rm -rf</code> spelling: combined flags (<code>-rf</code>), split flags (<code>-r -f</code>), case variants
+(<code>-R</code>), long flags (<code>--recursive --force</code>), runner prefixes (<code>sudo rm -rf</code>, <code>busybox rm</code>);</li>
+<li>destructive commands: <code>mkfs</code>, <code>dd if=</code>, <code>sudo</code>, <code>shutdown/reboot/halt</code>,
+<code>git push --force/-f</code>, <code>git clean -f*</code>, <code>find ... -delete</code> / <code>find ... -exec rm</code>,
+<code>python -c</code> with <code>shutil.rmtree</code> / <code>os.remove</code>, <code>curl|sh</code>, <code>wget|sh</code>,
+<code>chmod</code> on <code>.ssh</code>, <code>chown</code>;</li>
+<li>sensitive paths: <code>.env</code> (whitelist for <code>.env.example/.template</code>), <code>credentials</code>/<code>secrets</code>
+with common extensions, <code>.ssh/</code>, private keys such as <code>id_rsa</code> (case-insensitive),
+<code>.pem</code>, <code>.key</code>;</li>
+<li>prose never false-positives: <code>echo rm -rf</code>, <code>grep sudo</code> do not trigger
+(command-position anchored).</li>
+</ul>
+</li>
+<li><strong>Subagent tiering</strong>: <code>tier_worker</code> dispatches bounded task packets to a fresh subagent
+on a chosen tier (<code>agentOptions</code> model injection), with <code>outputSchema</code> (structured
+results), <code>toolFilter</code> (restrict worker tools), <code>maxDepth</code> (delegation-depth cap),
+<code>persona</code> (per-child persona) and <code>background</code> (run via the jobs service);
+<code>/tier subagent &lt;inherit|cheap|strong&gt;</code> sets the global policy for all other subagent steps.</li>
+<li><strong>Escalation rules injected into the system prompt</strong>: ambiguity unresolved,
+architecture / security / data integrity, two failed attempts, high-risk completion —
+the model is guided to call <code>tier_advisor</code> / <code>tier_review</code> at decision points.</li>
+</ul>
+<h2>Installation</h2>
+<blockquote>
+<p><strong>Plane note.</strong> <code>dsh-tier-router</code> contributes agent-plane surfaces — tools,
+slash commands, a prompt section, and step-routing listeners — so it must be
+composed in the <strong>agent preset</strong> your sessions use, not as a host bundle row.
+Installing the package alone (or shipping a host insert) activates nothing.</p>
+</blockquote>
+<pre><code># 1. Link the package into your profile (dev: clone this repo and add the path;
+#    once published: dsh plugin --profile web add dsh-tier-router)
+git clone https://github.com/BruceLanLan/dsh-tier-router.git
+cd dsh-tier-router
+dsh plugin --profile web add .
+
+# 2. Install the ready-made agent preset (standard + the tier-routing row) into
+#    the user preset root (${DSH_HOME:-$HOME/.dsh}/.agent-presets/):
+cp -R agent-presets/tiered "${DSH_HOME:-$HOME/.dsh}/.agent-presets/"
+
+# 3. Make it the default for new sessions (add to the profile's cordis.patch.yml):
+#      - id: agent-presets
+#        name: '@deepseek-ai/dsh-agent-presets'
+#        config:
+#          default: tiered
+#    (or select "tiered" per session in the preset picker instead)
+
+# 4. Restart DSH (kill the process LISTENing on the web port first), then open a
+#    NEW session (existing sessions keep the preset they were created with) and
+#    verify with /tier status.
+</code></pre>
+<p>Uninstall: remove the <code>tier-routing</code> row from the preset (or delete the preset
+directory), and <code>dsh plugin --profile web remove dsh-tier-router</code> to drop the
+package link.</p>
+<p>Installation is verified in practice: the package resolves from the profile
+store, the shipped <code>agent-presets/tiered</code> preset (a <code>standard</code> copy plus the
+<code>- id: tier-routing / name: dsh-tier-router</code> row) passes
+<code>agentPresets.standingKeyFor</code> mount validation, module loading is smoke-tested,
+and <code>npm pack</code> ships a clean tarball (lib + patch + preset + README/LICENSE).</p>
+<h2>Usage</h2>
+<h3>Slash commands (typed in the composer; they affect only the current session)</h3>
+<pre><code>/advisor &lt;question&gt;                          # one strong-tier consultation
+/tier status                                # routing state, escalation state, diagnostics
+/tier strong | cheap                        # force one tier for this session (optionally persist as session default)
+/tier auto                                  # restore auto for this session (plan -&gt; strong, execution -&gt; cheap)
+/tier off                                   # disable routing for this session, restore its default model (other sessions unaffected)
+/tier plan                                  # auto + enter plan mode, apply the strong header immediately
+/tier models                                # list registered providers and their models
+/tier set &lt;strong|cheap&gt; &lt;provider&gt; &lt;model&gt; [effort]
+/tier subagent &lt;inherit|cheap|strong&gt;       # global policy for subagent steps
+/tier review &lt;focus&gt;                        # strong-tier review
+</code></pre>
+<p>Sample output (<code>/tier status</code>):</p>
+<pre><code>Tiered model routing
+  mode: global=auto, this session=auto (per-session via /tier strong|cheap|auto|off; escalate: 2 errors / 60s window -&gt; 180s strong)
+  strong: deepseek-official/deepseek-v4-pro (max)
+  cheap:  deepseek-official/deepseek-v4-flash (high)
+  subagents: inherit
+  diag: requestSteps=42 guardChecks=31 guardDenies=3 headerWrites=4 errorsSeen=0 escalations=0
+  session default: deepseek-official/deepseek-v4-pro (max)
+  providers: deepseek-official, opencode-go, minimax
+</code></pre>
+<h3>Model tools (called by the model when needed)</h3>
+<table>
+<thead>
+<tr>
+<th>Tool</th>
+<th>Purpose</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>tier_advisor</code></td>
+<td>Strong-tier consultation: one question + evidence -&gt; advice / risks / acceptance criteria</td>
+</tr>
+<tr>
+<td><code>tier_review</code></td>
+<td>Strong-tier review: change set + validation results -&gt; verdict with ranked issues</td>
+</tr>
+<tr>
+<td><code>tier_route</code></td>
+<td>Set <strong>this session's</strong> tier (strong/cheap/auto/off, optionally persisted)</td>
+</tr>
+<tr>
+<td><code>tier_configure</code></td>
+<td>Reconfigure either tier's provider/model/effort and the subagent policy</td>
+</tr>
+<tr>
+<td><code>tier_worker</code></td>
+<td>Dispatch a bounded task packet to a subagent on a chosen tier; supports outputSchema / toolFilter / maxDepth / persona</td>
+</tr>
+<tr>
+<td><code>tier_status</code></td>
+<td>Read-only diagnostics: global &amp; session tiers, escalation state, listener counters, effective tier</td>
+</tr>
+</tbody></table>
+<h2>Configuration</h2>
+<p>Runtime configuration (no restart needed):</p>
+<pre><code>/tier set strong deepseek-official deepseek-v4-pro max
+/tier set cheap deepseek-official deepseek-v4-flash high
+</code></pre>
+<p><code>/tier set</code> and <code>tier_configure</code> persist the tier configuration in the <code>tier-router</code>
+settings namespace (survives restarts; pass <code>sessionOnly: true</code> for a transient change).
+<code>tier_route strong|cheap</code> scopes to the current session and does NOT persist by default;
+pass <code>persist: true</code> to also write the session default model (<code>agent-default-model</code>).
+Failure auto-escalation parameters (threshold / window / TTL) are currently built-in
+constants; configurable in a later version.</p>
+<h2>Tests</h2>
+<pre><code>npm test        # node:test — 20 cases: guard positive/negative matrix, tier decision precedence, per-session overrides
+npm run check   # syntax check for lib/index.js and lib/pure.js
+</code></pre>
+<p>Verified in live multi-round sessions (dynamic-plugin form):</p>
+<table>
+<thead>
+<tr>
+<th>Area</th>
+<th>Result</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>Main-session per-step routing (durable log evidence)</td>
+<td>✅ <code>request/header</code> events show the pro -&gt; flash switch</td>
+</tr>
+<tr>
+<td>Guard matrix (auto/strong/off)</td>
+<td>✅ auto denies / strong allows / off allows + restores default / auto-restored denies</td>
+</tr>
+<tr>
+<td>Guard hardening (split flags, runner prefixes, prose, .env whitelist, case)</td>
+<td>✅ 7/7 live probes</td>
+</tr>
+<tr>
+<td>Tools, positive paths</td>
+<td>✅ advisor/review hit the strong tier; route modes; configure; worker on both spawn and fork providers</td>
+</tr>
+<tr>
+<td>Worker options</td>
+<td>✅ outputSchema structured result, toolFilter restriction, maxDepth rejection, invalid filter error</td>
+</tr>
+<tr>
+<td>Tools, negative paths</td>
+<td>✅ invalid provider rejected, invalid subagent provider error</td>
+</tr>
+<tr>
+<td>Subagent tiering</td>
+<td>✅ cheap tier on flash, strong tier on pro (child logs + return values)</td>
+</tr>
+<tr>
+<td>Failure-escalation event path</td>
+<td>✅ <code>agent/error</code> fires, counters increment, off mode correctly skips</td>
+</tr>
+<tr>
+<td>Lifecycle</td>
+<td>✅ stop removes guard &amp; tools; re-run restores everything and the guard works</td>
+</tr>
+<tr>
+<td>Persistence</td>
+<td>✅ <code>agent-default-model</code> written</td>
+</tr>
+<tr>
+<td>Cross-turn listener survival</td>
+<td>✅ diagnostic counters keep incrementing across turns</td>
+</tr>
+</tbody></table>
+<h2>FAQ</h2>
+<p><strong>Q: Why was another session's model switched automatically?</strong>
+Early versions were process-global. Since v0.3.0 <code>/tier</code> commands scope to the <strong>current
+session</strong> only; other sessions default to <code>auto</code> independently. A session that should not
+be managed runs <code>/tier off</code> to opt out.</p>
+<p><strong>Q: The tier switch did not take effect immediately?</strong>
+Tier switches are written to the session header before the step is built, so they apply
+from the <strong>next step</strong> (one-step delay).</p>
+<p><strong>Q: How do I use subscription-channel models (OpenCode Go / MiniMax)?</strong>
+Run <code>/tier models</code> to confirm the provider is registered and its models are configured,
+then <code>/tier set cheap opencode-go deepseek-v4-flash</code>. pi-ai-style providers must declare
+<code>baseURL</code> / <code>api</code> / <code>models</code> in settings.yaml, otherwise every model id is rejected.</p>
+<p><strong>Q: A high-impact action was blocked. What now?</strong>
+The guard's message tells you: switch to the strong tier first (<code>tier_route strong</code> or
+<code>/tier strong</code>) and re-issue — the block exists precisely to keep the cheap tier from
+running destructive actions directly.</p>
+<p><strong>Q: <code>/tier</code> does not appear after installing the bundle?</strong>
+The package is an agent-plane plugin: it must be a row in the agent preset your
+session uses (see Installation). A host bundle row alone activates nothing —
+agent-plane services (<code>tools</code>, <code>commands</code>, <code>systemPrompt</code>) are only reachable
+from the preset scope, and this package ships no host insert by design. After
+adding the row, restart <code>dsh web</code> and verify with <code>/tier status</code>. (The
+dynamic-plugin form is a process-local temporary instance and disappears on
+restart.)</p>
+<h2>Known limitations</h2>
+<ul>
+<li>Tier switches take effect from the next step (the header is written before the step builds).</li>
+<li>The subagent global policy (<code>/tier subagent</code>) is process-wide; a worker's per-dispatch
+tier always wins.</li>
+<li>The full live "fail -&gt; self-heal" sequence for failure auto-escalation has been verified
+at the event path and unit-logic level; trigger it live per the FAQ if desired.</li>
+</ul>
+<h2>License</h2>
+<p>MIT</p>

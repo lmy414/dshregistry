@@ -1,0 +1,766 @@
+<h1>Project Change Router Skill</h1>
+<p>中文默认版。英文版见 <a href="https://github.com/WeirdSky924/project-change-router-skill/blob/HEAD/README.en.md">README.en.md</a>。</p>
+<p><code>project-change-router</code> 是一个面向大型仓库的 AI coding skill，可用于 Codex、Claude Code 和 DeepSeek Harness。它的目标不是让 agent 更大胆地猜架构，而是让 agent 更少乱猜：在真正修改代码之前，先用仓库本地的路由 bundle 获取能力归属、canonical root、owner、读写边界、复用风险和处理倾向。</p>
+<p>它解决的核心问题是大型项目开发中常见的结构漂移：</p>
+<ul>
+<li>agent 上下文有限，不可能每次完整读取大型全栈项目。</li>
+<li>agent 注意力会漂移，容易只根据局部文件和名字相似做判断。</li>
+<li>可复用能力可能被重复实现，形成第二套平行中心。</li>
+<li>本该进入底层共享能力的代码可能被写到 facade、API、UI 或临时目录里。</li>
+<li>空仓、早期仓和重构仓的边界不稳定，自动推断很容易把临时结构当成长期架构事实。</li>
+</ul>
+<p>这个 skill 提供的是一个低 token、可验证、可校准的“项目变更方向索引与边界护栏”。它不替代 agent 的详细工程分析，也不替用户做最终架构决策；它负责在动手前给出路线、证据、强约束、风险原因和后续校准方向。</p>
+<p><img src="https://raw.githubusercontent.com/WeirdSky924/project-change-router-skill/HEAD/assets/readme-hero.svg" alt="Project Change Router overview"></p>
+<h2>核心理念</h2>
+<p>这个项目的设计原则是：</p>
+<ul>
+<li>少乱猜优先于更聪明地猜。证据不足时宁可保留 <code>unknown</code> 并让 <code>execution_gate=blocked</code>，不要伪装成确定结论。</li>
+<li>profile 优先于纯启发式。真实 owner、public entry、capability 边界和 path pattern 应逐步写入 <code>.project-change-router.yaml</code>。</li>
+<li>结构证据优先于名字相似。路径、owner、public API、依赖关系、测试绑定比语义相似更可靠。</li>
+<li>早期仓库默认保守。<code>seed</code> / <code>emerging</code> 阶段不应轻易自动 <code>extend</code> 或 <code>extract</code>。</li>
+<li><code>review</code> 不是失败，也不是写入门禁；它是 action 建议层的调查方向。真正决定当前是否可写的是 <code>execution_gate</code>。</li>
+<li>路由输出是一体化契约。<code>execution_gate</code>、安全信封和 typed findings 必须遵守，<code>action</code> 和解阻建议用于辅助判断，不能替代源码分析。</li>
+<li>结果必须能持续变准。人工 override、误判、profile 修正和真实案例应沉淀到 feedback 与 evaluation。</li>
+</ul>
+<h2>两层使用模型</h2>
+<p>PCR 的输出分为两层，使用时不要混在一起理解。</p>
+<p>必须执行层：</p>
+<ul>
+<li>必须先读 <code>execution_gate.state</code>：<code>pass</code>、<code>conditional</code>、<code>blocked</code> 是唯一权威写入状态。</li>
+<li>必须尊重 <code>allowed_write_paths</code>、<code>forbidden_write_paths</code> 和 <code>must_read_before_edit</code>。</li>
+<li>必须识别并保护已有 owner、public entry、canonical root 和依赖方向。</li>
+<li>不能在已有能力可能存在时新建第二套平行实现中心。</li>
+<li><code>blocked</code> 时禁止产品代码写入；<code>conditional</code> 时必须先执行 <code>required_commands</code> 并限制在给定 envelope；<code>pass</code> 也不能越过 envelope。</li>
+<li><code>veto_reasons</code>、unknown evidence、生命周期、高风险重叠和 provisional 边界必须追溯到 typed finding 与 policy rule，不能忽略或仅凭 action 覆盖。</li>
+</ul>
+<p>参考建议层：</p>
+<ul>
+<li><code>action</code> 是当前证据下的处理倾向，不是最终工程命令。</li>
+<li><code>recommended_next_steps</code>、<code>safe_next_steps</code>、<code>analysis_directions</code>、<code>why_not_actions</code> 和 <code>profile_repair_hints</code> 是解阻方向和调查提示。</li>
+<li><code>action=review</code> 不等于永远不能做，也不自动等于 blocked；它表示应优先补证据、补 profile、读源码或协调确认，最终仍以 <code>execution_gate</code> 为准。</li>
+<li>最终实现方案仍必须来自真实源码分析、依赖追踪、测试和用户确认。</li>
+</ul>
+<h2>能力范围</h2>
+<p>这个 skill 可以：</p>
+<ul>
+<li>为目标仓库生成本地 <code>project-change-router/</code> bundle。</li>
+<li>识别仓库模块、capability、owner、public entry、路径归属和依赖方向。</li>
+<li>根据请求和 changed paths 输出 route report，包含强约束和建议动作。</li>
+<li>用统一 <code>run_change_flow.py</code> 编排 route、freshness、dependency、public API、structure、governance 和 reuse 检查，默认只返回 compact 安全信封并把完整证据保存为内容寻址 artifact。</li>
+<li>把所有门禁证据规范化为可追溯 typed findings，并以单一版本化规则表确定 <code>execution_gate</code>。</li>
+<li>基于 changed-path 的正反向依赖闭包增量复用可信全局快照，而不是停止全局不变量检查。</li>
+<li>将 reuse 拆为 capability 内、跨 capability 和 new/extract/lifecycle 扩展扫描三条独立覆盖通道。</li>
+<li>对重复实现、错误边界、public API 绕过、反向依赖和 runtime cycle 做 guardrail 检查；TypeScript type-only edge 不会被误算成 runtime edge。</li>
+<li>用 commit、内容结构摘要、索引路径、stale entry 和实际 changed paths 校验 freshness。</li>
+<li>用 exact baseline 阻止中央文件、800/1200 行文件、禁用实现根和第二 canonical owner 的新增净增长。</li>
+<li>通过 <code>path-to-capability-map.yaml</code> 暴露路径归属、共享归属和未覆盖模块。</li>
+<li>用 schema 校验 bundle 与报告。</li>
+<li>用 evaluation set 检查路由质量是否退化。</li>
+<li>用 governance audit 检查 profile/catalog 同步、ownership 颗粒度、contract 质量、forbidden density、evaluation 覆盖和 capability 生命周期。</li>
+<li>在 Codex / Claude Code 安装时追加提示块，并通过 DeepSeek Harness skill catalog 暴露触发描述，让 agent 更容易在功能级 create / modify / delete 前主动触发该 skill。</li>
+</ul>
+<p>它不应该：</p>
+<ul>
+<li>替代详细代码阅读、依赖追踪、测试设计和架构分析。</li>
+<li>把 <code>action</code> 当成无需分析即可执行的最终命令。</li>
+<li>把 <code>action=review</code> 本身当作放行或阻塞依据；写入状态必须读取 <code>execution_gate</code>。</li>
+<li>把 generated-only bundle 当作成熟架构事实。</li>
+<li>因为名字相似就强行复用或扩展已有 capability。</li>
+<li>在没有确认 canonical root 时创建第二套实现中心。</li>
+</ul>
+<h2>路由动作</h2>
+<p><code>resolve_entry.py</code> 会输出五类动作。这些动作是处理建议和调查方向，不是最终架构命令：</p>
+<ul>
+<li><code>reuse</code>：使用已有 capability，不修改核心实现。</li>
+<li><code>extend</code>：在已有共享 capability 或兼容扩展点上增加行为。</li>
+<li><code>extract</code>：先把重复逻辑抽到共享 capability，再让调用方复用。</li>
+<li><code>new</code>：没有合适复用目标，应建立新的隔离 capability 边界。</li>
+<li><code>review</code>：优先补证据、补 profile、做跨能力协调或请求人工确认；它描述调查方向，不授予也不撤销写权限。</li>
+</ul>
+<p><code>review</code> 需要特别理解：它不是“系统没用”，也不是永久阻塞，更不是门禁状态。在空仓或早期仓里，可能出现：</p>
+<pre><code>{
+  "action": "review",
+  "routing_confidence": 0.0,
+  "routing_confidence_level": "low",
+  "decision_confidence": 0.95,
+  "decision_confidence_level": "high"
+}
+</code></pre>
+<p>这表示：系统对“应该落到哪个 capability”没有把握，但对当前 action 建议很有把握。是否可以写产品代码必须另读 <code>execution_gate.state</code>；例如相关路径未索引时会是 <code>blocked</code>，而只有无关且不扩大的可信历史债务时可为 <code>conditional</code>。</p>
+<h2>仓库阶段策略</h2>
+<p>router 会根据仓库成熟度推断 <code>repo_stage</code>：</p>
+<ul>
+<li><code>seed</code>：空仓或极早期仓，默认只允许明显的新边界或 <code>review</code>。</li>
+<li><code>emerging</code>：已有少量结构，但 capability 边界仍保守，provisional 不自动成为强复用目标。</li>
+<li><code>structured</code>：模块边界较稳定，可以更完整地使用 <code>reuse</code>、<code>extend</code>、<code>extract</code>。</li>
+<li><code>governed</code>：以 profile、owner、public entry、evaluation 和 guardrail 为主要依据。</li>
+</ul>
+<p>capability 自身也有阶段：</p>
+<ul>
+<li><code>provisional</code></li>
+<li><code>candidate</code></li>
+<li><code>stable</code></li>
+<li><code>governed-capability</code></li>
+<li><code>deprecated</code></li>
+</ul>
+<p>早期仓库不要过早固化 generated capability。推荐先写最小 ownership/profile，再随着真实开发逐步补 capability、public entry、contract、test binding 和 evaluation case。</p>
+<h2>一体化路由报告</h2>
+<p>route report 不是只给一个 action。它是一个完整路由契约，核心字段包括：</p>
+<ul>
+<li><code>action</code></li>
+<li><code>decision_basis</code></li>
+<li><code>routing_confidence</code></li>
+<li><code>routing_confidence_level</code></li>
+<li><code>decision_confidence</code></li>
+<li><code>decision_confidence_level</code></li>
+<li><code>primary_capability</code></li>
+<li><code>primary_capability_stage</code></li>
+<li><code>secondary_capabilities</code></li>
+<li><code>candidate_capabilities</code></li>
+<li><code>required_reads</code></li>
+<li><code>required_checks</code></li>
+<li><code>recommended_next_action</code></li>
+<li><code>recommended_next_steps</code></li>
+<li><code>why_not_actions</code></li>
+<li><code>confidence_reasons</code></li>
+<li><code>veto_reasons</code></li>
+<li><code>positive_signals</code></li>
+<li><code>negative_signals</code></li>
+<li><code>risk_signals</code></li>
+<li><code>authorization_context</code></li>
+<li><code>route_fingerprint</code></li>
+<li><code>runtime_identity</code></li>
+<li><code>typed_findings</code></li>
+<li><code>execution_gate</code></li>
+<li><code>gate_shadow</code></li>
+<li><code>must_read_targets</code></li>
+<li><code>inventory_targets</code></li>
+<li><code>unresolved_read_targets</code></li>
+<li><code>authorization_request</code></li>
+</ul>
+<p>七类治理输出也是同一个 route report 的一等字段，不是外挂能力：</p>
+<ul>
+<li><code>review</code> 后处理：<code>block_reason</code>、<code>missing_evidence</code>、<code>analysis_directions</code>、<code>safe_next_steps</code>、<code>suggested_questions</code>、<code>override_requirements</code></li>
+<li>写入约束：<code>allowed_write_paths</code>、<code>forbidden_write_paths</code>、<code>must_read_before_edit</code></li>
+<li>profile 修复方向：<code>profile_repair_hints</code>，治理审计报告中还有 <code>repair_suggestions</code></li>
+<li>变更后收口：<code>post_change_closeout</code></li>
+<li>删除、合并、废弃能力治理：<code>capability_lifecycle_action</code></li>
+<li>跨栈复合路由：<code>composite_route</code></li>
+<li>真实回归沉淀：<code>evaluation_regression_hints</code></li>
+</ul>
+<p>详细契约见 <a href="https://github.com/WeirdSky924/project-change-router-skill/blob/HEAD/references/governance-outputs.md">references/governance-outputs.md</a>。</p>
+<p><img src="https://raw.githubusercontent.com/WeirdSky924/project-change-router-skill/HEAD/assets/readme-route-contract.svg" alt="Integrated route contract"></p>
+<h3>0.4 执行门禁与证据模型</h3>
+<p>PCR 0.4 把“路由建议”和“是否可写”彻底拆开：</p>
+<table>
+<thead>
+<tr>
+<th>字段</th>
+<th>作用</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>action</code></td>
+<td><code>reuse / extend / extract / new / review</code>，只提供工程调查与处理方向</td>
+</tr>
+<tr>
+<td><code>execution_gate.state=pass</code></td>
+<td>相关证据完整且没有任务相关阻塞项；仍须遵守读写 envelope</td>
+</tr>
+<tr>
+<td><code>execution_gate.state=conditional</code></td>
+<td>只剩已证明无关或不扩大的可信历史债务；必须执行前置命令并保持有界写入</td>
+</tr>
+<tr>
+<td><code>execution_gate.state=blocked</code></td>
+<td>存在 unknown/incomplete、任务相关 P0/P1、owner/canonical/public API/lifecycle/高风险问题或硬不变量冲突</td>
+</tr>
+</tbody></table>
+<p>门禁不重新扫描仓库，也不做第二套路由推理。所有结果都由一个版本化 policy table 对 schema-valid typed findings 做确定性归约。每条 finding 包含稳定 <code>finding_id</code>、来源、严重级、全局/闭包/局部不变量分类、delta、task relevance、evidence status、policy rule、路径/能力、相关性链路与证据摘要。</p>
+<p><code>gate_shadow</code> 仅保留旧门禁与新门禁的对照诊断；0.4 中 <code>execution_gate.authoritative=true</code>，旧门禁不再决定写入。<code>output_complete=false</code> 或无法满足新版精度的 schema-v1 输入必须形成 unknown/incomplete finding 并阻塞，不能用乐观默认值补齐。</p>
+<p>统一入口：</p>
+<pre><code>python scripts/run_change_flow.py --repo &lt;repo-root&gt; --request "Add invoice refund support" --changed-path services/billing/refund.py --format compact-json
+</code></pre>
+<p>默认 compact 输出始终保留不可投影的安全信封：<code>execution_gate</code>、<code>veto_reasons</code>、<code>allowed_write_paths</code>、<code>forbidden_write_paths</code>、<code>unknown_evidence</code>、<code>artifact_path</code>、<code>artifact_digest</code>、<code>output_complete</code>。完整 route、checks、findings、cache/baseline 证据写入内容寻址 artifact；<code>--format full-json</code> 返回完整报告，<code>--format artifact-reference</code> 返回最小引用，<code>--field</code> 只能增加普通字段，<code>--exclude-field</code> 不能隐藏安全字段。</p>
+<h2>安装</h2>
+<p>Python 要求：</p>
+<ul>
+<li>Python <code>&gt;= 3.10</code></li>
+<li>DeepSeek Harness 插件验证遵循 Harness 当前 Node 要求：<code>^22.19.0 || &gt;=24.0.0</code>；仅安装 filesystem skill 不额外启动 Node 进程</li>
+</ul>
+<p>安装依赖：</p>
+<pre><code>pip install -r requirements.txt
+</code></pre>
+<p>或以开发模式安装：</p>
+<pre><code>pip install -e .[dev]
+</code></pre>
+<p>同时安装到 Codex、Claude Code 和 DeepSeek Harness：</p>
+<pre><code>python scripts/install_skill.py --target all --inject-hints
+</code></pre>
+<p>安装路径：</p>
+<ul>
+<li>Codex：<code>%USERPROFILE%\.codex\skills\project-change-router</code></li>
+<li>Claude Code：<code>%USERPROFILE%\.claude\skills\project-change-router</code></li>
+<li>DeepSeek Harness：<code>$DSH_HOME/skills/project-change-router</code>；没有设置 <code>DSH_HOME</code> 时默认 <code>~/.dsh/skills/project-change-router</code></li>
+</ul>
+<p><code>--inject-hints</code> 只为需要规则入口提示的 Codex 和 Claude Code 追加标记块，不会重写整个文件：</p>
+<ul>
+<li>Codex：追加到 <code>~/.codex/AGENTS.md</code></li>
+<li>Claude Code：追加到 <code>~/.claude/CLAUDE.md</code></li>
+</ul>
+<p>这是一种“伪强制”提醒，用于让 agent 在功能级 create / modify / delete 前主动触发 skill。它不是后台守护进程，也不会绕过对话触发机制。</p>
+<p>DeepSeek Harness 通过 skill catalog 的 <code>name</code> 和 <code>description</code> 自动向模型暴露 PCR，并支持在用户消息中用 <code>/project-change-router</code> 显式触发，因此不需要修改 Harness 的全局提示文档。</p>
+<p>兼容说明：<code>--target both</code> 继续保持旧语义，只安装 Codex 和 Claude Code；<code>--target deepseek</code> 只安装 Harness；<code>--target all</code> 安装三端。项目级 Harness 安装可以把 <code>.dsh</code> 目录作为 home：</p>
+<pre><code>python scripts/install_skill.py --target deepseek --dsh-home &lt;repo-root&gt;/.dsh
+</code></pre>
+<p>Harness 原生 filesystem provider 会发现 <code>&lt;repo-root&gt;/.dsh/skills/project-change-router/SKILL.md</code>。它也兼容 <code>&lt;repo-root&gt;/.agents/skills</code>、<code>~/.agents/skills</code> 和自定义 skill roots，但本安装器默认写入官方 <code>DSH_HOME</code> 路径。</p>
+<h3>作为 DeepSeek Harness GitHub 插件安装</h3>
+<p>仓库根 <code>package.json</code> 声明了 <code>dsh.bundle</code>，其 Cordis provider 从根 <code>SKILL.md</code> 读取同一份 skill 内容和资源目录，不维护第二套提示词。建议固定提交 SHA 安装：</p>
+<pre><code>dsh plugin --profile &lt;profile-name&gt; add github:WeirdSky924/project-change-router-skill#&lt;commit-sha&gt;
+dsh --profile &lt;profile-name&gt; --dump-config
+</code></pre>
+<p>这个 bundle 使用原生 ESM，没有 TypeScript 构建、<code>prepare</code> 脚本或安装期代码执行许可。项目级 <code>.dsh/skills</code> 和用户级 filesystem skill 的 rank 高于 bundled provider，因此可按 Harness 官方优先级覆盖插件版本。</p>
+<p>卸载 profile 插件：</p>
+<pre><code>dsh plugin --profile &lt;profile-name&gt; remove project-change-router-skill
+</code></pre>
+<p>Harness 官方社区发现以公开 GitHub 仓库的 <code>dsh-plugin</code> topic 为入口；发布前应为仓库设置 <code>dsh-plugin</code>、<code>deepseek-harness</code>、<code>agent-skills</code> 和 <code>coding-agent</code> 等检索 topic。DeepSeek Harness 当前仍是 developer preview，升级 Harness preview 版本后应重新运行本仓库的 provider smoke 和安装验证。</p>
+<p>安装器使用 staging、完整载荷递归哈希、递归 Python 编译、治理 API probe 和原子替换。只有新副本完整通过校验后才替换旧 skill；失败时会恢复旧安装，避免顶层脚本、<code>router_support</code>、schemas、文档或 DSH provider 出现跨版本混装。</p>
+<p>源码 checkout 和安装目标必须是不同路径。如果当前 Git checkout 已位于任一目标的 <code>skills/project-change-router</code>，不要用安装器覆盖它；需要同时安装多个目标时使用独立 checkout，或只安装其他目标。<code>--verify-only</code> 必须读取原子安装建立的可信 manifest；没有该 manifest 的旧副本需要先原子重装一次，之后哈希验证才有来源完整性意义。</p>
+<h2>从旧版安全升级</h2>
+<p>全局 skill 和项目 bundle 是两个独立层次：</p>
+<ul>
+<li>全局 skill 位于 <code>~/.codex/skills/project-change-router</code>、<code>~/.claude/skills/project-change-router</code> 或 <code>~/.dsh/skills/project-change-router</code>，保存脚本和工作流。</li>
+<li>项目 bundle 位于 <code>&lt;repo-root&gt;/project-change-router/</code>，保存该项目长期校准的 capability、owner、path map、feedback 和 evaluation 数据。</li>
+</ul>
+<p>更新全局 skill 不需要、也不应该自动重建项目 bundle。安全升级步骤如下：</p>
+<ol>
+<li>在本 skill 源码仓库更新到准备使用的版本。</li>
+<li>运行原子安装命令：</li>
+</ol>
+<pre><code>python scripts/install_skill.py --target all --inject-hints
+</code></pre>
+<ol>
+<li>验证 Codex、Claude Code 和 DeepSeek Harness 安装副本的文件哈希及复用扫描 API：</li>
+</ol>
+<pre><code>python scripts/install_skill.py --target all --verify-only
+</code></pre>
+<ol>
+<li>对一个已经长期使用 PCR 的项目，只做只读兼容检查：</li>
+</ol>
+<pre><code>python &lt;new-skill-root&gt;\scripts\validate_router_bundle.py --repo &lt;existing-repo&gt; --format json
+python &lt;new-skill-root&gt;\scripts\check_bundle_governance.py --repo &lt;existing-repo&gt; --format json
+python &lt;new-skill-root&gt;\scripts\check_index_freshness.py --repo &lt;existing-repo&gt; --changed-path &lt;known-path&gt; --comparison-commit &lt;trusted-base-commit&gt; --format json
+python &lt;new-skill-root&gt;\scripts\check_deps.py --repo &lt;existing-repo&gt; --comparison-commit &lt;trusted-base-commit&gt; --format json
+python &lt;new-skill-root&gt;\scripts\check_public_api.py --repo &lt;existing-repo&gt; --comparison-commit &lt;trusted-base-commit&gt; --format json
+python &lt;new-skill-root&gt;\scripts\check_structure.py --repo &lt;existing-repo&gt; --comparison-commit &lt;trusted-base-commit&gt; --format json
+python &lt;new-skill-root&gt;\scripts\run_evaluation.py --repo &lt;existing-repo&gt; --format json
+python &lt;new-skill-root&gt;\scripts\check_reuse.py --repo &lt;existing-repo&gt; --changed-path &lt;known-path&gt; --strict-completeness --format json
+python &lt;new-skill-root&gt;\scripts\run_change_flow.py --repo &lt;existing-repo&gt; --request "Compatibility check only" --changed-path &lt;known-path&gt; --format compact-json
+</code></pre>
+<ol>
+<li>验证通过后直接继续使用原 bundle。不要仅仅因为升级 skill 就运行 <code>bootstrap_router.py</code> 或 <code>rebuild_index.py</code>。</li>
+</ol>
+<p>兼容保证：</p>
+<ul>
+<li>新版本继续读取 schema v1 bundle。</li>
+<li>0.4 使用架构治理 API v2、typed finding / gate / change flow / authorization API v1，并保持 reuse engine API v2。</li>
+<li>所有新版报告带统一 <code>runtime_identity</code>，绑定 skill version、Git commit（可用时）、安装载荷摘要、schema/API/policy/parser 版本。缓存、baseline、finding、授权与 artifact 都绑定该身份。</li>
+<li>schema v1 的新增 evaluation 字段保持 optional；runtime 使用安全默认值且不写回旧 YAML，缺少或显式关闭 evaluation enforcement 都保持 <code>review_only</code>，不能授予写入权限。</li>
+<li>schema v1 无法提供 typed finding、relevance closure 或 trusted baseline 所需精度时，0.4 输出 <code>unknown</code> 并让 execution gate 保持 blocked；它不会伪造精确度，也不会把新字段写回旧 bundle。</li>
+<li><code>normal</code> 只接受至少 30 个带 <code>curated_case_ids</code> 的真实案例、完整六类校准矩阵、明确 capability 期望以及合法 attestation；阈值只能收紧，生成案例和缺少 provenance 的旧案例始终保持 <code>review_only</code>。</li>
+<li>旧 bundle 没有 <code>reuse_scan_scope</code>、<code>reuse_scan_runtime</code> 或 <code>reuse_scan_retention</code> 时，代码使用新默认值，但不会写回或改动 YAML。</li>
+<li>新 fingerprint、checkpoint、canonical、diagnostic、flow artifact、baseline 和 authorization manifest 默认写到用户缓存目录，不写入目标仓库，也不要求修改目标仓库 <code>.gitignore</code>。</li>
+<li>安装器不会搜索任何项目目录，不会修改已有 profile、manual feedback、evaluation case、owner 或 lifecycle 数据。</li>
+<li>旧 bundle 中错误的仓库级 <code>** -&gt; concrete capability</code> 映射，在存在更具体映射时不会扩大 reuse 扫描范围；治理审计仍会提示修正元数据。</li>
+<li>“旧 bundle 可读”不表示历史报告永远满足新版输出 schema；需要作为当前样例或 CI fixture 使用的报告应按当前报告契约重新生成。</li>
+</ul>
+<p>只有在项目结构、owner、public entry 或 capability 边界确实发生变化时才执行 rebuild。执行前应先把直接写在生成 YAML 中的人工真值迁移到 <code>.project-change-router.yaml</code>，并保留 manual feedback、curated evaluation 和 lifecycle 数据。可使用 <a href="https://github.com/WeirdSky924/project-change-router-skill/blob/HEAD/examples/agent-workflows/update-existing-router-bundle-prompt.md">旧 bundle 更新提示词</a> 让 agent 做这次受控刷新。</p>
+<p>安装器成功输出中的：</p>
+<pre><code>repository_bundles_modified=0
+</code></pre>
+<p>表示本次升级没有触碰任何项目内 bundle。</p>
+<h2>安装校验</h2>
+<p>校验 skill 结构：</p>
+<pre><code>python &lt;codex-home&gt;\skills\.system\skill-creator\scripts\quick_validate.py &lt;codex-home&gt;\skills\project-change-router
+</code></pre>
+<p>期望输出：</p>
+<pre><code>Skill is valid!
+</code></pre>
+<p>本仓库完整 smoke：</p>
+<pre><code>python -m pytest tests/test_router_core.py -q
+python scripts/bootstrap_router.py --repo . --format json
+python scripts/rebuild_index.py --repo . --format json
+python scripts/validate_router_bundle.py --repo . --format json
+python scripts/check_bundle_governance.py --repo . --format json
+python scripts/check_index_freshness.py --repo . --format json
+python scripts/check_deps.py --repo . --format json
+python scripts/check_public_api.py --repo . --format json
+python scripts/check_structure.py --repo . --format json
+python scripts/run_evaluation.py --repo . --format json
+python scripts/check_reuse.py --repo . --changed-path scripts/router_support/owner_identity.py --strict-completeness --format json
+python scripts/install_skill.py --target codex --codex-home &lt;temporary-codex-home&gt;
+python scripts/install_skill.py --target codex --codex-home &lt;temporary-codex-home&gt; --verify-only
+</code></pre>
+<p>全新 bootstrap 会有意让 PCR 保持 <code>review_only</code>，直到 evaluation set 具备足量真实案例、完整校准矩阵和当前 attestation。因此在这条 smoke 流程中，<code>run_evaluation.py</code> 会以退出码 <code>1</code> 返回 <code>status=fail</code>、<code>enforcement_mode=review_only</code> 和 <code>evaluation_cases_not_curated</code> 原因。CI 会显式断言这一安全结果，而不是降低阈值，或把生成的种子案例冒充生产校准证据。</p>
+<h2>在目标仓库接入</h2>
+<p>首次接入目标仓库：</p>
+<pre><code>python &lt;skill-root&gt;\scripts\bootstrap_router.py --repo &lt;repo-root&gt; --format json
+</code></pre>
+<p>这会在目标仓库生成：</p>
+<pre><code>&lt;repo-root&gt;/project-change-router/
+</code></pre>
+<p>bundle 包含：</p>
+<ul>
+<li><code>router-config.yaml</code></li>
+<li><code>references/capability-catalog.yaml</code></li>
+<li><code>references/module-map.yaml</code></li>
+<li><code>references/ownership.yaml</code></li>
+<li><code>references/path-to-capability-map.yaml</code></li>
+<li><code>references/change-rules.yaml</code></li>
+<li><code>references/exception-registry.yaml</code></li>
+<li><code>references/evaluation-set.yaml</code></li>
+<li><code>schemas/</code></li>
+<li><code>reports/</code></li>
+</ul>
+<p>bootstrap 会自动把下面这行加入目标仓库 <code>.gitignore</code>：</p>
+<pre><code>project-change-router/
+</code></pre>
+<p>目标仓库根目录可放 profile 覆盖文件：</p>
+<pre><code>.project-change-router.yaml
+.project-change-router.yml
+project-change-router.profile.yaml
+project-change-router.profile.yml
+</code></pre>
+<p>这些名称按 canonical、legacy、skill fallback 的优先级选择，不会合并。同一优先级只能存在一份；<code>.yaml</code> 与 <code>.yml</code> 并存会 fail-closed，必须先确定唯一真值源。</p>
+<p>profile 可声明：</p>
+<ul>
+<li>capability 到路径的映射</li>
+<li>ownership rules</li>
+<li>显式 capability ownership，包括一个真实 primary owner 和不同的 reviewers</li>
+<li>module overrides</li>
+<li>public entries</li>
+<li>contracts</li>
+<li>forbidden patterns</li>
+<li>lifecycle metadata</li>
+<li>evaluation cases</li>
+<li>risk rules</li>
+</ul>
+<p>最小 profile 模板见 <a href="https://github.com/WeirdSky924/project-change-router-skill/blob/HEAD/examples/profiles/README.md">examples/profiles/README.md</a>。</p>
+<h2>日常使用</h2>
+<p>Codex 中可以显式触发：</p>
+<pre><code>Use $project-change-router to resolve the correct capability entry for this change.
+</code></pre>
+<p>Claude Code 中可以显式触发：</p>
+<pre><code>/project-change-router resolve the correct capability entry for this change
+</code></pre>
+<p>DeepSeek Harness 中也使用 whitespace-bounded slash invocation；或者让模型根据 skill catalog 的描述主动加载：</p>
+<pre><code>/project-change-router resolve the correct capability entry for this change
+</code></pre>
+<p>推荐用统一 flow 解析并检查一次变更：</p>
+<pre><code>python scripts/run_change_flow.py --repo &lt;repo-root&gt; --request "Add invoice refund support" --changed-path services/billing/refund.py --format compact-json
+</code></pre>
+<p>也可以从请求文件读取；需要单独排查路由时仍可使用兼容的 <code>resolve_entry.py</code>：</p>
+<pre><code>python scripts/run_change_flow.py --repo &lt;repo-root&gt; --request-file request.md --changed-path services/billing/refund.py --format artifact-reference --output flow-report.json
+python scripts/resolve_entry.py --repo &lt;repo-root&gt; --request-file request.md --changed-path services/billing/refund.py --format json --output route-report.json
+</code></pre>
+<p>解析后执行规则：</p>
+<ul>
+<li>如果 <code>execution_gate.state=blocked</code>：禁止产品代码写入；按 decisive finding、unknown evidence 和 required commands 补证据或进入有来源的授权流程。</li>
+<li>如果 <code>execution_gate.state=conditional</code>：先执行全部 required commands，只在返回的 allowed paths 内写入；它只适用于已证明无关或不扩大的可信历史债务。</li>
+<li>如果 <code>execution_gate.state=pass</code>：完成精确 must-read 后在 envelope 内推进。</li>
+<li><code>action=review</code> 只表示优先调查、补 profile 或协调，不自行阻塞；下面所有 action 也都不能覆盖 gate。</li>
+<li>如果 <code>action=reuse</code>：把它当成复用倾向；优先读取 <code>must_read_before_edit</code> 和 <code>required_reads</code>，不要改核心实现。</li>
+<li>如果 <code>action=extend</code>：把它当成扩展倾向；只在 <code>allowed_write_paths</code> 内扩展，避免绕过 public entry。</li>
+<li>如果 <code>action=extract</code>：把它当成抽取倾向；先确认重复面、调用方和测试，再抽共享能力。</li>
+<li>如果 <code>action=new</code>：把它当成新边界倾向；先命名隔离边界，不要在已有 capability 旁边生成第二套平行中心。</li>
+</ul>
+<h2>Codex / Claude Code / DeepSeek Harness 提示词</h2>
+<p>建议在无人值守计划或长期任务中加入：</p>
+<pre><code>Before any feature-level create, modify, delete, merge, deprecate, or migration work, invoke project-change-router and run run_change_flow.py for the target repository. Use PCR as a direction index and guardrail system, not as an automatic architecture decision engine.
+
+Read execution_gate before action. execution_gate.state is the authoritative write decision. For blocked, do not write product code. For conditional, run every required_command and keep writes inside the bounded envelope. For pass, still obey the envelope and precise must-read targets.
+
+Treat action, including action=review, as advisory direction only. Use recommended_next_steps, safe_next_steps, analysis_directions, profile_repair_hints, and why_not_actions for source analysis and user-confirmed decisions; never turn action into a second gate.
+
+Never ignore veto_reasons, unknown_evidence, canonical owner/root, public entry, lifecycle findings, duplicate risk, or unresolved closure evidence. Trace them to typed findings and policy rules. Bounded or incomplete evidence cannot prove absence.
+
+Do not create a second implementation center when an existing capability or canonical root may exist. If routing evidence is weak, repair the profile or ask for confirmation instead of guessing.
+
+Use must_read_targets by path, symbol, and content digest. Treat directories only as inventory_targets. Run unresolved_read_targets queries and keep the target unresolved until a unique implementation is proven.
+
+For an override, create an authorization_request and require explicit user confirmation before creating a grant. Bind it to task, paths, owner, route, pre-change snapshot, mutation envelope, runtime/policy identity, expiry, and use count. Never revive a consumed or invalidated grant.
+
+After routed changes, execute post_change_closeout, rerun the affected flow/checks, and record feedback/evaluation cases after review, override, lifecycle change, false route, or routing correction.
+
+Keep full diagnostics in the content-addressed artifact. In the main context retain the compact safety envelope, decisive delta, exact reads, and next command. Never hide a safety-envelope field through projection.
+</code></pre>
+<p>更完整的可复制版本见 <a href="https://github.com/WeirdSky924/project-change-router-skill/blob/HEAD/examples/agent-workflows/unattended-plan-prompt.md">examples/agent-workflows/unattended-plan-prompt.md</a>。</p>
+<p>升级 skill 后不需要自动刷新旧 bundle。只有只读兼容检查证明索引确实陈旧，或者仓库边界已经变化时，才使用 <a href="https://github.com/WeirdSky924/project-change-router-skill/blob/HEAD/examples/agent-workflows/update-existing-router-bundle-prompt.md">examples/agent-workflows/update-existing-router-bundle-prompt.md</a> 做受控刷新；该流程必须保留人工 profile、反馈、评估样例和生命周期信息。</p>
+<h2>生命周期命令表</h2>
+<table>
+<thead>
+<tr>
+<th>场景</th>
+<th>命令</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>初次接入仓库</td>
+<td><code>python scripts/bootstrap_router.py --repo &lt;repo-root&gt; --format json</code></td>
+</tr>
+<tr>
+<td>仓库结构大改后</td>
+<td><code>python scripts/rebuild_index.py --repo &lt;repo-root&gt; --format json</code></td>
+</tr>
+<tr>
+<td>统一路由、检查与收口计划</td>
+<td><code>python scripts/run_change_flow.py --repo &lt;repo-root&gt; --request "&lt;request&gt;" --changed-path &lt;path&gt; --format compact-json</code></td>
+</tr>
+<tr>
+<td>修改前解析路由</td>
+<td><code>python scripts/resolve_entry.py --repo &lt;repo-root&gt; --request "&lt;request&gt;" --changed-path &lt;path&gt; --format json</code></td>
+</tr>
+<tr>
+<td>创建/授予/消费授权</td>
+<td>`python scripts/manage_authorization.py --repo  &lt;request</td>
+</tr>
+<tr>
+<td>提交前校验 bundle</td>
+<td><code>python scripts/validate_router_bundle.py --repo &lt;repo-root&gt; --format json</code></td>
+</tr>
+<tr>
+<td>检查重复实现</td>
+<td><code>python scripts/check_reuse.py --repo &lt;repo-root&gt; --changed-path &lt;path&gt; --format json</code></td>
+</tr>
+<tr>
+<td>检查依赖方向</td>
+<td><code>python scripts/check_deps.py --repo &lt;repo-root&gt; --format json</code></td>
+</tr>
+<tr>
+<td>检查 public API 边界</td>
+<td><code>python scripts/check_public_api.py --repo &lt;repo-root&gt; --format json</code></td>
+</tr>
+<tr>
+<td>检查中央增长、文件规模和唯一 owner</td>
+<td><code>python scripts/check_structure.py --repo &lt;repo-root&gt; --format json</code></td>
+</tr>
+<tr>
+<td>检查索引新鲜度</td>
+<td><code>python scripts/check_index_freshness.py --repo &lt;repo-root&gt; --format json</code></td>
+</tr>
+<tr>
+<td>路由治理健康检查</td>
+<td><code>python scripts/check_bundle_governance.py --repo &lt;repo-root&gt; --format json</code></td>
+</tr>
+<tr>
+<td>路由质量回归评估</td>
+<td><code>python scripts/run_evaluation.py --repo &lt;repo-root&gt; --format json</code></td>
+</tr>
+<tr>
+<td>人工反馈回写</td>
+<td><code>python scripts/sync_feedback.py --repo &lt;repo-root&gt; --feedback-file feedback.json --format json</code></td>
+</tr>
+</tbody></table>
+<h2>架构治理</h2>
+<p>PCR 0.4 在原有可回归 guardrail 上增加 typed findings、增量全局证据、可信 baseline 和权威 execution gate：</p>
+<ul>
+<li>Python 和 TypeScript/JavaScript import graph 区分 runtime 与 type-only edge，并报告 runtime cycle、解析诊断和依赖方向。</li>
+<li><code>architecture_baseline</code> 只登记精确旧债；已登记问题可以告警，新问题或净增长失败。它不是 wildcard 豁免。</li>
+<li><code>central_growth_baseline</code> 阻止 composition root、global gateway、顶层 controller 等中央 owner 继续吸收领域实现。</li>
+<li><code>forbidden_implementation_roots</code> 阻止在 legacy、compat、generated 或非 canonical 根新增正式实现。</li>
+<li><code>exclusive_source_owners</code> 阻止 profile 明确声明的受保护实现 token 出现在 canonical owner 之外；不同标识符的 raw transport、cache/store 或 DTO 重复仍需项目级 import、identifier 或 AST 门。</li>
+<li><code>generated_output_baseline</code> 仅用于 canonical profile 迁移期的七个固定 PCR reference 产物，并绑定仓库唯一启用的 <code>.project-change-router.yaml</code> 或 <code>.project-change-router.yml</code>。规则源和每个非空 artifact provenance 都必须是该仓库对象格式的完整不可变 SHA；artifact 可以早于规则源，但必须是规则源与当前 rebuild source 的祖先，<code>null</code> 模式必须保持 <code>null</code>。固定摘要只投影掉顶层 <code>generated_at</code>、<code>source_commit</code> 和 capability catalog 中明确列出的 generator clock。<code>path_to_capability_map.path_index[*].code_file_count</code> 不从固定摘要中移除；它只在相同 <code>path_pattern</code> 且新旧值均为合法非负整数时作为 comparison-only rebuild volatile，以免仓库代码文件数量的正常变化造成假阳性。实际 pinned count 仍受摘要、canonical UTF-8 字节和行数约束，缺失、类型漂移或产物篡改仍会失败。普通 <code>rebuild_index.py</code> 验证成功后保留七个 tracked refs，只刷新 <code>router-config.yaml</code>、schemas 和 <code>latest.json</code>；失败时不写任何 bundle/report。evaluation attestation 会针对实际持久化的“新 config + pinned refs”重算。首次建立 pin 必须向 <code>check_structure.py</code> 或 <code>rebuild_index.py</code> 传入 <code>--initialize-generated-output-baseline &lt;fingerprint&gt;</code>；profile 文字不能自行授权。pin 启用、格式错误或尚未提交移除时，<code>bootstrap_router.py</code> 禁止清空正式 refs。</li>
+<li>stable capability 必须有唯一 <code>capability_ownership</code> 记录、真实 primary owner、不同 reviewer、lifecycle、contract/test binding 和 evaluation 覆盖；自动生成的 owner 标签、<code>UNKNOWN</code>、unassigned、缺失、重复或 provisional owner 都不提供自动写入授权。</li>
+<li>freshness 同时校验 commit、内容结构摘要、stale entries、索引路径、报告字段形状和 changed-path coverage。全局报告继续暴露所有债务；route gate 再按当前 capability 的正反向依赖闭包把 delta 分为 <code>task_local_new</code>、<code>baseline_unchanged</code>、<code>unknown</code>。相关变化和无法证明无关的变化继续阻塞，已证明属于其他 capability 的不变旧债不会把局部安全变更改成全仓 <code>forbidden=["**"]</code>。canonical config、七个 refs 与 schemas 即使被 bundle <code>ignore_paths</code> 命中也必须进入摘要，只有自引用的 <code>latest.json</code> 例外；显式 <code>--changed-path</code> 始终与从索引 source 到 HEAD、staged、unstaged、untracked、deleted 的真实路径取并集。</li>
+<li>每个 route report 都带 <code>authorization_context</code> 和 <code>route_fingerprint</code>，绑定源提交、结构摘要、路由真值、changed paths、capability、action、override 条件与读写 envelope。人工反馈必须回传原始 fingerprint；输入或报告改变后授权自动失效，manifest 不能自行恢复已消费授权。</li>
+<li>evaluation attestation 或阈值不满足时保持 <code>review_only</code>，不能因为 capability 命中正确就假定 action 和写入授权也可靠。</li>
+</ul>
+<p>现有债务应先建立精确 baseline 来阻止新增，再由后续治理包持续降低 baseline；不能通过扩大 ignore、弱化规则或伪造 evaluation case 获得通过。字段、退出条件和 CI 组合见 <a href="https://github.com/WeirdSky924/project-change-router-skill/blob/HEAD/references/architecture-governance.md">references/architecture-governance.md</a>。</p>
+<p>flow 中的 evidence baseline 还有更严格的来源约束：首次扫描、脏工作树、bounded/incomplete 结果只能成为 <code>candidate_snapshot</code> 或 <code>unknown</code>。只有干净 commit 上的完整候选、可信 CI 快照，或用户明确接受的精确 fingerprint 才能晋升为 <code>trusted_baseline</code>。baseline 绑定 commit、profile、bundle、structure、indexed paths、scope、tool/runtime、policy 和 evidence digest；后续身份变化会失效，旧版本保存在 history 中而不是被覆盖。delta 会明确报告 new、expanded、unchanged、reduced 和 resolved。</p>
+<h2>Reuse 扫描运行时</h2>
+<p><code>check_reuse.py</code> 现在是 capability-scoped 的有界扫描器，不是全仓语义搜索器。一次 changed-path 检查按下面的顺序执行：</p>
+<pre><code>changed paths
+  -&gt; path map / owner / key files / related tests / test bindings
+  -&gt; primary + dependency capability scope
+  -&gt; native fingerprint 候选召回
+  -&gt; 文件对去重与 Top-K
+  -&gt; 隔离 worker 精确比较
+  -&gt; canonical / checkpoint / diagnostic 报告
+</code></pre>
+<p>关键行为：</p>
+<ul>
+<li>changed path 即使不在 <code>modules[].path</code> 中，只要它是 key file、index source、related test、test binding 或精确 path-map 项，也会直接进入候选集。</li>
+<li>无法解析 capability 时返回 <code>completion_status=incomplete</code>，不会静默回退全仓扫描。</li>
+<li>有具体 path mapping 时，旧 bundle 中的仓库级 <code>** -&gt; concrete capability</code> 不参与扩展范围。</li>
+<li>精确 path-map owner 优先于宽 module owner；只有同一精确路径显式声明 shared owner 时才保留第二 owner。</li>
+<li>dependency scope 只沿已解析的 runtime import edge 双向扩张一跳；TypeScript type-only edge 和传递依赖不会扩张扫描范围。</li>
+<li>import parser/resolver diagnostic 会令 evidence incomplete，不会被当成干净依赖图。</li>
+<li>test path 优先使用同 capability 的 related tests、test bindings 和 owner surface，不默认比较所有产品模块。</li>
+<li>相同文件对只计算一次；多个 capability 命中同一重复对时合并 capability 列表和最高严重度。</li>
+<li>超过全文比较大小限制但 fingerprint 高度相似的文件会输出 P2 <code>duplicate-fingerprint-candidate</code>，要求 agent 做定向源码分析；它不是精确重复结论。</li>
+<li>每次 flow 还会独立统计 <code>intra_capability</code>、<code>cross_capability</code> 和 <code>extended</code> 三条通道。<code>new</code>、<code>extract</code>、lifecycle 请求必须运行 extended；shared/canonical surface 仍会触发跨 capability 检查。</li>
+<li>每条通道独立携带 scope digest、coverage、预算、完成状态、跳过原因和 evidence digest。任一 required channel 为 bounded/incomplete 时，全局重复结论只能是 <code>not_proven</code>。</li>
+</ul>
+<h3>Fingerprint 缓存</h3>
+<p>缓存使用 Python 原生 <code>sqlite3</code> 和 <code>hashlib</code>，保存文件身份、大小、归一化长度、token sketch、内容摘要和算法版本，不保存完整归一化源码。第二次扫描可直接复用未变化 owner 文件的 fingerprint，只对 Top-K 精确候选读取全文。</p>
+<p>默认运行时目录不在项目仓库中：</p>
+<ul>
+<li>Windows：<code>%LOCALAPPDATA%\project-change-router\repositories\&lt;repo-key&gt;\</code></li>
+<li>Linux/macOS：<code>$XDG_CACHE_HOME/project-change-router/repositories/&lt;repo-key&gt;/</code>，未设置时使用 <code>~/.cache/...</code></li>
+</ul>
+<p>缓存模式：<code>auto</code>、<code>read-only</code>、<code>off</code>、<code>rebuild</code>。可通过 <code>--cache-mode</code> 或 profile/change-rules 配置。</p>
+<h3>Timeout 与取消</h3>
+<p>CLI 在隔离子进程中运行扫描：</p>
+<ul>
+<li>soft timeout 停止派发新比较并写 checkpoint。</li>
+<li>hard timeout 终止仍卡在单次全文相似度计算中的 worker。</li>
+<li><code>Ctrl+C</code> 走相同的取消、终止和 canonical 报告收口流程。</li>
+<li>hard timeout 至少比 soft timeout 多一秒，确保有收口窗口。</li>
+</ul>
+<p>命令行覆盖优先级高于 profile/change-rules：</p>
+<pre><code>python scripts/check_reuse.py --repo &lt;repo-root&gt; --changed-path &lt;path&gt; `
+  --timeout-seconds 60 --hard-timeout-seconds 75 `
+  --cache-mode auto --diagnostics auto --format json
+</code></pre>
+<p>数量预算仍可使用：<code>--max-candidate-files</code>、<code>--max-owner-files</code>、<code>--max-comparisons</code>、<code>--max-file-bytes</code>、<code>--top-k-owner-files</code>。</p>
+<h3>报告分级</h3>
+<ul>
+<li><code>canonical</code>：agent/CI 使用的最终机器契约；完成、受预算限制、超时、取消和错误都会生成。</li>
+<li><code>checkpoint</code>：可恢复的过程状态；完整完成后删除，非完整扫描短期保留，不能作为最终结论。</li>
+<li><code>diagnostic</code>：scope、缓存命中、阶段耗时和淘汰原因；<code>auto</code> 只为慢扫描或非完整扫描保留。</li>
+</ul>
+<p>必须同时读取：</p>
+<pre><code>result_status      = pass | warn | fail
+completion_status  = complete | bounded | incomplete | timeout | cancelled | error
+evidence_complete  = true | false
+</code></pre>
+<p>典型含义：</p>
+<table>
+<thead>
+<tr>
+<th>场景</th>
+<th>result_status</th>
+<th>completion_status</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>已完成目标 scope，未发现阻断</td>
+<td><code>pass</code></td>
+<td><code>complete</code></td>
+</tr>
+<tr>
+<td>已完成目标 scope，发现 P1 重复</td>
+<td><code>fail</code></td>
+<td><code>complete</code></td>
+</tr>
+<tr>
+<td>没有 P0/P1，但达到预算或大文件限制</td>
+<td><code>warn</code></td>
+<td><code>bounded</code></td>
+</tr>
+<tr>
+<td>changed path 无法完整归属</td>
+<td><code>warn</code></td>
+<td><code>incomplete</code></td>
+</tr>
+<tr>
+<td>worker 超过截止时间</td>
+<td><code>warn</code></td>
+<td><code>timeout</code></td>
+</tr>
+<tr>
+<td>取消前已经发现 P1</td>
+<td><code>fail</code></td>
+<td><code>cancelled</code></td>
+</tr>
+</tbody></table>
+<p>只有 <code>completion_status=complete</code> 且 <code>evidence_complete=true</code> 才能说明“已完成目标 capability scope 的重复检查”。这仍不代表扫描了无关 capability，也不替代 agent 对候选文件的源码分析。</p>
+<p>changed-path 报告身份只使用路由真值、目标内容和实际参与扫描的 owner/candidate <code>source_fingerprint_digest</code>。无关 worktree 文件不会破坏 canonical report 去重，但任何参与判断的源文件变化都会使摘要失效。</p>
+<h3>自动保留与清理</h3>
+<p>canonical 结果按输入、scope、证据、预算和 findings 做语义去重；P0/P1 报告自动 pin。默认保留 90 天/500 个 canonical、7 天 checkpoint、3 天/200 个 diagnostic，fingerprint 最多 50000 条，单仓运行时上限 512 MiB。</p>
+<p>清理只删除 SQLite manifest 登记且位于解析后 runtime root 内的文件，不会 glob 删除仓库内容。可单独运行：</p>
+<pre><code>python scripts/check_reuse.py --repo &lt;repo-root&gt; --cleanup-only --format json
+</code></pre>
+<p>默认退出码兼容旧自动化：无 P0/P1 时仍为 <code>0</code>；P0/P1 为 <code>1</code>；timeout/error 为 <code>2</code>；取消为 <code>130</code>。使用 <code>--strict-completeness</code> 时，<code>bounded</code> 和 <code>incomplete</code> 也返回 <code>2</code>。自动化应优先读取 JSON 字段，不要只看退出码。</p>
+<p>完整配置与行为契约见 <a href="https://github.com/WeirdSky924/project-change-router-skill/blob/HEAD/references/reuse-scan-runtime.md">references/reuse-scan-runtime.md</a>。</p>
+<h2>治理审计</h2>
+<p><code>check_bundle_governance.py</code> 用于检查 bundle 是否只是“能跑”，还是具备长期路由治理质量。</p>
+<p>它会检查：</p>
+<ul>
+<li>profile 声明的 capability 是否进入 catalog。</li>
+<li>change rules 是否引用未知 capability。</li>
+<li>generated-only capability 是否过多。</li>
+<li>path-to-capability map 是否存在未覆盖模块或多能力冲突路径。</li>
+<li>ownership rules 是否过宽或过细。</li>
+<li>contracts 是否缺失、过短或过长。</li>
+<li>大能力的 forbidden patterns 密度是否过低。</li>
+<li>dependency priority 是否覆盖所有 capability。</li>
+<li>evaluation set 是否覆盖 profile-backed capability。</li>
+<li>deprecated capability 是否具备 <code>superseded_by</code>、<code>deprecation_date</code>、<code>migration_note</code>。</li>
+<li>stable capability 是否具备非 provisional owner、reviewer、lifecycle、正例与边界 evaluation 覆盖。</li>
+</ul>
+<p>默认退出码：</p>
+<ul>
+<li>P0：失败。</li>
+<li>P1：默认 warn，<code>--strict</code> 下失败。</li>
+<li>P2：维护建议，不阻塞。</li>
+</ul>
+<h2>人工反馈与持续校准</h2>
+<h3>有界授权 manifest</h3>
+<p><code>authorization_request</code> 只是对当前 task/path/owner/route/pre-change snapshot/mutation envelope 的请求草案，不能创造权限。用户明确确认后，使用 <code>manage_authorization.py grant</code> 记录 grant；默认单次使用、24 小时过期，可显式授权最多 100 次且最长 30 天。每次状态变化进入摘要链 audit event，任何上下文、runtime/policy 或 mutation 变化都会失效；已 consumed、expired、invalidated 或 rejected 的 grant 不能因输入相同而恢复。</p>
+<pre><code>python scripts/manage_authorization.py --repo &lt;repo-root&gt; request --route-report &lt;full-flow-report.json&gt;
+python scripts/manage_authorization.py --repo &lt;repo-root&gt; grant --request-id &lt;request-id&gt; --authorization-source user --confirmation "&lt;exact confirmation&gt;"
+python scripts/manage_authorization.py --repo &lt;repo-root&gt; consume --grant-id &lt;grant-id&gt; --route-report &lt;current-full-flow-report.json&gt;
+python scripts/manage_authorization.py --repo &lt;repo-root&gt; inspect --grant-id &lt;grant-id&gt;
+</code></pre>
+<p><img src="https://raw.githubusercontent.com/WeirdSky924/project-change-router-skill/HEAD/assets/readme-feedback-loop.svg" alt="Continuous router calibration loop"></p>
+<p>当发生人工确认、override、误判、能力合并、废弃或 profile 修正时，应记录反馈：</p>
+<pre><code>python scripts/sync_feedback.py --repo &lt;repo-root&gt; --feedback-file feedback.json --format json
+</code></pre>
+<p>示例：</p>
+<pre><code>{
+  "decision_id": "route-...",
+  "final_action": "review",
+  "final_capability": "billing",
+  "confirmed_public_entry": "services/billing/__init__.py",
+  "confirmed_owner": "billing-team",
+  "profile_update_recommended": true,
+  "notes": "Human-confirmed correction"
+}
+</code></pre>
+<p>推荐把真实误判沉淀为 evaluation case。不要只修规则而不加回归样例。</p>
+<p>可复制样例：</p>
+<ul>
+<li><a href="https://github.com/WeirdSky924/project-change-router-skill/blob/HEAD/examples/feedback/manual-route-correction.json">examples/feedback/manual-route-correction.json</a></li>
+<li><a href="https://github.com/WeirdSky924/project-change-router-skill/blob/HEAD/examples/evaluation/route-regression-cases.yaml">examples/evaluation/route-regression-cases.yaml</a></li>
+</ul>
+<h2>真实仓校准参考</h2>
+<p>匿名真实结构参考见：</p>
+<ul>
+<li><a href="https://github.com/WeirdSky924/project-change-router-skill/blob/HEAD/examples/calibration/README.md">examples/calibration/README.md</a></li>
+<li><a href="https://github.com/WeirdSky924/project-change-router-skill/blob/HEAD/examples/calibration/anonymized-structure.md">examples/calibration/anonymized-structure.md</a></li>
+<li><a href="https://github.com/WeirdSky924/project-change-router-skill/blob/HEAD/examples/calibration/anonymized-profile.yaml">examples/calibration/anonymized-profile.yaml</a></li>
+<li><a href="https://github.com/WeirdSky924/project-change-router-skill/blob/HEAD/examples/calibration/anonymized-module-map.yaml">examples/calibration/anonymized-module-map.yaml</a></li>
+<li><a href="https://github.com/WeirdSky924/project-change-router-skill/blob/HEAD/examples/calibration/anonymized-route-cases.yaml">examples/calibration/anonymized-route-cases.yaml</a></li>
+<li><a href="https://github.com/WeirdSky924/project-change-router-skill/blob/HEAD/examples/calibration/anonymized-feedback.json">examples/calibration/anonymized-feedback.json</a></li>
+</ul>
+<p>这些样例用于说明大型全栈项目如何把真实模块、owner、public entry、route case 和反馈沉淀为可复用治理数据。</p>
+<h2>示例文件</h2>
+<p>Agent 工作流示例：</p>
+<ul>
+<li><a href="https://github.com/WeirdSky924/project-change-router-skill/blob/HEAD/examples/agent-workflows/README.md">examples/agent-workflows/README.md</a></li>
+<li><a href="https://github.com/WeirdSky924/project-change-router-skill/blob/HEAD/examples/agent-workflows/unattended-plan-prompt.md">examples/agent-workflows/unattended-plan-prompt.md</a></li>
+<li><a href="https://github.com/WeirdSky924/project-change-router-skill/blob/HEAD/examples/agent-workflows/update-existing-router-bundle-prompt.md">examples/agent-workflows/update-existing-router-bundle-prompt.md</a></li>
+</ul>
+<p>Profile 模板：</p>
+<ul>
+<li><a href="https://github.com/WeirdSky924/project-change-router-skill/blob/HEAD/examples/profiles/early-repo.project-change-router.yaml">examples/profiles/early-repo.project-change-router.yaml</a></li>
+<li><a href="https://github.com/WeirdSky924/project-change-router-skill/blob/HEAD/examples/profiles/python-monorepo.project-change-router.yaml">examples/profiles/python-monorepo.project-change-router.yaml</a></li>
+<li><a href="https://github.com/WeirdSky924/project-change-router-skill/blob/HEAD/examples/profiles/ts-workspace.project-change-router.yaml">examples/profiles/ts-workspace.project-change-router.yaml</a></li>
+<li><a href="https://github.com/WeirdSky924/project-change-router-skill/blob/HEAD/examples/profiles/mixed-repo.project-change-router.yaml">examples/profiles/mixed-repo.project-change-router.yaml</a></li>
+<li><a href="https://github.com/WeirdSky924/project-change-router-skill/blob/HEAD/examples/profiles/skill-repo.project-change-router.yaml">examples/profiles/skill-repo.project-change-router.yaml</a></li>
+<li><a href="https://github.com/WeirdSky924/project-change-router-skill/blob/HEAD/examples/profiles/reuse-runtime.project-change-router.yaml">examples/profiles/reuse-runtime.project-change-router.yaml</a></li>
+</ul>
+<p>反馈与评估样例：</p>
+<ul>
+<li><a href="https://github.com/WeirdSky924/project-change-router-skill/blob/HEAD/examples/feedback/manual-route-correction.json">examples/feedback/manual-route-correction.json</a></li>
+<li><a href="https://github.com/WeirdSky924/project-change-router-skill/blob/HEAD/examples/evaluation/route-regression-cases.yaml">examples/evaluation/route-regression-cases.yaml</a></li>
+</ul>
+<p>Bundle 样例：</p>
+<ul>
+<li><a href="https://github.com/WeirdSky924/project-change-router-skill/blob/HEAD/examples/bundle/router-config.yaml">examples/bundle/router-config.yaml</a></li>
+<li><a href="https://github.com/WeirdSky924/project-change-router-skill/blob/HEAD/examples/bundle/references/capability-catalog.yaml">examples/bundle/references/capability-catalog.yaml</a></li>
+<li><a href="https://github.com/WeirdSky924/project-change-router-skill/blob/HEAD/examples/bundle/references/module-map.yaml">examples/bundle/references/module-map.yaml</a></li>
+<li><a href="https://github.com/WeirdSky924/project-change-router-skill/blob/HEAD/examples/bundle/references/ownership.yaml">examples/bundle/references/ownership.yaml</a></li>
+<li><a href="https://github.com/WeirdSky924/project-change-router-skill/blob/HEAD/examples/bundle/references/path-to-capability-map.yaml">examples/bundle/references/path-to-capability-map.yaml</a></li>
+<li><a href="https://github.com/WeirdSky924/project-change-router-skill/blob/HEAD/examples/bundle/references/change-rules.yaml">examples/bundle/references/change-rules.yaml</a></li>
+<li><a href="https://github.com/WeirdSky924/project-change-router-skill/blob/HEAD/examples/bundle/references/exception-registry.yaml">examples/bundle/references/exception-registry.yaml</a></li>
+<li><a href="https://github.com/WeirdSky924/project-change-router-skill/blob/HEAD/examples/bundle/references/evaluation-set.yaml">examples/bundle/references/evaluation-set.yaml</a></li>
+</ul>
+<p>输出样例：</p>
+<ul>
+<li><a href="https://github.com/WeirdSky924/project-change-router-skill/blob/HEAD/examples/outputs/resolve-entry.pass.json">examples/outputs/resolve-entry.pass.json</a></li>
+<li><a href="https://github.com/WeirdSky924/project-change-router-skill/blob/HEAD/examples/outputs/resolve-entry.review-guidance.json">examples/outputs/resolve-entry.review-guidance.json</a></li>
+<li><a href="https://github.com/WeirdSky924/project-change-router-skill/blob/HEAD/examples/outputs/resolve-entry.composite-review.json">examples/outputs/resolve-entry.composite-review.json</a></li>
+<li><a href="https://github.com/WeirdSky924/project-change-router-skill/blob/HEAD/examples/outputs/resolve-entry.seed-new-capability.json">examples/outputs/resolve-entry.seed-new-capability.json</a></li>
+<li><a href="https://github.com/WeirdSky924/project-change-router-skill/blob/HEAD/examples/outputs/check-deps.pass.json">examples/outputs/check-deps.pass.json</a></li>
+<li><a href="https://github.com/WeirdSky924/project-change-router-skill/blob/HEAD/examples/outputs/check-public-api.pass.json">examples/outputs/check-public-api.pass.json</a></li>
+<li><a href="https://github.com/WeirdSky924/project-change-router-skill/blob/HEAD/examples/outputs/check-structure.pass.json">examples/outputs/check-structure.pass.json</a></li>
+<li><a href="https://github.com/WeirdSky924/project-change-router-skill/blob/HEAD/examples/outputs/check-reuse.pass.json">examples/outputs/check-reuse.pass.json</a></li>
+<li><a href="https://github.com/WeirdSky924/project-change-router-skill/blob/HEAD/examples/outputs/check-reuse.warn.json">examples/outputs/check-reuse.warn.json</a></li>
+<li><a href="https://github.com/WeirdSky924/project-change-router-skill/blob/HEAD/examples/outputs/check-reuse.timeout.json">examples/outputs/check-reuse.timeout.json</a></li>
+<li><a href="https://github.com/WeirdSky924/project-change-router-skill/blob/HEAD/examples/outputs/check-bundle-governance.warn.json">examples/outputs/check-bundle-governance.warn.json</a></li>
+<li><a href="https://github.com/WeirdSky924/project-change-router-skill/blob/HEAD/examples/outputs/run-evaluation.pass.json">examples/outputs/run-evaluation.pass.json</a></li>
+</ul>
+<p>参考文档：</p>
+<ul>
+<li><a href="https://github.com/WeirdSky924/project-change-router-skill/blob/HEAD/references/router-workflow.md">references/router-workflow.md</a></li>
+<li><a href="https://github.com/WeirdSky924/project-change-router-skill/blob/HEAD/references/governance-outputs.md">references/governance-outputs.md</a></li>
+<li><a href="https://github.com/WeirdSky924/project-change-router-skill/blob/HEAD/references/bootstrap.md">references/bootstrap.md</a></li>
+<li><a href="https://github.com/WeirdSky924/project-change-router-skill/blob/HEAD/references/repo-discovery.md">references/repo-discovery.md</a></li>
+<li><a href="https://github.com/WeirdSky924/project-change-router-skill/blob/HEAD/references/evaluation.md">references/evaluation.md</a></li>
+<li><a href="https://github.com/WeirdSky924/project-change-router-skill/blob/HEAD/references/schema-overview.md">references/schema-overview.md</a></li>
+<li><a href="https://github.com/WeirdSky924/project-change-router-skill/blob/HEAD/references/architecture-governance.md">references/architecture-governance.md</a></li>
+<li><a href="https://github.com/WeirdSky924/project-change-router-skill/blob/HEAD/references/reuse-scan-runtime.md">references/reuse-scan-runtime.md</a></li>
+<li><a href="https://github.com/WeirdSky924/project-change-router-skill/blob/HEAD/references/typed-findings-gate-todo.md">references/typed-findings-gate-todo.md</a></li>
+</ul>
+<h2>脚本列表</h2>
+<ul>
+<li><code>scripts/install_skill.py</code></li>
+<li><code>scripts/bootstrap_router.py</code></li>
+<li><code>scripts/resolve_entry.py</code></li>
+<li><code>scripts/rebuild_index.py</code></li>
+<li><code>scripts/check_reuse.py</code></li>
+<li><code>scripts/reuse_runtime.py</code></li>
+<li><code>scripts/check_deps.py</code></li>
+<li><code>scripts/check_public_api.py</code></li>
+<li><code>scripts/check_structure.py</code></li>
+<li><code>scripts/check_index_freshness.py</code></li>
+<li><code>scripts/check_bundle_governance.py</code></li>
+<li><code>scripts/run_evaluation.py</code></li>
+<li><code>scripts/run_change_flow.py</code></li>
+<li><code>scripts/manage_authorization.py</code></li>
+<li><code>scripts/sync_feedback.py</code></li>
+<li><code>scripts/validate_router_bundle.py</code></li>
+</ul>
+<p>DeepSeek Harness 接入文件：</p>
+<ul>
+<li><code>package.json</code></li>
+<li><code>integrations/deepseek-harness/index.js</code></li>
+<li><code>integrations/deepseek-harness/cordis.patch.yml</code></li>
+</ul>
+<h2>CI</h2>
+<p>GitHub Actions workflow 位于 <a href="https://github.com/WeirdSky924/project-change-router-skill/blob/HEAD/.github/workflows/ci.yml">.github/workflows/ci.yml</a>，会执行：</p>
+<ul>
+<li>安装依赖。</li>
+<li>校验 skill 结构。</li>
+<li>校验 DeepSeek Harness provider 语法和注册/加载 smoke。</li>
+<li>用 <code>npm pack --dry-run</code> 校验 DSH 发布包不包含 <code>__pycache__</code>、<code>.pyc</code> 或其他本地运行时产物。</li>
+<li>运行单元测试。</li>
+<li>bootstrap 自仓库 bundle。</li>
+<li>validate bundle。</li>
+<li>governance audit。</li>
+<li>freshness check。</li>
+<li>dependency direction、runtime cycle 与 public API check。</li>
+<li>central growth、800/1200 文件规模、forbidden root 与 exclusive owner structure check。</li>
+<li>route evaluation。</li>
+<li>capability-scoped reuse scan、隔离 worker 和严格完整性检查。</li>
+<li>typed finding schema、execution gate replay、可信 baseline、增量缓存、三通道 reuse、compact flow 与 authorization 状态机回归。</li>
+<li>临时目录中的原子安装与 <code>--verify-only</code> 完整载荷校验。</li>
+</ul>
+<h2>边界与风险</h2>
+<p>需要明确：</p>
+<ul>
+<li>首次 bootstrap 只是 first pass。</li>
+<li>没有 profile 时，结果会偏保守。</li>
+<li>generated-only evaluation 只能说明系统自洽，不代表架构成熟。</li>
+<li>capability 命中正确不代表 action、secondary contract 或写入授权可靠；evaluation 未达阈值时仍为 <code>review_only</code>。</li>
+<li>只有 <code>execution_gate.state</code> 决定当前写入状态；<code>action=review</code>、<code>review_required</code> 和 confidence 都不是独立门禁。</li>
+<li><code>decision_confidence=high</code> 只说明 action/decision basis 稳定，不提供写权限。</li>
+<li><code>action</code> 是建议动作，不是最终工程命令；execution gate、安全信封、typed findings、owner、canonical root 和生命周期约束优先级更高。</li>
+<li><code>check_reuse</code> 的 <code>result_status=pass</code> 只有在 <code>completion_status=complete</code> 且 <code>evidence_complete=true</code> 时才表示目标 scope 已完成；bounded、timeout 和 incomplete 只能作为定向分析证据。</li>
+<li>生命周期操作，例如 delete、merge、deprecate、replace、migrate，会产生强制 lifecycle evidence/gate；<code>review</code> 只是建议的调查方向。</li>
+<li>这个 skill 给方向、证据和约束，最终实现方案仍应来自真实代码分析、测试和用户确认。</li>
+</ul>
+<h2>许可证</h2>
+<p>见 <a href="https://github.com/WeirdSky924/project-change-router-skill/blob/HEAD/LICENSE">LICENSE</a>。</p>

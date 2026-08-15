@@ -1,0 +1,171 @@
+<h1>dsh-lens-lite</h1>
+<p>Post-edit diagnostics for <a href="https://github.com/deepseek-ai/deepseek-harness">DeepSeek Harness</a>.</p>
+<p>After a file-mutating tool succeeds, this plugin runs the checkers you configured for that file's extension and attaches their output to the <strong>same tool result</strong> as model-visible context. The next model request therefore already carries the type errors or lint findings the edit introduced, instead of the model discovering them a few turns later.</p>
+<p><code>dsh-lsp</code> covers semantic navigation (definition, references, hover). It does not surface diagnostics, and nothing in the shipped harness runs a type-checker after an edit. This plugin fills that gap.</p>
+<h2>Install</h2>
+<pre><code>dsh plugin --profile web add dsh-lens-lite
+</code></pre>
+<p>Then override the row in your profile's <code>cordis.patch.yml</code> with the checkers your toolchain actually has (the shipped row has none — see <a href="#configuration">Configuration</a>).</p>
+<h2>How it behaves</h2>
+<ul>
+<li>Runs only after a <strong>successful</strong> call to a watched tool (<code>write</code>, <code>edit</code>, <code>str_replace_editor</code> by default).</li>
+<li>Takes the edited path from the tool's canonical <code>path</code> value — the path the filesystem backend actually resolved — and falls back to the <code>file_path</code> argument for tools that declare no such value.</li>
+<li>Runs every checker claiming that file's extension, concurrently.</li>
+<li>Attaches nothing when every checker exits with a configured clean code and prints nothing.</li>
+<li><strong>Never vetoes and never rewrites a call.</strong> It delegates the <code>tools/post-execute</code> waterfall first and only folds context onto whatever decision came back, preserving every downstream context's own source and metadata.</li>
+<li>Skips linting entirely when a downstream listener blocked the call — that blocked call is already the feedback the model must react to.</li>
+<li>Honours the tool call's cancellation signal, and terminates a checker's whole process tree when its own timeout expires.</li>
+</ul>
+<p>Findings arrive as a <code>notice</code>-form plugin context, so the transcript shows a collapsed one-line summary rather than a wall of compiler output.</p>
+<h2>Configuration</h2>
+<p>Every deployment-varying value is a config field. The plugin ships <strong>no built-in commands</strong>: which checkers exist is a property of your toolchain, not of this package.</p>
+<pre><code>- id: lens-lite
+  name: dsh-lens-lite
+  config:
+    tools: [write, edit, str_replace_editor]
+    maxDiagnosticChars: 4000
+    checkers:
+      - name: tsc
+        extensions: ['.ts', '.tsx']
+        argv: ['npx', '--no-install', 'tsc', '--noEmit']
+        cwd: '.'
+        timeoutMs: 60000
+
+      - name: eslint
+        extensions: ['.ts', '.tsx', '.js', '.jsx']
+        argv: ['npx', '--no-install', 'eslint', '--format', 'compact', '{file}']
+        cleanExitCodes: [0]
+
+      - name: ruff
+        extensions: ['.py']
+        argv: ['ruff', 'check', '--output-format', 'concise', '{file}']
+
+      - name: go-vet
+        extensions: ['.go']
+        argv: ['go', 'vet', '{dir}']
+        streams: [stderr]
+</code></pre>
+<h3>Checker fields</h3>
+<table>
+<thead>
+<tr>
+<th>Field</th>
+<th>Default</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>name</code></td>
+<td>— (required)</td>
+<td>Label shown to the model above this checker's output</td>
+</tr>
+<tr>
+<td><code>extensions</code></td>
+<td>— (required)</td>
+<td>Lowercase, leading-dot extensions this checker claims</td>
+</tr>
+<tr>
+<td><code>argv</code></td>
+<td>— (required)</td>
+<td>Executable + arguments. <code>argv[0]</code> resolves against the subprocess provider's scrubbed PATH. <strong>Never shell-interpreted</strong></td>
+</tr>
+<tr>
+<td><code>cwd</code></td>
+<td><code>.</code></td>
+<td>Working directory, resolved against the harness process directory (your workspace root)</td>
+</tr>
+<tr>
+<td><code>timeoutMs</code></td>
+<td><code>30000</code></td>
+<td>Wall-clock bound; the process tree is terminated when it expires</td>
+</tr>
+<tr>
+<td><code>graceMs</code></td>
+<td><code>2000</code></td>
+<td>SIGTERM→SIGKILL grace for that termination</td>
+</tr>
+<tr>
+<td><code>maxOutputBytes</code></td>
+<td><code>65536</code></td>
+<td>In-memory cap per collected stream; overflow keeps the tail</td>
+</tr>
+<tr>
+<td><code>cleanExitCodes</code></td>
+<td><code>[0]</code></td>
+<td>Exit codes meaning "no findings"</td>
+</tr>
+<tr>
+<td><code>streams</code></td>
+<td><code>[stdout, stderr]</code></td>
+<td>Which streams carry findings, in concatenation order</td>
+</tr>
+</tbody></table>
+<p><code>argv</code> entries support three placeholders, substituted per run:</p>
+<table>
+<thead>
+<tr>
+<th>Placeholder</th>
+<th>Value</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>{file}</code></td>
+<td>Absolute path of the edited file</td>
+</tr>
+<tr>
+<td><code>{relFile}</code></td>
+<td>That path relative to <code>cwd</code></td>
+</tr>
+<tr>
+<td><code>{dir}</code></td>
+<td>Its containing directory</td>
+</tr>
+</tbody></table>
+<h3>Plugin fields</h3>
+<table>
+<thead>
+<tr>
+<th>Field</th>
+<th>Default</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>tools</code></td>
+<td><code>[write, edit, str_replace_editor]</code></td>
+<td>Tool names whose successful results are inspected</td>
+</tr>
+<tr>
+<td><code>checkers</code></td>
+<td><code>[]</code></td>
+<td>Checkers, all consulted; empty means the plugin does nothing (it says so once at load)</td>
+</tr>
+<tr>
+<td><code>maxDiagnosticChars</code></td>
+<td><code>4000</code></td>
+<td>Cap on model-visible diagnostic text per result; overflow keeps the <strong>head</strong>, because the first error is usually the cause of the rest</td>
+</tr>
+</tbody></table>
+<h2>Cost</h2>
+<p>Whole-project checkers run on <strong>every</strong> edit. <code>npx tsc --noEmit</code> on a large repo can add seconds to each write. Prefer single-file invocations (<code>{file}</code>) where the tool supports them, and raise <code>timeoutMs</code> only for the checkers that genuinely need it.</p>
+<h2>Failure behavior</h2>
+<p>Load-time misconfiguration fails loud: an empty <code>argv</code>, a checker claiming no extensions or reading no streams, a duplicate checker name, or a non-positive bound throws at plugin load.</p>
+<p>Environment failures do not fail the edit — the call already succeeded — and become findings instead:</p>
+<ul>
+<li>An unresolvable executable is reported once as <code>checker unavailable: …</code>, then that checker stays quiet for the rest of the fiber's life.</li>
+<li>A timeout is reported as <code>checker timed out after Nms</code>.</li>
+<li>A spawn-level failure is reported as <code>checker failed to start: …</code>.</li>
+</ul>
+<h2>Extension point</h2>
+<p>One listener on <a href="https://github.com/deepseek-ai/deepseek-harness/blob/main/packages/core/tools/README.md#extension-points"><code>tools/post-execute</code></a>, plus <code>ctx.subprocess</code> for spawning. No core changes, no agent-loop changes.</p>
+<h2>Development</h2>
+<pre><code>pnpm install --ignore-workspace
+pnpm run typecheck
+pnpm test
+pnpm run build
+</code></pre>
+<p>The test suite drives the real <code>tools/post-execute</code> waterfall against the real local subprocess provider, using <code>node -e</code> programs as checkers, so it covers actual spawning, exit-code classification, stream selection, and timeouts without requiring any toolchain.</p>
+<h2>License</h2>
+<p>MIT</p>
+<h2>Prior art</h2>
+<p>The post-edit-feedback idea comes from <a href="https://github.com/apmantza/pi-lens">pi-lens</a> (MIT) in the Pi ecosystem. This is an independent implementation against Harness extension points and shares no code with it; it deliberately covers only the run-checkers-after-edit slice, not pi-lens's AST rules, dependency mapping, or triage system.</p>

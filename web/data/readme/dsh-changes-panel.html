@@ -1,0 +1,58 @@
+<h1>dsh-changes-panel · diff 面板</h1>
+<p>DeepSeek Harness Web GUI 的会话内 diff 面板：实时展示当前会话里所有被 <code>edit</code>/<code>write</code> 工具改动的文件，以及每个文件相对其最近状态分界点（本会话首次改动前的内容；条目被采纳/回退后以当时内容重新为界）的<strong>累计差异</strong>（git 风格 <code>+</code>绿 / <code>−</code>红），避免对话中看不清改动、误操作。</p>
+<p>术语与设计决策见 <a href="https://github.com/szh1007/dsh-changes-panel/blob/HEAD/CONTEXT.md"><code>CONTEXT.md</code></a> 与 <a href="https://github.com/szh1007/dsh-changes-panel/blob/HEAD/docs/adr/"><code>docs/adr/</code></a>。</p>
+<h2>特性</h2>
+<ul>
+<li>入口是会话标签栏（<code>[role="tablist"]</code>，与「对话/轨迹」同排对齐）的 <strong>diff</strong> 标签，带改动数量角标，点击开合面板</li>
+<li>面板位于<strong>会话界面内部</strong>：header 正下方、右侧贴边，不遮 header、不独立成框架级列</li>
+<li>打开时聊天区与输入框整体左移（对 <code>[data-conversation-scroll]</code> 加 <code>margin-right</code>，带过渡动画），header 与标签栏不动；聊天内容在常见屏宽下只重新居中、不缩窄</li>
+<li>面板<strong>左缘拖拽调宽</strong>（220–640px，始终给聊天区留 ≥320px），宽度在会话切换间保留</li>
+<li>面板默认收起，仅在<strong>出现真正改动</strong>（会话工作集由空转非空）时自动展开；新建会话、切换会话、刷新页面、用户提问都不会触发展开，手动关闭后改动清零前保持关闭；工作区内/工作区外两个分区<strong>按改动自动展开</strong>（出现改动→展开，改动清零→收起，无转变时尊重手动开合）</li>
+<li>文件行默认列出（<code>A/M</code> 状态 + 相对路径/绝对路径 + <code>+N −M</code> 统计）；<code>A</code> = 本会话新增（<code>fs/write-intent</code> 写入前探测到文件不存在，整文件渲染为 <code>+</code> 行），<code>M</code> = 已存在文件被修改；每个文件的 diff 详情默认收起，点击展开</li>
+<li>diff 带上下文行，滑动展开；<code>+</code> 绿、<code>−</code> 红；官方代码字体；单文件可「全屏」查看</li>
+<li>底部操作条：勾选文件后 <strong>采纳</strong>（仅从面板移除）/ <strong>回退</strong>（把基线内容写回磁盘）；两个分区标签行带<strong>全选勾选框</strong>（已全选时点击即取消，分区为空时禁用），一键选中整个分区再操作；条目被采纳/回退后，该文件的下一次改动会以<strong>采纳/回退后的状态</strong>为新基线重新展示 diff</li>
+<li>工作集按顶层会话一一对应（子代理的改动归属其父会话）；会话删除时清理（<code>session/disposed</code>）</li>
+<li>深色主题使用官方 <code>--dsw-alias-*</code> token，自动跟随亮/暗主题</li>
+</ul>
+<h2>不包含（有意暂缓）</h2>
+<ul>
+<li><strong>删除(D)</strong>：本 harness 无删除工具（只能 shell 写盘），首版不追踪。见 <code>docs/adr/0001-defer-deletion-tracking.md</code>。</li>
+<li><strong>持久化</strong>：工作集目前在 host 内存中——刷新页面不丢，重启 <code>dsh web</code> 清空。<code>storageDomain</code> 持久化因 zod 依赖问题暂缓。</li>
+</ul>
+<h2>结构</h2>
+<pre><code>dsh-changes-panel/
+├── CONTEXT.md                 # 术语表
+├── docs/adr/                  # 架构决策记录
+├── cordis.patch.yml           # 插入 host 半到插件花名册
+├── package.json               # dsh.bundle.patch + dsh.client 声明
+├── tsdown.config.ts           # node + browser 双产物构建
+├── src/index.ts               # host 半：fs/observed 内容快照 + 会话隔离 + webServer 路由
+└── src/client/index.ts        # client 半：标签注入 + 会话内面板 + diff 渲染
+</code></pre>
+<h2>工作原理</h2>
+<ul>
+<li><strong>host</strong>：监听全局 <code>fs/observed</code> 事件，首次观察某路径时记录基线，内容变化即视为改动，用 LCS 行 diff 计算累计差异；<code>fs/write-intent</code> 前置探测目标不存在则标记为新增（<code>A</code>，基线为空内容）；条目被采纳/回退移除后，文件下次写/改前的 <code>fs/write-intent</code> / <code>fs/edit-intent</code> 会重新捕获当前内容作为新基线，让后续改动与采纳/回退后的状态对比；通过 <code>webServer</code> 注册 <code>GET /plugins/ui-changes-panel/working-set?sessionId=...</code> 输出 JSON，<code>POST /plugins/ui-changes-panel/action</code> 执行批量采纳/回退。工作集在 host 内存中按会话隔离（子代理改动归属顶层会话），<code>session/disposed</code> 时删除。</li>
+<li><strong>client</strong>：把 <code>diff</code> 标签注入会话标签栏；面板本体挂在 <code>shell.overlay</code> 层，几何从 <code>[data-conversation-scroll]</code> 实测（ResizeObserver + 1s 心跳同步）；打开时给同一元素加 <code>margin-right</code> 让聊天区左移；<code>useSessions(s =&gt; s.current)</code> 取当前会话 id，轮询 working-set 渲染。</li>
+</ul>
+<h2>构建与安装</h2>
+<pre><code>cd dsh-changes-panel
+pnpm install
+pnpm build                     # 产出 lib/index.js + lib/client.js
+pnpm test                      # 运行 diff 算法单元测试
+</code></pre>
+<p>把包接入某个 Web 配置（profile）：在该 profile 的 <code>package.json</code> 中加入依赖</p>
+<pre><code>"@dsh-external/dsh-client-changes-panel": "link:&lt;本目录的绝对路径&gt;"
+</code></pre>
+<p>重新安装依赖并重启 <code>dsh web</code> 即生效。host 半（<code>cordis.patch.yml</code>）与 client 半（<code>package.json</code> 的 <code>dsh.client</code> 声明）由包自身携带，无需额外配置。</p>
+<blockquote>
+<p>生产构建建议改用 dsh-web-ui 脚手架自带的 <code>clientBundle</code> 预设（maid-atelier 同款）；本仓库的 <code>tsdown.config.ts</code> 是最小自包含替代。</p>
+</blockquote>
+<h2>遗留 TODO</h2>
+<ul>
+<li><strong>删除(D) 状态</strong>：见 <code>docs/adr/0001</code>——首版只追踪新增/修改，删除需 shell 写盘追踪，暂缓。</li>
+<li><strong>「新增(A)」的回退</strong>：<code>A</code> 已实现（<code>fs/write-intent</code> 写入前探测）；但回退新增文件目前只把基线（空内容）写回，留下空文件而非删除文件——fs 服务无删除能力，真正的删除仍有意暂缓，见 <code>docs/adr/0001</code>。</li>
+<li><strong>持久化</strong>：工作集落盘（<code>storageDomain</code>）以跨 host 重启保留。</li>
+<li><strong>面板宽度持久化</strong>：拖拽宽度目前仅保留在页面生命周期内。</li>
+</ul>
+<h2>许可</h2>
+<p>MIT。</p>

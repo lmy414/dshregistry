@@ -1,0 +1,103 @@
+<h1>dsh-plugin-wepre</h1>
+<p>English | <a href="https://github.com/shujiTech/dsh-plugin-wepre/blob/HEAD/README.zh.md">中文</a></p>
+<p>A <a href="https://github.com/deepseek-ai/deepseek-harness">DeepSeek Harness</a> (<code>dsh</code>) plugin that lets your agent publish single-screen content cards to <a href="https://wepre.cn/next-test/">WePre Next</a> — a platform that pushes offline, single-viewport cards to users while they wait on AI generations.</p>
+<p>With this plugin installed, a dsh session goes from "write me a card" to "it's live" in one conversation:</p>
+<pre><code>you:   Build a pomodoro-timer card and publish it to WePre
+agent: &lt;writes index.html, calls wepre_publish&gt;
+agent: QA gate rejected it — OVERFLOW_Y at 390x600. Fixing… &lt;edits, republishes&gt;
+agent: Published. contentId=cnt_xxx, version v1 (QA: passed)
+</code></pre>
+<h2>Install</h2>
+<pre><code>dsh plugin --profile web add dsh-plugin-wepre
+</code></pre>
+<p>Verify the layer composed, then boot:</p>
+<pre><code>dsh --profile web --dump-config   # shows a "# == dsh-plugin-wepre" layer
+dsh --profile web
+</code></pre>
+<p>No build step and no <code>prepare</code> script — installing from a git host works too:</p>
+<pre><code>dsh plugin --profile web add github:shujiTech/dsh-plugin-wepre
+</code></pre>
+<h2>What the agent gets</h2>
+<p>Five model-facing tools on <code>ctx.tools</code>:</p>
+<table>
+<thead>
+<tr>
+<th>Tool</th>
+<th>What it does</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>wepre_request_code</code></td>
+<td>Send a one-time login code (SMS / email)</td>
+</tr>
+<tr>
+<td><code>wepre_login</code></td>
+<td>Redeem the code; the session cookie is persisted locally</td>
+</tr>
+<tr>
+<td><code>wepre_whoami</code></td>
+<td>Show current login state</td>
+</tr>
+<tr>
+<td><code>wepre_publish</code></td>
+<td>Upload an <code>index.html</code> / <code>.zip</code> card through the server-side QA gate</td>
+</tr>
+<tr>
+<td><code>wepre_qa_report</code></td>
+<td>Fetch the full QA report (per-viewport issues) for a content</td>
+</tr>
+</tbody></table>
+<p>The tools' descriptions teach the model WePre's content rules (single-screen layout, no network calls, no external resources, the <code>wepre-next:execute</code> postMessage contract) and the QA fix loop: when the gate answers <code>QA_GATE_FAILED</code>, the agent reads the structured per-viewport issues, fixes the card, and republishes with the same <code>contentId</code> — no human in the loop.</p>
+<h2>Authentication</h2>
+<p><code>wepre_publish</code> / <code>wepre_qa_report</code> resolve credentials in this order:</p>
+<ol>
+<li><strong><code>token</code> config field</strong> — a short-lived publish token from the WePre publish page</li>
+<li><strong><code>WEPRE_PUBLISH_TOKEN</code></strong> environment variable</li>
+<li><strong>The stored login session</strong> — created by <code>wepre_login</code>, persisted to <code>sessionFile</code> (default <code>~/.dsh/wepre-session.json</code>, mode <code>0600</code>)</li>
+</ol>
+<p>For interactive use, just ask the agent to log in: <em>"log in to WePre with 13800138000"</em> — it will send the code, ask you for it, and store the session. For CI / headless (<code>dsh --profile headless "…"</code>), set a token.</p>
+<h2>Configuration</h2>
+<p>Override the plugin row in your profile's <code>cordis.patch.yml</code> (a patch replaces the row's <strong>whole</strong> config — restate keys you keep):</p>
+<pre><code>- id: wepre-publish
+  name: dsh-plugin-wepre
+  config:
+    endpoint: 'https://wepre.cn/next-test'
+    token: !!js process.env.WEPRE_PUBLISH_TOKEN
+    sessionFile: '/home/me/.dsh/wepre-session.json'
+</code></pre>
+<table>
+<thead>
+<tr>
+<th>Key</th>
+<th>Default</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>endpoint</code></td>
+<td><code>https://wepre.cn/next-test</code></td>
+<td>WePre Next site root</td>
+</tr>
+<tr>
+<td><code>token</code></td>
+<td>—</td>
+<td>Short-lived publish token (Bearer)</td>
+</tr>
+<tr>
+<td><code>sessionFile</code></td>
+<td><code>~/.dsh/wepre-session.json</code></td>
+<td>Persisted login session</td>
+</tr>
+</tbody></table>
+<h2>What a publish call looks like</h2>
+<p><code>wepre_publish</code> maps to <code>POST /next-test/api/next-contents</code> (multipart). Parameters: <code>title</code>, <code>path</code> (absolute, <code>.html</code> or <code>.zip</code>), <code>description</code>, <code>contentId</code> (for in-place version updates), <code>changeNote</code>, <code>versionLabel</code>, <code>downloadEnabled</code> (default <code>false</code>), and manifest fields <code>viewports</code> (<code>all</code>/<code>desktop</code>/<code>mobile</code>), <code>interaction</code> (<code>execute</code>/<code>passive</code>), <code>capabilities</code>.</p>
+<p>On success it returns <code>contentId</code>, <code>versionId</code>, <code>versionNumber</code> and the QA status. On <code>QA_GATE_FAILED</code> (HTTP 422) it returns the structured <code>issues</code> and <code>reportId</code> as a canonical value — not an exception — so the agent can iterate. Before uploading, the tool runs a local pre-flight scan for WePre's banned tokens (<code>fetch</code>, <code>localStorage</code>, <code>Worker</code>, <code>overflow:auto</code>, …) and external links, and reports them as non-blocking warnings.</p>
+<h2>Content rules in one paragraph</h2>
+<p>WePre Next cards are single-screen, offline, sandboxed pages: one <code>index.html</code> (or a zip with it at the root), root container at <code>100dvh</code> with <code>overflow:hidden</code>, no <code>overflow:auto/scroll</code>, no network calls / <code>localStorage</code> / <code>Worker</code> (the words are banned even in comments), no external or root-absolute URLs, and <code>execute</code>-mode cards must run their main action on the <code>wepre-next:execute</code> postMessage. The full contract: <a href="https://wepre.cn/next-test/">WePre Next 内容发布规范</a> (see the publish guide on the site).</p>
+<h2>Development</h2>
+<p>Plain ESM JavaScript, no build step. Behavioral tests drive the tools against a mock WePre server:</p>
+<pre><code>npm install
+npm test
+</code></pre>
+<h2>License</h2>
+<p><a href="https://github.com/shujiTech/dsh-plugin-wepre/blob/HEAD/LICENSE">MIT</a></p>

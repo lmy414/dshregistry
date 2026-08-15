@@ -1,0 +1,253 @@
+<h1>dsh-plugin-healthcheck</h1>
+<blockquote>
+<p>DSH 插件健康检查 —— 装完新插件后<strong>不重启后端</strong>即可验证插件是否会导致事故。
+纯静态检查 + 配置组合 + 隔离试跑 + 木马扫描，发现即修复（自动修复 / 自动回滚 / 预制提示词）。</p>
+</blockquote>
+<p><code>#dsh-plugin</code> · DeepSeek Harness (DSH) · TypeScript · turtle-ui</p>
+<h2>截图</h2>
+<p>设置面板 →「插件检测」：</p>
+<p><img src="https://raw.githubusercontent.com/chenw2759-wq/dsh-plugin-healthcheck/HEAD/docs/healthcheck-panel.png" alt="插件检测面板"></p>
+<p>运行一次检测（L0 静态 + L1 配置组合 + L2 隔离试跑 + 木马扫描）：</p>
+<p><img src="https://raw.githubusercontent.com/chenw2759-wq/dsh-plugin-healthcheck/HEAD/docs/healthcheck-results.png" alt="插件检测结果"></p>
+<hr>
+<h2>它解决什么问题</h2>
+<p>DSH 的 <code>dsh plugin add</code> 只负责把插件装进 profile（薄 pnpm 转发器），<strong>装完不做任何验证</strong>——
+问题要等下次后端启动才暴露。常见事故：</p>
+<table>
+<thead>
+<tr>
+<th>事故</th>
+<th>根因</th>
+<th>本插件拦截方式</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>启动报 <code>ERR_MODULE_NOT_FOUND</code>（缺哈希 chunk）</td>
+<td><code>files</code> 白名单漏掉代码分割产物</td>
+<td>C1 files 完整性</td>
+</tr>
+<tr>
+<td>后端启动报缺 <code>zod</code> / <code>schemastery</code></td>
+<td>插件登记成 <code>link:</code> 依赖，绕过了 profile 的 node_modules</td>
+<td>C2 依赖声明审计</td>
+</tr>
+<tr>
+<td>agent 报 <code>Cannot read properties of undefined (reading 'prepare')</code></td>
+<td><code>file:</code> 依赖装出 harness 核心包副本 → <strong>模块双实例</strong> → Symbol 身份错位</td>
+<td>C3 高危副本检测</td>
+</tr>
+<tr>
+<td><code>dsh-skin CLI not found</code>（Windows）</td>
+<td>命令不在注册表 PATH / <code>execFile</code> 只认 .exe</td>
+<td>C5 Windows 命令</td>
+</tr>
+<tr>
+<td>改了 <code>link:</code>→<code>file:</code> 不生效</td>
+<td>pnpm 不重解析 lockfile</td>
+<td>C6 lockfile 一致性</td>
+</tr>
+<tr>
+<td>被禁用的插件长期残留在依赖里</td>
+<td>禁用是压制症状而非修复</td>
+<td>C7 禁用插件识别</td>
+</tr>
+<tr>
+<td>供应链投毒 / 恶意代码</td>
+<td>发布包内注入恶意逻辑</td>
+<td>C8 木马扫描（纯静态隔离）</td>
+</tr>
+<tr>
+<td>启动报 <code>loader fibers failed</code>（<code>cannot get property "fs" without inject</code>）</td>
+<td>插件未构建（lib 缺失）或 cordis 用法错误（<code>ctx.plugin()</code> 后同步取服务）</td>
+<td>C9 cordis 用法检测（毫秒级） + L2 隔离试跑（重启前确认）</td>
+</tr>
+</tbody></table>
+<hr>
+<h2>实战案例（真实事故）</h2>
+<h3>案例 A：未构建的插件导致后端启动崩溃</h3>
+<p><code>dsh-ssh-workspace</code>（SSH 远程工作区）登记进了 profile（<code>file:</code> 依赖 + bundle），但它的
+<code>lib/</code> 从未构建 —— 源码在、构建产物缺。重启后端时报：</p>
+<pre><code>Error: dsh: plugin tree failed to load: loader fibers failed
+  Error: failed to apply loader entry ssh-workspace-fs (@deepseek-ai/dsh-ssh-workspace/fs):
+    cannot get property "fs" without inject
+</code></pre>
+<p><strong>根因链</strong>：<code>ctx.plugin(SandboxedFileSystem)</code> 是异步的，随后立即同步取 <code>localCtx.fs</code> 拿不到
+服务（隔离作用域的 key 对不上）→ <code>cannot get property "fs" without inject</code>。</p>
+<p><strong>L2 隔离试跑如何救场</strong>：装完插件后不重启，直接跑一遍子进程完整 boot——它在后端真正
+重启<strong>之前</strong>就把这条链断掉了（报同样的错），而不是等用户重启才发现。</p>
+<p><strong>修复</strong>（插件侧，不涉及 harness）：</p>
+<ol>
+<li>改用同步 <code>new SandboxedFileSystem(localCtx, config)</code> 并持有实例引用，不再
+<code>ctx.plugin()</code> 后同步取服务；</li>
+<li>直接 <code>new</code> 不走 cordis config 默认值填充，需显式传入
+<code>{ cwd, diffBasisMaxBytes: 10 * 1024 * 1024 }</code>；</li>
+<li><code>inject</code> 补上 <code>sandboxPolicy</code>。</li>
+</ol>
+<p><strong>这个案例说明</strong>：C8 木马扫描 + L2 隔离试跑在 CI 化的安装流程里互为补充——
+静态检查看"有什么"，隔离试跑看"装完能不能起来"。</p>
+<hr>
+<h2>检查能力</h2>
+<h3>L0 静态检查（不加载、不启动）</h3>
+<table>
+<thead>
+<tr>
+<th>检查器</th>
+<th>内容</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>C1 files 完整性</td>
+<td><code>files</code> 白名单 vs 实际 lib 产物，缺 chunk → error</td>
+</tr>
+<tr>
+<td>C2 依赖声明</td>
+<td><code>link:</code> 带运行时依赖 / <code>file:</code> 带 harness peer</td>
+</tr>
+<tr>
+<td>C3 高危副本</td>
+<td>6 个核心包（cordis/cosmokit/dsh-tools/schemastery/dsh-credentials/dsh-home-paths）是否被装成真实目录副本</td>
+</tr>
+<tr>
+<td>C4 依赖可解析</td>
+<td>逐个依赖从插件锚点试解析</td>
+</tr>
+<tr>
+<td>C5 Windows 命令</td>
+<td><code>execFile</code>/<code>spawn</code> 引用的命令在注册表 PATH 是否有真 .exe</td>
+</tr>
+<tr>
+<td>C6 lockfile 一致性</td>
+<td>specifier 与 lockfile <code>version:</code> 前缀是否一致</td>
+</tr>
+<tr>
+<td>C7 禁用插件</td>
+<td>被 disabled 但仍登记的插件（皮肤互斥正常机制不误报）</td>
+</tr>
+<tr>
+<td>C9 cordis 用法</td>
+<td>静态检测三类 cordis 错误：E1 <code>ctx.plugin()</code> 后同步取服务、E2 直接 <code>new</code> 需 config 的 Service 缺 config、E3 访问的服务不在 <code>inject</code> 声明里 → 提前捕获 <code>cannot get property "X" without inject</code> 类崩溃</td>
+</tr>
+</tbody></table>
+<h3>L1 配置组合</h3>
+<p>复用基座 <code>composeEntries</code> 组合 bundle + profile + home 补丁层，与真实启动用<strong>同一算法</strong>；
+检测补丁语法错误、行 id 冲突、补丁跳失。</p>
+<h3>L2 隔离试跑（"不重启试跑"的核心）</h3>
+<p>子进程完整 <code>boot()</code> 全树（webserver 端口偏置为 0，与运行中后端零冲突），
+基座 <code>assertEntriesActivated</code> 断言每个启用插件都激活，超时 90s 抓 hang。
+失败 → 自动回滚（写 home patch 禁用行，HMR 热生效，无需重启）。</p>
+<h3>C8 木马扫描（纯静态、隔离）</h3>
+<ul>
+<li><strong>隔离铁律</strong>：只 <code>readFile</code>，绝不 import / require / 执行插件代码。</li>
+<li>7 类恶意模式：M1 下载执行、M2 凭据窃取、M3 外联回传、M4 混淆后门、M5 持久化、M6 破坏性、M7 环境劫持。</li>
+<li>两级校准：强组合（下载执行 / 破坏性 / 凭据+外联）→ error；单一命中 → warn（提示人工复核）。</li>
+<li>证据脱敏：密钥/令牌/私钥一律 <code>[REDACTED]</code>。</li>
+<li>误报控制：跳过 tests/node_modules/构建产物；<code>new Function("return …")</code>（schemastery 惯用法）、
+<code>atob(dataUrl)</code> 数据解码、<code>downloadFile(</code> 方法名、回环 IP、普通 https API 均不命中。</li>
+</ul>
+<hr>
+<h2>铁律（HARD RULE）</h2>
+<p>修复执行器<strong>严禁修改 harness 源码/安装本体</strong>，只允许修改：</p>
+<ol>
+<li>插件代码（<code>~/.dsh/plugins/**</code>）</li>
+<li>配置层（<code>~/.dsh/profiles/**</code>、<code>~/.dsh/cordis.patch.yml</code>）</li>
+</ol>
+<p>所有写路径经 <code>assertSafeTarget</code> 门禁（realpath 后必须落在 home 内且不在安装根内），
+界面弹确认后路由仍要求 <code>confirmed: true</code>。修复执行器自身不跑 LLM——需要判断力的修复
+打包成预制提示词交给 agent。</p>
+<hr>
+<h2>安装</h2>
+<pre><code># 1. 克隆到插件目录
+mkdir -p ~/.dsh/plugins
+cd ~/.dsh/plugins
+git clone https://github.com/chenw2759-wq/dsh-plugin-healthcheck.git
+
+# 2. 装进 web profile
+npx @deepseek-ai/dsh plugin --profile web add "file:$HOME/.dsh/plugins/dsh-plugin-healthcheck"
+
+# 3. 重启后端，打开左下角设置 → 「插件检测」
+</code></pre>
+<blockquote>
+<p>Windows 下 <code>file:</code> 路径用正斜杠绝对路径，如
+<code>file:C:/Users/&lt;你&gt;/.dsh/plugins/dsh-plugin-healthcheck</code>。</p>
+</blockquote>
+<hr>
+<h2>使用</h2>
+<ol>
+<li>打开 Web GUI <strong>左下角设置</strong>，导航里点「插件检测」；</li>
+<li>选作用域（全部插件 / 指定插件）与层级（L0/L1/L2/木马扫描）；</li>
+<li>点「开始检测」；</li>
+<li>结果按 severity 徽标列出，每条含证据 + 修复动作：<ul>
+<li><strong>一键修复</strong>（确定性，弹确认）</li>
+<li><strong>自动回滚</strong>（L2 失败写 disabled 行，弹确认，HMR 热生效）</li>
+<li><strong>复制提示词</strong>（复杂问题交给 agent）</li>
+</ul>
+</li>
+</ol>
+<p>也可直接调 HTTP 路由：<code>/healthcheck/inventory</code>、<code>/healthcheck/run</code>、<code>/healthcheck/status</code>、
+<code>/healthcheck/repair</code>、<code>/healthcheck/rollback</code>、<code>/healthcheck/history</code>。</p>
+<hr>
+<h2>开发</h2>
+<pre><code>pnpm install          # devDeps（SDK 类型 + 构建工具）
+pnpm run typecheck    # host/client 双 program
+pnpm run build        # lib/index.js + lib/runner.js + lib/client.js
+pnpm test             # vitest（fixtures 复刻历史事故）
+</code></pre>
+<p>需要环境变量 <code>RUN_HEALTHCHECK_E2E=1</code> 才会跑真实 profile 的 e2e（smoke boot / live 路由）。</p>
+<hr>
+<h2>测试</h2>
+<table>
+<thead>
+<tr>
+<th>文件</th>
+<th>覆盖</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>tests/checkers.spec.ts</code></td>
+<td>L0 检查器对 fixture 的断言（missing-chunk 复刻 dsh-pet、link-dep 复刻 zod 事故、peer-copy 复刻双实例事故）</td>
+</tr>
+<tr>
+<td><code>tests/repair.spec.ts</code></td>
+<td>铁律门禁（harness 路径必须拒绝）+ files 修复 + 回滚/撤销幂等</td>
+</tr>
+<tr>
+<td><code>tests/malware.spec.ts</code></td>
+<td>恶意 fixture 拦截、零执行证明、干净插件不误报、密钥脱敏、禁用识别、patch 解析</td>
+</tr>
+<tr>
+<td><code>tests/cordis.spec.ts</code></td>
+<td>C9 cordis 用法检测：E1 异步 plugin 后同步取服务、E2 new Service 缺 config、E3 inject 缺服务（复刻 dsh-ssh-workspace 事故）</td>
+</tr>
+<tr>
+<td><code>tests/smoke.e2e.spec.ts</code></td>
+<td>真实 profile 子进程完整 boot（L2）</td>
+</tr>
+<tr>
+<td><code>tests/live.e2e.spec.ts</code></td>
+<td>真实 profile HTTP 路由全链路（inventory/run/status/history）</td>
+</tr>
+</tbody></table>
+<hr>
+<h2>目录结构</h2>
+<pre><code>src/
+├── index.ts              # host 入口：/healthcheck 路由 + systemPrompt 通告
+├── core/types.ts         # 共享类型（Envelope / Finding / 严重度）
+├── host/
+│   ├── env.ts            # home/profile/插件清单/禁用行解析
+│   ├── checkers.ts       # L0 检查器（C1~C7）
+│   ├── malware.ts        # C8 木马扫描（纯静态隔离）
+│   ├── cordis.ts         # C9 cordis 用法检测（E1~E3，纯静态）
+│   ├── verify.ts         # L1 配置组合 + L2 子进程试跑调度
+│   ├── runner.ts         # L2 子进程入口（lib/runner.js）
+│   ├── repair.ts         # 修复执行器 + 回滚（含铁律门禁）
+│   ├── service.ts        # 检测编排（分层 + 历史）
+│   └── routes.ts         # HTTP 路由
+└── client/
+    ├── index.ts          # settings.section 插槽注册
+    ├── HealthcheckSection.tsx  # 检测面板
+    ├── api.ts            # 浏览器客户端
+    └── locales.ts        # 中英文案
+</code></pre>
+<hr>
+<h2>License</h2>
+<p>MIT</p>

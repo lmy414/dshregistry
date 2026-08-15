@@ -1,0 +1,121 @@
+<h1>dsh-guardian</h1>
+<p>DeepSeek Harness（DSH）<strong>任务防护插件</strong>：把真实故障中总结的教训变成主动防护，防止任务意外中断、防止任务把系统带入自我递归或崩溃状态。<strong>永不终止任务</strong>，只做检测、引导与上报。</p>
+<h2>防护机制（对应四条教训）</h2>
+<h3>1. 插件预检：防止"坏插件把宿主搞崩"</h3>
+<p>历史事故：插件用了 <code>ctx.setInterval</code>（timer 服务）却漏声明 <code>inject: ["timer"]</code> → Cordis 启动抛 <code>cannot get property "timer" without inject</code> → <strong>整棵插件树崩溃、宿主宕机、会话中断</strong>。</p>
+<p>防护：部署任何新插件前运行预检扫描器，静态分析 <code>lib/index.js</code> 的 <code>ctx.&lt;服务&gt;</code> 用法与 <code>inject</code> 声明是否一致：</p>
+<pre><code>node &lt;dsh-guardian&gt;/scripts/preflight.mjs &lt;插件目录或 index.js&gt;
+</code></pre>
+<ul>
+<li>✅ 通过：<code>inject</code> 声明完整（含 timer 类：<code>ctx.setInterval/setTimeout/...</code>）</li>
+<li>❌ 失败：列出缺失的服务名（<code>timer</code>/<code>tools</code>/<code>settings</code>...）并给出修复提示</li>
+<li>智能识别：<code>ctx.get("X")</code> / <code>ctx.inject(["X"], cb)</code> 的嵌套获取<strong>不需要</strong>顶层声明；<code>sctx./wctx.</code> 作用域上下文不会被误判</li>
+</ul>
+<p>也可在代码里直接调用：<code>import { scanSource } from "dsh-guardian/preflight"</code>。</p>
+<h3>2. 循环检测：防止任务原地打转</h3>
+<p>同一工具调用（名称 + 参数指纹）在滑动窗口内重复 ≥ <code>maxLoopRepeats</code> 次 → 判定循环 → 注入换方向提示 + 记录 <code>LOOP_DETECTED</code>。</p>
+<h3>3. 递归防护：防止自我递归失控</h3>
+<p>子代理/工作流嵌套深度（<code>tool-workflow/agent-start</code>→<code>agent-end</code> 计数）超过 <code>maxSubagentDepth</code> → 注入收敛提示 + 记录 <code>RECURSION_DETECTED</code>。</p>
+<h3>4. 中断感知：防止任务执行中被打断</h3>
+<p><code>GET /api/dsh-guardian/status</code> 返回：</p>
+<ul>
+<li>各会话的 <code>running</code> / <code>busy</code> / 嵌套深度 / 近期调用数</li>
+<li><strong><code>safeToRestart</code></strong>：只要还有会话在运行就为 <code>false</code>——重启宿主前先查这里，避免把正在执行的任务连同宿主一起杀掉（本会话多次中断的根因）。</li>
+</ul>
+<p><strong>安全重启助手（强制机制）</strong>：直接重启仍可能因疏忽打断任务，因此提供 <code>scripts/safe-restart.ps1</code>——它<strong>先查 <code>safeToRestart</code>，有会话在运行就拒绝重启</strong>（除非 <code>-Force</code>）：</p>
+<pre><code>powershell -NoProfile -ExecutionPolicy Bypass -File &lt;dsh-guardian&gt;\scripts\safe-restart.ps1
+# 强制重启（仅在确实需要时）：加 -Force
+</code></pre>
+<p>所有事件写入 <code>$DSH_HOME/guardian/events.jsonl</code>，状态路由可查最近 50 条。</p>
+<h2>安装</h2>
+<pre><code>npx -p @deepseek-ai/dsh dsh plugin --profile web add github:akira399/dsh-guardian
+</code></pre>
+<p>安装后重启 DSH。插件<strong>默认启用</strong>。</p>
+<h2>配置（settings.yaml 的 <code>guardian</code> 命名空间）</h2>
+<table>
+<thead>
+<tr>
+<th>键</th>
+<th>默认值</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>enabled</code></td>
+<td><code>true</code></td>
+<td>总开关</td>
+</tr>
+<tr>
+<td><code>maxLoopRepeats</code></td>
+<td><code>5</code></td>
+<td>同一工具+参数重复多少次判定循环</td>
+</tr>
+<tr>
+<td><code>loopWindowSize</code></td>
+<td><code>8</code></td>
+<td>循环检测滑动窗口（最近 N 次工具调用）</td>
+</tr>
+<tr>
+<td><code>maxSubagentDepth</code></td>
+<td><code>5</code></td>
+<td>子代理/工作流嵌套深度上限</td>
+</tr>
+<tr>
+<td><code>cooldownMs</code></td>
+<td><code>30000</code></td>
+<td>引导消息冷却间隔（防止刷屏）</td>
+</tr>
+<tr>
+<td><code>policy</code></td>
+<td><code>"auto"</code></td>
+<td><code>auto</code>（检测到即引导）/ <code>report</code>（仅记录）</td>
+</tr>
+<tr>
+<td><code>loopMessage</code></td>
+<td>内置默认</td>
+<td>循环时注入的换方向提示</td>
+</tr>
+<tr>
+<td><code>recursionMessage</code></td>
+<td>内置默认</td>
+<td>递归超深时注入的收敛提示</td>
+</tr>
+</tbody></table>
+<p>示例：</p>
+<pre><code>guardian:
+  maxLoopRepeats: 4
+  maxSubagentDepth: 3
+</code></pre>
+<p>修改后<strong>热生效</strong>（无需重启）。</p>
+<h2>查看状态</h2>
+<ul>
+<li>事件日志：<code>~/.dsh/guardian/events.jsonl</code>（<code>GUARDIAN_ARMED</code> / <code>LOOP_DETECTED</code> / <code>LOOP_STEERED</code> / <code>RECURSION_DETECTED</code> / <code>RECURSION_STEERED</code>）</li>
+<li>实时状态：<code>GET http://127.0.0.1:3080/api/dsh-guardian/status</code>（配置、会话看门状态、<code>safeToRestart</code>、最近 50 条事件）</li>
+</ul>
+<h2>与 dsh-stall-guard 的分工</h2>
+<table>
+<thead>
+<tr>
+<th>插件</th>
+<th>关注点</th>
+<th>动作</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>dsh-stall-guard</td>
+<td><strong>静默</strong>：无事件 + 无在飞操作超时</td>
+<td>诊断→修复→换方向阶梯引导</td>
+</tr>
+<tr>
+<td>dsh-guardian</td>
+<td><strong>空转</strong>：有事件但在循环/递归 / <strong>崩溃预防</strong>：插件注入预检 / <strong>中断感知</strong></td>
+<td>循环/递归换向引导 + 预检 + safeToRestart</td>
+</tr>
+</tbody></table>
+<p>两者都不终止任务，只通过注入 <code>user/message</code> 引导 Agent。</p>
+<h2>验证</h2>
+<pre><code>pnpm verify
+</code></pre>
+<p>覆盖：语法、预检扫描器（真实插件通过 / 缺 timer·tools 的坏插件被拦截 / core-only 通过）、循环检测与冷却、递归深度防护、report 策略、<code>safeToRestart</code> 判定、事件落盘、隐私扫描。</p>
+<h2>许可</h2>
+<p>MIT © 2026 dsh-guardian contributors</p>

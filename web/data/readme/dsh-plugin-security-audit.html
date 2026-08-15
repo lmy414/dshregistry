@@ -1,0 +1,316 @@
+<h1>dsh-plugin-security-audit</h1>
+<p><strong>Static security audit for dynamic Cordis plugins in <a href="https://github.com/deepseek-ai/deepseek-harness">DeepSeek Harness</a> (DSH).</strong></p>
+<p><a href="#english">English</a> · <a href="#%E4%B8%AD%E6%96%87">中文</a></p>
+<hr>
+<p><a></a></p>
+<h2>What it does</h2>
+<p>Dynamic Cordis plugins defined in a DSH session run plain JavaScript with
+access to real Host services — files, shell, sessions, credentials. The
+sandbox restricts accidental misuse; it is <strong>not</strong> a security boundary against
+malicious code. This plugin adds a deterministic, zero-token static audit
+layer over every <code>cordis_define</code> / <code>cordis_run</code> call in the session:</p>
+<ul>
+<li><strong>Scan on define</strong> — every <code>cordis_define</code>'s <code>code.host</code> / <code>code.client</code>
+source is scanned by a 16-rule engine before the package is minted.</li>
+<li><strong>Gate on activate</strong> — a <code>cordis_run</code> for a package with <code>critical</code> or
+<code>high</code> findings is escalated to a user approval (<code>{kind:'ask'}</code>) whose
+reason carries the top findings. Clean and low-risk packages run normally.</li>
+<li><strong>Report in the conversation</strong> — a compact risk report is appended beside
+every <code>cordis_define</code> / <code>cordis_run</code> result as an <code>additionalContexts</code>
+notice, so both the model and the user see it in the tool-result stream.</li>
+<li><strong>Fail-open by design</strong> — any internal scan error is logged and the audited
+call proceeds untouched. The audit layer itself is never a failure point
+for the harness.</li>
+</ul>
+<h2>Install</h2>
+<p>Requires DSH with the <code>dsh plugin</code> command (v0.1.0-rc.6+).</p>
+<pre><code># from npm (once published)
+dsh plugin --profile web add dsh-plugin-security-audit
+
+# from GitHub
+dsh plugin --profile web add github:&lt;owner&gt;/dsh-plugin-security-audit
+</code></pre>
+<p>Restart the profile (<code>dsh web</code>) afterwards; bundle layers take effect on
+boot. Verify the row composed:</p>
+<pre><code>dsh --profile web --dump-config | grep plugin-security-audit
+</code></pre>
+<p>To use it in an agent preset instead, copy
+<a href="https://github.com/chendengyuanxm/dsh-plugin-security-audit/blob/HEAD/examples/preset/"><code>examples/preset/</code></a> into
+<code>~/.dsh/.agent-presets/plugin-security-audit/</code> and select the preset when
+starting a session.</p>
+<h2>How it works</h2>
+<pre><code>cordis_define ─▶ tools/pre-execute ─▶ scan engine (16 rules, pure function)
+                                        │ findings
+                                        ▼
+                                   report cache (LRU 100)
+                                        │
+cordis_run  ─▶ tools/pre-execute ─▶ high/critical? ─▶ {kind:'ask'} + reasons
+                                        │ else
+                                        ▼
+tools/post-execute ─▶ additionalContexts notice (model + user visible)
+</code></pre>
+<ul>
+<li>Listeners are registered on the composition scope, covering every agent in
+the profile/preset (DSH tool-pipeline events flow up the scope chain).</li>
+<li>Reports are plain owned JSON; no live Cordis objects are serialized.</li>
+<li>Report delivery uses the <code>additionalContexts</code> channel on
+<code>tools/post-execute</code> — independent of each tool's <code>output.render</code>, so the
+notice cannot be clobbered by the tool's own content finalization.</li>
+</ul>
+<h2>Rules</h2>
+<table>
+<thead>
+<tr>
+<th>Group</th>
+<th>Rule (id)</th>
+<th>Severity</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>Dangerous capabilities</td>
+<td><code>global-proc</code> — Node <code>process</code> global</td>
+<td>critical</td>
+</tr>
+<tr>
+<td></td>
+<td><code>global-buf</code> — <code>Buffer</code> global</td>
+<td>high</td>
+</tr>
+<tr>
+<td></td>
+<td><code>dynamic-eval</code> — <code>eval</code> / <code>new Function</code></td>
+<td>critical</td>
+</tr>
+<tr>
+<td></td>
+<td><code>module-load</code> — <code>require()</code> / <code>import</code> of external modules</td>
+<td>high</td>
+</tr>
+<tr>
+<td></td>
+<td><code>ctx-bracket</code> — <code>ctx[...]</code> dynamic property escape</td>
+<td>high</td>
+</tr>
+<tr>
+<td></td>
+<td><code>native-timer</code> — <code>setTimeout</code> &amp; friends (not <code>ctx.timeout</code>)</td>
+<td>medium</td>
+</tr>
+<tr>
+<td></td>
+<td><code>client-dom</code> — direct <code>document</code>/<code>window</code>/<code>fetch</code> on Client</td>
+<td>high</td>
+</tr>
+<tr>
+<td>Data exfiltration</td>
+<td><code>exfil-combo</code> — sensitive source + network sink combo</td>
+<td>critical</td>
+</tr>
+<tr>
+<td></td>
+<td><code>hardcoded-cred</code> — hardcoded secrets</td>
+<td>high</td>
+</tr>
+<tr>
+<td></td>
+<td><code>base64-net</code> — base64 codec + network sink combo</td>
+<td>high</td>
+</tr>
+<tr>
+<td>Cordis anti-patterns</td>
+<td><code>live-serialize</code> — <code>JSON.stringify</code>/<code>structuredClone</code> on live objects</td>
+<td>high/medium</td>
+</tr>
+<tr>
+<td></td>
+<td><code>undeclared-svc</code> — <code>ctx.x</code> access without <code>inject</code></td>
+<td>medium</td>
+</tr>
+<tr>
+<td></td>
+<td><code>sensitive-svc</code> — shell / subprocess / fs / web / credentials / sessionQuery use</td>
+<td>high</td>
+</tr>
+<tr>
+<td></td>
+<td><code>effect-no-dispose</code> — <code>ctx.effect</code> callback without a disposer</td>
+<td>medium</td>
+</tr>
+<tr>
+<td>Over-reach surfaces</td>
+<td><code>rpc-live-obj</code> — package RPC returning live objects</td>
+<td>medium</td>
+</tr>
+<tr>
+<td></td>
+<td><code>shadow-slot</code> — registering high-risk replacement Slots</td>
+<td>medium</td>
+</tr>
+</tbody></table>
+<p>Activation gating threshold: <code>critical</code> or <code>high</code> ⇒ user approval required.</p>
+<h2>Limitations</h2>
+<ul>
+<li>Static pattern matching with light scope approximation — it cannot catch
+intent-level or multi-step obfuscated attacks. A CLEAN verdict means "no
+rule matched", never "provably safe".</li>
+<li><code>critical</code>+<code>high</code> findings escalate the <em>approval</em>; the audit never hard
+-blocks a call by itself.</li>
+<li>Reports are in-process only (no persistence, no history UI).</li>
+</ul>
+<h2>Development</h2>
+<pre><code>npm test        # offline regression: bad vector must hit, clean must pass,
+                # activation gate must return {kind:'ask'}
+</code></pre>
+<p><code>examples/dynamic/</code> ships the in-session dynamic-plugin form (identical Host
+logic plus a Client audit panel registered in the <code>tool.view.cordis</code> slot of
+its own Run card — that panel relies on dynamic-plugin-only Builtins
+(<code>host.call</code>, <code>styles</code>) and therefore is not part of the static bundle).</p>
+<h2>License</h2>
+<p>MIT</p>
+<hr>
+<p><a></a></p>
+<h1>dsh-plugin-security-audit（插件安全审查）</h1>
+<p><strong>对 <a href="https://github.com/deepseek-ai/deepseek-harness">DeepSeek Harness</a>（DSH）中动态 Cordis 插件的静态安全审查。</strong></p>
+<h2>功能</h2>
+<p>会话内定义的动态 Cordis 插件以纯 JavaScript 运行，并可访问真实 Host 服务——文件、Shell、会话、凭据。沙箱只防误用，<strong>不是</strong>对抗恶意代码的安全边界。本插件在每个 <code>cordis_define</code> / <code>cordis_run</code> 调用上加一层确定性、零 token 的静态审查：</p>
+<ul>
+<li><strong>定义即扫描</strong>——每次 <code>cordis_define</code> 的 <code>code.host</code> / <code>code.client</code> 源码都会先经过 16 条规则的引擎扫描。</li>
+<li><strong>激活前把关</strong>——对存在 <code>critical</code> / <code>high</code> 发现的插件包，<code>cordis_run</code> 会升级为用户审批（<code>{kind:'ask'}</code>），审批理由携带最高危发现；干净与低风险包正常放行。</li>
+<li><strong>报告进对话流</strong>——每次 <code>cordis_define</code> / <code>cordis_run</code> 结果旁附带一条紧凑的风险报告（<code>additionalContexts</code> 通知），模型与用户都能在工具结果流里看到。</li>
+<li><strong>设计上永不阻塞</strong>——审查层内部任何异常只记录日志，被审调用照常进行；审查器自身永远不会成为 harness 的故障点。</li>
+</ul>
+<h2>安装</h2>
+<p>需要带 <code>dsh plugin</code> 命令的 DSH（v0.1.0-rc.6+）。</p>
+<pre><code># npm（发布后）
+dsh plugin --profile web add dsh-plugin-security-audit
+
+# GitHub
+dsh plugin --profile web add github:&lt;owner&gt;/dsh-plugin-security-audit
+</code></pre>
+<p>之后重启 profile（<code>dsh web</code>），bundle 层在启动时生效。验证组合结果：</p>
+<pre><code>dsh --profile web --dump-config | grep plugin-security-audit
+</code></pre>
+<p>若想以 agent preset 方式使用，把 <a href="https://github.com/chendengyuanxm/dsh-plugin-security-audit/blob/HEAD/examples/preset/"><code>examples/preset/</code></a>
+复制到 <code>~/.dsh/.agent-presets/plugin-security-audit/</code>，建会话时选择该预设即可。</p>
+<h2>工作原理</h2>
+<pre><code>cordis_define ─▶ tools/pre-execute ─▶ 扫描引擎（16 条规则，纯函数）
+                                        │ findings
+                                        ▼
+                                   报告缓存（LRU 100）
+                                        │
+cordis_run  ─▶ tools/pre-execute ─▶ 有 critical/high？─▶ {kind:'ask'} + 理由
+                                        │ 否则放行
+                                        ▼
+tools/post-execute ─▶ additionalContexts 通知（模型 + 用户可见）
+</code></pre>
+<ul>
+<li>监听器注册在组合层作用域上，按 DSH 工具管线事件的作用域链覆盖该 profile / preset 下的每个 agent。</li>
+<li>报告是自有的纯 JSON，不序列化任何 Cordis 活对象。</li>
+<li>报告走 <code>tools/post-execute</code> 的 <code>additionalContexts</code> 通道——独立于各工具自身的 <code>output.render</code>，不会被工具的内容终改覆盖。</li>
+</ul>
+<h2>规则</h2>
+<table>
+<thead>
+<tr>
+<th>分组</th>
+<th>规则（id）</th>
+<th>级别</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>危险能力</td>
+<td><code>global-proc</code>——Node <code>process</code> 全局</td>
+<td>critical</td>
+</tr>
+<tr>
+<td></td>
+<td><code>global-buf</code>——<code>Buffer</code> 全局</td>
+<td>high</td>
+</tr>
+<tr>
+<td></td>
+<td><code>dynamic-eval</code>——<code>eval</code> / <code>new Function</code></td>
+<td>critical</td>
+</tr>
+<tr>
+<td></td>
+<td><code>module-load</code>——<code>require()</code> / <code>import</code> 外部模块</td>
+<td>high</td>
+</tr>
+<tr>
+<td></td>
+<td><code>ctx-bracket</code>——<code>ctx[...]</code> 动态属性逃逸</td>
+<td>high</td>
+</tr>
+<tr>
+<td></td>
+<td><code>native-timer</code>——<code>setTimeout</code> 等（未用 <code>ctx.timeout</code>）</td>
+<td>medium</td>
+</tr>
+<tr>
+<td></td>
+<td><code>client-dom</code>——Client 端直接用 <code>document</code>/<code>window</code>/<code>fetch</code></td>
+<td>high</td>
+</tr>
+<tr>
+<td>数据外泄</td>
+<td><code>exfil-combo</code>——敏感数据源 + 网络出口组合</td>
+<td>critical</td>
+</tr>
+<tr>
+<td></td>
+<td><code>hardcoded-cred</code>——硬编码密钥</td>
+<td>high</td>
+</tr>
+<tr>
+<td></td>
+<td><code>base64-net</code>——base64 编解码 + 网络出口组合</td>
+<td>high</td>
+</tr>
+<tr>
+<td>Cordis 反模式</td>
+<td><code>live-serialize</code>——对活对象 <code>JSON.stringify</code>/<code>structuredClone</code></td>
+<td>high/medium</td>
+</tr>
+<tr>
+<td></td>
+<td><code>undeclared-svc</code>——未声明 <code>inject</code> 就访问 <code>ctx.x</code></td>
+<td>medium</td>
+</tr>
+<tr>
+<td></td>
+<td><code>sensitive-svc</code>——使用 shell / subprocess / fs / web / credentials / sessionQuery</td>
+<td>high</td>
+</tr>
+<tr>
+<td></td>
+<td><code>effect-no-dispose</code>——<code>ctx.effect</code> 回调不返回清理函数</td>
+<td>medium</td>
+</tr>
+<tr>
+<td>越权面</td>
+<td><code>rpc-live-obj</code>——包私有 RPC 返回活对象</td>
+<td>medium</td>
+</tr>
+<tr>
+<td></td>
+<td><code>shadow-slot</code>——注册高风险覆盖型 Slot</td>
+<td>medium</td>
+</tr>
+</tbody></table>
+<p>激活把关阈值：<code>critical</code> 或 <code>high</code> ⇒ 需用户审批。</p>
+<h2>局限</h2>
+<ul>
+<li>静态模式匹配 + 轻量作用域近似，无法识别意图级或多步混淆攻击；CLEAN 结论只表示"未命中规则"，绝不等于"证明安全"。</li>
+<li><code>critical</code>+<code>high</code> 只升级为<strong>审批</strong>；审查器自身从不硬阻断调用。</li>
+<li>报告仅存于进程内（无持久化、无历史界面）。</li>
+</ul>
+<h2>开发</h2>
+<pre><code>npm test        # 离线回归：违规向量必须命中、干净向量必须通过、
+                # 激活把关必须返回 {kind:'ask'}
+</code></pre>
+<p><code>examples/dynamic/</code> 提供会话内动态插件形态（Host 逻辑一致，另带一个挂在
+自身 Run 卡 <code>tool.view.cordis</code> Slot 的 Client 审查面板——面板依赖动态插件
+专属 Builtin（<code>host.call</code>、<code>styles</code>），因此不属于静态 bundle）。</p>
+<h2>许可</h2>
+<p>MIT</p>

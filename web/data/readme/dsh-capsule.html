@@ -1,0 +1,118 @@
+<h1>dsh-capsule</h1>
+<p><strong>Everything is a plugin. Ambient authority should not be.</strong></p>
+<p><code>dsh-capsule</code> v0.1 runs compatible third-party DeepSeek Harness guests in fresh Linux Bubblewrap processes. The trusted host verifies one integrity-pinned JavaScript artifact, discovers its contributions in an isolated <code>describe</code> cell, and registers real DSH tools and static system-prompt sections on the guest's behalf. Every tool call starts another fresh cell; guest code is never loaded into the DSH process and never remains resident between calls.</p>
+<p>中文说明见 <a href="https://github.com/2-c-q/dsh-capsule/blob/HEAD/README.zh.md">README.zh.md</a>.</p>
+<h2>v0.1 security boundary</h2>
+<p>The v0.1 isolation provider is Linux-only and accepts a DSH managed subprocess runtime only after fail-closed execution-world attestation. Before any guest code runs, an empty-environment probe with bounded time and output must echo a private random challenge, report Host-identical Node, Bubblewrap, reported non-addon shared-object, mount-namespace, and root identities, then join its managed process tree. The built-in local subprocess provider is the normal implementation that satisfies this proof, but class identity is not required. The selected subprocess provider remains part of the trusted computing base.</p>
+<p>A small trusted launcher opens every mounted runtime, artifact, and workspace source through stable descriptors without following a symbolic link, then Bubblewrap mounts only those descriptors. Bubblewrap constructs a new user, PID, mount, and network namespace from an empty root; adds the selected Node executable, non-addon shared libraries, the exact read-only guest artifact, a private bounded <code>/tmp</code>, <code>/proc</code>, a minimal <code>/dev</code>, and only explicitly admitted read-only workspace files; clears the inherited environment and sets only <code>HOME=/tmp</code> and <code>PATH=/runtime</code>; and drops capabilities. The strict launch document labels each mount <code>runtime</code>, <code>guest</code>, or <code>workspace-read</code>; Node workspace permissions derive only from <code>workspace-read</code>, not from a destination pathname. Node's Permission Model, disabled addons and inspector signal, V8 heap ceiling, protocol limits, deadlines, and the host scheduler provide defense in depth.</p>
+<p>Node's Permission Model is not the isolation boundary. A configured capsule fails to activate on non-Linux hosts, when Bubblewrap is unavailable, when the artifact or policy does not match, or when any required control cannot be established. There is no cooperative provider and no silent downgrade.</p>
+<p>Protocol v0.1 supports only exact <code>workspace-read</code> capabilities for existing regular files. Every request needs the same relative path in deployment <code>grants</code>; a requested workspace path needs an absolute <code>workspaceRoot</code> and must remain inside that root without symlink traversal. Bubblewrap mounts the file read-only at the corresponding <code>/workspace/&lt;path&gt;</code> destination and Node's allowlist mirrors it. A requested directory target or any <code>workspace-write</code>, <code>network-connect</code>, <code>subprocess-exec</code>, or <code>storage</code> request or grant fails activation. Empty <code>requests</code> and <code>grants</code> remain valid, as in the echo example. The threat claim is runtime authority containment within the documented Linux boundary, not protection from denial of service, kernel or Bubblewrap vulnerabilities, side channels, or unsafe prompt content. See the <a href="https://github.com/2-c-q/dsh-capsule/blob/HEAD/docs/THREAT_MODEL.md">threat model</a>.</p>
+<p>Directory mounts are not a v0.1 capability because their contents can include Host IPC endpoints and other special files. Raw write mounts are also excluded because inode aliases can extend a write's effects beyond the granted pathname. A later directory or write capability must use a Host-owned broker or snapshot-and-commit mechanism instead of exposing either mount directly.</p>
+<h2>Install in DeepSeek Harness</h2>
+<p>Install Bubblewrap on a Debian or Ubuntu Linux host:</p>
+<pre><code>sudo apt-get update
+sudo apt-get install --yes bubblewrap
+</code></pre>
+<p>Ubuntu 24.04 enables <a href="https://documentation.ubuntu.com/security/security-features/privilege-restriction/apparmor/">AppArmor restrictions on unprivileged user namespaces</a> by default. If Capsule activation reports <code>loopback: Failed RTM_NEWADDR: Operation not permitted</code>, load Ubuntu's targeted Bubblewrap profile instead of disabling that restriction system-wide, then run the final command as a preflight:</p>
+<pre><code>sudo apt-get install --yes apparmor-profiles
+sudo install -m 0644 \
+  /usr/share/apparmor/extra-profiles/bwrap-userns-restrict \
+  /etc/apparmor.d/bwrap-userns-restrict
+sudo apparmor_parser --replace /etc/apparmor.d/bwrap-userns-restrict
+bwrap --die-with-parent --new-session --unshare-all --unshare-user \
+  --disable-userns --cap-drop ALL --ro-bind / / /bin/true
+</code></pre>
+<p>The profile applies to every <code>/usr/bin/bwrap</code> invocation on that host, so an administrator should assess other Bubblewrap or Flatpak users before loading it on a long-lived machine. Other distributions need an equivalent administrator-approved policy that lets unprivileged Bubblewrap create its user, mount, PID, and network namespaces. Capsule does not change host AppArmor or sysctl policy itself.</p>
+<p>The installed Bubblewrap must support <code>--ro-bind-fd</code>. The active managed subprocess provider must pass execution-world attestation; a different filesystem view, a different resolved object, a missing Bubblewrap feature, malformed or truncated proof output, timeout, or incomplete process-tree join fails activation. The host never selects pathname mounts or a weaker execution mode.</p>
+<p>The package accepts <code>@deepseek-ai/dsh-subprocess</code>, <code>@deepseek-ai/dsh-system-prompt</code>, and <code>@deepseek-ai/dsh-tools</code> peers from <code>0.1.0-rc.5</code> up to but excluding <code>0.2.0</code>. It does not require <code>@deepseek-ai/dsh-subprocess-local</code> as a package peer.</p>
+<p>Install the bundle into the profile that should own the host:</p>
+<pre><code>dsh plugin --profile &lt;profile&gt; add github:2-c-q/dsh-capsule
+</code></pre>
+<p>The bundle mounts an inert <code>dsh-capsule-host</code> row with no capsules. Add a profile-level <code>cordis.patch.yml</code> override like the following, replacing the example root with the absolute path to this repository's <code>examples/echo-capsule</code> directory:</p>
+<pre><code>- id: dsh-capsule-host
+  config:
+    capsules:
+      - root: /absolute/path/to/dsh-capsule/examples/echo-capsule
+        manifest: capsule.json
+        policy:
+          capsuleId: example.echo
+          tools:
+            - capsule_echo
+          promptSections:
+            - capsule.echo.guidance
+          grants: []
+    bubblewrapCommand: bwrap
+    maxManifestBytes: 262144
+    maxArtifactBytes: 16777216
+    maxFrameBytes: 1048576
+    maxStderrBytes: 65536
+    maxDescriptionBytes: 4096
+    maxPromptBytes: 65536
+    maxContributions: 64
+    maxJsonNodes: 10000
+    maxJsonDepth: 32
+    startupTimeoutMs: 5000
+    callTimeoutMs: 30000
+    shutdownTimeoutMs: 500
+    processGraceMs: 500
+    maxConcurrentCalls: 4
+    maxQueuedCalls: 32
+    maxOldSpaceSizeMb: 128
+    tmpfsBytes: 16777216
+</code></pre>
+<p>A DSH patch replaces the target row's whole <code>config</code>; it does not deep-merge nested fields. An override must therefore restate every field it needs to preserve. The example explicitly repeats all v0.1 defaults so adding <code>capsules</code> does not discard a bundle-supplied limit. Use <code>dsh --profile &lt;profile&gt; --dump-config</code> to inspect the composed row before starting the profile.</p>
+<p>To grant workspace access, add <code>workspaceRoot</code> beside <code>root</code> and <code>manifest</code>, then declare an exact read-only file in the guest manifest and deployment policy. For example, this manifest request:</p>
+<pre><code>{"kind":"workspace-read","path":"reference/context.txt"}
+</code></pre>
+<p>requires this capsule mount configuration:</p>
+<pre><code>workspaceRoot: /absolute/path/to/workspace
+policy:
+  capsuleId: example.reader
+  tools:
+    - capsule_read
+  promptSections: []
+  grants:
+    - kind: workspace-read
+      path: reference/context.txt
+</code></pre>
+<p><code>/absolute/path/to/workspace/reference/context.txt</code> must already be a regular file, must not traverse a symlink, and must remain disjoint from private Host staging. The guest sees it read-only at <code>/workspace/reference/context.txt</code>. A parent grant, a directory, a different permission kind, or an unsupported resource kind does not satisfy the request. Extra <code>workspace-read</code> policy entries are syntax-checked but grant nothing, require no filesystem target until requested, and are not mounted.</p>
+<p>At activation, the host reads <code>capsule.json</code> without executing the guest, resolves the entry inside the configured root, verifies its SHA-256 digest, copies those exact bytes into a private read-only staging file, and requires every manifest contribution and resource request to fit the deployment policy upper bound. Extra policy entries grant nothing by themselves and are not mounted. The host stages immutable launcher bytes, opens each source by descriptor for the fresh <code>describe</code> cell, and publishes all admitted tools and prompt sections atomically through <code>ctx.tools</code> and <code>ctx.systemPrompt</code>. Tool calls then use the normal DSH validation, execution, presentation, and session-log path.</p>
+<h2>Build a guest</h2>
+<p>A guest imports the small SDK from <code>dsh-capsule/guest</code> and calls <code>runCapsuleGuest(...)</code>. See <a href="https://github.com/2-c-q/dsh-capsule/blob/HEAD/examples/echo-capsule/source.ts"><code>examples/echo-capsule/source.ts</code></a> for a complete tool and static prompt section.</p>
+<p>The runtime mounts exactly one guest file and provides no <code>node_modules</code>, so bundle the SDK and every JavaScript dependency into one standalone ESM artifact:</p>
+<pre><code>pnpm exec esbuild examples/echo-capsule/source.ts \
+  --bundle \
+  --platform=node \
+  --format=esm \
+  --target=node22 \
+  --outfile=examples/echo-capsule/guest.mjs
+sha256sum examples/echo-capsule/guest.mjs
+</code></pre>
+<p>Declare that lowercase digest in <code>capsule.json</code>. This echo guest requests no workspace access, so its resource array and policy grants are empty:</p>
+<pre><code>{
+  "protocol": "dsh-capsule/0",
+  "id": "example.echo",
+  "entry": "./guest.mjs",
+  "integrity": {
+    "sha256": "870a9cc8532a2b955ea5570ee9e8b79f6552029c403de95fd814f8489d5a5e58"
+  },
+  "contributes": {
+    "tools": ["capsule_echo"],
+    "promptSections": ["capsule.echo.guidance"]
+  },
+  "requests": []
+}
+</code></pre>
+<p>Rebuild and update the digest whenever guest source, SDK code, or bundled dependencies change. Activation fails on an integrity mismatch; it never executes different bytes as a fallback. The example repository automates this with <code>pnpm run build:example</code> and checks it with <code>pnpm run verify:example</code>.</p>
+<h2>Protocol and limitations</h2>
+<p>Messages are strict, length-prefixed JSON with frame-byte limits; descriptor schemas additionally have depth and node-count limits. Time, concurrency, queue, stderr, prompt, and description limits are deployment-controlled. <code>describe</code> activates one fresh process only long enough to return immutable tool schemas and static prompt text. Each invocation activates a different process, revalidates the same descriptors, executes exactly one tool, completes an explicit shutdown handshake, and joins the managed process tree. Guest process state is therefore ephemeral. A read-only workspace file remains Host-owned and may change through trusted external activity, but the guest cannot use it to persist writes. Private persistent storage and all network or subprocess capabilities are unsupported in v0.1.</p>
+<p>Capsule guests are a distinct API and are not transparent replacements for arbitrary Cordis plugins. Read the <a href="https://github.com/2-c-q/dsh-capsule/blob/HEAD/docs/RFC.md">RFC</a> for the exact protocol and lifecycle, and the dated <a href="https://github.com/2-c-q/dsh-capsule/blob/HEAD/docs/ECOSYSTEM_REVIEW.md">ecosystem review</a> for the project scope.</p>
+<h2>Development</h2>
+<pre><code>pnpm install
+pnpm run check
+pnpm run build:example
+pnpm run verify:example
+pnpm run pack:check
+</code></pre>
+<h2>License</h2>
+<p>MIT</p>

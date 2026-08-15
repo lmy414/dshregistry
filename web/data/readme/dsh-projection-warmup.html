@@ -1,0 +1,51 @@
+<h1>dsh-projection-warmup</h1>
+<p>DSH（DeepSeek Harness）projection 分片预热插件。</p>
+<h2>问题</h2>
+<p>dsh <code>0.1.0-rc.6</code> 的 projection 冷折叠是同步的：<code>SessionProjectionRegistry.cellFor()</code>
+在 cell 冷时对整个 <code>session.events</code> 逐事件 <code>apply()</code>，大会话（数十万事件）是分钟级
+纯 CPU 计算，期间 Node 事件循环冻结，所有 30s 超时的 unary RPC（历史加载、UI 操作）
+批量超时，前端表现为「signal timed out (internal)」。实测 74 万事件会话冷折叠阻塞
+20+ 分钟（100% 单核）。</p>
+<h2>方案</h2>
+<ol>
+<li><p><strong>live 会话分片预热</strong>（v0.1，默认开）：会话进入（created/resume）且事件数超过
+阈值时，抢在首次同步冷折叠前，分片重放 cells——每 <code>chunkSize</code> 个事件
+<code>setImmediate</code> 让出事件循环，折叠完成后直写 <code>registration.cells</code>（WeakMap），
+此后 <code>snapshot()</code>/<code>drive()</code> 全部命中热 cell。可用时从投影缓存行取基线跳过已折叠
+前缀。实测 74 万事件会话：<strong>冷折叠 20 分钟 → 预热 200ms</strong>。</p>
+</li>
+<li><p><strong>fork 子会话缓存回填</strong>（v0.2，默认开，零成本）：fork 子会话
+（<code>header.parentSession</code> 存在）预热完成后立即 <code>cache.write(child)</code> 建立投影缓存
+行——否则它被放弃时永远没有缓存行，下次打开历史 <code>coldSnapshot</code> 走
+<code>readFrom(0)</code> 全量读（分钟级阻塞）。</p>
+</li>
+<li><p><strong>磁盘冷会话后台补行</strong>（v0.2，<strong>默认关</strong>）：扫描缺缓存行的大日志，流式
+parse + fold 后 <code>putSoft</code> 写行。默认关闭的原因：<code>readRaw</code> 内部的 zstd 全量解码
+是同步的、插件层不可分片，对大文件仍会冻结事件循环数秒~数十秒；且启动期补行
+与 dsh 自身的启动投影折叠叠加会推高内存峰值（有 OOM 风险）。需要时经
+<code>config.set</code> 打开。</p>
+</li>
+</ol>
+<h2>安装</h2>
+<pre><code>dsh plugin --profile web add github:orangeofcarl0-sys/dsh-projection-warmup
+</code></pre>
+<h2>API</h2>
+<p><code>POST http://127.0.0.1:3080/dsh-projection-warmup/api/&lt;method&gt;</code>：</p>
+<ul>
+<li><code>stats.get</code> / <code>stats.reset</code> — 预热/补行计数与明细</li>
+<li><code>config.get</code> / <code>config.set</code> — 运行时开关</li>
+</ul>
+<h2>局限与上游建议</h2>
+<ul>
+<li>冷会话 <code>coldSnapshot</code> 的全量 <code>readFrom(0)</code>（含 zstd 解码 + 逐事件
+<code>snapshotStoredEvents</code> 深拷贝）无法在插件层安全分片——<code>readRaw</code> 的同步解码是硬伤。
+根治需上游把 <code>readFromCore</code>/<code>loadStored</code> 的解码与 <code>snapshotStoredEvents</code> 改成分片
+让出事件循环。</li>
+<li>超大会话（70 万+ 事件）加载本身有内存 OOM 风险，与插件无关。</li>
+</ul>
+<h2>验证</h2>
+<ul>
+<li><code>tests/smoke_test.mjs</code>（11 断言）：分片预热与同步折叠一致、checkpoint 基线、
+并发 drive 让位、dispose 中止、小会话跳过</li>
+<li><code>tests/test_backfill.mjs</code>（8 断言）：fork 回填、非 fork 不回填、磁盘冷会话补行</li>
+</ul>

@@ -1,0 +1,66 @@
+<h1>dsh-silent-pwsh</h1>
+<p>A <strong>DeepSeek-Harness plugin</strong> for Windows that makes sandboxed (confined) <code>pwsh</code> / <code>bash</code> calls spawn their console window <strong>hidden</strong> (<code>SW_HIDE</code>) — no black console window flashes on every command.</p>
+<p><img src="https://img.shields.io/badge/DeepSeek--Harness-plugin-4b6bff" alt="dsh"></p>
+<h2>Problem</h2>
+<p>Every sandboxed pwsh call in DeepSeek-Harness runs through the windows-acl runner (<code>dsh-sandbox-windows-acl/lib/runner.js</code>), which spawns the confined child with a fresh console window unless <code>STARTF_USESHOWWINDOW | SW_HIDE</code> is set in the child's <code>STARTUPINFOW</code>. The shipped package omits it, so <strong>every confined command flashes a black console window</strong> on the desktop. (<code>CREATE_NO_WINDOW</code> is not an option: under the restricted token it makes the child die with <code>STATUS_DLL_INIT_FAILED</code> (<code>0xC0000142</code>) — verified by the DSH maintainers. <code>SW_HIDE</code> keeps the console alive and simply never shows it.)</p>
+<p>Two related flashes are also fixed: the process-tree <code>taskkill</code> termination and the one-time sandbox capability probe, whose spawns lacked <code>windowsHide</code>.</p>
+<h2>How it works</h2>
+<p>DSH's plugin model is loader-config patches plus Cordis plugins; no config seam can change those native spawn flags. So this plugin is a <strong>self-healing patch plugin</strong>: on every host start (before any confined command runs) it idempotently checks and re-applies a three-file patch:</p>
+<table>
+<thead>
+<tr>
+<th>File (under <code>&lt;host&gt;\node_modules</code>)</th>
+<th>Patch</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>@deepseek-ai/dsh-sandbox-windows-acl/lib/types-CNjZgO4h.js</code></td>
+<td>both <code>encodeStartupInfo</code> calls: <code>dwFlags: 256</code> → <code>257</code> (+<code>STARTF_USESHOWWINDOW</code>), add <code>wShowWindow: 0</code> (<code>SW_HIDE</code>)</td>
+</tr>
+<tr>
+<td><code>@deepseek-ai/dsh-subprocess-local/lib/index.js</code></td>
+<td><code>taskkill</code> <code>spawnSync</code> gets <code>windowsHide: true</code></td>
+</tr>
+<tr>
+<td><code>@deepseek-ai/dsh-sandbox-local/lib/index.js</code></td>
+<td>windows-acl capability probe <code>spawnSync</code> gets <code>windowsHide: true</code></td>
+</tr>
+</tbody></table>
+<p>The patch only rewrites files that are in the expected pre-patch shape; if an upgrade changes them, it warns and skips instead of corrupting them. <strong>Reinstall or upgrade the app and the patch is re-applied automatically on the next boot.</strong></p>
+<h2>Install</h2>
+<p>Requirements: DeepSeek-Harness desktop app, <code>node</code> and <code>pnpm</code> on <code>PATH</code>.</p>
+<h3>From GitHub (recommended)</h3>
+<pre><code>dsh plugin --profile web add github:chengyimingvb/dsh-silent-pwsh
+# or with a full URL
+dsh plugin --profile web add https://github.com/chengyimingvb/dsh-silent-pwsh
+</code></pre>
+<h3>From a local folder / zip</h3>
+<pre><code># extract the zip, cd into dsh-silent-pwsh, then:
+.\install.ps1                      # installs into the 'web' profile
+.\install.ps1 -Profile headless    # or another profile
+# if blocked by execution policy:  powershell -ExecutionPolicy Bypass -File .\install.ps1
+</code></pre>
+<p>Then <strong>restart DeepSeek Harness</strong>. The host log will show <code>[silent-pwsh] up to date</code> (or <code>[silent-pwsh] patched …</code> when it had to heal).</p>
+<blockquote>
+<p><strong>Gotcha:</strong> if pnpm fails with a supply-chain policy error (<code>minimumReleaseAge</code>), add the reported <code>package@version</code> to the profile's <code>pnpm-workspace.yaml</code> <code>minimumReleaseAgeExclude</code> list and re-run.</p>
+</blockquote>
+<h2>Uninstall</h2>
+<pre><code>dsh plugin --profile web remove dsh-silent-pwsh
+</code></pre>
+<p>The patched files are left as-is. To restore the shipped files manually:</p>
+<pre><code>$chunk = "$env:ProgramFiles\DeepSeek Harness\resources\host\node_modules\@deepseek-ai\dsh-sandbox-windows-acl\lib\types-CNjZgO4h.js"
+(Get-Content $chunk -Raw) -replace 'dwFlags: 257,`n`t`twShowWindow: 0,', 'dwFlags: 256,' | Set-Content $chunk -NoNewline -Encoding utf8
+# likewise remove ', windowsHide: true' from the taskkill and probe spawnSync calls.
+</code></pre>
+<h2>Configuration</h2>
+<ul>
+<li><code>DSH_INSTALL_ROOT</code> — point at the directory containing <code>node_modules</code> when the host root cannot be auto-detected. Default detection: <code>&lt;app dir&gt;\resources\host</code> derived from <code>process.execPath</code>, with <code>cwd</code> and plugin-location fallbacks.</li>
+</ul>
+<h2>Development / verification</h2>
+<pre><code>node test.mjs   # idempotence against the real host files + heal-a-reverted-copy round trip
+</code></pre>
+<p>Verified: confined pwsh still executes correctly through the runner (exit 0, output flows through inherited stdio, no <code>0xC0000142</code> regression).</p>
+<h2>Notes for maintainers</h2>
+<p>The packaged app already ships a fixed-but-unused chunk (<code>types-C1ecepac.js</code>); wiring the entry imports to it is the upstream fix. This plugin exists so users on shipped builds get the behavior now, self-healing across reinstalls.</p>
+<h2>License</h2>
+<p>MIT</p>

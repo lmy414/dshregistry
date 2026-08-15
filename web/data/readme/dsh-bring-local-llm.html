@@ -1,0 +1,192 @@
+<h1>dsh-bring-local-llm</h1>
+<p>把<strong>你本机的任意本地大模型</strong>接入 <a href="https://github.com/deepseek-ai/deepseek-harness">DeepSeek Harness</a>（DSH Desktop）。
+本地优先处理一部分信息（文本批量劳动 + 视觉/OCR），难点才交由云端主模型 —— <strong>充分利用本地冗余算力、节省在线 token</strong>。</p>
+<p><strong>可连接任意本地模型（不限于某个具体模型）</strong>：通过 Control Plane 的 Provider 抽象，Ollama / KoboldCpp / LM Studio / 任意 OpenAI 兼容端点（vLLM、LocalAI、llama.cpp server 等）都可一键接入；模型文本/视觉能力按 <code>models.catalog.yaml</code> 声明即可。默认示例用 <code>qwen3.5:9b</code>，但<strong>不是唯一可选</strong>。</p>
+<blockquote>
+<p>综合实践：<code>dsh-koboldcpp-hands</code>（DSH 工具插件规范）· <code>local-agent-vision-team</code>（你自研的 DSH 桥接 + Control Plane + Ollama）· <code>OpenHarness</code>（provider 抽象 / 多角色 / 冗余算力思路）。</p>
+</blockquote>
+<hr>
+<h2>它能做什么</h2>
+<p>在 DSH 主模型（云端，如 DeepSeek）的工具清单里注册一组工具，全部委托给<strong>你本地部署的 Control Plane</strong>（FastAPI 后端，默认 <code>127.0.0.1:8765</code>）：</p>
+<table>
+<thead>
+<tr>
+<th>工具</th>
+<th>作用</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>local_llm_run</code></td>
+<td>在本地文本模型跑一次（批量改写/翻译/抽取/去重/格式化/结构化输出）→ 省在线 token</td>
+</tr>
+<tr>
+<td><code>local_llm_route</code></td>
+<td><strong>本地优先分流</strong>：先试本地冗余算力；全失败 → <code>needs_cloud=true</code>，请主模型（云端）接管难点</td>
+</tr>
+<tr>
+<td><code>local_vision_read</code></td>
+<td>本地多模态看图（OCR/分析），传图片文件路径</td>
+</tr>
+</tbody></table>
+<blockquote>
+<p>0.2.0 起为标准 Cordis 工具插件（<code>inject:["tools"]</code> + <code>ctx.tools.register(defineTool(...))</code>），与 DSH 生态工具插件一致；不再用动态插件/粘贴桥接，依赖更少、加载更稳。</p>
+</blockquote>
+<h2>实测 token 节省率（真实数据，多维度）</h2>
+<p>用<strong>本地模型 qwen3.5:9b</strong> 跑 5 类任务、每类 <strong>40 条真实文本</strong>（全部 <code>used_local=true, needs_cloud=false</code>），Control Plane 实测：</p>
+<table>
+<thead>
+<tr>
+<th>任务</th>
+<th>本地 in</th>
+<th>本地生成 out（=云端省掉）</th>
+<th>云端直接做基线</th>
+<th>走本地后云端在付</th>
+<th>节省 token</th>
+<th><strong>节省率</strong></th>
+</tr>
+</thead>
+<tbody><tr>
+<td>英译中</td>
+<td>468</td>
+<td>433</td>
+<td>901</td>
+<td>~468</td>
+<td>433</td>
+<td><strong>48%</strong></td>
+</tr>
+<tr>
+<td>改写·友好</td>
+<td>467</td>
+<td>1574</td>
+<td>2041</td>
+<td>~467</td>
+<td>1574</td>
+<td><strong>77%</strong></td>
+</tr>
+<tr>
+<td>抽取·JSON</td>
+<td>466</td>
+<td>592</td>
+<td>1058</td>
+<td>~466</td>
+<td>592</td>
+<td><strong>56%</strong></td>
+</tr>
+<tr>
+<td>分类</td>
+<td>475</td>
+<td>2000</td>
+<td>2475</td>
+<td>~475</td>
+<td>2000</td>
+<td><strong>81%</strong></td>
+</tr>
+<tr>
+<td>摘要</td>
+<td>463</td>
+<td>466</td>
+<td>929</td>
+<td>~463</td>
+<td>466</td>
+<td><strong>50%</strong></td>
+</tr>
+<tr>
+<td><strong>合计</strong></td>
+<td>2339</td>
+<td><strong>5065</strong></td>
+<td>7404</td>
+<td>~2339</td>
+<td><strong>5065</strong></td>
+<td><strong>≈ 68%</strong></td>
+</tr>
+</tbody></table>
+<ul>
+<li><strong>在线 token 节省率 ≈ 68%</strong>；生成的 <strong>output token 100% 由本地产出、不入云端</strong>（共省 5065 在线输出 token）。</li>
+<li>走本地委派后云端仅付「工具调用入参 ≈in」（无论本地/云端都过主模型上下文，不可避免）。</li>
+<li><strong>output 越大的任务（改写/分类）节省率越高（77–81%）</strong>；output 小/输入占比大则低（48–56%）——节省主要来自输出侧。</li>
+</ul>
+<blockquote>
+<p>说明：本地做不动的难点会升云端，此时节省趋近 0。可归因节省不包含 DSH 主模型每次对话固定的历史上下文注入开销（与是否用本地工具无关）。</p>
+</blockquote>
+<h2>架构</h2>
+<pre><code>DSH Desktop（云端主模型 = 规划/难点）
+   └── [dsh-bring-local-llm 插件]   local_llm_run / local_llm_route / local_vision_*
+        │  Loopback HTTP
+        ▼
+LocalHost Control Plane (FastAPI, 127.0.0.1:8765)     ← 你自己部署的后端
+   ├─ /api/llm/run   本地文本（executor 角色）
+   ├─ /api/llm/route 本地优先分流（多本地后端 → 冗余算力）
+   └─ /api/vision/read  本地视觉（vision 角色）
+        │  Provider 抽象
+        ▼
+   本地后端（三选/多选）：Ollama · KoboldCpp · LM Studio/任意 OpenAI 兼容
+</code></pre>
+<h2>安装</h2>
+<p>前置：DSH Desktop + 一个本地部署的 Control Plane（FastAPI，暴露 <code>/api/llm/run</code>、<code>/api/llm/route</code>、<code>/api/vision/read</code>）。</p>
+<pre><code># 把插件装进 DSH profile（web / desktop 任选）
+dsh plugin install &lt;本包路径&gt; --profile web
+# 或作为本地依赖在 profile package.json 添加后重启
+</code></pre>
+<p>插件默认通过 Loopback 调 <code>http://127.0.0.1:8765</code>：</p>
+<pre><code>// profile cordis.patch.yml 覆盖（按 id / name）
+{ "endpoint": "http://127.0.0.1:8765", "llm_tool_name": "local_llm_run", "route_roles": ["executor", "vision"] }
+</code></pre>
+<h3>本地后端配置（三种，皆由 Control Plane 定义）</h3>
+<p>在你本机的 Control Plane 配置文件（如 <code>config/config.yaml</code> 或 <code>config.local.yaml</code>）：</p>
+<pre><code>providers:
+  ollama:
+    type: ollama
+    endpoint: http://127.0.0.1:11434
+  koboldcpp:                 # KoboldCpp 暴露 OpenAI 兼容 /v1
+    type: openai_compatible
+    endpoint: http://127.0.0.1:5001/v1
+  lmstudio:                  # 任意 OpenAI 兼容本地端点
+    type: openai_compatible
+    endpoint: http://127.0.0.1:1234/v1
+
+models:
+  executor:                  # 本地文本：分流优先用
+    provider: ollama
+    model: qwen3.5:9b
+    fallback:
+      - provider: koboldcpp
+        model: &lt;你的 GGUF&gt;
+  vision:
+    provider: ollama
+    model: qwen3.5:9b
+</code></pre>
+<p><code>fallback</code> 就是 <strong>冗余算力</strong>：一个本地后端忙/挂了，自动切下一个本地后端；全失败才 <code>needs_cloud</code>。模型能力见 <code>config/models.catalog.yaml</code>（<code>text:true</code> / <code>vision:true</code>）。</p>
+<h2>使用</h2>
+<ul>
+<li>让主模型「本地处理」：<code>local_llm_run {prompt, json_schema?}</code></li>
+<li>「本地优先、不行交给云端」：<code>local_llm_route {prompt}</code> → 返回 <code>{ok,text}</code> 或 <code>{needs_cloud:true}</code></li>
+<li>贴图/看图：粘图 → <code>local_vision_read</code>（OCR/分析），或 <code>image_paths</code> 传本地文件路径</li>
+</ul>
+<p>主模型可通过工具描述里的提示习得：<strong>能本地就本地，难点才上云端</strong>。</p>
+<h2>开发 / 测试</h2>
+<pre><code>npm test            # node --test（31 cases：llm/vision/paste）
+npm run typecheck   # node --check 插件入口 + src 语法
+</code></pre>
+<h2>目录</h2>
+<pre><code>dsh-bring-local-llm/
+├─ package.json / cordis.patch.yml   DSH bundle + 插件行
+├─ src/index.js       标准 Cordis 插件入口（apply + 注册 3 工具）
+├─ src/llm.js         本地 LLM 调用 + 分流归一化（可单测）
+├─ src/vision.js      图片校验 + 本地视觉调用（复用自 local-agent-vision-team）
+├─ docs/              预设与提示词模板
+└─ tests/             llm / vision 单测（31 cases）
+</code></pre>
+<h2>预设 / 文档</h2>
+<p>开箱即用地把本工作流做成一个「智能调度」Agent 预设（先拆分、本地优先、代码等必须给 DSH），含可直接粘贴进 DSH 创造模式的 System Prompt 与落盘模板：</p>
+<ul>
+<li><a href="https://github.com/Hed1an/dsh-bring-local-llm/blob/HEAD/docs/preset-smart-router.md">预设：智能调度·本地省token</a> —— 推荐，含硬规范（代码/命令/文件/编排必须 DSH）</li>
+<li><a href="https://github.com/Hed1an/dsh-bring-local-llm/blob/HEAD/docs/preset-local-token-saver.md">预设：本地优先·省token</a> —— 精简版</li>
+</ul>
+<h2>Credits &amp; 免责声明</h2>
+<ul>
+<li><strong>非官方</strong>：这是第三方插件，<strong>与 DeepSeek 及其产品无隶属、背书或关联关系</strong>；<code>dsh</code> / <code>DeepSeek Harness</code> 系各自权利人的商标，本项目中仅作名称指代。</li>
+<li><strong>致谢</strong>：<code>src/vision.js</code>、<code>src/paste.js</code> 的图片校验/视觉链路逻辑复用自 <strong><code>local-agent-vision-team</code></strong>（你自研的项目）；工具插件/引擎参考 <strong><code>dsh-koboldcpp-hands</code></strong> 与 <strong><code>OpenHarness</code></strong> 的设计思路。</li>
+<li>本项目仅打包插件本身；本地推理后端（Control Plane）需你自行部署，未随本仓库一同发布。</li>
+</ul>
+<h2>License</h2>
+<p>MIT。</p>

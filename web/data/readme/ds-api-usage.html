@@ -1,0 +1,84 @@
+<h1>DHS API Usage — DeepSeek Harness plugin</h1>
+<p><strong>English</strong> | <a href="https://github.com/Sev7een/ds-api-usage/blob/HEAD/README.zh-CN.md">简体中文</a></p>
+<p>After installation, open <strong>Settings → API Usage</strong> in <a href="https://github.com/deepseek-ai/DeepSeek-Harness">DeepSeek Harness</a> to view your DeepSeek API usage. The page shows your account balance, estimated spend, token counts, and API request count over the last 24 hours, rendered as a timeline bar chart similar to the official DeepSeek platform usage page.</p>
+<h2>Features</h2>
+<ul>
+<li>💰 <strong>Balance card</strong> — total balance with granted / topped-up split, plus an availability badge, fetched from the official <a href="https://api-docs.deepseek.com/api/get-user-balance/"><code>GET /user/balance</code></a> endpoint.</li>
+<li>📊 <strong>Metric cards</strong> — 24h estimated spend (CNY), token counts (input / output split), and API request count.</li>
+<li>📈 <strong>Timeline chart</strong> — hourly bars of estimated spend over the last 24 hours (hover for exact values).</li>
+<li>🔄 <strong>Live refresh</strong> — balance refreshes every 60 s on the host; the page polls every 30 s and has a manual refresh button.</li>
+<li>🔑 <strong>No extra key setup</strong> — reuses the deployment's existing <code>DEEPSEEK_API_KEY</code> credential through the harness <code>credentials</code> service.</li>
+</ul>
+<h2>Architecture</h2>
+<pre><code>┌─────────────────────────────── Host (Node.js) ───────────────────────────────┐
+│ src/index.js                                                                 │
+│  • ctx.on('llm/stream', ...)  ← waterfall: folds every real model call's     │
+│      provider-reported TokenUsage (input/output/cache-hit/cache-miss,        │
+│      already disjoint, matching DeepSeek billing vocabulary)                 │
+│      into in-memory hourly + daily buckets                                   │
+│  • fetchBalance()             ← credentials.resolve('DEEPSEEK_API_KEY')      │
+│      → subprocess curl → https://api.deepseek.com/user/balance               │
+│      (web.fetch cannot send an Authorization header, hence curl)             │
+│  • webServer.register('/ds-api-usage/snapshot')  ← JSON endpoint for client  │
+└──────────────────────────────────────────────────────────────────────────────┘
+                              │ fetch('/ds-api-usage/snapshot')
+                              ▼
+┌────────────────────────────── Client (browser) ─────────────────────────────┐
+│ client/bundle.js (web bundle; client/index.js = dynamic-plugin source)      │
+│  • slots.inject('settings.section')  → new settings page "API用量"             │
+│  • balance card + 3 metric cards + 24h timeline bar chart                   │
+│  • auto-refresh every 30 s via ctx.interval                                 │
+└──────────────────────────────────────────────────────────────────────────────┘
+</code></pre>
+<h3>Data notes</h3>
+<ul>
+<li><strong>Token counts are real</strong> — they come from the <code>usage</code> chunk of every streaming model call (<code>StreamChunk</code> with <code>type: 'usage'</code>, <code>TokenUsage</code>), the same provider-reported numbers the harness itself uses for session stats.</li>
+<li><strong>Cost is an estimate</strong> — CNY is computed from DeepSeek's public list prices (Chinese docs, <a href="https://api-docs.deepseek.com/zh-cn/quick_start/pricing/">模型 &amp; 价格</a>) in <code>PRICING</code> (<code>src/index.js</code>), applied per model:<ul>
+<li>cache hit input → <code>hit</code> price</li>
+<li>cache miss input → <code>miss</code> price</li>
+<li>output → <code>output</code> price</li>
+<li>cache write is not billed separately by DeepSeek and is excluded.</li>
+</ul>
+</li>
+<li><strong>In-memory only</strong> — hourly buckets keep 48 h, daily keep 14 d; all data resets when the plugin (re)starts. No persistence is added on purpose: the harness has its own durable token-usage projection for sessions; this plugin is a live dashboard.</li>
+</ul>
+<h2>Installation</h2>
+<h3>Via <code>dsh plugin add</code> (recommended, from GitHub or npm)</h3>
+<p>Install directly from this GitHub repository:</p>
+<pre><code>dsh plugin --profile web add github:Sev7een/ds-api-usage
+</code></pre>
+<p>or, once published to npm:</p>
+<pre><code>dsh plugin --profile web add dsh-plugin-ds-api-usage
+</code></pre>
+<p><code>dsh plugin</code> forwards to pnpm in the profile directory and reconciles the
+package into the profile's bundle list (<code>dsh.profile.bundles</code>). The package's
+<code>cordis.patch.yml</code> (declared via <code>dsh.bundle.patch</code> in <code>package.json</code>) then
+inserts the plugin row into the host composition, and the <code>dsh.client</code>
+declaration makes the web shell load <code>client/bundle.js</code> as the settings page.</p>
+<h3>As a dynamic plugin (dev / session-scoped)</h3>
+<p>The original is a dynamic Cordis plugin, created per session with <code>cordis_define</code> / <code>cordis_run</code> (see the <a href="https://github.com/deepseek-ai/DeepSeek-Harness">DeepSeek Harness docs</a>). The <code>code.host</code> body is <code>src/index.js</code> minus the <code>module.exports</code> wrapper; the <code>code.client</code> body is <code>client/index.js</code> minus the wrapper.</p>
+<blockquote>
+<p>Note: the dynamic form uses the sandbox-private <code>harness.handle</code> / <code>host.call</code> channel (<code>client/index.js</code>), while the static bundle form (<code>client/bundle.js</code>) talks to the host over the HTTP route <code>/ds-api-usage/snapshot</code>. Keep both in sync when changing the protocol.</p>
+</blockquote>
+<h3>As a composition plugin (persistent, manual)</h3>
+<p>Add a row to the host composition (<code>cordis.patch.yml</code> of your profile):</p>
+<pre><code>- insert:
+    - id: ds-api-usage
+      name: 'dsh-plugin-ds-api-usage'
+</code></pre>
+<p>or, without installing the package, by a relative path to this repository. The plugin is <em>host-plane</em>: it reads the host <code>credentials</code>, <code>subprocess</code>, <code>timer</code>, and <code>webServer</code> services and registers the client settings page in the root-scoped <code>settings.section</code> slot, so it should live in the <strong>host composition</strong>, not inside an agent preset.</p>
+<h3>Requirements</h3>
+<ul>
+<li>DeepSeek Harness with the DeepSeek LLM adapter configured (<code>DEEPSEEK_API_KEY</code> credential resolvable via the <code>credentials</code> service)</li>
+<li><code>curl</code> available on the host for the balance endpoint</li>
+<li>A browser client with the settings sidebar (for the UI)</li>
+</ul>
+<h2>Development</h2>
+<pre><code>npm run check   # syntax-check both halves
+</code></pre>
+<ul>
+<li>Prices may drift: update <code>PRICING</code> in <code>src/index.js</code> when DeepSeek changes list prices (the constant is annotated with its snapshot date).</li>
+<li>The client currently hard-codes English labels; localize via the <code>locale</code> service if contributed back.</li>
+</ul>
+<h2>License</h2>
+<p><a href="https://github.com/Sev7een/ds-api-usage/blob/HEAD/LICENSE">MIT</a></p>

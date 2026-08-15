@@ -1,0 +1,296 @@
+<p align="center">
+  
+    
+    <img src="https://raw.githubusercontent.com/HsiangNianian/dsh-auto-continue/HEAD/docs/banner.svg" alt="dsh-auto-continue">
+  
+</p>
+
+<h1 align="center">dsh-auto-continue</h1>
+
+<p align="center">
+  <em>DSH Web UI plugin — when a request is interrupted by a network error or any other non-human cause, it automatically types 「继续」 and sends it for you.</em>
+</p>
+
+<p align="center">
+  <a href="https://www.npmjs.com/package/dsh-client-auto-continue"><img src="https://img.shields.io/npm/v/dsh-client-auto-continue?logo=npm&amp;label=npm" alt="npm version"></a>
+  <a href="https://www.npmjs.com/package/dsh-client-auto-continue"><img src="https://img.shields.io/npm/dm/dsh-client-auto-continue?label=downloads" alt="npm downloads"></a>
+  <a href="https://github.com/HsiangNianian/dsh-auto-continue/stargazers"><img src="https://img.shields.io/github/stars/HsiangNianian/dsh-auto-continue?logo=github&amp;label=Stars" alt="GitHub stars"></a>
+  <a href="https://github.com/HsiangNianian/dsh-auto-continue/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-MIT-65a30d?style=flat" alt="MIT license"></a>
+  <a href="https://awesome-dsh-plugin.com"><img src="https://awesome-dsh-plugin.com/badge.svg" alt="awesome · DSH plugin"></a>
+  <br>
+  <img src="https://img.shields.io/badge/TypeScript-3178C6?style=flat&amp;logo=typescript&amp;logoColor=fff" alt="TypeScript">
+  <img src="https://img.shields.io/badge/esbuild-FFCF00?style=flat&amp;logo=esbuild&amp;logoColor=000" alt="esbuild">
+  <img src="https://img.shields.io/badge/GUI--configurable-0ea5e9?style=flat" alt="GUI configurable">
+</p>
+
+<p align="center">
+  English · <a href="https://github.com/HsiangNianian/dsh-auto-continue/blob/HEAD/README.zh.md">中文</a>
+</p>
+
+<hr>
+<h2>What It Does</h2>
+<p>For <a href="https://github.com/deepseek-ai/deepseek-harness">DeepSeek Harness</a> (<code>dsh web</code>): whenever a request in the web GUI gets interrupted by a <strong>non-human cause</strong>, the plugin simulates the user typing <strong>「继续」</strong> and sends it, so the agent keeps working without manual intervention. The message enters the session log exactly like a manual prompt — the model sees it, and the interrupted work resumes.</p>
+<p><img src="https://raw.githubusercontent.com/HsiangNianian/dsh-auto-continue/HEAD/docs/demo.svg" alt="demo"></p>
+<p><strong>Smart recovery</strong> (all configurable):</p>
+<ul>
+<li><strong>Error classification</strong> — transient failures (network / timeout / 5xx / 429…) are auto-resumed; permanent ones are <strong>skipped</strong> and notified, because retrying them never helps. A failure counts as permanent when its HTTP status is 401/403 or its code/message matches auth, credential/API-key, balance/quota, unknown-model, or context-length/overflow keywords. Turn classification off to resume everything</li>
+<li><strong>Adaptive backoff</strong> — consecutive failures wait longer each time (cooldown × factor: 20s → 40s → 80s…), capped at the max backoff, instead of hammering a broken upstream</li>
+<li><strong>Templated continue text</strong> — <code>continueText</code> supports <code>{code}</code> <code>{message}</code> <code>{status}</code> <code>{tool}</code> <code>{turn}</code> <code>{errorCount}</code> <code>{sessionTitle}</code> <code>{elapsed}</code> placeholders, so the resume message can carry the failure context ("继续 (git push failed: UPSTREAM)"); a <strong>separate template</strong> fires on <code>max-tokens</code> (e.g. "继续输出, 不要重复已生成的内容")</li>
+<li><strong>Pause</strong> — a global <strong>Pause auto-continue</strong> toggle in the settings card stops everything (live + scan) instantly; per-session pauses (e.g. via a notification button) suspend only one session until they expire</li>
+<li><strong>Notification buttons</strong> — notifications carry <strong>Resume now</strong> (send immediately, ignoring cooldown and the consecutive cap) and <strong>Pause this session 1h</strong> actions</li>
+<li><strong>Stats panel</strong> — the settings card shows today's auto-continue count, recoveries, failures, permanent skips and give-ups, broken down by error code, with a one-click reset</li>
+<li><strong>Browser notifications</strong> — optional alerts when auto-continue fires, gives up, or hits a permanent error; the browser asks for permission on first use, and nothing is shown again after a denial</li>
+</ul>
+<p>It watches the live event streams and reacts to:</p>
+<table>
+<thead>
+<tr>
+<th>Event</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>turn/end</code> → <code>error</code></td>
+<td>Turn failed (model / network / timeout, …)</td>
+</tr>
+<tr>
+<td><code>turn/end</code> → <code>interrupted</code></td>
+<td>Crash-orphaned turn left behind by a host restart (recovered by the startup scan)</td>
+</tr>
+<tr>
+<td><code>turn/end</code> → <code>max-tokens</code></td>
+<td>Output token ceiling reached</td>
+</tr>
+<tr>
+<td><code>host/agent-error</code></td>
+<td>Agent failure with no turn position (only network/timeout-class messages auto-resume)</td>
+</tr>
+</tbody></table>
+<p><strong>Never auto-continues:</strong> user-aborted turns (<code>aborted</code>) or policy rejections (<code>blocked</code>); live <code>interrupted</code> turn-ends too — that marker is only written by crash repair when the host reloads, so orphaned turns are recovered by the startup scan, not the live path; sessions the host already resumed itself; running sessions or sessions with queued messages; subagent sessions; anything inside the cooldown / consecutive-cap windows (configurable in the settings card, below).</p>
+<hr>
+<h2>How It Works</h2>
+<p>The plugin opens two extra SSE streams in the browser — <code>events.mux</code> (session events) and <code>events.host</code> (host events). The host supports multiple consumers, so this never interferes with the built-in runtime. On an interruption it waits a <strong>grace period</strong> (default 3 s) — if the host starts a new turn by itself (<code>turn/start</code>), the auto-continue is cancelled — then calls <code>sessions.prompt</code> in <code>queue</code> mode with the configured text.</p>
+<p>On page load / reconnect it also scans the most recently updated sessions: a session whose last turn ended with a non-human reason <strong>within the scan window</strong> (default 15 minutes), with no later <code>turn/start</code> or user message, gets resumed automatically too (e.g. the host crashed while the browser was closed).</p>
+<p>With the page open in several tabs, a localStorage mutex plus a shared per-session cooldown stamp guarantee exactly one tab sends — no duplicated 「继续」.</p>
+<p>All knobs live in the plugin's settings card — see <a href="#configuration">Configuration</a>.</p>
+<hr>
+<h2>Quick Start</h2>
+<p>DSH plugins install into a <strong>profile</strong> (<code>dsh web</code> → <code>web</code> profile). Install, restart <code>dsh web</code>, done.</p>
+<h3>From npm (recommended)</h3>
+<p>Published as <a href="https://www.npmjs.com/package/dsh-client-auto-continue"><code>dsh-client-auto-continue</code></a>:</p>
+<pre><code>dsh plugin --profile web add dsh-client-auto-continue
+dsh web
+</code></pre>
+<h3>Directly from GitHub (no clone needed)</h3>
+<p>Installs straight from the repository's default branch — built artifacts are committed, so no local clone or build step:</p>
+<pre><code>dsh plugin --profile web add github:HsiangNianian/dsh-auto-continue
+dsh web
+</code></pre>
+<blockquote>
+<p>This tracks the <code>main</code> branch rather than released tags — great for trying the latest changes, while the npm method above is the stable choice. Switching between install sources is just re-running <code>dsh plugin --profile web add &lt;other-spec&gt;</code>; the profile dependency is replaced in place.</p>
+</blockquote>
+<h3>From this repository</h3>
+<p>Requires Node.js ≥ 18.</p>
+<pre><code>git clone https://github.com/HsiangNianian/dsh-auto-continue.git
+cd dsh-auto-continue
+npm install
+npm run build
+
+# the package carries its own cordis.patch.yml (dsh.bundle.patch),
+# so the plugin row registers itself
+dsh plugin --profile web add link:$(pwd)
+
+dsh web
+</code></pre>
+<h3>Manual (no pnpm / dsh plugin needed)</h3>
+<pre><code>ln -sfn "$(pwd)" ~/.dsh/profiles/node_modules/dsh-client-auto-continue
+# then append to ~/.dsh/profiles/web/cordis.patch.yml:
+#   - insert:
+#       - id: auto-continue
+#         name: 'dsh-client-auto-continue'
+dsh web
+</code></pre>
+<blockquote>
+<p>Switching from a manual install to <code>dsh plugin add</code>? Remove the manual <code>insert</code> entry first — the bundle patch registers the row and a duplicate would conflict.</p>
+</blockquote>
+<blockquote>
+<p><strong>Known DSH limitation (0.1.0-rc.6):</strong> the web settings surface only exposes
+namespaces on a hardcoded allowlist in the installed <code>@deepseek-ai/dsh-host-apiproxy</code>
+bundle. Until upstream moves exposure into <code>settings.register()</code>, one idempotent
+vendor patch makes exposure <strong>registry-driven</strong> — every namespace a plugin
+registers (this one or any other) becomes visible, with no plugin-specific
+strings anywhere. Run it once, and re-run after reinstalling dsh:</p>
+<pre><code>npx --yes --package dsh-client-auto-continue patch-expose
+dsh web
+</code></pre>
+<p>The patch script ships inside the npm package as a <code>bin</code> (works from any
+directory in a fresh environment — no repo clone, no profile-path guessing)
+and covers every reachable dsh installation: the profile-linked copy, a
+global <code>npm i -g @deepseek-ai/dsh</code> install, and the invoking directory's
+own. If you installed from this repository instead, the same script is
+<code>node scripts/patch-expose.mjs</code> at the repo root. The auto-continue engine
+itself works without this patch — it only gates the GUI settings section;
+until then, configure everything directly in <code>~/.dsh/settings.yaml</code>
+(see <a href="#configuration">Configuration</a>).</p>
+</blockquote>
+<h3>Verify &amp; uninstall</h3>
+<pre><code>dsh --profile web --dump-config | grep auto-continue   # config layer mounted
+</code></pre>
+<p>In the browser console (Ctrl/Cmd+Shift+I): <code>[auto-continue] 已启动(文本="继续", …)</code> — every detection and auto-send is logged.</p>
+<pre><code>dsh plugin --profile web remove dsh-client-auto-continue   # npm / repo install
+# or remove the symlink + the insert entry                  # manual install
+dsh web
+</code></pre>
+<hr>
+<h2>Configuration</h2>
+<p>Everything is configurable from the GUI — no file or console edits needed. Open <strong>Settings → Plugins</strong> and find the <strong>dsh-client-auto-continue</strong> configuration card, right where every other plugin's config lives. Besides the fields below, the card shows a live <strong>stats panel</strong> (today's activity with a reset button) and the list of <strong>paused sessions</strong> (each with a per-session resume button).</p>
+<p><strong>Or skip the GUI and edit the config file directly</strong> — the engine reads the plugin's section from <code>~/.dsh/settings.yaml</code> (one shared file for every plugin's sections), so this works in any install, patched or not. The file is watched and re-read automatically, so changes apply live; restart <code>dsh web</code> if a page that was already open doesn't pick them up. Fields you leave out fall back to the defaults in the table below:</p>
+<pre><code>auto-continue:
+  paused: false
+  continueText: '继续'
+  continueTextMaxTokens: '继续'
+  graceMs: 3000
+  cooldownMs: 20000
+  maxConsecutive: 3
+  scanOnBoot: true
+  scanLimit: 8
+  freshMs: 900000
+  reconnectScanDelayMs: 5000
+  reconnectBackoffMs: 3000
+  verbose: true
+  classify: true
+  backoffFactor: 2
+  backoffMaxMs: 300000
+  notify: false
+</code></pre>
+<p><strong>How the card works:</strong></p>
+<p><img src="https://raw.githubusercontent.com/HsiangNianian/dsh-auto-continue/HEAD/docs/screenshots/07-card-panels.png" alt="Stats &amp; paused sessions"></p>
+<ul>
+<li>Edits are <strong>staged</strong> — nothing reaches the disk until you hit <strong>Save</strong>; an unsaved badge marks the card while drafts are pending, and <strong>Discard</strong> drops them</li>
+<li>A field you changed shows an <strong>Overridden</strong> badge with a per-field <strong>Reset to default</strong> button that restores the built-in value</li>
+<li>Boolean fields are <strong>tri-state</strong>: <em>Inherit</em> (use the default) / <em>On</em> / <em>Off</em></li>
+<li>Invalid drafts (non-numbers, values below the minimum) block the save with a hint</li>
+<li>In a read-only deployment the card shows the stored values but disables every control</li>
+<li>Changes apply immediately after Save and persist in <code>~/.dsh/settings.yaml</code> (uninstalling the plugin leaves the section behind — harmless, delete it by hand if you like)</li>
+</ul>
+<table>
+<thead>
+<tr>
+<th>Field</th>
+<th>Default</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>Pause auto-continue</td>
+<td><code>off</code></td>
+<td>Global pause: no live or scan auto-send fires, queued pending sends are cancelled</td>
+</tr>
+<tr>
+<td>Continue text</td>
+<td><code>继续</code></td>
+<td>Text automatically sent after an interruption</td>
+</tr>
+<tr>
+<td>Continue text (max tokens)</td>
+<td><code>继续</code></td>
+<td>Text sent when the output token ceiling is reached (same placeholders)</td>
+</tr>
+<tr>
+<td>Grace period (ms)</td>
+<td><code>3000</code></td>
+<td>Wait after an interruption; cancelled if the host recovers on its own</td>
+</tr>
+<tr>
+<td>Cooldown (ms)</td>
+<td><code>20000</code></td>
+<td>Min interval between auto-continues per session (failed attempts count too)</td>
+</tr>
+<tr>
+<td>Max consecutive</td>
+<td><code>3</code></td>
+<td>Max consecutive auto-continues; stops until a user intervenes or a turn completes</td>
+</tr>
+<tr>
+<td>Scan on load / reconnect</td>
+<td><code>on</code></td>
+<td>Scan recently interrupted sessions on load / reconnect</td>
+</tr>
+<tr>
+<td>Scan limit</td>
+<td><code>8</code></td>
+<td>Max sessions scanned (running / subagent sessions excluded)</td>
+</tr>
+<tr>
+<td>Scan window (ms)</td>
+<td><code>900000</code></td>
+<td>Scan only considers interruptions inside this window</td>
+</tr>
+<tr>
+<td>Reconnect scan delay (ms)</td>
+<td><code>5000</code></td>
+<td>Delay before scanning after a reconnect</td>
+</tr>
+<tr>
+<td>Reconnect backoff (ms)</td>
+<td><code>3000</code></td>
+<td>SSE reconnect backoff</td>
+</tr>
+<tr>
+<td>Verbose logs</td>
+<td><code>on</code></td>
+<td><code>[auto-continue]</code> console logs</td>
+</tr>
+<tr>
+<td>Classify errors</td>
+<td><code>on</code></td>
+<td>Auto-resume transient failures only; auth / balance / model errors are skipped and notified</td>
+</tr>
+<tr>
+<td>Backoff factor</td>
+<td><code>2</code></td>
+<td>Cooldown multiplier per consecutive failure (2 = 20s → 40s → 80s…)</td>
+</tr>
+<tr>
+<td>Max backoff (ms)</td>
+<td><code>300000</code></td>
+<td>Cap on the adaptive backoff interval</td>
+</tr>
+<tr>
+<td>Browser notifications</td>
+<td><code>off</code></td>
+<td>Notify when auto-continue fires, gives up, or hits a permanent error</td>
+</tr>
+</tbody></table>
+<p><code>continueText</code> (and <code>continueTextMaxTokens</code>) accept the placeholders <code>{code}</code>, <code>{message}</code>, <code>{status}</code>, <code>{tool}</code> (last tool call before the failure), <code>{turn}</code>, <code>{errorCount}</code> (consecutive failures including this one), <code>{sessionTitle}</code> (from the session list) and <code>{elapsed}</code> (time since the failure, e.g. <code>1m5s</code>) — e.g. <code>继续 ({tool}: {code})</code> becomes <code>继续 (git push: UPSTREAM)</code>.</p>
+<hr>
+<h2>Privacy &amp; permissions</h2>
+<p>The plugin is browser-only and touches <strong>no files, credentials, or network beyond the dsh host</strong>:</p>
+<ul>
+<li>It opens the same two read-only event streams the web UI already uses (no extra server, no third-party endpoints)</li>
+<li>The only write it ever performs is <code>sessions.prompt</code> — the same call the Send button makes — with the text you configured</li>
+<li>Browser storage is limited to small <code>localStorage</code> keys: cross-tab coordination stamps, per-session pauses, and the daily stats counters</li>
+<li>Browser notifications are opt-in (<code>notify</code> setting) and permission is requested on first use only</li>
+</ul>
+<hr>
+<h2>Development</h2>
+<pre><code>npm run typecheck   # tsc --noEmit
+npm run build       # lib/client.js + lib/index.js + lib/types
+npm run watch       # rebuild on change; host HMR hot-reloads without a page refresh
+npm run test        # node tests/simulate.mjs — 22 behavioral scenarios
+</code></pre>
+<p>While <code>npm run watch</code> runs, the profile's client-hmr row polls <code>lib/client.js</code> every 500 ms and hot-reloads the plugin in the browser — no server restart needed for code changes.</p>
+<hr>
+<h2>Activity</h2>
+<p><a href="https://gitstock.org/HsiangNianian/dsh-auto-continue"><img src="https://gitstock.org/HsiangNianian/dsh-auto-continue/stock.svg" alt="HsiangNianian/dsh-auto-continue GitStock K-Line Chart"></a></p>
+<hr>
+<h2>Links</h2>
+<ul>
+<li><strong>Repository</strong>: <a href="https://github.com/HsiangNianian/dsh-auto-continue">github.com/HsiangNianian/dsh-auto-continue</a></li>
+<li><strong>LINUX DO</strong>: <a href="https://linux.do">linux.do</a></li>
+<li><strong>DeepSeek Harness</strong>: <a href="https://github.com/deepseek-ai/deepseek-harness">github.com/deepseek-ai/deepseek-harness</a></li>
+</ul>
+<hr>
+<h2>License</h2>
+<p><a href="https://github.com/HsiangNianian/dsh-auto-continue/blob/HEAD/LICENSE"><img src="https://img.shields.io/badge/license-MIT-65a30d" alt="MIT"></a></p>
+<p>MIT © Hsiang Nianian</p>

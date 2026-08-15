@@ -1,0 +1,466 @@
+<h1>Drive9 for DeepSeek Harness</h1>
+<p>Persistent agent workspaces and durable, bounded tool evidence for
+<a href="https://github.com/deepseek-ai/deepseek-harness">DeepSeek Harness</a>.</p>
+<p><code>@drive9/drive9-dsh</code> is a standard DSH bundle with four independent Cordis components:</p>
+<ul>
+<li>a Drive9 revision-CAS filesystem for Harness <code>read</code>, <code>write</code>, and <code>edit</code> tools;</li>
+<li>an isolated evidence backend for oversized tool results;</li>
+<li>model-visible <code>result_search</code> and <code>result_read</code> tools with hard output limits;</li>
+<li>a model-visible runtime-context warning for the opt-in eventual mount profile.</li>
+</ul>
+<p>The architecture keeps four lifecycles separate:</p>
+<table>
+<thead>
+<tr>
+<th>Layer</th>
+<th>Owner</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>Agent loop</td>
+<td>DeepSeek Harness</td>
+</tr>
+<tr>
+<td>Session and conversation history</td>
+<td>DeepSeek Harness</td>
+</tr>
+<tr>
+<td>Persistent workspace and immutable evidence</td>
+<td>Drive9</td>
+</tr>
+<tr>
+<td>Shell, sandbox, language servers, and compute runtime</td>
+<td>the user's DSH deployment</td>
+</tr>
+</tbody></table>
+<p>The Drive9 mount only exposes the persistent workspace inside an existing runtime.
+It does not create, own, or keep that runtime alive. Evidence remains readable after
+the runtime or workspace disappears because it is stored under a separate, unmounted
+Drive9 root.</p>
+<p>Drive9 does <strong>not</strong> provide a shell or sandbox. V1 exposes two explicit mount-consistency
+profiles:</p>
+<ul>
+<li><code>strong</code> (default and recommended) uses a Linux Drive9 FUSE mount in the same
+execution world as Harness process tools. Startup proves SDK-to-mount and
+mount-to-SDK coherence, and writes wait for exact mounted bytes before returning.</li>
+<li><code>eventual</code> is an opt-in WebDAV profile. Model-facing reads, writes, revision CAS, and
+evidence still use the Drive9 SDK, but process tools may observe stale mounted bytes
+for more than 30 seconds after an SDK write.</li>
+</ul>
+<p>The integration never silently downgrades <code>strong</code> to <code>eventual</code>. In real macOS
+WebDAVFS validation, the Drive9 bridge observed an SDK write immediately while the
+mounted <code>open</code>/<code>stat</code> view remained stale or blocked for more than 30 seconds.</p>
+<h2>Why</h2>
+<p>Agent work has two different kinds of state:</p>
+<pre><code>model filesystem tools ── Drive9 SDK + revision CAS ── persistent workspace
+                                  │
+process tools ── /mnt/drive9 ─────┘
+
+large tool output ── isolated Drive9 evidence root ── exact result_id
+                                                   ├─ result_search
+                                                   └─ result_read
+</code></pre>
+<p>The workspace remains process-visible, while evidence stays outside the workspace
+mount. A shell command, workspace deletion, or workspace rollback cannot address the
+evidence namespace.</p>
+<h2>Prerequisites</h2>
+<ul>
+<li>Linux with Node.js 22.19 or newer, npm, and pnpm on <code>PATH</code>;</li>
+<li>DeepSeek Harness <code>0.1.0-rc.6</code>, including the standard <code>dsh</code> CLI;</li>
+<li>a current Drive9 CLI with <code>drive9 token issue</code> support and access to a Drive9
+server;</li>
+<li><code>/dev/fuse</code> and <code>fusermount3</code> for the recommended <code>strong</code> profile, or a WebDAV
+mount for the opt-in <code>eventual</code> profile;</li>
+<li>separate, path-scoped workspace and evidence credentials. An owner credential is
+needed only to create roots and issue those scoped credentials.</li>
+</ul>
+<p>Install the Harness CLI and pnpm before continuing:</p>
+<pre><code>npm install --global @deepseek-ai/dsh@0.1.0-rc.6 pnpm
+</code></pre>
+<p>Install the Drive9 CLI from the
+<a href="https://github.com/mem9-ai/drive9">public Drive9 repository</a> and verify both CLIs:</p>
+<pre><code>dsh --version
+drive9 version
+</code></pre>
+<h2>Quick start</h2>
+<p>Supply the owner credential through your normal secret injector, then configure the
+non-secret paths once. The assertion fails before provisioning if the secret is
+absent:</p>
+<pre><code>: "${DRIVE9_OWNER_API_KEY:?inject the Drive9 owner credential}"
+
+export DRIVE9_BASE_URL="https://api.drive9.ai"
+export DRIVE9_EVIDENCE_BASE_URL="$DRIVE9_BASE_URL"
+export DRIVE9_MOUNT_ROOT="/mnt/drive9"
+export DRIVE9_REMOTE_ROOT="/workspace"
+export DRIVE9_EVIDENCE_ROOT="/evidence/dsh"
+export DRIVE9_MOUNT_CONSISTENCY="strong"
+</code></pre>
+<h3>1. Provision isolated roots and credentials</h3>
+<p>Create both roots once. Keep the evidence root unmounted so workspace tools and shell
+commands cannot address it:</p>
+<pre><code>drive9 ctx add \
+  --name dsh-owner \
+  --server "$DRIVE9_BASE_URL" \
+  --api-key "$DRIVE9_OWNER_API_KEY"
+drive9 ctx use dsh-owner
+
+drive9 fs mkdir :/workspace
+drive9 fs mkdir :/evidence/dsh
+
+drive9 token issue dsh-workspace \
+  --ttl 24h \
+  --allow /workspace:read,list,write,delete \
+  --print
+
+drive9 token issue dsh-evidence \
+  --ttl 24h \
+  --allow /evidence/dsh:read,write \
+  --print
+</code></pre>
+<p>Each command prints only the bearer token and saves its local name for later rotation
+or revocation. Store the printed value in your secret manager without leaving it on
+disk, then inject the values as distinct credentials. The package rejects a shared
+credential:</p>
+<pre><code>: "${DRIVE9_WORKSPACE_API_KEY:?inject the workspace-scoped credential}"
+: "${DRIVE9_EVIDENCE_API_KEY:?inject the separate evidence-scoped credential}"
+</code></pre>
+<p>See <a href="https://github.com/drive9-ai/drive9-dsh/blob/HEAD/docs/operations.md">credential and deployment guidance</a> for production token
+scope, TTL, and rotation guidance.</p>
+<h3>2. Mount the workspace</h3>
+<p>Mount the workspace into the Harness runtime. The default strong profile requires
+Linux with <code>/dev/fuse</code> and <code>fusermount3</code>:</p>
+<pre><code>mkdir -p "$DRIVE9_MOUNT_ROOT"
+
+DRIVE9_API_KEY="$DRIVE9_WORKSPACE_API_KEY" \
+  drive9 mount --mode=fuse --profile=none :/workspace "$DRIVE9_MOUNT_ROOT"
+</code></pre>
+<p>The mount must exist in the <strong>same execution world</strong> as Harness subprocesses. If
+Harness runs inside a container, mount Drive9 inside that container or bind the mount
+into it before Harness starts.</p>
+<p><code>--profile=none</code> is part of the strong profile. A coding-agent mount profile can
+route process paths through a local overlay while SDK calls still address Drive9,
+splitting the two sides of the revision-CAS contract. Do not use a local-overlay
+profile, and do not disable the startup proof to make one start.</p>
+<p>To opt into relaxed WebDAV semantics instead, mount with WebDAV and explicitly select
+<code>eventual</code>:</p>
+<pre><code>DRIVE9_API_KEY="$DRIVE9_WORKSPACE_API_KEY" \
+  drive9 mount --mode=webdav --profile=none :/workspace "$DRIVE9_MOUNT_ROOT"
+
+export DRIVE9_MOUNT_CONSISTENCY="eventual"
+</code></pre>
+<p>This profile returns from writes after the SDK CAS commits; it does not wait for the
+mounted path to converge. Do not use it for workflows that write through Harness and
+immediately validate with <code>cat</code>, <code>rg</code>, tests, a language server, or another subprocess.</p>
+<h3>3. Install the bundle</h3>
+<p>The recommended release channel is the prebuilt npm package:</p>
+<pre><code>dsh plugin --profile web add @drive9/drive9-dsh
+</code></pre>
+<p>To validate an unreleased checkout or install before registry publication, build the
+same prebuilt tarball from the public repository instead of installing the TypeScript
+sources directly from Git:</p>
+<pre><code>git clone https://github.com/drive9-ai/drive9-dsh.git
+cd drive9-dsh
+npm ci
+PACKAGE_TARBALL="$(npm pack --silent)"
+dsh plugin --profile web add "$PWD/$PACKAGE_TARBALL"
+cd ..
+</code></pre>
+<p>This source-build route runs the package's normal <code>prepack</code> build and gives DSH a
+tarball containing <code>dist/</code>. A direct <code>github:drive9-ai/drive9-dsh</code> dependency does not
+contain built output and is not a supported install path.</p>
+<p>The package declares a DSH bundle, so the standard <code>dsh plugin</code> command installs it
+and adds its <code>cordis.patch.yml</code> layer to the selected profile. The bundle disables the stock
+<code>fs-sandbox</code> and <code>spill-local</code> storage providers, then installs the Drive9 filesystem,
+evidence backend, and result tools. Harness's stock filesystem tools, subprocess
+runtime, sandbox policy, observation policy, and spill policy remain in place. The
+Drive9 filesystem implements the same per-call <code>read-only</code>, <code>workspace-write</code>, and
+<code>danger-full-access</code> mutation policy that the replaced filesystem provider enforced.</p>
+<h3>4. Configure and run</h3>
+<pre><code>cd "$DRIVE9_MOUNT_ROOT"
+dsh web --dump-config
+dsh web
+</code></pre>
+<p><code>dsh web --dump-config</code> is the recommended preflight. Its composed tree must contain
+exactly one active <code>fs</code> provider: <code>@drive9/drive9-dsh/filesystem</code>. Custom profiles
+use the equivalent <code>dsh --profile &lt;name&gt; --dump-config</code> and <code>dsh --profile &lt;name&gt;</code>
+commands; no Drive9-specific launcher is required.</p>
+<p>To remove the bundle and its profile layer:</p>
+<pre><code>dsh plugin --profile web remove @drive9/drive9-dsh
+</code></pre>
+<p>In the default strong profile, startup fails instead of falling back or weakening the
+contract when:</p>
+<ul>
+<li>the mount is missing or not writable;</li>
+<li>the remote root is missing or not a directory;</li>
+<li>SDK writes do not appear through the mount;</li>
+<li>mount writes do not produce a newer Drive9 revision through the SDK.</li>
+</ul>
+<p>The eventual profile still validates the local mount directory and remote Drive9 root,
+logs a prominent warning, adds the same warning to the model's durable runtime-context
+snapshot, and skips the bidirectional proof by default. Explicitly setting
+<code>verifyCoherence: true</code> still runs the complete proof and propagates any failure.</p>
+<h2>Components</h2>
+<h3><code>@drive9/drive9-dsh/filesystem</code></h3>
+<p><code>Drive9FileSystem</code> implements the complete Harness <code>FileSystem</code> contract.</p>
+<table>
+<thead>
+<tr>
+<th>Operation</th>
+<th>Drive9 behavior</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>resolve</code></td>
+<td>Canonical mount resolution with lexical and symlink escape rejection</td>
+</tr>
+<tr>
+<td><code>processPath</code> / <code>fileUrl</code></td>
+<td>Authenticated provider targets mapped below the real mount</td>
+</tr>
+<tr>
+<td><code>stat</code></td>
+<td>Drive9 metadata; revision becomes an opaque Harness version</td>
+</tr>
+<tr>
+<td><code>readText</code> / <code>streamText</code></td>
+<td>Strict UTF-8, NUL rejection, no silent binary coercion</td>
+</tr>
+<tr>
+<td><code>readBytes</code></td>
+<td>Metadata preflight plus bounded range read</td>
+</tr>
+<tr>
+<td><code>listDir</code></td>
+<td>Stable sorting and <code>batchStat</code> requests capped at 256 paths</td>
+</tr>
+<tr>
+<td>guarded write/edit</td>
+<td>Exact Drive9 revision CAS</td>
+</tr>
+<tr>
+<td>unconditional write/edit</td>
+<td>Bounded read/modify/CAS retry</td>
+</tr>
+<tr>
+<td>mutation policy</td>
+<td>DSH per-call sandbox policy, rechecked against the fresh canonical target</td>
+</tr>
+</tbody></table>
+<p>In <code>strong</code>, ordinary success returns only after the SDK write commits and the mounted
+path exposes the same bytes. If Drive9 commits but the mount cannot be confirmed before
+the bounded coherence deadline, the operation throws
+<code>DRIVE9_WORKSPACE_COMMITTED_MOUNT_UNCONFIRMED</code> with <code>workspaceCommitted: true</code>, the
+committed version, and reason <code>timeout</code>, <code>aborted</code>, or <code>io</code>. This is neither success nor
+evidence that the write did not happen; callers must inspect/reconcile rather than
+blindly retrying. In <code>eventual</code>, it returns after the SDK CAS succeeds; <code>processPath()</code> and
+<code>fileUrl()</code> remain available, but their mounted view has no read-your-writes guarantee.
+Both methods reject targets not authenticated by that filesystem instance.</p>
+<h3><code>@drive9/drive9-dsh/evidence</code></h3>
+<p><code>Drive9EvidenceStore</code> implements Harness <code>SpillStore</code>:</p>
+<ol>
+<li>generate a random 256-bit capability;</li>
+<li>create the content object;</li>
+<li>create the canonical manifest with byte count and SHA-256;</li>
+<li>publish <code>result_id</code> and a provenance receipt only after both writes succeed.</li>
+</ol>
+<p>Reads verify stable revisions, exact byte count, manifest shape, SHA-256, and strict
+UTF-8. A failed manifest write returns no locator. The unreachable content orphan can
+be reclaimed by operator retention without exposing partial evidence to the model.</p>
+<h3><code>@drive9/drive9-dsh/result-tools</code></h3>
+<p>The bundle registers:</p>
+<pre><code>result_search(result_id, query, max_matches?, context_lines?)
+result_read(result_id, offset?, limit?)
+</code></pre>
+<p>Both tools require an exact locator already issued into the current session's durable
+tool history, or inherited from its explicitly seeded direct parent. Guessing,
+enumeration, plain-text echoes, unseeded parent references, and sibling references are
+denied.</p>
+<p>Hard package limits:</p>
+<ul>
+<li>1,000 returned lines;</li>
+<li>64 KiB returned UTF-8 text;</li>
+<li>100 search matches;</li>
+<li>64 MiB scanned per request;</li>
+<li>64 KiB search query.</li>
+</ul>
+<h2>Configuration</h2>
+<p>The shipped bundle reads these environment variables:</p>
+<table>
+<thead>
+<tr>
+<th>Variable</th>
+<th align="right">Required</th>
+<th>Default</th>
+<th>Purpose</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>DRIVE9_BASE_URL</code></td>
+<td align="right">no</td>
+<td>Drive9 SDK default</td>
+<td>Drive9 API base for workspace SDK calls</td>
+</tr>
+<tr>
+<td><code>DRIVE9_WORKSPACE_API_KEY</code></td>
+<td align="right">yes</td>
+<td>—</td>
+<td>Workspace-scoped SDK credential</td>
+</tr>
+<tr>
+<td><code>DRIVE9_MOUNT_ROOT</code></td>
+<td align="right">no</td>
+<td><code>/mnt/drive9</code></td>
+<td>Process-visible Drive9 mount</td>
+</tr>
+<tr>
+<td><code>DRIVE9_REMOTE_ROOT</code></td>
+<td align="right">no</td>
+<td><code>/</code></td>
+<td>Remote subtree represented by the mount</td>
+</tr>
+<tr>
+<td><code>DRIVE9_MOUNT_CONSISTENCY</code></td>
+<td align="right">no</td>
+<td><code>strong</code></td>
+<td><code>strong</code> Linux FUSE or explicit <code>eventual</code> WebDAV semantics</td>
+</tr>
+<tr>
+<td><code>DRIVE9_EVIDENCE_BASE_URL</code></td>
+<td align="right">no</td>
+<td><code>DRIVE9_BASE_URL</code></td>
+<td>Drive9 API base for evidence</td>
+</tr>
+<tr>
+<td><code>DRIVE9_EVIDENCE_API_KEY</code></td>
+<td align="right">yes</td>
+<td>—</td>
+<td>Separate evidence-scoped credential</td>
+</tr>
+<tr>
+<td><code>DRIVE9_EVIDENCE_ROOT</code></td>
+<td align="right">no</td>
+<td><code>/evidence/dsh</code></td>
+<td>Unmounted evidence root</td>
+</tr>
+</tbody></table>
+<p>Programmatic composition is also supported inside a DSH context that already provides
+the standard <code>sandboxPolicy</code>, <code>systemPrompt</code>, and <code>tools</code> services:</p>
+<pre><code>import { Context } from '@deepseek-ai/cordis'
+import * as Drive9Dsh from '@drive9/drive9-dsh'
+
+const ctx = new Context()
+
+await ctx.plugin(Drive9Dsh, {
+  filesystem: {
+    mountRoot: '/mnt/drive9',
+    remoteRoot: '/workspace',
+    baseUrl: process.env.DRIVE9_BASE_URL,
+    apiKey: process.env.DRIVE9_WORKSPACE_API_KEY,
+    mountConsistency: 'strong',
+  },
+  evidence: {
+    root: '/evidence/dsh',
+    baseUrl: process.env.DRIVE9_BASE_URL,
+    apiKey: process.env.DRIVE9_EVIDENCE_API_KEY!,
+  },
+  resultTools: {
+    maxScanBytes: 16 * 1024 * 1024,
+  },
+})
+</code></pre>
+<p>The preset rejects missing credentials and rejects using the same credential for
+workspace and evidence.</p>
+<h2>Errors</h2>
+<p>Filesystem failures use Harness <code>FS_*</code> codes, including <code>FS_STALE_VERSION</code>,
+<code>FS_NOT_OBSERVED</code>, <code>FS_PERMISSION_DENIED</code>, <code>FS_TOO_LARGE</code>, <code>FS_NOT_TEXT</code>,
+<code>FS_ABORTED</code>, and <code>FS_IO_ERROR</code>.</p>
+<p><code>DRIVE9_WORKSPACE_COMMITTED_MOUNT_UNCONFIRMED</code> is the distinct post-commit outcome for
+a strong-profile mount verification failure. It carries <code>workspaceCommitted: true</code> and
+must never be treated as a retry-safe “write did not happen” error.</p>
+<p>Evidence retrieval uses stable <code>DRIVE9_RESULT_*</code> codes:</p>
+<ul>
+<li><code>DRIVE9_RESULT_INVALID_ID</code></li>
+<li><code>DRIVE9_RESULT_NOT_FOUND</code></li>
+<li><code>DRIVE9_RESULT_CORRUPT</code></li>
+<li><code>DRIVE9_RESULT_UNAUTHORIZED</code></li>
+<li><code>DRIVE9_RESULT_SCAN_LIMIT</code></li>
+<li><code>DRIVE9_RESULT_ABORTED</code></li>
+<li><code>DRIVE9_RESULT_IO</code></li>
+</ul>
+<p>Errors never include credentials or authorization headers.</p>
+<h2>Security model</h2>
+<ul>
+<li>Workspace and evidence credentials must be distinct and path-scoped.</li>
+<li>Evidence has no path, listing, mount, or filesystem-target API.</li>
+<li>Locators are random capabilities but are not authorized by possession alone.</li>
+<li>A versioned issuance receipt, immutable manifest, and enclosing Harness tool event
+must agree on session, tool name, call id, locator, and manifest digest.</li>
+<li>Current-session and explicitly seeded direct-parent evidence are readable; sibling
+and unseeded artifacts are not.</li>
+<li>V1 is append-only from the integration's perspective. Configure Drive9 retention or
+administrative GC for the evidence root.</li>
+</ul>
+<p>See <a href="https://github.com/drive9-ai/drive9-dsh/blob/HEAD/SECURITY.md">SECURITY.md</a> and the complete <a href="https://github.com/drive9-ai/drive9-dsh/blob/HEAD/docs/design-lock.md">V1 design lock</a>.</p>
+<h2>Limits</h2>
+<p>V1 intentionally does not provide:</p>
+<ul>
+<li>a shell, process sandbox, terminal, or language server;</li>
+<li>automatic Drive9 mounting;</li>
+<li>strong subprocess read-your-writes through WebDAV;</li>
+<li>local-overlay support for either consistency profile;</li>
+<li>LayerFS checkpoints or workspace rollback;</li>
+<li>source-streaming or crash-recoverable tool capture;</li>
+<li>exactly-once external tool side effects;</li>
+<li>evidence enumeration.</li>
+</ul>
+<p>The stock Harness spill policy receives a fully materialized tool result. Storage is
+durable-before-reference, but tool output is not streamed to Drive9 at source in V1.</p>
+<h2>Development</h2>
+<pre><code>npm ci
+npm run check
+npm test
+npm run test:race
+npm run build
+npm pack --dry-run
+</code></pre>
+<p>The default suite includes a scripted <strong>real Harness agent loop</strong>: the model uses the
+stock filesystem tool, <code>/bin/cat</code> reads the same mounted bytes, an oversized result is
+spilled, and later model steps invoke <code>result_search</code> and <code>result_read</code>.</p>
+<p>For a real Drive9 service and Linux FUSE mount created with
+<code>drive9 mount --mode=fuse --profile=none</code>:</p>
+<pre><code>DRIVE9_REAL_E2E=1 npm run test:real
+</code></pre>
+<p>Required environment and cleanup behavior are documented in
+<a href="https://github.com/drive9-ai/drive9-dsh/blob/HEAD/docs/operations.md">docs/operations.md</a>. See <a href="https://github.com/drive9-ai/drive9-dsh/blob/HEAD/CONTRIBUTING.md">CONTRIBUTING.md</a> for
+the release checklist. The real test rejects non-Linux and non-FUSE mount roots.</p>
+<h2>Compatibility</h2>
+<table>
+<thead>
+<tr>
+<th>Component or profile</th>
+<th>Supported contract</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>Node.js</td>
+<td>22.19 or newer</td>
+</tr>
+<tr>
+<td>DeepSeek Harness</td>
+<td><code>0.1.0-rc.6</code></td>
+</tr>
+<tr>
+<td>Drive9 JavaScript SDK</td>
+<td><code>0.1.4</code></td>
+</tr>
+<tr>
+<td><code>strong</code></td>
+<td>Linux Drive9 FUSE; writes wait for exact process-visible bytes. Current real-service validation observed SDK-to-mount convergence in 1.3–1.5 seconds and mount-close-to-new-SDK-revision convergence in 0.36–0.40 seconds. These observations are not an SLA.</td>
+</tr>
+<tr>
+<td><code>eventual</code></td>
+<td>WebDAV; no subprocess read-your-writes guarantee, with observed staleness beyond 30 seconds.</td>
+</tr>
+</tbody></table>
+<p>DeepSeek Harness is a developer preview. Upstream service-contract changes require a
+new package release and contract review.</p>

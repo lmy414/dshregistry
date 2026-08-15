@@ -1,0 +1,124 @@
+<h1>awesome-dsh</h1>
+<p>按种类和功能浏览 GitHub topic <a href="https://github.com/topics/dsh-plugin"><code>dsh-plugin</code></a> 下的<strong>全部</strong>插件，英文简介由 Workers AI 自动译成中文。</p>
+<p>线上地址：<a href="https://dsh.jamintextiles.com">https://dsh.jamintextiles.com</a></p>
+<p>本仓库同时是一个可安装的 DSH 插件：<code>dsh plugin --profile &lt;profile&gt; add github:stakeswky/awesome-dsh</code> 会把按需查插件的技能注册进 DSH。</p>
+<h2>架构</h2>
+<p>单个 Cloudflare Worker 承载整站。两条 cron 分工，数据与页面分离，更新数据不需要重新部署。</p>
+<pre><code>  ┌─ cron 17 */6 * * *  抓取 ─────────────────────────┐
+  │   GitHub Search API ──▶ 按 star 分区取全量        │
+  │                          ▼                        │
+  │                    KV plugins:latest ◀────────┐   │
+  └───────────────────────────────────────────────┼───┘
+  ┌─ cron */5 * * * *   翻译 ─────────────────────┼───┐
+  │   Workers AI ──▶ 每轮译 60 条 ──▶ KV 翻译缓存 ─┘   │
+  └───────────────────────────────────────────────────┘
+                             │
+         浏览器 ◀─ /api/plugins.json ◀─ fetch()
+         浏览器 ◀─ index.html（静态资源直出）
+</code></pre>
+<h3>取全量：按 star 分区</h3>
+<p>GitHub 搜索对<strong>单个查询</strong>最多只返回 1000 条，而该 topic 已有 2600+ 仓库。抓取时把 star 区间切成若干片分别查询，某片命中数超过 1000 就继续二分；单一 star 值（如 <code>stars:0</code>）仍超限时改按仓库创建时间二分。任何分布都能取全，且随生态增长自动适应。</p>
+<p>抓取全程约 3.5 分钟：匿名调用 GitHub 搜索限额为每分钟 10 次，代码按 6.5 秒一次节流；配了 <code>GITHUB_TOKEN</code> 后限额升到 30 次/分钟，间隔自动降到 2.1 秒。</p>
+<h3>翻译：增量填充 + 永久缓存</h3>
+<ul>
+<li>简介里中日韩字符达到 6 个即视为已是中文，跳过翻译。</li>
+<li>译文按 <code>full_name</code> + 原文指纹缓存在 KV，原文没变就永不重译；抓到新快照时自动回填。</li>
+<li>每 5 分钟译 60 条，首次填满 1400 余条约需 2 小时，之后只翻新增的。</li>
+<li>模型 <code>@cf/meta/llama-3.3-70b-instruct-fp8-fast</code>（对比过 m2m100、llama-3.2-3b：m2m100 把 “AI agent” 译成 “AI特工”，3b 会脑补原文没有的内容）。</li>
+<li>单条翻译失败只跳过该条，留待下一轮重试，不影响其余。</li>
+</ul>
+<h3>抓取失败的保护</h3>
+<p>抓取或校验失败时<strong>保留上一份快照</strong>，只把错误记到 KV，页面不会变空。新结果少于 100 条、或少于上一份的一半时同样拒绝发布。</p>
+<h2>端点</h2>
+<table>
+<thead>
+<tr>
+<th>端点</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>GET /</code></td>
+<td>导航页面</td>
+</tr>
+<tr>
+<td><code>GET /api/search</code></td>
+<td>按相关度检索，只回少量精简结果；参数 <code>q</code>、<code>kind</code>、可重复的 <code>fn</code>、<code>limit</code>（默认 8，上限 25）</td>
+</tr>
+<tr>
+<td><code>GET /api/facets.json</code></td>
+<td>可用的种类与功能标签及各自数量</td>
+</tr>
+<tr>
+<td><code>GET /api/plugins.json</code></td>
+<td>完整快照（约 1.1 MB，gzip 后约 290 KB）；带 <code>ETag</code>，命中条件请求返回 304</td>
+</tr>
+<tr>
+<td><code>GET /api/status.json</code></td>
+<td>抓取与翻译进度，以及未恢复的错误</td>
+</tr>
+<tr>
+<td><code>POST /api/refresh</code></td>
+<td>手动触发抓取，需 <code>Authorization: Bearer &lt;REFRESH_KEY&gt;</code></td>
+</tr>
+<tr>
+<td><code>POST /api/translate</code></td>
+<td>手动触发一批翻译，同样需要令牌</td>
+</tr>
+</tbody></table>
+<p>自动化调用方（如 <code>dsh-plugin-finder</code> skill）应当只用 <code>/api/search</code>：全量快照有 1.1 MB，为挑几个插件把整份目录读进上下文是浪费。检索排序为「词条得分 × 流行度系数」——该 topic 下有成批靠仓库名塞关键词的克隆仓库，纯词条打分会让它们压过成熟项目。</p>
+<p>两个 <code>POST</code> 端点立即返回 <code>202</code>，任务在后台跑，结果轮询 <code>/api/status.json</code>。</p>
+<p><strong>注意</strong>：后台任务的存活时间短于一次全量抓取（约 3.5 分钟），所以 <code>/api/refresh</code> 在匿名抓取下大概率跑不完就被回收——<strong>全量抓取以 6 小时的 cron 为准</strong>（cron 有 15 分钟额度）。配上 <code>GITHUB_TOKEN</code> 后抓取缩短到约 70 秒，手动触发才稳定可用。<code>/api/translate</code> 一批只要十几秒，不受此限。</p>
+<h2>运维</h2>
+<p>部署：</p>
+<pre><code>cd /Volumes/data/dev/dsh-plugin-explorer/worker &amp;&amp; npx wrangler deploy
+</code></pre>
+<p>查看抓取与翻译进度：</p>
+<pre><code>curl -s https://dsh.jamintextiles.com/api/status.json
+</code></pre>
+<p>手动催一批翻译（密钥存在 <code>worker/.refresh-key</code>，已 gitignore）：</p>
+<pre><code>cd /Volumes/data/dev/dsh-plugin-explorer/worker &amp;&amp; curl -X POST -H "Authorization: Bearer $(cat .refresh-key)" https://dsh.jamintextiles.com/api/translate
+</code></pre>
+<p>实时日志（含两条 cron 的执行结果）：</p>
+<pre><code>cd /Volumes/data/dev/dsh-plugin-explorer/worker &amp;&amp; npx wrangler tail
+</code></pre>
+<p>本地开发。Workers AI 只有远端实现，所以<strong>不要加 <code>--local</code></strong>，否则 AI 绑定直接报错：</p>
+<pre><code>cd /Volumes/data/dev/dsh-plugin-explorer/worker &amp;&amp; npx wrangler dev --port 8788
+</code></pre>
+<pre><code>curl "http://localhost:8788/cdn-cgi/local/scheduled?cron=17+*/6+*+*+*"
+</code></pre>
+<h2>配置</h2>
+<p>都在 <code>worker/wrangler.jsonc</code>，改完重新部署生效：</p>
+<ul>
+<li><code>vars.GITHUB_TOPIC</code> — 抓取的 topic，默认 <code>dsh-plugin</code></li>
+<li><code>vars.TRANSLATE_BATCH</code> — 每轮翻译条数，默认 60</li>
+<li><code>vars.CRON_FETCH</code> / <code>vars.CRON_TRANSLATE</code> — 必须与 <code>triggers.crons</code> 里的表达式逐字一致，否则 <code>scheduled()</code> 会拒绝执行并报错</li>
+<li><code>triggers.crons</code> — 定时表达式</li>
+</ul>
+<p>提高 GitHub 限额（可选，能让手动抓取也稳定跑完）：</p>
+<pre><code>cd /Volumes/data/dev/dsh-plugin-explorer/worker &amp;&amp; npx wrangler secret put GITHUB_TOKEN
+</code></pre>
+<h2>分类规则</h2>
+<p>种类（单选）与功能标签（可叠加）都由名称、描述、topic 的关键词匹配得出，规则是 <code>worker/src/index.ts</code> 里的 <code>KINDS</code> 和 <code>FUNCTIONS</code> 两个数组，发布快照时算好存进去。页面和 <code>/api/search</code> 共用这份结果，规则只有这一处；页面只保留 id 到显示名的映射。</p>
+<p>分类只看<strong>原文</strong>：把译文一并计入会让 “vision → 视觉” 这类词重复命中，放大误判。搜索则同时匹配原文和译文，所以用中文也搜得到英文项目。</p>
+<h2>按需查插件的 skill</h2>
+<p><a href="https://github.com/stakeswky/awesome-dsh/blob/HEAD/SKILL.md"><code>SKILL.md</code></a> 把「用户说要什么 → 检索本站 → 给出真实安装命令」这套流程固化下来，含检索技巧（中英混合词、宽泛诉求改用标签筛选）和两个已知坑：git 源插件首次 <code>add</code> 会被 pnpm 的 <code>allowBuilds</code> 拦下，以及未声明 <code>dsh.bundle</code> 的包只会作为普通依赖装上、不激活插件层。</p>
+<p>同一份 SKILL.md 有两种装法，都只读公开端点，不需要任何密钥。</p>
+<p><strong>装进 DSH</strong>（本仓库即 DSH 插件包）：</p>
+<pre><code>dsh plugin --profile &lt;profile&gt; add github:stakeswky/awesome-dsh
+</code></pre>
+<p>插件把 <code>SKILL.md</code> 注册为 <code>ctx.skills</code> 上的 <code>dsh-plugin-finder</code>，DSH 智能体按需加载。</p>
+<p><strong>装进 Claude Code</strong>：</p>
+<pre><code>mkdir -p ~/.claude/skills/dsh-plugin-finder &amp;&amp; cp SKILL.md ~/.claude/skills/dsh-plugin-finder/
+</code></pre>
+<p>装好后说「给 DSH 装个能看图的插件」「DSH 有没有记忆类插件」即可触发。</p>
+<h2>自行部署一份</h2>
+<p><code>worker/wrangler.jsonc</code> 里的 KV namespace id 和自定义域名属于本站账号，换成自己的：</p>
+<pre><code>cd worker &amp;&amp; npm install
+npx wrangler kv namespace create DSH_PLUGINS   # 把输出的 id 填进 wrangler.jsonc
+</code></pre>
+<p>再把 <code>routes</code> 换成自己的域名（或整段删掉，走 <code>*.workers.dev</code>），然后：</p>
+<pre><code>npx wrangler deploy
+npx wrangler secret put REFRESH_KEY   # 自定一个随机串，用于手动触发抓取/翻译
+</code></pre>
+<p>首份数据等抓取 cron 触发即可（最长 6 小时），或临时把 <code>CRON_FETCH</code> 与 <code>triggers.crons</code> 改密一些跑一轮再改回来。Workers AI 与 KV 均需 Workers 付费计划：全量抓取要跑约 3.5 分钟，超出免费版的 CPU 与子请求额度。</p>

@@ -1,0 +1,79 @@
+<h1>dsh-repro</h1>
+<p>Export a minimal, secret-scrubbed, replayable problem bundle for the DeepSeek
+Harness.</p>
+<p><a href="https://awesome-dsh-plugin.com"><img src="https://awesome-dsh-plugin.com/badge.svg" alt="Awesome DSH Plugin"></a></p>
+<p><code>/repro</code> reads the current session's complete canonical log through
+<code>sessionPersistence.inspect</code>, scrubs secrets value by value, collects failed
+commands and a <code>git diff</code>, and writes a <code>repro-&lt;sessionId&gt;.json</code> manifest.</p>
+<h2>Install</h2>
+<pre><code>dsh plugin --profile &lt;name&gt; add github:EvilIrving/dsh-repro
+</code></pre>
+<p>Or, from a checkout:</p>
+<pre><code>dsh plugin --profile &lt;name&gt; add ./dsh-repro
+</code></pre>
+<p>The bundle patch inserts one plugin row (<code>dsh-repro</code>); it needs the
+<code>commands</code> and <code>sessionPersistence</code> services, which the base profile already
+mounts.</p>
+<h2>What the bundle contains</h2>
+<pre><code>interface ReproManifest {
+  formatVersion: number          // 1
+  header: SessionHeader          // cwd, lineage, delegation depth
+  events: SessionEvent[]         // complete, secret-scrubbed canonical log
+  failedCommands: string[]       // `name &lt;arguments&gt;` for each errored tool call
+  gitDiff: string                // empty when git or a repo is unavailable
+  versions: Record&lt;string, string&gt;
+}
+</code></pre>
+<p>The <code>events</code> array is the full canonical log (contiguous from seq 0), so it can
+later be replayed via <code>ctx.sessions.create(id, { seed })</code>; secrets are redacted,
+not dropped, which preserves replay balance.</p>
+<h2>Secret scrubbing (fail-closed)</h2>
+<p><code>redactValue</code> walks the detached JSON log and:</p>
+<ol>
+<li>redacts any object key matching the harness's credential pattern
+(<code>/KEY|PASSWORD|SECRET|TOKEN/i</code>) <strong>whole</strong>;</li>
+<li>redacts any string beginning with a known token prefix (<code>sk-</code>, <code>ghp_</code>,
+<code>xoxb-</code>, <code>Bearer </code>, …);</li>
+<li>redacts any high-entropy run (long base64/hex/token-shaped sequence).</li>
+</ol>
+<p>Both prefix and entropy thresholds are <code>Config</code>-driven. The default is
+fail-closed: a string that looks credential-shaped is redacted rather than
+passed through. This mirrors <code>session-telemetry</code>'s waterfall <em>shape</em> (rewrite an
+outbound copy, never the canonical log) while supplying the value-level rules
+the telemetry seam deliberately ships without.</p>
+<h2>Config</h2>
+<pre><code>export interface Config {
+  tokenPrefixes: string[]
+  minHighEntropyLength: number  // default 20
+  gitDiffMaxBytes: number       // default 256 KiB
+  gitGraceMs: number            // default 5000
+}
+</code></pre>
+<h2>Dependencies</h2>
+<ul>
+<li><code>commands</code> and <code>sessionPersistence</code> are hard dependencies (<code>inject</code>).</li>
+<li><code>subprocess</code> is optional (<code>ctx.get</code>): <code>git diff</code> degrades to an empty string
+when it is absent or the cwd is not a repository.</li>
+</ul>
+<h2>Model Experience</h2>
+<h3>Request context and condition</h3>
+<h4>What the model sees</h4>
+<p>A single slash command <code>/repro [output directory]</code>. Its result is a one-line
+success message naming the written bundle path; the bundle contents are never
+injected into the model context.</p>
+<h4>Token effect</h4>
+<p>Zero-direct effect; the command result is a single short text line.</p>
+<h4>KV Cache effect</h4>
+<p>Append-only: the command lifecycle events (<code>command/run</code>, <code>command/done</code>) append
+to the log and never rewrite earlier tokens.</p>
+<h2>Known Limitations and Deferred Work</h2>
+<ul>
+<li><strong>Bundle write bypasses the sandboxed <code>ctx.fs</code> seam</strong> — v1 uses
+<code>node:fs/promises</code> directly; routing the write through <code>ctx.fs</code> (so a
+sandboxed deployment constrains the output path) is deferred.</li>
+<li><strong>Replay CLI is out of scope</strong> — <code>dsh repro run &lt;bundle&gt;</code> is a separate
+process-level seam (<code>boot/cmdline</code> + <code>cmdlineArgs</code>), not <code>/repro</code>; v1 only
+exports.</li>
+<li><strong>No oversized-artifact inlining</strong> — spill artifacts are referenced by
+locator, never inlined; any file-byte inlining would need a size policy.</li>
+</ul>

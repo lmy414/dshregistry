@@ -1,0 +1,458 @@
+<h1>dsh-compaction-instant</h1>
+<p><a href="https://github.com/KitDoesIt/dsh-compaction-instant/blob/HEAD/README.md">English</a> | <a href="https://github.com/KitDoesIt/dsh-compaction-instant/blob/HEAD/README.zh-CN.md">简体中文</a></p>
+<p>Instant, near-lossless context compaction for <a href="https://github.com/deepseek-ai/deepseek-harness">DeepSeek Harness</a> — a <strong>drop-in replacement for <code>@deepseek-ai/dsh-compaction-basic</code></strong> that replaces LLM summarization with the deterministic conversation-compiler principle of <a href="https://github.com/lllyasviel/VCC">lllyasviel/VCC</a>.</p>
+<p>A compaction compresses a shadowed history span in <strong>milliseconds, with zero model calls</strong>, keeping <strong>original tokens only</strong> — no paraphrase, no hallucination, no summarizer cost. Everything that is cut is still recoverable through <code>(seq N)</code> pointers into the durable session log.</p>
+<h2>Key features</h2>
+<ul>
+<li><strong>LLM-free</strong> — compaction never invokes a model. No summarizer prompt, no inference latency, no token spend; the compile is deterministic text processing, so a million-token history compresses in milliseconds.</li>
+<li><strong>Near-lossless</strong> — output contains only original tokens; every cut is marked and points at its durable <code>seq</code>, and prior checkpoints are copied verbatim.</li>
+<li><strong>Instant</strong> — a single deterministic pass over the shadowed nodes; no network, no model, no KV-cache concerns.</li>
+<li><strong>Contract-exact drop-in</strong> — same seam, events, provenance and failure vocabulary as <code>compaction-basic</code>; every built-in preset loads it unchanged (alias install).</li>
+</ul>
+<h2>Example</h2>
+<p>A region containing a user request, an assistant text + tool call, and its result compiles to:</p>
+<pre><code>[user]
+please fix the bug
+[assistant]
+on it
+* read "a.js" (seq 2 -&gt; result 3)
+[user]
+next question
+</code></pre>
+<p>Every tool call is ONE line: the key argument for whitelisted tools (<code>toolArgTools</code>), name-only for the rest (<code>* job_kill (seq 9 -&gt; result 10)</code>), nothing at all for <code>hideTools</code> rows. Tool results never occupy entries — the <code>-&gt; result N</code> pointer keeps them one <code>recall(type:"result")</code> away. Long user/assistant text is truncated to its budget with <code>...(truncated from seq N)</code>; every elision names the durable event that still holds the full content.</p>
+<h2>Recall: the lossless read-back layer</h2>
+<p>The package also ships the counterparts that close the near-lossless loop — <strong>same-session recall</strong> for the agent and the human. Because the session log is append-only, every token the compiler ever elided is still recoverable:</p>
+<table>
+<thead>
+<tr>
+<th>Entry point</th>
+<th>Module</th>
+<th>What it does</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>recall</code> <strong>tool</strong> (model-facing)</td>
+<td><code>dsh-compaction-instant/tool</code></td>
+<td>Typed restore: <code>type:"seq"</code> with <code>(seq N)</code>/<code>(seqs A-B)</code> markers, <code>type:"result"</code> with the <code>result N</code> pointer, <code>type:"checkpoint"</code> with a <code>[checkpoint N]</code> ordinal — restores exact original content into the current tool result</td>
+</tr>
+<tr>
+<td><code>search</code> <strong>tool</strong> (model-facing, grep)</td>
+<td><code>dsh-compaction-instant/tool</code></td>
+<td>Keyword/regex search over the whole durable log — including content elided by compaction — returning matching events with their <code>(seq N)</code> pointers, ready for <code>recall</code></td>
+</tr>
+<tr>
+<td><code>/recall</code> <strong>command</strong> (human, grep)</td>
+<td><code>dsh-compaction-instant/command</code></td>
+<td>`/recall &lt;keyword</td>
+</tr>
+<tr>
+<td>Shared cores</td>
+<td><code>dsh-compaction-instant/recall</code> + <code>dsh-compaction-instant/search</code></td>
+<td>Seq parsing (<code>12</code>, <code>3-7</code>, <code>seq 12</code> / <code>seqs 3-7</code>), log expansion, budgets, projection; regex compilation and hit rendering</td>
+</tr>
+</tbody></table>
+<p>Recall keeps <strong>everything</strong>: text, reasoning, raw tool-call arguments, nested tool-result content; log-only events render as labeled data dumps; missing seqs are reported; a <code>maxRecallTokens</code> budget (default <strong>16000</strong>) cuts with a provenance marker and counts the skipped remainder; searches cap shown hits (<code>maxSearchHits</code>, default <strong>50</strong>). Both plugins are separate rows, so they can be mounted next to <strong>any</strong> compaction backend — they only read the durable log.</p>
+<p>Every checkpoint also frames a short <strong>RECALL guide</strong> at its head, telling the model exactly how to use <code>recall</code> / <code>search</code> to recover elided content. When a prior checkpoint is elided under cap pressure it never vanishes silently: it leaves a single <code>[checkpoint N]</code> line (N = compaction ordinal, 1 = oldest), which <code>recall(type:"checkpoint", id:"N")</code> restores in full.</p>
+<h2>Configuration</h2>
+<p>All fields optional; defaults shown.</p>
+<table>
+<thead>
+<tr>
+<th>Key</th>
+<th>Default</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>thresholdRatio</code></td>
+<td><code>0.5</code></td>
+<td>Fraction of the routed model's context window that triggers automatic compaction</td>
+</tr>
+<tr>
+<td><code>retainRatio</code></td>
+<td><code>0.05</code></td>
+<td>Fraction of the context window kept verbatim at the surface tail</td>
+</tr>
+<tr>
+<td><code>retainTokens</code></td>
+<td>—</td>
+<td>Exact tail budget; mutually exclusive with <code>retainRatio</code></td>
+</tr>
+<tr>
+<td><code>manualRetainRatio</code></td>
+<td><code>0.05</code></td>
+<td>Fraction of the measured surface kept verbatim by a manual <code>/compact</code> (so the recent conversation is never compiled away)</td>
+</tr>
+<tr>
+<td><code>manualRetainTokens</code></td>
+<td>—</td>
+<td>Exact manual tail budget; mutually exclusive with <code>manualRetainRatio</code></td>
+</tr>
+<tr>
+<td><code>auto</code></td>
+<td><code>true</code></td>
+<td>Register <code>agent/pre-step</code> pressure and <code>agent/request-error</code> overflow recovery</td>
+</tr>
+<tr>
+<td><code>maxTokens</code></td>
+<td><code>8192</code></td>
+<td>Floor of the total cap for one compiled checkpoint (density-aware tokens)</td>
+</tr>
+<tr>
+<td><code>checkpointScale</code></td>
+<td><code>0.1</code></td>
+<td>The effective cap is <code>max(maxTokens, shadowed × checkpointScale)</code>, ceilinged at <code>checkpointCap</code> — a large span never crushes every entry into a sliver</td>
+</tr>
+<tr>
+<td><code>checkpointCap</code></td>
+<td><code>65536</code></td>
+<td>Absolute ceiling of the scaled checkpoint cap</td>
+</tr>
+<tr>
+<td><code>textTokens</code></td>
+<td><code>512</code></td>
+<td>Budget per assistant text block</td>
+</tr>
+<tr>
+<td><code>userTextTokens</code></td>
+<td><code>1024</code></td>
+<td>Budget per user text block</td>
+</tr>
+<tr>
+<td><code>toolCallTokens</code></td>
+<td><code>128</code></td>
+<td>Budget per tool-call one-liner (never rescaled — see the elision rules)</td>
+</tr>
+<tr>
+<td><code>toolResultExcerptTokens</code></td>
+<td><code>256</code></td>
+<td>Accepted for compatibility; <strong>inert</strong> — tool results no longer occupy entries</td>
+</tr>
+<tr>
+<td><code>includeReasoning</code></td>
+<td><code>false</code></td>
+<td>Keep reasoning blocks in the checkpoint</td>
+</tr>
+<tr>
+<td><code>stripNoiseXml</code></td>
+<td><code>true</code></td>
+<td>Strip configured noise wrappers from user text</td>
+</tr>
+<tr>
+<td><code>noisePatterns</code></td>
+<td>see compiler</td>
+<td>Noise XML regex sources, applied with the <code>s</code> flag</td>
+</tr>
+<tr>
+<td><code>toolKeyFields</code></td>
+<td>built-ins</td>
+<td>Extra tool-name → argument-field map for one-liners</td>
+</tr>
+<tr>
+<td><code>toolArgTools</code></td>
+<td>see compiler</td>
+<td>Whitelist whose key argument renders in the one-liner (<code>read</code>/<code>write</code>/<code>edit</code>/<code>glob</code>/<code>grep</code>/<code>bash</code>/<code>shell</code>/<code>web_search</code>/<code>skill</code>/<code>subagent</code>/…); every other tool is name-only</td>
+</tr>
+<tr>
+<td><code>hideTools</code></td>
+<td>—</td>
+<td>Bookkeeping tools dropped from the checkpoint entirely</td>
+</tr>
+<tr>
+<td><code>modelPolicies</code></td>
+<td>—</td>
+<td>Per provider/model overrides of <code>thresholdRatio</code>/<code>retain*</code> (basic-compatible shape)</td>
+</tr>
+<tr>
+<td><code>compactionRetries</code> / <code>maxOverflowRetries</code></td>
+<td><code>1</code> / <code>1</code></td>
+<td>Retry budgets, same semantics as basic</td>
+</tr>
+<tr>
+<td><code>summarizationProvider</code> / <code>summarizationModel</code></td>
+<td>—</td>
+<td>Accepted for config drop-in compatibility; <strong>inert</strong> — this backend never routes a model</td>
+</tr>
+</tbody></table>
+<p>The tool and command plugins each take their own <code>{ maxRecallTokens?: 16000, maxSearchHits?: 50 }</code> config.</p>
+<blockquote>
+<p><strong>Cordis config gotcha:</strong> the plugin row's config passes through the schemastery schema, whose <code>~standard</code> adapter injects <strong><code>[]</code> for every absent array key</strong> (<code>toolArgTools</code>, <code>hideTools</code>, <code>noisePatterns</code>, <code>toolKeyFields</code>, <code>modelPolicies</code>). The resolver treats an empty list as <em>unset</em> and falls back to the defaults — so a missing <code>toolArgTools</code> keeps the built-in whitelist (never disable it by writing <code>toolArgTools: []</code>; empty means default). <code>debug: true</code> writes per-compile diagnostics to the configured <code>debugLogPath</code> (default <code>$DSH_HOME/compaction-debug.log</code>).</p>
+</blockquote>
+<p>Budgets are enforced twice — by token count and by a <code>budget × 4</code> character ceiling — so pathological unbroken runs (base64 blobs, minified files) cannot bypass them. Tool calls are <strong>always one line</strong>: they are never rescaled, and the cap loop shrinks only the conversation-text budgets (floor <strong>32 tokens</strong> each). If the compiled region still exceeds the (scaled) cap, the oldest <strong>tool rows</strong> are removed first (<code>[N tool/result entries elided: seqs a-b]</code>), and only then the oldest remaining entries (<code>[N earlier entries elided: seqs a-b]</code>) — tool calls can never squeeze the dialogue out. The newest content always survives.</p>
+<h3>Browser settings card (Settings → Plugins)</h3>
+<p>Since 0.1.4 the engine exposes a <strong>user-owned settings namespace</strong> (<code>compaction-instant</code>) on every deployment that composes the settings domain (the standard web/desktop profiles do). The editable subset, persisted to <code>settings.yaml</code> and layered <strong>over</strong> the plugin row's cordis config:</p>
+<table>
+<thead>
+<tr>
+<th>Field</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>checkpointScale</code></td>
+<td>Checkpoint budget = shadowed tokens × this ratio</td>
+</tr>
+<tr>
+<td><code>checkpointCap</code></td>
+<td>Absolute ceiling of the scaled budget</td>
+</tr>
+<tr>
+<td><code>maxTokens</code></td>
+<td>Total compiler-token cap for one checkpoint</td>
+</tr>
+<tr>
+<td><code>auto</code></td>
+<td>Register automatic between-step compaction</td>
+</tr>
+<tr>
+<td><code>debug</code></td>
+<td>Write engine debug lines to the log file</td>
+</tr>
+<tr>
+<td><code>debugLogPath</code></td>
+<td>Debug log path (empty = <code>$DSH_HOME/compaction-debug.log</code>)</td>
+</tr>
+</tbody></table>
+<p>Everything else (<code>modelPolicies</code>, <code>toolArgTools</code>, …) stays cordis-config-only. The settings layer never breaks the engine: every settings write is re-validated by the full config resolver before it is persisted, and non-exposed entry fields keep their composed values. Without a settings service the engine behaves exactly as before (composition entry only). The card is registered on the client bundle, so it appears without touching any deployment config beyond installing the package — restart <code>dsh web</code> once so the boot graph picks up the <code>dsh.client</code> bundle.</p>
+<h3>Tokenizer and multilingual behavior</h3>
+<p>The tokenizer is a character-class heuristic: ASCII letter runs and digit runs count as one token each, punctuation is per-character, whitespace is free, and every other code unit is its own token. Concretely:</p>
+<table>
+<thead>
+<tr>
+<th>Content</th>
+<th>Tokens</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>CJK (<code>你好，世界！</code>)</td>
+<td>1 per code point (6)</td>
+</tr>
+<tr>
+<td>Cyrillic / Arabic</td>
+<td>1 per code unit</td>
+</tr>
+<tr>
+<td>Accented Latin (<code>café</code>)</td>
+<td>ASCII runs stay grouped (<code>caf</code> + <code>é</code>)</td>
+</tr>
+<tr>
+<td>Emoji (<code>😀</code>)</td>
+<td>2 (surrogate pair)</td>
+</tr>
+</tbody></table>
+<p>Every truncation, excerpt, and cap cut is taken at a <strong>code-point boundary</strong> — a slice never leaves a lone surrogate half, so emoji and other astral characters always reach the model intact (pinned by <code>test/multilang.test.js</code>). The character-density ceiling uses UTF-16 length, which is the conservative side for astral content.</p>
+<p>The harness token meter (used for the shrink guarantee and <code>/compact</code> reporting) is a separate <code>chars / 4 + block overhead</code> estimator; the two deliberately coexist — see the top-level design notes.</p>
+<h2>Guarantees</h2>
+<ul>
+<li><strong>Instant</strong> — the compile is a single deterministic pass over the shadowed nodes; no network, no model, no KV-cache concerns.</li>
+<li><strong>Near-lossless</strong> — output contains only original tokens; every cut is marked and points at its durable <code>seq</code>; prior checkpoints are copied verbatim.</li>
+<li><strong>Contract-exact drop-in</strong> — identical seam, events, provenance, pricing (via the singleton <code>ctx.tokenMeter</code>), and failure vocabulary as <code>compaction-basic</code>, including the shrink guarantee (a checkpoint that would not reduce the surface is rejected).</li>
+<li><strong>Optional pruner compatible</strong> — consumes the optional <code>toolResultPruner</code> service exactly like basic (it helps the <em>retained tail</em>; the compiler collapses the <em>shadowed</em> region).</li>
+</ul>
+<h2>Measured compression (real sessions, no drops)</h2>
+<p>Rates measured on real session logs (this project's own development sessions), compiled <strong>without dropping a single entry</strong> — every row survives, only per-entry truncation and one-line tool rows apply. Percentages are of the original token count.</p>
+<table>
+<thead>
+<tr>
+<th>Load</th>
+<th>Raw tokens</th>
+<th>Compiled</th>
+<th>Retained</th>
+<th>Compressed</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>Tool-dense session, full (3,181 nodes: 1,438 tool calls + 1,540 results)</td>
+<td>2,523,012</td>
+<td>226,205</td>
+<td><strong>9.0%</strong></td>
+<td>91.0%</td>
+</tr>
+<tr>
+<td>Another session, full (864 nodes)</td>
+<td>685,088</td>
+<td>62,705</td>
+<td><strong>9.2%</strong></td>
+<td>90.8%</td>
+</tr>
+<tr>
+<td>Same tool-dense session, recent 800 messages</td>
+<td>625,927</td>
+<td>45,031</td>
+<td><strong>7.2%</strong></td>
+<td>92.8%</td>
+</tr>
+<tr>
+<td>Pure text only (same session minus all tool rows)</td>
+<td>160,963</td>
+<td>109,945</td>
+<td><strong>68.3%</strong></td>
+<td>31.7%</td>
+</tr>
+</tbody></table>
+<p>Where the ratio comes from (no drops):</p>
+<ul>
+<li><strong>Tool results cost nothing</strong> — results never produce entries; the <code>-&gt; result N</code> pointer keeps each one one <code>recall</code> away. That is the biggest win.</li>
+<li><strong>Tool calls are one line</strong> — each call collapses to a single row (≤ 128 tokens; ~100 on average).</li>
+<li><strong>Reasoning text is not retained</strong> — reasoning deltas are elided entirely (marked, never silent).</li>
+<li><strong>Conversation text is nearly lossless</strong> — the pure-text control retained 68.3%; the ~1.5x on text is mostly JSON wrapper stripping plus truncation of only the longest blocks.</li>
+</ul>
+<p>Budget scan (same 2.5M-token tool-dense session): dropping starts at a cap of ~226K tokens (9% of the raw size — close to the default <code>checkpointScale</code> of 0.1, but the 64K hard cap cuts it short). Below that the cost is a cliff, not a slope:</p>
+<table>
+<thead>
+<tr>
+<th>Cap</th>
+<th>Compiled</th>
+<th>Retained</th>
+<th>Entries</th>
+<th>Dropped</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>8,192</td>
+<td>8,243</td>
+<td>0.33%</td>
+<td>111</td>
+<td>2,090</td>
+</tr>
+<tr>
+<td>32,768</td>
+<td>22,263</td>
+<td>0.88%</td>
+<td>232</td>
+<td>1,969</td>
+</tr>
+<tr>
+<td>65,536 (deployment default)</td>
+<td>55,737</td>
+<td>2.2%</td>
+<td>325</td>
+<td>1,876</td>
+</tr>
+<tr>
+<td>65,536</td>
+<td>55,737</td>
+<td>2.2%</td>
+<td>325</td>
+<td>1,876</td>
+</tr>
+<tr>
+<td>131,072</td>
+<td>131,047</td>
+<td>5.2%</td>
+<td>1,142</td>
+<td>1,058</td>
+</tr>
+<tr>
+<td>226,205 (no-drop threshold)</td>
+<td>226,205</td>
+<td>9.0%</td>
+<td>2,199</td>
+<td>0</td>
+</tr>
+</tbody></table>
+<h2>Installation</h2>
+<p>All three methods below install the package (published to npm as <code>dsh-compaction-instant</code>) with the harness's own plugin manager (which runs pnpm inside the profile directory, making the package resolvable to both the host composition and every agent preset):</p>
+<pre><code>dsh plugin --profile web add &lt;spec&gt;
+</code></pre>
+<p><code>dsh-command-compact</code> (<code>/compact</code>) is backend-independent, so it keeps working unchanged in every method.</p>
+<h3>Method 1 — Drop-in replace the built-in engine (alias)</h3>
+<pre><code>dsh plugin --profile web add "@deepseek-ai/dsh-compaction-basic@npm:dsh-compaction-instant"
+</code></pre>
+<p><strong>dsh currently has no way to choose the compaction engine</strong>, and the built-in agent presets (<code>standard</code>, <code>code</code>, <code>cordis</code>) pin the package name <code>@deepseek-ai/dsh-compaction-basic</code> in their compositions. To use this engine inside those built-in presets you therefore <strong>masquerade as the built-in plugin</strong>: preset rows resolve bare package names from the profile's <code>node_modules</code> (which outranks the harness installation), so installing our package under the built-in name makes every built-in preset load this engine automatically — no preset files are touched, and preset upgrades keep working.</p>
+<p>The masquerade is safe by construction: this engine is a contract-exact drop-in — the same <code>ctx.compaction</code> seam, the <strong>identical inject list</strong> (<code>llm</code>, <code>tokenMeter</code>, <code>sessions</code>), the same event protocol and error vocabulary, and its <code>Config</code> accepts every key of basic's configuration surface. Removing the alias dependency restores the real basic.</p>
+<p>This install is <strong>not</strong> recognized as a bundle (the harness resolves the name <code>@deepseek-ai/dsh-compaction-basic</code> from its own installation, which declares no <code>dsh.bundle</code>), so nothing is automatic — add the recall tools and <code>/recall</code> command to the profile's <code>cordis.patch.yml</code> yourself (new rows ride an <code>insert</code> list; the file hot-reloads, no restart needed). Row names must use the <strong>alias package name</strong>, the only one resolvable in this install; the engine row is optional, needed only as a host fallback for presets without compaction (e.g. <code>minimal</code>):</p>
+<pre><code>- id: compaction-basic
+  disabled: true                     # host-level swap (optional fallback)
+- insert:
+    - id: compaction-instant
+      name: '@deepseek-ai/dsh-compaction-basic'   # host fallback for presets without compaction
+    - id: tool-recall
+      name: '@deepseek-ai/dsh-compaction-basic/tool'
+    - id: command-recall
+      name: '@deepseek-ai/dsh-compaction-basic/command'
+</code></pre>
+<h3>Method 2 — Direct install + AI-authored preset copy (dsh authoring mode)</h3>
+<pre><code>dsh plugin --profile web add dsh-compaction-instant
+</code></pre>
+<p>Then open a session with the preset-authoring preset (the shipped <code>cordis</code> preset, "creation mode") and ask the AI to:</p>
+<blockquote>
+<p>Copy the <code>standard</code> preset and swap its compaction engine row to <code>dsh-compaction-instant</code>.</p>
+</blockquote>
+<p>The AI uses <code>agentPresets.copy('standard', '&lt;id&gt;')</code> to create a locally authored preset, swaps the compaction row's <code>name</code> in the copy, mount-validates it with <code>standingKeyFor('&lt;id&gt;')</code>, and can set it as the default by patching the <code>agent-presets</code> row (<code>config.default: &lt;id&gt;</code>). The new preset appears in the UI picker; the built-in presets stay untouched.</p>
+<p>Since v0.1.1 the package also declares <code>dsh.bundle</code>, so the direct install registers itself as a <strong>profile layer automatically</strong>: the built-in summarizer row is disabled and the instant engine + recall tools are inserted host-side (see <code>cordis.patch.yml</code> in the package). No manual patch rows needed for the host; only the preset copy above.</p>
+<h3>Method 3 — Direct install + manual preset configuration</h3>
+<pre><code>dsh plugin --profile web add dsh-compaction-instant
+mkdir -p "$DSH_HOME/.agent-presets/&lt;id&gt;"
+# copy composition + metadata from the built-in preset you want as a base
+# (the preset roster lists every preset's real path):
+cp &lt;built-in-preset&gt;/agent.cordis.yml "$DSH_HOME/.agent-presets/&lt;id&gt;/agent.cordis.yml"
+# write preset.yml beside it with name + description
+</code></pre>
+<p>Then hand-edit the copy's compaction group — one row name change, inside the same isolate realm:</p>
+<pre><code>- id: compaction
+  name: cordis:group
+  group: true
+  isolate:
+    compaction: true
+    toolResultPruner: true      # the pruner must share this realm
+  config:
+    - id: compaction-instant
+      name: dsh-compaction-instant   # was '@deepseek-ai/dsh-compaction-basic'
+    - id: command-compact
+      name: '@deepseek-ai/dsh-command-compact'
+    # ... keep the pruner row
+</code></pre>
+<p>Rules: never edit the shipped preset install; keep the isolate realm; a successful <code>standingKeyFor</code> mount (or simply starting a session on the preset) is the real validation — the roster's <code>broken</code> flag only catches parse errors.</p>
+<p>No host-level rows are needed for Methods 2 and 3: the <code>dsh.bundle</code> mentioned above registers everything automatically.</p>
+<table>
+<thead>
+<tr>
+<th>Method</th>
+<th>Engine in built-in presets</th>
+<th>Touches preset files</th>
+<th>Extra preset in picker</th>
+<th>Setup effort</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong>1. Alias replace</strong></td>
+<td>✅ automatic (standard/code/cordis)</td>
+<td>no</td>
+<td>no</td>
+<td>one command + patch rows</td>
+</tr>
+<tr>
+<td><strong>2. AI-authored copy</strong></td>
+<td>only the new preset</td>
+<td>the copy</td>
+<td>yes</td>
+<td>one prompt</td>
+</tr>
+<tr>
+<td><strong>3. Manual preset</strong></td>
+<td>only the new preset</td>
+<td>the copy</td>
+<td>yes</td>
+<td>manual edit</td>
+</tr>
+</tbody></table>
+<blockquote>
+<p>Only one <code>ctx.compaction</code> implementation may be mounted per context (the seam documents "load one implementation per context"); preset mounts keep their own isolate realm, so host and preset instances never collide.</p>
+</blockquote>
+<h2>Development</h2>
+<pre><code>npm test        # node --test (compiler units, config validation, session integration, engine)
+npm run check   # node --check over all sources
+</code></pre>
+<p>The package is dependency-light: <code>@deepseek-ai/schemastery</code> for the Config schema; everything else is a peer (the harness provides it). <code>src/compiler.js</code> is deliberately dependency-free so it is unit-testable without a running harness.</p>
+<h2>Differences from compaction-basic</h2>
+<ul>
+<li>No summarizer call → compaction latency goes from seconds to milliseconds; no summarizer token spend.</li>
+<li>No rephrasing → facts, file paths, commands, and identifiers survive byte-exact; the model continues on its own words.</li>
+<li>Deterministic → the same region always compiles to the same checkpoint.</li>
+<li>Prior checkpoints are copied verbatim instead of being re-summarized (cheap and lossless).</li>
+<li>Manual <code>/compact</code> keeps a verbatim recent tail (<code>manualRetainRatio</code>, default 0.05 of the measured surface) instead of compiling the whole history, so the active conversation is never compacted away; the compiled checkpoint only covers the older span.</li>
+<li>The <code>compaction/summary</code> event carries the <strong>compiled entries themselves</strong> — the UI's expandable checkpoint row shows exactly the body the model sees, wrapped in an <strong>adaptive Markdown code fence</strong> (the fence grows longer than any ``` inside, so messages containing markdown render as one tidy code block), and the checkpoint heads with a short RECALL guide telling the model how to recover elided content via <code>recall</code> / <code>search</code>.</li>
+<li>Trade-off: the checkpoint can be less <em>dense</em> than an LLM summary for prose-heavy history (facts are truncated, not merged). The verbatim tail (automatic <code>retainRatio</code> and manual <code>manualRetainRatio</code>) is where active work lives, and everything else stays recoverable through <code>(seq N)</code> pointers + recall.</li>
+</ul>
+<p>MIT licensed.</p>

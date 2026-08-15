@@ -1,0 +1,91 @@
+<h1>dsh-task-control</h1>
+<p><a href="https://github.com/p2coder/dsh-task-control/blob/HEAD/README.en.md">English</a> | 中文</p>
+<p>任务控制插件（DSH Web）：提交对话任务后，除了现有的"停止/取消"，还提供 <strong>暂停任务</strong>、<strong>恢复任务</strong> 两个控制，以 Cordis 双面插件（宿主端 + 浏览器端）实现。</p>
+<h2>功能</h2>
+<table>
+<thead>
+<tr>
+<th>操作</th>
+<th>行为</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong>暂停</strong> (Pause)</td>
+<td>两种模式：<strong>强制暂停</strong>与<strong>安全暂停</strong>；未显式指定时按设置 →「任务控制」中的默认粒度执行（出厂默认 <code>safe wait</code>）。</td>
+</tr>
+<tr>
+<td>· 安全暂停</td>
+<td>从不中断工作：有<strong>工具在执行</strong> → 延迟到<strong>安全界限</strong>（工具执行完毕、<code>tool/result</code> 落地且无更多 in-flight 工具）才真正暂停；有<strong>推理在执行</strong> → 按设置中的推理粒度：<code>wait</code>（默认，不中断 LLM，等推理完成后再暂停）或 <code>stop</code>（终止当前 LLM 输出，恢复时重新推理）。期间 trace 持续记录。</td>
+</tr>
+<tr>
+<td>· 强制暂停</td>
+<td>立即<strong>取消正在执行的工具</strong>、<strong>中断推理输出</strong>；暂停状态记住被中断的工具（<code>interruptedTool</code>）。<strong>恢复时先查该工具在会话日志中的实际结果</strong>：已执行完成 → 直接继续不重跑；被中止/状态未知（可能部分执行）→ 提醒用户"上次暂停时 xxx 工具没有执行完成，将重新执行"，由用户选择 <strong>重新执行该工具 / 跳过该工具 / 保持暂停</strong>。</td>
+</tr>
+<tr>
+<td><strong>恢复</strong> (Resume)</td>
+<td>清除暂停标记，<strong>从暂停点继续执行</strong>（会话日志即 trace，不重发原始提示词、不重跑已完成工作）。安全暂停：从暂停点继续；若恢复时任务实际仍在运行（暂停未真正落地）→ 仅清除标记，期间工具/模型执行结果正常显示。强制暂停（有被中断工具）：必须先确认，用户选择 <code>rerun</code>/<code>skip</code> 后按选择继续。</td>
+</tr>
+<tr>
+<td><strong>取消</strong> (Cancel)</td>
+<td><strong>立即</strong>中断当前回合（保留输入队列），清除暂停标记；若有工具在执行，<strong>立即终止</strong>并在回复中说明其<strong>预期目的</strong>、<strong>提醒检查副作用</strong>（文件/进程/网络等）。</td>
+</tr>
+</tbody></table>
+<blockquote>
+<p>暂停粒度默认值：在 Web 设置 →「任务控制」中配置（出厂默认 <code>safe</code> + <code>wait</code>）。命令 <code>/pause</code>（及输入区暂停按钮）未显式指定模式时按此默认执行；<code>/pause force</code>、<code>/pause safe [stop|wait]</code> 显式覆盖。<code>taskControl</code> 服务：<code>pause(sessionId, { mode, reason })</code>（缺省字段同样按设置解析）、<code>resume(sessionId, { confirm, choice: 'rerun'|'skip' })</code>。强制暂停后点恢复会弹出三选菜单（重新执行 / 跳过该工具 / 保持暂停）。</p>
+</blockquote>
+<p><strong>状态模型（Route A）</strong>：暂停/恢复状态<strong>不再写入会话日志</strong>（<code>task-control/paused</code> / <code>task-control/resumed</code> 是自定义事件类型，harness 的持久化读取器只认内置事件类型清单或带 <code>ignorable</code> 标记的事件，写进去会导致会话在重启后无法加载）。状态改由插件自己的持久化 store 保存（<code>~/.dsh/task-control/&lt;sessionId&gt;.json</code>，原子写；测试可用 <code>DSH_TASK_CONTROL_STATE_DIR</code> 覆盖目录），所有读取方统一走这一个数据源：</p>
+<ul>
+<li>浏览器 dock：轮询宿主路由 <code>/task-control/state?session=&lt;id&gt;</code>（每 2 秒）；</li>
+<li>浏览器设置页：<code>/task-control/settings</code> 路由读写暂停粒度默认值（默认 <code>safe</code> + <code>wait</code>），修改后立即生效；</li>
+<li><code>taskControl</code> 服务 <code>state()</code>：直接读 store，<strong>离线会话（未加载）也能返回暂停状态</strong>，重启后暂停态不丢；</li>
+<li>dsh-trace-repeat：在每个会话事件上通过 <code>taskControl</code> 服务对账暂停门控。</li>
+</ul>
+<p>task-batch 等其他插件继续用 <code>taskControl</code> 服务，无需改动。</p>
+<h2>安装</h2>
+<p>包内已含 <code>dsh.bundle</code> manifest，安装后自动激活（无需手动修改任何配置）：</p>
+<pre><code># 从 GitHub 安装
+dsh plugin --profile web add github:p2coder/dsh-task-control
+# 发布 npm 后亦可：dsh plugin --profile web add dsh-task-control
+</code></pre>
+<p>安装后<strong>完整重启 dsh web</strong>（宿主插件不支持运行时热装），并在浏览器中刷新页面。</p>
+<h2>使用</h2>
+<ol>
+<li>刷新浏览器页面。</li>
+<li>提交一个任务，agent 运行期间，发送按钮左侧会出现三个图标按钮：<ul>
+<li>⏸ 暂停（运行中可用）</li>
+<li>▶ 恢复（已暂停时可用）</li>
+<li>⏹ 取消（运行中或已暂停时可用）</li>
+</ul>
+</li>
+<li>按钮组<strong>常驻</strong>（不随空闲隐藏），仅按状态禁用：空闲/无暂停时暂停与恢复按钮变灰、取消按钮在既非运行也非暂停时变灰。</li>
+<li>设置 →「任务控制」：配置默认暂停粒度（默认 <code>safe</code> + <code>wait</code>），裸 <code>/pause</code> 与暂停按钮按此执行。</li>
+</ol>
+<p>也可以直接在输入框输入斜杠命令：<code>/pause</code>、<code>/resume</code>、<code>/cancel</code>（命令结果会以普通命令行形式出现在对话中）。</p>
+<p><strong>暂停语义（默认跟随设置，出厂为 safe wait）</strong>：<code>/pause</code>（及 dock 暂停按钮）未显式指定模式时，按设置 →「任务控制」中的默认粒度执行（默认 <code>safe wait</code>：等推理/工具完成后才落地，不中断工作）。显式 <code>/pause force</code> 立即中断当前回合：在途工具被取消、LLM 输出被切断，暂停快照记录被中断的工具（<code>interruptedTool</code>）；恢复时需先确认：<code>/resume confirm rerun</code>（重新执行被中断的工具）/ <code>/resume confirm skip</code>（跳过该工具）；工具实际已完成的自动跳过、绝不重跑。<code>/pause safe [stop|wait]</code> 显式指定安全暂停：<code>safe wait</code> 落在推理完成后、工具派发前，未派发的工具记录为 <code>deferredTools</code>，恢复同样需确认。</p>
+<h2>结构</h2>
+<pre><code>dsh-task-control/
+├── package.json          # dsh.bundle.patch + dsh.client(platform: web) 声明
+├── cordis.patch.yml      # 一个双面行：- id: task-control / name: dsh-task-control
+├── lib/
+│   ├── index.js          # 宿主端：/pause /resume /cancel 命令 + taskControl 服务 + 持久化状态/设置 store + /task-control/state、/task-control/settings 路由
+│   └── client.js         # 浏览器端：composer 工具行按钮组 + 状态轮询 + 设置页「任务控制」面板（__ModuleLoader__ 格式）
+└── test/
+    └── host-smoke.mjs    # 宿主端逻辑冒烟测试（node test/host-smoke.mjs）
+</code></pre>
+<h2>宿主服务（供其他插件调用）</h2>
+<p>宿主端发布 <code>taskControl</code> 服务，其他插件可按 <strong>sessionId</strong> 调用同一套实现（命令与按钮内部也走它）：</p>
+<pre><code>taskControl.pause(sessionId)  → { ok, text } | { ok: false, error }   // 按设置默认粒度暂停（默认 safe wait）+ 标记暂停
+taskControl.resume(sessionId) → { ok, text } | { ok: false, error }   // 清除标记 + 从暂停点继续（不重发原始提示词）
+taskControl.cancel(sessionId) → { ok, text } | { ok: false, error }   // 中断回合 + 清除标记
+taskControl.state(sessionId)  → { status, paused, forced, interruptedTool, deferredTools, resumeContent }  // status: idle|running|offline（离线也能读暂停态）
+</code></pre>
+<p>消费方（例如 <code>dsh-task-batch</code> 的「全部暂停/恢复/取消」）用 <code>ctx.get("taskControl")</code> 读取，不要复制实现——本服务的语义即唯一事实来源。</p>
+<h2>已知限制</h2>
+<ul>
+<li><strong>暂停期间的新输入</strong>：暂停只拦截"当前回合"，不拦截新消息——界面在暂停态仍允许发送（发送会开启新回合）。如需"暂停=彻底冻结会话"，需要额外的 composer 提交闸门，暂未实现。</li>
+<li><strong>schedule 定时提醒</strong>：暂停不会拦截 <code>dsh-schedule</code> 到期的提醒回合（会照常唤醒）；goal 自动轮次会被拦截（见上）。</li>
+<li><strong>子代理</strong>：暂停父回合不会中断已派发的子代理，其汇报可能在恢复后到达。</li>
+<li><strong>恢复语义</strong>：恢复 = 从暂停点继续执行（不重发原始提示词、不重跑已完成工作）；被强制暂停中断的工具由用户选择重新执行（<code>rerun</code>）或跳过（<code>skip</code>）。工具的副作用状态按会话日志中的实际结果判断：有完成结果 → 视为已执行；中止/无结果 → 状态未知，提醒用户后由用户决定。</li>
+<li><strong>状态位置（Route A）</strong>：暂停状态在插件的持久化 store 里，不在会话日志里——这是有意为之（自定义会话事件会让 harness 拒绝加载该会话）。代价：浏览器 dock 靠 2 秒轮询 <code>/task-control/state</code> 获取状态，而非投影订阅；trace-repeat 的暂停标记版本在「暂停/恢复后的下一个会话事件」时写入，纯暂停+恢复且中间无任何事件时不会产生标记版本。暂停粒度默认值存于同一 store 根的 <code>settings.json</code>（默认 <code>safe</code> + <code>wait</code>），修改后立即生效、无需重启。</li>
+<li><strong>safe wait + 推理输出工具调用（deferredTools）</strong>：在默认（<code>safe wait</code>）或显式 <code>/pause safe wait</code> 时生效，落在推理完成后、工具派发前。此时模型刚输出的工具调用会被内核标记为 <code>ABORTED_BEFORE_DISPATCH</code>（未派发、无副作用），并记录为暂停快照的 <code>deferredTools</code>。恢复时<strong>必须先确认</strong>（<code>/resume confirm rerun</code> 重新执行 / <code>/resume confirm skip</code> 跳过；工具实际已完成的自动跳过，绝不重跑）。若浏览器 dock 的 client bundle 未随 <code>lib/client.js</code> 更新（需重启 dsh web 生效），dock 的恢复按钮仍会直接发不带 <code>confirm</code> 的 <code>/resume</code>，host 返回 <code>needConfirmation</code> 拒绝——此时请手动输入 <code>/resume confirm rerun</code>。注意：这些被 abort 的工具调用仍会以失败记录留在会话日志中（内核 <code>appendSkippedToolCall</code> 写入），这是方案一（记录+重放）的固有形态；如要彻底消除失败观感需在核心 agent-loop 实现"工具派发前冻结"（方案二，未实施）。<strong>裸 <code>/pause</code> 跟随设置中的默认粒度（出厂 <code>safe wait</code>），显式 <code>force</code>/<code>safe</code> 才走对应路径</strong>。</li>
+</ul>

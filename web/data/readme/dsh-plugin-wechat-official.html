@@ -1,0 +1,338 @@
+<h1>dsh-plugin-wechat-official</h1>
+<p><strong>DeepSeek Harness 微信 ClawBot 渠道插件</strong> —— 通过腾讯官方开放的 <strong>微信 ClawBot 插件功能</strong>（iLink 协议），让用户在<strong>个人微信</strong>中直接与 DeepSeek Harness Agent 对话。</p>
+<blockquote>
+<p>✅ 全部基于腾讯官方通道（<code>ilinkai.weixin.qq.com</code>），<strong>不使用</strong>任何个人微信逆向协议、网页自动化、Hook 客户端或其它可能导致封号的非官方方案。
+底层协议与 openclaw 的微信渠道插件 <code>@tencent-weixin/openclaw-weixin</code> 同一套（HTTP/JSON，腾讯仅作为消息管道，不存储输入输出内容）。</p>
+</blockquote>
+<hr>
+<h2>目录</h2>
+<ul>
+<li><a href="#%E5%B7%A5%E4%BD%9C%E5%8E%9F%E7%90%86">工作原理</a></li>
+<li><a href="#%E5%89%8D%E7%BD%AE%E6%9D%A1%E4%BB%B6">前置条件</a></li>
+<li><a href="#%E5%AE%89%E8%A3%85">安装</a></li>
+<li><a href="#%E9%85%8D%E7%BD%AE">配置</a></li>
+<li><a href="#%E9%A6%96%E6%AC%A1%E8%BF%90%E8%A1%8C%E6%89%AB%E7%A0%81%E7%99%BB%E5%BD%95">首次运行（扫码登录）</a></li>
+<li><a href="#%E4%BD%BF%E7%94%A8">使用</a></li>
+<li><a href="#%E8%BF%9E%E6%8E%A5%E7%BB%AD%E6%9C%9F24-%E5%B0%8F%E6%97%B6">连接续期（24 小时）</a></li>
+<li><a href="#%E8%AE%BF%E9%97%AE%E6%8E%A7%E5%88%B6">访问控制</a></li>
+<li><a href="#%E5%90%88%E8%A7%84%E4%B8%8E%E9%A3%8E%E9%99%A9%E6%8F%90%E7%A4%BA">合规与风险提示</a></li>
+<li><a href="#%E5%B8%B8%E8%A7%81%E9%97%AE%E9%A2%98">常见问题</a></li>
+<li><a href="#%E9%A1%B9%E7%9B%AE%E7%BB%93%E6%9E%84">项目结构</a></li>
+<li><a href="#%E5%BC%80%E5%8F%91%E4%B8%8E%E6%B5%8B%E8%AF%95">开发与测试</a></li>
+<li><a href="#%E5%8F%82%E8%80%83">参考</a></li>
+</ul>
+<hr>
+<h2>工作原理</h2>
+<pre><code>微信用户 ──▶ 微信 ClawBot（腾讯官方 iLink 服务）
+                 │  getupdates 长轮询（游标 get_updates_buf）
+                 ▼
+        dsh-plugin-wechat-official（本插件，运行在 DSH 进程中）
+                 │  文本 → createUserMessage → followup
+                 ▼
+        DSH Agent 会话（每个微信用户独立会话，持久化可恢复）
+                 │  回复文本 ← assistant/message 事件
+                 ▼
+        sendmessage（必须回带 context_token 关联对话窗口）
+                 │  sendtyping「正在输入」状态
+                 ▼
+微信用户 ◀── 收到 Agent 回复
+</code></pre>
+<p>关键机制：</p>
+<table>
+<thead>
+<tr>
+<th>机制</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>官方通道</td>
+<td>登录走 <code>get_bot_qrcode</code> / <code>get_qrcode_status</code> 扫码；收消息走 <code>getupdates</code> 长轮询；回消息走 <code>sendmessage</code></td>
+</tr>
+<tr>
+<td>会话关联</td>
+<td>每条入站消息带 <code>context_token</code>，回复时必须原样回带，否则消息无法关联到对话窗口</td>
+</tr>
+<tr>
+<td>独立会话</td>
+<td>每个微信用户对应一个 DSH Agent 会话（id 由用户 id 派生），历史经 sessionPersistence 持久化，重启可恢复</td>
+</tr>
+<tr>
+<td>正在输入</td>
+<td>通过 <code>getconfig</code> 获取 typing_ticket 后调用 <code>sendtyping</code>（status 1/2）显示「正在输入」</td>
+</tr>
+<tr>
+<td>24h 续连</td>
+<td>iLink 连接约 24 小时有效，到期前提醒最近联系人，可回复 Y 立即重连，最后时限强制重连，全程不断线</td>
+</tr>
+<tr>
+<td>按用户串行</td>
+<td>同一用户的消息按顺序处理，回复不会交错错位</td>
+</tr>
+</tbody></table>
+<hr>
+<h2>前置条件</h2>
+<ol>
+<li><strong>一个开通了「微信 ClawBot 插件功能」的微信个人账号</strong>。ClawBot 是微信官方向用户提供的连接第三方 AI 服务的功能，在微信内按提示「连接」并同意《微信ClawBot功能使用条款》后即可使用（本插件是条款意义上的「第三方 AI 服务提供方」）。</li>
+<li><strong>DeepSeek Harness</strong>（<code>dsh</code> CLI）与 web profile 可正常运行（插件作为宿主插件挂载到 web profile 进程）。</li>
+<li><strong>Node.js ≥ 22</strong>（DSH 本身要求）。</li>
+<li>运行 DSH 的机器可访问 <code>ilinkai.weixin.qq.com</code>（出站网络）。<strong>无需公网 IP / 域名 / 端口映射</strong> —— ClawBot 是插件主动长轮询拉取消息，不需要微信回调你的服务器。</li>
+</ol>
+<hr>
+<h2>安装</h2>
+<h3>1. 安装依赖包到 web profile</h3>
+<pre><code># 克隆本仓库
+git clone https://github.com/echo-lgtm/dsh-plugin-wechat-official.git
+cd dsh-plugin-wechat-official
+
+# 安装到 DSH web profile
+dsh plugin --profile web add file:$(pwd)
+</code></pre>
+<blockquote>
+<p>等价于在 <code>~/.dsh/profiles/web</code> 下执行 <code>pnpm add file:&lt;仓库绝对路径&gt;</code>。</p>
+</blockquote>
+<h3>2. 挂载插件行</h3>
+<p>编辑 <code>~/.dsh/profiles/web/cordis.patch.yml</code>，追加（把示例值替换成你的配置）：</p>
+<pre><code>- insert:
+    - id: wechat-clawbot
+      name: 'dsh-plugin-wechat-official'
+      config:
+        # 扫码登录后凭证的存储目录（默认 $DSH_HOME/wechat-clawbot，可留空）
+        storageDir: ''
+        # 启动时自动恢复会话 / 无凭证时自动进入扫码登录
+        autoLogin: true
+        # 二维码展示：log（打印链接）| file（写 qrcode-url.txt）| both（默认）
+        qrcodeOutput: 'both'
+        # 访问控制：open | allowlist | disabled
+        dmPolicy: 'open'
+        allowFrom: []
+        # Agent 工作目录（绝对路径；留空使用 DSH 进程当前目录）
+        agentCwd: ''
+</code></pre>
+<h3>3. 启动</h3>
+<pre><code>dsh web
+</code></pre>
+<p>首次启动会在日志中打印二维码链接（并写入 <code>&lt;storageDir&gt;/qrcode-url.txt</code>）。</p>
+<hr>
+<h2>配置</h2>
+<table>
+<thead>
+<tr>
+<th>字段</th>
+<th>默认值</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>storageDir</code></td>
+<td><code>$DSH_HOME/wechat-clawbot</code></td>
+<td>凭证与二维码文件存储目录</td>
+</tr>
+<tr>
+<td><code>autoLogin</code></td>
+<td><code>true</code></td>
+<td>启动时自动恢复已保存会话；无凭证时自动进入扫码登录</td>
+</tr>
+<tr>
+<td><code>qrcodeOutput</code></td>
+<td><code>both</code></td>
+<td>二维码展示方式：<code>log</code> / <code>file</code> / <code>both</code></td>
+</tr>
+<tr>
+<td><code>qrcodeScanTimeoutMs</code></td>
+<td><code>600000</code></td>
+<td>等待扫码的最长时间（毫秒）</td>
+</tr>
+<tr>
+<td><code>sessionDurationMs</code></td>
+<td><code>86400000</code></td>
+<td>iLink 连接有效期（毫秒，约 24 小时）</td>
+</tr>
+<tr>
+<td><code>reconnectWarningBeforeMs</code></td>
+<td><code>7200000</code></td>
+<td>到期前多久向最近联系人发送重连提醒（毫秒）</td>
+</tr>
+<tr>
+<td><code>reconnectReminderIntervalMs</code></td>
+<td><code>1800000</code></td>
+<td>用户回复 N 后再次提醒的间隔（毫秒）</td>
+</tr>
+<tr>
+<td><code>reconnectForceBeforeMs</code></td>
+<td><code>1800000</code></td>
+<td>到期前多久开始强制重连（毫秒）</td>
+</tr>
+<tr>
+<td><code>longPollTimeoutMs</code></td>
+<td><code>38000</code></td>
+<td>长轮询超时（毫秒，微信最多 hold 35 秒）</td>
+</tr>
+<tr>
+<td><code>dmPolicy</code></td>
+<td><code>open</code></td>
+<td>访问控制：<code>open</code>（所有人）/ <code>allowlist</code>（仅 <code>allowFrom</code>）/ <code>disabled</code>（关闭对话）</td>
+</tr>
+<tr>
+<td><code>allowFrom</code></td>
+<td><code>[]</code></td>
+<td><code>allowlist</code> 模式下允许的用户 id 列表（形如 <code>xxx@im.wechat</code>）</td>
+</tr>
+<tr>
+<td><code>renderMarkdown</code></td>
+<td><code>true</code></td>
+<td>Agent 回复的 Markdown 是否转为微信友好的纯文本</td>
+</tr>
+<tr>
+<td><code>welcomeText</code></td>
+<td><code>你好，我是 DeepSeek Harness Agent…</code></td>
+<td>新用户首次对话欢迎语</td>
+</tr>
+<tr>
+<td><code>agentCwd</code></td>
+<td>DSH 进程 cwd</td>
+<td>Agent 工作目录</td>
+</tr>
+</tbody></table>
+<blockquote>
+<p>连接参数（<code>sessionDurationMs</code> 等）如需调小测试，例如 <code>sessionDurationMs: 300000, reconnectWarningBeforeMs: 60000, reconnectReminderIntervalMs: 30000, reconnectForceBeforeMs: 60000</code> 可在一分钟内跑完整个续连流程。</p>
+</blockquote>
+<hr>
+<h2>首次运行（扫码登录）</h2>
+<ol>
+<li>启动 <code>dsh web</code>，日志中会出现：<pre><code>wechat-clawbot: starting QR login…
+wechat-clawbot: scan QR in WeChat → https://…
+wechat-clawbot: QR url saved to …/qrcode-url.txt
+</code></pre>
+</li>
+<li>用手机微信打开该链接（或在微信内扫描二维码），按提示「连接」并确认。</li>
+<li>日志出现 <code>wechat-clawbot: login OK (bot …)</code> 后，即可在微信中向该机器人发送消息。</li>
+<li>凭证自动保存到 <code>storageDir/session.json</code>（0600 权限），下次启动自动恢复，无需重复扫码。</li>
+</ol>
+<hr>
+<h2>使用</h2>
+<p>在微信中向机器人发送消息：</p>
+<ul>
+<li><p><strong>直接发文字</strong> → 转发给 DSH Agent，回复经 <code>sendmessage</code> 送达，期间对方可见「正在输入」。</p>
+</li>
+<li><p><strong>发语音</strong> → 若微信已附带转写文字，则以 <code>[语音] 转写内容</code> 形式转发给 Agent。</p>
+</li>
+<li><p><strong>发图片 / 文件 / 视频</strong> → 以占位描述（<code>[图片]</code> 等）转发给 Agent，由 Agent 决定如何回应。</p>
+</li>
+<li><p><strong>内置指令</strong>：</p>
+<table>
+<thead>
+<tr>
+<th>指令</th>
+<th>作用</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>/help</code> 或 <code>/指令</code></td>
+<td>查看指令列表</td>
+</tr>
+<tr>
+<td><code>/time</code></td>
+<td>查询当前连接剩余时间</td>
+</tr>
+<tr>
+<td><code>/status</code></td>
+<td>查看 Bot 运行状态</td>
+</tr>
+<tr>
+<td><code>/重新连接</code></td>
+<td>立即重新连接（需回复 Y 确认）</td>
+</tr>
+</tbody></table>
+</li>
+</ul>
+<p>每个用户拥有独立的 Agent 会话（带完整对话历史），也可在 DSH Web UI 的会话列表中查看。</p>
+<hr>
+<h2>连接续期（24 小时）</h2>
+<p>iLink 连接有效期约 24 小时。插件在到期前约 2 小时向最近联系人发送提醒：</p>
+<pre><code>[提醒] 连接还剩约 22.0 小时到期，是否现在重新连接？回复 Y 立即重连，N 稍后提醒
+</code></pre>
+<ul>
+<li>回复 <strong>Y</strong> → 立即重连：插件向该联系人推送新二维码，扫码确认后 <strong>token 原子替换，连接无缝切换</strong>。</li>
+<li>回复 <strong>N</strong> → 按 <code>reconnectReminderIntervalMs</code> 间隔再次提醒。</li>
+<li>到达 <code>reconnectForceBeforeMs</code> 时限 → 自动强制重连。</li>
+<li>意外会话失效（token 过期）→ 自动清除凭证并重新进入扫码登录。</li>
+</ul>
+<hr>
+<h2>访问控制</h2>
+<ul>
+<li><code>dmPolicy: 'open'</code>（默认）：任何能向该机器人发消息的微信用户均可对话。</li>
+<li><code>dmPolicy: 'allowlist'</code>：仅 <code>allowFrom</code> 中列出的用户 id 可对话，其余用户收到「没有权限」提示。</li>
+<li><code>dmPolicy: 'disabled'</code>：关闭对话能力（仅保留指令与重连相关消息）。</li>
+</ul>
+<blockquote>
+<p>用户 id 形如 <code>o9cq800kum_xxx@im.wechat</code>。可先以 <code>open</code> 模式运行，用 <code>/status</code> 或日志查看来访用户 id，再收紧为 <code>allowlist</code>。</p>
+</blockquote>
+<hr>
+<h2>合规与风险提示</h2>
+<ol>
+<li>本插件只使用腾讯官方 ClawBot 接口，但请务必遵守《<a href="https://github.com/hao-ji-xing/openclaw-weixin/blob/main/protocol.md">微信ClawBot功能使用条款</a>》与《微信个人账号使用规范》：不得利用该功能绕过/破解微信技术保护措施、不得从事违法违规行为。</li>
+<li>腾讯仅作为消息管道，<strong>不存储</strong>输入输出内容；接入的 AI 服务（即 DSH Agent）由你自行负责，输出结果责任自负。</li>
+<li>腾讯有权对连接的第三方 AI 服务进行识别、限流甚至阻断（条款 4.7 / 7.2），<strong>不建议把核心业务完全依赖该通道</strong>，应保留降级方案。</li>
+<li>请妥善保管 <code>storageDir/session.json</code>（内含 bot token）。</li>
+</ol>
+<hr>
+<h2>常见问题</h2>
+<table>
+<thead>
+<tr>
+<th>问题</th>
+<th>处理</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>启动后没有看到二维码</td>
+<td>检查日志是否出现 <code>starting QR login…</code>；若 <code>storageDir</code> 下有旧 <code>session.json</code> 且仍有效则直接恢复，不会重新登录。删除 <code>session.json</code> 可强制重新登录</td>
+</tr>
+<tr>
+<td>发送消息没有回复</td>
+<td>确认日志中是否出现 <code>收到消息</code> / <code>deliver reply</code>；检查 <code>dmPolicy</code> 是否拦截；确认 Agent 服务（<code>agents</code> / <code>agentLoop</code>）可用</td>
+</tr>
+<tr>
+<td>回复没有进入对话窗口</td>
+<td>该现象通常是 <code>context_token</code> 丢失或过期——本插件始终回带用户<strong>最新</strong>入站消息的 context_token</td>
+</tr>
+<tr>
+<td>提示「连接即将到期」</td>
+<td>正常现象，按提示回复 Y 重连即可；也可用 <code>/重新连接</code> 手动触发</td>
+</tr>
+<tr>
+<td>收不到消息、日志持续报错</td>
+<td>检查出站网络能否访问 <code>ilinkai.weixin.qq.com</code>；token 可能已失效，删除 <code>session.json</code> 后重启重新扫码</td>
+</tr>
+</tbody></table>
+<hr>
+<h2>项目结构</h2>
+<pre><code>dsh-plugin-wechat-official/
+├── package.json            # 插件包定义（main 指向 lib/index.js，peerDeps 为 DSH 包）
+├── cordis.patch.yml        # DSH profile 插件行声明（- insert: 条目）
+├── lib/
+│   ├── index.js            # Cordis 插件入口：Config schema / apply / 生命周期
+│   ├── ilink.js            # iLink ClawBot 协议客户端（登录/长轮询/sendmessage/typing）
+│   ├── channel.js          # 频道运行时：登录生命周期/轮询循环/指令/重连/访问控制
+│   ├── bridge.js           # DSH Agent 桥接：会话映射/入队/回复提取（复用 DSH 核心）
+│   ├── markdown.js         # Markdown → 微信友好纯文本
+│   └── store.js            # 凭证持久化（原子写 + 0600）
+├── scripts/
+│   └── smoke.mjs           # 冒烟测试：本地模拟 iLink 服务器跑通全链路
+├── test/                   # node:test 单元测试（ilink/markdown/bridge/channel）
+└── README.md
+</code></pre>
+<h2>开发与测试</h2>
+<pre><code>npm run check    # 语法检查
+npm test         # 单元测试（32 个用例）
+npm run smoke    # 冒烟测试：本地模拟 iLink 服务器，验证登录→收消息→typing→回复全链路
+</code></pre>
+<hr>
+<h2>参考</h2>
+<ul>
+<li>OpenClaw 微信渠道文档：<a href="https://docs.openclaw.ai/zh-CN/channels/wechat">https://docs.openclaw.ai/zh-CN/channels/wechat</a></li>
+<li>微信 ClawBot 使用条款（协议全文）：<a href="https://github.com/hao-ji-xing/openclaw-weixin/blob/main/protocol.md">https://github.com/hao-ji-xing/openclaw-weixin/blob/main/protocol.md</a></li>
+<li>iLink 协议技术解析：<a href="https://github.com/hao-ji-xing/openclaw-weixin/blob/main/weixin-bot-api.md">https://github.com/hao-ji-xing/openclaw-weixin/blob/main/weixin-bot-api.md</a></li>
+<li>官方插件包（腾讯）：<a href="https://www.npmjs.com/package/@tencent-weixin/openclaw-weixin">https://www.npmjs.com/package/@tencent-weixin/openclaw-weixin</a></li>
+</ul>

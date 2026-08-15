@@ -1,0 +1,237 @@
+<h1>dsh-custom-header</h1>
+<p><strong>Outbound LLM request header modification for DeepSeek Harness (DSH).</strong></p>
+<p>Operates at the fetch transport layer — one layer below the LLM SDK — and
+modifies the HTTP headers of outgoing provider requests:</p>
+<ul>
+<li><strong>injects</strong> client-identity headers (<code>User-Agent</code>, <code>Originator</code>,
+<code>X-Claude-Code-Session-Id</code>, <code>x-opencode-*</code>, …) from a set of presets that
+mirror real Codex / Claude Code / opencode clients</li>
+<li><strong>strips</strong> SDK runtime fingerprint headers (<code>X-Stainless-*</code>)</li>
+<li><strong>rewrites</strong> request URLs (path matching + <code>appendQuery</code>)</li>
+<li><strong>patches</strong> Anthropic Messages request bodies (identity / billing system
+block + <code>metadata.user_id</code>)</li>
+</ul>
+<p>All of it is scoped by an explicit host allowlist (<code>autoHosts</code>) — nothing
+outside the allowlist is ever touched; the default <code>auto</code> profile with an
+empty allowlist sends every request through untouched.</p>
+<blockquote>
+<p>For servers you administer or are authorized to use. Cloudflare TLS/Bot
+edge blocks need a different API entry, an admin allowlist, or a local
+forward proxy — see the troubleshooting section in the Chinese README.</p>
+</blockquote>
+<h2>How it works</h2>
+<p>DSH has no per-request header hook, so every modification lands at the
+<strong>fetch transport layer</strong>, sharing one middleware pipeline
+(<code>Symbol.for("dsh-custom-header.fetch.pipeline.v1")</code>):</p>
+<table>
+<thead>
+<tr>
+<th>mechanism</th>
+<th>middleware</th>
+<th>safety gate</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>header injection</td>
+<td><code>header-inject</code> (priority 7)</td>
+<td>auto needs host match; fixed profiles always inject</td>
+</tr>
+<tr>
+<td>fingerprint stripping</td>
+<td><code>header-strip</code> (priority 6)</td>
+<td><code>autoHosts</code> hosts only</td>
+</tr>
+<tr>
+<td>Anthropic body patch</td>
+<td><code>body-patch</code> (priority 8)</td>
+<td>Anthropic Messages paths only</td>
+</tr>
+<tr>
+<td>URL rewrite</td>
+<td><code>url-rewrite</code> (priority 5)</td>
+<td><code>autoHosts</code> hosts only</td>
+</tr>
+<tr>
+<td>session id scoping</td>
+<td>per-conversation: <code>GenerateOptions.sessionId</code> → AsyncLocalStorage → fetch middlewares (<code>session-context.ts</code>)</td>
+<td>—</td>
+</tr>
+<tr>
+<td>403 hints</td>
+<td><code>llm/stream</code> waterfall observer</td>
+<td>—</td>
+</tr>
+</tbody></table>
+<p>Safe default: <code>profile: "auto"</code> with empty <code>autoHosts</code> does nothing at all.</p>
+<h2>Profiles</h2>
+<p>Each fixed profile is a complete client-identity header set:</p>
+<table>
+<thead>
+<tr>
+<th>Profile</th>
+<th>Headers sent</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>codex_desktop</code></td>
+<td><code>codex_app/1.2026.0628 (Windows NT 10.0; Win64; x64)</code> + <code>Originator: codex_app</code></td>
+</tr>
+<tr>
+<td><code>codex_official</code></td>
+<td><code>codex_cli_rs/0.147.0 (Windows 10.0.19045; x86_64) WindowsTerminal</code> + <code>Originator: codex_cli_rs</code></td>
+</tr>
+<tr>
+<td><code>codex_tui</code></td>
+<td><code>codex-tui/0.147.0 (…; x86_64) WindowsTerminal</code> + <code>Originator: codex-tui</code></td>
+</tr>
+<tr>
+<td><code>codex_claude_plugin</code></td>
+<td><code>Claude Code/0.5.0 (Macos 15.5; arm64) iTerm2.app</code> + <code>Originator: Claude Code</code></td>
+</tr>
+<tr>
+<td><code>pi_agent</code></td>
+<td><code>pi-coding-agent/1.0</code> + <code>Originator: pi</code> (needs the server to accept this identity too)</td>
+</tr>
+<tr>
+<td><code>claude_code_messages</code></td>
+<td><code>claude-cli/2.1.220 (external, sdk-cli)</code> + <code>X-Claude-Code-Session-Id</code> + full <code>anthropic-beta</code> + body (<code>metadata.user_id</code> JSON / system block)</td>
+</tr>
+<tr>
+<td><code>opencode_zen</code></td>
+<td><code>opencode/1.18.18 ai-sdk/...</code> UA + <code>x-opencode-client/project/session/request</code>, strips <code>X-Stainless-*</code> fingerprints</td>
+</tr>
+<tr>
+<td><code>auto</code></td>
+<td><code>autoHosts</code> match: Anthropic Messages paths → Claude set; else → <code>autoCodexProfile</code></td>
+</tr>
+<tr>
+<td><code>off</code></td>
+<td>nothing</td>
+</tr>
+</tbody></table>
+<p>The Codex header values are verified against openai/codex source (see
+"Truthfulness verification"); the opencode <code>Identifier.ascending()</code> id
+scheme (<code>ses_</code>/<code>msg_</code> + hex12 + base62) and the Claude Code 2.1.220 header
+set are re-implemented from their real-world formats.</p>
+<h2>Truthfulness verification (Codex presets)</h2>
+<p>Codex identity fields were checked against primary sources:</p>
+<ul>
+<li><strong><code>Originator: codex_cli_rs</code></strong> — openai/codex
+<code>codex-rs/login/src/auth/default_client.rs</code>: <code>DEFAULT_ORIGINATOR = "codex_cli_rs"</code>.</li>
+<li><strong>codex_official UA shape</strong> — same file, <code>get_codex_user_agent()</code>:
+<code>{originator}/{CARGO_PKG_VERSION} ({os_type} {os_version}; {arch}) {terminal}</code>,
+with the terminal token from <code>codex-rs/terminal-detection/src/lib.rs</code>
+(<code>WindowsTerminal</code> for Windows Terminal, <code>xterm-256color</code> from <code>TERM</code>, …).
+A literal <code>terminal</code> tail matches no real build and was replaced.
+<code>0.147.0</code> is the current release (rust-v0.147.0, 2026-08-07).</li>
+<li><strong>codex_cli_rs vs codex-tui</strong> — the CLI has several first-party front-ends.
+<code>default_client.rs</code> sets <code>DEFAULT_ORIGINATOR = "codex_cli_rs"</code> and builds the
+UA from the process originator, but <code>is_first_party_originator</code> also
+whitelists <code>codex-tui</code> and <code>codex_vscode</code>, and the TUI self-identifies as
+<code>client_name: "codex-tui"</code> (<code>tui/src/lib.rs</code>). Interactive <code>codex</code> sessions
+therefore actually send <code>codex-tui/…</code> UA + <code>Originator: codex-tui</code>.
+Profiles <code>codex_official</code> (headless/default) and <code>codex_tui</code> (interactive
+TUI) cover both.</li>
+<li><strong><code>codex_app/</code> + <code>Originator: codex_app</code></strong> — the desktop shell is
+closed-source; <code>codex_app</code> is the client family's own identity string.
+The full UA is a measured capture; override via <code>codexDesktopVersion</code>.</li>
+<li><strong>codex_claude_plugin UA</strong> — Claude Code UA format
+(<code>Claude Code/x.y.z (OS; arch) Terminal</code>); 0.5.0 is an old but real
+version. Server checks only match the prefix, so the value is kept
+conservative.</li>
+</ul>
+<h2>Behavior notes</h2>
+<p>Verified by <code>tests/smoke.mjs</code>:</p>
+<ul>
+<li><strong>Per-conversation session ids.</strong> DSH runs concurrent agents in one
+process, so this plugin scopes <code>x-opencode-session</code> /
+<code>X-Claude-Code-Session-Id</code> per <code>GenerateOptions.sessionId</code>: the
+<code>llm/stream</code> wrapper runs every adapter iteration inside
+<code>AsyncLocalStorage</code>, and the fetch middlewares read the key back. Requests
+outside the LLM seam fall back to a stable "default" session.</li>
+<li><strong>Prefixed gateway paths.</strong> The fetch layer only sees the URL, so the
+Anthropic Messages branch — both profile selection and body patching —
+accepts <code>/v1/messages</code>, <code>/v1/messages/…</code> and <code>…/v1/messages</code> (baseUrl path
+prefixes).</li>
+<li><strong>UA override is final.</strong> <code>dsh-llm-pi-ai</code> merges its harness attribution
+<code>User-Agent</code> after profile headers (attribution wins there); the fetch
+layer writes after the adapter, so the injected UA always wins and the
+attribution layer cannot resurrect a conflicting one (attribution emits
+only <code>user-agent</code>, nothing else leaks).</li>
+</ul>
+<p>Structural details kept by design:</p>
+<ul>
+<li><strong>403 diagnostics trigger at the stream terminal</strong> (<code>llm/stream</code> finish
+with <code>status: 403</code>); the diagnostic distinguishes Cloudflare HTML blocks
+from JSON rejection responses.</li>
+<li><strong><code>accept-language</code> / <code>sec-fetch-mode</code></strong> are injected by Node undici below
+<code>fetch</code> — unremovable at this layer. If your server checks them, terminate
+them at a local reverse proxy.</li>
+</ul>
+<h2>Install</h2>
+<pre><code>dsh plugin --profile web add file:$(pwd)     # or: dsh plugin --profile web add dsh-custom-header
+</code></pre>
+<p>Verify: <code>dsh --profile web --dump-config | grep dsh-custom-header</code>, or look
+for the <code>dsh-custom-header loaded: ...</code> diagnostics in the server log.</p>
+<h2>Config (<code>cordis.yml</code>)</h2>
+<pre><code>dsh-custom-header:
+  profile: auto                 # auto | off | codex_desktop | codex_official | codex_claude_plugin | pi_agent | claude_code_messages | opencode_zen
+  autoHosts:
+    - gateway.example.com       # (required for auto/rewrite/strip to engage)
+  autoCodexProfile: codex_desktop
+  codexVersion: 0.147.0        # codex_cli_rs UA version
+  codexDesktopVersion: 1.2026.0628  # codex_app UA version (desktop, closed-source)
+  claudeCliVersion: 2.1.220
+  opencodeVersion: 1.18.18
+  opencodeClient: cli
+  opencodeProject: global
+  claudeSystemMode: identity    # identity | billing
+  extraHeaders: {}              # merged onto every profile
+  urlRewrites:
+    /v1/messages:
+      appendQuery: beta=true    # servers that strictly check ?beta=true
+  persistProfile: true
+</code></pre>
+<h2>Settings page</h2>
+<p>Settings → Plugins → <strong>Custom Header</strong> (请求头修改) tab: choose the
+<code>profile</code>, the auto fallback, edit the <code>autoHosts</code> allowlist, switch the
+Claude system-block mode (<code>identity</code> / <code>billing</code>) and tune the version
+fields — all host-validated. Save writes the patch over the
+<code>customHeader/settingsSet</code> Typert Remote endpoint and applies to the next
+request (the fetch middlewares read the same state object), no reload.</p>
+<pre><code>ctx.dshCustomHeader.setProfile('codex_desktop')
+ctx.dshCustomHeader.status()   // diagnostics snapshot
+</code></pre>
+<p>Precedence: <strong>persisted file fields &gt; cordis.yml fields &gt; defaults</strong>,
+except an explicitly set cordis.yml <code>profile</code>, which still wins over the
+persisted one (deployment intent beats a saved UI selection).</p>
+<h2>Known residuals &amp; limits</h2>
+<ul>
+<li><strong><code>accept-language</code> / <code>sec-fetch-mode</code></strong> — injected by Node undici below
+<code>fetch</code>, unremovable at the extension layer. Most servers only check UA +
+custom headers.</li>
+<li><strong>opencode header mutual exclusion</strong> — opencode's <code>LLMRequestPrep.prepare</code>
+sends <code>x-opencode-*</code> only for opencode providers; other providers get
+<code>x-session-affinity</code> / <code>X-Session-Id</code>. This plugin replicates the former
+only.</li>
+<li><strong>Fixed profiles inject globally</strong> — <code>codex_official</code> etc. are not gated by
+<code>autoHosts</code>. Use <code>auto</code> if you must not touch certain endpoints.</li>
+<li><strong><code>?beta=true</code> for Anthropic</strong> — solved via <code>urlRewrites.appendQuery</code>, no
+proxy needed.</li>
+<li><strong>Cloudflare blocks</strong> — HTML edge responses cannot be fixed by header
+modification; switch API entry, ask for an allowlist, or forward locally.
+The <code>llm/stream</code> observer distinguishes CF HTML from JSON rejection
+responses in the logs.</li>
+<li>Host-only plugin: no browser client; diagnostics go to the server log and
+<code>ctx.dshCustomHeader.status()</code>.</li>
+</ul>
+<h2>Development</h2>
+<pre><code>npm install
+npm run typecheck
+npm run build                # esbuild → lib/index.js + lib/types
+node tests/smoke.mjs         # transport smoke tests against a local fake endpoint (9 scenarios)
+</code></pre>
+<h2>License</h2>
+<p>MIT. Fetch pipeline vendored from
+<a href="https://github.com/aizigao/pi-fetch-pipeline"><code>@aizigao/pi-fetch-pipeline</code></a>
+(MIT).</p>

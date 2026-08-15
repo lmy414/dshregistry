@@ -1,0 +1,115 @@
+<h1>dsh-swarm-router</h1>
+<p>A DeepSeek Harness <strong>bundle</strong> (installable plugin) that adds a <strong>sub-agent matrix
+swarm</strong>: give it a batch of heterogeneous tasks, and it (1) routes each task to
+the most suitable model from an OpenRouter-like gateway plus the
+<code>cfgpu.com/llm/square</code> model catalog, then (2) dispatches each assignment in
+parallel as a real in-process <strong>subagent</strong> pinned to that model — so quick tasks
+land on fast/cheap models and hard tasks land on strong reasoning models.</p>
+<blockquote>
+<p>子智能体矩阵蜂群：任务是行，候选模型是列，路由器为每一行选中一格，
+然后通过 DSH 的 <code>ctx.subagents</code> 蜂群把每格变成一个绑定到所选模型的子智能体并行下放，
+达到“按任务难度匹配模型、省时提效”的目标。</p>
+</blockquote>
+<h2>What is in the DSH plugin marketplace today</h2>
+<p>DSH's extension surface is "everything is a plugin", and it ships <strong>three
+intertwined mechanisms</strong> rather than one app store:</p>
+<ol>
+<li><strong>Bundles</strong> — npm packages that declare <code>"dsh": { "bundle": { "patch": "./cordis.patch.yml" } }</code>
+and contribute a configuration layer. Installed into a profile with
+<code>dsh plugin --profile &lt;name&gt; add &lt;pkg&gt;</code>; a profile composes them in order.
+In-box bundles: <code>@deepseek-ai/dsh-base</code>, <code>dsh-web-app</code>, <code>dsh-headless</code>.
+Discoverability for third-party plugins is the GitHub topic
+<a href="https://github.com/topics/dsh-plugin"><code>dsh-plugin</code></a> (e.g. <code>turtle-ui</code>).</li>
+<li><strong>Skills</strong> — installable task-instruction packs (<code>dsh skill</code>) loaded by the
+skill capability + a catalog/loader tool; <code>find-skills</code> discovers them.</li>
+<li><strong>MCP / examples overlays</strong> — <code>--patch &lt;cordis.yml&gt;</code> overlays (the
+<code>examples/</code> leaves: headless-agent, acp-agent, jsonrpc-agent, mcp-memory,
+web-cordis, web-schedule).</li>
+</ol>
+<p>There is <strong>no central hosted registry yet</strong> — the "marketplace" is npm packages</p>
+<ul>
+<li>the <code>dsh-plugin</code> GitHub topic + skills, composed per profile. This bundle is
+an author-side contribution to that ecosystem.</li>
+</ul>
+<h2>What this bundle adds</h2>
+<table>
+<thead>
+<tr>
+<th>Layer</th>
+<th>Row</th>
+<th>Effect</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>llm-pi-ai</code> override</td>
+<td><code>cfgpu-swarm</code>, <code>openrouter</code> routes</td>
+<td>Registers the swarm's model catalog under <strong>distinct</strong> route keys, so it unions with (never clashes with) the machine's settings-driven <code>cfgpu</code> route</td>
+</tr>
+<tr>
+<td><code>swarm-router</code> insert</td>
+<td>the plugin</td>
+<td>Registers <code>swarm_route_preview</code> (plan, no model calls) and <code>swarm_dispatch</code> (plan + real parallel subagent fan-out) tools</td>
+</tr>
+</tbody></table>
+<h3>Model sources</h3>
+<ul>
+<li><strong>cfgpu.com/llm/square</strong> — probed live via <code>GET .../userapi/v1/model/v1/models</code>;
+18 chat text models declared on the <code>cfgpu-swarm</code> route (OpenAI-compatible). 16
+answered <code>/chat/completions</code> with HTTP 200 during capture; 2 thinking models
+returned a transient 502 and are demoted by the router.</li>
+<li><strong>OpenRouter-like gateway</strong> — an <code>openrouter</code> route (OpenAI-compatible) with a
+small subset drawn from <code>openrouter.ai/api/v1/models</code>. It needs
+<code>OPENROUTER_API_KEY</code>; without it the router reports it unavailable and never
+dispatches to it, so the profile still boots.</li>
+</ul>
+<h3>The router</h3>
+<p>Pure, zero-API: <code>scoreModel(model, kind)</code> gates on required capability
+(<code>reasoning</code>/<code>coding</code>/<code>longContext</code>) then ranks by kind-weighted
+strength/speed/cost/contextWindow. <code>routeBatch</code> returns assignments + a
+distinct-models summary (a diverse batch should fan out across several models —
+the matrix signal), and <code>swarm_dispatch</code> realizes each cell with
+<code>ctx.subagents.start('spawn', { agentOptions: { provider, model, maxTokens }, toolFilter: { allow: [] } })</code>.</p>
+<h2>Install</h2>
+<p>From a DeepSeek Harness checkout where <code>pnpm dsh</code> runs:</p>
+<pre><code>pnpm dsh plugin --profile headless add /Users/aiad/Desktop/cfel/routerAI/dsh-swarm-router
+pnpm dsh --profile headless --dump-config   # see the # == dsh-swarm-router layer + the two routes
+</code></pre>
+<p>The cfgpu route needs a credential. The machine's <code>$DSH_HOME/.credentials.yaml</code>
+already carries <code>CFGPU_API_KEY</code>; if you are sandboxed away from <code>~/.dsh</code>, run the
+whole profile against a <strong>workspace-local</strong> <code>DSH_HOME</code> seeded with that credential
+and a <code>settings.yaml</code> that declares the orchestrator <code>cfgpu</code> route — this is
+exactly how the benchmark below was run (no network, no <code>~/.dsh</code> writes):</p>
+<pre><code>export DSH_HOME=/Users/aiad/Desktop/cfel/routerAI/.dsh-home   # seeded with .credentials.yaml + settings.yaml
+pnpm dsh plugin --profile headless add /Users/aiad/Desktop/cfel/routerAI/dsh-swarm-router
+pnpm dsh --profile headless --dump-config | grep -E 'cfgpu-swarm|openrouter|swarm-router'
+</code></pre>
+<p>The installed profile composes <code>[@deepseek-ai/dsh-base, @deepseek-ai/dsh-headless, dsh-swarm-router]</code>; the in-box packages resolve from the maintained
+<code>$DSH_HOME/profiles/node_modules</code> symlinks, and <code>dsh-swarm-router</code> is <code>link:</code>-ed.</p>
+<h2>Benchmark</h2>
+<p><code>benchmark/benchmark.json</code> is the minimal subset: 5 cheap, heterogeneous tasks
+spanning <code>fast</code>, <code>reasoning</code>, <code>coding</code>, <code>general</code> (×2 reasoning). Success is
+judged by <strong>content</strong> (the expected answer substring / CJK appears), not by the
+run merely completing. Drive it by asking the headless agent to call
+<code>swarm_dispatch</code> once with the tasks and print the JSON:</p>
+<pre><code>DSH_HOME=… pnpm dsh --profile headless "$(cat benchmark/benchmark_prompt.txt)"
+</code></pre>
+<p>The recorded run (<code>benchmark/benchmark_RESULT.json</code>) routed 5/5 tasks across
+<strong>4 distinct real cfgpu models</strong> — all 5 children returned <code>stopReason: completed</code> with correct answers (17×23=391, bat-and-ball=0.05, a real
+<code>is_prime</code>, an accurate CJK translation, widgets=5). Verify any run against the
+expectations:</p>
+<pre><code>node benchmark/verify_benchmark.mjs            # uses benchmark_RESULT.json
+node benchmark/verify_benchmark.mjs path.json  # or any captured result
+</code></pre>
+<p>The recorded result is <strong>32/32 green</strong>.</p>
+<h2>Files</h2>
+<ul>
+<li><code>package.json</code> — the <code>dsh.bundle</code> manifest.</li>
+<li><code>cordis.patch.yml</code> — the config layer (cfgpu-swarm + openrouter routes, swarm-router row).</li>
+<li><code>index.js</code> — the plugin: <code>swarm_route_preview</code> + <code>swarm_dispatch</code> tools.</li>
+<li><code>catalog.js</code> — the capability-tagged model catalog (18 cfgpu text models, 3 real OpenRouter ids).</li>
+<li><code>router.js</code> — the pure, effort-matched task→model router.</li>
+<li><code>benchmark/benchmark.json</code> — the minimal benchmark subset + declarative expectations.</li>
+<li><code>benchmark/benchmark_prompt.txt</code> — the headless task that drives the swarm.</li>
+<li><code>benchmark/benchmark_RESULT.json</code> — the recorded real run.</li>
+<li><code>benchmark/verify_benchmark.mjs</code> — the content-based verifier.</li>
+</ul>

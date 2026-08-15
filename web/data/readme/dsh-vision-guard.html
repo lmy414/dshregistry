@@ -1,0 +1,131 @@
+<h1>dsh-vision-guard</h1>
+<p><strong>English | <a href="https://github.com/good-boy4069/dsh-vision-guard/blob/HEAD/README.zh.md">中文</a></strong></p>
+<blockquote>
+<p>Let text-only models "see" images — and never let an image deadlock your session.
+Transparent image guard + vision analysis tool for <a href="https://github.com/deepseek-ai/deepseek-harness">DeepSeek Harness</a> (dsh).</p>
+</blockquote>
+<p>Most models on DeepSeek Harness (<code>deepseek-v4-pro</code> etc.) are text-only, which causes two problems:</p>
+<ol>
+<li><strong>Text-only models can't see images</strong> — paste a screenshot and the model has no idea it exists;</li>
+<li>worse, <strong>the 400 deadlock</strong>: some gateways (e.g. opencode-go's main route) accept text only. Once an image block lands in the session log, <em>every subsequent turn</em> replays the whole history with the image to the upstream → <code>400 unknown variant \</code>image_url`` → the conversation is stuck forever.</li>
+</ol>
+<p>This plugin fixes both with two gates, and turns images into text the main model can actually consume.</p>
+<hr>
+<h2>What it does</h2>
+<pre><code>paste image → [Gate 1] agent/pre-step: the image is converted to text by the vision
+              model BEFORE it is ever written into the session log
+              → the log only contains text, no image block exists
+              → [Gate 2] llm/stream backstop: if an image block still appears in
+              replayed history (e.g. a session poisoned before install), it is
+              rewritten to OCR text at request time before reaching the model
+</code></pre>
+<ul>
+<li><strong>Vision model = eyes, main model = brain</strong>: <code>deepseek-v4-pro</code> keeps reasoning; image content arrives as text.</li>
+<li><strong>Heals already-deadlocked sessions</strong>: a conversation stuck on 400 before install works again after install (history images are rewritten at request time).</li>
+<li><strong><code>vision_analyze</code> tool</strong> (model-invoked, engine chosen by the model per task): reads workspace files — image OCR, PDF text layer + embedded images, docx/pptx text + embedded images, video frame OCR (≤12 frames), plain text files; loud rejection for xlsx/doc.</li>
+<li><strong>Native vision unaffected</strong>: routes that genuinely accept images (e.g. minimax-m3, kimi-k3) pass through untouched once whitelisted.</li>
+</ul>
+<h2>What makes it different (vs. community vision plugins)</h2>
+<p>Compared with dsh-vision-router, ModLens, dsh-vision-toolkit, see_image/view_image and similar:</p>
+<ol>
+<li><strong>Images never enter the session log</strong> — they are rewritten to text at agent/pre-step <em>before</em> the log append. Most peers rewrite only inside the model call: images still land in the log, replay every turn, and deadlock risk returns if the plugin is removed.</li>
+<li><strong>Heals sessions that were already deadlocked</strong> — a conversation stuck on image-400s before install recovers with one message after install (replayed history images are rewritten at request time). No other community plugin does this.</li>
+<li><strong>Anti-deadlock is a hard invariant</strong> — non-whitelisted routes never receive an image block; even with the whole vision pipeline down (model unavailable / timeout / budget exhausted) it degrades to placeholder text, <em>never</em> back to the 400 deadlock.</li>
+<li><strong>One package, two components, isolated failure domains</strong> — one install mounts both rows (guard = safety-critical, tool = convenience); the tool breaking never takes the guard down.</li>
+<li><strong>Zero dependencies, pure Node builtins</strong> — no Node 22+ requirement, no pnpm orchestration, no Python 3.11+; only the document/video paths need system tools (pdftotext/ffmpeg etc.), plain image OCR needs none.</li>
+<li><strong>Engine chosen by the main model per task</strong> — <code>vision_analyze</code>'s <code>engine</code> argument (<code>local</code> free character OCR / <code>vision</code> model) is decided by the model after analysing the task: cheap and smart.</li>
+<li><strong>Reuses your own dsh routes and credentials</strong> — carries no API keys and calls no third-party service directly (most peers require self-managed keys).</li>
+<li><strong>Three rounds of red-team audit + shipped automated tests</strong> — 22 real bugs fixed and documented (symlink escape, zip bombs, concurrency races), pure-function regression tests ship with the package (<code>npm test</code>).</li>
+</ol>
+<h2>Install</h2>
+<pre><code># 已发布 npm 后：
+dsh plugin --profile web add dsh-vision-guard
+# 或直接从 GitHub 安装：
+dsh plugin --profile web add github:good-boy4069/dsh-vision-guard
+</code></pre>
+<blockquote>
+<p>If pnpm refuses with <code>ERR_PNPM_ADDING_TO_ROOT</code> (older launchers), add the workspace-root flag: <code>dsh plugin --profile web add -w dsh-vision-guard</code>.</p>
+</blockquote>
+<p>Restart <code>dsh web</code>. Or add the two rows from the repo's <code>cordis.patch.yml</code> to your profile patch layer manually.</p>
+<h2>Configuration</h2>
+<p>All fields optional (defaults shown). The vision route must point to a model that <strong>accepts image input</strong>:</p>
+<table>
+<thead>
+<tr>
+<th>Field</th>
+<th>Default</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>visionProvider</code> / <code>visionModel</code></td>
+<td><code>opencode-go</code> / <code>minimax-m3</code></td>
+<td>The vision route. Point it at an image-capable model on your subscription</td>
+</tr>
+<tr>
+<td><code>ocrTimeoutMs</code></td>
+<td><code>45000</code></td>
+<td>Per-image OCR timeout</td>
+</tr>
+<tr>
+<td><code>budgetPerDay</code></td>
+<td><code>200</code></td>
+<td>Daily OCR cap (runaway-cost guard), state stored under <code>$DSH_HOME</code></td>
+</tr>
+<tr>
+<td><code>cacheMaxEntries</code></td>
+<td><code>500</code></td>
+<td>OCR result cache size cap (LRU eviction)</td>
+</tr>
+<tr>
+<td><code>maxOcrTokens</code></td>
+<td><code>2048</code></td>
+<td>Vision call output cap</td>
+</tr>
+<tr>
+<td><code>stateFile</code></td>
+<td><code>~/vision-guard-state.json</code></td>
+<td>Budget state file (<code>~</code> = dsh home)</td>
+</tr>
+<tr>
+<td><code>ocrPrompt</code></td>
+<td>verbatim transcription</td>
+<td>Custom instruction</td>
+</tr>
+<tr>
+<td><code>passthrough</code></td>
+<td><code>[]</code></td>
+<td>Raw-image whitelist: <code>[{provider, model}]</code> — only add routes you have <strong>tested</strong> to accept images</td>
+</tr>
+</tbody></table>
+<p><code>vision_analyze</code> side: the OCR engine is a <strong>required per-call argument</strong> (<code>engine</code>), chosen by the model per task — <code>local</code> = local tesseract (free, characters only), <code>vision</code> = the configured vision model. There is no <code>localOcr</code> config key.</p>
+<h2>⚠️ Requirements &amp; limitations (please read)</h2>
+<ul>
+<li><strong>This plugin carries no API keys and calls no third-party service directly.</strong> It reuses the model routes and credentials already configured in your dsh. Therefore:<ul>
+<li><strong>You must have an image-capable model</strong> (e.g. <code>minimax-m3</code> on opencode-go). Text-only models like <code>deepseek-v4-pro</code> <strong>cannot</strong> serve as the vision model — their upstream gateway 400s on images and deadlocks the session.</li>
+<li>Without a vision model it still installs: images degrade to placeholder text, the session works but the content is not read (never deadlocks).</li>
+</ul>
+</li>
+<li><strong>Whitelist policy (important)</strong>: any route other than the configured vision model gets images rewritten to text — <strong>untested routes never receive raw images</strong>. To enable native vision for a model: first test "image straight to that route" (a clean response counts as pass), then add it to <code>passthrough</code>. This is the core anti-deadlock design; do not bypass it.</li>
+<li><strong>System tools</strong> (only for <code>vision_analyze</code>'s document/video paths; plain image OCR needs none):<ul>
+<li>PDF: <code>pdftotext</code>/<code>pdfimages</code> (poppler-utils);</li>
+<li>Video: <code>ffmpeg</code>/<code>ffprobe</code>;</li>
+<li>docx/pptx: <code>python3</code> (stdlib only);</li>
+<li>Optional: <code>tesseract</code> (free local OCR; needs <code>chi_sim+eng</code>).</li>
+<li>Windows ships none of these by default; missing tools fail loudly per path, the image path is unaffected.</li>
+</ul>
+</li>
+<li><strong>5 MB/image cap</strong>: dsh's attachment service limits images to 5 MB; larger images/frames fail loudly.</li>
+<li><strong>Cost</strong>: one vision call per <em>new</em> image (attachment-id-addressed cache — repeats are free); ~1-2k tokens per minimax-m3 read (sub-cent range); <code>budgetPerDay</code> as a backstop.</li>
+<li><strong>Quality</strong>: local tesseract only extracts characters and is less accurate (it read <code>42 + 7 = 49</code> as <code>4247249</code> in our tests); for charts/photos/complex UI pick the vision engine (the model chooses per task when calling <code>vision_analyze</code>).</li>
+<li><strong>Privacy</strong>: images go to <em>your</em> vision model provider (same as normal dsh use of that model); text inside images is treated as <strong>untrusted input</strong> — read only, never execute.</li>
+<li><strong>Settings coupling warning</strong>: if you declare <code>input: [text, image]</code> on a text-only model in your model settings (required for GUI image pasting), <strong>you must keep this guard installed</strong> — removing the guard while keeping that declaration will deadlock sessions again.</li>
+</ul>
+<h2>FAQ</h2>
+<ul>
+<li><strong>After a dsh restart/upgrade</strong>: the plugin boots with the profile; no reinstall. After a dsh upgrade, upgrade this plugin first if behavior changes.</li>
+<li><strong>How do I verify it's running</strong>: <code>ctx.get('visionGuard')?.status()</code>, or the <code>[vision-guard] active</code> line in the dsh log.</li>
+<li><strong>Rollback</strong>: remove the two rows from your profile patch (or <code>dsh plugin remove</code>), restart; already-recognized text stays in history, no side effects.</li>
+</ul>
+<h2>License</h2>
+<p>MIT</p>

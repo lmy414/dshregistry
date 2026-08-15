@@ -1,0 +1,67 @@
+<h1>dsh-mcp-xcode</h1>
+<p>DeepSeek Harness (DSH) 插件:把 <strong>Xcode Headless MCP</strong>(<code>xcrun mcpbridge</code>)桥接为 DSH 原生工具。</p>
+<p>装上之后,DSH agent 就能直接调用 Xcode 的全部 headless 能力:创建/打开工程、构建、测试、渲染 SwiftUI Preview 为 PNG、启动模拟器并交互(tap/type/swipe)、读截图与无障碍层级、读 OSLog 等 —— 无需打开 Xcode UI。</p>
+<h2>安装</h2>
+<p>一条命令(官方插件通道,<code>dsh plugin</code> 转发给 pnpm,支持 npm / GitHub / 本地路径):</p>
+<pre><code># 从 GitHub 安装(推荐;v1.0.0 为最新标签)
+dsh plugin --profile web add "github:nanshanyi/dsh-mcp-xcode#v1.0.0"
+
+# 或本地路径
+dsh plugin --profile web add file:/path/to/dsh-mcp-xcode
+</code></pre>
+<p>本包通过 <code>dsh.bundle.patch</code> 自描述挂载:安装后<strong>无需编辑任何 profile 文件</strong>,重启 DSH 即生效(设置 → 插件列表可见,<code>xcode_*</code> 工具对所有会话可用)。</p>
+<blockquote>
+<p>如果你之前手动在 <code>cordis.patch.yml</code> 里写过本插件的行,请先删掉,避免双挂载。</p>
+</blockquote>
+<h2>前置条件(macOS + Xcode 27+)</h2>
+<p><strong>要求 Xcode 27 或更高</strong>(headless MCP 从 Xcode 27 beta 5 起内置 <code>xcrun mcp-server</code> / <code>mcpbridge</code>,更早版本没有这些命令;本项目在 27.0 27A5237l 上开发验证):</p>
+<pre><code># headless 服务需开启并运行
+xcrun mcp-server status          # Permission: enabled / mcp-server: running
+sudo xcrun mcp-server enable     # 若未启用
+xcrun mcp-server start           # 若未运行
+</code></pre>
+<p>首次连接会弹 Xcode agent 授权框,批准一次即可。DSH 是签名应用,授权<strong>永久有效</strong>;未签名客户端则约 24 小时过期。</p>
+<blockquote>
+<p>构建报 <code>Operation not permitted</code> 时,给 headless 服务授权工程所在文件夹(需 sudo):
+<code>sudo xcrun mcp-server allow-folder /path/to/your/projects</code></p>
+</blockquote>
+<h2>原理</h2>
+<p>插件通过 <code>subprocess</code> 服务 spawn <code>/usr/bin/xcrun mcpbridge</code>,在 stdio 上自行实现 MCP(JSON-RPC 2.0)客户端:</p>
+<ol>
+<li><code>initialize</code>(protocolVersion <code>2025-06-18</code>)→ <code>notifications/initialized</code> → <code>tools/list</code>;</li>
+<li>把 <code>tools/list</code> 返回的每个工具(实测 Xcode 27 = <strong>54 个</strong>)的 JSON Schema 转成 DSH 参数 DSL,注册为 <code>xcode_&lt;原名&gt;</code> 工具;</li>
+<li>工具调用转发为 <code>tools/call</code>,文本内容聚合进结果;截图自动存入 attachment 并通过 <code>deferContext</code> 注入下一轮模型上下文;</li>
+<li>附带控制工具 <code>xcode_mcp_status</code>:查看连接状态 / 强制重连 / 查看 bridge stderr。</li>
+</ol>
+<h2>使用</h2>
+<p>直接自然语言描述即可,例如:</p>
+<blockquote>
+<p>打开 /path/to/Project.xcodeproj,跑一遍单元测试,把失败的用例列出来</p>
+</blockquote>
+<p>排障:让 agent 调用 <code>xcode_mcp_status</code>(必要时带 <code>reconnect: true</code>)。</p>
+<p><strong>断桥自愈</strong>:<code>xcrun mcpbridge</code> 进程崩溃/被终止后,<code>xcode_*</code> 工具保持注册,下一次调用会自动重连并同步注册(按名对账,不会 <code>already registered</code>),无需人工干预。</p>
+<h2>配置</h2>
+<p>全部可选,写在 patch 行的 <code>config</code> 下:</p>
+<pre><code>config:
+  clientName: deepseek-harness   # 显示在 Xcode 授权弹窗里的客户端名
+  bridgePath: /usr/bin/xcrun     # 桥可执行文件
+  bridgeArgs: ['mcpbridge']      # 桥参数
+  includeTools: ['BuildProject', 'XcodeList*']   # 只注册匹配的工具(支持 * ? 通配)
+  excludeTools: ['StringCatalog*']               # 排除匹配的工具
+</code></pre>
+<p><code>includeTools</code>/<code>excludeTools</code> 按 Xcode 工具<strong>原名</strong>匹配,常用于给模型瘦身(54 个工具的 schema 描述会占用不少上下文)。匹配规则:</p>
+<ul>
+<li>单个字符串或字符串数组都行</li>
+<li>模式是<strong>锚定</strong>的:<code>List</code> 不会命中 <code>XcodeListSchemes</code>,要写 <code>*List*</code>(子串)或 <code>XcodeList*</code>(前缀)</li>
+<li>支持 <code>*</code>(任意多字符)与 <code>?</code>(单个字符)通配;<code>[</code> <code>]</code> 等其它字符一律按<strong>字面量</strong>处理(不支持字符类)</li>
+<li><strong>大小写敏感</strong>;<code>excludeTools</code> 优先于 <code>includeTools</code></li>
+<li><code>xcode_mcp_status</code> 是控制通道,<strong>不受筛选影响</strong>,永远注册</li>
+<li>任何模式都能安全编译(最坏情况是匹配不到任何工具);若筛选把全部工具排除,启动日志会告警,<code>xcode_mcp_status</code> 也会带 <code>WARNING</code> 提示,便于发现配置拼写错误</li>
+</ul>
+<h2>安全说明</h2>
+<ul>
+<li>连接走的是 Xcode 官方 headless 权限模型:签名应用一次批准长期有效,无需 <code>--unsafe-always-allow-all-agents</code>。</li>
+<li>插件不发布任何 service,不修改 Xcode 权限存储;停止/禁用插件会终止它持有的 mcpbridge 子进程。</li>
+</ul>
+<h2>License</h2>
+<p>MIT</p>

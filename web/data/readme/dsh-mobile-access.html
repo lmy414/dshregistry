@@ -1,0 +1,86 @@
+<h1><code>dsh-mobile-access</code></h1>
+<p>English | <a href="https://github.com/kk99668/dsh-mobile-access/blob/HEAD/README.zh.md">中文</a></p>
+<p>The dsh mobile-access bundle: serve the Web GUI to a phone through your own domain and server. <a href="https://github.com/kk99668/dsh-mobile-access/blob/HEAD/cordis.patch.yml"><code>cordis.patch.yml</code></a> rides over the web surface: it extends the <code>connection</code> row's <code>/api</code> browser-trust fence with the public authority the tunnel serves, and inserts this package's <code>mobile-access</code> glue plugin. That plugin starts a local token gate (<code>src/gate.ts</code>) in front of the webserver and a supervised SSH reverse tunnel (<code>src/tunnel.ts</code>) to the relay server, provides the <code>mobileAccess</code> service (the public host the fence accepts), registers the mobile-surface prompt section and the bash-visible <code>DSH_WEB_PUBLIC_URL</code> runtime variable when <code>surfaceContext</code> is true, and prints the public URL (plus a terminal QR code when <code>qrCode</code> is true) once the tunnel is established. On the relay server, <a href="https://caddyserver.com">Caddy</a> terminates HTTPS for the domain and reverse-proxies into the tunnel; <a href="https://github.com/kk99668/dsh-mobile-access/blob/HEAD/scripts/setup-server.sh"><code>scripts/setup-server.sh</code></a> installs that side. The step-by-step deployment runbook is <a href="https://github.com/kk99668/dsh-mobile-access/blob/HEAD/DEPLOYMENT.md">DEPLOYMENT.md</a>.</p>
+<h2>How it works</h2>
+<pre><code>phone ── https://dsh.example.com ──&gt; Caddy (HTTPS, on your server)
+                                        └──&gt; 127.0.0.1:&lt;relay-port&gt;  (sshd reverse tunnel)
+                                                  └──&gt; local token gate (dsh process)
+                                                        └──&gt; http://127.0.0.1:&lt;web-port&gt;
+</code></pre>
+<p>The tunnel is an <code>ssh -N -R</code> child owned by the plugin: it reconnects with exponential backoff, resets the backoff after a stable uptime, and dies with its fiber. The gate is the authentication layer the fence deliberately is not: every request and WebSocket upgrade must present the token (a cookie set by the login form, or Basic/Bearer credentials) before it is forwarded to the webserver. The public authority reaches the fence through the <code>mobileAccess</code> service, which the patch injects into the <code>connection</code> row so the fence's config expression can never resolve before the authority exists.</p>
+<h2>Weak-network behavior</h2>
+<p>The phone link is the constrained hop (a subway commute, for example); the tunnel and the relay sit on the two stable ends. Three mechanisms keep the GUI usable when that link degrades:</p>
+<ul>
+<li><strong>The event streams compress when the host supports it.</strong> The WebSocket downlinks negotiate <code>permessage-deflate</code> (shipped in dsh <code>web</code> builds), so the session event stream (repetitive JSON) shrinks several-fold on the phone's link. The browser negotiates the extension automatically.</li>
+<li><strong>The browser reconnects.</strong> The web client's connection controller re-establishes both event streams with exponential backoff (500 ms doubling to a 10 s cap) whenever the signal drops, so a tunnel outage or a dead zone recovers without a page reload.</li>
+<li><strong>The tunnel heals itself.</strong> <code>keepAliveIntervalSec</code> / <code>keepAliveCountMax</code> make ssh notice a dead relay fast (default 30 s × 3 probes), and the supervisor restarts the child with jittered backoff (<code>backoffBaseMs</code>..<code>backoffMaxMs</code>). On a flaky home uplink, lowering <code>keepAliveIntervalSec</code> to 10 and <code>backoffBaseMs</code> to 1000 shortens the blackout window at the cost of a few extra probe packets.</li>
+</ul>
+<h2>Install</h2>
+<p>The bundle is opt-in, on top of the shipped <code>web</code> profile. Install from this repository (a <code>prepare</code> script builds the plugin from source; pnpm ≥10 asks you to allow the build the first time — copy the package key pnpm prints into the profile's <code>pnpm-workspace.yaml</code> under <code>allowBuilds</code> and re-run), or from npm when published:</p>
+<pre><code>dsh plugin --profile web add github:kk99668/dsh-mobile-access
+# or, once published to npm:
+dsh plugin --profile web add dsh-mobile-access
+</code></pre>
+<p>The inserted row reads its config from environment variables (the app boot loads <code>.env</code> from the invoking directory and the Harness home):</p>
+<table>
+<thead>
+<tr>
+<th>Variable</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>DSH_MOBILE_PUBLIC_HOST</code></td>
+<td>Public origin, bare <code>host</code> or <code>host:port</code> (required)</td>
+</tr>
+<tr>
+<td><code>DSH_MOBILE_RELAY_HOST</code></td>
+<td>Relay server address (required)</td>
+</tr>
+<tr>
+<td><code>DSH_MOBILE_RELAY_USER</code></td>
+<td>SSH login user on the relay server (required)</td>
+</tr>
+<tr>
+<td><code>DSH_MOBILE_TOKEN</code></td>
+<td>Gate secret, at least 8 characters (required)</td>
+</tr>
+</tbody></table>
+<p>Unset required variables fail the boot loud with the field names. Every other setting is a validated plugin config field with a default: <code>relayPort</code> 22, <code>remoteBindHost</code> <code>127.0.0.1</code>, <code>remoteBindPort</code> 3080, <code>localPort</code> (the active webserver port), <code>gatePort</code> 0 (OS-assigned), <code>sshBin</code> <code>ssh</code>, <code>identityFile</code> unset, <code>keepAliveIntervalSec</code> 30, <code>keepAliveCountMax</code> 3, <code>connectTimeoutSec</code> 10, backoff 2s..30s, <code>stableUptimeMs</code> 60s, <code>runningAfterMs</code> 3s, <code>printUrl</code> true, <code>qrCode</code> true, <code>surfaceContext</code> true. To change one, override the row's config in <code>$DSH_HOME/profiles/web/cordis.patch.yml</code> (a patch replaces the whole config, so restate every key):</p>
+<pre><code>- id: mobile-access
+  config:
+    publicHost: dsh.example.com
+    relayHost: vps.example.com
+    relayUser: dsh-relay
+    token: a-long-random-secret
+    remoteBindPort: 8443
+    identityFile: C:\Users\you\.ssh\id_ed25519
+</code></pre>
+<h2>Server setup</h2>
+<p>Run once on the relay server (root): <code>sudo ./scripts/setup-server.sh dsh.example.com 3080 ~/dsh-relay.pub</code>. The script installs Caddy with automatic HTTPS for the domain, creates the <code>dsh-relay</code> user, installs the given public key with <code>authorized_keys</code> restrictions that allow only the reverse listen (<code>permitlisten="127.0.0.1:3080"</code>, no shell, no agent, no X11), warns when <code>GatewayPorts</code> is enabled, and opens 22/80/443 in ufw. The key file argument is optional: any SSH login that can reach the server works, though the restricted relay user is the recommended shape. After the script, set the environment variables above, start <code>dsh --profile web</code>, and scan the QR code with the phone.</p>
+<h2>Security</h2>
+<ul>
+<li>The token gate is the only thing between the public internet and the agent. Anyone who knows the token can control this agent — treat it as a credential.</li>
+<li>The gate's login cookie is <code>HttpOnly</code> and <code>SameSite=Lax</code>; the token never enters the URL, logs, or referrers.</li>
+<li>The relay server binds the tunnel port to loopback only; the phone never talks to the tunnel directly, only to Caddy over TLS.</li>
+<li>The fence's privileged methods (<code>settings.*</code>, <code>credentials.*</code>, <code>host.*</code>, ...) stay pinned to loopback even on a trusted-host deployment, so the configuration plane is not reachable through the tunnel.</li>
+<li>Reconsider before exposing the harness from a shared or untrusted network. The web app itself has no user accounts; the gate is the boundary.</li>
+</ul>
+<h2>Model Experience</h2>
+<h3>Mobile-surface context</h3>
+<h4>What the model sees</h4>
+<p>When <code>surfaceContext</code> is true, the <code>app:mobile-surface</code> global section (order −97, right after the web-surface section) orients the model to the public origin, and <code>DSH_WEB_PUBLIC_URL</code> appears in the managed bash environment with its description, resolved per invocation:</p>
+<h5>Verbatim text for this field</h5>
+<pre><code>The DeepSeek Harness Web GUI is also served at https://dsh.example.com through a secure tunnel. Users arriving there interact with the same harness and sessions as this local GUI.
+</code></pre>
+<h4>Token effect</h4>
+<p>One prompt paragraph per session plus one managed-environment variable line, constant per process.</p>
+<h4>KV Cache effect</h4>
+<p>The section sits near the system prompt's head and is stable for the life of the process (the public host is a boot fact), so it does not invalidate the cache across turns.</p>
+<h2>Known Limitations and Deferred Work</h2>
+<ul>
+<li><strong>The tunnel requires an SSH client</strong> — <code>sshBin</code> must resolve on the machine running dsh; a missing binary fails loud at spawn and retries with backoff, and the README's manual <code>ssh -N -R</code> command is the diagnosis path.</li>
+<li><strong>The phone needs a browser login per device</strong> — the session cookie has no <code>Max-Age</code>, so each phone authenticates once per browser profile; there is no persistent-device registry or per-device revocation.</li>
+<li><strong>Windows autostart is the user's own</strong> — the tunnel lives inside the <code>dsh --profile web</code> process; keeping the GUI reachable means keeping that process running (a service wrapper is not shipped).</li>
+<li><strong>No in-GUI status surface</strong> — tunnel status is visible in the console log and through the <code>mobileAccess</code> service only; a settings card is deferred work.</li>
+</ul>

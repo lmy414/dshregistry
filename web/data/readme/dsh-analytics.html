@@ -1,0 +1,222 @@
+<h1>dsh-analytics</h1>
+<p>English | <a href="https://github.com/hccccc01333/dsh-analytics/blob/HEAD/README.zh.md">中文</a></p>
+<p>Agent FinOps / token analytics for DeepSeek Harness: collect usage from session
+events into a local SQLite ledger, price it with a time-aware pricing table
+(never hardcoded in logic), and query it through a service, an agent tool, and
+JSON API routes.</p>
+<p>This is the v1 scope from the design: <strong>Overview + Session drill-down + Cost
+Engine + Cache analytics</strong>, packaged the way the dsh-plugin ecosystem ships
+bundles (npm package with <code>dsh.bundle</code> → <code>cordis.patch.yml</code>).</p>
+<h2>Install</h2>
+<pre><code>dsh plugin --profile web add dsh-analytics
+</code></pre>
+<p>From git (requires the <code>prepare</code> build allowance):</p>
+<pre><code>dsh plugin --profile web add github:you/dsh-analytics#&lt;sha&gt;
+</code></pre>
+<p>From a local checkout:</p>
+<pre><code>dsh plugin --profile web add /path/to/dsh-analytics
+</code></pre>
+<p>For local development, mount the source overlay:</p>
+<pre><code>dsh --profile web --patch ./cordis.yml
+</code></pre>
+<h2>Configuration</h2>
+<p>The plugin row's <code>config</code> (see <a href="https://github.com/hccccc01333/dsh-analytics/blob/HEAD/cordis.yml">cordis.yml</a> for the shape):</p>
+<table>
+<thead>
+<tr>
+<th>Key</th>
+<th>Type</th>
+<th>Default</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>dbPath</code></td>
+<td>string</td>
+<td>— (required)</td>
+<td>SQLite database file; missing directories are created.</td>
+</tr>
+<tr>
+<td><code>currency</code></td>
+<td>string</td>
+<td>—</td>
+<td>Preferred currency sorted first in summaries (rows carry their own currency).</td>
+</tr>
+<tr>
+<td><code>peakHours</code></td>
+<td><code>[startHour, endHour][]</code></td>
+<td><code>[[1,4],[6,10]]</code></td>
+<td>UTC half-open peak windows; all other hours are off-peak.</td>
+</tr>
+<tr>
+<td><code>pricing</code></td>
+<td><code>PricingRow[]</code></td>
+<td>shipped DeepSeek V4 table</td>
+<td>Pricing rows that <strong>replace</strong> the shipped defaults.</td>
+</tr>
+<tr>
+<td><code>pricingFile</code></td>
+<td>string (absolute)</td>
+<td>—</td>
+<td>JSON file of <code>PricingRow[]</code>; mutually exclusive with <code>pricing</code>.</td>
+</tr>
+<tr>
+<td><code>budget.daily</code></td>
+<td>number</td>
+<td>—</td>
+<td>Daily spending limit in <code>budget.currency</code> (UTC day).</td>
+</tr>
+<tr>
+<td><code>budget.monthly</code></td>
+<td>number</td>
+<td>—</td>
+<td>Monthly limit; the overview also projects month-end spend.</td>
+</tr>
+<tr>
+<td><code>budget.currency</code></td>
+<td>string</td>
+<td><code>currency</code> or <code>USD</code></td>
+<td>Currency the limits are measured in.</td>
+</tr>
+<tr>
+<td><code>tools</code></td>
+<td>boolean</td>
+<td><code>true</code></td>
+<td>Register the <code>analytics_query</code> agent tool.</td>
+</tr>
+<tr>
+<td><code>web</code></td>
+<td>boolean</td>
+<td><code>true</code></td>
+<td>Register the <code>/api/analytics/*</code> JSON routes when <code>ctx.webServer</code> exists.</td>
+</tr>
+</tbody></table>
+<h2>Pricing: the table is data, not code</h2>
+<p>Costs are computed by matching each request against pricing rows:</p>
+<pre><code>interface PricingRow {
+  provider: string          // request/header config provider
+  model: string             // request/header config model
+  region?: string           // optional discriminator
+  priceType: 'peak' | 'off-peak' | 'flat'
+  inputType: 'cache_hit' | 'cache_miss' | 'cache_write' | 'output'
+  pricePerMillion: number   // per 1M tokens, in `currency`
+  currency: string
+  effectiveFrom: string     // ISO 8601, inclusive
+  effectiveTo?: string      // ISO 8601, exclusive
+}
+</code></pre>
+<p>The match uses <code>model + timestamp + cache hit/miss + input/output</code>, so a
+request at time T is always billed with the rows in force at T — later
+repricing never rewrites history. <code>cache_write</code> falls back to <code>cache_miss</code>
+when no dedicated row exists. Among matching rows the one with the latest
+<code>effectiveFrom</code> wins.</p>
+<p>The shipped defaults follow DeepSeek's V4 announcement: flat rates until
+<code>2026-08-16T16:00:00Z</code>, then peak/off-peak rates (off-peak = 50% of peak).
+They are seed data only — supply <code>pricing</code> or <code>pricingFile</code> to own the table.
+Without configuration, defaults are seeded only when the table is empty, so a
+restart without a pricing config never overwrites recorded prices.</p>
+<h2>What is collected</h2>
+<p>The plugin listens to <code>session/event</code> and replays persisted sessions through
+<code>ctx.sessionQuery</code> on startup (live-only when the seam is absent):</p>
+<ul>
+<li><code>assistant/message</code> usage → one request row per (session, seq)
+(deduplicated, replay-safe)</li>
+<li><code>request/header</code> → provider / model / reasoning effort for pricing</li>
+<li><code>tool/call</code> + <code>tool/result</code> → tool call rows with error flags</li>
+<li>session headers → created-at, cwd, parent for grouping</li>
+</ul>
+<p>Storage is a local SQLite database (<code>dsh_analytics_requests</code>,
+<code>dsh_analytics_tool_calls</code>, <code>dsh_analytics_sessions</code>,
+<code>dsh_analytics_pricing</code>). Nothing leaves the machine; the plugin never calls
+the provider API.</p>
+<h2>Service: <code>ctx.analytics</code></h2>
+<p>All reads are detached snapshots; the service never touches the session store
+or the agent loop:</p>
+<pre><code>await ctx.analytics.overview({ start, end })   // totals, cost, cache, reasoning, trend, byModel, bySession, budget
+await ctx.analytics.session(sessionId)          // request rows, turn waterfall, tools, cache
+await ctx.analytics.sessions({ start, end })    // per-session summaries
+await ctx.analytics.models({ start, end })      // per-provider/model summaries
+await ctx.analytics.tools({ start, end })       // per-tool calls/errors + step-attributed cost
+await ctx.analytics.pricing()                   // the pricing table in force
+await ctx.analytics.budget()                    // spend vs configured limits + projection
+</code></pre>
+<p>Tool cost is <strong>step-level attribution</strong>: a model call's cost is distributed
+evenly across the tools called in that step, so a step with several tools
+shares its cost (never double counted).</p>
+<h2>Agent tool: <code>analytics_query</code></h2>
+<p>The model can ask for the same numbers:</p>
+<pre><code>analytics_query(query="overview", range_hours=24)
+analytics_query(query="session", session_id="session-1")
+analytics_query(query="models" | "sessions" | "tools" | "reasoning" | "agents" | "insights" | "inflation" | "pricing" | "budget", range_hours=24)
+</code></pre>
+<p><code>range_hours</code> bounds the window ending now (<code>0</code> = all time, default 24).</p>
+<h2>Web API</h2>
+<p>When <code>ctx.webServer</code> is mounted, read-only JSON routes register at
+<code>/api/analytics/overview|sessions|models|tools|pricing|budget</code> (with an
+optional <code>?hours=</code> query) and <code>/api/analytics/session/&lt;sessionId&gt;</code>. These are
+the data source for a future dashboard page.</p>
+<h2>Browser dashboard</h2>
+<p>The same routes power a self-contained dashboard served by the plugin at
+<code>/analytics</code> (open the harness web server URL in any browser, or
+<code>http://127.0.0.1:&lt;port&gt;/analytics</code> in a headless profile that mounts
+<code>ctx.webServer</code>). It is a zero-build vanilla JS app shipped inside the
+package (<code>web/</code>):</p>
+<ul>
+<li><strong>Overview</strong> — KPI cards (cost, tokens, cache hit rate, reasoning share),
+token/cost trend, composition donut, cache hit-rate trend, cost by model, sessions, budget</li>
+<li><strong>Sessions</strong> — list with drill-down: turn waterfall with duration/outcome,
+cumulative context chart, per-turn cost bars, tools, cache</li>
+<li><strong>Reasoning</strong> — low/high/max efficiency: calls, success rate, avg duration,
+cost, and cost per success</li>
+<li><strong>Agents</strong> — parent/child subagent cost tree with per-node cost bars and a
+top-level cost donut (click any node to drill down)</li>
+<li><strong>Insights</strong> — rule-generated optimization suggestions (reasoning effort,
+cache, tool concentration, budget, subagent share, context growth)</li>
+<li><strong>Context Inflation</strong> — tool results re-sent in later requests: duplicated
+tokens, avoidable cost, and per-tool share</li>
+<li><strong>Token Flow / Models / Cost / Pricing</strong> — per-bucket trend, per-model
+aggregates, per-tool step attribution, latest-rate price comparison, and the pricing table</li>
+</ul>
+<p>The range selector (6h/24h/7d/30d/all) applies to every page; the shell-nav
+integration inside the harness client is a follow-up (the harness client has
+no free plugin page slot today). The top bar also has an <strong>EN / 中文</strong> toggle
+(persisted across visits; <code>?lang=zh</code> forces Chinese).</p>
+<h2>In-shell entry (web profile)</h2>
+<p>The package also ships a browser client bundle (<code>dsh.client</code> →
+<code>exports["./client"]</code>, built to the harness module-loader contract). In a web
+profile it registers three entries:</p>
+<ul>
+<li>a <strong>Token Analytics</strong> action beside Settings at the sidebar foot, opening a
+full-screen in-app panel with the same six pages as <code>/analytics</code>
+(Overview / Sessions / Token Flow / Models / Cost / Pricing, with a range
+selector and refresh);</li>
+<li>a per-session <strong>Analytics</strong> action in the conversation header, opening the
+task-cost overlay (cost, tokens, cache hit rate, turn waterfall, tool
+attribution, and a link to the full dashboard);</li>
+<li>a per-turn cost line under each closed turn's final chat message
+("tokens · cost · duration"), rendered by the <code>conversation.chat.turnTail</code> entry.</li>
+</ul>
+<p>Both read the same read-only JSON routes, so they need the plugin's host half
+(and its web routes) mounted. No harness client shell change is required:
+the sidebar entry uses the shell's existing <code>sidebar.footer.action</code> hole.</p>
+<h2>Development</h2>
+<pre><code>pnpm install
+pnpm test
+pnpm lint
+pnpm build
+pnpm doctor
+</code></pre>
+<p>Visual QA: run <code>pnpm preview</code> in one terminal, then
+<code>node scripts/visual-qa.mjs</code> — it drives headless Edge over the dashboard and
+reports element overlaps, SVG chart-label collisions, text overflow, and the
+font-size scale.</p>
+<h2>Roadmap</h2>
+<ul>
+<li>Analytics entry inside the harness client shell (left-nav integration; the
+client has no free plugin page slot today, so the dashboard currently lives
+at <code>/analytics</code>)</li>
+<li>Skill / sub-agent ROI and reasoning-effort efficiency</li>
+<li>Cost anomaly alerts from the budget signals</li>
+</ul>
+<h2>License</h2>
+<p>MIT</p>

@@ -1,0 +1,115 @@
+<h1>dsh-cot-profile</h1>
+<p>Real-time chain-of-thought trajectory profiling for <a href="https://github.com/deepseek-ai/deepseek-harness">DeepSeek Harness</a>: watch the reasoning stream as it happens, tally signature wording indicators (<code>let me</code> / <code>we</code> / <code>let's</code> / <code>I</code>), classify the current session's trajectory family against built-in baselines, and optionally record per-session measurement aggregates.</p>
+<h2>Read this first: honest framing</h2>
+<p>Wording fingerprints describe the <strong>(model × assembly) combination</strong> — system prompt, tool schema, reasoning effort — <strong>not model identity</strong>. The underlying research (<a href="https://github.com/xiaobright/modeltest"><code>xiaobright/modeltest</code></a>) shows the same wording pattern across different models when the interface changes (the V4 Flash counterexample: identical <code>we</code>-heavy, <code>let me</code>-free reasoning under the minimal assembly, at a different ability level).</p>
+<p>This plugin tells you <strong>which trajectory family the current session behaves like</strong> (minimal-like / standard-like / gray-like) and shows you the raw indicators side by side, so you draw your own conclusions. It does not assert "this is model X".</p>
+<h2>Features</h2>
+<ul>
+<li><strong>Live UI</strong>: session-header badge + collapsible floating panel, updated by session-projection push frames — no polling, no custom RPC.</li>
+<li><strong>Indicators</strong>: <code>let me</code> / <code>we</code> / <code>let's</code> / <code>I</code> counts, first-line patterns (<code>We need…</code> / <code>The user wants…</code> / <code>Let me…</code> / <code>I…</code>), block-length median, interim visible replies.</li>
+<li><strong>Judgment</strong>: weighted-distance match against built-in profile baselines with confidence; verdicts only after N blocks (default 10, configurable).</li>
+<li><strong>Extensible</strong>: user-editable profile families and per-dimension weights (Web settings or cordis config).</li>
+<li><strong>Record mode</strong>: one aggregate JSON record per session at session end (event and/or JSONL) — the measurement instrument that calibrates the baselines with real data.</li>
+<li><strong>Privacy</strong>: only aggregates ever leave the host computation; raw reasoning text is never recorded or transmitted.</li>
+</ul>
+<h2>Install</h2>
+<pre><code>dsh plugin --profile web add github:Chloride233/dsh-cot-profile
+</code></pre>
+<p>The core plugin (badge, panel, records) works immediately. The <strong>Web settings section</strong> additionally needs a temporary one-time patch to DeepSeek Harness 0.1.0-rc.6 (see <a href="#optional-web-settings-section">Optional: Web settings</a>); without it, configure via cordis config below.</p>
+<h2>Configure</h2>
+<p>Configuration lives in the <code>cot-profile</code> plugin row (<code>cordis.patch.yml</code> of this repo, or your profile's cordis.yml). Defaults:</p>
+<pre><code>- id: cot-profile
+  config:
+    minBlocksForJudgment: 10   # verdict only after N reasoning blocks
+    badge: true                # session-header badge
+    panel: true                # real-time panel
+    panelMode: overlay         # 'overlay' (default, zero risk) | 'track' (experimental right column)
+    weights: {}                # per-dimension weights; {} = built-in defaults
+    profiles: []               # custom profile families; [] = built-in baselines
+    record:
+      emit: true               # emit cot-profile/record at session end
+      file: ''                 # optional JSONL path (leading ~ expands to $HOME)
+</code></pre>
+<p><strong>Panel modes:</strong></p>
+<ul>
+<li><code>overlay</code> (default): floating panel pinned to the right edge of the conversation — an official additive slot, zero risk.</li>
+<li><code>track</code> (<strong>experimental</strong>): a real right column appended to the shell's three-column grid via direct DOM manipulation (MutationObserver over <code>grid-template-columns</code>). It does not cover content and does not replace any shipped UI, but it operates outside the official slot system — a DSH upgrade that changes the frame structure may require adapting this mode. Off by default.</li>
+</ul>
+<p>Weights (defaults, <code>let me</code>/<code>we</code> dominate per research separation):</p>
+<pre><code>{ "letMe100": 3, "we100": 3, "lets100": 2, "i100": 1.5,
+  "firstLineWeNeed": 1.5, "firstLineUserWants": 1, "firstLineLetMe": 1.5,
+  "firstLineI": 1, "firstLineOther": 0.5, "p50BlockChars": 1, "visibleReplies": 1.5 }
+</code></pre>
+<p>A custom profile is <code>{ "id", "name", "description", "vector" }</code> with any of the vector dims; add one per model/version you want to track and judge against.</p>
+<h2>Optional: Web settings section</h2>
+<p>DeepSeek Harness 0.1.0-rc.6 exposes only a hard-coded allowlist of settings namespaces to the browser (<code>WEB_SETTINGS_NAMESPACES</code> in <code>dsh-host-apiproxy</code>; its source comment calls moving that decision to <code>settings.register()</code> <em>deferred work</em>). Until upstream lands plugin-declared settings exposure, run:</p>
+<pre><code>sh scripts/install-patch.sh
+</code></pre>
+<p>This copies the installed <code>dsh-host-apiproxy</code> into the web profile and adds <code>cot-profile</code> to the allowlist. It is <strong>idempotent and optional</strong> — the plugin is fully functional without it. Caveats:</p>
+<ul>
+<li>A <code>pnpm install</code> in the profile directory removes the copied package; re-run the script afterwards.</li>
+<li>A dsh upgrade may change the allowlist layout; the patch script fails loudly (never silently) when it cannot find the block.</li>
+</ul>
+<h2>FAQ</h2>
+<ul>
+<li><strong>Local-path install fails to load?</strong> <code>dsh plugin add &lt;local-dir&gt;</code> installs via pnpm's <code>link:</code> protocol, which resolves the linked package's imports from its own directory — so the checkout needs a resolvable <code>node_modules</code>. Run <code>pnpm install</code> in the checkout (or symlink it to the running harness's node_modules). Installing from the GitHub URL (<code>github:...</code>) does not have this issue — pnpm resolves dependencies from its store natively.</li>
+</ul>
+<h2>Events &amp; data</h2>
+<table>
+<thead>
+<tr>
+<th>Surface</th>
+<th>Shape</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>Projection key</td>
+<td><code>cot-profile</code> — read it in any session-scoped slot via <code>useProjection('cot-profile')</code> (typed as <code>CotProfileView</code> in <code>lib/index.d.ts</code>)</td>
+</tr>
+<tr>
+<td><code>cot-profile/update</code></td>
+<td><code>{ sessionId, blocks, counts, firstLines, p50BlockChars, visibleReplies, vector, judgment, ui, revision, seq }</code> (throttled 500ms)</td>
+</tr>
+<tr>
+<td><code>cot-profile/record</code></td>
+<td>one aggregate record at session end (only when the session had ≥1 reasoning block)</td>
+</tr>
+</tbody></table>
+<h3>Record schema (v1)</h3>
+<pre><code>{
+  "v": 1,
+  "sessionId": "...",
+  "startedAt": 1720000000000,
+  "endedAt": 1720000100000,
+  "preset": "anchored-standard",        // when known (agent-preset/selected)
+  "provider": "deepseek",               // when known (agent/request capture)
+  "model": "deepseek-v4-pro",           // when known
+  "reasoningBlocks": 193,
+  "indicators": { "letMe": 1, "we": 179, "lets": 88, "i": 17,
+                  "p50BlockChars": 111, "visibleReplies": 1,
+                  "firstLines": { "we-need": 120, "other": 73 } },
+  "vector": { /* normalized indicator vector */ },
+  "judgment": { "family": "minimal-like", "confidence": 0.87, "distances": {} }
+}
+</code></pre>
+<p><strong>Privacy boundary (hard requirement):</strong> records contain only aggregates — never raw reasoning text. File recording is off by default and opt-in.</p>
+<h3>GUI calibration (semi-automatic)</h3>
+<p>The settings section (<strong>Settings → 思维链画像 → 数据校准</strong>) scans the configured record file, groups records by (provider, model, preset), aggregates indicator-vector means per group, and offers a one-click <strong>"应用为画像族"</strong> — writing the measured group as a new profile-family into the <code>profiles</code> config. Aggregation is automatic; applying is always a human decision, and the built-in baselines are never rewritten automatically.</p>
+<p>The scan reads <code>GET /cot-profile/records</code> — a route the plugin registers on the web server. It reads <strong>only</strong> the configured <code>record.file</code> path and returns aggregates (never raw reasoning text); without a configured file it returns an empty result. If the settings section shows a scan error, confirm the JSONL path is set and a few sessions have ended.</p>
+<h2>Development</h2>
+<pre><code>npm test          # node --test test/analyzer.test.js (zero dependencies)
+</code></pre>
+<ul>
+<li><code>lib/analyzer.js</code> — pure analysis (tokenize, counts, first-line classes, vector, distance, judgment)</li>
+<li><code>lib/profiles.js</code> — built-in baselines (marked <strong>estimates</strong> — calibrate with record-mode data)</li>
+<li><code>lib/index.js</code> — host: session projection, events, record sink</li>
+<li><code>lib/client.js</code> — badge, panel, settings section</li>
+</ul>
+<h2>Upstream wishlist</h2>
+<p>Both are temporary gaps in DeepSeek Harness 0.1.0-rc.6 this plugin works around:</p>
+<ol>
+<li><strong>Plugin-declared settings exposure</strong> — move the settings namespace allowlist from <code>dsh-host-apiproxy</code> into <code>settings.register()</code> so plugins can expose their own configuration without patching a bundle.</li>
+<li><strong>Additive right-column slot</strong> — a <code>conversation.details.panel</code>-style list seat so a floating panel can become a native right column.</li>
+</ol>
+<h2>License</h2>
+<p>MIT. See <a href="https://github.com/Chloride233/dsh-cot-profile/blob/HEAD/LICENSE">LICENSE</a>. Built on the trajectory methodology of <a href="https://github.com/xiaobright/dsh-anchored-standard"><code>xiaobright/dsh-anchored-standard</code></a> and <a href="https://github.com/xiaobright/modeltest"><code>xiaobright/modeltest</code></a> (MIT, aggregates only).</p>

@@ -1,0 +1,264 @@
+<h1>dsh-trajectory-governance</h1>
+<p><a href="https://awesome-dsh-plugin.com"><img src="https://awesome-dsh-plugin.com/badge.svg" alt="Awesome DSH Plugin"></a></p>
+<p><strong>Agent trajectory governance &amp; anomaly diagnosis for DeepSeek Harness (dsh).</strong></p>
+<p>Rebuilds the flat <code>session/event</code> log into a <strong>structured, multi-branch trajectory
+tree</strong>, keeps <strong>observation-layer snapshots</strong>, and runs <strong>three temporal anomaly
+strategies</strong> (loop deadlock / invalid retry / goal drift) with results mounted on
+tree nodes and surfaced in an <strong>independent GUI tab</strong>.</p>
+<blockquote>
+<p>Zero kernel modification · consume-only event subscription · observation-layer
+snapshots (no control-plane rollback) · independent SQLite storage · never
+overwrites the official Trajectory view.</p>
+</blockquote>
+<hr>
+<h2>Why</h2>
+<p>The official Trajectory page is a <strong>flat raw-event log</strong>. For long-running agent
+tasks (dozens of turns, subagents, forks) you cannot see:</p>
+<ul>
+<li>which tool call belongs to which sub-task / subagent / fork branch,</li>
+<li>where the agent started drifting from the original goal,</li>
+<li>whether it is looping in place burning tokens (deadlock / invalid retry).</li>
+</ul>
+<p>This plugin is an <strong>upper observation &amp; reasoning layer</strong>: it consumes committed
+events and derives structure, snapshots, and diagnoses — it never steers,
+intercepts, or rolls back the agent. Both views coexist.</p>
+<table>
+<thead>
+<tr>
+<th>Aspect</th>
+<th>Official Trajectory</th>
+<th>dsh-trajectory-governance</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>View</td>
+<td>flat raw event log</td>
+<td>structured multi-branch trajectory tree</td>
+</tr>
+<tr>
+<td>Lineage</td>
+<td>none</td>
+<td>parent/child + fork/subagent branches (derived implicitly)</td>
+</tr>
+<tr>
+<td>Snapshots</td>
+<td>no</td>
+<td>observation-layer snapshots (nodeId + context hash + branchId)</td>
+</tr>
+<tr>
+<td>Diagnosis</td>
+<td>no</td>
+<td>loop_deadlock / invalid_retry / goal_drift with confidence + suggestions</td>
+</tr>
+<tr>
+<td>Storage</td>
+<td>host storage</td>
+<td>plugin-private SQLite (<code>~/.dsh-trajectory-governance/</code>)</td>
+</tr>
+<tr>
+<td>Behavior</td>
+<td>—</td>
+<td>consume-only; never schedules, forks, or rewinds the agent</td>
+</tr>
+</tbody></table>
+<h2>Architecture</h2>
+<pre><code>dsh web profile
+ ├─ @deepseek-ai/dsh-base (official core)
+ └─ dsh-trajectory-governance (this bundle)
+      │
+      │  ctx.on('session/event' | 'session/created' | 'session/disposed'
+      │         | 'subagent/start' | 'subagent/end')   ← emit-mode, post-commit, read-only
+      ▼
+ ┌─ ingest ───────────────┐   ┌─ tree ─────────────────┐
+ │ normalize (scalars)    │──▶│ cross-session trajectory │
+ │ sqlite (events/sessions)│   │ tree + branch attach    │
+ └────────────────────────┘   └─────────────────────────┘
+ ┌─ snapshot ─────────────┐   ┌─ diagnose ──────────────┐
+ │ index-only snapshots    │   │ 3 strategies (async)    │
+ │ LRU/TTL prune, branches │   │ results → anomalies DB  │
+ └────────────────────────┘   └─────────────────────────┘
+      │
+      ▼
+ ┌─ api (host) ────────────┐   ┌─ client (browser) ─────┐
+ │ /trajectory-governance/  │◀──│ independent Tab:        │
+ │ api/* (JSON, same-origin)│   │ conversation.view slot, │
+ └─────────────────────────┘   │ id 'trajectory-…'       │
+                               └─────────────────────────┘
+</code></pre>
+<p>Data flow: <code>session/event</code> (durable, post-commit) → normalized + persisted →
+tree/snapshot/diagnosis services → JSON API → the GUI tab. The diagnosis engine
+runs <strong>asynchronously</strong> on an interval (incremental watermark + tail overlap) and
+never blocks the agent loop.</p>
+<h2>Install</h2>
+<p>Requires dsh <code>&gt;= 0.1.0-rc.6</code>. Two ways:</p>
+<p><strong>Bundle (published / git):</strong></p>
+<pre><code>dsh plugin --profile web add github:dfycaly98931680/dsh-trajectory-governance#&lt;commit-sha&gt;
+</code></pre>
+<p>A git install fetches sources, so the package ships a <code>prepare</code> build; pnpm
+requires an explicit allow-list for it (add the printed key to the profile's
+<code>pnpm-workspace.yaml</code>, then re-run):</p>
+<pre><code>allowBuilds:
+  dsh-trajectory-governance: true
+</code></pre>
+<p>Alternatively install a built tarball (<code>pnpm pack</code>) — no build permission needed.</p>
+<p><strong>Dev overlay (no pnpm):</strong></p>
+<pre><code>dsh web --patch C:\path\to\dsh-plugin\overlay.dev.yml
+</code></pre>
+<p>Then restart the web app. You should see <code>[trajectory-governance] loaded; storage=... sessions=N events=M anomalies=K</code> in the logs.</p>
+<h2>Use</h2>
+<ol>
+<li>Run any agent task in the GUI (ideally a long one).</li>
+<li>Open the <strong>轨迹治理 / Trajectory Governance</strong> tab (a separate <code>conversation.view</code>
+entry — the official Trajectory tab is untouched).</li>
+<li>Pick a session: the tree renders with <strong>branch badges</strong> (subagent/fork),
+<strong>snapshot marks (★)</strong>, and <strong>red-highlighted anomaly ranges (⚠)</strong>.</li>
+<li>Click a node for the raw event + mounted diagnosis report (type, confidence,
+severity, description, suggestion).</li>
+<li>Use the snapshot bar to capture checkpoints at any node, list them, and jump
+back; delete stale branches via the API/CLI.</li>
+</ol>
+<p>CLI inspection utilities (against the plugin's own SQLite):</p>
+<pre><code>node scripts/inspect.mjs   [dbPath]                 # sessions/events overview
+node scripts/tree.mjs      &lt;sessionId&gt; [dbPath]     # trajectory tree JSON
+node scripts/snapshot.mjs  &lt;dbPath&gt; &lt;cmd&gt; [...]     # list|create|context|delete|prune
+</code></pre>
+<h2>Configuration</h2>
+<p>The plugin row accepts <code>config</code> (all optional; deep-merged over defaults):</p>
+<pre><code>- insert:
+    - id: trajectory-governance
+      name: dsh-trajectory-governance
+      config:
+        storage:
+          path: C:/data/trajectory.db   # default ~/.dsh-trajectory-governance/trajectory.db
+        diagnosis:
+          strategyA:
+            enabled: true
+            windowSize: 5
+            similarityThreshold: 0.85
+            resultSimilarityThreshold: 0.8
+          strategyB:
+            enabled: true
+            minRounds: 3
+          strategyC:
+            enabled: true
+            sampleEveryNRounds: 5
+            similarityThreshold: 0.5
+            consecutiveSamples: 2
+            embedder: lexical        # 'lexical' built-in; 'llm' is the extension seam
+          analyzer:
+            enabled: true
+            intervalMs: 10000
+          alerts:
+            enabled: true
+            minConfidence: 0.8
+            cooldownMs: 600000
+            channels:
+              desktop: true          # browser Notification (client side)
+              cordisEvent: true      # 'trajectory/anomaly' bus event for the ecosystem
+              webhook:
+                url: ""              # Feishu/DingTalk/Slack-style text webhook
+          actions:
+            onLoopDeadlock: notify   # notify | suggest-stop(一键中断按钮) | auto-stop
+            onInvalidRetry: notify
+            onGoalDrift: notify
+          cost:
+            enabled: true
+            tokenPricePerM: 0.28     # adjust to your provider pricing
+            estimateWhenUsageMissing: true
+</code></pre>
+<p>Full schema: <code>DIAGNOSIS_CONFIG_SCHEMA</code> in <code>src/diagnose/config.ts</code>.</p>
+<h2>Alerts &amp; stop-loss (v0.2)</h2>
+<p>When a NEW anomaly is detected (confidence ≥ <code>alerts.minConfidence</code>), the plugin:</p>
+<ol>
+<li>emits <code>trajectory/anomaly</code> on the Cordis bus (ecosystem notification plugins
+can subscribe) and POSTs a text webhook if configured — the message is in
+<strong>stop-loss language</strong>: type, confidence, and how much tokens/money/time the
+range already consumed (from official <code>assistant/message.usage</code>);</li>
+<li>the GUI tab polls <code>/api/alerts</code>, shows a desktop notification (browser
+Notification API, permission button in the bar), and pins abnormal sessions
+on top of the dropdown sorted by wasted tokens;</li>
+<li>offers a <strong>one-click interrupt</strong> (<code>POST /api/actions/interrupt</code>) which calls
+the official <code>agent.cancel</code> capability — never a monkey-patch. Default tier
+is <code>notify</code>; <code>auto-stop</code> (loop deadlock only, confidence ≥ 0.9) can be
+configured for unattended setups.</li>
+</ol>
+<h2>Breakpoints &amp; waste reports (v0.3)</h2>
+<p><strong>Breakpoint exit — the legitimate lightweight "rollback".</strong> Instead of a
+control-plane rewind (already covered by <a href="https://github.com/Anionex/dsh-turn-rewind">dsh-turn-rewind</a>),
+this plugin offers a <em>diagnosis-driven restart</em>: at any snapshot / anomaly
+start / selected node, <strong>"branch a new session here"</strong> resolves the target down
+to the nearest stable <code>turn/end</code> boundary and calls the <strong>official
+<code>ctx.sessions.fork(source, boundary)</code></strong> — a fresh child session seeded at that
+point. It never touches workspace files, keeps the observation-layer stance,
+and turns "you wasted money here" into a one-click action.</p>
+<p><strong>Waste attribution report</strong> — not another usage-stats dashboard (that niche is
+saturated): it answers the attribution question nobody else does, <em>"which
+sessions wasted tokens/money, on which anomaly types"</em>:</p>
+<pre><code>curl http://127.0.0.1:3080/trajectory-governance/api/report/waste          # all sessions (Markdown + JSON)
+curl "http://127.0.0.1:3080/trajectory-governance/api/report/waste?sessionId=&lt;id&gt;"  # one session detail
+</code></pre>
+<p>Both are also reachable from the tab ("浪费报告" / "本会话报告" buttons).</p>
+<h2>Quick demo (reproduce loop deadlock &amp; goal drift)</h2>
+<p><strong>Instant (no waiting for a real loop):</strong> seed a synthetic session into the
+live store, refresh the tab, pick <code>demo-session</code>:</p>
+<pre><code>node scripts/demo-seed.mjs            # writes into the default live DB
+</code></pre>
+<p>You should see a tree with red-highlighted <code>loop_deadlock</code> (5 identical tool
+calls) and a severe <code>goal_drift</code> range, plus a snapshot mark (★).</p>
+<p><strong>Real agent:</strong></p>
+<ol>
+<li>Give the agent a <strong>long, open-ended refactor</strong> prompt (e.g. "重构这个项目为
+TypeScript 并补单元测试，先读代码再动手").</li>
+<li>Let it run until it starts <strong>repeating the same tool call</strong> (same file, same
+content) with no visible progress — Strategy A flags <code>loop_deadlock</code> on the
+trigger node.</li>
+<li>Ask a follow-up in a different domain ("顺便帮我看看怎么做番茄意面") — after
+N sampled turns Strategy C flags <code>goal_drift</code> (mild/moderate/severe) against
+the original baseline.</li>
+</ol>
+<p>Verify: the tree tab highlights the ranges in red; <code>scripts/inspect.mjs</code> shows the
+anomaly counts; <code>scripts/tree.mjs &lt;sessionId&gt;</code> dumps the mounted <code>anomalyInfo</code>.</p>
+<h2>Screenshots</h2>
+<blockquote>
+<p>TODO — add after the first live run: tree tab overview / anomaly card / snapshot
+list. (Placeholders reserved here.)</p>
+</blockquote>
+<h2>Testing</h2>
+<pre><code>npm install
+npm run build &amp;&amp; npm test    # 46 tests: normalize/store/subscriber/tree/snapshot/diagnose/api
+</code></pre>
+<h2>Boundaries (important)</h2>
+<ul>
+<li><strong>Zero kernel modification</strong> — no fork, no monkey-patch, no host storage access.</li>
+<li><strong>Consume-only events</strong> — <code>session/event</code> etc. are emit-mode, post-commit,
+fire-and-forget listeners; payloads are never mutated.</li>
+<li><strong>Observation-layer snapshots</strong> — a snapshot is an index (nodeId + context hash<ul>
+<li>branchId); context is rebuilt from the event store. This plugin never forks,
+resumes, or rewinds the agent.</li>
+</ul>
+</li>
+<li><strong>Independent Tab</strong> — registered with its own slot id; the official Trajectory
+page (id <code>trajectory</code>) is never overwritten.</li>
+<li><strong>Preview API</strong> — <code>SESSION_FORMAT_VERSION = 0</code>, no compatibility implied. The
+event vocabulary is centralized in <code>src/core/event-catalog.ts</code>; unknown types
+honor the envelope's <code>ignorable</code> marker.</li>
+</ul>
+<h2>Repository layout</h2>
+<pre><code>src/
+  index.ts                  # Cordis plugin entry (name/apply)
+  core/                     # types + 44-type event catalog
+  ingest/                   # normalize + session-event subscriber
+  persistence/              # node:sqlite store (events/sessions/snapshots/anomalies)
+  tree/                     # trajectory tree builder + queries
+  snapshot/                 # observation snapshots + branch manager
+  diagnose/                 # similarity, config, 3 strategies, engine, mount, runtime
+  api/                      # host JSON API (/trajectory-governance/api/*)
+  client/                   # independent GUI tab (conversation.view, id 'trajectory-governance')
+tests/                      # node:test suites
+scripts/                    # inspect / tree / snapshot / smoke
+cordis.patch.yml            # official bundle load row
+plugin.manifest.yaml        # self-describing metadata (loader uses cordis.patch.yml)
+</code></pre>
+<h2>License</h2>
+<p>MIT — see <a href="https://github.com/dfycaly98931680/dsh-trajectory-governance/blob/HEAD/LICENSE">LICENSE</a>. Part of the <a href="https://github.com/awesome-dsh-plugin/awesome-dsh-plugin">awesome-dsh-plugin</a>
+ecosystem. Topic: <code>dsh-plugin</code>.</p>

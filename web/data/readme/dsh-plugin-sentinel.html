@@ -1,0 +1,80 @@
+<h1>dsh-plugin-sentinel 🔒</h1>
+<p><a href="https://awesome-dsh-plugin.com"><img src="https://awesome-dsh-plugin.com/badge.svg" alt="Awesome DSH Plugin"></a></p>
+<p><strong>DSH 插件安检机</strong> — 给 <a href="https://github.com/deepseek-ai/deepseek-harness">DeepSeek Harness</a> 装一台插件安检机：在安装任何社区插件<strong>之前</strong>做纯静态安全审计，输出按严重度排序的结构化风险报告。</p>
+<blockquote>
+<p>官方文档对 GitHub 安装方式的警告原话：<code>prepare</code> 脚本授权是 <em>"permission to execute the package's code on your machine at install time, outside any sandbox the agent runs under"</em>。DSH 生态 24 小时收录 288+ 社区插件——这台安检机就是为了让"先过安检再安装"成为一句话的事。</p>
+</blockquote>
+<h2>安装</h2>
+<pre><code>dsh plugin --profile &lt;你的profile&gt; add github:&lt;你的fork&gt;/dsh-plugin-sentinel
+# 或本地安装
+dsh plugin --profile &lt;你的profile&gt; add ./dsh-plugin-sentinel
+</code></pre>
+<p>装好后对 DSH 说：</p>
+<ul>
+<li>「帮我装 github:xxx/yyy 这个插件」→ 模型会先调 <code>audit_plugin</code> 过安检，<code>block</code> 则拒绝安装并说明风险</li>
+<li>「巡检我当前 profile 装过的插件安不安全」→ <code>audit_installed</code></li>
+</ul>
+<h2>提供的工具</h2>
+<table>
+<thead>
+<tr>
+<th>工具</th>
+<th>用途</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>audit_plugin</code></td>
+<td>审计一个插件目录或 <code>.tgz</code> 压缩包：安装期脚本、动态执行、凭据读取、网络外传、patch 层 <code>!!js</code> 表达式、静默禁用安全行、路径穿越、软链接…</td>
+</tr>
+<tr>
+<td><code>audit_installed</code></td>
+<td>巡检 profile 内全部社区 bundle（官方 <code>@deepseek-ai/*</code> 内置包标记 trusted 跳过）</td>
+</tr>
+</tbody></table>
+<p>结论分级：<code>pass</code>（通过）/ <code>review</code>（需人工审查）/ <code>block</code>（建议拒绝）。风险分权重 critical=10 / high=5 / medium=2 / low=1。</p>
+<h2>安全设计：安检机自身的攻击面为零</h2>
+<table>
+<thead>
+<tr>
+<th>决策</th>
+<th>理由</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong>零 npm 依赖、零安装脚本、零构建</strong></td>
+<td><code>package.json</code> 没有 scripts、没有 dependencies；从 GitHub 安装<strong>不需要</strong> pnpm <code>allowBuilds</code> 授权，不存在安装期执行</td>
+</tr>
+<tr>
+<td><strong>原生 JSON-Schema ToolDefinition 注册</strong>（MCP 工具同款路径）</td>
+<td>全部源码只 import Node 内置模块，不依赖任何运行时包</td>
+</tr>
+<tr>
+<td><strong>纯 JS tar 解析</strong>（<code>node:zlib</code> + 手写 ustar/pax/GNU-longname）</td>
+<td><code>.tgz</code> 审计全程在内存完成，被审计的恶意代码<strong>不落盘</strong>；全程不用 <code>child_process</code></td>
+</tr>
+<tr>
+<td><strong>词法剥离扫描</strong>：先剥注释/字符串再匹配危险 API；模板 <code>${}</code> 插值内的代码保留</td>
+<td>字符串和注释里写着 <code>eval(</code> 不算证据（防误报）；藏在插值里的代码跑不掉（防漏报）</td>
+</tr>
+<tr>
+<td><strong>组合规则</strong></td>
+<td><code>process.env</code> 读取 × 网络出站 = 凭据外传特征（critical）；编码载荷 × 动态执行（critical）；shell × 网络（critical）</td>
+</tr>
+</tbody></table>
+<h2>审计覆盖（v0.1 规则表）</h2>
+<ul>
+<li><strong>package.json</strong>：安装期 lifecycle 脚本（critical）、伪装插件、运行时依赖</li>
+<li><strong>JS/TS 源码</strong>：<code>child_process</code>、<code>eval</code>/<code>new Function</code>/<code>vm</code>、网络出站、<code>process.env</code>、文件写入、动态 require、homedir 探测</li>
+<li><strong>字符串字面量</strong>：敏感路径（<code>.ssh</code>/<code>.env</code>/云凭据/DSH credentials）、外部 URL、长编码载荷（混淆特征）</li>
+<li><strong>cordis.patch.yml</strong>：<code>!!js</code> 配置表达式（加载期宿主执行，critical）、<code>disabled: true</code> 静默禁用 sandbox/approval/guard 行（critical）、重配置安全行（high）、伪装安全行 id（high）</li>
+<li><strong>tarball 结构</strong>：路径穿越（critical）、软链接（high）、异常档案</li>
+</ul>
+<h2>局限（诚实地写）</h2>
+<ul>
+<li>词法扫描器不是完整 AST——针对<strong>蓄意构造</strong>的规避手法（如把代码藏进插值内的伪注释）可能漏报；它面向捕获真实世界的常见恶意模式，不承诺对抗性完备。规则表在 <code>src/rules.js</code>，欢迎补充。</li>
+<li><code>review</code>/<code>block</code> 是"值得人看一眼/建议拒绝"，最终决定权在人。</li>
+</ul>
+<h2>开发</h2>
+<pre><code>node --test test/*.test.js   # 27 个用例：扫描器/规则/解析器/tar/注册契约/端到端
+</code></pre>
+<p>MIT License.</p>

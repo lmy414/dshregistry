@@ -1,0 +1,175 @@
+<h1>dsh-approval-guardian</h1>
+<p>English | <a href="https://github.com/karuboniru/dsh-approval-guardian/blob/HEAD/README.zh.md">中文</a></p>
+<p><code>dsh-approval-guardian</code> is a DeepSeek Harness (DSH) profile bundle. It intercepts only the <strong>sandbox escalation approvals</strong> that would otherwise pop up and ask a human to allow or deny in the Web/ACP interface, and hands a bounded slice of session context, the tool arguments, and the escalation reason to a fresh one-shot approval-reviewer agent.</p>
+<p>Ordinary workspace operations never enter the automated approval flow. Even if an ordinary operation later fails because of a sandbox restriction, the plugin stays out of it as long as no real escalation approval was emitted.</p>
+<h2>Overview</h2>
+<ul>
+<li><strong>Problem it solves:</strong> DSH shows an interactive approval prompt whenever an agent needs to widen its sandbox. For automation and for reviewers that should run without a human in the loop, <code>dsh-approval-guardian</code> replaces that popup with a deterministic, tool-less reviewer that produces a structured <code>allow</code>/<code>deny</code>.</li>
+<li><strong>Who it is for:</strong> users and teams who want a lightweight, explainable approval policy in front of sandbox escalation, with a safe fallback when the reviewer cannot run. It is <strong>not</strong> a general approval-policy replacement: it claims only genuine sandbox widening requests and calls <code>next()</code> for everything else.</li>
+</ul>
+<p>Every tool execution takes exactly one of three paths:</p>
+<table>
+<thead>
+<tr>
+<th>Request</th>
+<th>Plugin behavior</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>Executable within the current sandbox mode</td>
+<td>Does not intervene at all</td>
+</tr>
+<tr>
+<td>An approval that is not emitted by this tool execution, or not a strict widening</td>
+<td>Calls the downstream answerer, preserving DSH's original behavior</td>
+</tr>
+<tr>
+<td>A strict sandbox escalation exactly correlated with this tool execution</td>
+<td>Starts a fresh tool-less reviewer and applies its <code>allow</code> or <code>deny</code> directly</td>
+</tr>
+</tbody></table>
+<p>After a review completes, the result is queued through <code>ToolRunContext.deferContext()</code> so it is injected after the matching <code>tool/result</code>. The reviewer's rationale is explicitly framed as untrusted data and can never inject instructions back into the parent agent.</p>
+<h2>Compatibility</h2>
+<ul>
+<li><strong>Runtime:</strong> Node.js <code>^22.19.0</code> or <code>&gt;=24.0.0</code>, and pnpm.</li>
+<li><strong>Peer packages:</strong> <code>@deepseek-ai/cordis ^4.0.1</code> and the DSH packages declared in <a href="https://github.com/karuboniru/dsh-approval-guardian/blob/HEAD/package.json"><code>package.json</code></a> at <code>^0.1.0-rc.5</code> (<code>dsh-agent</code>, <code>dsh-compaction</code>, <code>dsh-llm</code>, <code>dsh-sandbox</code>, <code>dsh-sandbox-policy</code>, <code>dsh-session</code>, <code>dsh-subagent</code>, <code>dsh-system-prompt</code>, <code>dsh-tools</code>, <code>dsh-user-approval</code>).</li>
+<li><strong>Verified against:</strong> DSH CLI <code>0.1.0-rc.6</code> with all peer packages resolved at <code>0.1.0-rc.6</code> (exact resolved snapshot hashes are pinned in <a href="https://github.com/karuboniru/dsh-approval-guardian/blob/HEAD/pnpm-lock.yaml"><code>pnpm-lock.yaml</code></a>). <code>0.1.0-rc.6</code> is confirmed working: the automatic approval-review flow — matching a strict sandbox escalation, spawning the tool-less reviewer, and applying its structured <code>allow</code>/<code>deny</code> — was observed end-to-end at runtime in a live session on <strong>2026-08-14</strong>.</li>
+<li>The bundle is auto-loaded through the <code>dsh.bundle.patch</code> entry in <code>package.json</code>, which points at <a href="https://github.com/karuboniru/dsh-approval-guardian/blob/HEAD/cordis.patch.yml"><code>cordis.patch.yml</code></a>.</li>
+</ul>
+<h2>Install / Uninstall</h2>
+<h3>Install</h3>
+<p>From this checkout, install dependencies, build, and register the bundle into a profile:</p>
+<pre><code>pnpm install
+pnpm run build
+dsh plugin --profile web add .
+</code></pre>
+<p>You can also pass a Git URL or a published package name:</p>
+<pre><code>dsh plugin --profile &lt;profile-name&gt; add dsh-approval-guardian@0.1.1
+</code></pre>
+<p>The bundle's <code>cordis.patch.yml</code> registers the plugin ahead of the interactive Web/ACP approval answerer; requests the plugin does not claim continue to the downstream answerers. The plugin is loaded because <code>package.json</code> declares <code>dsh.bundle.patch</code>, so installing the package and restarting the DSH surface is all that is required.</p>
+<p>Git installs execute the <code>prepare</code> script during install. On pnpm 10 and newer you may first need to allow the package to run build scripts in the target profile's <code>pnpm-workspace.yaml</code>.</p>
+<h3>Upgrade</h3>
+<p>Update the package in the profile and restart:</p>
+<pre><code>dsh plugin --profile &lt;profile-name&gt; add dsh-approval-guardian@&lt;new-version&gt;
+</code></pre>
+<h3>Disable</h3>
+<p>Keep the package installed but turn the plugin off by overriding its row in the profile's own <code>cordis.patch.yml</code> (or in <code>$DSH_HOME/cordis.patch.yml</code>, the machine-level layer that applies to every profile):</p>
+<pre><code>- id: approval-guardian
+  disabled: true
+</code></pre>
+<p>Then restart the DSH surface. This is the same <code>disabled</code> mechanism DSH uses for its own optional rows, so no files are removed.</p>
+<h3>Remove</h3>
+<p>Fully remove the plugin and its patch from a profile:</p>
+<pre><code>dsh plugin --profile &lt;profile-name&gt; remove dsh-approval-guardian
+</code></pre>
+<p>If you added a profile-level override under the <code>approval-guardian</code> id, remove that block from the profile's <code>cordis.patch.yml</code> as well, then restart. Requests fall back to the interactive Web/ACP answerer immediately after removal.</p>
+<h2>Quick start</h2>
+<p>The shipped <code>cordis.patch.yml</code> already applies conservative defaults, so a minimal setup is just the install step above. To customize the deployment policy, override the same <code>id</code> in the profile's own <code>cordis.patch.yml</code>:</p>
+<pre><code>- id: approval-guardian
+  name: dsh-approval-guardian
+  config:
+    prompt: |
+      - Deny writes below /company/protected unless the user explicitly names the target.
+      - Allow routine package installation required by the user's task.
+    provider: deepseek-official
+    model: deepseek-v4-flash
+    subagentProvider: spawn
+    failureMode: fail-closed
+    timeoutMs: 90000
+    maxOutputTokens: 1024
+</code></pre>
+<p><strong>Reproducible example:</strong> start the Web profile and ask the agent to perform a task that requires a wider sandbox mode (for example writing outside the current writable root, which triggers a <code>tools/execute</code> call carrying <code>sandbox_permissions</code> and a <code>justification</code>). Instead of a human popup, the guardian spawns a tool-less reviewer, applies its structured <code>allow</code> or <code>deny</code>, and injects a notice into the session under an <code>UNTRUSTED REVIEWER OUTPUT</code> marker. With the defaults above, <code>fail-closed</code> means a reviewer timeout or invalid output returns <code>unavailable</code> rather than opening a user dialog.</p>
+<h2>Configuration</h2>
+<table>
+<thead>
+<tr>
+<th>Field</th>
+<th>Default</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>prompt</code></td>
+<td>built-in generic policy</td>
+<td>Replaces the deployment security-policy section in the reviewer's fixed prompt. Role, evidence-trust rules, and the output contract cannot be overridden.</td>
+</tr>
+<tr>
+<td><code>provider</code></td>
+<td>inherited from the parent model route</td>
+<td>Reviewer model provider; must be configured together with <code>model</code>.</td>
+</tr>
+<tr>
+<td><code>model</code></td>
+<td>inherited from the parent model route</td>
+<td>Reviewer model id; must be configured together with <code>provider</code>.</td>
+</tr>
+<tr>
+<td><code>subagentProvider</code></td>
+<td><code>spawn</code></td>
+<td>One-shot subagent provider registered on <code>ctx.subagents</code>.</td>
+</tr>
+<tr>
+<td><code>failureMode</code></td>
+<td><code>fail-closed</code></td>
+<td>Behavior when the reviewer is unavailable or produces invalid output.</td>
+</tr>
+<tr>
+<td><code>timeoutMs</code></td>
+<td><code>90000</code></td>
+<td>Deadline for a single review, in milliseconds.</td>
+</tr>
+<tr>
+<td><code>maxOutputTokens</code></td>
+<td><code>1024</code></td>
+<td>Token cap for the reviewer's structured output.</td>
+</tr>
+</tbody></table>
+<p><code>failureMode</code> accepts:</p>
+<ul>
+<li><code>fail-closed</code> — reviewer timeout, unavailability, or invalid output returns <code>unavailable</code>; no user dialog is shown.</li>
+<li><code>fallback-to-user</code> — only a reviewer failure hands the request back to a downstream answerer such as Web/ACP.</li>
+</ul>
+<p>An explicit reviewer <code>deny</code> is a valid decision and never falls back to the user in either mode.</p>
+<p><strong>Pairing rule:</strong> <code>provider</code> and <code>model</code> must be supplied together or omitted together; supplying only one is a configuration error and the plugin refuses to start with that config. Omitting both inherits the parent model route.</p>
+<p><strong>Sensitive items:</strong> the <code>prompt</code> value may embed deployment-specific security policy — keep it out of public repositories if it contains internal rules. No credentials or secrets are configured here; model-provider credentials are managed by DSH's existing model routing, not by this plugin. There are no environment variables specific to this plugin.</p>
+<h2>Permissions &amp; data</h2>
+<ul>
+<li><strong>Files:</strong> the plugin reads the parent session transcript in memory via <code>session.deriveMessages()</code> and reads the sandbox policy for the current mode and workspace root. It does not read arbitrary files and does not write any files itself. The reviewer is spawned with <code>toolFilter: { allow: [] }</code>, so it has no tools and cannot read or write the filesystem.</li>
+<li><strong>Network:</strong> the only network activity is the reviewer's model-provider request over the normal DSH model route (the configured <code>provider</code>/<code>model</code> or the parent's route). The plugin opens no other connections.</li>
+<li><strong>Credentials:</strong> no credentials are read, stored, or forwarded by the plugin. Routine credential use by the parent is evaluated by the reviewer as part of its policy, but the plugin itself never touches secrets.</li>
+<li><strong>User data:</strong> a bounded, Codex-style subset of conversation history plus the exact planned-action JSON (tool, arguments, cwd, workspace root, current and requested sandbox modes, justification, approval reason) is sent to the configured reviewer model. Only entries labelled <code>TRUSTED HUMAN MESSAGE</code>, <code>TRUSTED INSTRUCTION</code>, or <code>TRUSTED QUESTION ANSWER</code> establish authorization; everything else is treated as untrusted evidence.</li>
+<li><strong>Prompt-context suppression:</strong> dynamic runtime contexts (for example "approval prompts are disabled" and "delegated scope cannot be widened") are removed only for the approval reviewer during <code>system-prompt/assemble</code>. Parent agents and unrelated subagents keep their contexts unchanged.</li>
+</ul>
+<h2>Troubleshooting</h2>
+<ul>
+<li><strong>My escalation was not reviewed at all.</strong> All of these must hold: the approval request is emitted inside the in-flight <code>tools/execute</code> dynamic scope; agent, call id, and tool name match exactly; the tool arguments include non-empty <code>sandbox_permissions</code> and <code>justification</code>; the reason text matches DSH's standard sandbox escalation text; and the requested mode is strictly wider than the session's current mode. Anything else calls <code>next()</code> and reaches the normal approval channel by design.</li>
+<li><strong>"provider and model must be configured together".</strong> The plugin refuses to start with only one of the pair. Configure both, or omit both to inherit the parent route.</li>
+<li><strong><code>fail-closed</code> returns <code>unavailable</code>.</strong> The reviewer timed out, was unavailable, or returned output that failed the structured schema. Raise <code>timeoutMs</code>, check <code>maxOutputTokens</code>, and verify the model route before considering <code>fallback-to-user</code>.</li>
+<li><strong>The reviewer always denies.</strong> Versions before 0.1.1 let the child-runtime "approval prompts are disabled" / "delegated scope cannot be widened" context leak into the review and bias it toward denial. 0.1.1+ removes those contexts for the reviewer only. Confirm the installed bundle version and that the <code>system-prompt/assemble</code> suppression is active.</li>
+<li><strong>Where to look.</strong> DSH keeps user data under <code>$DSH_HOME</code> (default <code>~/.dsh</code>); profile config lives at <code>$DSH_HOME/profiles/&lt;name&gt;</code> with <code>cordis.patch.yml</code> and <code>pnpm-workspace.yaml</code>. Inspect the composed tree with <code>dsh --profile &lt;name&gt; --dump-config</code> to confirm the <code>approval-guardian</code> row is present and not <code>disabled</code>. DSH writes no separate log file; diagnostics appear on the boot console/stderr.</li>
+<li><strong>Rollback.</strong> Disable with <code>- id: approval-guardian</code> + <code>disabled: true</code> in the profile's <code>cordis.patch.yml</code>, remove the plugin (<code>dsh plugin --profile &lt;name&gt; remove dsh-approval-guardian</code>), or reinstall a previous version (<code>dsh plugin --profile &lt;name&gt; add dsh-approval-guardian@0.1.0</code>). Revert any profile-level config override at the same time, then restart.</li>
+</ul>
+<h2>Development</h2>
+<pre><code>pnpm run typecheck
+pnpm test
+pnpm run build
+npm pack --dry-run
+</code></pre>
+<p>Source lives in <code>src/</code>, tests in <code>tests/</code>, and build output is <code>lib/index.js</code> plus <code>lib/types/</code>. Do not edit <code>lib/</code> by hand; regenerate it with <code>pnpm run build</code>.</p>
+<p>Key files:</p>
+<ul>
+<li><code>src/index.ts</code> — config, event wiring, strict widening matching, result injection, and lifecycle.</li>
+<li><code>src/reviewer.ts</code> — one-shot reviewer start, identity tracking, structured-result validation, and disposal.</li>
+<li><code>src/policy.ts</code> — fixed reviewer persona, default policy, and review-prompt construction.</li>
+<li><code>src/transcript.ts</code> — context selection, trust labels, budgets, and UTF-8-safe truncation.</li>
+<li><code>src/types.ts</code> — shared types.</li>
+<li><code>tests/plugin.spec.ts</code> — interception, configuration, failure, and prompt-assembly behavior.</li>
+<li><code>tests/transcript.spec.ts</code> — context selection, trust boundaries, and timing rules.</li>
+<li><code>tests/cordis.spec.ts</code> — real Cordis lifecycle composition.</li>
+</ul>
+<p>Behavioral changes must ship regression coverage (positive and negative tests for matching and trust changes) and must pass the validation commands above. See <a href="https://github.com/karuboniru/dsh-approval-guardian/blob/HEAD/AGENTS.md"><code>AGENTS.md</code></a> for the full maintenance contract.</p>
+<h2>License &amp; security</h2>
+<ul>
+<li><strong>License:</strong> MIT — see <a href="https://github.com/karuboniru/dsh-approval-guardian/blob/HEAD/LICENSE"><code>LICENSE</code></a>.</li>
+<li><strong>Reporting security issues:</strong> report privately rather than in a public issue. Use a private vulnerability report (for example a GitHub Security Advisory) on the repository, or contact the maintainer directly, and include the DSH version and the composed profile dump. Do not include credentials, session data, or private repository contents in any report or in the repository itself. Before publishing the repo publicly, confirm no secrets, personal information, or private-repo content are committed.</li>
+</ul>

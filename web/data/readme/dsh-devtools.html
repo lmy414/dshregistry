@@ -1,0 +1,155 @@
+<h1>dsh-devtools</h1>
+<p>Metadata-first runtime profiler for DeepSeek Harness agents.</p>
+<p>GitHub: <a href="https://github.com/izz-BLUE/dsh-devtools">https://github.com/izz-BLUE/dsh-devtools</a> · Issues: <a href="https://github.com/izz-BLUE/dsh-devtools/issues">https://github.com/izz-BLUE/dsh-devtools/issues</a></p>
+<p>一个社区（community）插件：把会话的持久化事件日志折叠成 <strong>Agent Runtime Profiler</strong>，
+在 Web GUI 的会话视图里以 DevTools 标签页展示每次模型调用（Step）与回合（Turn）的
+执行事实——模型归属、延迟、工具调用、重试与回合结局。只读、不拦截、不修改任何请求。</p>
+<blockquote>
+<p>本插件不是 DeepSeek 官方发布的插件；它基于官方 NPM SDK
+（<code>@deepseek-ai/*</code>）开发，通过 DSH 的 cordis patch + profile 机制挂载。</p>
+</blockquote>
+<h2>1. What it does</h2>
+<p>公开版 0.1 提供的能力（全部来自对持久化会话事件的只读折叠）：</p>
+<ul>
+<li><strong>Runtime Profiler</strong>：一眼看出 agent 做了什么、哪里最慢、哪里异常</li>
+<li><strong>Agent Turn / Step runtime trace</strong>：按回合与步骤还原 agent 执行时间线</li>
+<li><strong>Step runtime timeline</strong>：同一回合内的 model / tool 时长条按同一时间轴缩放；
+并行工具调用分 lane 表达并行，极短工具保留最小可见宽度（tooltip 显示真实值），
+运行中的活动带 running 状态，失败工具带 error 标记</li>
+<li><strong>Turn collapse / expand</strong>：进行中的 Turn 与最新 Turn 默认展开，较早 Turn 默认折叠；
+折叠摘要展示 Turn 号、状态、步骤数、工具数与耗时；2 秒轮询刷新不会重置手动折叠状态</li>
+<li><strong>Summary 三组</strong>：<ul>
+<li><strong>Execution</strong>：Turns / Steps（含 completed · running 计数）/ Tool Calls / Retries /
+Errors（step / turn / tool 三类错误独立统计）/ Interrupted / Aborted</li>
+<li><strong>Performance</strong>：Model Wall / Tool Wall / Avg First Activity / Wall Time / Decode / Throughput</li>
+<li><strong>Tokens</strong>：Input / Output / Cache Read / Reasoning / Cache Reuse</li>
+</ul>
+</li>
+<li><strong>model / provider attribution</strong>：每个 Step 标注调用当时的模型与提供商</li>
+<li><strong>TTFT / first-activity</strong>：由 <code>step/start</code> 到首个持久化 block-start 的时间戳派生
+（UI 简称 Avg First Activity，tooltip 说明与 TTFT 的关系，不冒充 Provider 官方上报值）</li>
+<li><strong>Model Wall / Tool Wall</strong>：<code>assistantAt - startAt</code> 的模型侧 Wall 时间；
+<code>tool/call -&gt; tool/result</code> 的工具 Wall 时间（tooltip 说明含调用与结果之间的全部等待）</li>
+<li><strong>tool errors</strong>：结构化失败码（如 <code>FS_NOT_FOUND</code>、<code>ABORTED</code>）标记在单个工具上</li>
+<li><strong>retry trace</strong>：<code>llm/retry</code> 事件出现时，按 Step 归属展示 retry/maxRetries/delay/code</li>
+<li><strong>provider-reported usage</strong>：input / output / cacheRead / reasoning tokens；
+cache reuse = <code>cacheRead / (input + cacheRead)</code>（内部派生指标，非 Provider 官方缓存命中率）</li>
+<li><strong>回合结局</strong>：<code>completed</code> / <code>aborted</code> / <code>interrupted</code> / <code>error</code> / <code>max-tokens</code> / <code>blocked</code>
+等 <code>turn/end.reason</code> 的正确映射；Turn 级结局与 Step 状态、工具错误分开统计</li>
+<li><strong>trace completeness</strong>：顶部状态指示显示 <code>Trace complete</code>（低调绿色圆点）；
+发生 ring 淘汰时升级为橙色 <code>Partial trace · N earlier steps omitted</code>，
+不把截断后的页面伪装成完整历史</li>
+<li><strong>live session 与 cold/history session</strong>：内存日志增量折叠；持久化会话从落盘日志重建</li>
+<li><strong>subagent metadata</strong>：subagent 会话的 label / mode / agentModel</li>
+<li><strong>hook trace</strong>：<code>hook/invoked|hook/result</code> 事件存在时展示执行耗时与错误标记；
+无 producer 时显示语义准确的空状态（不暗示"没有执行任何 Hook"）</li>
+</ul>
+<p>以下能力<strong>不属于公开版 0.1</strong>，本版本不实现：mutation provenance、request diff、
+prompt diff、context composition / context inspector、tool dispatch breakdown、
+plugin token attribution。</p>
+<h2>2. Architecture</h2>
+<pre><code>Durable Session Event Log
+        |
+        v
+     Pure Fold
+        |
+        v
+ Runtime Trace Snapshot
+        |
+        v
+ /dsh-devtools RPC
+        |
+        v
+ conversation.view / DevTools
+</code></pre>
+<ul>
+<li><strong>read-only</strong>：插件只消费已提交的会话事件，不注入、不拦截、不修改任何请求</li>
+<li><strong>zero behavior modification</strong>：不改变 agent 的输入、输出或执行路径</li>
+<li><strong>no request interception / no request mutation</strong></li>
+<li><strong>durable-events-first</strong>：live 会话直接折叠内存日志（增量、无克隆）；
+cold 会话经 <code>sessionQuery</code> 从持久化日志重建并缓存（日志不再增长）</li>
+</ul>
+<h2>3. Privacy / Security</h2>
+<p><strong>metadata-first by design</strong>：默认不读取、不保存、不通过 RPC 返回——</p>
+<ul>
+<li>prompt / system prompt 正文</li>
+<li>user message content</li>
+<li>assistant message content</li>
+<li>tool arguments</li>
+<li>tool result text</li>
+<li>API key / secret</li>
+</ul>
+<p>RPC wire 只携带运行时 metadata：类型、时间戳、ID、名称、状态、usage 计数等必要字段。</p>
+<p>有自动隐私测试（<code>tests/fold.spec.ts</code> 的 privacy 用例），并经过真实会话 E2E 的
+RPC + DOM privacy audit（对 wire JSON 与渲染页面全量扫描 prompt / tool args /
+tool result / API key 模式，无泄漏）。</p>
+<h2>4. UI</h2>
+<p>DevTools 通过 <code>conversation.view</code> slot 注册，位于标签页环的最右侧：</p>
+<pre><code>Chat | Trajectory | Context | DevTools
+</code></pre>
+<p>DevTools 拥有独立宽布局（不受聊天阅读宽度限制，自适应桌面/窄窗，小窗口自动单列），
+并在高细节背景皮肤上使用主题 token 的半透明遮罩 + blur 保证可读性。</p>
+<p><img src="https://raw.githubusercontent.com/izz-BLUE/dsh-devtools/HEAD/docs/overview.png" alt="DevTools overview"></p>
+<ul>
+<li><strong>Sticky runtime status bar</strong>：Turns / Steps / 当前 Turn·Step / Model Wall /
+Tool Wall / Avg First Activity / Throughput / Cache Reuse；窄屏自动隐藏次要指标</li>
+<li><strong>Summary 三组</strong>：Execution / Performance / Tokens（见 What it does）</li>
+<li><strong>逐 Turn 卡片</strong>：结局徽章 + 步骤数 + 工具数 + 耗时，可折叠/展开</li>
+<li><strong>Turn-level sticky timeline ruler</strong>：展开长 Turn 滚动时时间刻度保持可见，
+与每 Step 的全局时间网格严格对齐（自适应 nice interval + tick 标签）</li>
+<li><strong>逐 Step 行</strong>：状态、模型、TTFT / model / decode / wall、usage、
+runtime timeline 时长条、工具 chips、retry chips</li>
+<li><strong>hook 执行表</strong>：有事件时展示，无事件时显示语义空状态</li>
+</ul>
+<h2>5. Installation</h2>
+<h3>After npm publication (recommended)</h3>
+<p>一条命令安装（无需 clone 仓库、无需构建、无需手改 profile）：</p>
+<pre><code>dsh plugin --profile web add dsh-devtools
+</code></pre>
+<p>其他 profile：</p>
+<pre><code>dsh plugin --profile &lt;name&gt; add dsh-devtools
+</code></pre>
+<p>启动：</p>
+<pre><code>dsh web
+</code></pre>
+<h3>Local development / local installation</h3>
+<p>从本仓库以 <code>file:</code> 依赖安装（仅限开发调试）：</p>
+<pre><code># 1. 在仓库内构建
+pnpm install
+pnpm build
+
+# 2. 加入 web profile（file: 依赖）
+cd ~/.dsh/profiles/web
+pnpm add "dsh-devtools@file:&lt;本仓库绝对路径&gt;"
+# 并在 package.json 的 dsh.profile.bundles 追加 "dsh-devtools"
+
+# 3. 重启 dsh web
+</code></pre>
+<h2>6. Development</h2>
+<pre><code>pnpm install
+pnpm typecheck
+pnpm test
+pnpm build
+pnpm pack
+</code></pre>
+<h2>7. Known limitations</h2>
+<ul>
+<li><code>hook/invoked | hook/result</code>：当前验证环境没有 producer，真实 hook 数据路径
+未做 E2E；fold 对缺失与未配对事件做了防御性处理并有自动测试</li>
+<li>real-world LLM retry E2E 尚未覆盖（需要 API 层故障才能真实触发）；
+自动测试已覆盖 retry 归属与字段展示语义</li>
+<li><code>droppedSteps</code> ring truncation（默认保留最近 1000 个 Step）未做真实超长会话
+E2E；自动测试覆盖裁剪与上报语义，UI 以 partial-trace 横幅如实展示</li>
+<li>TTFT 定义为 <code>step/start -&gt; 首个持久化 block-start chunk</code> 的时间差
+（非 Provider 官方上报的 TTFT）</li>
+<li>Tool Wall 本质为 <code>tool/call -&gt; tool/result</code> 的 wall time，包含调用与结果之间
+的全部等待；不拆分 queue / dispatch / execution（属未来版本）</li>
+<li>cache reuse 为内部派生指标 <code>cacheRead / (input + cacheRead)</code>，
+不是 Provider 官方缓存命中率</li>
+<li>公开版 0.1 不做 request mutation provenance / tool dispatch breakdown（属未来版本）</li>
+</ul>
+<h2>8. Compatibility</h2>
+<p>Verified with DeepSeek Harness <code>v0.1.0-rc.6</code>（npm 版，web profile 挂载实测；
+真实会话 E2E 通过）。其他版本未验证。</p>
+<h2>License</h2>
+<p>BSD-3-Clause（见 <code>LICENSE</code>）。</p>

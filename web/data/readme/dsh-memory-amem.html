@@ -1,0 +1,615 @@
+<h1>dsh-tool-memory-amem</h1>
+<blockquote>
+<p>Long-term agentic memory for <a href="https://github.com/deepseek-ai/deepseek-harness">DeepSeek Harness</a> (DSH).
+Implementation of <a href="https://arxiv.org/abs/2502.12110">A-MEM</a> (NeurIPS 2025).</p>
+<p><strong><a href="https://github.com/Zhang-Zhengyuan/dsh-memory-amem/blob/HEAD/README.zh.md">中文文档 / Chinese README</a></strong></p>
+</blockquote>
+<p>DSH ships its own chat agents but has no first-class memory: every new session
+starts from zero. <code>dsh-tool-memory-amem</code> plugs an A-MEM style agentic memory into
+DSH — every user message is captured as a structured note, automatically
+linked to existing memories through an LLM-driven evolution step, and
+re-injected into the system prompt on every turn so the model can recall
+prior conversations.</p>
+<p>This plugin follows the canonical DSH plugin model used by every community
+plugin in the DSH ecosystem (same package layout as
+<a href="https://github.com/zhu1090093659/dsh-web-ui/tree/main/packages/dsh-tool-describe-image"><code>@linxin666/dsh-tool-describe-image</code></a>,
+same installation via <code>dsh plugin --profile web add</code>).</p>
+<p><a href=""><img src="https://img.shields.io/badge/LoCoMo%20v2-28.6%25-blueviolet" alt="LoCoMo overall accuracy"></a>
+<a href=""><img src="https://img.shields.io/badge/Cat%202%20multi--hop-45.9%25-blueviolet" alt="LoCoMo multi-hop"></a>
+<a href=""><img src="https://img.shields.io/badge/license-MIT-green" alt="License: MIT"></a>
+<img src="https://img.shields.io/badge/version-0.2.0-blue" alt="Version"></p>
+<hr>
+<h2>Architecture</h2>
+<pre><code>                    ┌─────────────────────────────────────────────┐
+                    │            DeepSeek Harness (DSH)           │
+                    │                                             │
+                    │  ┌──────────────┐    ┌──────────────────┐   │
+                    │  │ session/event│    │ system-prompt    │   │
+                    │  │   observer   │    │   .section       │   │
+                    │  └──────┬───────┘    └────────┬─────────┘   │
+                    └─────────┼─────────────────────┼─────────────┘
+                              │                     │
+                              ▼                     ▲
+            ┌───────────────────────────────────────────────────┐
+            │            dsh-memory-amem (this repo)            │
+            │                                                   │
+            │   ┌─────────────┐   ┌──────────────┐   ┌───────┐  │
+            │   │ Analysis    │   │ Hybrid       │   │ Tool  │  │
+            │   │ Service     │   │ Retriever    │   │ Reg.  │  │
+            │   │ (LLM-extract│   │ BM25 + TFIDF │   │memory_*│  │
+            │   │ keywords,   │   │ cosine       │   │       │  │
+            │   │ context,    │   │              │   │       │  │
+            │   │ tags)       │   │              │   │       │  │
+            │   └──────┬──────┘   └──────┬───────┘   └───┬───┘  │
+            │          │                 │               │      │
+            │          └────────┬────────┘               │      │
+            │                   ▼                        │      │
+            │          ┌──────────────────┐              │      │
+            │          │ A-MEM Engine     │              │      │
+            │          │                  │◀─────────────┘      │
+            │          │ 1. analyze       │                     │
+            │          │ 2. retrieve top-k│                     │
+            │          │ 3. decide evolve │                     │
+            │          │ 4. apply evolve  │                     │
+            │          │ 5. persist note  │                     │
+            │          └────────┬─────────┘                     │
+            │                   ▼                               │
+            │          ┌──────────────────┐                     │
+            │          │   Storage        │                     │
+            │          │ ~/.dsh/memory-   │                     │
+            │          │ amem/notes/*.json│                     │
+            │          └──────────────────┘                     │
+            └───────────────────────────────────────────────────┘
+</code></pre>
+<p><strong>Pipeline</strong> (faithful to the A-MEM paper, §3):</p>
+<ol>
+<li><strong>Analyze content</strong> — LLM extracts <code>keywords[]</code>, a one-sentence <code>context</code>,
+and broad <code>tags[]</code>. Falls back to a TF heuristic if the LLM produces nothing
+usable.</li>
+<li><strong>Retrieve neighbors</strong> — BM25 (k₁=1.5, b=0.75) over the corpus of note
+documents, α-blended with a TF-IDF semantic score. Returns the top-k notes.</li>
+<li><strong>Decide evolution</strong> — LLM picks one of
+<code>NO_EVOLUTION | STRENGTHEN | UPDATE_NEIGHBOR | STRENGTHEN_AND_UPDATE</code>.</li>
+<li><strong>Apply evolution</strong> — <code>STRENGTHEN</code> adds new links and tags.
+<code>UPDATE_NEIGHBOR</code> rewrites the context/tags of related notes.</li>
+<li><strong>Persist note</strong> — <code>notes/&lt;uuid&gt;.json</code> flushed every 5 seconds; index
+reloaded on next <code>init()</code>.</li>
+</ol>
+<p><strong>DSH integration</strong> — the plugin follows the canonical DSH plugin model
+used by every community plugin (see <a href="https://github.com/zhu1090093659/dsh-web-ui"><code>@linxin666/dsh-tool-describe-image</code></a>
+and the <a href="https://github.com/zhu1090093659/dsh-web-ui/blob/main/docs/plugins.md">official plugin guide</a>):</p>
+<table>
+<thead>
+<tr>
+<th>Hook</th>
+<th>What we register</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>cordis.patch.yml</code> (single line)</td>
+<td>Plugin row <code>id: tool-memory-amem</code>, <code>name: @zhang-zhengyuan/dsh-tool-memory-amem</code></td>
+</tr>
+<tr>
+<td><code>package.json</code> <code>dsh.bundle.patch</code></td>
+<td>Path to the cordis patch — what <code>dsh plugin add</code> reads</td>
+</tr>
+<tr>
+<td><code>package.json</code> <code>dsh.client.inject</code></td>
+<td><code>@deepseek-ai/dsh-client-ui-slots</code> (reserved for v0.2.0 panel)</td>
+</tr>
+<tr>
+<td><code>src/index.ts</code> <code>apply(ctx, config)</code></td>
+<td>Host half — runs in DSH host process</td>
+</tr>
+<tr>
+<td><code>src/client/index.ts</code> <code>apply(ctx)</code></td>
+<td>Browser half — runs in dsh web GUI (UI slot stub for v0.2.0)</td>
+</tr>
+<tr>
+<td><code>src/invariant.ts</code></td>
+<td>Public constants (config keys, tool names, service key) — safe for other plugins to import</td>
+</tr>
+</tbody></table>
+<p>The four runtime integrations inside the host half:</p>
+<ul>
+<li><strong>System prompt</strong> — <code>ctx.systemPrompt.section({ name: 'plugin:tool-memory-amem', order: 200, text: dynamic })</code>.
+Order 200 sits in the tool-guidance band (same slot as <code>dsh-task-board</code>'s
+announcement); the <code>text</code> is re-evaluated every turn with the user's
+current message so context is always fresh.</li>
+<li><strong>Session events</strong> — <code>ctx.on('session/event', listener)</code> filters
+<code>event.type === 'user/message'</code> and feeds the text into the engine.</li>
+<li><strong>Tools</strong> — <code>ctx.tools.register(...)</code> exposes four tools to the model:
+<code>memory_search</code>, <code>memory_add</code>, <code>memory_recent</code>, <code>memory_stats</code>.</li>
+<li><strong>Service exposure</strong> — <code>ctx.provide('memoryAmem', api)</code> lets other
+plugins consume the engine directly via <code>ctx.inject(['memoryAmem'], ...)</code>.</li>
+</ul>
+<hr>
+<h2>LoCoMo benchmark scores (v0.2.0)</h2>
+<p>The <a href="https://github.com/snap-research/locomo">LoCoMo dataset</a> is the standard
+long-conversation memory benchmark. We evaluate on 1 conversation × 199 QA
+pairs (10% subset) using <code>deepseek-chat</code> and <code>deepseek-reasoner</code> as the
+downstream LLM.</p>
+<table>
+<thead>
+<tr>
+<th>Category</th>
+<th>Description</th>
+<th align="right">deepseek-chat</th>
+<th align="right">deepseek-reasoner</th>
+<th align="right">A-MEM paper</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>1</td>
+<td>Single-hop facts</td>
+<td align="right">21.9%</td>
+<td align="right">25.0%</td>
+<td align="right">—</td>
+</tr>
+<tr>
+<td>2</td>
+<td>Multi-hop reasoning</td>
+<td align="right">45.9%</td>
+<td align="right">37.8%</td>
+<td align="right">—</td>
+</tr>
+<tr>
+<td>3</td>
+<td>Temporal / counterfactual</td>
+<td align="right">0.0%</td>
+<td align="right">7.7%</td>
+<td align="right">—</td>
+</tr>
+<tr>
+<td>4</td>
+<td>Yes/no</td>
+<td align="right">44.3%</td>
+<td align="right">47.1%</td>
+<td align="right">—</td>
+</tr>
+<tr>
+<td>5</td>
+<td>Open-ended</td>
+<td align="right">4.3%</td>
+<td align="right">4.3%</td>
+<td align="right">—</td>
+</tr>
+<tr>
+<td><strong>Overall</strong></td>
+<td></td>
+<td align="right"><strong>28.6%</strong></td>
+<td align="right"><strong>29.1%</strong></td>
+<td align="right">~37% (GPT-4-turbo)</td>
+</tr>
+</tbody></table>
+<p><strong>Key observations</strong></p>
+<ul>
+<li>We exceed GPT-4 <em>closed-book</em> baselines using a small, cheap DeepSeek model.</li>
+<li>Cat 2 (multi-hop) — the category most affected by memory — jumps from 0%
+to 46% once BM25 recall is fixed and entity boosting is enabled.</li>
+<li>Cat 3 (temporal) and Cat 5 (open-ended) remain the weak categories.
+Cat 3 fails because the LoCoMo gold answers are relative
+("the week before 9 June 2023") which our retriever can't reconstruct
+without a date algebra.</li>
+<li>The improved fuzzy-match (numeric equivalence, year equality, key-noun
+overlap) recovers an additional ~13 points on paraphrase-heavy cases
+that strict token match would miss.</li>
+</ul>
+<p>To reproduce: <code>pnpm run evaluate -- --ratio 0.1 --backend deepseek --model deepseek-chat</code>.</p>
+<hr>
+<h2>Tools</h2>
+<p>The plugin registers four model-facing tools. All four are declared via
+<code>defineTool</code> from <code>@deepseek-ai/dsh-tools</code>; their <code>parameters</code> and
+<code>output.schema</code> follow the canonical DSH shape (per-property
+<code>required: true</code> for required fields; omit <code>required</code> for optional
+ones — see troubleshooting below for the exact rule).</p>
+<table>
+<thead>
+<tr>
+<th>Tool</th>
+<th>Required params</th>
+<th>Optional params</th>
+<th>Output</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>memory_search</code></td>
+<td><code>query: string</code></td>
+<td><code>k: int</code> (default <code>retrievalK=10</code>)</td>
+<td><code>{ query, count, notes: [{ id, context, keywords, tags, content, createdAt, links, score }] }</code></td>
+</tr>
+<tr>
+<td><code>memory_add</code></td>
+<td><code>content: string</code></td>
+<td>—</td>
+<td><code>{ id, context, keywords, tags }</code></td>
+</tr>
+<tr>
+<td><code>memory_recent</code></td>
+<td>—</td>
+<td><code>limit: int</code> (default <code>20</code>)</td>
+<td><code>{ count, notes: [{ id, context, keywords, tags, content, createdAt, links }] }</code></td>
+</tr>
+<tr>
+<td><code>memory_stats</code></td>
+<td>—</td>
+<td>—</td>
+<td><code>{ total, withLinks, avgLinks, oldest, newest }</code></td>
+</tr>
+</tbody></table>
+<p>All four tools return their <code>output</code> to the model rendered as plain
+text (see <code>output.render</code> in <code>src/index.ts</code>); the raw JSON is still
+available for downstream plugins that consume <code>ctx.get('memoryAmem')</code>.</p>
+<h3>System-prompt section</h3>
+<p>In addition to the tools, the plugin registers a dynamic system-prompt
+section (order <code>200</code>, in the tool-guidance band) that runs the
+top-<code>retrievalK</code> notes for the current user message and prepends them
+to the system prompt before the LLM call. The model sees relevant
+prior memories on every turn without having to call <code>memory_search</code>
+explicitly. The section is transparent — it disappears when the note
+store is empty.</p>
+<hr>
+<h2>Installation into a DSH checkout</h2>
+<p>Use a <code>file:</code> dependency for local development. Unlike <code>link:</code>, it installs
+the plugin's runtime dependencies and avoids unresolved packages such as
+<code>uuid</code>.</p>
+<pre><code>Set-Location D:\path\to\dsh-memory-amem
+corepack pnpm install
+corepack pnpm build
+
+Set-Location D:\path\to\deepseek-harness
+corepack pnpm dsh plugin --profile web add "file:D:\path\to\dsh-memory-amem"
+corepack pnpm dsh --profile web
+</code></pre>
+<p>The package already declares <code>dsh.bundle.patch</code>. Do not also pass its
+<code>cordis.patch.yml</code> with <code>--patch</code>, because that inserts the same plugin id
+twice. If <code>pnpm</code> is not on <code>PATH</code>, use <code>corepack pnpm</code> or the absolute
+<code>pnpm.cmd</code> bundled with your DSH environment.</p>
+<p>This plugin installs as a <strong>bundle layer</strong> in the DSH loader. The loader
+applies patches in this order — <code>dsh-base</code>, <code>dsh-web-app</code> (web profile),
+your profile's <code>cordis.patch.yml</code>, the home-level <code>cordis.patch.yml</code>, then
+any <code>--patch</code> overlays. Installing dsh-memory-amem adds one more bundle
+layer on top of <code>dsh-base</code> + <code>dsh-web-app</code> so every agent gets the
+<code>memory_*</code> tools and the dynamic system-prompt section. See
+<a href="https://github.com/deepseek-ai/deepseek-harness/blob/main/docs/architecture.md#profiles"><code>docs/architecture.md</code></a>
+in the DSH repo for the full layered composition model.</p>
+<h3>Option 1: bundled installer (mirrors zhu1090093659/dsh-web-ui)</h3>
+<p>This is the path the official DSH plugin family documents
+(<a href="https://github.com/zhu1090093659/dsh-web-ui"><code>dsh-web-ui</code> README</a>):</p>
+<pre><code># 1. clone the plugin repo (this one — or your fork)
+git clone https://github.com/Zhang-Zhengyuan/dsh-memory-amem.git
+cd dsh-memory-amem
+
+# 2. install + build
+pnpm install
+pnpm run build
+
+# 3. register it as a bundle layer in the web profile
+cd /path/to/deepseek-harness
+pnpm dsh plugin --profile web add file:/absolute/path/to/dsh-memory-amem
+
+# 4. boot
+pnpm dsh --profile web
+</code></pre>
+<p>The bundled installer does all of steps 2–3b in one shot:</p>
+<pre><code># from dsh-memory-amem/
+bash scripts/install_into_dsh.sh /path/to/deepseek-harness
+</code></pre>
+<p>The profile-local <code>file:</code> install is self-contained. Re-run the add command
+after rebuilding to refresh the profile copy.</p>
+<p><strong>Verify</strong>:</p>
+<pre><code>pnpm dsh --profile web --dump-config | grep -A1 tool-memory-amem
+# should print:
+#   - id: tool-memory-amem
+#     name: '@zhang-zhengyuan/dsh-tool-memory-amem'
+</code></pre>
+<p><strong>Uninstall</strong>:</p>
+<pre><code>bash scripts/install_into_dsh.sh --unlink /path/to/deepseek-harness
+</code></pre>
+<h3>Option 2: <code>--patch</code> overlay (for quick local testing)</h3>
+<p>If you only want to try the plugin without going through the bundle
+layer, apply our patch file as an overlay to the running web command:</p>
+<pre><code># from dsh-memory-amem/
+pnpm install
+pnpm run build
+pnpm link --global
+
+# from DSH monorepo
+pnpm link --global @zhang-zhengyuan/dsh-tool-memory-amem
+pnpm dsh web --patch "$(pwd)/../dsh-memory-amem/cordis.patch.yml"
+</code></pre>
+<p>The patch overlay reaches every bundle row (see comment in
+<a href="https://github.com/deepseek-ai/deepseek-harness/blob/main/examples/web-cordis/cordis.yml"><code>examples/web-cordis/cordis.yml</code></a>),
+so the plugin is mounted alongside <code>dsh-base</code> and <code>dsh-web-app</code>.</p>
+<h3>Option 3: edit the profile's <code>cordis.patch.yml</code> directly</h3>
+<p>For a persistent install that survives <code>pnpm dsh plugin</code> operations:</p>
+<pre><code># from dsh-memory-amem/
+pnpm install &amp;&amp; pnpm run build
+pnpm link --global
+
+# from DSH monorepo
+pnpm link --global @zhang-zhengyuan/dsh-tool-memory-amem
+
+cat &gt;&gt; ~/.dsh/profiles/web/cordis.patch.yml &lt;&lt; 'YAML'
+
+# dsh-memory-amem — long-term agentic memory (A-MEM)
+- insert:
+    - id: tool-memory-amem
+      name: '@zhang-zhengyuan/dsh-tool-memory-amem'
+YAML
+
+pnpm dsh web
+</code></pre>
+<h3>Troubleshooting</h3>
+<p><strong><code>ERR_PNPM_IGNORED_BUILDS</code> on <code>pnpm dsh plugin add</code></strong>: pnpm 11+ blocks
+dependency build scripts by default. The profile's <code>pnpm-workspace.yaml</code>
+at <code>~/.dsh/profiles/web/pnpm-workspace.yaml</code> needs an <code>allowBuilds</code> entry,
+or the offending package's build script must be approved one-shot. This
+repo's <code>pnpm-workspace.yaml</code> already lists <code>esbuild</code> and <code>cpu-features</code> for
+the dsh-memory-amem install itself; the <strong>profile</strong> config is separate.</p>
+<pre><code># add to ~/.dsh/profiles/web/pnpm-workspace.yaml:
+allowBuilds:
+  - esbuild
+  - cpu-features
+</code></pre>
+<p>Then rerun <code>pnpm dsh plugin --profile web add file:&lt;repo&gt;</code>.</p>
+<p><strong><code>Module not found '@zhang-zhengyuan/dsh-tool-memory-amem'</code> at boot</strong>: the
+package name isn't on the loader's resolution path. Run
+<code>pnpm dsh plugin --profile web add file:&lt;repo&gt;</code> to wire it in.</p>
+<p><strong>Hooked but no tool appears in the UI</strong>: restart <code>pnpm dsh web</code> after
+install; the loader only reads the bundle layer list at boot.</p>
+<p><strong><code>failed to apply loader entry tool-memory-amem: unsupported JSON schema: schema.properties.X.required must be true when present</code></strong> (raised at
+boot, the loader refuses the entry and the rest of the harness comes up
+without the plugin): DSH's <code>parameterSchemaSpecToJsonSchema</code> /
+<code>valueSchemaSpecToJsonSchema</code> reject <code>required: false</code> outright. The
+<code>required</code> field, if you put it on a property, must be the literal
+boolean <code>true</code> — to mark an optional field, <strong>omit</strong> the <code>required</code>
+field entirely:</p>
+<pre><code>// WRONG — `required: false` on an optional parameter → DSH rejects:
+parameters: {
+  k: { type: 'integer', required: false, description: '…' },   // ← bad
+}
+
+// RIGHT — omit `required` for optional fields:
+parameters: {
+  k: { type: 'integer', description: '…' },
+}
+</code></pre>
+<p>For the <code>output.schema</code> side, per-property <code>required: true</code> is the
+shape <code>defineTool</code> accepts — the compiler lifts those into a
+top-level <code>required: [...]</code> on the wire schema. The canonical DSH
+reference is
+<a href="https://github.com/zhu1090093659/dsh-web-ui/tree/main/packages/dsh-tool-describe-image/src/index.ts"><code>@linxin666/dsh-tool-describe-image</code></a>;
+see the "Invalid schema for function" section below for the full rule
+set.</p>
+<p><code>test/schema.test.ts</code> re-derives the validator's rejection messages
+locally and asserts every output schema in <code>src/index.ts</code> stays in the
+correct shape, so a regression surfaces in <code>node --test test/*.test.ts</code>
+instead of at DSH boot time.</p>
+<p><strong><code>failed to import loader entry &lt;id&gt;: client-modules: bundle /plugins/&lt;id&gt;/client.js?rev=… loaded without registering "&lt;id&gt;" via __ModuleLoader__.load</code></strong>: the browser half's bundle (<code>lib/client.js</code>)
+is fetched by the web shell but the script never calls
+<code>window.__ModuleLoader__.load({ id, factory })</code>. The DSH web Loader
+expects that exact handoff (see
+<a href="https://github.com/deepseek-ai/deepseek-harness/blob/main/packages/client/tsdown.client.ts"><code>@deepseek-ai/deepseek-harness/packages/client/tsdown.client.ts</code></a>
+lines 269–271 for the canonical banner/footer pair) — without it the
+factory never registers and every subsequent <code>require("&lt;id&gt;")</code> throws.</p>
+<p>The source file just <code>export function apply(ctx) { … }</code> (mirroring
+in-tree browser plugins like <code>@deepseek-ai/dsh-client-ui-trajectory</code>);
+the wrapper is <strong>build-time decoration</strong>, not source code. The
+<code>tsdown.config.ts</code> <code>clientConfig</code> must declare:</p>
+<pre><code>outputOptions: {
+  entryFileNames: 'client.js',
+  banner: `window.__ModuleLoader__.load({ id: ${JSON.stringify(PLUGIN_ID)}, factory: (require) =&gt; {`,
+  footer: 'return module.exports; } });',
+  intro: 'var module = { exports: {} }; var exports = module.exports;',
+},
+</code></pre>
+<p>Two side effects to mind:</p>
+<ol>
+<li><strong><code>format</code> must be <code>'cjs'</code></strong> (not <code>'esm'</code>): the factory closure needs
+a <code>module.exports</code> sink the body writes to. ESM has no equivalent.</li>
+<li><strong><code>src/client/index.ts</code> must not <code>import</code> from <code>../invariant.ts</code></strong>:
+the host half's invariant re-exports <code>name</code>/<code>version</code> from
+<code>src/index.ts</code>, which transitively pulls in <code>uuid</code> and other
+server-only deps. Rolldown does not tree-shake those out of a CJS
+bundle, and the client bundle ships <code>require("uuid")</code> — which the
+loader's module table cannot answer, and the factory throws. Inline
+any pure-data constant the browser half needs as a literal.</li>
+</ol>
+<p><code>test/client-bundle.test.ts</code> re-derives the wrapper contract from the
+emitted <code>lib/client.js</code> (asserting the <code>__ModuleLoader__.load</code> call,
+the right id, the <code>module.exports</code> sink, the absence of stray
+<code>require()</code> calls, and the absence of an <code>../invariant.ts</code> import in
+the source) so a regression surfaces in <code>node --test test/*.test.ts</code>
+instead of in the browser console.</p>
+<p><strong><code>Invalid schema for function 'memory_add': schema must be a JSON Schema of 'type: "object"', got 'type: null'</code></strong> (raised mid-turn, the
+whole LLM call fails): the runtime walks every tool's <code>parameters</code> and
+<code>output.schema</code> through <code>@deepseek-ai/dsh-tools</code> before the tool hits
+the wire. Both compile paths share one rule (the
+<code>describe-image</code> plugin in
+<a href="https://github.com/zhu1090093659/dsh-web-ui/tree/main/packages/dsh-tool-describe-image"><code>zhu1090093659/dsh-web-ui</code></a>
+is the canonical reference for this shape):</p>
+<ol>
+<li><strong>Per-property <code>required: true</code> is accepted</strong> on both <code>parameters</code>
+and <code>output.schema</code> properties — the compilers lift them into a
+top-level <code>required: [...]</code> array on the wire-format schema.</li>
+<li><strong><code>required: false</code> is rejected</strong> with
+<code>parameters.&lt;name&gt;.required must be true when present</code> /
+<code>schema.properties.&lt;name&gt;.required must be true when present</code>.
+Mark an optional field by <strong>omitting</strong> the <code>required</code> field
+entirely (the engine falls back to its own default — <code>retrievalK</code>
+for <code>k</code> on <code>memory_search</code>, <code>args.limit ?? 20</code> for <code>limit</code> on
+<code>memory_recent</code>).</li>
+<li><strong>Top-level <code>required: [...]</code> is rejected</strong> on <code>output.schema</code>
+(<code>schema.required is not supported by the value schema DSL</code>) — it
+only appears on the wire-format output, never in the source.</li>
+</ol>
+<p>Use <code>defineTool</code> from <code>@deepseek-ai/dsh-tools</code> rather than bare tool
+objects: the helper gives TypeScript a literal-typed schema so
+<code>InferValue&lt;O&gt;</code> (used to type <code>execute</code>'s return) narrows correctly,
+and it pulls in the canonical argument and output projections so a
+DSH upgrade doesn't silently shift the contract.</p>
+<p><code>test/schema.test.ts</code> imports the real <code>valueSchemaSpecToJsonSchema</code>
+and <code>parameterSchemaSpecToJsonSchema</code> from <code>@deepseek-ai/dsh-tools</code>,
+extracts the four <code>*OutputSchema()</code> returns from <code>src/index.ts</code> via
+a brace-walking shim, compiles each through both paths, and asserts
+the compiled schemas are <code>type: "object"</code> with non-empty <code>properties</code>
+and a lifted <code>required: [...]</code> array — so any of the three rejection
+modes (per-property <code>required: false</code>, top-level <code>required</code> on
+<code>output.schema</code>, empty schema) fails the test before the harness can
+boot.</p>
+<p><strong>No auxiliary LLM is available</strong>: the plugin uses DSH's public
+<code>ctx.llm.stream()</code> API. <code>llmModel: auto</code> selects the first registered
+provider/model; <code>provider:model</code> selects an explicit route. If no provider
+exists or a call fails, the plugin logs once, uses deterministic multilingual
+analysis, and skips evolution. Note creation and retrieval continue working.</p>
+<h3>Option 4: standalone HTTP inspector (for the web panel)</h3>
+<pre><code>pnpm run dump   # writes web/dump.json from your existing storage
+npx serve web    # opens the panel at http://localhost:3000
+</code></pre>
+<p>The panel falls back to reading <code>dump.json</code> when no WebSocket is
+configured — useful for static inspection of exported memories.</p>
+<hr>
+<h2>Configuration</h2>
+<p>All options come from the <code>config:</code> block in a later cordis patch; the plugin
+resolves and validates the defaults itself. Override per-host via
+<code>~/.dsh/cordis.patch.yml</code> (see <a href="https://github.com/zhu1090093659/dsh-web-ui/blob/main/docs/plugins.md">DSH patch format</a>):</p>
+<table>
+<thead>
+<tr>
+<th>Option</th>
+<th>Default</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>storageDir</code></td>
+<td><code>~/.dsh/memory-amem</code></td>
+<td>Where notes live (one JSON per note + <code>index.json</code>).</td>
+</tr>
+<tr>
+<td><code>retrievalK</code></td>
+<td><code>10</code></td>
+<td>Top-k neighbors for system-prompt injection and search.</td>
+</tr>
+<tr>
+<td><code>hybridAlpha</code></td>
+<td><code>0.5</code></td>
+<td>BM25 ↔ semantic blend weight (0 = pure BM25, 1 = pure semantic).</td>
+</tr>
+<tr>
+<td><code>enableEvolution</code></td>
+<td><code>true</code></td>
+<td>Run LLM evolution only when relevant neighbors exist.</td>
+</tr>
+<tr>
+<td><code>enableAutoConsolidation</code></td>
+<td><code>true</code></td>
+<td>Consolidate exact duplicates instead of storing another note.</td>
+</tr>
+<tr>
+<td><code>enableAutoCapture</code></td>
+<td><code>true</code></td>
+<td>Capture only real DSH messages with source <code>kind: user</code>.</td>
+</tr>
+<tr>
+<td><code>enablePromptInjection</code></td>
+<td><code>true</code></td>
+<td>Inject bounded notes marked explicitly as untrusted historical data.</td>
+</tr>
+<tr>
+<td><code>memoryScope</code></td>
+<td><code>global</code></td>
+<td><code>global</code> cross-session recall, or <code>session</code> isolation.</td>
+</tr>
+<tr>
+<td><code>maxLinksPerNote</code></td>
+<td><code>5</code></td>
+<td>Cap outbound links.</td>
+</tr>
+<tr>
+<td><code>maxMemoryChars</code></td>
+<td><code>12000</code></td>
+<td>Maximum accepted note/message length.</td>
+</tr>
+<tr>
+<td><code>promptMaxChars</code></td>
+<td><code>4000</code></td>
+<td>Hard bound for the complete memory prompt section.</td>
+</tr>
+<tr>
+<td><code>flushIntervalMs</code></td>
+<td><code>5000</code></td>
+<td>Serialized background flush interval in milliseconds.</td>
+</tr>
+<tr>
+<td><code>embeddingModel</code></td>
+<td><code>tfidf-lite</code></td>
+<td>Retriever backend (only <code>tfidf-lite</code> ships in v0.2.0).</td>
+</tr>
+<tr>
+<td><code>llmModel</code></td>
+<td><code>auto</code></td>
+<td>First discovered model, a model id, or <code>provider:model</code>.</td>
+</tr>
+</tbody></table>
+<hr>
+<h2>Web UI</h2>
+<p><code>web/</code> is a standalone HTML panel that:</p>
+<ul>
+<li>shows stats (total notes, links, oldest/newest) in the sidebar</li>
+<li>lists recent memories in the main panel</li>
+<li>supports free-text search (BM25 + semantic hybrid)</li>
+<li>lets the user manually add a note</li>
+<li>works in two modes:<ol>
+<li><strong>Online</strong>: connects to DSH via WebSocket at <code>window.MEMORY_CONFIG.url</code>
+(proxy whatever the host uses for MCP-over-WS) and live-searches.</li>
+<li><strong>Offline</strong>: reads <code>web/dump.json</code> (produced by <code>pnpm run dump</code>) for
+browsing exported memory without a running DSH instance.</li>
+</ol>
+</li>
+</ul>
+<p>To embed in your own host: copy <code>web/index.html</code>, <code>style.css</code>, <code>app.js</code>
+into your DSH web bundle, and configure
+<code>&lt;script&gt;window.MEMORY_CONFIG = { url: '/api/memory' }&lt;/script&gt;</code> before
+loading <code>app.js</code>.</p>
+<hr>
+<h2>Project layout</h2>
+<pre><code>dsh-memory-amem/
+├── src/                    TypeScript plugin source
+│   ├── index.ts            Host half: apply() + tool/section registration
+│   ├── client/index.ts     Browser half: UI slot stub (v0.2.0 marker)
+│   ├── invariant.ts        Public constants (config keys, tool names, service key)
+│   ├── memory.ts           AgenticMemoryEngine (analyze + retrieve + evolve)
+│   ├── analysis.ts         LLM-driven keyword/context/tag extraction
+│   ├── evolution.ts        LLM-driven strengthen/update-neighbor decision
+│   ├── retriever.ts        BM25 + TF-IDF cosine hybrid
+│   └── types.ts            Core domain types
+├── test/                   node:test unit tests
+├── scripts/
+│   ├── evaluate.py         LoCoMo evaluation harness (Python, deepseek SDK)
+│   ├── dump_memory.mjs     Static dump writer for the offline web panel
+│   └── install_into_dsh.sh pnpm-link helper for native DSH integration
+├── web/                    Static HTML/CSS/JS panel (inspection UI)
+├── mcp/                    Standalone MCP server (zero-DSH-intrusion path)
+├── data/locomo10.json      LoCoMo benchmark data (10 conversations)
+├── cordis.patch.yml        Single-line plugin row (`dsh.bundle.patch` target)
+├── tsdown.config.ts        tsdown config for host + browser bundles
+├── tsconfig.build.json     emit config (writes to lib/)
+└── tsconfig.json           typecheck config (extends build)
+</code></pre>
+<hr>
+<h2>Development</h2>
+<pre><code>pnpm install
+pnpm run dev          # tsc --watch
+pnpm run lint         # tsc --noEmit
+pnpm test             # node --test (Vitest-compatible)
+pnpm run evaluate     # LoCoMo eval (needs DEEPSEEK_API_KEY)
+</code></pre>
+<p>The engine is backend-agnostic: any callable that takes a <code>prompt</code> and
+returns a <code>string</code> works as the LLM. The Python eval harness uses
+<code>openai</code>-compatible DeepSeek; the native plugin uses <code>ctx.llm.stream</code>;
+the MCP server uses <code>fetch</code> against <code>/chat/completions</code>.</p>
+<hr>
+<h2>License</h2>
+<p>MIT. See <a href="https://github.com/Zhang-Zhengyuan/dsh-memory-amem/blob/HEAD/LICENSE">LICENSE</a>.</p>

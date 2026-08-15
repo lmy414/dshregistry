@@ -1,0 +1,125 @@
+<h1>dsh-mcp-manager</h1>
+<p>MCP 服务器管理器：给 <a href="https://github.com/deepseek-ai/deepseek-harness">DeepSeek Harness</a>（DSH）加一个「设置 → MCP 服务器」页面，在界面上配置 MCP（Model Context Protocol）服务器，<strong>保存即生效</strong>——宿主侧自动挂载/卸载 <code>@deepseek-ai/dsh-mcp-client</code> 实例，我（模型）随即拿到或失去 <code>mcp__&lt;名称&gt;__&lt;工具名&gt;</code> 形式的工具。</p>
+<p>无需再手写 <code>cordis.patch.yml</code> 里的 MCP 行，也无需重启进程。</p>
+<h2>功能</h2>
+<ul>
+<li>设置页管理：列出 / 新增 / 编辑 / 删除 MCP 服务器，带挂载状态</li>
+<li>每台服务器可单独开启/关闭（<code>enabled</code> 开关）：关闭立即停止实例并移除工具，开启重新挂载并注册工具，状态持久化</li>
+<li>两种传输：<code>stdio</code>（本地命令）与 <code>streamable-http</code>（远程 URL）</li>
+<li>配置持久化在 <code>settings.yaml</code> 的 <code>mcp</code> 命名空间（<code>mcp.servers</code>），改动热生效</li>
+<li>宿主侧按配置动态挂载 <code>@deepseek-ai/dsh-mcp-client</code> 实例（断线自动重连、工具自动注册/注销由它负责）</li>
+<li>headless profile 也能用：没有 <code>webServer</code> 服务时跳过 HTTP 接口，只做实例管理</li>
+</ul>
+<h2>安装</h2>
+<blockquote>
+<p>前置：已安装 <code>dsh</code> CLI（以及 pnpm；<code>dsh plugin</code> 命令转发给 pnpm）。</p>
+</blockquote>
+<pre><code># 从 npm 安装（发布后）
+dsh plugin --profile web add @fishlikewater/dsh-mcp-manager
+
+# 或从本地 checkout 安装
+dsh plugin --profile web add ./path/to/dsh-mcp-manager
+</code></pre>
+<p><code>dsh plugin add</code> 会把包安装进 profile 的依赖，并因为本包声明了 <code>dsh.bundle</code>，自动把 <code>@fishlikewater/dsh-mcp-manager</code> 追加到该 profile 的 <code>dsh.profile.bundles</code>（即应用本包的 <code>cordis.patch.yml</code> 层）。验证组合树：</p>
+<pre><code>dsh --profile web --dump-config   # 应能看到 mcp-manager 行
+</code></pre>
+<p><strong>重启 dsh 进程后生效</strong>（bundle 层在启动时组合；插件代码改动也需要重启，见下文「开发」）。重启后刷新浏览器页面，打开 设置 → MCP 服务器 即可。</p>
+<p>卸载：<code>dsh plugin --profile web remove @fishlikewater/dsh-mcp-manager</code>（同时移除依赖与 bundle 层）。</p>
+<h2>使用</h2>
+<p>设置页各字段：</p>
+<table>
+<thead>
+<tr>
+<th>字段</th>
+<th>传输</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>名称（serverName）</td>
+<td>两者</td>
+<td><code>[A-Za-z0-9_-]{1,32}</code>，全局唯一，决定工具名前缀 <code>mcp__&lt;名称&gt;__…</code></td>
+</tr>
+<tr>
+<td>传输方式</td>
+<td>两者</td>
+<td><code>stdio</code> / <code>streamable-http</code></td>
+</tr>
+<tr>
+<td>命令（command）</td>
+<td>stdio</td>
+<td>可执行文件（支持绝对路径）或 <code>npx</code> 之类命令</td>
+</tr>
+<tr>
+<td>参数（args）</td>
+<td>stdio</td>
+<td>每行一个</td>
+</tr>
+<tr>
+<td>环境变量（env）</td>
+<td>stdio</td>
+<td>每行 <code>KEY=VALUE</code></td>
+</tr>
+<tr>
+<td>工作目录（cwd）</td>
+<td>stdio</td>
+<td>可选</td>
+</tr>
+<tr>
+<td>URL</td>
+<td>http</td>
+<td>如 <code>http://localhost:3000/mcp</code></td>
+</tr>
+<tr>
+<td>请求头（headers）</td>
+<td>http</td>
+<td>每行 <code>KEY: VALUE</code></td>
+</tr>
+</tbody></table>
+<p>保存后立即生效；删除后对应工具立即移除。</p>
+<p>每张服务器卡片上的「关闭 / 开启」按钮会立即停止 / 启动对应实例：关闭后工具马上移除、不再重连；开启后重新挂载并注册工具。开关状态（<code>enabled</code>，默认 <code>true</code>）随配置一起持久化在 settings.yaml，重启 dsh 后保持；只影响被切换的那一台，其余服务器不受影响。</p>
+<h3>示例</h3>
+<p><code>examples/mcp-servers.example.yaml</code> 给出了 settings.yaml 中 <code>mcp</code> 命名空间的示例（stdio 与 streamable-http 各一）。可以直接把它合并进 <code>$DSH_HOME/settings.yaml</code> 作为初始配置，再从设置页调整。</p>
+<h2>HTTP 接口（供设置页使用）</h2>
+<table>
+<thead>
+<tr>
+<th>方法</th>
+<th>路径</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>GET</td>
+<td><code>/api/mcp/servers</code></td>
+<td>返回 <code>{ servers, status }</code>，status 是 <code>serverName -&gt; { state: 'ok'|'error'|'disabled', message }</code></td>
+</tr>
+<tr>
+<td>POST</td>
+<td><code>/api/mcp/servers</code></td>
+<td>请求体 <code>{ servers: [...] }</code>，整体替换并触发重挂载；校验失败返回 400 <code>{ error }</code></td>
+</tr>
+</tbody></table>
+<h2>开发</h2>
+<p>结构：</p>
+<pre><code>├── package.json       # dsh.bundle.patch + dsh.client 双 manifest
+├── cordis.patch.yml   # bundle 层：插入 mcp-manager 行
+├── index.js           # 宿主侧：settings 注册 + 实例挂载 + HTTP 接口
+├── client.js          # 客户端 bundle（手写 CJS factory，经 ./client 导出）
+└── examples/
+</code></pre>
+<p>注意：</p>
+<ul>
+<li><strong>改代码后必须重启 dsh 进程</strong>：Node 的 ESM 模块缓存不会随文件变化失效。配置数据不需要重启（设置页保存即热生效）。</li>
+<li><code>client.js</code> 是给浏览器模块加载器的构建产物（<code>window.__ModuleLoader__.load</code> 格式），直接手写维护，不需要打包器。</li>
+<li>设置页导航图标：外壳按 section id 硬编码图标且没有注册点，本插件用一小段 CSS 覆盖把「MCP 服务器」行的图标换成链接图标；选择器依赖外壳的类名哈希（<code>VOzbGW_*</code>），DSH 升级后若失效只会安静地退回默认齿轮图标，不影响功能。</li>
+<li><code>@deepseek-ai/dsh-mcp-client</code> 以 peerDependency 声明，由运行时提供；<code>@deepseek-ai/schemastery</code> 为普通依赖。</li>
+</ul>
+<h2>发布</h2>
+<pre><code>npm publish
+</code></pre>
+<blockquote>
+<p>包名使用 scope 版 <code>@fishlikewater/dsh-mcp-manager</code>：无 scope 的 <code>dsh-mcp-manager</code> 已被他人占用（github.com/Nichts0v0/dsh-mcp-manager）。发布者的 npm 账号必须是 <code>fishlikewater</code>（scope 归属），<code>publishConfig.access: public</code> 已配置，无需 <code>--access public</code>。改包名时需同步修改 <code>cordis.patch.yml</code> 里的 <code>name</code> 行。</p>
+</blockquote>
+<h2>License</h2>
+<p>MIT</p>

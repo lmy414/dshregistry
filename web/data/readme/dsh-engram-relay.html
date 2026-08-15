@@ -1,0 +1,217 @@
+<h1>dsh-engram-relay</h1>
+<blockquote>
+<p><strong>本仓库是公开镜像</strong>（上游：<code>dsh-external/dsh-engram-relay</code>，BSD-3-Clause）。
+安装请用下方公开地址；上游转为公开后本镜像仍保持同步。</p>
+</blockquote>
+<blockquote>
+<p>跨会话分层记忆：大一统记忆图谱（Obsidian 式双向链接 + 因果双向追溯 + 自组织聚类），
+N-gram 哈希确定性寻址 × <strong>三通道纯算法语义精排（词汇/图/共现，零外部模型）</strong> × 因果传播的超稀疏主动唤醒，渐进披露
+（入口 = <code>[[标题]]</code> + 摘要，按需展开正文）；<strong>分层归属由 AI 自主决策</strong>——
+global 全局持久 / project 项目持久 / session 会话临时，跨会话沉淀与召回。</p>
+</blockquote>
+<h2>是什么</h2>
+<p><code>dsh-engram-relay</code> 把 DeepSeek Engram 的「N-gram 哈希 O(1) 确定性寻址」思想做成<strong>系统级</strong>
+外置记忆转接层（无需训练任何小模型）：</p>
+<ol>
+<li><strong><a href="https://arxiv.org/abs/2601.07372">Engram（条件记忆，</a><a href="https://github.com/deepseek-ai/Engram">deepseek-ai/Engram</a>）</strong>：N-gram 哈希 O(1) 确定性寻址 → 巨大静态记忆表。为 Transformer 补上「知识查找原语」（MoE 扩计算容量，Engram 扩静态记忆容量）。</li>
+<li><strong>三通道纯算法语义引擎（SemanticScorer，零嵌入模型）</strong>：对哈希粗筛候选做语义精排——
+词汇通道（n-gram Jaccard 重叠 + 词频）、图通道（因果/链接邻居语义传播）、
+共现通道（PCA 谱分解语义桥，跨词共现如「缓存↔cache」）；确定性、可解释、
+<strong>零外部模型、零联网、零 Python</strong>。修掉哈希的 mode-level 跨主题误命中
+（同 80 查询实测：纯哈希精确率 54% → 混合 95%，三通道承接了当年 bge 实验的增益）。</li>
+<li><strong>因果图</strong>：节点间 <code>causes/effects</code> 双向边，唤醒时沿因果链双向传播激活——「什么导致了它 / 它导致了什么」，这是普通向量索引做不到的。</li>
+</ol>
+<p><strong>混合检索管线</strong>：哈希粗筛（精确、O(1)、确定性）→ 三通道纯算法精排（修误命中，零模型）→
+因果传播（召回前因后果）→ top-K 超稀疏注入 = <strong>精确 + 语义 + 因果</strong>。</p>
+<h2>架构</h2>
+<pre><code>┌────────────────────────────────────────────────────────┐
+│ 云端 API 主模型（100k 上下文，KV 保持小）                 │
+│   ↑ 超稀疏文本注入（systemPrompt 记忆段，预算 600 token）  │
+├────────────────────────────────────────────────────────┤
+│ Node 插件（核心零第三方运行时依赖）                       │
+│  ├─ 请求前：哈希粗筛 → 分层准入 → 三通道纯算法精排 →      │
+│  │           因果传播 → 稀疏注入（global 全可见 /          │
+│  │           project 同 cwd / session 本会话）             │
+│  ├─ 写入：模型调 engram_store 落节点（自主分层 + 因果）     │
+│  ├─ 维护：search/link/update/remove/promote（织图谱/转层） │
+│  └─ 会话结束：agent/disposed → 只清 session 层临时记忆     │
+│            （global/project 跨会话持久）                   │
+├────────────────────────────────────────────────────────┤
+│ 可选向量缓存增强（非必需；核心语义引擎零模型）            │
+│  ├─ TS ONNX：包内 int8 bge 模型（transformers.js 懒加载） │
+│  └─ Python 转接服务（遗留回退，JSON 行协议）：            │
+│      embed op：本地 fp32 bge-small-zh-v1.5 编码（懒加载） │
+└────────────────────────────────────────────────────────┘
+</code></pre>
+<ul>
+<li><strong>大一统记忆图谱</strong>：节点 = <code>{layer, title, summary, content, links[], causes[], effects[]}</code>，
+<code>[[标题]]</code> 双向链接（Obsidian 风格）+ 因果双向追溯；<strong>层是节点属性（不分家）</strong>，
+主题结构由链接/因果密度自组织成簇（连通分量），唤醒时给出簇概览；</li>
+<li><strong>预设分层 + AI 自主决策</strong>：3 层 = <code>global</code>（全局持久·所有会话）/ <code>project</code>（项目持久·
+按工作目录隔离）/ <code>session</code>（会话临时·结束清理）；模型经 <code>engram_store</code> 写入时<strong>自主决策</strong>
+归属层（跨会话长期→global、本项目→project、仅本次→session），可在会话结束前
+<code>engram_promote</code> 把 session 临时记忆转长期；</li>
+<li><strong>跨会话准入</strong>：唤醒/检索按查看者视角过滤——global 所有会话可见、project 仅同工作目录、
+session 仅本会话；session 层随会话结束清理，global/project 跨会话沉淀与召回；</li>
+<li><strong>渐进披露</strong>：唤醒只注入入口（<code>[[标题]]</code> + 层 + 摘要 + ↑因/↓果），模型可经 <code>engram_open</code>
+按需展开正文与因果邻居——超稀疏且不丢细节；</li>
+<li><strong>与官方 compact 共存</strong>：DSH 自带的 <code>dsh-compact-basic</code> 负责腾 KV（有损总结式折叠）；
+engram 在折叠前实时留底（<code>agent/turn-stopping</code>），细节可唤醒找回。</li>
+</ul>
+<h2>安装</h2>
+<pre><code># dshx（marisa）外部插件管理器（公开镜像地址）
+dshx install dsh-engram-relay https://github.com/yjh051108/dsh-engram-relay.git
+</code></pre>
+<p>依赖：Node ≥ 18。<strong>核心语义引擎零模型、零依赖、开箱即用</strong>——三通道纯算法
+（词汇 n-gram + 图语义传播 + PCA 共现），无需下载嵌入模型、无需 Python、无联网。
+可选增强（向量缓存补分用，非必需）：包内自带 int8 量化 bge-small-zh
+（<code>model/bge-small-zh/</code>，~24MB，TS ONNX 懒加载）或 Python 3.10+
+（sentence-transformers）加载本地 fp32 bge-small-zh-v1.5 目录
+（配置 <code>embedModel</code> 或环境变量 <code>ENGRAM_EMBED_MODEL</code>）。</p>
+<h2>工具</h2>
+<table>
+<thead>
+<tr>
+<th>工具</th>
+<th>作用</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>engram_recall</code></td>
+<td>按需唤醒检索（跨会话分层准入 + 因果邻接，可过滤层）</td>
+</tr>
+<tr>
+<td><code>engram_store</code></td>
+<td>写入记忆（<strong>AI 自主决策分层</strong> + 因果前因/后果 + 双向链接）</td>
+</tr>
+<tr>
+<td><code>engram_propose</code></td>
+<td>提议记忆（写入 ⏳pending，用户确认后才参与召回，确认制沉淀）</td>
+</tr>
+<tr>
+<td><code>engram_confirm</code></td>
+<td>确认一个待确认节点（确认后参与 recall/唤醒命中）</td>
+</tr>
+<tr>
+<td><code>engram_reject</code></td>
+<td>拒绝（删除）一个待确认节点（仅 pending 可拒）</td>
+</tr>
+<tr>
+<td><code>engram_open</code></td>
+<td>展开入口（正文 + 层 + 链接 + 因果邻居，渐进披露第二层）</td>
+</tr>
+<tr>
+<td><code>engram_search</code></td>
+<td>盘点记忆图谱（按层/项目/类型/关键词检索，遵守可见性）</td>
+</tr>
+<tr>
+<td><code>engram_link</code></td>
+<td>显式连接节点（因果/依赖/引用边，双向链接织图谱）</td>
+</tr>
+<tr>
+<td><code>engram_update</code></td>
+<td>修正节点（摘要/正文/链接/重要度/标题）</td>
+</tr>
+<tr>
+<td><code>engram_remove</code></td>
+<td>删除节点（谨慎，不可恢复）</td>
+</tr>
+<tr>
+<td><code>engram_promote</code></td>
+<td>提升层（session→project/global，会话结束前转长期）</td>
+</tr>
+<tr>
+<td><code>engram_weave</code></td>
+<td>织网清洗（孤立节点语义配对自动织双向链接）</td>
+</tr>
+<tr>
+<td><code>engram_status</code></td>
+<td>查看服务状态（分层统计/槽位/因果边/模型/预算）</td>
+</tr>
+</tbody></table>
+<h2>配置（profile patch，如 <code>~/.dsh/profiles/web/cordis.patch.yml</code>）</h2>
+<pre><code>- id: dsh-engram-relay
+  name: '@dsh-external/dsh-engram-relay'
+  config:
+    # 可选增强（向量缓存）：本地 fp32 bge 模型目录；
+    # 缺省留空 = 核心三通道纯算法引擎（推荐，零模型零配置）
+    embedModel: '/path/to/bge-small-zh-v1.5'
+</code></pre>
+<table>
+<thead>
+<tr>
+<th>键</th>
+<th>默认</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>embedModel</code></td>
+<td>``</td>
+<td>可选增强：bge 嵌入模型目录（向量缓存补分）；空 = 核心三通道纯算法（零模型），包内 int8（TS ONNX）→ Python 服务 <code>ENGRAM_EMBED_MODEL</code> 依次可选</td>
+</tr>
+<tr>
+<td><code>modelId</code></td>
+<td>``</td>
+<td>遗留：0.6B 蒸馏模型目录（已移除；空 = 不加载）</td>
+</tr>
+<tr>
+<td><code>pythonPath</code></td>
+<td><code>python</code></td>
+<td>Python 解释器（可选增强服务）</td>
+</tr>
+<tr>
+<td><code>injectBudgetTokens</code></td>
+<td><code>600</code></td>
+<td>单次唤醒注入预算（超稀疏，&lt;1%）</td>
+</tr>
+<tr>
+<td><code>lessonMinScore</code></td>
+<td><code>0.42</code></td>
+<td><strong>教训通道阈值</strong>（v0.6）：tags 含 <code>教训:</code> 的节点在自动唤醒时独立补位——同类操作时踩坑提醒必达（主 top-1 会漏掉低分教训）；<code>0</code> = 关闭</td>
+</tr>
+<tr>
+<td><code>lessonBudgetTokens</code></td>
+<td><code>60</code></td>
+<td>教训通道注入预算（独立于主预算，提醒不挤占普通记忆）</td>
+</tr>
+<tr>
+<td><code>maxWakePerTurn</code></td>
+<td><code>3</code></td>
+<td>每回合唤醒条数上限</td>
+</tr>
+<tr>
+<td><code>storeDir</code></td>
+<td><code>~/.dsh/engram-relay/</code></td>
+<td>engram 持久化目录</td>
+</tr>
+</tbody></table>
+<h2>目录</h2>
+<pre><code>src/                    # Node 插件（llm/stream 转接 + 工具）
+├── engram/hash.ts      # N-gram 多头哈希寻址（论文移植，确定性）
+├── engram/causal.ts    # 因果图（causes/effects 双向传播）
+├── engram/store.ts     # 大一统记忆图谱（节点/链接/聚类/持久化）
+├── engram/wake.ts      # 唤醒管线（哈希粗筛 → 三通道纯算法精排 → 因果 → 稀疏截断）
+├── engram/semantic-scorer.ts  # 三通道纯算法语义引擎（词汇/图/PCA 共现，零模型）
+└── model/              # 可选向量缓存：TS ONNX（包内 int8）+ Python 服务客户端
+python/engram_model/    # Python 转接服务（可选/遗留）
+├── hash.py             # N-gram 哈希寻址（Python 移植，与 TS 同构）
+├── server.py           # JSON 行协议服务（embed op：bge 编码；遗留 0.6B op）
+python/embed_compare.py # 哈希 vs bge vs 混合 检索质量对比（95% 精确率，历史实验）
+python/tests/           # 哈希/融合模块数学测试
+</code></pre>
+<h2>设计要点</h2>
+<ul>
+<li><strong>确定性寻址</strong>：相同 N-gram 模式永远命中相同槽位（精确匹配，非相似度近似）；</li>
+<li><strong>三通道纯算法语义精排</strong>：哈希粗筛保证精确命中保底，词汇（n-gram Jaccard + 词频）/
+图（因果链接邻居传播）/ 共现（PCA 谱分解语义桥）三通道修跨主题误命中——
+零嵌入模型、确定性、可解释；因果传播再召回前因后果；</li>
+<li><strong>教训通道（v0.6）</strong>：tags 含 <code>教训:</code> 的节点（如 <code>教训:代码</code>）在自动唤醒时用
+更低阈值（<code>lessonMinScore</code> 0.42，主 top-1 约 0.50）<strong>独立补位</strong>——同类操作时
+「踩过的坑」即使语义分略低也会提醒，渲染带 <code>⚠️教训</code> 标记 + 分类 tag，
+独立预算不挤占普通记忆；<code>0</code> 可关闭；</li>
+<li><strong>渐进披露</strong>：入口超稀疏（title + summary），正文/链接按需展开；</li>
+<li><strong>零核心改动</strong>：只使用公开 seam（<code>llm/stream</code>、<code>systemPrompt.context</code>、<code>tools.register</code>、<code>agent/turn-stopping</code>、<code>agent/disposed</code>）。</li>
+</ul>
+<h2>收录</h2>
+<p>按 <a href="https://github.com/dsh-external/hub/blob/main/LOOP.md">dsh-external/hub LOOP.md</a> 收录：<code>marisa-plugin</code> topic + <code>catalog.source.json</code>（category: <code>plugin</code>）。</p>

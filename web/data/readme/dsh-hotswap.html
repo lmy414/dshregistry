@@ -1,0 +1,63 @@
+<h1>dsh-hotswap</h1>
+<p>DSH Web 插件热插拔管理器：在 <strong>设置 → 插件 → 「插件管理」</strong> 标签页里列出当前挂载的所有 Cordis 插件，支持<strong>运行时热启用 / 热停用 / 热重启</strong>，以及<strong>监视 profile 的 <code>package.json</code> 自动热挂载 / 卸载 bundle</strong>——全程无需重启 <code>dsh web</code>。</p>
+<blockquote>
+<p>原名 <code>@dsh-external/dsh-plugin-manager</code>（未公开发布）。</p>
+</blockquote>
+<h2>功能</h2>
+<ul>
+<li><strong>热停用</strong>：调用 Loader 的 <code>entry.update({ disabled: true })</code>，插件当场卸载（服务、工具、监听器全部回收）。</li>
+<li><strong>热启用</strong>：<code>entry.update({ disabled: false })</code>，当场导入并启动插件——包括启动时就处于停用状态的插件。</li>
+<li><strong>热重启</strong>：卸载后重新加载，并尽力清除 Node ESM 模块缓存，让磁盘上的新代码生效（best-effort，见「已知限制」）。</li>
+<li><strong>Bundle 自动同步（热挂载）</strong>：监视 profile 的 <code>package.json</code>，当 <code>dsh.profile.bundles</code> 增删条目时，通过 Include 根分组热挂载 / 卸载对应 bundle——<code>dsh plugin add/remove</code> 之后无需重启。</li>
+<li><strong>持久化</strong>：每次开关都会把 <code>disabled: true</code> 写入 / 移除 profile 的 <code>cordis.patch.yml</code> 中一个由本插件维护的自动区块（<code># === dsh-hotswap managed block ===</code>），因此重启 DSH 后开关状态依然生效。</li>
+<li><strong>安全护栏</strong>：<ul>
+<li>保护名单：<code>webserver</code>、<code>connection</code>、<code>api-gateway</code>、<code>modules</code>、<code>typert*</code>、<code>web*</code>、<code>hmr</code> 等界面赖以生存的条目以及本插件自身，不能被停用；</li>
+<li><code>!!js</code> 表达式控制、父分组停用的条目不允许切换；</li>
+<li>一键「全部恢复」重新启用所有由管理器停用的插件。</li>
+</ul>
+</li>
+<li><strong>外部停用识别</strong>：能识别 <code>cordis.patch.yml</code> 中手写的 <code>disabled: true</code> 行；启用时会同步移除该行，避免“现在能跑、重启又没了”的不一致。</li>
+</ul>
+<h2>安装</h2>
+<pre><code>dsh plugin --profile web add dsh-hotswap
+# 重启生效：
+dsh web
+</code></pre>
+<p>本地源码 / tgz：</p>
+<pre><code>npm pack
+dsh plugin --profile web add ./dsh-hotswap-0.1.0.tgz
+</code></pre>
+<h2>配置</h2>
+<p>全部可选，通过 profile 的 <code>cordis.patch.yml</code> 覆盖：</p>
+<pre><code>- id: dsh-hotswap
+  config:
+    profile: web              # 持久化目标 profile（仅作兜底；默认从 Loader baseUrl 推导）
+    protected: [some-id]      # 追加不可停用的条目 id
+</code></pre>
+<h2>⚠️ 安全须知（重要）</h2>
+<p>本插件暴露同源 HTTP 端点（<code>/_dsh/hotswap/*</code>），可让请求方<strong>停用 / 启用 / 重启任意插件</strong>。它沿用 DSH Web 的「受信任主机」模型，<strong>不额外加鉴权</strong>：</p>
+<ul>
+<li>只要 Web 服务绑定在 <code>127.0.0.1</code>，就只有本机进程能调用，是安全的。</li>
+<li><strong>如果你把 <code>webserver</code> 的 <code>host</code> 设为 <code>0.0.0.0</code> 暴露到局域网，局域网内任何设备都能控制你的插件（进而驱动 agent）</strong>。DSH Web 本身无鉴权 / 无 TLS，切勿暴露到不可信网络。</li>
+<li>来源校验（<code>isSameOrigin</code>）只拦截带 <code>Origin</code> 头的跨站请求；无 <code>Origin</code> 头的本机程序（curl 等）会被放行——这是刻意的本机便利，不是漏洞，但意味着<strong>不要与不信任的进程共享这台机器</strong>。</li>
+</ul>
+<h2>兼容性</h2>
+<ul>
+<li>开发 / 测试于 <strong>DSH <code>0.1.0-rc.6</code></strong>。</li>
+<li>热重启与代码重载依赖 Cordis Loader 的<strong>内部 API</strong>（<code>entry._dispose</code> / <code>entry.refresh</code> / <code>loader.internal</code>），这些不是公开契约，可能在 DSH 升级后变化。升级 DSH 前请先确认本插件仍可用。</li>
+</ul>
+<h2>架构</h2>
+<ul>
+<li>主机端 <code>index.js</code>：注入 <code>webServer</code> + <code>loader</code>，注册 <code>/_dsh/hotswap/</code> 前缀路由（state / set / restart / reset）；通过 Loader 的公共条目 API 做运行时启停，用文本级“围栏区块”维护 <code>cordis.patch.yml</code>；<code>createBundleSyncer</code> 监视 <code>package.json</code> 做热挂载。</li>
+<li>客户端 <code>client.js</code>：注册 <code>settings.plugins.tab</code> 插槽（id <code>manager</code>），React 渲染插件列表（搜索、筛选、状态灯、徽章、开关/重启按钮）。</li>
+</ul>
+<h2>已知限制</h2>
+<ul>
+<li>停用某个插件后，<strong>已经打开的页面</strong>里它注入的客户端 UI（如设置页标签）要到刷新页面后才会消失。</li>
+<li>运行时启停只影响当前进程；「持久化」只覆盖本管理器经手的开关。手动写在围栏外的配置行不会被改动（除非点击“启用”时顺手移除同 id 的 <code>disabled: true</code> 行）。</li>
+<li>热重启的「代码重载」是 best-effort：Node ESM 模块缓存无法被可靠失效，多数情况下只是卸载后重新 apply，未必读到磁盘新代码。</li>
+<li>若误停关键插件导致界面无法操作：编辑 UI 上显示的持久化文件，删除 dsh-hotswap 自动区块后重启 <code>dsh web</code> 即可恢复。</li>
+<li><code>headless</code> profile 没有 <code>webServer</code>，本插件只服务于 Web 界面。</li>
+</ul>
+<h2>License</h2>
+<p>MIT</p>

@@ -1,0 +1,253 @@
+<h1>dsh-hotreload-plugin-manager</h1>
+<p>中文 | <a href="https://github.com/kyorakuyk/dsh-hotreload-plugin-manager/blob/HEAD/README.en.md">English</a></p>
+<p>一个<strong>树外（out-of-tree）</strong><a href="https://github.com/deepseek-ai/deepseek-harness">DeepSeek Harness</a>
+插件：在<strong>运行中的实例上直接完成插件的热安装、热卸载、禁用/启用——无需重启</strong>，
+并提供 Web 设置页标签页：</p>
+<ul>
+<li><strong>🔥 热安装</strong>：按 spec（npm 包名 / git URL / <code>github:owner/repo</code> / <code>file:</code> 路径）
+安装插件 bundle，立即热生效于运行中的 <code>dsh web</code>，且重启后保留。</li>
+<li><strong>🔥 热卸载</strong>：移除 bundle——行与 fiber 即刻卸载、依赖被清理、陈旧的
+bundle 层条目一并移除。</li>
+<li><strong>🔥 禁用 / 启用</strong>：在 UI 上一键切换已安装 bundle 的条目开关，状态持久化且立即生效。</li>
+<li><strong>热更新</strong>：热替换 bundle 的补丁行并实时重放配置（模块代码变更按 Node 进程内
+缓存特性仍需重启）。</li>
+<li><strong>零内核改动</strong>：纯树外 bundle，dsh checkout 完全不被触碰。</li>
+<li><strong>双面包</strong>：一个 npm 包同时是 host 网关与浏览器设置标签页。</li>
+</ul>
+<h2>架构</h2>
+<pre><code>┌────────────────────────────── 浏览器（React）──────────────────────────────┐
+│  设置 → 插件 → "插件管理"标签页（槽位 settings.plugins.tab）                 │
+│        │  fetch('/plugin-manager/*')                                      │
+└────────┼──────────────────────────────────────────────────────────────────┘
+         ▼
+┌──────────────────────────── dsh web 进程 ──────────────────────────────────┐
+│  webserver 路由（node:http）──▶ manager 核心                               │
+│    ① pnpm add/remove（profile 内的真实依赖）                               │
+│    ② 行写入 profile 用户补丁层（cordis.patch.yml）                         │
+│    ③ 根 Include entry.update → Loader 挂载/卸载 fiber                      │
+│  网关：TypertRemoteService（源码模式反射，无代码生成）                       │
+└────────────────────────────────────────────────────────────────────────────┘
+</code></pre>
+<p>包是双面的：</p>
+<ul>
+<li><strong>Node 半</strong>（<code>lib/index.js</code>，tsc 编译）——<code>PluginManagerGateway</code>，一个注册为
+<code>pluginManager</code> 的 <code>TypertRemoteService</code>。api-gateway 可通过<strong>源码模式反射</strong>
+分发它的 <code>@Remote</code> 方法（无需生成产物）；同时它在 webServer 服务上注册浏览器
+HTTP 传输。</li>
+<li><strong>浏览器半</strong>（<code>lib/client.js</code>，esbuild 打包）——注册进 <code>settings.plugins.tab</code>
+槽位（id <code>manager</code>）的 Web 设置标签页，由 <code>dsh-client-modules</code> 发现，并以普通
+模块表 bundle（<code>window.__ModuleLoader__.load</code>）形式服务。</li>
+</ul>
+<h2>工作原理</h2>
+<p>全部复用 launcher 已有的机制，因此插件不需要对 dsh checkout 做任何改动：</p>
+<ol>
+<li><strong>安装</strong>：在 profile 目录执行 <code>pnpm add &lt;spec&gt;</code>。包成为<strong>真实依赖</strong>（进入
+profile 的 <code>node_modules</code> 与 <code>package.json</code>，pnpm 不会剪除它）。管理器读取
+该 bundle 的 <code>dsh.bundle.patch</code> 行，写入 profile 的用户补丁层
+（<code>cordis.patch.yml</code>）。</li>
+<li><strong>热应用</strong>：直接对根 Include 条目调用 <code>entry.update</code>（携带新补丁列表）——
+与 launcher 用户补丁 watcher 相同的调用。管理器自己应用自己的写入，因为文件
+watcher 可能漏掉紧跟其后的写入事件。</li>
+<li><strong>重启持久</strong>：用户补丁层在启动时被重新组合，因此已安装 bundle 在重启后保留，
+且<strong>不触碰 <code>dsh.profile.bundles</code></strong>（也就不会双组合行）。</li>
+<li><strong>卸载 / 更新</strong>：移除或替换行，并执行 <code>pnpm remove</code> / <code>pnpm update</code>
+（registry 包）或 remove + re-add（<code>file:</code>/<code>link:</code>——pnpm 的增量重拷不会
+物化新增文件）。</li>
+<li><strong>启停</strong>：写入用户层禁用行（<code>{ id, disabled }</code>），按 id 覆盖 bundle 行而不
+产生重复。</li>
+</ol>
+<p><strong>依赖语义透传给 pnpm。</strong> 管理器不解释被安装 bundle 的 manifest：
+<code>optionalDependencies</code> 与可选 peer 的行为完全遵循 pnpm 的定义（失败的可选
+依赖被跳过、安装继续；profile 使用 <code>autoInstallPeers: false</code>，peer 从不被
+自动安装，运行时从 dsh 安装闭包解析）。插件若 import 非闭包 peer，其可用性
+由 bundle 作者负责。</p>
+<p>浏览器半通过插件自有的<strong>同源 HTTP 传输</strong>（<code>/plugin-manager/*</code>）与 host 通信，
+而不是 Typert remote 管线：npm 上的 <code>dsh-api-gateway</code> 包装不了（其若干依赖
+<code>dsh-type-meta</code>、<code>dsh-compact</code> 等未发布），树外无法挂载 client contribution。
+host 网关仍注册 Typert 绑定，供进程内消费者使用。</p>
+<h2>可安装的插件（什么能装）</h2>
+<p><strong>唯一硬性要求</strong>：一个 npm 包，其 <code>package.json</code> 声明
+<code>"dsh": { "bundle": { "patch": "./cordis.patch.yml" } }</code>（标准 DSH 插件
+bundle）。满足即装，插件内部形态不限。</p>
+<p><strong>来源形式</strong>（spec 白名单，底层透传 <code>pnpm add</code>，pnpm 能解析的规范基本都能用）：</p>
+<ul>
+<li>npm 包名（可带版本）：<code>@kyorakuyk/dsh-plugin-manager</code>、<code>@scope/name@^1.0.0</code></li>
+<li>git URL：<code>https://github.com/x/y.git</code>、<code>git+ssh://…</code></li>
+<li>GitHub 简写：<code>github:owner/repo</code>、<code>owner/repo</code></li>
+<li>本地路径：<code>file:C:/path/to/bundle</code>、<code>link:…</code>（开发/离线最常用）</li>
+</ul>
+<p><strong>插件内部可以是什么</strong>（补丁行由根 Include 的插值机制统一处理）：</p>
+<ul>
+<li>Host 插件：普通 Cordis 插件、Service、工具注册</li>
+<li>浏览器 UI 插件：双面 <code>dsh.client</code> 包（浏览器半经 <code>dsh-client-modules</code> 可用）</li>
+<li>skill 提供方 / MCP 适配器：挂 <code>dsh-skill-filesystem</code>、<code>dsh-mcp-client</code> 的 bundle</li>
+<li>补丁行含 <code>insert</code> / id-targeted 覆盖 / 禁用行 / group / <code>!!js</code> 表达式</li>
+<li>带 <code>optionalDependencies</code> 的 bundle（缺失的可选依赖被跳过、安装继续——已实测）</li>
+</ul>
+<p><strong>装不了的（会明确拒绝）</strong>：</p>
+<ul>
+<li>无 <code>dsh.bundle.patch</code> 的普通库 → 拒绝并自动 <code>pnpm remove</code> 回滚，不留残渣</li>
+<li>旧 <code>.dsh-plugin</code> / <code>config.yaml</code> 安装格式 → 不支持（DSH 核心已整体移除该路径）</li>
+<li>补丁行 id 与用户层或其他 bundle 冲突 → 拒绝安装（防双组合）</li>
+<li>git 规格装完无法识别包名 → 明确报错 "could not resolve the installed package name"</li>
+</ul>
+<p><strong>边界提醒</strong>：</p>
+<ul>
+<li><strong>非闭包 peer</strong>：bundle 若 import 既不在 profile 也不在 dsh 安装闭包里的
+peer，运行时挂——这是 bundle 作者的责任，管理器不干预</li>
+<li><strong>模块代码级更新需重启</strong>（Node 进程内缓存，见"已知限制"）</li>
+<li>管理器与 <code>dsh plugin</code> CLI <strong>不要对同一 bundle 混用</strong>（卸载会自动清理 CLI
+残留的 bundle 层条目）</li>
+</ul>
+<h2>快速开始（其他用户）</h2>
+<p>前置条件：Node ≥ 22、pnpm ≥ 10、已安装 dsh 并初始化过目标 profile。</p>
+<p><strong>① 直接从 GitHub 安装（推荐）</strong>——无需克隆本仓库：</p>
+<pre><code>dsh plugin --profile web add "github:kyorakuyk/dsh-hotreload-plugin-manager"
+# 或完整 git URL：
+# dsh plugin --profile web add "https://github.com/kyorakuyk/dsh-hotreload-plugin-manager.git"
+</code></pre>
+<p><strong>② 或者克隆后本地安装</strong>：</p>
+<pre><code>git clone https://github.com/kyorakuyk/dsh-hotreload-plugin-manager.git
+dsh plugin --profile web add "file:$(pwd)/dsh-hotreload-plugin-manager"
+</code></pre>
+<p><strong>③ 或者从 npm 安装</strong>（发布后可用）：</p>
+<pre><code>dsh plugin --profile web add "@kyorakuyk/dsh-plugin-manager"
+</code></pre>
+<p><strong>装完后必须重启 dsh web 实例</strong>（新 bundle 需要重启才挂载；仓库已包含构建产物 <code>lib/</code>，无需先构建），浏览器硬刷新一次（<code>Ctrl+Shift+R</code>）：</p>
+<pre><code>dsh --profile web
+</code></pre>
+<p>然后打开 Web UI → <strong>设置 → 插件 → 插件管理</strong>，按 spec 安装其他插件——npm 包名、
+git URL、<code>github:owner/repo</code>、或 <code>file:</code>/<code>link:</code> 路径均可。</p>
+<blockquote>
+<p>npm 已发布：<code>dsh plugin --profile web add "@kyorakuyk/dsh-plugin-manager"</code>。</p>
+</blockquote>
+<h2>Web UI</h2>
+<p>设置 → 插件 → <strong>插件管理</strong>：</p>
+<ul>
+<li>安装输入框（支持上述 spec 形式）；</li>
+<li>已安装列表，每个包带 <strong>禁用/启用</strong>、<strong>更新</strong>、<strong>卸载</strong> 按钮（禁用后显示
+"（已禁用）"，按钮切换为"启用"）；</li>
+<li>手动 <strong>刷新</strong> 按钮（列表实时反映热变更，无需整页刷新）；</li>
+<li>操作结果内联展示（失败时包含 pnpm 输出尾部）。</li>
+</ul>
+<h2>HTTP API</h2>
+<table>
+<thead>
+<tr>
+<th>方法</th>
+<th>路径</th>
+<th>Body</th>
+<th>结果</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>GET</td>
+<td><code>/plugin-manager/list</code></td>
+<td>—</td>
+<td><code>{ ok, value: Bundle[] }</code></td>
+</tr>
+<tr>
+<td>POST</td>
+<td><code>/plugin-manager/install</code></td>
+<td><code>{ spec }</code></td>
+<td><code>{ ok, message, exitCode?, tail? }</code></td>
+</tr>
+<tr>
+<td>POST</td>
+<td><code>/plugin-manager/uninstall</code></td>
+<td><code>{ packageName }</code></td>
+<td>同上</td>
+</tr>
+<tr>
+<td>POST</td>
+<td><code>/plugin-manager/update</code></td>
+<td><code>{ packageName }</code></td>
+<td>同上</td>
+</tr>
+<tr>
+<td>POST</td>
+<td><code>/plugin-manager/setEnabled</code></td>
+<td><code>{ entryId, enabled }</code></td>
+<td>同上</td>
+</tr>
+</tbody></table>
+<p><code>Bundle</code> 形如 <code>{ packageName, version?, spec, rowIds, disabled }</code>。</p>
+<h2>开发</h2>
+<pre><code>pnpm install
+pnpm build        # tsc（Node 半）+ esbuild（浏览器 bundle）
+pnpm test         # vitest：REAL-composition / HTTP / bundle 契约共 22 个测试
+pnpm typecheck
+</code></pre>
+<h3>发布（npm Trusted Publishing）</h3>
+<p>发布走 GitHub Actions OIDC 信任发布——<strong>无需 token、无需 OTP/恢复码</strong>：</p>
+<pre><code>npm version 0.1.5 --no-git-tag-version   # 升版本
+git add package.json pnpm-lock.yaml &amp;&amp; git commit -m "pkg: bump to 0.1.5"
+git push
+git tag v0.1.5 &amp;&amp; git push origin v0.1.5 # 触发 .github/workflows/publish.yml
+</code></pre>
+<p>workflow 会：typecheck → build → test → <code>npm publish --provenance</code>（OIDC）
+→ 自动创建 GitHub Release。发布失败可重跑：</p>
+<pre><code>gh workflow run publish.yml --ref main -f publish_ref=refs/tags/v0.1.5
+</code></pre>
+<blockquote>
+<p>前置：npm 账号需把本仓库 + <code>publish.yml</code> 注册为该包的 Trusted Publisher
+（npmjs.com → 包设置 → Trusted Publisher）。</p>
+</blockquote>
+<p>目录结构：</p>
+<pre><code>src/                 host 半（tsc → lib/*.js）
+├── index.ts         PluginManagerGateway（TypertRemoteService + @Remote）
+├── manager.ts       核心生命周期操作
+├── http.ts          webserver 路由处理器
+└── spec|pnpm|patch-layer|state|types.ts
+src/client/index.tsx 浏览器半（esbuild → lib/client.js）
+scripts/build-client.mjs  esbuild 配置（模块表闭包契约）
+tests/               vitest 套件 + fixtures/ 测试夹具
+</code></pre>
+<p>依赖按"运行时共享安装内单一 Cordis 实例"分类：<code>@deepseek-ai/*</code> 包为
+<code>peerDependencies</code>（从 dsh 安装闭包解析），<code>js-yaml</code> 是唯一运行时依赖，构建与
+测试工具放在 <code>devDependencies</code>。</p>
+<h2>已知限制与待办</h2>
+<ul>
+<li><strong>远程信任</strong>：<code>/plugin-manager/*</code> 路由对任何能触达服务器的人都开放。Web 面
+默认仅回环绑定（launcher 拒绝 <code>--host 0.0.0.0</code>），但暴露到局域网时不能依赖
+/api 信任围栏的保护；按可信权威校验为待办。</li>
+<li><strong>与 CLI 混用</strong>：管理器把 bundle 装为真实依赖，但<strong>不加入 <code>dsh.profile.bundles</code></strong>
+（行在用户补丁层）。之后若再运行 <code>dsh plugin</code> CLI，reconcile 会把声明
+dsh.bundle 的依赖并入 bundle 层，下一次启动时双组合这些行。每个 bundle 只用
+一种机制（卸载时会自动清理 CLI 残留的 bundle 层条目）。</li>
+<li><strong>无法解析包名的 spec</strong>：安装 git URL 时若无法在 profile 的 <code>node_modules</code>
+中识别出包名，会以 "could not resolve the installed package name" 明确失败。</li>
+<li><strong>行 id 冲突</strong>在安装时被拒绝：补丁行与用户层（或其他 bundle）冲突的 bundle
+不会被安装。</li>
+<li><strong>更新热应用的是组合与配置，不是模块代码</strong>。Node 会在进程内缓存已解析的模块
+与包 exports，因此 <em>代码</em> 或 <em>exports map</em> 变更的版本需要重启才生效；manager
+的 update 热替换补丁行（行集合与行配置），依赖本身经 <code>pnpm update</code>
+（registry）或 remove + re-add（<code>file:</code>/<code>link:</code>）刷新。</li>
+<li><strong>启停按行 id 定位条目</strong>；非补丁行 id 的生成式 Loader id 无法被切换。</li>
+<li><strong>pnpm ≥ 11 的 supply-chain 策略</strong>：默认 <code>minimumReleaseAge</code>（24h）会拒绝
+"刚发布"的包（<code>ERR_PNPM_MINIMUM_RELEASE_AGE_VIOLATION</code>）。管理器执行
+pnpm 时统一附加 <code>--config.minimumReleaseAge=0</code> 跳过冷却（安装是用户主动
+操作），并把违规包的 scope 追加到 profile <code>pnpm-workspace.yaml</code> 的
+<code>minimumReleaseAgeExclude</code>（例如 <code>@kyorakuyk/*</code>）作为第二道防线。带
+构建脚本的 git 依赖（<code>prepare</code> 等）会被 <code>allowBuilds</code> 白名单拦截
+（<code>ERR_PNPM_GIT_DEP_PREPARE_NOT_ALLOWED</code> / <code>ERR_PNPM_IGNORED_BUILDS</code>）：
+管理器会从 pnpm 输出提取其要求的<strong>精确 spec</strong>（<code>包名@git+url#sha</code>），
+自动写入 <code>allowBuilds</code> 并重试一次。手动处理时把对应 scope/spec 加入
+<code>pnpm-workspace.yaml</code> 对应区块即可。</li>
+<li><strong>暂无插件市场</strong>：安装是 spec 驱动的；浏览与精选发现为待办。</li>
+<li><strong>向运行中的 profile 部署 bundle 变更需要重启</strong>。启动清单里的 bundle rev 与
+host 半都在进程激活时冻结：把变更后的代码重装进已运行的 profile，服务端按
+请求读取新 client bundle，但 host 仍运行旧逻辑（且启动图保持旧 rev）；浏览器
+也可能在旧 URL 下缓存旧 bundle。重装 host 代码后请<strong>重启实例</strong>，并硬刷新一次
+浏览器；管理器标签页能容忍错配窗口（对缺失的行状态做了防御）。</li>
+<li><strong>in-box 的"插件清单"标签页是即时快照</strong>。它在首次挂载时拉取一次 Loader
+快照，之后保持挂载（隐藏），因此不会反映在"插件管理"里做的热生命周期变更
+——需要刷新页面。管理器标签页本身是实时的（每次操作后自动重拉，并有手动
+刷新按钮）。</li>
+</ul>
+<h2>Model Experience</h2>
+<p>无：管理器不注册任何 prompt、工具、消息或 provider 请求。</p>
+<h4>KV Cache 影响</h4>
+<p>无；本包从不组装模型输入。</p>
+<h2>License</h2>
+<p>MIT</p>

@@ -1,0 +1,308 @@
+<h1>dsh-auth-gate</h1>
+<blockquote>
+<p><strong>English</strong>: <a href="https://github.com/jiang539/dsh-auth-gate/blob/HEAD/README.en.md">README.en.md</a> · <strong>简体中文</strong></p>
+</blockquote>
+<p>面向 <a href="https://github.com/deepseek-ai/deepseek-harness">DeepSeek Harness</a>（DSH）的安全认证插件。
+它在 <strong>DSH Web UI 前加一道登录门</strong>，并提供 Nginx <code>auth_request</code> 可强制校验的 <strong><code>/auth</code> API</strong>，
+让局域网或公网部署获得身份验证与防暴力破解能力，且无需改动 DSH 本身。</p>
+<blockquote>
+<p>对接真实的 DSH 插件 API（<code>ctx.webServer.register</code>、Cordis 槽位系统、<code>dsh.client</code> 打包契约）实现。</p>
+</blockquote>
+<h2>工作原理</h2>
+<pre><code>外网用户 → Nginx (HTTPS + 限流)
+         → auth_request (Nginx 层认证校验, 子请求到 /auth/verify)
+         → DSH Web UI (插件登录门 + 登录页)
+
+DSH 内部: dsh-auth-gate 插件注册 /auth/* 路由
+         - GET  /auth/captcha → 图形验证码 { svg, uuid }   (一次性)
+         - POST /auth/login   → 校验 验证码+账号+密码 → { token }
+         - GET  /auth/verify  → 校验 Token (供 Nginx auth_request 调用)
+         - POST /auth/logout  → 销毁会话
+         - POST /auth/username → 修改自己的账号名称 (需登录)
+         - POST /auth/password → 修改自己的密码 (需登录, 校验旧密码)
+         - GET  /auth/security  → 安全设置状态与实时数据 (需登录)
+         - POST /auth/security  → 修改安全设置并持久化 (需登录)
+</code></pre>
+<p>两层相互独立的强制校验：</p>
+<table>
+<thead>
+<tr>
+<th>层</th>
+<th>机制</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong>Nginx 层</strong></td>
+<td><code>auth_request /_auth</code> → 子请求 <code>GET /auth/verify</code></td>
+<td>没有合法 Token 的请求在到达 DSH 之前就被 401 拒绝</td>
+</tr>
+<tr>
+<td><strong>插件层</strong></td>
+<td>客户端登录门 + 服务端会话</td>
+<td>浏览器打开页面时校验 Token；未登录时整个 UI 被登录页遮挡，服务端不签发会话</td>
+</tr>
+</tbody></table>
+<h2>功能特性</h2>
+<ul>
+<li><strong>SVG 图形验证码</strong> — 一次性使用、过期自动失效、剔除 <code>0o1i</code> 等易混淆字符；插件级按 IP 限流（每 60 秒 60 次，存储上限 5000 条），无 Nginx 前置时同样有界</li>
+<li><strong>防暴力破解（按 IP）</strong> — 同一 IP 在 <code>blockDuration</code> 窗口内的连续失败（验证码错误、验证码过期/无效或密码错误均计数）达到 <code>maxLoginAttempts</code> 后锁定 <code>blockDuration</code> 秒；另有 Nginx 限流兜底</li>
+<li><strong>防暴力破解（按账号）</strong> — 任一账号（不限 IP）在 <code>blockDuration</code> 窗口内的<strong>凭据</strong>失败达到 <code>accountMaxLoginAttempts</code> 后锁定该账号，IP 轮换无法绕过；验证码错误不计入此计数（避免被用于投毒锁定他人账号）</li>
+<li><strong>会话管理</strong> — 服务端内存存储 Token + 滑动过期（<code>/auth/verify</code> 每次调用顺延 <code>sessionTimeout</code>）</li>
+<li><strong>会话绑定 IP</strong> — 可选能力：将 Token 绑定到登录时的客户端 IP（<code>bindSessionToIp</code>），在其他 IP 上使用立即失效并销毁会话，被 XSS/日志窃取的 Token 无法异地使用；<strong>默认关闭</strong>（客户端 IP 不固定的部署保持关闭，否则 IP 变化会强制下线）</li>
+<li><strong>单点登录</strong> — 每个账号同时只允许一个登录会话（<code>singleSessionPerUser</code>，默认开启）：在别处再次登录会立即使该账号之前的所有会话失效（旧 Token 下次校验即 401，被挤下线），登录响应中的 <code>kickedPrevious</code> 标记可让新登录方感知这一行为</li>
+<li><strong>密码安全</strong> — bcrypt 哈希存储（<code>username:bcrypt_hash</code>，权限 0600，新哈希轮数 12），绝不存明文；创建/重置密码强制至少 8 个字符</li>
+<li><strong>请求约束</strong> — 所有 <code>/auth</code> 请求体必须为 <code>application/json</code>（否则 415），且限 64 KB（否则 413）</li>
+<li><strong>审计日志</strong> — 登录成功/失败（含锁定、验证码错误、凭据错误）均写入日志（含 IP 与用户名，绝不记录密码）</li>
+<li><strong>双端集成</strong> — Host 端注册 <code>/auth/*</code> 路由；Client 端通过 DSH 官方 Slot 机制注册登录页（root slot 优先级 -1 覆盖布局，登录成功后自动释放）</li>
+<li><strong>信任代理</strong> — 支持从 <code>X-Forwarded-For</code> 获取真实客户端 IP；仅当直接对端是回环地址（同机 Nginx）时才信任该头，且取代理追加的<strong>最后一项</strong>，客户端伪造的前缀无法绕过锁定</li>
+</ul>
+<h2>安装</h2>
+<blockquote>
+<p><strong>开箱即用（默认凭据）</strong>：如果启动时密码文件 <code>~/.dsh/auth.passwd</code> 里<strong>没有任何账号</strong>，
+插件会自动创建初始账号 <code>admin</code>，默认密码为 <code>admin123</code>，并在本次 DSH 启动日志中打印一次。
+默认凭据是<strong>公开值</strong>：首次登录会被强制修改账号名与密码后才能进入系统，
+且 <code>admin</code> 这个名称之后被保留禁用（任何账号都不能改名为它，改名后旧名立即失效）。
+不需要此机制时，在配置中将 <code>autoProvisionAdmin</code> 设为 <code>false</code>（见「配置」）。</p>
+</blockquote>
+<pre><code># 1. 将插件添加到 profile（会作为 profile 的依赖安装）
+dsh plugin --profile web add dsh-auth-gate
+
+# 2.（可选，推荐）创建带 bcrypt 哈希的密码文件（每行一个用户）——不执行此步则使用上面的默认账号
+mkdir -p ~/.dsh
+npx dsh-auth-passwd set admin            # 交互式输入密码，权限 0600
+#   或手动生成（⚠️ 明文会出现在 shell 历史与进程列表中，仅限一次性使用）：
+node -e "console.log(require('bcryptjs').hashSync('你的密码', 10))" &gt; ~/.dsh/auth.passwd
+
+# 3. 重启 DSH
+dsh web
+</code></pre>
+<p>DSH 启动时，插件的 <code>cordis.patch.yml</code> 会把 <code>dsh-auth-gate</code> 条目写入 profile，
+客户端部分由 Web 客户端注册表（<code>dsh.client</code> 声明）自动加载。打开 Web UI 即可看到登录门。</p>
+<blockquote>
+<p>本地开发安装：<code>dsh plugin --profile web add ./path/to/dsh-auth-gate</code>。</p>
+</blockquote>
+<h3>验证是否生效</h3>
+<pre><code># 获取验证码
+curl http://127.0.0.1:3080/auth/captcha
+
+# 登录（将验证码答案和 uuid 替换为上一步返回的值）
+curl -X POST http://127.0.0.1:3080/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"username":"admin","password":"your-password","captcha":"abcd","uuid":"&lt;uuid&gt;"}'
+
+# 校验 Token（Nginx auth_request 即调用此接口）
+curl -H "Authorization: Bearer &lt;token&gt;" http://127.0.0.1:3080/auth/verify   # → 200 + X-Auth-User
+
+# 防暴力破解：连续 5 次错误 → 429，并返回 blockedUntil
+</code></pre>
+<h2>配置</h2>
+<p>所有选项都在插件条目的 <code>config</code> 中设置（可在 profile 的 <code>cordis.patch.yml</code> 或
+<code>--patch</code> 覆盖层中修改）：</p>
+<table>
+<thead>
+<tr>
+<th>Key</th>
+<th>默认值</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>passwordFile</code></td>
+<td><code>~/.dsh/auth.passwd</code></td>
+<td>密码文件路径（<code>~</code> 展开为操作系统用户主目录）</td>
+</tr>
+<tr>
+<td><code>sessionTimeout</code></td>
+<td><code>3600</code></td>
+<td>会话有效期（秒），滑动窗口续期</td>
+</tr>
+<tr>
+<td><code>captchaExpires</code></td>
+<td><code>300</code></td>
+<td>验证码有效期（秒）</td>
+</tr>
+<tr>
+<td><code>maxLoginAttempts</code></td>
+<td><code>5</code></td>
+<td>同一 IP 连续失败多少次后锁定</td>
+</tr>
+<tr>
+<td><code>accountMaxLoginAttempts</code></td>
+<td><code>10</code></td>
+<td>任一账号（不限 IP）凭据连续失败多少次后锁定该账号（防 IP 轮换；验证码错误不计入）</td>
+</tr>
+<tr>
+<td><code>blockDuration</code></td>
+<td><code>300</code></td>
+<td>锁定持续时长（秒，按 IP 与按账号共用）</td>
+</tr>
+<tr>
+<td><code>bindSessionToIp</code></td>
+<td><code>false</code></td>
+<td>会话是否绑定登录时的客户端 IP（Token 离开该 IP 立即失效）；默认关闭（本部署客户端 IP 不固定）；仅当客户端 IP 固定时可设为 <code>true</code></td>
+</tr>
+<tr>
+<td><code>singleSessionPerUser</code></td>
+<td><code>true</code></td>
+<td>单点登录：同一账号再次登录会使之前所有会话立即失效（旧 Token 下次校验即 401，即"只能在一个地方登录，其它地方登录后前面登录的掉线"）；需要多处同时登录可设为 <code>false</code></td>
+</tr>
+<tr>
+<td><code>trustProxy</code></td>
+<td><code>false</code></td>
+<td>是否信任 <code>X-Forwarded-For</code>（仅当 Nginx 与 DSH 同机、直接对端为回环地址时生效；取代理追加的最后一项）</td>
+</tr>
+<tr>
+<td><code>devCaptchaText</code></td>
+<td><code>false</code></td>
+<td><strong>仅限开发</strong> — 在 <code>/auth/captcha</code> 中回显验证码答案，便于 curl 调试；生产环境切勿开启</td>
+</tr>
+<tr>
+<td><code>defaultAdminUser</code></td>
+<td><code>admin</code></td>
+<td>初始账号的用户名（仅当密码文件为空且 <code>autoProvisionAdmin</code> 开启时自动创建）。该名称是<strong>保留名</strong>：登录时会被强制改名，且任何账号都不能改名为它</td>
+</tr>
+<tr>
+<td><code>defaultPassword</code></td>
+<td><code>admin123</code></td>
+<td>初始账号的默认密码（公开值；首次登录强制修改；至少 8 个字符）</td>
+</tr>
+<tr>
+<td><code>autoProvisionAdmin</code></td>
+<td><code>true</code></td>
+<td>启动时若密码文件里没有任何账号，是否自动创建初始账号并把默认密码打印到日志</td>
+</tr>
+</tbody></table>
+<p>profile 覆盖示例：</p>
+<pre><code># ~/.dsh/profiles/web/cordis.patch.yml
+- id: dsh-auth-gate
+  config:
+    sessionTimeout: 7200
+    maxLoginAttempts: 10
+    blockDuration: 600
+</code></pre>
+<p>除 <code>passwordFile</code> 与 <code>devCaptchaText</code> 外，其余选项（<code>sessionTimeout</code>、<code>captchaExpires</code>、
+<code>maxLoginAttempts</code>、<code>blockDuration</code>、<code>trustProxy</code>、<code>singleSessionPerUser</code>）都可以在登录后通过
+<strong>设置 → 个人配置 → 安全设置</strong> 在线修改：修改立即生效，并持久保存到
+密码文件同目录的 <code>auth-gate.security.json</code>（权限 0600），重启后依然有效；
+profile 中的值作为基准层，运行时覆盖层在其之上。为保证安全，数值有上下限
+（会话超时 60–86400 秒、验证码有效期 30–3600 秒、失败阈值 1–100 次、锁定
+时长 30–86400 秒），越界请求会被拒绝；<code>devCaptchaText</code> 刻意不提供在线开关
+（仅限开发，任何环境都不应在生产开启）。</p>
+<h2>密码文件</h2>
+<p>格式：每行一个 <code>username:bcrypt_hash</code>（以 <code>#</code> 开头为注释），权限 0600。</p>
+<pre><code>npx dsh-auth-passwd hash            # 打印一个哈希，供手动使用
+npx dsh-auth-passwd set &lt;user&gt;      # 添加/更新用户（交互式输入密码）
+npx dsh-auth-passwd list            # 列出用户
+npx dsh-auth-passwd delete &lt;user&gt;   # 删除用户
+</code></pre>
+<blockquote>
+<p>密码策略：<code>set</code> 与 <code>hash</code> 均要求密码至少 8 个字符（与 Web 端修改密码一致）。</p>
+</blockquote>
+<blockquote>
+<p><strong>初始账号自动创建</strong>：当 <code>autoProvisionAdmin</code> 开启（默认）且密码文件中没有任何账号时，
+插件启动时会创建 <code>defaultAdminUser</code>（默认 <code>admin</code>）并写入 <code>defaultPassword</code>（默认 <code>admin123</code>）
+的 bcrypt 哈希（权限 0600），同时在本次启动日志中打印一次默认密码；
+<strong>首次登录会被强制修改账号名与密码</strong>（改名后旧名称 <code>admin</code> 立即失效，且任何账号都不能再改名为它）。
+已有账号的密码文件永远不会被改动。</p>
+</blockquote>
+<h2>个人配置（修改用户名 / 修改密码 / 退出登录）</h2>
+<p>登录后打开左下角 <strong>设置</strong> 面板，导航栏第一项即为 <strong>个人配置</strong>（通过官方
+<code>settings.section</code> 槽位注册，位于「通用设置」之上），提供账号自助与安全设置：
+<strong>修改用户名</strong>、<strong>修改密码</strong>、<strong>安全设置</strong>、<strong>退出登录</strong>；样式使用 shell 的
+<code>--dsw-*</code> 设计变量，自动跟随明暗主题。</p>
+<p><strong>安全设置</strong> 卡片展示每项防护措施的启用状态与当前参数（图形验证码、防暴力破解、
+会话管理、单点登录、信任代理、请求体限制），并附在线会话数与当前锁定 IP 数；
+下方可在线调整会话超时、验证码有效期、连续失败锁定阈值、锁定时长、信任代理开关与单点登录开关，
+保存后立即生效并持久化（见「配置」一节）。</p>
+<p>修改用户名需要输入新名称（1-32 个字符，不含空格和冒号；<strong>不能使用保留名</strong> <code>defaultAdminUser</code>，默认 <code>admin</code>）；
+修改密码需要输入旧密码和新密码；
+退出登录需二次确认，会调用 <code>/auth/logout</code> 销毁服务端会话并清除本地 Token；<strong>不影响正在执行的任务</strong>（子代理、后台作业等继续在服务端运行，重新登录后可见）。</p>
+<p>服务端强制规则：</p>
+<ul>
+<li>必须已登录（<code>Authorization: Bearer &lt;token&gt;</code>）；会话失效返回 401。</li>
+<li>旧密码必须与存储的 bcrypt 哈希匹配（否则 403；失败会计入与登录相同的按 IP 锁定）。</li>
+<li>新密码至少 8 个字符、最多 72 字节（bcrypt 上限）。</li>
+<li>修改成功后，<strong>该用户的其他登录会话全部失效</strong>，当前会话保持有效。</li>
+</ul>
+<p>密码文件以原子方式重写（临时文件 + rename，权限 0600），读-验-写在同一串行队列中完成；
+注释和其他用户的条目都会保留。管理员仍可直接在服务器上重置任意用户密码：</p>
+<pre><code>npx dsh-auth-passwd set &lt;user&gt;   # 覆盖任意用户的密码
+</code></pre>
+<h2>Nginx 反向代理（公网 / 局域网部署）</h2>
+<p>DSH 刻意只监听 <code>127.0.0.1</code>。用同一台机器上的 Nginx 做前置（<code>auth_request</code> + 限流）
+即可安全地对外暴露 — 公网 HTTPS 见 <a href="https://github.com/jiang539/dsh-auth-gate/blob/HEAD/docs/nginx.conf.example">docs/nginx.conf.example</a>，
+局域网 HTTP 见 <a href="https://github.com/jiang539/dsh-auth-gate/blob/HEAD/docs/nginx.conf.lan.example">docs/nginx.conf.lan.example</a>。</p>
+<pre><code>nginx -V 2&gt;&amp;1 | grep -- 'http_auth_request_module'   # 检查模块是否可用
+sudo nginx -t &amp;&amp; sudo systemctl restart nginx
+</code></pre>
+<p>要点：</p>
+<ul>
+<li><code>location /</code> → <code>auth_request /_auth</code>；子请求携带浏览器的 <code>Authorization</code> 头转发到 <code>/auth/verify</code>。
+2xx 放行，401/403 拒绝。</li>
+<li><code>/auth/login</code> 和 <code>/auth/captcha</code> 放行通过，但按 IP 限流。</li>
+<li><code>limit_req</code> 区域提供粗粒度的传输层限流；插件的失败计数存储提供细粒度的账号锁定。</li>
+<li>HTTPS 使用 Let's Encrypt：<code>apt install certbot python3-certbot-nginx &amp;&amp; certbot --nginx -d your-domain.com</code>。</li>
+</ul>
+<h3>局域网 HTTP（IP 直连）</h3>
+<p>局域网内不需要 HTTPS 时，直接以 IP + 80 端口访问即可。把公网配置中的
+<code>listen 443 ssl</code> 换成 <code>listen 80</code>、去掉 <code>ssl_*</code> 指令即可，<code>auth_request</code>
+认证流程与传输层加密无关，行为完全一致 — 完整示例见
+<a href="https://github.com/jiang539/dsh-auth-gate/blob/HEAD/docs/nginx.conf.lan.example">docs/nginx.conf.lan.example</a>：</p>
+<pre><code># 只需把 server 块改成：
+listen 80;
+# server_name 留空或用本机 IP，如 server_name 192.168.1.10;
+</code></pre>
+<blockquote>
+<p>⚠️ HTTP 是明文传输：账号密码和会话 Token 在局域网内可被抓包看到。
+仅建议在可信内网使用；任何对公网开放的部署都应使用上方的 HTTPS 配置。</p>
+</blockquote>
+<h2>安全说明</h2>
+<ul>
+<li><strong>默认凭据是公开的</strong>：开箱即用的 <code>admin</code> / <code>admin123</code> 会被打印到启动日志并写入文档，
+任何读到这些信息的人都能在改密前登录。首次登录强制<strong>改名 + 改密</strong>只是缩短暴露窗口，
+<strong>请务必在部署完成后立即完成这两步</strong>（改名后 <code>admin</code> 名称即被保留禁用），
+或在不需要开箱即用时将 <code>autoProvisionAdmin</code> 设为 <code>false</code>，改用 <code>dsh-auth-passwd set</code>
+创建自己的账号。注意：命令行工具 <code>dsh-auth-passwd</code> 属于服务器管理员工具，仍然可以直接
+创建名为 <code>admin</code> 的账号——Web 端无法做到的事，管理员在服务器上始终可以做。</li>
+<li><strong>插件信任</strong>：第三方 DSH 插件在启动时可以改写完整配置树（本门禁正是借此自启的）。
+只安装可信来源的插件、锁定版本，并审查其 <code>cordis.patch.yml</code>。</li>
+<li><strong>内存态存储</strong>：会话、验证码和失败计数都存在内存中。进程重启会登出所有用户。
+多实例部署时，可将这些 Map 换成共享存储（如 Redis）— 处理器被隔离在小型函数后面，替换很容易。</li>
+<li><strong>Nginx 才是强制校验点</strong>：插件的登录门只是隐藏了 UI，公网部署下对 <code>/api</code> 流量的权威校验
+在 Nginx 的 <code>auth_request</code> 层。没有 Nginx 前置时，DSH 只会在回环地址上提供服务。</li>
+<li><strong>密码文件</strong>：保持在 <code>~/.dsh/auth.passwd</code>，权限 0600；用 <code>dsh-auth-passwd set</code>
+轮换哈希（bcrypt 轮数 = 12，新哈希；旧哈希仍按各自轮数校验；创建/重置密码强制
+至少 8 个字符）。</li>
+<li><strong>trustProxy 务必与部署形态匹配</strong>：仅在「同机 Nginx 反代」时开启（插件启动时会打警告）。
+直接部署（无反代）时开启 trustProxy，任何能直连回环地址的进程都可伪造
+<code>X-Forwarded-For</code> 绕过按 IP 锁定，甚至把任意 IP 投毒进锁定状态；反之，有反代却关闭
+trustProxy 会让所有远端用户共享同一个（回环）锁定桶。</li>
+<li><strong>Token 存储于 localStorage</strong>：浏览器内的 XSS 可读取会话 Token（滑动窗口使其在被
+使用期间一直有效）。高安全场景建议：为 Web UI 配置严格的 CSP。</li>
+<li><strong>分布式暴力破解</strong>：插件内置的按账号锁定（<code>accountMaxLoginAttempts</code>）已覆盖
+IP 池/轮换攻击；高安全场景可再叠加 Nginx 全局限流与 fail2ban 作纵深防御。</li>
+</ul>
+<h2>开发</h2>
+<pre><code>npm install
+npm run build          # tsc 构建 host → lib/host，esbuild 构建 client → lib/client.js
+npm run typecheck
+npm test              # 构建 host 后运行集成测试（覆盖验证码/锁定/改密/信任代理/并发写）
+</code></pre>
+<p>目录结构：</p>
+<pre><code>dsh-auth-gate/
+├── package.json            # dsh.bundle.patch + dsh.client(platform: web)
+├── cordis.patch.yml        # 向 profile 插入 host 条目
+├── src/
+│   ├── host/index.ts       # /auth/* 服务（captcha、login、verify、logout）
+│   ├── client/index.tsx    # 登录门（root slot，优先级 -1）
+│   ├── client/login.css    # 登录门样式
+│   └── shared/types.ts     # 双端共享的线上类型
+├── bin/dsh-auth-passwd.mjs # 密码文件 CLI
+├── scripts/build-client.mjs# 将 esbuild 产物包装进 __ModuleLoader__.load()
+└── lib/                    # 构建产物
+    ├── host/               # host ESM（tsc）
+    └── client.js           # client bundle（esbuild，CJS-in-loader 包装）
+</code></pre>
+<p>客户端 bundle 由 DSH 自身的模块系统在 <code>/plugins/dsh-auth-gate/client.js</code> 提供，
+并自动注入 <code>window.__DSH_BOOT__</code> — 无需额外接线。</p>

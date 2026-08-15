@@ -1,0 +1,227 @@
+<h1>thinking-level-override</h1>
+<p>English | <a href="https://github.com/my-dsh-plugin/thinking-level-override/blob/HEAD/README.zh.md">中文</a></p>
+<p>A <a href="https://github.com/deepseek-ai/deepseek-harness">DeepSeek Harness</a> plugin that fixes missing or mismatched thinking-level presets of third-party models: it overrides and adjusts the reasoning effort on every request, and lets you choose exactly which thinking levels each model offers.</p>
+<p>Third-party models reach the harness through adapter catalogs whose reasoning presets do not always match reality: a selector offers a level the exact model cannot serve, a session inherits an effort across a model switch, or a deployment simply wants one level for a whole route. Left alone, such a request fails <code>UNSUPPORTED_REASONING_EFFORT</code> before it reaches the provider. This plugin intercepts the request configuration, rewrites the reasoning effort according to your rules, and repairs unserviceable levels instead of letting the request fail.</p>
+<h2>Quick start</h2>
+<p>You can use the plugin two ways — they can be combined:</p>
+<p><strong>A. Pick the offered levels on the Web settings page (no YAML).</strong> Open the Web GUI → <strong>Settings → Thinking levels</strong> (right below <strong>Models</strong>). For each model, check the levels it can actually serve, then <strong>Save</strong>. The conversation's model-selection dialog now offers exactly those levels — choosing the actual level still happens in the dialog. This writes each model's <code>reasoningEfforts</code> under <code>llm-pi-ai</code> in <code>settings.yaml</code> for you.</p>
+<p><strong>B. Write override rules in YAML.</strong> Rules force, default, or remap levels per provider/model, and repair levels a model cannot serve:</p>
+<pre><code>thinking-level-override:
+  rules:
+    # The kimi-k2 family on openrouter misreports its preset: always use high.
+    - provider: openrouter
+      models: ['kimi-k2*']
+      effort: high
+    # acme-gateway uses a different vocabulary: rename the levels, default to medium.
+    - provider: acme-gateway
+      map:
+        max: high
+        xhigh: high
+      default: medium
+    # legacy-gw cannot serve inherited efforts: drop them instead of failing.
+    - provider: legacy-gw
+      onUnsupported: drop
+</code></pre>
+<p>Rules are live: writes to <code>settings.yaml</code> are picked up by the next request, no restart.</p>
+<h2>How it works</h2>
+<p>The plugin listens to the <code>agent/request</code> waterfall — the documented interception point for the frozen call configuration — and transforms the resolved <code>LlmCallConfig</code> before the LLM seam validates it against the exact model capability. It registers with <code>prepend</code>, so the override is the outermost listener and has the last word over later listeners such as model selection. The loop logs the rewritten configuration through its normal <code>request/header</code> path, so every override stays durable and reconstructable from the session log.</p>
+<p>For each request:</p>
+<ol>
+<li>The first rule matching <code>provider</code> (exact) and <code>model</code> (<code>*</code> globs) governs the request; later rules are ignored.</li>
+<li>The effective effort is proposed: the rule's forced <code>effort</code> wins, then the request's own level (rewritten by the rule's <code>map</code> when one applies), then the rule's <code>default</code>.</li>
+<li>Under <code>clamp</code> or <code>drop</code>, the plugin reads the exact model capability through <code>ctx.llm.resolveModelInfo()</code>. A model that offers the level keeps it; a model that does not is repaired per policy; a model declaring no reasoning sheds the effort. When the capability cannot be read, the request passes through unchanged and the LLM seam stays the authority.</li>
+</ol>
+<h2>Install</h2>
+<p>Requires a <code>dsh</code> installation (developer preview).</p>
+<p><strong>From this directory</strong> (installs as a link — your later <code>pnpm run build</code> changes take effect immediately):</p>
+<pre><code>dsh plugin --profile &lt;name&gt; add ./thinking-level-override
+</code></pre>
+<p>Replace <code>&lt;name&gt;</code> with your profile, e.g. <code>web</code>.</p>
+<p><strong>From git</strong> — pnpm fetches sources and runs the <code>prepare</code> build; allow it in the profile's <code>pnpm-workspace.yaml</code> when pnpm asks:</p>
+<pre><code>dsh plugin --profile &lt;name&gt; add github:&lt;you&gt;/thinking-level-override
+</code></pre>
+<pre><code>allowBuilds:
+  dsh-thinking-level-override: true
+</code></pre>
+<p><strong>For local iteration without installing</strong>, a <code>--patch</code> overlay loads the source (or built) module directly:</p>
+<pre><code>- insert:
+    - id: thinking-level-override
+      name: '/absolute/path/to/thinking-level-override/src/index.ts'
+      config:
+        rules:
+          - provider: acme-gateway
+            effort: high
+</code></pre>
+<p>After installing, restart the Web app; the <strong>Thinking levels</strong> entry appears in Settings.</p>
+<h2>Web settings page</h2>
+<p><img src="https://raw.githubusercontent.com/my-dsh-plugin/thinking-level-override/HEAD/assets/settings-en-full.png" alt="Thinking levels settings page"></p>
+<p>The package ships a browser half (<code>dsh.client</code> declaration, <code>./client</code> entry) that renders a <strong>Thinking levels</strong> entry in the Web Settings nav, directly below <strong>Models</strong>.</p>
+<h3>Pick the offered levels</h3>
+<ol>
+<li>Open <strong>Settings → Thinking levels</strong>.</li>
+<li>For each model, click the level picker (right of the model name) and check the levels the model can serve — a bare checkmark marks each selection. <code>off</code> means "thinking disabled" and is shown as such.</li>
+<li>Click <strong>Save</strong> (bottom right). The conversation's model-selection dialog now offers exactly the checked levels; choosing the actual level stays in that dialog.</li>
+</ol>
+<p>Unchecking a level removes it; clearing all levels restores the model's inherited behavior. The page writes <code>reasoningEfforts</code> into the pi-ai adapter's settings, so the model entry itself — its id, name, context window — is never touched.</p>
+<h3>Edit the wire spelling (Thinking level mappings)</h3>
+<p>Some gateways use their own vocabulary for the levels. With the <strong>Thinking level mappings</strong> switch on (off by default), each checked level gains an inline text field for the value actually sent on the wire — the level name by default, <code>off</code> shown as blank (sends nothing):</p>
+<pre><code># What the page writes for: off checked (blank), high checked with "high",
+# max checked with "ultra" (the dialog shows max; the wire sends ultra)
+llm-pi-ai:
+  providers:
+    qwen-token-plan-cn:
+      models:
+        - id: qwen3.8-max-preview
+          reasoningEfforts:
+            off:
+            high: high
+            max: ultra
+</code></pre>
+<p>Existing hand-written spellings are preserved — only newly checked levels get the level name as their default, and a blank non-off spelling falls back to the level name. Two constraints come from the adapter schema: keys must be one of the seven levels (pi-ai's level set <code>off/minimal/low/medium/high/xhigh/max</code> — a key like <code>ultra</code> is rejected at write time), and only <code>off</code> may leave its value empty (send nothing). Turning the switch off only hides the editor; saved levels and spellings keep working. <code>settings.yaml</code> remains the authoritative document; the page writes through the same seam.</p>
+<blockquote>
+<p><strong>Needed only for the mappings editor: the settings-exposure allowlist.</strong> The Web client only sees and edits settings namespaces the harness's API gateway explicitly allows; <code>dsh-host-apiproxy</code> hardcodes that boundary in <code>WEB_SETTINGS_NAMESPACES</code>. The offered-level picker writes into the pi-ai namespace, which is always exposed, so it works without any patch. Only the <strong>Thinking level mappings</strong> switch and editor live in the plugin's own namespace: without the patch below the page degrades gracefully — a note replaces the switch, level selection keeps working, and the section stays fully live-editable through <code>settings.yaml</code>. To enable the mappings editor, add <code>'thinking-level-override'</code> to the array in the sibling checkout's <code>packages/host/apiproxy/src/api-proxy.ts</code>, rebuild, and run the GUI from that checkout:</p>
+</blockquote>
+<pre><code>cd ../deepseek-harness
+pnpm run build
+pnpm dsh web
+</code></pre>
+<p>A GUI launched from <code>npx @deepseek-ai/dsh</code> instead needs the same edit in the npx install's built bundle:</p>
+<pre><code>~/.npm/_npx/&lt;hash&gt;/node_modules/@deepseek-ai/dsh-host-apiproxy/lib/index.js
+</code></pre>
+<p>Find the <code>WEB_SETTINGS_NAMESPACES = [</code> array, add <code>"thinking-level-override",</code>, save, and restart the GUI. Note that npm re-fetching the package cache reverts the edit.</p>
+<h2>Configuration</h2>
+<table>
+<thead>
+<tr>
+<th>Field</th>
+<th>Meaning</th>
+<th>Default</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>enableMappings</code></td>
+<td>Master switch for the per-model wire-spelling editor on the Web settings page</td>
+<td><code>false</code></td>
+</tr>
+<tr>
+<td><code>onUnsupported</code></td>
+<td>What to do with an effort the exact model cannot serve: <code>fail</code> with stock harness behavior (the default — models ship their own compat layer), <code>clamp</code> to the nearest offered level, or <code>drop</code> it from the request</td>
+<td><code>fail</code></td>
+</tr>
+<tr>
+<td><code>rules</code></td>
+<td>Override rules in precedence order</td>
+<td><code>[]</code></td>
+</tr>
+</tbody></table>
+<p>Each rule:</p>
+<table>
+<thead>
+<tr>
+<th>Field</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>provider</code></td>
+<td>Exact provider route the rule governs (required)</td>
+</tr>
+<tr>
+<td><code>models</code></td>
+<td>Model-id globs (<code>*</code> wildcard); absent or empty governs every model on the route</td>
+</tr>
+<tr>
+<td><code>effort</code></td>
+<td>Force this level on every matched request, replacing any selection</td>
+</tr>
+<tr>
+<td><code>default</code></td>
+<td>Level applied when a matched request names none</td>
+</tr>
+<tr>
+<td><code>map</code></td>
+<td>Rewrite requested levels before capability validation (<code>requested: replacement</code>)</td>
+</tr>
+<tr>
+<td><code>onUnsupported</code></td>
+<td>Per-rule policy override</td>
+</tr>
+</tbody></table>
+<p>A rule must declare at least one of <code>effort</code>, <code>default</code>, <code>map</code>, or <code>onUnsupported</code>; an actionless rule fails plugin load.</p>
+<h3>Example configurations</h3>
+<p>Force one level for a model family whose preset misreports support:</p>
+<pre><code>thinking-level-override:
+  rules:
+    - provider: openrouter
+      models: ['kimi-k2*']
+      effort: high
+</code></pre>
+<p>Rewrite the levels a gateway vocabulary does not accept, and default new conversations to <code>medium</code>:</p>
+<pre><code>thinking-level-override:
+  rules:
+    - provider: acme-gateway
+      map:
+        max: high
+        xhigh: high
+      default: medium
+</code></pre>
+<p>Never let an inherited effort break one route's requests:</p>
+<pre><code>thinking-level-override:
+  rules:
+    - provider: legacy-gw
+      onUnsupported: drop
+</code></pre>
+<h2>Dynamic configuration (settings)</h2>
+<p>The plugin registers the <code>thinking-level-override</code> settings namespace with its <code>Config</code> schema and the <code>cordis.yml</code> entry as the composition base — the same seam <code>dsh-llm-pi-ai</code> uses. A user-settings layer therefore edits the rules live, with no restart: write the section into <code>settings.yaml</code> (the settings document the Web UI edits) and the next request picks it up.</p>
+<pre><code>thinking-level-override:
+  onUnsupported: clamp
+  rules:
+    - provider: qwen-token-plan-cn
+      models: ['qwen3.8-max-preview']
+      effort: xhigh
+</code></pre>
+<p>A write the schema or the rule validation refuses is rejected where it is written and the last good section keeps serving. Without a mounted settings service the entry config alone drives the plugin, unchanged.</p>
+<h2>Uninstall</h2>
+<ol>
+<li><strong>Remove the plugin from the profile:</strong></li>
+</ol>
+<pre><code>dsh plugin --profile &lt;name&gt; remove dsh-thinking-level-override
+</code></pre>
+<ol>
+<li><p><strong>Clean the settings document.</strong> Open <code>settings.yaml</code> and delete the <code>thinking-level-override:</code> section (the rules it stored stop applying the moment the plugin is gone, but leaving it is harmless and confusing). Optionally, also remove the <code>reasoningEfforts</code> blocks the settings page wrote under <code>llm-pi-ai.providers.&lt;route&gt;.models</code> if you want the models back to their inherited level presets.</p>
+</li>
+<li><p><strong>If you installed via <code>--patch</code> overlay</strong>, remove the <code>insert</code> entry from your patch file instead of steps 1–2.</p>
+</li>
+<li><p><strong>Restart the Web app.</strong> The <strong>Thinking levels</strong> entry disappears from Settings.</p>
+</li>
+<li><p><strong>Optional:</strong> revert the harness <code>WEB_SETTINGS_NAMESPACES</code> edit (see <a href="#web-settings-page">Web settings page</a>) if you made it only for this plugin.</p>
+</li>
+</ol>
+<h2>Troubleshooting</h2>
+<p><strong>The conversation fails with <code>UNSUPPORTED_REASONING_EFFORT</code>.</strong> The exact model cannot serve the requested level. Either check the level off in <strong>Settings → Thinking levels</strong> for that model, or add a rule that forces a supported level / remaps the unsupported one (<code>map</code>) / drops it (<code>onUnsupported: drop</code>).</p>
+<p><strong><code>llm-pi-ai: provider "X" sets modelOverrides for "Y" beside a models list</code>.</strong> pi-ai refuses a provider that declares both a <code>models</code> list and a <code>modelOverrides</code> dict — with a <code>models</code> list, every field must live on the list entries themselves. Merge the override's fields into the matching <code>models</code> entry and delete the <code>modelOverrides</code> block.</p>
+<p><strong>The settings page shows "settings service unavailable".</strong> The page degrades when the plugin's namespace is not exposed: level selection still works, and only the mappings switch shows an unavailable note (the harness allowlist keeps model-provider namespaces like <code>llm-pi-ai</code> exposed by default). If you want the mappings editor, apply the patch under <a href="#web-settings-page">Web settings page</a>; until then, edit <code>settings.yaml</code> directly — rules are live either way.</p>
+<p><strong>I checked levels and saved, but the conversation dialog shows no level options.</strong> Confirm the save succeeded (the page shows "Saved"), then check <code>settings.yaml</code> for the <code>reasoningEfforts</code> block under <code>llm-pi-ai.providers.&lt;route&gt;.models.&lt;id&gt;</code> — it is written into the model's own entry, not a <code>modelOverrides</code> block. Restart the Web app so the catalog reloads.</p>
+<p><strong><code>allowBuilds</code> warning during git install.</strong> pnpm blocks the <code>prepare</code> build of git-installed packages; add the shown key to the profile's <code>pnpm-workspace.yaml</code> and re-run the install.</p>
+<h2>Clamping</h2>
+<p>Clamp distance is measured on the canonical escalation ladder <code>off &lt; minimal &lt; low &lt; medium &lt; high &lt; xhigh &lt; max</code> — pi-ai's level set, which supersedes the DeepSeek adapter's <code>off</code>/<code>high</code>/<code>max</code>. On a distance tie the lower level wins. A requested id outside the ladder takes the highest offered level; effort ids an adapter offers outside the ladder sort after every known level in the adapter's reported order.</p>
+<h2>Scope and limitations</h2>
+<ul>
+<li>Governs conversation requests dispatched through the agent loop's <code>agent/request</code> waterfall, including subagents. Direct <code>ctx.llm.stream()</code> callers with their own configs — session titles, compaction — are unaffected.</li>
+<li>Cannot add reasoning capability an adapter does not declare: a model whose catalog entry carries no reasoning metadata sheds every effort under <code>clamp</code>/<code>drop</code> and fails under <code>fail</code>. Wire-level preset repair (offered levels and their spellings) belongs to the adapter's own configuration — for <code>@deepseek-ai/dsh-llm-pi-ai</code>, the <code>modelOverrides</code> and <code>reasoningEfforts</code> fields in its settings section.</li>
+<li>The first matching rule wins; overlapping rules do not merge.</li>
+<li>Under <code>onUnsupported: fail</code>, forced/mapped/defaulted efforts apply without capability validation, so a misconfigured force still fails loud at the LLM seam.</li>
+<li>The settings section is edited through the settings document (the <code>thinking-level-override:</code> key in <code>settings.yaml</code>) and is discoverable via <code>settings.describe</code>. The in-page editor additionally needs the harness exposure-allowlist patch documented under <a href="#web-settings-page">Web settings page</a>; without it the section remains fully live-editable through <code>settings.yaml</code>.</li>
+</ul>
+<h2>Development</h2>
+<p>This repository develops against a sibling <code>deepseek-harness</code> checkout (../deepseek-harness) that has completed the run-from-source path (<code>pnpm install</code>). Type checking resolves harness packages to that checkout's source through project references; tests run the real <code>LlmRuntime</code> seam with a stub adapter and dispatch <code>agent/request</code> through a scope carrier the way the agent loop does.</p>
+<pre><code>pnpm install
+pnpm test        # vitest: engine, schema, controller, and plugin-integration suites
+pnpm typecheck   # tsc -b over src + tests against the harness checkout
+pnpm build       # tsc declarations + tsdown bundle into lib/
+</code></pre>
+<p>The <code>prepare</code> script builds <code>src/</code> self-contained for git installs and needs no harness checkout; it does not type-check.</p>
+<h3>AI-assisted development</h3>
+<p>This codebase is primarily written with the assistance of AI coding tools — specifically DeepSeek V4 Flash running inside DeepSeek Harness. The maintainer owns the product direction, requirements, and testing; changes are reviewed and covered by the test suite before release.</p>
+<h2>License</h2>
+<p><a href="https://github.com/my-dsh-plugin/thinking-level-override/blob/HEAD/LICENSE">Apache-2.0</a></p>

@@ -1,0 +1,252 @@
+<h1>dsh-plan-lattice</h1>
+<p><strong>Evidence-gated work graph for long-horizon DeepSeek Harness agents.</strong></p>
+<blockquote>
+<p>Every plan mutation earns its context. No parent completes before its evidence reconciles.</p>
+</blockquote>
+<p><code>dsh-plan-lattice</code> is an independent community plugin for DeepSeek Harness. It
+implements the "Fractal Ledger" method: begin with a small project tree,
+recursively split only the active frontier into atomic leaves, and make each
+meaningful change prove that the agent has just read the current project
+contract.</p>
+<p>It is designed for the failure mode where a long-running agent starts with a
+good plan, discovers new constraints during implementation, and quietly keeps
+executing an obsolete version of that plan.</p>
+<h2>What It Enforces</h2>
+<p>The plugin makes ten rules executable rather than advisory:</p>
+<ol>
+<li><strong>Configurable execution intake.</strong> Long work can run with <code>intakeMode: off</code>,
+<code>adaptive</code>, or <code>guided</code>. <code>off</code> preserves the original autonomous workflow.
+<code>adaptive</code> lets the user choose guided clarification or model-led autonomy
+for each long task. <code>guided</code> asks only high-impact missing questions and
+requires approval of the exact contract before planning starts.</li>
+<li><strong>Boundary before decomposition.</strong> Intake separates confirmed facts, product
+decisions, assumptions, and unknowns. It records the system boundary, time
+horizon, desired outcome, invariants, changeable forms, directional forces,
+and the few variables that decide success. Work below the configurable step
+threshold bypasses intake.</li>
+<li><strong>Human ownership.</strong> Only the live root agent may ask questions. Child agents
+must return unresolved boundary questions to their parent. User answers and
+decisions outrank model assumptions, while autonomous mode remains available
+with explicit assumptions and no detail-by-detail questioning.</li>
+<li><strong>Context contract.</strong> A project names its background, product, and
+architecture documents explicitly. <code>lattice_open</code> and
+<code>lattice_refresh_context</code> read every document in full, render their content
+and the exact copyable receipt fields to the agent, and issue a
+revision-bound SHA-256 receipt. Oversized context fails closed rather than
+being silently truncated.</li>
+<li><strong>Freshness receipt.</strong> Adding, splitting, editing, archiving, checking out,
+and checkpointing a node all reread the complete contract. The operation is
+refused when the receipt is stale, from another session, or when any tracked
+document changed since it was issued.</li>
+<li><strong>Recursive work graph.</strong> The workspace ledger has stable node ids, an
+append-only audit history, compare-and-set revisions, a small branching
+policy, and evidence attached to each leaf. It is not a replace-all todo
+list or a workflow scheduler.</li>
+<li><strong>Reconciliation gate.</strong> A configured write tool needs an active leaf lease.
+After each successful guarded action, the next guarded action is denied
+until <code>lattice_checkpoint</code> records evidence. A parent becomes complete only
+when every live child is complete, at which point it receives derived
+reconciliation evidence.</li>
+<li><strong>Compaction and contract-change fences.</strong> When Harness commits a
+<code>compaction/summary</code>, the plugin revokes that session's receipt and marks its
+active lease as needing a refresh. The next guarded write is denied until
+<code>lattice_refresh_context</code> rereads and renders the complete contract again.
+This is deliberately conservative: the plugin does not guess whether one
+particular tool result survived a model-visible history replacement.
+Immediately before every configured guarded write, it also synchronously
+rechecks the declared contract against the last rendered digest.</li>
+<li><strong>Dynamic reframing.</strong> When a material fact changes the boundary, acceptance
+criteria, or irreversible work, <code>lattice_reframe</code> renews the human policy,
+persists a new intake contract, bumps the graph revision, and keeps existing
+nodes visible for explicit reconciliation. It does not silently replace the
+work graph.</li>
+<li><strong>Contract-set adoption.</strong> If a newly discovered decision or architecture
+   document must govern the task, <code>lattice_adopt_context</code> first proves a
+   current read of the old contract, rejects the change while any leaf is
+   checked out, reads every added file before durable mutation, then renders
+   the complete new contract with a new revision-bound receipt. A missing,
+   unsafe, or oversized addition leaves the old graph and contract intact.</li>
+</ol>
+<p>The default shape is at most two top-level nodes and five children per nested
+node. That deliberately keeps a dynamic task understandable instead of
+spawning an uncontrolled task swarm. These limits are configurable; they are
+not a promise of parallelism.</p>
+<h2>Why This Is Different</h2>
+<p>Harness already provides plan mode, a same-session goal, and a per-turn flat
+todo list. Ecosystem plugins also cover Markdown specifications, plan review,
+workflow graphs, and task scheduling. Plan Lattice does not replace them.</p>
+<p>Its narrow ownership point is the missing hard boundary between <strong>establishing
+the current execution contract</strong> and <strong>changing or advancing a recursive
+plan</strong>. The ledger records structure, references, timestamps, and content
+digests. When intake is enabled, a separate generated contract records the
+confirmed framing and human answers; source product documents are not copied.</p>
+<p>This responds to real Harness reports where final child verification arrived
+after the parent goal had already been completed, and where repeated whole
+context injection had no clear budget. The design uses receipts and a bounded
+contract instead of assuming a model will remember to update a Markdown plan.</p>
+<h2>Install</h2>
+<p>Build a portable bundle and add it to a Harness profile:</p>
+<pre><code>pnpm install
+pnpm pack
+dsh plugin --profile web add ./dsh-plan-lattice-&lt;version&gt;.tgz
+</code></pre>
+<p>The default patch enables the plugin. Configure it only when the deployment
+needs a different write boundary or budget:</p>
+<pre><code>- id: plan-lattice
+  config:
+    guardedTools: [write, edit, str_replace_editor]
+    strictBash: false
+    intakeMode: adaptive
+    longTaskThreshold: 8
+    maxContextBytes: 262144
+    topLevelLimit: 2
+    nestedLimit: 5
+    snapshotEvery: 1024
+</code></pre>
+<p><code>bash</code> is intentionally not guarded by default. A shell command cannot be
+classified safely as read-only from its text alone. Set <code>strictBash: true</code> to
+gate every bash invocation behind a lattice leaf and checkpoint.</p>
+<p><code>intakeMode</code> defaults to <code>off</code> for compatibility and fully autonomous use.
+Choose <code>adaptive</code> when each long task should begin with a single guided-versus-
+autonomous choice, or <code>guided</code> when the user must answer high-impact questions
+and approve the exact contract. The default <code>longTaskThreshold</code> is 8 estimated
+atomic steps. The web profile supplies a user-question provider; an unattended
+or headless profile must mount its own provider or leave intake <code>off</code>.</p>
+<h2>Workflow</h2>
+<ol>
+<li>When intake is enabled and the honest estimate meets the configured
+threshold, call <code>lattice_intake</code> after reading repository evidence. In
+adaptive mode, honor the user's guided or autonomous choice. Persisted
+assumptions must remain explicit in either path.</li>
+<li>Call <code>lattice_open</code> with the durable outcome, exact step estimate, intake
+receipt when required, and every required
+workspace-relative product or architecture document. Read the returned
+context before planning.</li>
+<li>Use the returned receipt and revision with <code>lattice_add</code> to create one or
+two root outcomes. Every structural tool consumes its receipt, so call
+<code>lattice_refresh_context</code> and read the complete rendered contract before the
+next add, split, edit, archive, checkout, or checkpoint.</li>
+<li>Call <code>lattice_checkout</code> on one leaf. The plugin then permits configured
+write tools for that leaf.</li>
+<li>After every successful guarded action, call <code>lattice_refresh_context</code>, then
+call <code>lattice_checkpoint</code> with a concise outcome and concrete references
+such as file paths, commands, test names, or review artifacts. The next
+write remains blocked until then.</li>
+<li>Set <code>complete: true</code> only when the leaf acceptance criterion is proven.
+Parents collapse automatically only after all of their live children are
+complete.</li>
+<li>After Harness compacts the session, call <code>lattice_refresh_context</code> before
+the next guarded write. A committed <code>compaction/summary</code> invalidates the
+session's active receipt and lease even when the project documents on disk
+have not changed.</li>
+<li>If a newly discovered fact changes the boundary, acceptance criteria, or
+irreversible work, checkpoint the active leaf and call <code>lattice_reframe</code>.
+Reconcile every unfinished node against the newly approved contract before
+continuing.</li>
+<li>If a newly discovered document must constrain future work, first finish or
+checkpoint every checked-out leaf. Call <code>lattice_refresh_context</code>, then
+<code>lattice_adopt_context</code> with the current receipt and the new paths. Read the
+complete returned contract before taking the next plan action. The existing
+graph remains durable; re-opening the workspace is neither needed nor
+permitted.</li>
+<li>If any declared product or architecture document changes, the next guarded
+   write is rejected automatically. Call <code>lattice_refresh_context</code>, read its
+   complete rendered output, and then reconsider the next action. This closes
+   the period between checkout or checkpoint and the next side effect without
+   relying on the model to notice an external edit.</li>
+</ol>
+<p>The fence detects the contract at authorization time. It cannot make an
+arbitrary third-party file writer and an arbitrary guarded tool one filesystem
+transaction; deployments that need that stronger property must use their host
+workspace locking policy as well.</p>
+<p>The always-available tools are <code>lattice_open</code>, <code>lattice_status</code>,
+<code>lattice_refresh_context</code>, <code>lattice_adopt_context</code>, <code>lattice_add</code>,
+<code>lattice_split</code>, <code>lattice_update</code>, <code>lattice_archive</code>, <code>lattice_checkout</code>, and
+<code>lattice_checkpoint</code>. <code>lattice_intake</code> and <code>lattice_reframe</code> are registered
+when intake mode is <code>adaptive</code> or <code>guided</code>.</p>
+<h2>Storage And Privacy</h2>
+<p>One workspace stores its materialized snapshot, short replay ledger, and
+append-only history under:</p>
+<pre><code>.dsh/plan-lattice/v1/
+</code></pre>
+<p>The Plan Lattice ledger stores node metadata, evidence references, timestamps,
+context paths, and SHA-256 digests. It does not copy source product or
+architecture document bodies into <code>.dsh/plan-lattice</code>. With intake enabled,
+<code>INTAKE.md</code> and <code>intake.json</code> also store the generated execution framing,
+explicit assumptions and unknowns, and the user's submitted clarification
+answers. Treat those files as project-sensitive state.</p>
+<p><code>lattice_status</code> is deliberately a bounded projection: it returns counts and a
+small actionable frontier (16 nodes by default, 64 maximum), or one focused
+node with a bounded direct-child list. A large ledger is durable project state,
+not material to dump back into the model prompt. The process caches the
+materialized graph behind a tiny revision marker, while restarts rebuild from
+the snapshot plus its replay ledger.</p>
+<p>The tool response does include complete current context because an agent cannot
+earn a meaningful read receipt without being able to inspect what it read. As
+with every model-visible tool result, the active Harness session persistence
+may retain that response in its own session log. Treat declared context
+documents as session-visible data and use the Harness session storage policy
+appropriate for the workspace.</p>
+<h2>Guarantees And Boundaries</h2>
+<p>The protocol is designed so a ten-step and a very deep task follow the same
+state rules: mutations are revision checked, require a full current contract
+read, and record evidence before a parent may complete. It can prevent stale
+plan state from being silently advanced.</p>
+<p>No plugin can guarantee that a language model will always understand every
+requirement or produce equal-quality output at arbitrary scale. Plan Lattice
+does not claim that. Its guarantee is operational: it exposes and rejects the
+specific missing-state transitions that let a long task drift without a fresh
+context read, an execution checkpoint, or a parent-child reconciliation.</p>
+<p>It does not run subagents, schedule work, replace Harness plan mode, or infer
+which arbitrary shell commands write files. Use the host sandbox and approval
+policy for security boundaries.</p>
+<p>Intake and reframe serialization is process-local. Multiple Harness processes
+sharing one workspace still need a host-level workspace lock. Intake uses
+atomic file replacement and a digest-bound JSON commit marker; an interrupted
+or competing update fails closed and may require the intake or reframe to be
+run again. The plugin is a workflow integrity boundary, not a distributed
+transaction or access-control system.</p>
+<h2>Verification</h2>
+<p>Version <code>0.3.0</code> has 20 automated tests against real Harness <code>Context</code>, agent,
+system-prompt, user-question, session, and tool-runtime services. The suite
+proves:</p>
+<ul>
+<li>guided clarification, exact contract review, adaptive autonomous choice, and
+threshold bypass through the real <code>UserQuestionService</code> seam;</li>
+<li>intake receipts bound to the exact session, step estimate, mode, and generated
+contract digest, with incomplete or rejected intake failing closed;</li>
+<li>live reframing after a material fact changes, while retaining old nodes for
+explicit reconciliation;</li>
+<li>every context-rendering tool exposing the exact copyable receipt id and
+revision in final model-facing content, not only internal JSON;</li>
+<li>guarded writes requiring an active leaf, a fresh full contract, and an
+evidence checkpoint before the next guarded action;</li>
+<li>contract edits and real session compaction blocking later guarded writes until
+the full current contract is rendered again;</li>
+<li>contract-set adoption without losing graph nodes, including safe rejection of
+missing additions and conflicting session leases; and</li>
+<li>parent completion only after every live child has evidence-backed completion.</li>
+</ul>
+<p>The scale proof builds and advances a 100,000-node graph, restarts it from the
+snapshot plus replay ledger, and verifies that <code>lattice_status</code> stays bounded.
+Separate store instances prove cache invalidation after external commits and
+that rejected mutations do not leak into durable state.</p>
+<p>A real-model smoke on DeepSeek Harness <code>master</code> (<code>47f943859b</code>) used the same
+DeepSeek model defaults, fixture, scripted clarification, and external 100-point
+grader for three fixed arms. With one run per arm, native sparse, native full,
+and Plan Lattice guided each scored 100. The guided run produced 57 passing
+fixture tests, completed all 7 lattice nodes, and made 39 lattice calls with
+zero lattice errors after the receipt-presentation fix. This is compatibility
+and non-regression evidence, not an improvement claim; the sample size is one
+and the fixture was too easy to separate already-correct outputs. The public
+protocol and grader live under <code>eval/</code> so later claims cannot quietly change the
+rubric after seeing a result.</p>
+<p>Run the local suite with:</p>
+<pre><code>pnpm test
+pnpm run check
+pnpm run build
+</code></pre>
+<p>Artifact-level profile boot and published-release verification are recorded in
+the release notes for each version.</p>
+<h2>License</h2>
+<p>MIT</p>

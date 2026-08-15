@@ -1,0 +1,242 @@
+<h1>dsh-agentmemory</h1>
+<blockquote>
+<p><strong>dsh-agentmemory</strong> — a <a href="https://github.com/Yiipu/dsh-agentmemory/blob/HEAD//deepseek-harness">DSH</a> (DeepSeek Harness) Cordis plugin that bridges a session's activity into <a href="https://github.com/rohitg00/agentmemory">agentmemory</a>, a local, self-hosted memory daemon.</p>
+</blockquote>
+<p>English | <a href="https://github.com/Yiipu/dsh-agentmemory/blob/HEAD/README.zh.md">中文</a></p>
+<p>The plugin subscribes to the DSH <strong>Session lifecycle</strong> events, mirrors session activity into the agentmemory daemon (REST, default <code>http://localhost:3111</code>), and exposes <strong><code>memory_recall</code> / <code>memory_remember</code></strong> model tools. It additionally injects a memory window into model requests once per session through the <strong><code>agent/pre-step</code></strong> waterfall.</p>
+<p>All configuration comes from the plugin's row in <code>cordis.yml</code> — editing the <code>config</code> field of that row (or the file that carries it) is how you change configuration. There is no browser UI and no persisted config file.</p>
+<blockquote>
+<p><strong>agentmemory is a hard dependency.</strong> On load, the plugin checks <code>&lt;baseUrl&gt;/agentmemory/livez</code> before registering any capability (tools, listeners). If the daemon is unreachable or does not report <code>status: ok</code>, the plugin <strong>fails to load loudly</strong> — it does not silently degrade.</p>
+</blockquote>
+<h2>Capability overview</h2>
+<table>
+<thead>
+<tr>
+<th>Capability</th>
+<th>Implementation</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>Session lifecycle → agentmemory</td>
+<td><code>session/created</code> → <code>session/start</code>; <code>session/event</code> → <code>observe</code> (buffered); <code>session/flush</code> → flush to disk; <code>session/disposed</code> → <code>session/end</code></td>
+</tr>
+<tr>
+<td>Model tools (read)</td>
+<td><code>memory_recall</code> → <code>POST /agentmemory/search</code> (auto-locates <code>sessionId</code>/project from the calling session)</td>
+</tr>
+<tr>
+<td>Model tools (write)</td>
+<td><code>memory_remember</code> → <code>POST /agentmemory/remember</code> (decisions, preferences, architecture facts, and similar)</td>
+</tr>
+<tr>
+<td><strong>Memory injection</strong></td>
+<td>Sourced <code>user/message</code> via the <code>agent/pre-step</code> waterfall: ① <strong>project recall</strong> (<code>form: 'recall'</code>) injects the project-level <code>/context</code> cross-session window once per session; ② <strong>semantic recall</strong> (<code>form: 'semantic'</code>, optional) uses each user message to recall relevant memory titles via <code>/smart-search</code>; a pre-compaction re-inject keeps the project window when history compresses. The front end renders each injection as an independent "context injection" block (<code>ContextMessageNode</code>)</td>
+</tr>
+<tr>
+<td><strong>Configuration source</strong></td>
+<td>Read-only <code>config</code> from the <code>cordis.yml</code> row; no UI, no file persistence</td>
+</tr>
+</tbody></table>
+<h2>Install (static composition)</h2>
+<p>Mount the row from <code>cordis-row.example.yml</code> into a host composition <code>cordis.yml</code> (or into a per-session agent preset's composition under <code>${DSH_HOME:-$HOME/.dsh}/.agent-presets/&lt;id&gt;/</code>). First install the package from GitHub into a profile:</p>
+<pre><code>dsh plugin --profile web add github:Yiipu/dsh-agentmemory
+</code></pre>
+<p>(A local dev checkout also works via <code>dsh plugin --profile web add /path/to/checkout</code>.)</p>
+<p>Then add the row (<code>@</code> begins a YAML reserved scalar, so the package name must be quoted):</p>
+<pre><code>- insert:
+    - id: agentmemory-bridge
+      name: "dsh-agentmemory"
+      config:
+        baseUrl: http://localhost:3111
+        enabled: true
+</code></pre>
+<p>Validate: <code>node scripts/boot-check.mjs</code> (7 checks, needs the daemon on :3111); <code>node test/smoke.mjs</code> (end-to-end, needs the daemon on :3111).</p>
+<blockquote>
+<p>Requires Node &gt;= 20 and a <code>shell</code> capability seam (the standard bash/pwsh executors).</p>
+</blockquote>
+<h2>Hard dependency: the daemon must be reachable at load</h2>
+<p>agentmemory is a <strong>hard dependency</strong>. <code>apply()</code> probes <code>&lt;baseUrl&gt;/agentmemory/livez</code> with one curl before registering any capability:</p>
+<ul>
+<li>reachable and <code>status: ok</code> → loading continues;</li>
+<li>unreachable / not ok → <strong>plugin load fails (loudly)</strong>, no silent degradation;</li>
+<li>no <code>shell</code> seam → load fails.</li>
+</ul>
+<blockquote>
+<p>This is a <strong>load-time</strong> hard gate. If the daemon drops during a run the plugin is tolerant: every call is logged and contained, and it never vetoes a session lifecycle event or a model step.</p>
+</blockquote>
+<h2>Configuration keys</h2>
+<p><code>baseUrl</code>, <code>secret</code> (below), <code>enabled</code> (bridge master switch), <code>enableTools</code>, <code>enableSessionStartEnd</code>, <code>curlTimeoutMs</code>, <code>observeBatchLimit</code>, <code>maxContentChars</code>, <code>maxArgsChars</code>,
+<code>injectContext</code> (project recall switch, default <code>true</code>), <code>injectContextMaxChars</code> (default <code>6000</code>), <code>injectContextOnCompaction</code> (pre-compaction re-inject, default <code>true</code>),
+<code>injectSemantic</code> (semantic recall switch, default <code>false</code>), <code>injectSemanticMaxResults</code> (default <code>8</code>), <code>injectSemanticMaxChars</code> (default <code>3000</code>).</p>
+<p>Keys omitted from a row are filled with defaults by Cordis according to the plugin's <code>Config</code> schema — do <strong>not</strong> hand-write a merge. Cordis validates natively: an invalid value (such as <code>curlTimeoutMs: -5</code>) makes the plugin <strong>fail to load</strong> with a clear error. The full numeric bounds (min/max) are declared on each key in <code>index.js</code>.</p>
+<h3><code>secret</code>: plaintext or an environment-variable reference</h3>
+<p><code>secret</code> accepts two forms; whether you write plaintext is your choice:</p>
+<table>
+<thead>
+<tr>
+<th>Form</th>
+<th>Behavior</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>secret: "xxx"</code></td>
+<td>Plaintext, used verbatim as the Bearer token</td>
+</tr>
+<tr>
+<td><code>secret: '${AGENTMEMORY_SECRET}'</code></td>
+<td>Reads the env var; if unset → <strong>load fails (loudly)</strong></td>
+</tr>
+<tr>
+<td><code>secret: '${AGENTMEMORY_SECRET:default}'</code></td>
+<td>Reads the env var; if unset → uses <code>default</code></td>
+</tr>
+<tr>
+<td><code>secret: '${AGENTMEMORY_SECRET:?goes nowhere}'</code></td>
+<td>Reads the env var; if unset → fails with the message <code>goes nowhere</code></td>
+</tr>
+</tbody></table>
+<p>Environment variables are resolved through the <code>shell</code> seam at the start of <code>apply()</code> (the sandbox has no direct env access).</p>
+<h2>Memory injection (read side → model + "context injection" front-end block)</h2>
+<p>The bridge uses DSH's native <strong><code>agent/pre-step</code></strong> injection channel (the same pattern as <code>dsh-time-context</code>) and appends sourced <code>user/message</code> rows to the tail of the incoming message batch. The two injection routes each have a distinct job and both deduplicate at the event level — they do <strong>not</strong> re-inject on every tool step.</p>
+<h3>Route 1 — Project recall (<code>form: 'recall'</code>, on by default)</h3>
+<p>Injects <strong>once</strong> per session the agentmemory <strong><code>/context</code> project-level cross-session window</strong> ("what this project has done before", excluding the current session). <code>session/created</code> → <code>/session/start</code> caches <code>context</code> from the response; the first step in <code>agent/pre-step</code> that has a cached window appends it once (<code>st.injectedContext</code> dedup); every <code>user/message</code> still refreshes the cache asynchronously.</p>
+<h3>Route 2 — Semantic recall (<code>form: 'semantic'</code>, off by default)</h3>
+<p>Each <code>user/message</code> runs a <code>/smart-search</code> (BM25 + vector + graph) on the raw text and assembles the recalled memory <strong>titles</strong> into one injected message (<code>st.semanticSeq</code> dedups per message). Precise recall (<code>/search</code>) is still left to the agent's explicit <code>memory_recall</code> tool.</p>
+<h3>Pre-compaction re-inject (<code>injectContextOnCompaction</code>, on by default)</h3>
+<p><code>compaction/start</code> triggers a <code>/context</code> refresh and the next <code>agent/pre-step</code> re-injects the latest project window so project background survives history compression.</p>
+<h2>Session lifecycle → agentmemory mapping</h2>
+<p>The bridge maps every DSH event to an agentmemory <strong>standard hookType</strong> so the daemon's compression pipeline reads real content (custom hookTypes collapse to <code>{timestamp, hookType}</code>, degrading summaries):</p>
+<table>
+<thead>
+<tr>
+<th>DSH event</th>
+<th>hookType</th>
+<th>standard <code>data</code> fields</th>
+<th>dedup discriminator</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>user/message</code></td>
+<td><code>prompt_submit</code></td>
+<td><code>prompt=content</code></td>
+<td><code>tool_input=content</code> (identical prompts merge naturally)</td>
+</tr>
+<tr>
+<td><code>assistant/message</code></td>
+<td><code>post_tool_use</code></td>
+<td><code>tool_name='assistant_message'</code>, <code>tool_output=content</code></td>
+<td><code>tool_input='#'+seq</code> (unique; content not in Input)</td>
+</tr>
+<tr>
+<td><code>tool/call</code></td>
+<td><code>dsh_tool_call</code></td>
+<td><code>tool_name='dsh_call'</code></td>
+<td><code>tool_input='call#'+callId</code> (not merged with the result)</td>
+</tr>
+<tr>
+<td><code>tool/result</code> (ok)</td>
+<td><code>post_tool_use</code></td>
+<td><code>tool_name/tool_input/tool_output</code> (callMeta fallback)</td>
+<td><code>tool_input=args</code></td>
+</tr>
+<tr>
+<td><code>tool/result</code> (err)</td>
+<td><code>post_tool_failure</code></td>
+<td>same + <code>error</code></td>
+<td><code>tool_input=args</code></td>
+</tr>
+<tr>
+<td><code>turn/end</code></td>
+<td><code>dsh_turn_end</code></td>
+<td>—</td>
+<td><code>tool_input='turn#'+seq</code> (unique)</td>
+</tr>
+</tbody></table>
+<p><strong>Dedup-safe design</strong>: agentmemory's <code>mem::observe</code> drops duplicates by <code>sha256(sessionId, tool_name||hookType, tool_input[0..500])</code> with a 5-minute TTL; a hit discards the observation. The bridge uses a per-session monotonic <code>seq</code> and natural content/<code>callId</code> as the <code>tool_input</code> discriminator, so multiple rows of the same kind all persist while identical prompts / identical <code>(tool, args)</code> results still merge naturally.</p>
+<h2>Model tools</h2>
+<table>
+<thead>
+<tr>
+<th>Tool</th>
+<th>Arguments</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>memory_recall</code></td>
+<td><code>query</code> (required), <code>limit?</code>, <code>sessionId?</code>, <code>project?</code></td>
+<td>Auto-locates sessionId/project from the calling session; recalls across sessions</td>
+</tr>
+<tr>
+<td><code>memory_remember</code></td>
+<td><code>content</code> (required), <code>type?</code>, <code>concepts?</code>, <code>ttlDays?</code></td>
+<td>Curated, durable memory; <code>type</code> ∈ pattern/preference/architecture/bug/workflow/fact</td>
+</tr>
+</tbody></table>
+<p>Tools are defined with <code>defineTool</code> and registered through <code>ctx.tools.register</code>, and daemon transport runs over the host <code>shell</code> seam (<code>inject: ['tools', 'shell']</code>); both are cleaned up automatically with the plugin Fiber lifecycle. On failure, <code>execute</code> returns <code>{ok: false, error}</code> rather than throwing.</p>
+<h2>Model Experience</h2>
+<h3>Common requests</h3>
+<h4>What the model sees</h4>
+<p>The bridge does not alter accepted input. Its observable model input is additive after the incoming batch: one injected sourced <code>user/message</code> per projective event, whose <code>text</code> is the project <code>/context</code> window (route 1), the semantic recall titles (route 2), or a pre-compaction re-inject of the project window (<code>source.kind === 'plugin'</code>, <code>plugin === 'agentmemory'</code>, <code>form</code> <code>'recall'</code> / <code>'semantic'</code>). Tool calls <code>memory_recall</code> and <code>memory_remember</code> are registered only when <code>enableTools</code> is true.</p>
+<h4>Token effect</h4>
+<p>Conditional. Injection contributes extra input tokens only at the dedup boundaries — once per session for project recall, once per user message for semantic recall when enabled, and once per compaction — not per tool step. Capped by <code>injectContextMaxChars</code> / <code>injectSemanticMaxChars</code>. Tool schemas add a small fixed token cost while <code>enableTools</code> is true. Tool responses are returned to the model's context window normally.</p>
+<h4>KV Cache effect</h4>
+<p>Append-only, prefix-stable. Injected messages are appended at the tail of the step's message batch, so the prior message prefix is preserved and reusable; re-injection changes the suffix. The dedup conditions (<code>injectedContext</code>, <code>injectedSemanticKey</code>, <code>compactionInject</code>) prevent repeated appends of the same block at the same boundary, so a stable prefix is not invalidated by the bridge's own activity across steps.</p>
+<h2>Transport and failure semantics</h2>
+<ul>
+<li>The sandbox has no <code>fetch</code>/require/timers; outbound traffic goes through the <code>shell</code> capability seam, one curl per call with the JSON body on stdin (<code>--data-binary @-</code>).</li>
+<li><strong>Never veto a lifecycle event</strong>: listeners are fully try/catch guarded.</li>
+<li>Infrastructure failures re-queue and retry at the next checkpoint; payload-level failures are logged and dropped.</li>
+<li>Flush race: if a flush is in flight when new events arrive, the <code>dirty</code> flag makes the in-flight loop re-send them, so nothing is lost.</li>
+</ul>
+<h2>Verification</h2>
+<pre><code>cd plugins/agentmemory
+node scripts/boot-check.mjs   # module + Config schema + daemon livez + peer deps (7 checks)
+node test/smoke.mjs           # end-to-end (needs the daemon on :3111)
+</code></pre>
+<p>The smoke test covers: Config schema validation (including rejecting invalid values), the <code>apply</code> liveness hard gate (including loud failure on an unreachable daemon), <code>defineTool</code> tool registration, the three secret env-reference forms, observation persistence and session state, and the <code>agent/pre-step</code> injection shape with watermark pass-through.</p>
+<h2>Local development: resolving peer dependencies</h2>
+<p>The plugin imports <code>@deepseek-ai/schemastery</code> and <code>@deepseek-ai/dsh-tools</code> (peer deps, resolved by the harness at runtime). To run boot-check / smoke with plain Node from this repo without installing the whole harness, link the built-in packages in:</p>
+<pre><code>mkdir -p node_modules
+ln -s &lt;harness&gt;/node_modules/@deepseek-ai node_modules/@deepseek-ai
+</code></pre>
+<p>(<code>&lt;harness&gt;</code> is the global dsh install directory; when installed via pnpm in a profile these resolve automatically and this step is unnecessary.)</p>
+<h2>Files</h2>
+<table>
+<thead>
+<tr>
+<th>File</th>
+<th>Purpose</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>index.js</code></td>
+<td>Single static entry: <code>Config</code> schema, <code>inject</code>, <code>apply</code> (lifecycle + tools + injection + livez hard gate)</td>
+</tr>
+<tr>
+<td><code>index.d.ts</code></td>
+<td><code>Config</code> type and the plugin's exported type surface</td>
+</tr>
+<tr>
+<td><code>cordis-row.example.yml</code></td>
+<td>Static composition row example (<code>name</code> uses a resolvable package name)</td>
+</tr>
+<tr>
+<td><code>scripts/boot-check.mjs</code></td>
+<td>Boot/CI readiness check (module + schema + daemon + peer deps, 7 checks)</td>
+</tr>
+<tr>
+<td><code>test/smoke.mjs</code></td>
+<td>End-to-end smoke test</td>
+</tr>
+<tr>
+<td><code>package.json</code></td>
+<td>Publishable structure (<code>dsh-agentmemory</code>, with peer deps)</td>
+</tr>
+</tbody></table>
+<h2>Known Limitations and Deferred Work</h2>
+<ul>
+<li><strong>Memory is shared across sessions by default</strong> (no <code>agentId</code> is passed); to isolate, add an <code>agentId</code> to <code>observe</code>/remember calls.</li>
+<li><strong>Project resolution order</strong>: <code>AGENTMEMORY_PROJECT_NAME</code> env var → git toplevel basename → cwd basename.</li>
+<li><strong>The bridge does not modify any <code>@deepseek-ai</code> package</strong> and does not touch the shipped preset install directory.</li>
+</ul>

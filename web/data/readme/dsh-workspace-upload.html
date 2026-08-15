@@ -1,0 +1,124 @@
+<h1>dsh-workspace-upload</h1>
+<p>English | <a href="https://github.com/LI-Huaa/dsh-workspace-upload/blob/HEAD/README-zh.md">中文</a></p>
+<p>A workspace file-manager plugin for the <a href="https://github.com/deepseek-ai/deepseek-harness">dsh</a>
+Web profile — browse, upload, download, rename, create and delete files in the
+session's workspace, right from the chat UI.</p>
+<h2>Features</h2>
+<ul>
+<li>A <strong>文件 (Files) button</strong> in the composer's left controls opens a file-manager
+dialog over the app:<ul>
+<li>browse the workspace and its subdirectories (breadcrumb navigation, up /
+refresh);</li>
+<li><strong>upload</strong> — multi-file, chunked, any size (640 KiB chunks, adaptive shrink
+under proxy body limits);</li>
+<li><strong>download</strong> files;</li>
+<li><strong>rename</strong> files and folders;</li>
+<li><strong>create folders</strong>;</li>
+<li><strong>delete</strong> files and folders (two-step confirm).</li>
+</ul>
+</li>
+<li>Every operation is scoped to the workspace root: host-side path containment
+rejects any <code>..</code> or absolute-path escape.</li>
+<li>The workspace resolves to the session's workspace (session → cwd → first
+registered workspace).</li>
+</ul>
+<h2>Directory structure</h2>
+<pre><code>dsh-workspace-upload/
+├── cordis.patch.yml      # profile patch layer: inserts the plugin row
+├── package.json          # dsh.bundle / dsh.client declarations, exports
+├── lib/
+│   ├── index.js          # host half: /api/workspace-upload file-manager route
+│   └── client.js         # client half: browser bundle (button + dialog)
+├── test/
+│   ├── protocol.mjs      # host protocol tests (real handler, no dsh needed)
+│   └── simulate.mjs      # client kernel simulation (slot registration fake)
+├── LICENSE               # MIT
+├── .gitignore
+├── README.md             # English
+└── README-zh.md          # 中文
+</code></pre>
+<h2>Architecture</h2>
+<p>One package, one profile row, two halves:</p>
+<table>
+<thead>
+<tr>
+<th>Half</th>
+<th>File</th>
+<th>Role</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>Host</td>
+<td><code>lib/index.js</code></td>
+<td>Registers <code>GET/POST /api/workspace-upload</code> on the dsh web server: list / rename / mkdir / delete / download / chunked upload, all with workspace containment.</td>
+</tr>
+<tr>
+<td>Client</td>
+<td><code>lib/client.js</code></td>
+<td>Browser bundle (<code>window.__ModuleLoader__.load</code>): the trigger button in <code>conversation.input.left</code>; the dialog renders from the button itself (plain local state, <code>position: fixed</code> overlay).</td>
+</tr>
+</tbody></table>
+<p>Wiring:</p>
+<ul>
+<li><code>package.json</code> → <code>dsh.bundle.patch</code> points at <code>cordis.patch.yml</code> (the profile
+layer that inserts the row) and <code>dsh.client.platform: "web"</code> marks the
+package as a browser-roster entry whose bundle ships via <code>exports["./client"]</code>.</li>
+<li><code>cordis.patch.yml</code> inserts one row, <code>workspace-upload</code>, into the web
+composition.</li>
+</ul>
+<h2>API</h2>
+<pre><code>GET  /api/workspace-upload
+       → { "workspace": "&lt;resolved workspace dir&gt;" }        (no params)
+       → file download with attachment headers              (?sessionId&amp;path&amp;name)
+</code></pre>
+<p>File-manager modes (JSON POST; <code>path</code> is a workspace-relative directory
+<code>""</code> / <code>"sub"</code> / <code>"sub/deep"</code>, <code>name</code> is always one path segment):</p>
+<pre><code>{ "mode": "list",   "sessionId"?, "path"? }                    → { workspace, path, entries:[{name,type,size,mtime}] }
+{ "mode": "rename", "sessionId"?, "path"?, "name", "newName" } → { ok, from, to }
+{ "mode": "mkdir",  "sessionId"?, "path"?, "name" }            → { ok, path }
+{ "mode": "delete", "sessionId"?, "path"?, "name" }            → { ok, deleted }
+</code></pre>
+<p>Chunked upload (any file size; the GUI sends 640 KiB chunks — base64 bodies
+~853 KiB, under the nginx default <code>client_max_body_size</code> of 1 MiB; on a bare
+<code>413</code> the client halves the chunk size down to 64 KiB and retries):</p>
+<pre><code>{ "mode": "chunk",  "sessionId"?, "path"?, "transferId", "name", "offset", "data", "total" } → { received }
+{ "mode": "finish", "sessionId"?, "path"?, "transferId", "name", "total", "overwrite"? }     → { status, path, bytes }
+{ "mode": "abort",  "transferId" }                                                            → { aborted }
+</code></pre>
+<p>Chunks are appended to a hidden <code>.dsh-upload-&lt;transferId&gt;</code> temp file inside the
+target directory and renamed on finish. Chunks must arrive in order from
+offset 0; a repeated chunk at an already-received offset is answered
+idempotently (safe client retry). Orphaned transfers are swept after
+30 minutes.</p>
+<p>A legacy single-shot batch mode is kept for API/curl compatibility:</p>
+<pre><code>{ "sessionId"?, "files": [{ "name", "data": "&lt;base64&gt;", "overwrite"? }] }
+  → { "workspace": string, "results": [{ name, path?, status, bytes?, error? }] }
+</code></pre>
+<p>Limits: 32 MiB per request (one chunk + overhead), 8 MiB decoded per chunk.
+<code>overwrite: true</code> replaces an existing file; otherwise the file is skipped with
+<code>status: "skipped"</code>.</p>
+<h2>Install</h2>
+<p>The package installs as a dsh profile bundle. From the checkout that owns the
+package directory:</p>
+<pre><code>dsh plugin --profile web add ./dsh-workspace-upload
+# or from a clone:  dsh plugin --profile web add /path/to/dsh-workspace-upload
+</code></pre>
+<p>Then restart the web profile (<code>dsh web ...</code>) so the loader picks up the new
+row, and refresh the browser. Removing the plugin:</p>
+<pre><code>dsh plugin --profile web remove dsh-workspace-upload
+</code></pre>
+<h2>Development</h2>
+<p>Both tests run without a dsh instance (they exercise the real host handler and
+client bundle factory directly):</p>
+<pre><code>node test/protocol.mjs   # host protocol: list/rename/mkdir/delete/download/chunked upload
+node test/simulate.mjs   # client kernel: slot registration against a faithful slots fake
+</code></pre>
+<h2>Security notes</h2>
+<ul>
+<li>All <code>path</code> / <code>name</code> values are sanitized and containment-checked on the host;
+uploads use hidden temp files that never escape the target directory.</li>
+<li>The route inherits the dsh web server's bind (localhost by default); when
+exposing the GUI remotely, put it behind the same TLS/Basic-Auth reverse
+proxy as the rest of the app (and raise <code>client_max_body_size</code> if you want
+fewer, larger chunks).</li>
+</ul>

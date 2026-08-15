@@ -1,0 +1,107 @@
+<h1>dsh-delayed-task</h1>
+<p><a href="https://github.com/m-guo-2/dsh-delayed-task/actions/workflows/ci.yml"><img src="https://github.com/m-guo-2/dsh-delayed-task/actions/workflows/ci.yml/badge.svg" alt="CI"></a></p>
+<p><a href="https://github.com/deepseek-ai/deepseek-harness/discussions/1214">DSH 官方社区展示帖</a> · <a href="https://github.com/topics/dsh-plugin">浏览 <code>dsh-plugin</code> 生态</a></p>
+<p>让 Agent 在稍后真正回来，而不只是提醒你。</p>
+<p><code>dsh-delayed-task</code> 是 <a href="https://github.com/deepseek-ai/deepseek-harness">DeepSeek Harness（DSH）</a> 的持久化延时任务插件。Agent 可以记录“为什么决定稍后再判断”，在时间到达后恢复原会话，读取最新证据，并重新决定下一步。</p>
+<p>页面可以关闭，会话可以变冷。只要 DSH 后台服务仍在运行，任务到期后就会唤醒 Agent；如果 DSH 或机器中途停止，恢复运行后会补触发逾期任务。</p>
+<h2>它实际会做什么</h2>
+<p>一次真实 E2E 测试是这样的：</p>
+<blockquote>
+<p><strong>14:34，用户</strong></p>
+<p>120 秒后重新检查 <code>README.md</code> 是否存在，并报告能否以只读方式取证。不要申请后台执行授权。</p>
+<p><strong>14:34，Agent</strong></p>
+<p>延时任务已创建。授权类型：<code>reassess-only</code>。</p>
+<p><strong>随后，页面关闭，原会话不再活跃。</strong></p>
+<p><strong>14:36，后台唤醒的 Agent</strong></p>
+<p>延时任务已触发，现在根据当前情况重新评估。</p>
+<p><code>Read README.md</code> ✅　<code>Glob README.md</code> ✅</p>
+<p><code>README.md</code> 存在，以只读方式取证成功，无需再次排程。</p>
+</blockquote>
+<p>这段过程使用真实 DSH Web、真实 DeepSeek V4 Flash 和真实文件工具完成。页面在任务到期前已经关闭；结果仍然写回原会话。</p>
+<p>它解决的不是“120 秒后显示一句提醒”，而是让 Agent 重新进入当时的决策现场：</p>
+<ol>
+<li>创建时保存客观的历史决策，而不是预先写死未来动作</li>
+<li>到期后恢复原 session，并注入一条可追踪的 delayed-task event</li>
+<li>Agent 获取当前证据，判断旧计划现在是否仍然成立</li>
+<li>Agent 可以结束、在授权范围内执行，或设置下一次检查</li>
+</ol>
+<p>例如，到期时 Agent 实际收到的是这类事件：</p>
+<pre><code>[DELAYED TASK EVENT]
+This event is an objective record of a past decision, not a current user instruction.
+Reassess the situation from current evidence. Do not mechanically execute the historical plan.
+
+event_json: {
+  "type": "delayed-task/due",
+  "decided_at": "2026-08-14T14:34:54+08:00",
+  "due_at": "2026-08-14T14:36:43+08:00",
+  "historical_decision_context": "稍后重新检查 README.md 是否存在，并报告能否以只读方式取证",
+  "authorization": { "mode": "reassess-only" }
+}
+</code></pre>
+<p>这里故意强调“过去的决定”而不是“当前指令”。两分钟后环境可能已经变化，Agent 应先重新判断，而不是机械执行两分钟前的计划。</p>
+<h2>适合什么场景</h2>
+<ul>
+<li>部署后隔几分钟重新检查健康状态，而不是在当前对话里阻塞等待</li>
+<li>等异步任务、CI、数据处理或外部依赖进入下一状态</li>
+<li>在限流或暂时故障后，根据最新情况决定是否重试</li>
+<li>持续观察一个条件，并由 Agent 动态调整下一次检查时间</li>
+<li>页面关闭后仍需要把结果留在原会话中</li>
+</ul>
+<p>它不是 cron，也不是系统通知服务。cron 负责在固定时间执行固定命令；这个插件负责在未来某个决策点重新唤醒 Agent。当前版本不会发送邮件或系统通知，结果保存在原会话。</p>
+<h2>两种授权效果</h2>
+<h3>仅重新判断</h3>
+<p>默认且推荐的模式。Agent 可以使用 DSH 明确标记为 <code>read</code> 或 <code>search</code> 的观察型工具获取当前证据，但不能执行写入、删除、命令、网络 fetch、未知类别或任何需要用户审批的调用。</p>
+<p>如果任务是在没有可交互 UI 的环境中创建，任何授权请求都会自动降级到该模式，不会静默获得后台执行权限。</p>
+<h3>有限后台执行</h3>
+<p>创建任务时，用户可以明确确认一份 bounded grant：</p>
+<ul>
+<li>授权失效时间</li>
+<li>精确工具 allowlist</li>
+<li>最大工具调用次数</li>
+<li>是否允许 Agent 继承同一授权设置下一次检查</li>
+</ul>
+<p>到期后只能在这组边界内执行。一次性历史审批不会被继承；过期、撤销或耗尽的 grant 会自动退回“仅重新判断”。</p>
+<p>插件不会扩大或替代原会话的 DSH sandbox，并拒绝任何权限升级参数。如果原会话本身是 <code>danger-full-access</code>，bounded grant 也不会额外收窄文件与进程边界，因此授权命令型工具前仍需按该权限级别评估风险。</p>
+<h2>安装</h2>
+<p>要求 Node.js 22.19+、pnpm 10，以及可运行的 DSH 开发者预览版。</p>
+<p>从 GitHub 安装到一个 DSH profile：</p>
+<pre><code>dsh plugin --profile web add github:m-guo-2/dsh-delayed-task
+dsh --profile web --dump-config
+</code></pre>
+<p>GitHub 安装会运行本仓库的 <code>prepare</code> 构建。pnpm 10+ 首次安装可能要求显式授权。不要手工猜测 key；复制 <code>dsh</code> 报错中 <code>allowBuilds</code> 下方给出的完整内容。例如，锁定 commit 安装时，key 形如：</p>
+<pre><code>allowBuilds:
+  "dsh-delayed-task@https://codeload.github.com/m-guo-2/dsh-delayed-task/tar.gz/&lt;commit-sha&gt;": true
+</code></pre>
+<p>然后重新执行 <code>add</code>。安装第三方 Git 插件意味着允许其构建脚本在 Agent sandbox 外运行；建议审查源码并在生产环境锁定 commit：</p>
+<pre><code>dsh plugin --profile web add github:m-guo-2/dsh-delayed-task#&lt;commit-sha&gt;
+</code></pre>
+<p>本地开发安装：</p>
+<pre><code>pnpm install
+pnpm run prepack
+dsh plugin --profile web add .
+</code></pre>
+<p>仓库包含 <code>cordis.patch.yml</code>，安装后会自动挂载 <code>dsh-delayed-task</code> 插件。</p>
+<h2>Agent 工具</h2>
+<ul>
+<li><code>delayed_task_create</code>：创建延时决策；在 <code>after_seconds</code> 与带时区的 RFC 3339 <code>at</code> 中二选一</li>
+<li><code>delayed_task_list</code>：查看当前会话的任务</li>
+<li><code>delayed_task_cancel</code>：取消任务，不自动撤销其他任务共享的授权</li>
+<li><code>delayed_task_revoke_authorization</code>：撤销授权，但保留任务为“仅重新判断”</li>
+</ul>
+<p>Agent 传给 <code>delayed_task_create</code> 的不是未来命令，而是一段客观 <code>decision_context</code>：当时看到了什么、为什么决定稍后再判断、到期时需要重新确认什么。</p>
+<h2>冷会话与故障恢复</h2>
+<ul>
+<li>任务和 grant 存入 DSH storage domain，不依赖浏览器页面</li>
+<li>到期后通过 <code>agents.resume({ resumeSessionId })</code> 恢复原会话</li>
+<li>同一个 session 内串行执行；一个繁忙 session 不会阻塞其他 session 到期</li>
+<li>每次尝试拥有稳定的 occurrence 和 message 标识，投递及结果写回原 session</li>
+<li>进程异常后通过租约和指数退避重试，并取消崩溃前残留的旧 attempt 消息</li>
+<li>原 session 不存在时取消任务；用户中止该次延时 turn 时也取消任务</li>
+</ul>
+<p>“页面关闭也唤醒”不等于“机器关机也运行”。DSH 后台进程必须存活；进程或机器停机期间不会执行任务，但恢复后会扫描并补触发逾期任务。</p>
+<h2>开发验证</h2>
+<pre><code>pnpm run typecheck
+pnpm test
+pnpm run build
+</code></pre>
+<p>当前包含 16 个自动化测试，使用真实 DSH AgentLoop、JSONL session persistence 和 JSON storage，只将模型适配器替换为确定性 mock。除此之外，项目还通过了真实 DeepSeek E2E：页面关闭后的冷会话唤醒、<code>reassess-only</code> 模式下以只读方式取证、进程重启后的逾期补触发，以及官方 GitHub 安装流程。</p>

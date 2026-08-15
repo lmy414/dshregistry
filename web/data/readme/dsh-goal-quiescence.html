@@ -1,0 +1,57 @@
+<h1>dsh-goal-quiescence</h1>
+<p><strong>Do not complete a Harness goal while observed subagent evidence is still
+running or has not been explicitly returned to the goal agent.</strong></p>
+<p><code>dsh-goal-quiescence</code> is a community plugin for DeepSeek Harness. It addresses
+the goal-mode failure reported in <a href="https://github.com/deepseek-ai/deepseek-harness/discussions/284">DeepSeek Harness Discussion #284</a>: a parent can call
+<code>update_goal(action=complete)</code> while background reviewers are still running,
+after which their result can arrive too late to affect the completed goal.</p>
+<h2>What it enforces</h2>
+<p>For every subagent run observed after the plugin has loaded under an active
+goal, the plugin records the public <code>subagent/start</code> and <code>subagent/end</code>
+lifecycle pair. It then denies <code>update_goal(action=complete)</code> until:</p>
+<ol>
+<li>Every observed child run has settled.</li>
+<li>The goal agent calls <code>goal_quiescence_ack</code> for every settled run. That tool
+returns the run's terminal assistant output as its own tool result, making
+the evidence visible in the parent agent's current context.</li>
+</ol>
+<p><code>goal_quiescence_status</code> gives a bounded list of the runs that still block
+completion. The plugin does not schedule, cancel, or retry children, and it
+does not replace Harness goal mode.</p>
+<h2>Install</h2>
+<pre><code>pnpm install
+pnpm pack
+dsh plugin --profile web add ./dsh-goal-quiescence-&lt;version&gt;.tgz
+</code></pre>
+<p>The bundled patch enables the plugin. It requires the normal Harness <code>goal</code>,
+<code>subagent</code>, and <code>tools</code> services provided by the Web profile.</p>
+<h2>Completion flow</h2>
+<ol>
+<li>Work normally in goal mode and delegate background reviews as needed.</li>
+<li>If goal completion is denied, call <code>goal_quiescence_status</code>.</li>
+<li>Wait for each <code>running</code> run to settle.</li>
+<li>Call <code>goal_quiescence_ack</code> with each returned <code>runId</code>; inspect the terminal
+output it returns.</li>
+<li>Resolve any reported finding, then call <code>update_goal(action=complete)</code>.</li>
+</ol>
+<h2>Guarantees and boundaries</h2>
+<p>The gate is a process-local lifecycle policy. It covers runs that begin after
+the plugin is loaded and completion attempts made through the model-facing
+<code>update_goal</code> tool. The policy deliberately does not claim to be an atomic core
+transaction: direct service calls, a process restart, or a child that began
+before plugin activation are outside its observable boundary. A core lifecycle
+permit would be needed for an end-to-end atomic guarantee.</p>
+<p>Within that boundary, acknowledgement is not a metadata checkbox: the
+acknowledgement tool returns the saved terminal output into the parent agent's
+tool context before it releases completion. This prevents the specific
+"settled but unseen" state from being treated as complete.</p>
+<h2>Verification</h2>
+<p>The integration test mounts the real Harness <code>ToolRuntime</code>, <code>GoalService</code>, and
+<code>SubagentRuntime</code>. It starts a real runtime lifecycle through a deferred
+provider, proves completion is denied while the child is running, proves it is
+still denied after settlement but before acknowledgement, verifies the child
+output reaches the acknowledgement tool result, and finally completes the
+unchanged goal revision.</p>
+<pre><code>pnpm test
+pnpm check
+</code></pre>

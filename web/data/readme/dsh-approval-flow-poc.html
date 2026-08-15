@@ -1,0 +1,153 @@
+<h1>dsh-approval-flow-poc</h1>
+<blockquote>
+<p><strong>非官方社区实验。</strong> 本项目与 DeepSeek AI 无隶属或背书关系，不是生产安全承诺。</p>
+</blockquote>
+<p>一个面向 <a href="https://github.com/deepseek-ai/deepseek-harness">DeepSeek Harness</a> 的最小企业审批策略插件：在官方 <code>tools/pre-execute</code> 扩展点上，把工具调用分成 <code>allow</code>、<code>deny</code>、<code>requireApproval</code> 三类，并生成脱敏 JSONL 审计记录。需要人工确认时，插件返回 DSH 原生 <code>ask</code> 决策，由 DSH 内置审批服务和 Web UI 完成一次性授权；本项目不修改官方核心。</p>
+<h2>验证基线</h2>
+<table>
+<thead>
+<tr>
+<th>项目</th>
+<th>验证值</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>DSH npm</td>
+<td><code>@deepseek-ai/dsh@0.1.0-rc.6</code></td>
+</tr>
+<tr>
+<td>DSH 源码</td>
+<td><code>47f943859bef60e4160492346772ded9b24f765a</code></td>
+</tr>
+<tr>
+<td>Node.js</td>
+<td><code>v24.19.0</code></td>
+</tr>
+<tr>
+<td>验证日期</td>
+<td><code>2026-08-15</code></td>
+</tr>
+<tr>
+<td>项目版本</td>
+<td><code>0.1.0-beta.1</code></td>
+</tr>
+</tbody></table>
+<p>DSH 当前仍处于 developer preview，官方明确提示会有不兼容改动；升级 DSH 后请重新执行本文的配置检查和测试。</p>
+<h2>功能边界</h2>
+<ul>
+<li>基于工具名和脱敏参数摘要评估 <code>low</code>、<code>medium</code>、<code>high</code>、<code>critical</code> 风险。</li>
+<li><code>critical</code> 默认拒绝；其他风险按 <code>developer</code>、<code>production</code>、<code>strict</code> 预设处理。</li>
+<li><code>allow</code> 会继续委托后续策略，不会绕过 DSH 自带安全控制。</li>
+<li><code>requireApproval</code> 使用 DSH 原生审批通道；无可用审批通道时由 DSH 自动拒绝。</li>
+<li>审计日志只记录脱敏摘要、策略决定和最终错误状态，不记录原始参数。</li>
+<li>提供可注入的 <code>ApprovalTransport</code> 接口，以及用于无界面调试的本地 TTY transport。</li>
+</ul>
+<p>这个 PoC <strong>不提供</strong> SSO、RBAC、多级会签、远程 Webhook、不可篡改日志或合规认证。</p>
+<h2>安装</h2>
+<p>从 GitHub 安装到 Web profile：</p>
+<pre><code>npx @deepseek-ai/dsh plugin --profile web add github:lasoloryan/dsh-approval-flow-poc
+npx @deepseek-ai/dsh --profile web --dump-config
+npx @deepseek-ai/dsh web
+</code></pre>
+<p>在配置输出中应看到：</p>
+<pre><code>- id: approval-flow-policy
+  name: dsh-approval-flow-poc
+</code></pre>
+<p>从本地 checkout 验证：</p>
+<pre><code>npm install
+npm run check
+npx @deepseek-ai/dsh plugin --profile web add .
+npx @deepseek-ai/dsh web
+</code></pre>
+<p>如果 pnpm 阻止 Git 依赖的 <code>prepare</code> 脚本，请按 pnpm 输出的精确提示在对应 profile 的 <code>pnpm-workspace.yaml</code> 中允许该包构建，然后重新执行安装；不要关闭全部构建保护。</p>
+<h2>三套策略</h2>
+<table>
+<thead>
+<tr>
+<th>预设</th>
+<th>low</th>
+<th>medium</th>
+<th>high</th>
+<th>critical</th>
+<th>适用场景</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>developer</code></td>
+<td>委托/允许</td>
+<td>委托/允许</td>
+<td>人工审批</td>
+<td>拒绝</td>
+<td>本地开发</td>
+</tr>
+<tr>
+<td><code>production</code></td>
+<td>委托/允许</td>
+<td>人工审批</td>
+<td>人工审批</td>
+<td>拒绝</td>
+<td>预生产或受控运行</td>
+</tr>
+<tr>
+<td><code>strict</code></td>
+<td>委托/允许</td>
+<td>人工审批</td>
+<td>拒绝</td>
+<td>拒绝</td>
+<td>高敏感演示</td>
+</tr>
+</tbody></table>
+<p><code>allow</code> 实际上调用 <code>next()</code>，所以后续 DSH 策略仍可拒绝该调用。</p>
+<p>切换预设时，在 profile 的 <code>cordis.patch.yml</code> 覆盖完整配置：</p>
+<pre><code>- id: approval-flow-policy
+  config:
+    preset: production
+    auditPath: .dsh-approval-flow/audit.jsonl
+    approvalTimeoutMs: 45000
+    localPrompt: false
+    include: []
+    exclude: []
+</code></pre>
+<p>注意：DSH patch 对同一 row 的 <code>config</code> 是整体替换，不是深度合并，因此覆盖时应写全字段。</p>
+<h2>公共接口</h2>
+<pre><code>export interface ApprovalRequest {
+  requestId: string
+  callId: string
+  toolName: string
+  summary: string
+  risk: 'low' | 'medium' | 'high' | 'critical'
+  createdAt: string
+  expiresAt: string
+}
+
+export interface ApprovalDecision {
+  requestId: string
+  decision: 'allow' | 'deny'
+  reason: string
+  decidedAt: string
+}
+
+export interface ApprovalTransport {
+  requestApproval(request: ApprovalRequest, signal?: AbortSignal): Promise&lt;ApprovalDecision&gt;
+}
+</code></pre>
+<p>当前 DSH 适配器把 <code>requireApproval</code> 映射为官方 <code>{ kind: 'ask' }</code>。<code>ApprovalTransport</code> 为后续 Webhook/飞书/企微适配保留稳定的最小 seam；本版本只提供本地 TTY 实现。</p>
+<h2>审计示例</h2>
+<pre><code>{"schemaVersion":1,"event":"policy-decision","timestamp":"2026-08-15T00:00:00.000Z","request":{"requestId":"…","callId":"…","toolName":"bash","summary":"{\"cmd\":\"deploy\",\"token\":\"[REDACTED]\"}","risk":"high","createdAt":"…","expiresAt":"…"},"decision":"requireApproval","reason":"high-risk action requires one-time approval"}
+</code></pre>
+<p>日志默认写到当前项目的 <code>.dsh-approval-flow/audit.jsonl</code>。它是调试和取证线索，不是防篡改账本；生产环境应接入受保护的集中日志系统。</p>
+<h2>测试</h2>
+<pre><code>npm run check
+</code></pre>
+<p>当前测试覆盖：风险分类、允许/拒绝/需要审批、敏感字段脱敏、本地批准/拒绝、审批超时默认拒绝和 JSONL 审计。</p>
+<h2>配套内容</h2>
+<ul>
+<li><a href="https://github.com/lasoloryan/dsh-approval-flow-poc/blob/HEAD/docs/BLUEPAPER.md">《DSH 插件开发周末速通——企业审批实战》</a></li>
+<li><a href="https://github.com/lasoloryan/dsh-approval-flow-poc/blob/HEAD/docs/ZHIHU.md">知乎发布稿：《如何评价 DeepSeek Harness？》</a></li>
+<li><a href="https://github.com/lasoloryan/dsh-approval-flow-poc/blob/HEAD/video/SCRIPT.md">B 站视频脚本：《两天做出第一个 DSH 企业审批插件》</a></li>
+<li><a href="https://dsh-approval-flow-lasoloryan.lasoloryan.chatgpt.site/?source=github">需求登记页</a></li>
+</ul>
+<h2>反馈</h2>
+<p>请在 <a href="https://github.com/lasoloryan/dsh-approval-flow-poc/issues">GitHub Issues</a> 提交可复现问题。工具包、训练营和企业诊断仅做需求验证，不在本 Beta 中收费交付。</p>
+<h2>License</h2>
+<p>MIT</p>

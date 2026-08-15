@@ -1,0 +1,169 @@
+<h1>dsh-tool-policy</h1>
+<p>Declarative, fail-closed governance for model-requested tools in <a href="https://github.com/deepseek-ai/deepseek-harness">DeepSeek Harness</a>.</p>
+<blockquote>
+<p>Community plugin. Not affiliated with or maintained by DeepSeek AI.</p>
+</blockquote>
+<p>Repository: <a href="https://github.com/Drifter-yh/dsh-tool-policy">Drifter-yh/dsh-tool-policy</a></p>
+<p><code>dsh-tool-policy</code> is a small Cordis plugin that evaluates ordered rules at the public <code>tools/pre-execute</code> extension point. It can deny a tool call, route it to Harness's existing human approval seam, or delegate it unchanged. It does not replace the Harness approval, sandbox, timeout, retry, telemetry, or session systems. It is a per-call policy and routing layer, not a capability sandbox.</p>
+<h2>Why this is needed</h2>
+<p>DeepSeek Harness already has strong primitives for tool execution: sandbox policy, one-shot approval, cooperative timeouts, provider retries, repeat-call reminders, and session telemetry. What is missing is a deployment-owned policy layer that applies the same rule vocabulary to every tool, including third-party and MCP tools.</p>
+<p>Typical uses include:</p>
+<ul>
+<li>require approval for an entire MCP tool namespace such as <code>mcp__*</code>;</li>
+<li>deny a known destructive command pattern before the matched tool body starts;</li>
+<li>run a deny-by-default tool-call allowlist for unattended jobs;</li>
+<li>keep sensitive argument values out of policy feedback messages.</li>
+</ul>
+<p>The plugin is intentionally not an audit logger or approval implementation. The Harness already owns those seams.</p>
+<h2>Security model</h2>
+<p>The plugin operates on individual tool calls. Its rules match observable tool names and optional argument patterns before the tool body runs:</p>
+<ul>
+<li><strong>Harness sandbox:</strong> Can this agent perform this class of operation at all? Harness sandboxing and runtime isolation are the layers responsible for enforcing capabilities such as filesystem writes or deletes, network access, and process execution.</li>
+<li><strong>Tool policy:</strong> Should this particular known tool call be allowed, denied, or escalated? A matching <code>deny</code> prevents that call from executing; it does not revoke the underlying capability.</li>
+<li><strong>Harness approval:</strong> Should an escalated <code>ask</code> call receive a one-shot human verdict?</li>
+</ul>
+<p>A rule that matches one shell argument pattern, such as <code>rm -rf /foo</code>, only governs that call shape. A different tool or command sequence may produce the same effect. Tool policy and capability sandboxing are therefore complementary layers; production deployments should combine policy routing with a restrictive Harness sandbox.</p>
+<h3>What this does not do</h3>
+<p><code>dsh-tool-policy</code> does not implement sandboxing, capability enforcement, shell semantic analysis, or equivalent-operation detection. A <code>deny</code> rule makes the matched call unavailable, not destructive behavior impossible in general. It does not rewrite arguments or execute tool bodies.</p>
+<h2>Installation</h2>
+<p>The public Harness package line is currently <code>0.1.0-rc.6</code>:</p>
+<pre><code>pnpm add dsh-tool-policy @deepseek-ai/cordis @deepseek-ai/dsh-tools
+</code></pre>
+<p>The Harness packages are peer dependencies so the host controls the runtime version. <code>@deepseek-ai/schemastery</code> is installed as the plugin's normal runtime dependency. The upstream source repository currently reports <code>0.1.0-rc.5</code> in <code>master</code>; this package is tested against the public <code>0.1.0-rc.6</code> registry artifacts.</p>
+<h3>GitHub installation</h3>
+<p>The upstream profile-plugin documentation supports installing a TypeScript bundle directly from GitHub:</p>
+<pre><code>dsh plugin --profile my-profile add github:Drifter-yh/dsh-tool-policy#028e2ce4167a88ad32b0c6eec89ee22072189e71
+</code></pre>
+<p>Git installs fetch source, so this package's <code>prepare</code> script runs only the standalone <code>tsdown</code> build needed to create <code>dist/</code>. With pnpm 10 or newer, add the package to the profile's <code>pnpm-workspace.yaml</code> build allowlist if pnpm reports that the prepare script is blocked, then retry:</p>
+<pre><code>allowBuilds:
+  'dsh-tool-policy@https://codeload.github.com/Drifter-yh/dsh-tool-policy/tar.gz/5d7d4f15781aca9017bf5f420f6fd6bd6b2c0210': true
+</code></pre>
+<p>Review and pin the Git commit before allowing install-time code execution. <code>prepare</code> does not run tests or depend on a DeepSeek Harness checkout.</p>
+<p>For local development, use the ordinary package-manager workflow from a clean clone: <code>pnpm install</code>.</p>
+<h3>Harness profile bundle</h3>
+<p>The package also follows Harness's official profile-bundle contract: its <code>package.json</code> declares <code>dsh.bundle.patch</code>, and the published package contains <code>cordis.patch.yml</code>. Install it into a profile with:</p>
+<pre><code>dsh plugin --profile my-profile add dsh-tool-policy
+</code></pre>
+<p>That activates one <code>tool-policy</code> row with <code>defaultDecision: deny</code> and no rules. Before starting an agent, configure the row in <code>$DSH_HOME/profiles/my-profile/cordis.patch.yml</code>:</p>
+<pre><code>- id: tool-policy
+  config:
+    defaultDecision: deny
+    rules:
+      - tool: 'read_*'
+        decision: allow
+      - tool: 'bash'
+        decision: ask
+        reason: 'Shell execution requires approval.'
+</code></pre>
+<p>Harness profile patches target the row by id and replace its whole <code>config</code>; repeat every configuration field you want to keep. The bundle patch is only a composition layer: the plugin remains usable as a direct Cordis entry.</p>
+<h2>Quick Start</h2>
+<p>Add the community plugin directly to a Cordis composition. This example is explicitly deny-by-default and allows only tools matched by <code>read_*</code> unless another rule handles them:</p>
+<pre><code>- id: tool-policy
+  name: 'dsh-tool-policy'
+  config:
+    defaultDecision: deny
+    rules:
+      - tool: 'read_*'
+        decision: allow
+      - tool: 'bash'
+        decision: ask
+        reason: 'Shell execution requires approval.'
+      - tool: 'mcp__*'
+        decision: ask
+        reason: 'External tool calls require approval.'
+      - tool: 'delete_*'
+        decision: deny
+        reason: 'Delete operations are disabled in this deployment.'
+</code></pre>
+<p>The plugin is fail-closed at the tool-call layer when mounted: the default decision is <code>deny</code>, so only explicitly allowed calls run. Set <code>defaultDecision: allow</code> only when intentionally deploying a targeted or advisory policy.</p>
+<h2>Configuration</h2>
+<pre><code>defaultDecision: deny # deny (default), ask, or allow
+rules:
+  # First matching rule wins.
+  - tool: 'bash'
+    decision: deny
+    reason: 'Destructive shell commands are disabled.'
+    argument:
+      path: /command
+      contains: 'rm -rf'
+
+  - tool: 'record.update'
+    decision: deny
+    reason: 'System records are immutable.'
+    argument:
+      path: /scope
+      equals: system
+
+  - tool: 'safe_*'
+    decision: allow
+
+  - tool: '*'
+    decision: ask
+    reason: 'Unlisted tools require approval.'
+</code></pre>
+<p><code>tool</code> is an anchored name pattern with one wildcard, <code>*</code>. Other regular-expression metacharacters are treated literally. <code>argument.path</code> is an RFC 6901 JSON Pointer into parsed tool arguments. A condition uses exactly one of <code>equals</code> (JSON scalar equality) or <code>contains</code> (non-empty substring on a string). Rule order is explicit and deterministic.</p>
+<p>Decision semantics:</p>
+<ul>
+<li><code>deny</code> returns a normal Harness tool error before the body runs;</li>
+<li><code>ask</code> returns <code>{ kind: 'ask' }</code> and lets <code>ctx.approval</code> decide; without an approval channel Harness fails closed;</li>
+<li><code>allow</code> calls <code>next()</code> and therefore does not override a prior or later policy listener;</li>
+<li><code>defaultDecision</code> applies only when no rule matches.</li>
+</ul>
+<p>Reasons never interpolate the call arguments. This avoids copying secrets or large payloads into model-visible approval feedback.</p>
+<h2>Architecture</h2>
+<pre><code>flowchart LR
+  model["Model tool call"] --&gt; logged["tool/call logged"]
+  logged --&gt; policy["dsh-tool-policy\ntools/pre-execute"]
+  policy --&gt;|deny| blocked["Tool error\nbody skipped"]
+  policy --&gt;|ask| approval["ctx.approval\nexisting Harness seam"]
+  policy --&gt;|allow| guards["Other pre policies\nand monotonic guards"]
+  approval --&gt;|allowed-once| guards
+  approval --&gt;|rejected or unavailable| blocked
+  guards --&gt; execute["tools/execute\nbody\npost-execute"]
+  execute --&gt; result["tools/result\nthen tool/result"]
+</code></pre>
+<p>The plugin uses only <code>inject: ['tools']</code> and <code>ctx.on('tools/pre-execute', ...)</code>. Cordis owns listener disposal and reload behavior. The plugin does not patch <code>ToolRuntime</code> or <code>agent-loop</code>.</p>
+<h2>Example</h2>
+<p>The checked-in demo loads <code>@deepseek-ai/dsh-system-prompt</code>, <code>@deepseek-ai/dsh-tools</code>, this plugin, and a fixture through the real Cordis Loader. It denies <code>delete_record</code> and allows <code>read_record</code>; the fixture proves the denied body is never invoked.</p>
+<pre><code>pnpm build
+pnpm integration
+</code></pre>
+<p>Expected output contains:</p>
+<pre><code>{
+  "blocked": { "isError": true, "message": "deleting records is disabled in the demo" },
+  "allowed": { "isError": false, "value": "record:42" },
+  "executed": 1
+}
+</code></pre>
+<h2>Compatibility with DeepSeek Harness</h2>
+<p>The plugin targets the Harness API range <code>&gt;=0.1.0-rc.5 &lt;0.2.0</code> and Cordis <code>&gt;=4.0.1 &lt;5</code>. It is currently validated against the published <code>0.1.0-rc.6</code> registry packages and upstream commit <code>47f943859bef60e4160492346772ded9b24f765a</code>. Its Harness-specific code uses the documented <code>Context</code>, <code>tools</code> service, and <code>tools/pre-execute</code> event only. The peer dependency upper bounds make later API drift visible at installation time.</p>
+<p>The package's <code>dsh.bundle.patch</code> metadata follows the Harness profile-bundle specification. <code>cordis.patch.yml</code> inserts the plugin by package name, and profile composition applies that layer before the profile's own patch. The bundle defaults to deny with an empty rule list; configure the inserted <code>tool-policy</code> row in the profile layer before running tools.
+DeepSeek Harness exposes MCP tools as <code>mcp__&lt;serverName&gt;__&lt;rawName&gt;</code>, so an <code>mcp__*</code> rule covers the complete MCP namespace.</p>
+<h2>Current limitations</h2>
+<ul>
+<li>Rules are deployment-global; use multiple Cordis contexts if different agents require different policy trees.</li>
+<li>The Harness API is still prerelease. The public registry currently provides <code>0.1.0-rc.6</code>, while exact <code>0.1.0-rc.5</code> package versions are unavailable there; the peer range still begins at rc.5 to reflect the intended API boundary, but fresh registry validation is currently rc.6-only.</li>
+<li>Matching supports one condition per rule, JSON Pointer scalar equality, or string containment. It does not implement a general expression language.</li>
+<li><code>ask</code> depends on the Harness approval service and an answerer. The plugin does not provide a UI or automatically approve a request.</li>
+<li>Policy feedback is intentionally argument-free; an operator must inspect the original tool call in the Harness session or telemetry stream.</li>
+<li>The plugin is a per-call pre-dispatch policy, not capability enforcement. Use the Harness sandbox for filesystem, network, and process confinement.</li>
+</ul>
+<h2>Roadmap</h2>
+<ul>
+<li>add an optional policy decision trace through an opt-in plugin-owned observer, without duplicating session audit events;</li>
+<li>add reusable policy presets for common MCP, filesystem, and CI deployments;</li>
+<li>validate compatibility against the first stable Harness <code>0.1</code> release and publish a matching package version;</li>
+<li>consider a separate, independently scoped rate-limit plugin if deployments need time-window quotas.</li>
+</ul>
+<h2>Development</h2>
+<pre><code>pnpm install
+pnpm typecheck
+pnpm lint
+pnpm format:check
+pnpm test
+pnpm build
+pnpm integration
+</code></pre>
+<p>The pure matcher is covered by unit tests, the Cordis plugin is exercised through <code>ToolRuntime</code>, and <code>tests/loader.integration.spec.ts</code> boots the actual Harness Loader composition.</p>
+<h2>License</h2>
+<p>MIT</p>

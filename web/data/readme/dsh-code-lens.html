@@ -1,0 +1,111 @@
+<h1>dsh-code-lens</h1>
+<p>Observability for DeepSeek Harness <strong>code-mode sub-dispatches</strong> — the tool calls a
+<code>run_code</code> program makes that the model never sees.</p>
+<h2>The gap this fills</h2>
+<p>In code mode the model writes a TypeScript program that orchestrates tool calls.
+The program receives every result in full. The model receives none of them —
+only whatever the program finally returns. Both dispatch boundaries are still
+recorded on the session log.</p>
+<p>That produces a three-way split with no equivalent outside code mode:</p>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>program</th>
+<th>model</th>
+<th>session log</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>sub-call arguments</td>
+<td>✅</td>
+<td>❌</td>
+<td>✅</td>
+</tr>
+<tr>
+<td>sub-call results</td>
+<td>✅</td>
+<td>❌</td>
+<td>✅</td>
+</tr>
+</tbody></table>
+<p>dsh is the only harness that draws this distinction, because it is the only one
+where a tool call can happen <em>inside a program the model wrote</em>. The data is
+recorded and nothing surfaces it. This plugin does.</p>
+<h2>What it gives you</h2>
+<p><strong>A <code>codeLens</code> session projection</strong> — whole-session totals, readable from the UI
+without touching the log:</p>
+<pre><code>{ "programs": 1, "dispatches": 2, "settled": 2, "errors": 1, "dispatchMs": 340, "hiddenBytes": 1027 }
+</code></pre>
+<p><code>hiddenBytes</code> is the payload the program consumed and the log preserved while the
+model saw none of it.</p>
+<p><strong>A <code>code_lens</code> tool</strong> — lets the model audit its own program after the fact:</p>
+<pre><code>run_code call_abc: 2 sub-calls, 1 errors, 340ms, 1027B hidden from context
+  call_abc:code:1  bash  ok     140ms  3B
+  call_abc:code:2  read  error  190ms  1024B
+</code></pre>
+<h2>Install</h2>
+<pre><code>dsh plugin --profile web add dsh-code-lens
+dsh --profile web
+</code></pre>
+<p>Development, without packaging — note the <code>file://</code> URL (a bare <code>G:/...</code> path is
+parsed as a URL scheme on Windows):</p>
+<pre><code># scratch/cordis.yml
+- insert:
+    - id: code-lens
+      name: 'file:///G:/dsh-plugins/dsh-code-lens/index.js'
+</code></pre>
+<pre><code>dsh --profile web --patch ./scratch/cordis.yml
+</code></pre>
+<h2>Design notes</h2>
+<ul>
+<li><strong>Zero dependencies.</strong> The projection registry's runtime contract is
+structural — it calls <code>schema.parse(value)</code> and nothing else — so the view
+validator is hand-written rather than pinning a zod copy that could drift from
+the host's.</li>
+<li><strong>Never appends from the observer.</strong> <code>session/event</code> listeners run inside the
+publication window of the append that produced the event, and <code>Session.append()</code>
+throws on reentry. This plugin only reads there.</li>
+<li><strong>Both registries are optional.</strong> <code>sessionProjections</code> and <code>tools</code> are acquired
+through <code>ctx.inject</code>, so the plugin stays loadable in headless assemblies that
+compose neither.</li>
+<li><strong>Holes in sub-call numbering are normal.</strong> A sub-call queued but abandoned by
+run settlement logs <em>neither</em> event, so a start without a settle is a valid
+terminal state, not a leak. <code>turn/end</code> drops the leftovers so persisted state
+cannot grow forever.</li>
+<li><strong>Pairing is by <code>subCallId</code>; timing comes from the event envelope <code>time</code></strong> —
+neither event carries a duration.</li>
+</ul>
+<h2>Verified against</h2>
+<p><code>@deepseek-ai/dsh@0.1.0-rc.6</code>, Node 24, DeepSeek-V4 via the headless profile.</p>
+<p>Real session output — one <code>run_code</code> program reading eight files:</p>
+<pre><code>run_code call_00_lMDLou1XAHEXiQYgKbUR9330: 9 sub-calls, 0 errors, 23ms, 1312B hidden from context
+  call_00_lMDLou1XAHEXiQYgKbUR9330:code:1  read  ok  6ms  164B
+  ...
+  call_00_lMDLou1XAHEXiQYgKbUR9330:code:8  read  ok  2ms  164B
+  call_00_lMDLou1XAHEXiQYgKbUR9330:code:9  code_lens  unsettled  —  0B
+</code></pre>
+<p>The model reported only "24 lines" — those 1312 bytes never entered its context.
+The trailing <code>unsettled</code> row is <code>code_lens</code> observing its own in-flight call,
+which is the documented terminal state for a start whose settle has not landed.</p>
+<p>To reproduce, code mode must be on. The headless bundle already wires the tools
+row to an environment variable, so no patch is needed:</p>
+<pre><code>DSH_TOOLS_MODE=code dsh --profile headless --patch ./scratch/cordis.yml "…"
+</code></pre>
+<p>Unit-level checks: <code>verify-integration.mjs</code> (projection fold through the real
+<code>SessionStore</code>/<code>SessionProjections</code>) and <code>verify-tool.mjs</code> (tool registration and
+execution).</p>
+<h2>Note for plugin authors</h2>
+<p><code>ctx.tools.register()</code> takes the <strong>wire</strong> schema — a complete JSON Schema object.
+<code>defineTool</code> accepts the author-facing shorthand (a bare property map) and
+compiles it. Passing the shorthand straight to <code>register()</code> reaches the provider
+as <code>type: null</code> and the request is rejected:</p>
+<pre><code>INVALID_REQUEST: Invalid schema for function 'x':
+schema must be a JSON Schema of 'type: "object"', got 'type: null'.
+</code></pre>
+<p>This plugin writes the object root explicitly, and validates its own argument,
+because <code>defineTool</code>'s compiled validator is what it gives up in exchange for
+staying dependency-free. (A plain-JS plugin installed outside the harness tree
+cannot resolve <code>@deepseek-ai/dsh-tools</code> as a bare specifier.)</p>
+<h2>License</h2>
+<p>MIT</p>

@@ -1,0 +1,153 @@
+<h1>TapPass governance for DeepSeek Harness</h1>
+<p><strong>The authority layer for agentic AI, as a DeepSeek Harness plugin.</strong></p>
+<p>Everything in DeepSeek Harness is a plugin. This is the one that decides what
+your agents are allowed to do.</p>
+<p>Guardrails and safety classifiers ask <em>"is this output harmful?"</em> That is a
+property of the model. TapPass asks a different question: <em>"is this agent
+<strong>allowed</strong> to do this, under <strong>our</strong> rules, right now?"</em> That is a property of
+your business, and no model level tool can answer it, because the answer lives
+in your organisation, not in the weights.</p>
+<p>This plugin intercepts every tool call at the harness's <code>tools/pre-execute</code>
+seam, sends it to the TapPass policy decision point (<code>POST /v1/govern</code>), and
+allows, denies, or escalates it for human approval.</p>
+<h2>Why it is different</h2>
+<ul>
+<li><strong>Business rules, not model safety.</strong> Write the rule once, in your language:
+"refunds over 500 need a human", "no customer PII leaves the EU region", "this
+agent may read the CRM, never write it". It is enforced on every tool call, on
+every harness, under every model. A prompt is a suggestion. A policy is a fact.</li>
+<li><strong>Authority is earned.</strong> The plugin ships in <strong>observe mode</strong>: from the first
+minute it watches and records every call, and blocks nothing. You see what
+your agents do before you enforce a single deny. Then you turn on enforcement
+for what matters. Autonomy is a track record, not a checkbox.</li>
+<li><strong>Harness and model agnostic.</strong> The same rules that govern an agent here
+govern it in Claude Code, in Codex, behind LiteLLM. The harness is
+interchangeable. The authority is not.</li>
+<li><strong>EU hosted, EU AI Act ready.</strong></li>
+</ul>
+<h2>Install</h2>
+<pre><code># create a profile if you do not have one, then add the plugin
+dsh plugin --profile default add @tappass/dsh-governance
+
+# point it at your TapPass workspace
+export TAPPASS_API_KEY="tp_dev_..."      # a TapPass developer key
+
+# verify the layer without booting, then run
+dsh --profile default --dump-config
+dsh --profile default
+</code></pre>
+<p>Get a developer key from your TapPass dashboard (Settings, Developer keys) or
+<code>POST /api/agents/{agent}/developer-keys</code>. The key is bound to one agent and one
+org; TapPass records the audit trail against it.</p>
+<h2>Configure</h2>
+<p>Every tool call is governed once it is installed. Configuration is optional; the
+defaults are safe.</p>
+<table>
+<thead>
+<tr>
+<th>Key</th>
+<th>Default</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>baseURL</code></td>
+<td><code>https://api.tappass.ai</code></td>
+<td>TapPass API base. The plugin POSTs to <code>${baseURL}/v1/govern</code>.</td>
+</tr>
+<tr>
+<td><code>apiKeyEnv</code></td>
+<td><code>TAPPASS_API_KEY</code></td>
+<td>Env var holding your <code>tp_dev_</code> key. A reference, not the secret.</td>
+</tr>
+<tr>
+<td><code>mode</code></td>
+<td><code>observe</code></td>
+<td><code>observe</code>: send and record every call, block nothing. <code>enforce</code>: honor verdicts.</td>
+</tr>
+<tr>
+<td><code>onError</code></td>
+<td><code>deny</code></td>
+<td>In <code>enforce</code>, when TapPass is unreachable: <code>deny</code> (fail closed) or <code>allow</code> (fail open).</td>
+</tr>
+<tr>
+<td><code>timeoutMs</code></td>
+<td><code>4000</code></td>
+<td>Hard timeout per verdict call. A slow PDP never wedges the agent loop.</td>
+</tr>
+<tr>
+<td><code>agentId</code></td>
+<td>harness agent id</td>
+<td>Override the agent id sent to TapPass.</td>
+</tr>
+<tr>
+<td><code>orgId</code></td>
+<td>from the key</td>
+<td>Override the org id; normally stamped from the developer key.</td>
+</tr>
+</tbody></table>
+<p>Set them in your profile's patch, for example to enforce:</p>
+<pre><code># $DSH_HOME/profiles/default/cordis.patch.yml
+- tappass-governance:
+    config:
+      mode: enforce
+</code></pre>
+<h2>How a verdict becomes a decision</h2>
+<table>
+<thead>
+<tr>
+<th>TapPass <code>outcome</code></th>
+<th>dsh <code>PreToolDecision</code></th>
+<th>Effect</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>allow</code></td>
+<td><code>next()</code></td>
+<td>the tool runs</td>
+</tr>
+<tr>
+<td><code>block</code></td>
+<td><code>{ kind: 'deny', reason }</code></td>
+<td>the model gets an error result with the reason</td>
+</tr>
+<tr>
+<td><code>needs_approval</code></td>
+<td><code>{ kind: 'ask', reason }</code></td>
+<td>routed to the harness approval flow for a human</td>
+</tr>
+</tbody></table>
+<p>In <code>observe</code> mode every call returns <code>next()</code>, but a would-be block or approval
+is still recorded server side and logged locally, so you can size your policy
+against real traffic before enforcing.</p>
+<h2>Honest limitations</h2>
+<ul>
+<li><strong>No argument rewriting.</strong> DeepSeek Harness makes tool arguments read only at
+<code>tools/pre-execute</code> by design (they are already logged and shown to the
+model), so a TapPass <code>modify</code> verdict cannot be applied in place. This plugin
+fails such a call closed in <code>enforce</code> mode with a clear reason rather than
+silently running the unmodified request. Redaction obligations are surfaced,
+not applied.</li>
+<li><strong>Approval needs an open turn.</strong> A <code>needs_approval</code> verdict maps to the
+harness <code>ask</code> decision, which routes to whatever approval answerer your
+profile mounts. With no approver configured, <code>ask</code> fails closed to a denial,
+which is the safe default.</li>
+<li><strong>Developer preview.</strong> DeepSeek Harness and its plugin API are pre-release and
+may change. This plugin is deliberately thin: it is a bridge to <code>/v1/govern</code>,
+so if the harness API shifts the fix is a small shim, not a rewrite.</li>
+</ul>
+<h2>Develop</h2>
+<pre><code>npm install --legacy-peer-deps   # dsh rc packages have skewed peer ranges
+npm run build
+node --test
+</code></pre>
+<p>The verdict mapping and the <code>/v1/govern</code> client are covered by
+<code>test/plugin.test.mjs</code> and run against a local mock server, no TapPass instance
+required.</p>
+<h2>Links</h2>
+<ul>
+<li>TapPass: <a href="https://tappass.ai">https://tappass.ai</a></li>
+<li>The authority layer for agentic AI. Authority is earned. Even by AI.</li>
+</ul>
+<h2>License</h2>
+<p>MIT © Cogniqor BV (TapPass)</p>

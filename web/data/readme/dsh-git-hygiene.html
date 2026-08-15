@@ -1,0 +1,126 @@
+<h1>dsh-git-hygiene（Git 卫生巡检）</h1>
+<blockquote>
+<p><strong>Git Hygiene Checker for DeepSeek Harness.</strong>
+A read-only DSH plugin that inspects a repository's hygiene: merged-but-not-deleted
+branches, stale branches with no commits for months, oversized tracked files,
+untracked files, and uncommitted work — then outputs a health report with cleanup
+suggestions. It never deletes or modifies anything automatically.
+Install with: <code>dsh plugin --profile web add "github:lucky8197/dsh-git-hygiene#main"</code>.</p>
+</blockquote>
+<p>仓库用久了会"长胖"：功能分支合并后没人删、几个月不动的老分支堆积、不小心提交了
+几十 MB 的二进制、未跟踪文件散落一地。<code>dsh-git-hygiene</code> 用<strong>只读 git 命令</strong>给仓库
+做一次"体检"，把这些问题量化成带清理建议的报告。</p>
+<h2>特性</h2>
+<table>
+<thead>
+<tr>
+<th>维度</th>
+<th>说明</th>
+<th>发现类型</th>
+<th>严重度</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>已合并分支</td>
+<td>已合并到当前分支但未删除的分支（<code>git branch --merged</code>）</td>
+<td><code>merged_branch</code></td>
+<td>medium</td>
+</tr>
+<tr>
+<td>过期分支</td>
+<td>超过 N 天（默认 90）无提交的分支（<code>for-each-ref</code> committerdate）</td>
+<td><code>stale_branch</code></td>
+<td>low</td>
+</tr>
+<tr>
+<td>大文件</td>
+<td>跟踪文件超过阈值（默认 5 MB），提示用 LFS/filter-repo 处理</td>
+<td><code>large_file</code></td>
+<td>low</td>
+</tr>
+<tr>
+<td>未跟踪文件</td>
+<td><code>git status --porcelain</code> 的 <code>??</code> 条目</td>
+<td><code>untracked</code></td>
+<td>low</td>
+</tr>
+<tr>
+<td>未提交修改</td>
+<td>工作区 dirty 状态（<code>M</code>/<code>A</code>/<code>D</code> 等）</td>
+<td><code>dirty_worktree</code></td>
+<td>low</td>
+</tr>
+</tbody></table>
+<h2>快速安装</h2>
+<pre><code>dsh plugin --profile web add "github:lucky8197/dsh-git-hygiene#main"
+</code></pre>
+<h2>工具用法</h2>
+<pre><code>git_hygiene
+  参数：
+    cwd?: string          仓库目录（默认当前会话工作目录）
+    staleDays?: number    过期分支阈值（天，默认 90）
+    maxFileBytes?: number 大文件阈值（字节，默认 5MB）
+  输出：canonical JSON 报告（渲染为分节文本）
+</code></pre>
+<h3>canonical JSON</h3>
+<pre><code>{
+  "tool": "git_hygiene",
+  "version": 1,
+  "cwd": "/path/to/repo",
+  "repo": { "isRepo": true, "root": "/path/to/repo", "branch": "main",
+            "head": "abc1234…", "remotes": ["origin"], "sizeBytes": 4211000, "objectCount": 1200 },
+  "findings": [
+    { "severity": "medium", "kind": "merged_branch",
+      "detail": "2 个分支已合并到当前分支，可以安全删除：feature-a、feature-b",
+      "evidence": "feature-a, feature-b",
+      "fix": "对每个已合并分支执行 `git branch -d &lt;branch&gt;`（-d 安全删除，未合并会拒绝）" }
+  ],
+  "stats": { "findingCount": 1, "byKind": { "merged_branch": 1 } },
+  "suggestions": [ { "severity": "medium", "text": "…" } ]
+}
+</code></pre>
+<h2>配置（cordis 配置节）</h2>
+<pre><code>- insert:
+    - id: git-hygiene
+      name: 'dsh-git-hygiene'
+      config:
+        staleDays: 90          # 过期分支阈值（天）
+        maxFileBytes: 5242880  # 大文件阈值（字节）
+        maxList: 30            # 各清单最大展示条数
+</code></pre>
+<h2>安全边界（硬性要求）</h2>
+<ul>
+<li><strong>只执行白名单只读 git 子命令</strong>（<code>src/git.ts</code> WHITELIST 全量枚举：status --porcelain /
+branch --merged / for-each-ref / ls-files / count-objects -v / remote -v / rev-parse /
+log -1 / symbolic-ref）；白名单外的一律拒绝（含 <code>checkout</code>/<code>reset</code>/<code>clean</code>/<code>delete</code>/<code>push</code>）；</li>
+<li><strong>不自动删除/修改任何分支或文件</strong>——只输出建议，清理动作由用户执行；</li>
+<li>文件体积用只读 <code>node:fs stat</code>，报告不含任何文件内容；</li>
+<li>非 git 目录返回 <code>isRepo: false</code>，不报错不猜测。</li>
+</ul>
+<h2>防误报设计</h2>
+<ul>
+<li>当前分支自动从"已合并"清单排除（<code>*</code> 标记剥离）；</li>
+<li>detached HEAD 正常处理（branch 为空，不崩溃）；</li>
+<li>文件缺失/不可读静默跳过。</li>
+</ul>
+<h2>工程结构</h2>
+<pre><code>dsh-git-hygiene/
+├── package.json          # name=dsh-git-hygiene, main=./lib/index.js, dsh.bundle.patch
+├── cordis.patch.yml      # - insert: [{ id: git-hygiene, name: 'dsh-git-hygiene' }]
+├── scripts/              # setup-dsh-deps / build.sh / build-win.mjs（纯 tsc 构建）
+├── src/
+│   ├── index.ts          # apply(ctx)：注册 git_hygiene 工具 + 配置读取
+│   ├── audit.ts          # 编排：只读 git 命令序列 + 大文件 stat
+│   ├── git.ts            # 白名单执行器（破坏性命令一律拒绝）
+│   ├── scan.ts           # git 输出解析 + 严重度/建议/渲染
+│   └── types.ts          # canonical 类型 + 配置
+└── tests/                # node --test（22 用例，真实 git 临时仓库端到端）
+</code></pre>
+<h2>开发 / 测试 / 构建</h2>
+<pre><code>npm install &amp;&amp; npm run setup
+npm test                # node --test（22 用例，含真实 git 建仓）
+npm run build:win       # Windows 构建；POSIX 用 npm run build
+</code></pre>
+<p>构建产物 <code>lib/</code> 入库提交（GitHub 源安装免构建）。</p>
+<h2>License</h2>
+<p>BSD-3-Clause。见 <a href="https://github.com/lucky8197/dsh-git-hygiene/blob/HEAD/LICENSE">LICENSE</a>。</p>

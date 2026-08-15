@@ -1,0 +1,161 @@
+/**
+ * dshregistry 共享逻辑:主题切换、语言切换(i18n)、数据加载、渲染助手。
+ * 纯原生 JS,无框架无构建;配合原型页面的 DOM 结构工作。
+ */
+(function () {
+  'use strict'
+
+  const htmlEl = document.documentElement
+
+  // ------------------------------------------------------------------ 主题
+  const THEME_KEY = 'dsh-theme'
+  function preferredTheme() {
+    const saved = localStorage.getItem(THEME_KEY)
+    if (saved === 'dark' || saved === 'light') return saved
+    return window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light'
+  }
+  function applyTheme(theme) {
+    htmlEl.classList.toggle('dark', theme === 'dark')
+    htmlEl.classList.toggle('light', theme !== 'dark')
+  }
+  applyTheme(preferredTheme())
+  function initThemeToggle() {
+    const btn = document.querySelector('.theme-toggle')
+    if (!btn) return
+    btn.addEventListener('click', () => {
+      const next = htmlEl.classList.contains('dark') ? 'light' : 'dark'
+      localStorage.setItem(THEME_KEY, next)
+      applyTheme(next)
+    })
+  }
+
+  // ------------------------------------------------------------------ i18n
+  const LANG_KEY = 'dsh-lang'
+  const dictCache = {}
+  function currentLang() {
+    const saved = localStorage.getItem(LANG_KEY)
+    if (saved === 'zh' || saved === 'en') return saved
+    return (navigator.language || 'en').toLowerCase().startsWith('zh') ? 'zh' : 'en'
+  }
+  async function loadDict(lang) {
+    if (dictCache[lang]) return dictCache[lang]
+    const res = await fetch(`i18n/${lang}.json`)
+    if (!res.ok) throw new Error(`i18n/${lang}.json: HTTP ${res.status}`)
+    dictCache[lang] = await res.json()
+    return dictCache[lang]
+  }
+  let dict = {}
+  /** 静态文本:字典里 `@选择器` 条目替换 textContent;`@!选择器` 替换 innerHTML(含标签的文案)。 */
+  function applyStaticTexts() {
+    for (const [rawSelector, text] of Object.entries(dict)) {
+      if (!rawSelector.startsWith('@')) continue
+      if (rawSelector.startsWith('@!')) {
+        document.querySelectorAll(rawSelector.slice(2)).forEach((el) => { el.innerHTML = text })
+      } else {
+        document.querySelectorAll(rawSelector.slice(1)).forEach((el) => { el.textContent = text })
+      }
+    }
+    document.querySelectorAll('[data-i18n-placeholder]').forEach((el) => {
+      const v = dict[el.getAttribute('data-i18n-placeholder')]
+      if (typeof v === 'string') el.setAttribute('placeholder', v)
+    })
+    htmlEl.lang = currentLang() === 'zh' ? 'zh-CN' : 'en'
+  }
+  function syncLangToggle() {
+    const lang = currentLang()
+    document.querySelectorAll('.lang-toggle button').forEach((btn) => {
+      const isZh = btn.textContent.trim() === '中'
+      btn.classList.toggle('active', (lang === 'zh') === isZh)
+    })
+  }
+  async function setLang(lang) {
+    localStorage.setItem(LANG_KEY, lang)
+    dict = await loadDict(lang)
+    applyStaticTexts()
+    syncLangToggle()
+    document.dispatchEvent(new CustomEvent('dsh:lang', { detail: { lang } }))
+  }
+  function initLangToggle() {
+    document.querySelectorAll('.lang-toggle button').forEach((btn) => {
+      btn.addEventListener('click', () => setLang(btn.textContent.trim() === '中' ? 'zh' : 'en'))
+    })
+  }
+  /** 查 JS 文案:`#key` 条目。 */
+  function t(key) {
+    const v = dict[`#${key}`]
+    return typeof v === 'string' ? v : key
+  }
+
+  // ------------------------------------------------------------------ 数据
+  async function fetchJson(url) {
+    const res = await fetch(url)
+    if (!res.ok) throw new Error(`${url}: HTTP ${res.status}`)
+    return res.json()
+  }
+  function loadData() {
+    return Promise.all([fetchJson('data/plugins.json'), fetchJson('data/meta.json')])
+  }
+
+  // ------------------------------------------------------------------ 渲染助手
+  const SVG_USER = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"></path><circle cx="9" cy="7" r="4"></circle><path d="M22 21v-2a4 4 0 0 0-3-3.87"></path><path d="M16 3.13a4 4 0 0 1 0 7.75"></path></svg>'
+  const SVG_STAR = '<svg viewBox="0 0 24 24" fill="currentColor" stroke="none"><polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"></polygon></svg>'
+
+  function escapeHtml(s) {
+    return String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]))
+  }
+
+  /** 分类键 → 当前语言标签。 */
+  const CATEGORIES = ['all', 'tool', 'vision', 'dashboard', 'bridge', 'launcher', 'mcp', 'skill', 'other']
+  function categoryLabel(cat) {
+    return t(`cat.${cat}`)
+  }
+
+  /** 信任状态:data 用 community,原型徽章类名是 vouched。 */
+  function badgeClass(state) {
+    return state === 'community' ? 'vouched' : state === 'flagged' ? 'flagged' : 'unreviewed'
+  }
+  function badgeHtml(state, reasons) {
+    const cls = badgeClass(state)
+    const tip = Array.isArray(reasons) && reasons.length > 0 ? reasons.join('; ') : t(`badge.tip.${cls}`)
+    return `<span class="trust-badge ${cls}" title="${escapeHtml(tip)}">${escapeHtml(t(`badge.${cls}`))}</span>`
+  }
+
+  /** 相对时间(双语):today/yesterday/N 天前 → 周 → 月 → 年。 */
+  function relativeTime(isoDate) {
+    const days = Math.max(0, Math.floor((Date.now() - new Date(isoDate).getTime()) / 86400000))
+    const zh = currentLang() === 'zh'
+    if (days === 0) return zh ? '今天' : 'today'
+    if (days === 1) return zh ? '昨天' : 'yesterday'
+    if (days < 7) return zh ? `${days} 天前` : `${days} days ago`
+    if (days < 30) return zh ? `${Math.floor(days / 7)} 周前` : `${Math.floor(days / 7)} weeks ago`
+    if (days < 365) return zh ? `${Math.floor(days / 30)} 个月前` : `${Math.floor(days / 30)} months ago`
+    return zh ? `${Math.floor(days / 365)} 年前` : `${Math.floor(days / 365)} years ago`
+  }
+
+  /** 替换"图标+文本"元素的尾部文本节点(保留内部 SVG)。 */
+  function setTrailingText(selector, text) {
+    const el = document.querySelector(selector)
+    if (!el) return
+    const node = [...el.childNodes].reverse().find((n) => n.nodeType === Node.TEXT_NODE && n.textContent.trim())
+    if (node) node.textContent = ` ${text} `
+  }
+
+  // ------------------------------------------------------------------ 启动
+  async function boot() {
+    initThemeToggle()
+    initLangToggle()
+    dict = await loadDict(currentLang())
+    applyStaticTexts()
+    syncLangToggle()
+    document.dispatchEvent(new CustomEvent('dsh:ready', { detail: { lang: currentLang() } }))
+  }
+
+  window.DSHR = {
+    t, loadData, fetchJson, escapeHtml, badgeHtml, categoryLabel, relativeTime, setTrailingText,
+    CATEGORIES, SVG_USER, SVG_STAR,
+    onReady: (fn) => document.addEventListener('dsh:ready', fn),
+    onLangChange: (fn) => document.addEventListener('dsh:lang', fn),
+    lang: currentLang,
+  }
+  document.addEventListener('DOMContentLoaded', () => { boot().catch((e) => console.error('[dshregistry] boot failed', e)) })
+})()

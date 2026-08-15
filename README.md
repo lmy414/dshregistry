@@ -31,19 +31,13 @@ dshregistry/
 
 ## 提交插件 Submit your plugin
 
-> **收录不等于审计。** 合并 PR 仅表示进入索引,插件默认状态仍为「未审计 / Unreviewed」。
+> **收录不等于审计。** 收录仅表示进入索引,插件默认状态为「未审计 / Unreviewed」。
 
-**方式一(推荐):PR 提交**
+**方式一(推荐):提 Issue,无需 fork**
 
-1. Fork 本仓库,在 `config/seeds.json` 追加一条:
-
-   ```json
-   { "repo": "owner/name", "category": "tool" }
-   ```
-
-   `category` 可选(`tool/vision/dashboard/bridge/launcher/mcp/skill/other`),缺省由爬虫推断。
-2. 提交 PR,按模板填自查清单;站长审查合并后,服务器下次同步(≤6 小时)自动收录上线。
-3. 确认你的仓库:`package.json` 声明 `dsh.bundle.patch`(收录必要条件)、有 README、有 LICENSE。
+1. 打开 [收录提交表单](https://github.com/lmy414/dshregistry/issues/new?template=plugin-submission.yml),填入你的仓库地址(`owner/name`)。
+2. 确认仓库:`package.json` 声明 `dsh.bundle.patch`(收录必要条件)、有 README、有 LICENSE。
+3. 站长审核合入 `config/seeds.json` 后,服务器下次同步(≤6 小时)自动收录上线。
 
 **方式二(被动)**:给仓库添加 `dsh-plugin` topic,并推荐在 `package.json` 声明 `dsh.registry` 元数据;爬虫每 6 小时扫描自动发现。
 

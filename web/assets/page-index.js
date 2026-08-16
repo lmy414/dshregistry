@@ -31,14 +31,14 @@
     return [...list].sort(by)
   }
 
-  // P1-9: 分类页可分享 URL (/c/tool.html)
+  // P1-9: 分类页可分享 URL (/c/tool.html) — 绝对路径, 任意层级页面可跳转
   function categoryUrl(cat) {
-    if (cat === 'all') return 'index.html'
-    return `c/${cat}.html`
+    if (cat === 'all') return '/index.html'
+    return `/c/${cat}.html`
   }
 
   function cardHtml(p) {
-    return `<a href="p/${encodeURIComponent(p.slug)}.html" class="plugin-card" data-dom-id="card-${DSHR.escapeHtml(p.slug)}">
+    return `<a href="/p/${encodeURIComponent(p.slug)}.html" class="plugin-card" data-dom-id="card-${DSHR.escapeHtml(p.slug)}">
       <div class="card-top">
         <div class="card-title-group">
           <div class="card-title">${DSHR.escapeHtml(p.name)}</div>
@@ -60,7 +60,7 @@
       <div class="empty-icon">🔍</div>
       <div class="empty-title">${DSHR.t('empty.title')}</div>
       <div class="empty-desc">${DSHR.t('empty.desc')}</div>
-      <a class="empty-btn" href="index.html" id="empty-clear">${DSHR.t('empty.clear')}</a>
+      <a class="empty-btn" href="/index.html" id="empty-clear">${DSHR.t('empty.clear')}</a>
     </div>`
   }
 

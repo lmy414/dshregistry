@@ -1,11 +1,13 @@
 /**
- * dshregistry 详情页逻辑:按 ?slug= 渲染插件详情、安装命令、完整 README、
- * 元信息表、风险区与相关推荐。DOM 复用原型稿。
+ * dshregistry 详情页逻辑:按 ?slug= 或 /p/<slug>.html 渲染插件详情、安装命令、
+ * 完整 README、元信息表、风险区与相关推荐。DOM 复用原型稿。
  */
 (function () {
   'use strict'
 
-  const slug = new URLSearchParams(location.search).get('slug')
+  // 从 URL 提取 slug: 优先路径式 /p/<slug>.html, 兼容旧 ?slug= 参数
+  const pathMatch = location.pathname.match(/^\/p\/([^/]+)\.html$/)
+  const slug = pathMatch ? decodeURIComponent(pathMatch[1]) : new URLSearchParams(location.search).get('slug')
   let plugin = null
   let all = []
   let meta = {}
@@ -186,7 +188,7 @@
     if (!grid) return
     const related = all.filter((p) => p.slug !== plugin.slug && p.category === plugin.category).slice(0, 4)
     const pool = related.length > 0 ? related : all.filter((p) => p.slug !== plugin.slug).slice(0, 3)
-    grid.innerHTML = pool.map((p) => `<a href="p/${encodeURIComponent(p.slug)}.html" class="related-card">
+    grid.innerHTML = pool.map((p) => `<a href="/p/${encodeURIComponent(p.slug)}.html" class="related-card">
       <div class="related-card-top">
         <span class="related-card-name">${DSHR.escapeHtml(p.name)}</span>
         ${DSHR.badgeHtml(p.state)}

@@ -39,7 +39,7 @@
   }
   async function loadDict(lang) {
     if (dictCache[lang]) return dictCache[lang]
-    const res = await fetch(`i18n/${lang}.json`)
+    const res = await fetch(`/i18n/${lang}.json`)
     if (!res.ok) throw new Error(`i18n/${lang}.json: HTTP ${res.status}`)
     dictCache[lang] = await res.json()
     return dictCache[lang]
@@ -93,7 +93,7 @@
     return res.json()
   }
   function loadData() {
-    return Promise.all([fetchJson('data/plugins.json'), fetchJson('data/meta.json')])
+    return Promise.all([fetchJson('/data/plugins.json'), fetchJson('/data/meta.json')])
   }
 
   // ------------------------------------------------------------------ 渲染助手

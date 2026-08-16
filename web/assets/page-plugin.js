@@ -159,6 +159,13 @@
         const res = await fetch(readmeUrl)
         if (!res.ok) throw new Error(`HTTP ${res.status}`)
         body.innerHTML = await res.text()
+        // P2: README 标题降级 (h1→h2, h2→h3), 避免与页面主标题 h1 / 章节 h2 冲突
+        body.querySelectorAll('h1, h2').forEach((h) => {
+          const tag = h.tagName === 'H1' ? 'h2' : 'h3'
+          const nh = document.createElement(tag)
+          nh.innerHTML = h.innerHTML
+          h.replaceWith(nh)
+        })
         body.querySelectorAll('a[href]').forEach((a) => { a.target = '_blank'; a.rel = 'noopener' })
       } catch {
         body.innerHTML = `<p>${DSHR.escapeHtml(DSHR.t('readme.error'))}</p>`

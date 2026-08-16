@@ -20,6 +20,15 @@ log() {
   echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"
 }
 
+# 失败告警: 发送到飞书 (cron 环境用 hermes send 独立进程)
+alert() {
+  local msg="$1"
+  log "ALERT: $msg"
+  export PATH="/root/.hermes/bin:$PATH"
+  timeout 30 hermes send --to feishu:"${FEISHU_CHAT_ID:-oc_8b9d4bdf8c49af3d4c1cfd614fddd3cf}" "⚠️ dshregistry 同步告警: $msg" 2>/dev/null \
+    || echo "[$(date '+%Y-%m-%d %H:%M:%S')] ALERT 发送失败: $msg" >> "$LOG_FILE"
+}
+
 cd "$REPO_DIR" || { log "ERROR: 无法进入 $REPO_DIR"; exit 1; }
 
 # 当前分支（数据源头=分支，不写死 main）
@@ -41,7 +50,7 @@ fi
 # 2) 运行爬虫
 export GITHUB_TOKEN="$(gh auth token 2>/dev/null || echo '')"
 if [ -z "$GITHUB_TOKEN" ]; then
-  log "ERROR: 无法获取 GITHUB_TOKEN"
+  alert "无法获取 GITHUB_TOKEN"
   exit 1
 fi
 
@@ -54,7 +63,7 @@ fi
 if env $CRAWL_OPTS timeout 3500 node tools/crawl.js >> "$LOG_FILE" 2>&1; then
   log "爬虫运行成功"
 else
-  log "ERROR: 爬虫运行失败 (exit=$?)"
+  alert "爬虫运行失败 (exit=$?)"
   exit 1
 fi
 
@@ -82,11 +91,11 @@ if ! git diff --quiet -- web/data/ web/sitemap.xml; then
     if timeout 180 git push origin "$BRANCH" >> "$LOG_FILE" 2>&1; then
       log "推送成功 (origin/$BRANCH)"
     else
-      log "ERROR: 推送失败"
+      alert "git push 失败 (origin/$BRANCH)"
       exit 1
     fi
   else
-    log "提交失败（可能无变更）"
+    alert "git commit 失败"
   fi
 else
   log "无数据变更，跳过提交"

@@ -31,44 +31,51 @@
         '.mp-title{font-size:14px;font-weight:600;opacity:.9}',
         '.mp-subtitle{font-size:12px;opacity:.5;margin-top:2px}',
         '.mp-status{font-size:12px;opacity:.6}',
-        '.mp-status.err{color:#e74c3c;opacity:1}',
-        '.mp-btn{background:transparent;border:1px solid var(--dsw-border,rgba(255,255,255,.18));border-radius:6px;padding:5px 12px;font:inherit;font-size:12px;color:inherit;cursor:pointer;opacity:.7;transition:all .15s}',
+        '.mp-status.err{color:var(--dsw-alias-state-error-primary,#e74c3c);opacity:1}',
+        '.mp-btn{background:transparent;border:1px solid var(--dsw-alias-border-l1,rgba(255,255,255,.18));border-radius:6px;padding:5px 12px;font:inherit;font-size:12px;color:inherit;cursor:pointer;opacity:.7;transition:all .15s}',
         '.mp-btn:hover{opacity:1}',
-        '.mp-btn.primary{background:var(--dsw-accent,#4a9eff);border-color:var(--dsw-accent,#4a9eff);color:#fff;opacity:1}',
-        '.mp-btn.danger{color:#e74c3c;border-color:rgba(231,76,60,.5)}',
+        '.mp-btn.primary{background:var(--dsw-alias-brand-primary,#4a9eff);border-color:var(--dsw-alias-brand-primary,#4a9eff);color:#fff;opacity:1}',
+        '.mp-btn.danger{color:var(--dsw-alias-state-error-primary,#e74c3c);border-color:color-mix(in srgb,var(--dsw-alias-state-error-primary,#e74c3c) 50%,transparent)}',
         '.mp-btn:disabled{opacity:.35;cursor:not-allowed}',
         '.mp-controls{display:flex;flex-direction:column;gap:8px}',
-        '.mp-search{background:rgba(255,255,255,.05);border:1px solid var(--dsw-border,rgba(255,255,255,.18));border-radius:8px;padding:8px 12px;font:inherit;font-size:13px;color:inherit;outline:none;width:100%;box-sizing:border-box}',
-        '.mp-search:focus{border-color:var(--dsw-accent,#4a9eff)}',
+        '.mp-search{background:rgba(255,255,255,.05);border:1px solid var(--dsw-alias-border-l1,rgba(255,255,255,.18));border-radius:8px;padding:8px 12px;font:inherit;font-size:13px;color:inherit;outline:none;width:100%;box-sizing:border-box}',
+        '.mp-search:focus{border-color:var(--dsw-alias-brand-primary,#4a9eff)}',
         '.mp-chips{display:flex;flex-wrap:wrap;gap:6px}',
-        '.mp-chip{background:transparent;border:1px solid var(--dsw-border,rgba(255,255,255,.18));border-radius:999px;padding:3px 12px;font:inherit;font-size:12px;color:inherit;cursor:pointer;opacity:.55}',
+        '.mp-chip{background:transparent;border:1px solid var(--dsw-alias-border-l1,rgba(255,255,255,.18));border-radius:999px;padding:3px 12px;font:inherit;font-size:12px;color:inherit;cursor:pointer;opacity:.55}',
         '.mp-chip:hover{opacity:.9}',
-        '.mp-chip.on{opacity:1;background:var(--dsw-accent,#4a9eff);border-color:var(--dsw-accent,#4a9eff);color:#fff}',
+        '.mp-chip.on{opacity:1;background:var(--dsw-alias-brand-primary,#4a9eff);border-color:var(--dsw-alias-brand-primary,#4a9eff);color:#fff}',
         '.mp-cards{display:flex;flex-direction:column;gap:8px}',
         '.mp-card{background:var(--dsw-alias-bg-layer-2,#2c2c2e);border:1px solid transparent;border-radius:10px;padding:10px 14px;cursor:pointer;transition:border-color .15s}',
-        '.mp-card:hover{border-color:var(--dsw-border,rgba(255,255,255,.25))}',
-        '.mp-card.installed{border-color:rgba(74,158,255,.45)}',
+        '.mp-card:hover{border-color:var(--dsw-alias-border-l1,rgba(255,255,255,.25))}',
+        '.mp-card.installed{border-color:color-mix(in srgb,var(--dsw-alias-brand-primary,#4a9eff) 45%,transparent)}',
         '.mp-card-head{display:flex;align-items:center;gap:8px;flex-wrap:wrap}',
         '.mp-card-name{font-size:13px;font-weight:600}',
-        '.mp-card-cat{font-size:11px;opacity:.5;border:1px solid var(--dsw-border,rgba(255,255,255,.15));border-radius:4px;padding:0 6px}',
+        '.mp-card-cat{font-size:11px;opacity:.5;border:1px solid var(--dsw-alias-border-l1,rgba(255,255,255,.15));border-radius:4px;padding:0 6px}',
         '.mp-card-desc{font-size:12px;opacity:.65;margin-top:4px;line-height:1.5;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}',
         '.mp-card-meta{display:flex;align-items:center;gap:10px;font-size:11px;opacity:.5;margin-top:6px;flex-wrap:wrap}',
         '.mp-badge{font-size:11px;border-radius:4px;padding:1px 7px;cursor:help}',
         '.mp-badge-gray{background:rgba(128,128,128,.22);color:#c8c8c8}',
         '.mp-badge-blue{background:rgba(74,158,255,.22);color:#7db9ff}',
         '.mp-badge-red{background:rgba(231,76,60,.25);color:#ff8a80}',
-        '.mp-detail{border-top:1px solid var(--dsw-border,rgba(255,255,255,.12));margin-top:10px;padding-top:10px;display:flex;flex-direction:column;gap:8px}',
+        '.mp-detail{border-top:1px solid var(--dsw-alias-border-l2,rgba(255,255,255,.12));margin-top:10px;padding-top:10px;display:flex;flex-direction:column;gap:8px}',
         '.mp-detail-row{display:flex;gap:8px;font-size:12px;flex-wrap:wrap}',
         '.mp-detail-row .k{opacity:.5;min-width:72px}',
         '.mp-detail-row .v{opacity:.9;word-break:break-all;font-family:ui-monospace,Menlo,Consolas,monospace}',
-        '.mp-warning{border:1px solid rgba(231,76,60,.5);background:rgba(231,76,60,.08);border-radius:8px;padding:10px 12px;font-size:12px;line-height:1.6;color:#ffb4ac}',
-        '.mp-warning b{color:#ff6b60}',
+        '.mp-warning{border:1px solid color-mix(in srgb,var(--dsw-alias-state-error-primary,#e74c3c) 50%,transparent);background:color-mix(in srgb,var(--dsw-alias-state-error-primary,#e74c3c) 8%,transparent);border-radius:8px;padding:10px 12px;font-size:12px;line-height:1.6;color:#ffb4ac}',
+        '.mp-warning b{color:var(--dsw-alias-state-error-primary,#ff6b60)}',
         '.mp-confirm{display:flex;align-items:flex-start;gap:8px;font-size:12px;opacity:.85}',
         '.mp-confirm input{margin-top:1px}',
         '.mp-actions{display:flex;gap:8px;flex-wrap:wrap}',
         '.mp-empty{font-size:12px;opacity:.55;padding:12px 0}',
         '.mp-sort{display:flex;gap:6px;align-items:center}',
-        '.mp-sort select{background:transparent;border:1px solid var(--dsw-border,rgba(255,255,255,.18));border-radius:6px;padding:3px 8px;font:inherit;font-size:12px;color:inherit;outline:none}',
+        '.mp-sort select{background:transparent;border:1px solid var(--dsw-alias-border-l1,rgba(255,255,255,.18));border-radius:6px;padding:3px 8px;font:inherit;font-size:12px;color:inherit;outline:none}',
+        '.mp-src{display:flex;align-items:center;gap:8px;flex-wrap:wrap}',
+        '.mp-src select{background:transparent;border:1px solid var(--dsw-alias-border-l1,rgba(255,255,255,.18));border-radius:6px;padding:3px 8px;font:inherit;font-size:12px;color:inherit;outline:none;max-width:260px}',
+        '.mp-addsrc{display:flex;gap:6px;flex-wrap:wrap}',
+        '.mp-addsrc input{background:rgba(255,255,255,.05);border:1px solid var(--dsw-alias-border-l1,rgba(255,255,255,.18));border-radius:6px;padding:4px 8px;font:inherit;font-size:12px;color:inherit;outline:none;min-width:220px;box-sizing:border-box}',
+        '.mp-addsrc input:focus{border-color:var(--dsw-alias-brand-primary,#4a9eff)}',
+        '.mp-srcinfo{font-size:11px;opacity:.55}',
+        '.mp-src-badge{font-size:11px;border-radius:4px;padding:1px 7px;background:rgba(128,128,128,.22);color:#c8c8c8}',
       ].join('\n')
 
       /* ---------- 工具函数 ---------- */
@@ -145,7 +152,7 @@
             h('div', { className: 'mp-detail-row' }, h('span', { className: 'k' }, '收录'), h('span', { className: 'v' }, fmtRelative(p.addedAt))),
             h('div', { className: 'mp-detail-row' }, h('span', { className: 'k' }, '标记依据'), h('span', { className: 'v' }, (p.stateReasons || []).join('; ') || '—')),
             h('div', { className: 'mp-detail-row' }, h('span', { className: 'k' }, '安装命令'), h('span', { className: 'v' }, p.installSpec || '—')),
-            h('div', { className: 'mp-detail-row' }, h('span', { className: 'k' }, 'GitHub'), h('a', { href: p.githubUrl, target: '_blank', rel: 'noreferrer', style: { color: 'var(--dsw-accent,#4a9eff)' } }, '查看源码 ↗')),
+            h('div', { className: 'mp-detail-row' }, h('span', { className: 'k' }, 'GitHub'), h('a', { href: p.githubUrl, target: '_blank', rel: 'noreferrer', style: { color: 'var(--dsw-alias-brand-primary,#4a9eff)' } }, '查看源码 ↗')),
             h('div', { className: 'mp-warning' },
               h('b', null, '此插件未经人工安全审计。'), ' 安装后将以你运行 DSH 的用户权限执行任意代码,可读写你的文件、访问网络。仅安装你信任的来源。插件在 DSH 主进程内运行,无沙箱隔离;安装 = 运行该插件的发布脚本与全部代码。建议先查看源码。'),
             h(ConfirmCheck, {
@@ -179,7 +186,7 @@
               disabled: props.busy,
               onClick: function () {
                 if (window.confirm('确认卸载 ' + (props.row.name || props.row.id) + '?\n将热卸载并从 profile 移除依赖。')) {
-                  props.onUninstall(props.row.name || props.row.id)
+                  props.onUninstall(props.row.id)
                 }
               },
             }, busy ? '卸载中…' : '卸载'),
@@ -226,12 +233,12 @@
           })
         }
 
-        function doUninstall(name) {
-          patch({ busy: name, result: null })
+        function doUninstall(id) {
+          patch({ busy: id, result: null })
           api('/uninstall', {
             method: 'POST',
             headers: { 'content-type': 'application/json' },
-            body: JSON.stringify({ name: name }),
+            body: JSON.stringify({ id: id }),
           }).then(function (r) {
             patch({ busy: null, result: { ok: true, text: r.message } })
             loadAll()

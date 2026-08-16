@@ -346,36 +346,44 @@ export function apply(ctx) {
           return
         }
 
-        // POST /uninstall { name } — 热卸载
+        // POST /uninstall { id } — 热卸载。按 patch insert 行的 id(安装时写入的 slug)
+        // 查找并删除块;包名从块内解析,用于 pnpm remove。兼容旧客户端传 { name }。
         if (route === '/uninstall' && method === 'POST') {
           const body = await readBody(req)
-          const name = typeof body?.name === 'string' ? body.name.trim() : ''
-          if (name === '' || !/^[a-z0-9][a-z0-9-_.]*$/.test(name)) {
-            writeJson(res, 400, { ok: false, error: '缺少合法的 name' })
+          const id = typeof body?.id === 'string'
+            ? body.id.trim()
+            : (typeof body?.name === 'string' ? body.name.trim() : '')
+          if (id === '' || id.length > 128 || !/^[A-Za-z0-9][A-Za-z0-9-_.@/]*$/.test(id)) {
+            writeJson(res, 400, { ok: false, error: '缺少合法的 id' })
             return
           }
           const result = await withMutationLock(async () => {
             let patchText = ''
             try { patchText = await readFile(patchPath, 'utf8') } catch { /* 无文件 */ }
-            const removed = removeInsertBlock(patchText, name)
-            if (!removed.removed) {
-              return { ok: false, status: 404, error: `${name} 不在 patch 安装列表中` }
+            const found = findBlockByInsertId(patchText, id)
+            if (found === null) {
+              return { ok: false, status: 404, error: `${id} 不在 patch 安装列表中` }
             }
+            // 包名从 insert 块解析(pnpm remove 需要包名,而非 slug)。
+            const rows = parseInsertRows(found.block)
+            const pkgName = rows[0]?.name ?? id
             // 1. 先删 patch 行(热卸载)
+            const removed = removeInsertBlock(patchText, id)
             await atomicWrite(patchPath, removed.text)
             // 2. pnpm remove 清理依赖(失败只告警,不阻塞)
             let cleanup = null
             try {
-              await runPnpm(profileDir, ['remove', name], cfg.pnpmTimeoutMs)
+              await runPnpm(profileDir, ['remove', pkgName], cfg.pnpmTimeoutMs)
             } catch (error) {
               cleanup = String(error?.message ?? error)
             }
-            await writeLog({ action: 'uninstall', name, ok: true, cleanup })
+            await writeLog({ action: 'uninstall', id, name: pkgName, ok: true, cleanup })
             return {
               ok: true,
-              name,
+              id,
+              name: pkgName,
               hotReload: true,
-              message: `已卸载 ${name}${cleanup ? `(依赖清理失败: ${cleanup},可手动 pnpm remove)` : ''}`,
+              message: `已卸载 ${pkgName}${cleanup ? `(依赖清理失败: ${cleanup},可手动 pnpm remove)` : ''}`,
             }
           })
           writeJson(res, result.status ?? (result.ok ? 200 : 500), result)

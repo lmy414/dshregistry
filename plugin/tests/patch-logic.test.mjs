@@ -94,3 +94,27 @@ test('真实场景:追加 -> 提取 -> 删除 全链路幂等', () => {
   const rows2 = parseInsertRows(t1)
   assert.deepEqual(rows2.map((r) => r.id), ['dsh-dashboard', 'p0', 'p2'])
 })
+
+test('卸载按 id:slug 与包名不同名时,必须按 id(slug)删除', () => {
+  // 安装:appendInsertBlock 用 slug 作 id、包名作 name(两者不同名是常态)
+  const text = appendInsertBlock(BASE, 'dsh-a', '@scope/dsh-a')
+  // 卸载按 id(slug)查找 → 命中
+  assert.ok(findBlockByInsertId(text, 'dsh-a') !== null)
+  // 卸载按 name(包名)查找 → 找不到(旧实现会 404)
+  assert.equal(findBlockByInsertId(text, '@scope/dsh-a'), null)
+  // 从块内解析包名(pnpm remove 需要包名)
+  const found = findBlockByInsertId(text, 'dsh-a')
+  const rows = parseInsertRows(found.block)
+  assert.equal(rows[0].name, '@scope/dsh-a')
+  const { text: t1, removed } = removeInsertBlock(text, 'dsh-a')
+  assert.equal(removed, true)
+  assert.ok(!t1.includes('dsh-a'))
+  assert.ok(t1.includes('dsh-dashboard'))
+})
+
+test('卸载兼容:特殊字符 slug(含 / 与 @)可被正确匹配', () => {
+  const text = appendInsertBlock('', 'owner/repo', 'dsh-x')
+  assert.ok(findBlockByInsertId(text, 'owner/repo') !== null)
+  const { removed } = removeInsertBlock(text, 'owner/repo')
+  assert.equal(removed, true)
+})

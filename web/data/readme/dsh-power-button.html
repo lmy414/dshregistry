@@ -1,0 +1,101 @@
+<h1>dsh-power-button</h1>
+<p><a href="https://github.com/keyiadiannao/dsh-power-button/blob/HEAD/LICENSE"><img src="https://img.shields.io/badge/license-MIT-green" alt="license"></a>
+<a href="https://github.com/deepseek-ai/DeepSeek-Harness"><img src="https://img.shields.io/badge/DeepSeek-Harness-blue" alt="DSH"></a></p>
+<p><a href="https://github.com/keyiadiannao/dsh-power-button/blob/HEAD/README.md">English</a> | <a href="https://github.com/keyiadiannao/dsh-power-button/blob/HEAD/README.zh-CN.md">中文</a></p>
+<p>A self-contained <strong>power &amp; lifecycle controller</strong> for <a href="https://github.com/deepseek-ai/DeepSeek-Harness">DeepSeek Harness</a>: a sidebar power button with a Restart / Shutdown menu and a full-screen transition overlay. The restart/shutdown engine is built into the plugin — no third-party dependencies.</p>
+<blockquote>
+<p>Developed with DeepSeek AI assistance; reviewed before release.</p>
+</blockquote>
+<h2>Features</h2>
+<ul>
+<li><strong>Sidebar power button</strong> in the footer action slot, theme-aware and styled to match the adjacent Settings trigger.</li>
+<li><strong>Restart / Shutdown menu</strong> with a Windows-style full-screen transition overlay; the page auto-reloads after a confirmed restart.</li>
+<li><strong>Self-contained restart engine</strong>: writes a detached <code>.cjs</code> helper that waits for the old process to exit and the port to free, then relaunches DSH with the same <code>execPath/execArgv/argv/cwd</code>. No PowerShell, no <code>taskkill</code>.</li>
+<li><strong><code>/restart</code> and <code>/shutdown</code> commands</strong>, plus a <strong><code>restart_harness</code> model tool</strong> (same name as <code>anweat/dsh-restart</code>; registration is skipped when another plugin already owns the name).</li>
+<li><strong>Localized UI and host notices</strong> (zh / en), following the profile's <code>locale.preference</code>.</li>
+<li><strong>Startup housekeeping</strong>: <code>restart-helper-*.log</code> files older than 7 days are pruned from the runtime directory.</li>
+</ul>
+<h2>Install</h2>
+<pre><code>dsh plugin --profile web add "github:keyiadiannao/dsh-power-button#master"
+</code></pre>
+<p>Restart DSH; a power button appears in the sidebar footer. Requires Node ≥ 22.19.</p>
+<h2>Configuration</h2>
+<p>The plugin is configured through the profile's cordis layer (<code>cordis.patch.yml</code> or the settings UI):</p>
+<table>
+<thead>
+<tr>
+<th>Key</th>
+<th>Default</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>enableModelTool</code></td>
+<td><code>true</code></td>
+<td>Register the <code>restart_harness</code> model tool. Set <code>false</code> to keep restart exclusively on the GUI button and <code>/restart</code>.</td>
+</tr>
+<tr>
+<td><code>maxDelayMs</code></td>
+<td><code>5000</code></td>
+<td>Upper bound (ms) for the model tool's <code>delayMs</code> argument. The effective floor is 1000 ms.</td>
+</tr>
+</tbody></table>
+<p>Example:</p>
+<pre><code>- id: dsh-power-button
+  config:
+    enableModelTool: true
+</code></pre>
+<h2>How it works</h2>
+<pre><code>click power → menu → Restart
+[host]    POST /api/dsh-power-button/restart
+          → write ~/.dsh/restart-helper-&lt;pid&gt;-&lt;ts&gt;.cjs
+          → spawn `node &lt;helper&gt;` (detached, windowsHide)
+[helper]  wait for old PID to exit → wait for port to free
+          → spawn DSH again with same execPath/argv/cwd → self-delete
+[host]    terminate after the HTTP response flushes
+[client]  poll health → confirm new instanceId → auto reload
+</code></pre>
+<p>Shutdown posts <code>/api/dsh-power-button/shutdown</code> and terminates without relaunching. Because it is irreversible (the process must be started manually), the GUI <strong>confirms shutdown in a dialog</strong> before it fires — a second click is required. (<code>/shutdown</code> and the model tool remain single-action by design; the model never exposes shutdown.)</p>
+<p>Design notes (from real issues hit during development):</p>
+<ul>
+<li>The helper must run <strong>outside the process tree</strong> (<code>detached</code> + <code>unref</code>), otherwise terminating DSH kills the helper mid-flight.</li>
+<li>The helper is a <strong>real <code>.cjs</code> file</strong>, not <code>node -e</code>: multi-line <code>node -e</code> scripts are mangled by Windows <code>CreateProcess</code> and die with a silent <code>SyntaxError</code>.</li>
+<li>Restart success is confirmed by a per-process <code>instanceId</code> that must <strong>change</strong> (old → new), so a brief outage alone never fakes success.</li>
+<li><strong>Durable-write quiescence</strong>: after the old process exits and the port frees, the helper polls every session log's <code>(size, mtimeMs)</code> until two consecutive samples are identical (bounded at ~15s) before relaunching. The old process's session write-behind buffer can keep draining after its main loop exits; relaunching into a file that is still being appended interleaves stale seq numbers and corrupts the session — this check closes that window.</li>
+</ul>
+<h2>Safety</h2>
+<ul>
+<li>Destructive POSTs are protected by a <strong>same-origin / loopback guard</strong> (CSRF): the socket must be loopback, <code>Host</code> must be a loopback authority, and a browser <code>Origin</code> must match.</li>
+<li>An <strong>at-most-once latch</strong> rejects duplicate transitions (a concurrent second POST gets <code>409</code>).</li>
+<li>The model tool's <code>delayMs</code> is <strong>floored at 1000 ms</strong> — the model cannot kill the process before its own turn settles.</li>
+<li>The restart marker is <strong>consumed (deleted) on boot</strong>, so a later ordinary launch never misreports a restart.</li>
+<li>Command-line logging is <strong>redacted</strong> (credentials never reach <code>~/.dsh/restart-helper-&lt;pid&gt;.log</code>); helper and marker files are written <code>0600</code>, the runtime directory <code>0700</code>.</li>
+</ul>
+<h2>Restart confirmation — UI toast, never written into a session</h2>
+<p>After a successful restart the plugin shows a small localized <code>已重启</code> /
+<code>Restarted</code> toast in the corner of the UI. This is <strong>purely a UI notice</strong>:
+nothing is written into any session log. (This replaced an earlier design that
+appended a synthetic <code>assistant/message</code> (<code>turn: 0, step: 0</code>) into the resumed
+conversation — that approach tripped the token-meter's step-pairing invariant
+and could corrupt large sessions, so it was removed. Tracked upstream:
+<a href="https://github.com/deepseek-ai/deepseek-harness/discussions/802">deepseek-ai/DeepSeek-Harness#802</a>.)</p>
+<p>Mechanics:</p>
+<ul>
+<li>On boot, if the restart marker was consumed, <code>/health</code> reports
+<code>restarted: true, fromInstanceId: &lt;old&gt;</code>.</li>
+<li>The client checks <code>/health</code> once after load; when <code>restarted</code> is true it
+shows the toast, then ACKs via <code>POST /api/dsh-power-button/notice-shown</code>
+so a later refresh does not re-show it.</li>
+<li>Because the confirmation never touches a session file, a restart can no
+longer corrupt session logs or leave unpaired events behind.</li>
+</ul>
+<h2>Development</h2>
+<pre><code>npm run build        # tsdown: host + client bundle
+npm run typecheck    # tsc --noEmit
+npm test             # vitest: marker lifecycle, delayMs clamp, argv redaction, log pruning
+</code></pre>
+<p>Tests isolate <code>DSH_HOME</code> via a vitest setup file, so they never touch your
+real <code>~/.dsh</code>. Artifacts: host at <code>lib/index.js</code>, client bundle at
+<code>lib/client.js</code> (both committed — git installs are build-free).</p>
+<h2>License &amp; Attribution</h2>
+<p>MIT. The "detached helper relaunch" idea follows <a href="https://github.com/anweat/dsh-restart">anweat/dsh-restart</a> (MIT); the implementation is independently written (real <code>.cjs</code> file, no PowerShell, dynamic port), no code copied.</p>

@@ -1,0 +1,193 @@
+<h1>dsh-tool-diagnose</h1>
+<p>A <a href="https://github.com/deepseek-ai/deepseek-harness">DeepSeek Harness</a> <strong>Cordis plugin</strong> (not a
+Skill — see <a href="#plugin-vs-skill">Plugin vs Skill</a>) that exposes a model-facing <code>diagnose</code> tool backed
+by an extensible check registry, <code>ctx.diagnostics</code>. Where a symptom-table Skill tells the agent
+which shell command to run and how to read its output, this plugin runs the introspection itself,
+inside the process, against live Cordis state — and lets other plugins contribute more checks the
+same way this package's own <code>checks.ts</code> does.</p>
+<h2>Layout</h2>
+<pre><code>src/
+  registry.ts    # ctx.diagnostics: DiagnosticRegistry Service — registerCheck/list/run
+  checks.ts       # create*Check FACTORIES (2 always-on) + optional checks (4, service-gated)
+  index.ts        # the plugin: mounts the registry, calls each factory, registers the `diagnose` tool
+tests/
+  registry.spec.ts            # registry mechanics + the closure-vs-passed-ctx regression test
+  checks.spec.ts                # credential-format / approval-policy branches + the index.ts wiring regression test
+  checks-integration.spec.ts     # all 6 checks against real Loader/ToolRuntime/SessionStore/etc.
+cordis.patch.yml    # the bundle layer a profile applies when it lists this package
+package.json         # declares dsh.bundle, pointing at cordis.patch.yml
+</code></pre>
+<h2>What the checks actually do</h2>
+<p>Every one reads a real, already-shipped service — no invented APIs. Two are always registered
+(they only need <code>ctx.tools</code>, which this plugin already requires, or nothing beyond <code>ctx.diagnostics</code>
+itself); four more register only when their service is actually mounted in this deployment (see
+<a href="#optional-checks-service-gated">Optional checks</a>).</p>
+<ul>
+<li><strong><code>plugin-fiber-state</code></strong> reads <code>ctx.loader.entries()</code> — the same primitive
+<code>@deepseek-ai/dsh-host-plugin-inventory</code> projects to the web UI — and reports each matching
+entry's <code>enabled</code>/<code>disabled</code> state and fiber phase (<code>pending</code>/<code>loading</code>/<code>active</code>/<code>failed</code>/
+<code>unloading</code>/none). This is the live version of manually running <code>dsh --profile &lt;p&gt; --dump-config</code> and reading it by eye. (It's gated on <code>ctx.loader</code> like the other optional checks
+below, even though the description here groups it with the "always on" pair for token-cost
+purposes — see <code>index.ts</code>.)</li>
+<li><strong><code>tool-visibility</code></strong> calls <code>ctx.tools.get(name)</code> to tell you whether a tool is registered and
+visible in the global scope, or absent (never registered, owning plugin failed to load, or
+scope-restricted away).</li>
+</ul>
+<p>Call the tool with an optional <code>target</code> (check-specific: a plugin module-name substring, a tool
+name, a credential-reference name, or a session id); omit it to get every check's unfiltered view.</p>
+<h3>Optional checks (service-gated)</h3>
+<p>Each depends on a service <code>dsh-base</code> normally provides but an unusual deployment might not mount;
+<code>index.ts</code> registers each one inside its own <code>ctx.inject([...])</code>, so a deployment missing one
+service still gets every other check instead of the whole plugin failing to load.</p>
+<ul>
+<li><strong><code>credential-resolution</code></strong> (needs <code>ctx.credentials</code>) — resolves a credential reference (e.g.
+<code>DEEPSEEK_API_KEY</code>) via <code>ctx.credentials.describe()</code>: configured/source/writable, <strong>never the
+value itself</strong>, per that seam's own doctrine.</li>
+<li><strong><code>approval-policy</code></strong> (needs <code>ctx.approval</code>, <code>ctx.sessions</code>) — reports the deployment default
+approval policy (<code>"ask"</code>/<code>"never"</code>), or a specific session's override when given a session-id
+target.</li>
+<li><strong><code>token-pressure</code></strong> (needs <code>ctx.tokenMeter</code>, <code>ctx.sessions</code>) — measures a live session's current
+<code>totalTokens</code> (request/response pressure) vs. <code>surfaceTokens</code> (fixed-heuristic total), useful for
+"why hasn't compaction run yet" symptoms.</li>
+<li><strong><code>subagent-tree</code></strong> (needs <code>ctx.subagents</code>) — flattens a session's descendant subagent tree,
+reporting count, max depth, and any descendant the registry couldn't interpret
+(<code>corrupt</code>/<code>unavailable</code>).</li>
+</ul>
+<h2>Extending it: a third-party check</h2>
+<p>Any other plugin can depend on this one and register more checks. <strong>A check is a factory that
+closes over its own already-scoped <code>ctx</code></strong> — construct it inside the <code>ctx.inject</code> callback for
+whatever services it needs, not as a standalone object built ahead of time (see
+<a href="#audit-notes">Audit notes</a> for exactly why that distinction is load-bearing):</p>
+<pre><code>import type { Context } from '@deepseek-ai/cordis'
+
+export const name = 'my-extra-diagnostics'
+
+export function apply(ctx: Context) {
+  ctx.inject(['diagnostics' /* , 'whateverServiceThisCheckNeeds' */], (ctx) =&gt; {
+    ctx.diagnostics.registerCheck({
+      id: 'my-check',
+      description: 'What this check looks at and what target means for it.',
+      run(target) {
+        // read ctx (closed over above) here — never accept ctx as a run() parameter
+        return []
+      },
+    })
+  })
+}
+</code></pre>
+<p>Disposing that plugin's fiber automatically unregisters its check — <code>registerCheck</code> returns the
+disposer but you rarely need to call it directly; Cordis calls it for you on unload.</p>
+<h2>Try it locally</h2>
+<pre><code>pnpm dsh plugin --profile demo add /path/to/dsh-tool-diagnose
+dsh --profile demo --dump-config   # confirm the "diagnose-tool" row is present
+dsh --profile demo
+</code></pre>
+<p>Then, in a session: "Use the diagnose tool to check why the bash_run tool isn't showing up."</p>
+<p>On Windows, if you instead point a <code>--patch</code> overlay directly at <code>src/index.ts</code> (the
+tutorial-style local-file pattern) for a quick source-launch test, the module <code>name</code> must be a
+<code>file:///</code> URL, not a bare <code>D:/...</code> path — Node's ESM loader rejects the latter with
+<code>ERR_UNSUPPORTED_ESM_URL_SCHEME</code>.</p>
+<h2>Plugin vs Skill</h2>
+<p>If you want a portable, no-build, copy-into-<code>~/.agents/skills/</code> symptom table any DSH session can
+read instead, that's a Skill, not a plugin — see the original share in
+<a href="https://github.com/deepseek-ai/deepseek-harness/discussions/1739">Discussion #1739</a>, which is what
+this plugin took its methodology cues from (especially version-anchoring knowledge to a specific
+dsh release). The two compose well: a Skill can tell the agent "call the <code>diagnose</code> tool first,
+then read its findings against this table" instead of asking it to run shell commands and parse
+the output itself.</p>
+<h2>Status</h2>
+<ul>
+<li> Published on GitHub, public, tagged with the <a href="https://github.com/topics/dsh-plugin"><code>dsh-plugin</code></a> topic.</li>
+<li> <code>LICENSE</code> filled in with a real copyright holder.</li>
+<li> Published on npm as <a href="https://www.npmjs.com/package/dsh-tool-diagnose"><code>dsh-tool-diagnose</code></a> —
+install with <code>dsh plugin add dsh-tool-diagnose</code>. The GitHub source install
+(<code>dsh plugin add github:xu-kai-quan/dsh-tool-diagnose</code>, see the build-script caveat below)
+still works too, and tracks <code>master</code> rather than the last tagged npm release.</li>
+</ul>
+<p>If you fork or extend this:</p>
+<ol>
+<li>Confirm dependency versions against what you actually build/test against — this skeleton pins
+the versions available at scaffold time: <code>@deepseek-ai/cordis@4.0.1</code>,
+<code>@deepseek-ai/cordis-plugin-loader@1.0.2</code>, <code>@deepseek-ai/schemastery@3.18.1</code>, and
+<code>@deepseek-ai/dsh-tools</code>/<code>dsh-credentials</code>/<code>dsh-user-approval</code>/<code>dsh-token-meter</code>/<code>dsh-session</code>/
+<code>dsh-subagent</code> all at <code>0.1.0-rc.5</code> (the dsh family is versioned in lockstep).</li>
+<li>Ship prebuilt output (<code>npm publish</code>, or <code>pnpm pack</code> + tarball) rather than relying on installers
+allowing a git-install <code>prepare</code> script, unless you want users to opt into that.</li>
+<li><code>npm install &amp;&amp; npm test &amp;&amp; npm run build</code> before tagging a release — and, per the audit notes
+below, actually boot it inside a real <code>dsh</code> process at least once. This package's own bugs were
+invisible to its test suite until that step.</li>
+<li>Write real checks — the six shipped here are a useful starting set, not the ceiling; port
+whatever mechanism chains you'd otherwise write as Skill symptom rows into <code>DiagnosticCheck</code>s
+that actually read the live state instead of describing how to. Grep the target package's
+README for its <code>ctx.&lt;key&gt;</code> service surface first, the way this package's checks were built.</li>
+</ol>
+<h2>Audit notes</h2>
+<h3>Two real bugs a full test suite (22 passing tests) did not catch</h3>
+<p>Both were found only by actually running this exact plugin inside a real <code>dsh --profile headless</code>
+process and asking the agent to call the <code>diagnose</code> tool for real — every unit and integration
+test up to that point passed cleanly while the tool was either unregistered or broken.</p>
+<ol>
+<li><strong>Wrong <code>output.schema</code> DSL for <code>defineTool</code>.</strong> <code>dsh-tools</code>' <code>ValueSchemaSpec</code> marks a property
+optional/required with <code>required: true</code> <strong>on the property itself</strong>, mirroring <code>parameters</code> —
+NOT a sibling plain-JSON-Schema <code>required: [...]</code> array on the object node. The wrong form
+compiled fine under <code>tsc</code> and looked identical to the (correct) <code>parameters</code> block a few lines
+above it, but threw <code>JsonSchemaError: schema.items.required is not supported by the value schema DSL</code> the instant <code>defineTool()</code> ran — which happens at plugin-load time, so the entire
+<code>diagnose</code> tool silently failed to register with no crash and no log line, in every profile.</li>
+<li><strong>A ctx reference does not survive being stored and handed back through another service's
+<code>this.ctx</code>.</strong> The original registry design captured <code>ctx</code> (or <code>this.ctx</code>) once and passed it to
+each check's <code>run(ctx, target)</code> later. Verified against the real <code>@deepseek-ai/cordis</code> 4.0.1
+runtime with isolated repro scripts: a scope's injected-service access (<code>ctx.approval</code>,
+<code>ctx.tools</code>, even a <strong>statically</strong> <code>inject</code>-declared dependency) is granted per exact context
+reference and does <em>not</em> propagate when that reference is stored as a plain value inside
+another <code>Service</code> instance and read back via <code>this.ctx</code> in a later method call — it throws
+<code>cannot get property "X" without inject</code>, regardless of whether the original grant was static
+or from a nested <code>ctx.inject()</code>. The fix: <code>DiagnosticCheck.run</code> takes no <code>ctx</code> parameter at
+all; every check is a <strong>factory</strong> (<code>create*Check(ctx)</code>) that closes over its scope's <code>ctx</code>
+directly at construction time, and the registry only ever calls <code>check.run(target)</code>.</li>
+</ol>
+<p><code>tests/registry.spec.ts</code> and <code>tests/checks.spec.ts</code> both now carry regression tests for bug #2
+(a check registered from a deeper scope than <code>run()</code> is later called from); nothing in the suite
+directly regression-tests bug #1 (a wrong-but-type-checking <code>output.schema</code> shape) — if you touch
+that schema, boot the plugin for real again rather than trusting <code>npm test</code> alone.</p>
+<h3>What was verified this way, end-to-end, with a live model call</h3>
+<p>Against a real <code>dsh --profile headless</code> boot (no mocks, no fakes, real npm-installed
+dependencies): the <code>diagnose</code> tool appears in the model's tool list; called with no target, it
+returns real findings from <code>plugin-fiber-state</code> (4 real disabled-plugin rows: <code>cordis-plugin-hmr</code>,
+<code>dsh-bash-sandbox</code>, <code>dsh-tool-bash</code>, <code>dsh-skill-badge</code>) and <code>approval-policy</code> (<code>"ask"</code>, the real
+deployment default); called with <code>target: 'DEEPSEEK_API_KEY'</code>, <code>credential-resolution</code> correctly
+reported it configured (source: file, writable) <strong>without leaking the value</strong>; called with
+<code>target: 'write'</code>, <code>tool-visibility</code> correctly reported it registered and visible. <code>credentials</code>,
+<code>approval</code>, <code>sessions</code>, <code>tokenMeter</code>, and <code>subagents</code> all turned out to be mounted in the
+<code>headless</code> profile — only <code>loader</code> gating was ever a real portability concern, and it's now
+handled the same way as the other four.</p>
+<h3>Per-check unit-test technique, in case you extend these further</h3>
+<ul>
+<li><code>plugin-fiber-state</code>: <code>ctx.plugin(Loader)</code> + <code>ctx.loader.builtins.&lt;name&gt; = fn</code> +
+<code>ctx.loader.create({ name })</code> — the same harness <code>dsh-host-plugin-inventory</code>'s own test suite
+uses, avoiding any real file/module resolution.</li>
+<li><code>tool-visibility</code>: direct <code>new ToolRuntime(ctx)</code> — but its constructor reads <code>ctx.systemPrompt</code>
+synchronously, so <code>await ctx.plugin(SystemPrompt, {})</code> has to happen first, or construction
+throws <code>Cannot read properties of undefined (reading 'tools')</code>. <code>dsh-tools</code>' own
+<code>code-mode.spec.ts</code> has the same prerequisite.</li>
+<li><code>token-pressure</code> / <code>approval-policy</code>: direct <code>new SessionStore(ctx)</code> + <code>new TokenMeter(ctx)</code> /
+<code>new ApprovalService(ctx, config)</code>, then <code>ctx.sessions.create()</code> for a live session — no
+persistence or agent loop needed since <code>measure()</code> and <code>overrideOf()</code> take the session object
+directly rather than reading it back through a service.</li>
+<li><code>subagent-tree</code>: direct <code>new SessionStore(ctx)</code> + <code>new SessionProjectionRegistry(ctx)</code> +
+<code>new SubagentRuntime(ctx)</code>. <code>listDescendants()</code> throws <code>SubagentError</code> before any candidate
+scan if <code>sessionProjections</code> isn't mounted — even for a session with zero children — so that
+service is not skippable even for the trivial empty-tree case tested here.</li>
+</ul>
+<h3>A real dependency-declaration bug, separately caught and fixed</h3>
+<p><code>@deepseek-ai/dsh-credentials</code> was briefly marked <code>optional</code> in <code>peerDependenciesMeta</code>, but
+<code>checks.ts</code> does a hard value-import of <code>credentialRef</code> from it — so the module import would fail
+at load time regardless of whether the credential check is ever registered, contradicting
+"optional". <code>dsh-user-approval</code>, <code>dsh-token-meter</code>, and <code>dsh-subagent</code> are genuinely optional:
+they're referenced only via <code>import type {}</code> side-effect imports, which TypeScript erases, leaving
+no runtime import to fail if the package is absent.</p>
+<h3>Still not covered</h3>
+<p>The non-trivial branches of <code>subagent-tree</code> (an actual descendant, or a <code>corrupt</code>/<code>unavailable</code>
+diagnostic entry) aren't tested — reaching them needs a real subagent provider and a started child
+(see <code>packages/subagent/subagent/tests/list-children.spec.ts</code> in the harness repo for the full
+weight of that harness: JSONL persistence, a mock LLM adapter, a real spawn/fork provider). The
+trivial empty-tree path is covered, and was independently confirmed by the live boot test above.</p>

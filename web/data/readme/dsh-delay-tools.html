@@ -1,0 +1,141 @@
+<h1>dsh-delay-tools</h1>
+<p>Delay utilities for DeepSeek Harness: <strong>two tools sharing one core concept — delay</strong>:</p>
+<table>
+<thead>
+<tr>
+<th>Mode</th>
+<th>Tool</th>
+<th>What the agent does while waiting</th>
+<th>User messages during the wait</th>
+<th>Typical use</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>Wake</td>
+<td><code>schedule_reminder</code></td>
+<td>keeps working; wakes up in the SAME conversation when due</td>
+<td>handled normally</td>
+<td>"remind me in 3 minutes about X"</td>
+</tr>
+<tr>
+<td>Gate</td>
+<td><code>wait</code></td>
+<td>blocks the current turn</td>
+<td>queued, processed after</td>
+<td>"wait 30 seconds, then continue", cooldowns</td>
+</tr>
+</tbody></table>
+<h2>Why</h2>
+<p>A plain background shell timer cannot do "wake me in 3 minutes": DSH background
+jobs are bound to the agent turn's lifecycle and get torn down when the turn
+ends (<code>ctx.jobs</code> owner-scoped dispose — the process exits with <code>0xC000013A</code> and
+the cancel is misreported as completed). This plugin uses a <strong>host-level timer</strong>
+(not bound to any turn) plus the official <code>followup()</code> wake channel to deliver
+the message back into the <strong>same conversation</strong>.</p>
+<h2>Install</h2>
+<pre><code>dsh plugin add github:keyiadiannao/dsh-delay-tools#master
+</code></pre>
+<h2>Usage</h2>
+<p>Tell the agent:</p>
+<blockquote>
+<p>Call the <code>schedule_reminder</code> tool and remind me in 30 seconds to drink water.</p>
+</blockquote>
+<p>The agent calls the tool and returns the expected trigger time; when the delay
+elapses it wakes up and delivers the reminder in the same conversation. No
+matter how many other turns happen in between (including new messages you send),
+the reminder arrives on time. Multiple reminders per conversation are
+supported — each has its own <code>reminder_id</code>.</p>
+<blockquote>
+<p><strong>Durability note:</strong> reminders live in process memory. They survive agent
+turns (and plugin reloads cancel them cleanly), but <strong>restarting the DSH
+host cancels all pending reminders</strong>. Durable persistence is on the roadmap.</p>
+</blockquote>
+<h3>Tool parameters</h3>
+<table>
+<thead>
+<tr>
+<th>Param</th>
+<th>Type</th>
+<th>Required</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>delay_ms</code></td>
+<td>number</td>
+<td>no</td>
+<td>Delay in ms, default 60000; clamped to <code>minDelayMs</code>..<code>maxDelayMs</code></td>
+</tr>
+<tr>
+<td><code>message</code></td>
+<td>string</td>
+<td>yes</td>
+<td>The text the agent delivers to you when the delay elapses</td>
+</tr>
+</tbody></table>
+<h3>Return value</h3>
+<p><code>scheduled</code> / <code>due_at</code> / <code>delay_ms</code> / <code>pending</code> (how many reminders are still
+pending for this agent).</p>
+<h2>The second mode: <code>wait</code> (timed gate)</h2>
+<p><code>schedule_reminder</code> means "wake later, keep working meanwhile"; <code>wait</code> is the
+opposite — it <strong>blocks the current turn</strong>, and the agent only continues after
+the countdown:</p>
+<blockquote>
+<p>Call the <code>wait</code> tool for 30 seconds, then continue.</p>
+</blockquote>
+<p><code>wait</code> takes only <code>delay_ms</code> and returns <code>waited_ms</code> / <code>elapsed_until</code> / <code>note</code>.
+Messages you send during the gate go into the inbox queue (the composer shows
+"N queued messages") and are processed after the countdown — which makes it a
+reliable trigger for testing queue/merge plugins such as
+<a href="https://github.com/keyiadiannao/dsh-queue-merge">dsh-queue-merge</a>.</p>
+<p><code>wait</code> observes <code>exec.signal</code> per the tools contract: pressing the <strong>stop</strong>
+button mid-wait interrupts the gate immediately (returns
+<code>note: 'Wait interrupted by the user (stop).'</code>) instead of hanging for the full
+delay.</p>
+<h2>Configuration</h2>
+<pre><code>- id: dsh-delay-tools
+  config:
+    defaultDelayMs: 60000       # default delay when delay_ms is omitted
+    maxDelayMs: 3600000         # upper bound for a single delay
+    minDelayMs: 1000            # lower bound, guards against instant re-entry
+</code></pre>
+<h2>How it works</h2>
+<pre><code>user: "tell me X in 3 minutes"
+  ↓
+schedule_reminder(delay_ms, message)
+  ↓
+host setTimeout(delay).unref()      ← not bound to any turn lifetime
+  ↓ (turn ends, teardown, further turns — none of it matters)
+due → agent.followup(userMessage)   ← official wake channel
+  ↓
+agent (idle) opens a new turn → replies in the same conversation
+</code></pre>
+<p>Key points:</p>
+<ul>
+<li>The timer lives in the <strong>plugin apply scope</strong>, not <code>ctx.jobs</code> (which dies
+with the owning turn).</li>
+<li><code>setTimeout().unref()</code> lets the process exit normally when only the timer is
+left — it never blocks the DSH lifecycle.</li>
+<li><code>agent.followup()</code> is the runtime's official wake channel: a wake submitted
+while the agent is idle always opens a new turn boundary (see the runtime-types
+comments), so cross-turn waking is a supported semantic.</li>
+</ul>
+<h2>Testing</h2>
+<p><code>tests/</code> holds config-validation tests (<code>pnpm test</code>). End-to-end verification:</p>
+<ol>
+<li>New session → have the agent call <code>schedule_reminder</code> with a 30 s delay;</li>
+<li>After the agent finishes its turn, <strong>send an interrupting message</strong>;</li>
+<li>~30 s later the agent wakes and delivers the reminder → cross-turn survival
+confirmed.</li>
+</ol>
+<p><code>wait</code> interruption: have the agent call <code>wait</code> for 40 s, press stop mid-way →
+the turn ends immediately instead of hanging for the full 40 s.</p>
+<h2>Roadmap</h2>
+<ul>
+<li><code>cancel_reminder</code> / <code>list_reminders</code> tools (per-agent, by <code>reminder_id</code>)</li>
+<li>Durable reminder store (<code>reminders.json</code> + re-hydrated timers on boot), so
+reminders survive a DSH host restart</li>
+<li>Pending-reminder cap</li>
+</ul>
+<h2>License</h2>
+<p>MIT</p>

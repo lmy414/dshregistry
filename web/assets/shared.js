@@ -39,7 +39,7 @@
   }
   async function loadDict(lang) {
     if (dictCache[lang]) return dictCache[lang]
-    const res = await fetch(`i18n/${lang}.json`)
+    const res = await fetch(`/i18n/${lang}.json`)
     if (!res.ok) throw new Error(`i18n/${lang}.json: HTTP ${res.status}`)
     dictCache[lang] = await res.json()
     return dictCache[lang]
@@ -92,8 +92,22 @@
     if (!res.ok) throw new Error(`${url}: HTTP ${res.status}`)
     return res.json()
   }
+  /** 带 sessionStorage 缓存的加载: 切换页面不重复下载 (首页数据 2.27MB 关键优化) */
+  const DATA_CACHE_KEY = 'dsh-data-v1'
   function loadData() {
-    return Promise.all([fetchJson('data/plugins.json'), fetchJson('data/meta.json')])
+    const cached = sessionStorage.getItem(DATA_CACHE_KEY)
+    if (cached) {
+      try {
+        const { t, plugins, meta } = JSON.parse(cached)
+        if (t && Date.now() - t < 10 * 60 * 1000) return Promise.resolve([plugins, meta])
+      } catch { /* 缓存损坏则重取 */ }
+    }
+    return Promise.all([fetchJson('/data/plugins.json'), fetchJson('/data/meta.json')]).then(([plugins, meta]) => {
+      try {
+        sessionStorage.setItem(DATA_CACHE_KEY, JSON.stringify({ t: Date.now(), plugins, meta }))
+      } catch { /* 存储满则忽略 */ }
+      return [plugins, meta]
+    })
   }
 
   // ------------------------------------------------------------------ 渲染助手
@@ -147,7 +161,23 @@
     dict = await loadDict(currentLang())
     applyStaticTexts()
     syncLangToggle()
+    prefetchNav()
     document.dispatchEvent(new CustomEvent('dsh:ready', { detail: { lang: currentLang() } }))
+  }
+
+  /** 预取导航目标页 (关于/首页), 切换时命中缓存不重新下载 */
+  function prefetchNav() {
+    if (!('requestIdleCallback' in window)) return
+    const targets = [...new Set([...document.querySelectorAll('a[data-dom-id^="nav-"], a.brand, a[data-dom-id="nav-about-footer"]')].map((a) => a.getAttribute('href')).filter(Boolean))]
+    requestIdleCallback(() => {
+      targets.forEach((href) => {
+        if (href === location.pathname || !href.startsWith('/')) return
+        const link = document.createElement('link')
+        link.rel = 'prefetch'
+        link.href = href
+        document.head.appendChild(link)
+      })
+    }, { timeout: 2000 })
   }
 
   window.DSHR = {

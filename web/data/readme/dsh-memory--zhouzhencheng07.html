@@ -1,0 +1,119 @@
+<h1 align="center">dsh-memory</h1>
+
+<p align="center">跨会话记忆插件：Auto-Memory 每轮提醒主模型自行判断并增量写入，memory_search 检索，Dream 长期巩固</p>
+
+<p align="center">
+  <img src="https://badgen.net/badge/license/MIT/green" alt="license">
+</p>
+
+<p>跨会话、跨项目的<strong>全局经验记忆</strong>：主 agent 的每次模型请求都会在 system prompt 里收到【自动记忆】提醒，自行判断本轮是否有值得跨会话保留的内容并<strong>增量写入</strong>每日记忆文件；<code>memory_search</code> 检索「Dream 精炼库 + 每日笔记」；Dream 定时把笔记提炼成长期 digest。形态：官方 <strong>bundle 插件</strong>（<code>dsh.bundle</code> + dshClient 通道），0 patch，<strong>零 npm 依赖</strong>（<code>@deepseek-ai/*</code> 由 dsh 运行时扁平 fallback 提供，与运行实例共享同一份包）。</p>
+<h2>能力</h2>
+<p><strong>工具</strong>（<code>defineTool</code> 注册，模型侧）：</p>
+<table>
+<thead>
+<tr>
+<th>工具</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>memory_search</code></td>
+<td>搜索 memory + dream：子串匹配（中文友好）、digest 加权，配置向量服务后自动升级为子串 + 向量 RRF 融合</td>
+</tr>
+<tr>
+<td><code>memory_dream</code></td>
+<td>立即执行一次 Dream 巩固（同 <code>/dream</code>，模型侧入口）</td>
+</tr>
+</tbody></table>
+<p><strong>命令</strong>（用户侧）：</p>
+<table>
+<thead>
+<tr>
+<th>命令</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>/dream</code></td>
+<td>立即执行一次 Dream 巩固（不依赖定时开关）</td>
+</tr>
+</tbody></table>
+<p><strong>系统集成</strong>（无 UI 组件，零官方改动）：</p>
+<table>
+<thead>
+<tr>
+<th>功能</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>Auto-Memory</td>
+<td>每轮 system prompt 注入记忆提醒（<code>dsh-memory:auto</code>，order 200），主 agent 自行判断并写入；子 agent 不提示</td>
+</tr>
+<tr>
+<td>Dream 定时</td>
+<td><code>dreamTime</code>（默认 23:00）每日自动巩固；空 = 关（<code>/dream</code> 手动仍可用）</td>
+</tr>
+<tr>
+<td>配置卡片</td>
+<td>设置 → 插件 → 插件配置 → 记忆（dsh-memory），改完保存即热生效（settings.yaml 持久化，无需重启）</td>
+</tr>
+</tbody></table>
+<h2>记忆写入：Auto-Memory</h2>
+<p>记忆由<strong>主 agent 在对话中直接整理</strong>——没有后台 LLM 调用（实测两次失败：手拼请求破坏 tool-call 配对 → 400；<code>reasoningEffort: max</code> 模型把 token 全花在思考 → 空回答。对话机制组装合法请求、主模型正常回答，两种失败都不存在）：</p>
+<ul>
+<li><strong>机制</strong>：<code>autoMemory: true</code>（默认）时，插件注册一段 system prompt context（<code>order: 200</code>），<strong>每次模型请求组装时重新求值</strong>，提醒主 agent 审视本轮内容；有值得记的（决策及原因、偏好/纠正/约定、踩坑与修复、可复用命令/流程、状态变化）就主动写入，没有就不动文件</li>
+<li><strong>执行规则</strong>：文件不存在 → <code>write</code> 新建；已存在 → 只用 <code>edit</code> 精确修改（禁止整体 write 覆盖）；只写尚未覆盖的新内容，旧内容过时或错误时更新修正；关键处逐字引用；多级标题（# 主题 + ## 小节）；首行来源注释；全文不写日期/时间戳</li>
+<li><strong>跨日天然正确</strong>：提醒里的文件路径在组装时取<strong>当天</strong>日期——跨午夜的会话自动切到新一天文件，无水位、无轮次计数</li>
+<li><strong>子 agent 不参与</strong>（<code>delegationDepth &gt; 0</code> 不注入）；<code>autoMemory: false</code> 时注入为空（段落常驻、开关即时生效，无需重挂）</li>
+<li><strong>无重试</strong>（失败即设计问题，如实暴露）；无专用写入工具（直接用 dsh 自带的 read/edit/write）；无手动命令（每轮提醒即捕获路径）</li>
+</ul>
+<h2>Dream 机制</h2>
+<ul>
+<li><strong>触发</strong>：<code>dreamTime</code>（默认 23:00；非空 = 定时开，空 = 关）每日定时 + <code>/dream</code> 命令 + <code>memory_dream</code> 工具</li>
+<li><strong>桶</strong>：<code>personal</code>（偏好/约定/约束）、<code>procedure</code>（流程/方法）、<code>wiki</code>（知识/原则/先例/事实）</li>
+<li><strong>窗口（固定两天，无水位）</strong>：每次处理「今天 + 昨天」的全部笔记——每个文件有两次扫描机会；重复运行靠 <code>merge_with</code> 收敛（不产生重复节点）</li>
+<li><strong>流程</strong>：窗口内 <code>memory/</code> 笔记 → 当前会话模型整合进 <code>dream/&lt;桶&gt;/&lt;主题&gt;.md</code>：同主题 <code>merge_with</code> 融合（保留旧要点与全部来源）、新主题新建；文件尾写 <code>derived_from:: [[memory/...]]</code> 溯源；原始笔记永不删除</li>
+<li><strong>质量 gate</strong>：宁缺毋滥——只提炼可长期复用的抽象（禁止 passing mention/已知概念复述/事件总括/一次性时间戳）；不进 digest 的笔记仍被 <code>memory_search</code> 全库检索</li>
+</ul>
+<h2>向量检索（可选）</h2>
+<p>配置 <code>embeddingBaseUrl</code>（Ollama 兼容 <code>/api/embed</code>，如 <code>http://localhost:11434</code>）后，<code>memory_search</code> 自动升级为<strong>子串 + 向量 RRF 融合</strong>（k=60）：</p>
+<ul>
+<li>记忆文件按 <code>#</code> 小节分块（空节不产生向量），余弦相似度 ≥ 0.45 才参与融合（按 bge-m3 实测分布调校）</li>
+<li><strong>内存索引 + sha1 签名缓存</strong>：文件未变不重复嵌入；向量服务不可用时自动回退纯子串，<code>memory_search</code> 永不因向量失败</li>
+<li>嵌入模型默认 <code>bge-m3</code>，可经 <code>embeddingModel</code> 覆盖；不配置则零网络依赖</li>
+</ul>
+<h2>安装</h2>
+<pre><code>dsh plugin --profile web add "github:zhouzhencheng07/dsh-memory"
+</code></pre>
+<p>装完 <strong>重启 web</strong> 生效（bundle 挂载在启动时合成）；之后可在设置页「插件」面板停用/启用（运行时生效 + 持久化）。</p>
+<blockquote>
+<p>本包<strong>零 npm 依赖</strong>：<code>@deepseek-ai/dsh-tools</code> / <code>dsh-settings</code> / <code>dsh-llm</code> / <code>dsh-home-paths</code> / <code>schemastery</code> 在运行时经 dsh 的扁平模块 fallback（<code>$DSH_HOME/profiles/node_modules</code>）解析，保证与运行中的 dsh 共享同一份包实例。更新：push 后 <code>dsh plugin --profile web update dsh-memory</code> + 重启。</p>
+</blockquote>
+<h2>使用</h2>
+<pre><code># 用户侧
+/dream                              # 立即巩固一次（把近两天笔记提炼进 dream/）
+
+# 模型侧（工具）
+memory_search query="向量检索阈值"  # 查记忆库（digest 优先，可向量融合）
+memory_dream                        # 巩固（同 /dream）
+</code></pre>
+<p>Auto-Memory 无需任何操作：开启后每轮自动提醒，主 agent 自行决定写入。</p>
+<h2>配置</h2>
+<p><code>$DSH_HOME/settings.yaml</code>（热更新，不用重启；也可在设置页配置卡片改）：</p>
+<pre><code>dsh-memory:
+  searchLimit: 5          # memory_search 默认返回条数（1-10）
+  model: ''               # Dream LLM 模型覆盖，provider/model；留空 = 会话模型
+  dreamTime: '23:00'      # Dream 每日触发时间（HH:MM）；留空 = 关闭定时（/dream 手动仍可用）
+  embeddingBaseUrl: ''    # Ollama 基地址（如 http://localhost:11434）；留空禁用向量检索
+  embeddingModel: 'bge-m3'  # embeddingBaseUrl 提供的嵌入模型名
+  autoMemory: true        # 自动记忆开关：每轮 system prompt 提醒；false = 无提醒
+</code></pre>
+<h2>开发</h2>
+<ul>
+<li>Node half：<code>src/*.js</code>——纯 ESM 手写，<strong>无构建步骤</strong>（<code>index.js</code> 入口 + <code>auto.js</code> 每轮注入 / <code>search.js</code> 检索 / <code>dream.js</code> 巩固 / <code>embed.js</code> 向量 / <code>store.js</code> 存储 / <code>config-http.js</code> 配置端点）</li>
+<li>client：<code>client/bundle.js</code>——手写 bundle 格式（<code>window.__ModuleLoader__.load</code>，与官方 <code>lib/client.js</code> 同形），注册到 <code>settings.plugin.item</code> 槽</li>
+<li>本地开发：源码目录 <code>node_modules</code>（真实 pnpm 安装，版本与运行时一致）负责解析 <code>@deepseek-ai/*</code>；运行时解析靠 dsh 扁平模块 fallback，两者互不干扰</li>
+</ul>
+<h2>许可</h2>
+<p>MIT License</p>

@@ -9,6 +9,18 @@
   const SORTS = ['updated', 'stars', 'firstSeen']   // 与 .sort-select option 顺序一致
   const PAGE_SIZE = 60                              // 大数据量分批渲染,加载更多递增
 
+  // P1-9: 从 URL 恢复初始状态 —— 优先路径式 /c/<cat>.html, 兼容 ?cat=&q=&page=
+  function initStateFromUrl() {
+    const pathMatch = location.pathname.match(/^\/c\/([^/]+)\.html$/)
+    const params = new URLSearchParams(location.search)
+    const cat = pathMatch ? pathMatch[1] : params.get('cat')
+    if (cat && DSHR.CATEGORIES.includes(cat)) state.category = cat
+    const q = params.get('q')
+    if (q) state.query = q
+    const page = Number(params.get('page') || 1)
+    if (page > 1) state.shown = PAGE_SIZE * page
+  }
+
   function filtered() {
     const q = state.query.trim().toLowerCase()
     let list = state.plugins
@@ -22,8 +34,14 @@
     return [...list].sort(by)
   }
 
+  // P1-9: 分类页可分享 URL (/c/tool.html) — 绝对路径, 任意层级页面可跳转
+  function categoryUrl(cat) {
+    if (cat === 'all') return '/index.html'
+    return `/c/${cat}.html`
+  }
+
   function cardHtml(p) {
-    return `<a href="plugin.html?slug=${encodeURIComponent(p.slug)}" class="plugin-card" data-dom-id="card-${DSHR.escapeHtml(p.slug)}">
+    return `<a href="/p/${encodeURIComponent(p.slug)}.html" class="plugin-card" data-dom-id="card-${DSHR.escapeHtml(p.slug)}">
       <div class="card-top">
         <div class="card-title-group">
           <div class="card-title">${DSHR.escapeHtml(p.name)}</div>
@@ -45,7 +63,7 @@
       <div class="empty-icon">🔍</div>
       <div class="empty-title">${DSHR.t('empty.title')}</div>
       <div class="empty-desc">${DSHR.t('empty.desc')}</div>
-      <a class="empty-btn" href="index.html" id="empty-clear">${DSHR.t('empty.clear')}</a>
+      <a class="empty-btn" href="/index.html" id="empty-clear">${DSHR.t('empty.clear')}</a>
     </div>`
   }
 
@@ -109,18 +127,41 @@
     const input = document.querySelector('.search-box input')
     if (input) {
       input.setAttribute('data-i18n-placeholder', '#search.placeholder')
-      input.value = ''
+      input.value = state.query
       input.addEventListener('input', () => { state.query = input.value; state.shown = PAGE_SIZE; render() })
     }
+    // P1-9: 分类 chip 前端过滤 + history.pushState (不整页跳转, 秒切; URL 可分享)
     document.querySelectorAll('.chip-row .chip').forEach((chip, i) => {
-      chip.addEventListener('click', () => { state.category = DSHR.CATEGORIES[i]; state.shown = PAGE_SIZE; syncChips(); render() })
+      const cat = DSHR.CATEGORIES[i]
+      chip.classList.toggle('active', cat === state.category)
+      chip.textContent = DSHR.categoryLabel(cat)
+      chip.style.cursor = 'pointer'
+      chip.addEventListener('click', () => {
+        if (cat === state.category) return
+        state.category = cat
+        state.shown = PAGE_SIZE
+        syncChips()
+        render()
+        // 更新 URL (可分享/可收藏), 不触发页面刷新
+        history.pushState(null, '', categoryUrl(cat))
+        syncTitle()
+      })
     })
     const select = document.querySelector('.sort-select')
     if (select) {
       select.selectedIndex = 0
       select.addEventListener('change', () => { state.sort = SORTS[select.selectedIndex] || 'updated'; state.shown = PAGE_SIZE; render() })
     }
-    syncChips()
+    // P1-9: 加载更多按钮 → 更新 ?page=N 可分享分页 URL (state.shown 已由 initStateFromUrl 设置)
+    document.addEventListener('click', (e) => {
+      const btn = e.target.closest('#loadmore-btn')
+      if (!btn) return
+      const next = Math.floor(state.shown / PAGE_SIZE) + 1
+      const base = state.category !== 'all' ? categoryUrl(state.category) : '/index.html'
+      history.replaceState(null, '', `${base}?page=${next}`)
+      state.shown += PAGE_SIZE
+      render()
+    })
   }
 
   DSHR.onReady(async () => {
@@ -131,6 +172,7 @@
     } catch (e) {
       console.error('[dshregistry] data load failed', e)
     }
+    initStateFromUrl()
     wire()
     syncTitle()
     renderStats()
@@ -139,6 +181,11 @@
   DSHR.onLangChange(() => { syncTitle(); syncChips(); renderStats(); render() })
 
   function syncTitle() {
-    document.title = DSHR.t('title.index')
+    if (state.category !== 'all') {
+      const catLabel = DSHR.categoryLabel(state.category)
+      document.title = `${catLabel} · DSH-Registry`
+    } else {
+      document.title = DSHR.t('title.index')
+    }
   }
 })()

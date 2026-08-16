@@ -1,13 +1,14 @@
 /**
- * dshregistry 详情页逻辑:按 ?slug= 渲染插件详情、安装命令、完整 README、
- * 元信息表、风险区与相关推荐。DOM 复用原型稿。
+ * dshregistry 详情页逻辑:按 ?slug= 或 /p/<slug>.html 渲染插件详情、安装命令、
+ * 完整 README、元信息表、风险区与相关推荐。DOM 复用原型稿。
  */
 (function () {
   'use strict'
 
-  const slug = new URLSearchParams(location.search).get('slug')
+  // 从 URL 提取 slug: 优先路径式 /p/<slug>.html, 兼容旧 ?slug= 参数
+  const pathMatch = location.pathname.match(/^\/p\/([^/]+)\.html$/)
+  const slug = pathMatch ? decodeURIComponent(pathMatch[1]) : new URLSearchParams(location.search).get('slug')
   let plugin = null
-  let all = []
   let meta = {}
 
   function setText(selector, text) {
@@ -24,6 +25,71 @@
     const titles = document.querySelectorAll('main .section-title')
     const keys = ['section.install', 'section.intro', 'section.meta', 'section.related']
     titles.forEach((el, i) => { if (keys[i]) el.textContent = DSHR.t(keys[i]) })
+    renderWarningCallout()
+    updateSeo()
+  }
+
+  /** 信任状态差异化警示条: unreviewed=红色强警示, community=琥珀温和提醒, flagged=红色 */
+  function renderWarningCallout() {
+    const el = document.querySelector('[data-dom-id="warning-callout"]')
+    if (!el || !plugin) return
+    const state = plugin.state || 'unreviewed'
+    if (state === 'community') {
+      el.className = 'warning-callout vouched'
+      el.innerHTML = DSHR.t('risk.warning.vouched')
+    } else {
+      el.className = 'warning-callout'
+      el.innerHTML = DSHR.t('risk.warning.unreviewed')
+    }
+  }
+
+  /** SEO: 按插件动态覆盖 meta / canonical / OG / JSON-LD */
+  function updateSeo() {
+    if (!plugin) return
+    const url = `https://dshregistry.xyz/p/${encodeURIComponent(slug)}.html`
+    const desc = (plugin.description || plugin.name || '').slice(0, 160)
+    const setMeta = (attr, key, value) => {
+      let el = document.querySelector(`meta[${attr}="${key}"]`)
+      if (!el) {
+        el = document.createElement('meta')
+        el.setAttribute(attr, key)
+        document.head.appendChild(el)
+      }
+      el.setAttribute('content', value)
+    }
+    document.title = `${plugin.name} · DSH-Registry`
+    setMeta('name', 'description', desc)
+    let canonical = document.querySelector('link[rel="canonical"]')
+    if (!canonical) { canonical = document.createElement('link'); canonical.rel = 'canonical'; document.head.appendChild(canonical) }
+    canonical.href = url
+    setMeta('property', 'og:title', `${plugin.name} · DSH-Registry`)
+    setMeta('property', 'og:description', desc)
+    setMeta('property', 'og:url', url)
+    setMeta('name', 'twitter:title', `${plugin.name} · DSH-Registry`)
+    setMeta('name', 'twitter:description', desc)
+    // JSON-LD: SoftwareApplication 结构化数据
+    let ld = document.getElementById('ld-plugin')
+    if (!ld) {
+      ld = document.createElement('script')
+      ld.id = 'ld-plugin'
+      ld.type = 'application/ld+json'
+      document.head.appendChild(ld)
+    }
+    ld.textContent = JSON.stringify({
+      '@context': 'https://schema.org',
+      '@type': 'SoftwareApplication',
+      name: plugin.name,
+      description: desc,
+      url,
+      applicationCategory: 'DeveloperApplication',
+      operatingSystem: 'DeepSeek Harness (DSH)',
+      author: { '@type': 'Organization', name: plugin.repo ? plugin.repo.split('/')[0] : undefined, url: plugin.githubUrl || undefined },
+      codeRepository: plugin.githubUrl || undefined,
+      dateModified: plugin.pushedAt || undefined,
+      datePublished: plugin.firstSeenAt || undefined,
+      aggregateRating: plugin.stars ? undefined : undefined,
+      offers: { '@type': 'Offer', price: '0', priceCurrency: 'USD' },
+    })
   }
 
   function renderStats() {
@@ -87,9 +153,18 @@
     } else {
       try {
         // 片段由爬虫在构建期渲染并白名单清洗,见 tools/crawl.js
-        const res = await fetch(plugin.readmeUrl)
+        // readmeUrl 可能是相对路径 (data/readme/xxx.html), 在 /p/ 或 /c/ 页面需转绝对路径
+        const readmeUrl = plugin.readmeUrl.startsWith('/') ? plugin.readmeUrl : `/${plugin.readmeUrl}`
+        const res = await fetch(readmeUrl)
         if (!res.ok) throw new Error(`HTTP ${res.status}`)
         body.innerHTML = await res.text()
+        // P2: README 标题降级 (h1→h2, h2→h3), 避免与页面主标题 h1 / 章节 h2 冲突
+        body.querySelectorAll('h1, h2').forEach((h) => {
+          const tag = h.tagName === 'H1' ? 'h2' : 'h3'
+          const nh = document.createElement(tag)
+          nh.innerHTML = h.innerHTML
+          h.replaceWith(nh)
+        })
         body.querySelectorAll('a[href]').forEach((a) => { a.target = '_blank'; a.rel = 'noopener' })
       } catch {
         body.innerHTML = `<p>${DSHR.escapeHtml(DSHR.t('readme.error'))}</p>`
@@ -131,38 +206,49 @@
     }
   }
 
-  function renderRelated() {
-    const grid = document.querySelector('.related-grid')
-    if (!grid) return
-    const related = all.filter((p) => p.slug !== plugin.slug && p.category === plugin.category).slice(0, 4)
-    const pool = related.length > 0 ? related : all.filter((p) => p.slug !== plugin.slug).slice(0, 3)
-    grid.innerHTML = pool.map((p) => `<a href="plugin.html?slug=${encodeURIComponent(p.slug)}" class="related-card">
-      <div class="related-card-top">
-        <span class="related-card-name">${DSHR.escapeHtml(p.name)}</span>
-        ${DSHR.badgeHtml(p.state)}
-      </div>
-      <div class="related-card-desc">${DSHR.escapeHtml(p.description || '')}</div>
-    </a>`).join('')
-  }
-
   function renderAll() {
-    renderStatics(); renderStats(); renderHeader(); renderInstall(); renderMeta(); renderRisk(); renderRelated()
+    renderStatics(); renderStats(); renderHeader(); renderInstall(); renderMeta(); renderRisk()
   }
 
   DSHR.onReady(async () => {
     try {
-      ;[all, meta] = await DSHR.loadData()
+      // 性能优化: 只加载当前插件数据 (~1KB), 不再全量下载 plugins.json (2.27MB)
+      const res = await DSHR.fetchJson(`/data/plugin/${encodeURIComponent(slug)}.json`)
+      plugin = res
     } catch (e) {
-      console.error('[dshregistry] data load failed', e)
-      all = []
+      console.error('[dshregistry] plugin data load failed', e)
+      plugin = null
     }
-    plugin = all.find((p) => p.slug === slug)
     if (!plugin) {
       location.replace('404.html')
       return
     }
+    // 统计条数据 (meta.json 仅 136B, 并行加载不阻塞)
+    DSHR.fetchJson('/data/meta.json').then((m) => { meta = m || {}; renderStats() }).catch(() => {})
     renderAll()
     await renderReadme()
+    loadRelated()
   })
   DSHR.onLangChange(() => { if (plugin) renderAll() })
+
+  /** 相关推荐: 延迟加载分类子集 (小文件), 不阻塞首屏 */
+  async function loadRelated() {
+    try {
+      const cat = plugin.category || 'other'
+      const list = await DSHR.fetchJson(`/data/by-cat/${encodeURIComponent(cat)}.json`)
+      const related = list.filter((p) => p.slug !== plugin.slug).slice(0, 4)
+      const grid = document.querySelector('.related-grid')
+      if (grid) {
+        grid.innerHTML = related.map((p) => `<a href="/p/${encodeURIComponent(p.slug)}.html" class="related-card">
+          <div class="related-card-top">
+            <span class="related-card-name">${DSHR.escapeHtml(p.name)}</span>
+            ${DSHR.badgeHtml(p.state)}
+          </div>
+          <div class="related-card-desc">${DSHR.escapeHtml(p.description || '')}</div>
+        </a>`).join('')
+      }
+    } catch (e) {
+      console.warn('[dshregistry] related load failed', e)
+    }
+  }
 })()

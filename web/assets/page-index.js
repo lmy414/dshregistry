@@ -9,13 +9,16 @@
   const SORTS = ['updated', 'stars', 'firstSeen']   // 与 .sort-select option 顺序一致
   const PAGE_SIZE = 60                              // 大数据量分批渲染,加载更多递增
 
-  // P1-9: 从 URL 参数恢复初始状态 (分类/搜索),支持 /c/<cat>.html 与 ?cat=&q=
+  // P1-9: 从 URL 恢复初始状态 —— 优先路径式 /c/<cat>.html, 兼容 ?cat=&q=&page=
   function initStateFromUrl() {
+    const pathMatch = location.pathname.match(/^\/c\/([^/]+)\.html$/)
     const params = new URLSearchParams(location.search)
-    const cat = params.get('cat')
+    const cat = pathMatch ? pathMatch[1] : params.get('cat')
     if (cat && DSHR.CATEGORIES.includes(cat)) state.category = cat
     const q = params.get('q')
     if (q) state.query = q
+    const page = Number(params.get('page') || 1)
+    if (page > 1) state.shown = PAGE_SIZE * page
   }
 
   function filtered() {
@@ -127,14 +130,21 @@
       input.value = state.query
       input.addEventListener('input', () => { state.query = input.value; state.shown = PAGE_SIZE; render() })
     }
-    // P1-9: 分类 chip 改为链接到独立分类页 (/c/<cat>.html)，支持分享与收录
+    // P1-9: 分类 chip 前端过滤 + history.pushState (不整页跳转, 秒切; URL 可分享)
     document.querySelectorAll('.chip-row .chip').forEach((chip, i) => {
       const cat = DSHR.CATEGORIES[i]
       chip.classList.toggle('active', cat === state.category)
       chip.textContent = DSHR.categoryLabel(cat)
       chip.style.cursor = 'pointer'
       chip.addEventListener('click', () => {
-        if (cat !== state.category) location.href = categoryUrl(cat)
+        if (cat === state.category) return
+        state.category = cat
+        state.shown = PAGE_SIZE
+        syncChips()
+        render()
+        // 更新 URL (可分享/可收藏), 不触发页面刷新
+        history.pushState(null, '', categoryUrl(cat))
+        syncTitle()
       })
     })
     const select = document.querySelector('.sort-select')
@@ -142,17 +152,13 @@
       select.selectedIndex = 0
       select.addEventListener('change', () => { state.sort = SORTS[select.selectedIndex] || 'updated'; state.shown = PAGE_SIZE; render() })
     }
-    // P1-9: 加载更多按钮改为 ?page=N 可分享分页 URL
-    const params = new URLSearchParams(location.search)
-    const page = Number(params.get('page') || 1)
-    state.shown = PAGE_SIZE * page
+    // P1-9: 加载更多按钮 → 更新 ?page=N 可分享分页 URL (state.shown 已由 initStateFromUrl 设置)
     document.addEventListener('click', (e) => {
       const btn = e.target.closest('#loadmore-btn')
       if (!btn) return
       const next = Math.floor(state.shown / PAGE_SIZE) + 1
-      const p = new URLSearchParams(location.search)
-      p.set('page', String(next))
-      history.replaceState(null, '', `${location.pathname}?${p.toString()}`)
+      const base = state.category !== 'all' ? categoryUrl(state.category) : '/index.html'
+      history.replaceState(null, '', `${base}?page=${next}`)
       state.shown += PAGE_SIZE
       render()
     })
@@ -175,6 +181,11 @@
   DSHR.onLangChange(() => { syncTitle(); syncChips(); renderStats(); render() })
 
   function syncTitle() {
-    document.title = DSHR.t('title.index')
+    if (state.category !== 'all') {
+      const catLabel = DSHR.categoryLabel(state.category)
+      document.title = `${catLabel} · DSH-Registry`
+    } else {
+      document.title = DSHR.t('title.index')
+    }
   }
 })()

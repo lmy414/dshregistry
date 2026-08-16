@@ -1,0 +1,263 @@
+<p><a href="https://github.com/JohnXu22786/context-pruner/blob/HEAD/README.zh.md">简体中文</a></p>
+<h1>dsh-context-triage</h1>
+<p>A session context triage plugin for <a href="https://github.com/deepseek-ai/deepseek-harness">DeepSeek Harness</a> (dsh) that automatically manages context volume during long sessions: it identifies and handles stale, duplicate, failed, oversized, and low-value message content to save token budget and curb context bloat.</p>
+<h2>Features</h2>
+<ul>
+<li><strong>Deterministic, zero model dependency</strong>: all verdicts and rewrites are produced by heuristic rules—no LLM calls, no extra services; behavior is predictable and testable offline.</li>
+<li><strong>Five Screeners</strong>, each independently switchable:<table>
+<thead>
+<tr>
+<th>Screener</th>
+<th>Verdict rule</th>
+<th>Handling action</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>Stale output <code>staleOutput</code></td>
+<td>Tool call pairs more than N turns after the latest user message, with results still complete</td>
+<td>Call block rewritten to an archive summary, result block removed</td>
+</tr>
+<tr>
+<td>Repeated call <code>repeatedCall</code></td>
+<td>Call pairs with the same tool and same arguments (JSON key order irrelevant)</td>
+<td>Only the most recent is kept; older call pairs are cut</td>
+</tr>
+<tr>
+<td>Failed call <code>failedCall</code></td>
+<td>Stale error results (<code>isError</code>)</td>
+<td>Input arguments replaced with a failure stub (prevents leakage / saves space), error text kept and trimmed</td>
+</tr>
+<tr>
+<td>Oversized block <code>oversizedBlock</code></td>
+<td>Tool result text exceeds the character cap</td>
+<td>Head/tail trimmed, middle annotated with the omitted amount</td>
+</tr>
+<tr>
+<td>Stale reasoning <code>staleReasoning</code></td>
+<td>Reasoning blocks beyond the retention turns; kept blocks exceeding the length cap</td>
+<td>Removed; or trimmed (within the reserve region only trim, never delete)</td>
+</tr>
+</tbody></table>
+</li>
+<li><strong>Reserve area (<code>reserve</code>)</strong>: content within the most recent N user turns is never touched, avoiding disruption of context the model is currently using.</li>
+<li><strong>Exemption list (<code>exempt</code>)</strong>: two-dimensional tool-name and file-path glob exemption (protects stateful tools like <code>task</code>/<code>skill</code>/<code>todowrite</code>/<code>todoread</code>/<code>write</code>/<code>edit</code>/<code>batch</code> by default).</li>
+<li><strong>"Worth it" check</strong>: any archive/stub action requires the rewrite to be strictly smaller than the original, ruling out changes that cost more; call-pair-level actions (archive = rewrite + cut) take effect or are abandoned as atomic groups.</li>
+<li><strong>Audit report</strong>: every triage outputs structured statistics—counts and savings per reason, per-item details, and suggested compression ranges; visible through the tool, the command, and the CLI.</li>
+<li><strong>Native integration with the dsh compression seam</strong>: implements <code>ctx.compaction</code> (<code>CompactionEngine</code>); auto-pressure, context overflow, manual, and forced region compression all go through the official harness mechanism. Replacement summary messages use a checkpoint source recognized by any backend-agnostic consumer.</li>
+</ul>
+<h2>Installation and mounting</h2>
+<p>The plugin is distributed as a <strong>bundle</strong>: <code>dsh.bundle.patch</code> in <code>package.json</code> points to <code>cordis.patch.yml</code> (the patch inserts the plugin line; config can be overridden on the line).</p>
+<h3>Installing in DSH</h3>
+<pre><code>dsh plugin --profile demo add github:JohnXu22786/context-pruner
+</code></pre>
+<p>Option 1 (mount from a local directory, recommended):</p>
+<pre><code>dsh plugin --profile web add link:/absolute/path/context-pruner
+</code></pre>
+<p>Option 2 (manual patch): merge the entry in <code>cordis.patch.yml</code> into the profile's <code>cordis.patch.yml</code>, or launch it directly as an overlay:</p>
+<pre><code>dsh web --patch ./cordis.patch.yml
+</code></pre>
+<p>Option 3 (git source):</p>
+<pre><code>dsh plugin --profile web add "github:your-repo/context-pruner#main"
+</code></pre>
+<p>After mounting, use <code>dsh --profile web --dump-config</code> to check whether the plugin line reaches the startup tree.</p>
+<blockquote>
+<p>Note: <code>ctx.compaction</code> allows only one provider per context. If your profile already loads another compression implementation (e.g., the built-in base compression backend), disable one of them via the patch's <code>disabled: true</code>—they cannot coexist.</p>
+</blockquote>
+<h2>Interface</h2>
+<h3>Entry point (manifest)</h3>
+<table>
+<thead>
+<tr>
+<th>Item</th>
+<th>Value</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>Package name</td>
+<td><code>dsh-context-triage</code> (<code>dsh.bundle.patch</code> in <code>package.json</code> declares the bundle)</td>
+</tr>
+<tr>
+<td>Main entry</td>
+<td><code>lib/index.js</code> (<code>main</code>/<code>exports</code>; <code>./core</code> and <code>./dsh</code> subpaths available for embedders)</td>
+</tr>
+<tr>
+<td>Plugin name</td>
+<td><code>context-triage</code></td>
+</tr>
+<tr>
+<td>Dependency injection</td>
+<td><code>tools</code> (required); the command registry is optionally probed via <code>ctx.get('commands')</code>, silently skipped if absent</td>
+</tr>
+<tr>
+<td>Config</td>
+<td>Exports <code>Config</code> (Schemastery Schema); defaults in the config table below</td>
+</tr>
+</tbody></table>
+<p>The plugin is a functional plugin: it exports <code>name</code> / <code>inject</code> / <code>Config</code> / <code>apply(ctx, config)</code>, called by cordis after validating config and filling defaults.</p>
+<h3>Provided extension points</h3>
+<table>
+<thead>
+<tr>
+<th>Extension point</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>Service <code>ctx.compaction</code></td>
+<td><code>TriageCompactionEngine extends CompactionEngine</code>, implementing <code>compactIfNeeded</code> (auto-pressure / overflow), <code>compactNow</code> (manual idle compression), <code>compactRegion</code> (forced region compression)</td>
+</tr>
+<tr>
+<td>Tool <code>triage_history</code></td>
+<td>Model-visible; parameter <code>dryRun?: boolean</code>. Runs one triage and returns the audit report to the model; with <code>dryRun=false</code> and a worth-handling region present, applies it directly</td>
+</tr>
+<tr>
+<td>Command <code>/triage</code></td>
+<td>Human command, bypasses the model; outputs the audit report and applies worthwhile handling</td>
+</tr>
+</tbody></table>
+<h3>How a compression transaction lands</h3>
+<p>Triage results are written to the session log as a standard compression transaction (append-only; history is not rewritten):</p>
+<ol>
+<li><code>compaction/start</code> (holds the lock until the paired <code>compaction/end</code>)</li>
+<li><code>compaction/summary</code> (summary content, masked regions, masked seq list, and heuristic token cost; <code>llmStreamCall</code> absent = non-model summary)</li>
+<li><code>user/message</code> + <code>surfaceOp: { op: 'replace', start, end }</code> + <code>sourceEventSeqs</code> (replacement summary message, <code>source</code> is the checkpoint source)</li>
+<li><code>compaction/end</code></li>
+</ol>
+<p>The model-visible history is derived from the session log; after the replacement, <code>deriveMessages()</code> naturally yields <code>[summary message, ...retained content]</code>—no in-place modification of historical records is needed.</p>
+<h2>Configuration</h2>
+<p>All fields have defaults; only override what you want to adjust. Invalid values (negative turns, out-of-range ratios, etc.) throw at load time. Example:</p>
+<pre><code># cordis.patch.yml
+- insert:
+    id: context-triage
+    name: dsh-context-triage
+    config:
+      budget:
+        contextTokens: 200000   # lower for smaller-context models
+        softRatio: 0.6
+      screeners:
+        staleOutput: { turns: 5 }
+        staleReasoning: { enabled: false }
+      exempt:
+        tools: [task, skill, write, edit]
+</code></pre>
+<table>
+<thead>
+<tr>
+<th>Field</th>
+<th>Default</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>enabled</code></td>
+<td><code>true</code></td>
+<td>Master switch</td>
+</tr>
+<tr>
+<td><code>reserve.turns</code></td>
+<td><code>3</code></td>
+<td>Reserve area: content within the most recent N user turns is not processed</td>
+</tr>
+<tr>
+<td><code>budget.contextTokens</code></td>
+<td><code>1000000</code></td>
+<td>Estimated context window (tokens); determines the pressure ratio</td>
+</tr>
+<tr>
+<td><code>budget.softRatio</code></td>
+<td><code>0.7</code></td>
+<td>Usage above this ratio → auto-compression triggers (pressure)</td>
+</tr>
+<tr>
+<td><code>budget.hardRatio</code></td>
+<td><code>0.9</code></td>
+<td>Usage above this ratio → pressure report marked forced (hard) grade</td>
+</tr>
+<tr>
+<td><code>budget.minSavingsTokens</code></td>
+<td><code>2000</code></td>
+<td>No action when estimated savings are below this</td>
+</tr>
+<tr>
+<td><code>screeners.staleOutput.turns</code></td>
+<td><code>8</code></td>
+<td>Call pairs more than N turns after the latest user message are archived</td>
+</tr>
+<tr>
+<td><code>screeners.repeatedCall.enabled</code></td>
+<td><code>true</code></td>
+<td>Repeated calls cut</td>
+</tr>
+<tr>
+<td><code>screeners.failedCall.turns</code></td>
+<td><code>4</code></td>
+<td>Failed-call handling threshold (turns)</td>
+</tr>
+<tr>
+<td><code>screeners.failedCall.errorKeepChars</code></td>
+<td><code>400</code></td>
+<td>Error text kept for failed calls (chars)</td>
+</tr>
+<tr>
+<td><code>screeners.oversizedBlock.capChars</code></td>
+<td><code>6000</code></td>
+<td>Tool result text cap (chars); beyond it, head/tail trimmed</td>
+</tr>
+<tr>
+<td><code>screeners.oversizedBlock.headChars</code> / <code>tailChars</code></td>
+<td><code>800</code> / <code>400</code></td>
+<td>Head/tail length kept during trimming</td>
+</tr>
+<tr>
+<td><code>screeners.staleReasoning.keepTurns</code></td>
+<td><code>3</code></td>
+<td>Keep reasoning blocks within the most recent N user turns</td>
+</tr>
+<tr>
+<td><code>screeners.staleReasoning.maxBlockChars</code></td>
+<td><code>2000</code></td>
+<td>Length cap for kept reasoning blocks; beyond it, trimmed</td>
+</tr>
+<tr>
+<td><code>exempt.tools</code></td>
+<td><code>[task, skill, todowrite, todoread, write, edit, batch]</code></td>
+<td>Exempt tool names</td>
+</tr>
+<tr>
+<td><code>exempt.filePatterns</code></td>
+<td><code>[]</code></td>
+<td>Exempt path globs (match call arguments <code>filePath</code>/<code>path</code>), e.g. <code>['**/*.lock']</code></td>
+</tr>
+<tr>
+<td><code>summary.capChars</code></td>
+<td><code>20000</code></td>
+<td>Compression summary char cap</td>
+</tr>
+<tr>
+<td><code>summary.headRatio</code></td>
+<td><code>0.4</code></td>
+<td>Head retention ratio when trimming the summary</td>
+</tr>
+</tbody></table>
+<h2>Local experience (no dsh required)</h2>
+<p><code>src/core</code> is a framework-agnostic engine with an offline replay CLI; it runs directly against a JSONL session file:</p>
+<pre><code>npm install
+npm run build
+node lib/cli/replay.js examples/session.sample.jsonl --config examples/demo.config.json
+node lib/cli/replay.js examples/session.sample.jsonl --config examples/demo.config.json --show-transcript
+</code></pre>
+<p>Replay format (one JSON event per line; seq determined by line order):</p>
+<pre><code>{"type":"user/message","text":"项目构建失败了"}
+{"type":"assistant/message","reasoning":"…","calls":[{"id":"c1","name":"bash","arguments":"{\"cmd\":\"npm run build\"}"}]}
+{"type":"tool/result","callId":"c1","text":"…","isError":false}
+</code></pre>
+<p>Sample output in <a href="https://github.com/JohnXu22786/context-pruner/blob/HEAD/examples/report.example.md">examples/report.example.md</a>; tests cover all screeners, merge priorities, atomic groups, audit consistency, and end-to-end replay (<code>npm test</code>).</p>
+<h2>Design trade-offs</h2>
+<ul>
+<li><strong>Token estimation is heuristic</strong>: CJK ≈ 1 token/char, others ≈ 4 chars/token; used only for pressure verdicts and audit statistics, not for billing. Configure <code>budget.contextTokens</code> per your actual model window.</li>
+<li><strong>Rewrites always yield net savings</strong>: archive summaries, failure stubs, and trimming all compare the sizes before and after the action; unattractive findings are automatically abandoned. Call-pair actions are judged as atomic groups, so there is no half-done state like "summary kept, result split."</li>
+<li><strong>Prompt caching</strong>: compression changes the message sequence, invalidating the prompt cache prefix after that point. In long sessions, saved tokens usually vastly outweigh cache recomputation cost; for pay-per-request providers (no cache billing) it is pure gain.</li>
+<li><strong>Never touches user input</strong>: the oversized-block screener only acts on tool results; user messages are never rewritten unless the whole reserve region covers them.</li>
+</ul>
+<h2>License</h2>
+<p>Released under the <a href="https://github.com/JohnXu22786/context-pruner/blob/HEAD/LICENSE">MIT License</a>.</p>

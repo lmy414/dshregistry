@@ -1,0 +1,222 @@
+
+
+<p><strong>中文</strong> · <a href="https://github.com/beimianism/Hermeslike-Mixagent-MoA/blob/HEAD/README.en.md">English</a></p>
+<h1>hermeslike-MoA</h1>
+<p><strong>Hermes 风格的 Mixture-of-Agents(MoA)请求聚合器——为 DSH 的 LLM 调用注入「路由器 → 多路参考顾问 → 聚合器流式输出」流水线,并带双通道故障切换与 V4P 三重闸门费用防护。</strong></p>
+
+
+<hr>
+<p><code>hermeslike-moa</code> 是一个 DSH 插件(<code>dsh.bundle</code>)。它注册一个 dsh-llm <code>LlmAdapter</code>(provider 路由 <code>deepseek-moa</code>,配置了 OpenCode Go key 时追加 <code>go-moa</code>),所有路由到这些 provider 的模型请求都会经过 MoA 流水线:</p>
+<pre><code>用户请求
+  → V4F 路由器(单次调用 JSON 判定:任务是否值得 V4P 介入)
+  → 参考顾问 ×N 并行(V4F;Hermes 风格顾问角色 system prompt;工具调用/结果折叠为纯文本;
+     工具结果 head+tail 裁剪;参考输出脱敏;末尾追加合成 user 判断指令)
+  → 聚合器(模型选择:用户显式选择优先 → 路由器辅助 → V4P 三重闸门兜底)
+  → 流式透传(标准 dsh-llm StreamChunk)
+</code></pre>
+<h2>三个模型选项</h2>
+<p>模型选择器里本插件提供三个模型:</p>
+<table>
+<thead>
+<tr>
+<th>模型</th>
+<th>含义</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong><code>deepseek-v4-mix</code></strong>(MoA Mix · 模型混合)</td>
+<td><strong>完整 MoA 流水线</strong>:路由器 → 参考顾问 ×N(flash,并行)→ 聚合器(pro 或 flash)→ 流式。消耗 1 路由 + N 参考 + 1 聚合共 N+2 次调用;聚合 pro 受 V4P 闸门约束</td>
+</tr>
+<tr>
+<td><strong><code>deepseek-v4-pro</code></strong></td>
+<td><strong>直连单一 V4 Pro</strong>(不走 MoA,无路由/参考/聚合开销);<strong>仍受 V4P 闸门约束</strong>(防呆:预算不足时按设置降级 flash 或报错)</td>
+</tr>
+<tr>
+<td><strong><code>deepseek-v4-flash</code></strong></td>
+<td><strong>直连单一 V4 Flash</strong>(不走 MoA,最便宜最快;<strong>不受闸门约束</strong>)</td>
+</tr>
+</tbody></table>
+<blockquote>
+<p>任何<strong>未知模型 id</strong>(不在上述三个之内)按 <strong>flash 直连</strong>处理,绝不静默触发昂贵的 MoA 路径。</p>
+</blockquote>
+<h2>核心特性</h2>
+<ul>
+<li><strong><code>mix</code> 模型大类</strong>:模型选择器里新增 <strong><code>MoA Mix · 模型混合</code></strong>(<code>deepseek-v4-mix</code>)——选中它即强制走完整 MoA 流水线(模拟选择入口),聚合模型仍按设置/路由器决定;<code>flash</code>/<code>pro</code> 保留为显式聚合模型。</li>
+<li><strong>Hermes 忠实参考语义</strong>:<code>lib/reference.js</code> 复刻 Hermes <code>moa_loop.py</code> 的顾问视图——丢弃主 system prompt、把 <code>tool_calls</code> 渲染为 <code>[called tool: name(args)]</code>、把工具结果 head+tail 裁剪(4000 字符预算)折叠进前一条 assistant 消息、<strong>不发出任何 tool-role 消息</strong>(兼容严格 provider)、末尾追加合成 user 判断指令保证 user 结尾。</li>
+<li><strong>脱敏</strong>:集中式密钥形状(sk-/Bearer/JWT/私钥/数据库连接串)+ 安全的 email/电话正则(带边界条件,不误伤 SHA/ID/日期)。</li>
+<li><strong>上下文裁剪</strong>:估算 token 预算,从最旧帧丢弃,保持 user-first 不变式,保留尾部合成指令。</li>
+<li><strong>双通道</strong>:official(DeepSeek 官方按量)+ go(OpenCode Go 订阅额度);<strong>Go 优先整套流水线,连续 3 次失败自动切官方整套</strong>。</li>
+<li><strong>V4P 三重闸门</strong>:预算倍数(前瞻预算池 = F 已花×ratio − P 已花)+ 窗口内次数上限 + 最小间隔。</li>
+<li><strong>新契约记账</strong>:dsh-llm 分离式 <code>TokenUsage</code>(<code>inputTokens</code> 为未缓存输入,cache 读写单独计),滚动窗口成本核算。</li>
+</ul>
+<h2>安装</h2>
+<pre><code># bundle:进入 profile layer stack(重启 web 生效)
+dsh plugin --profile web add github:beimianism/Hermeslike-Mixagent-MoA
+
+# 或 本地开发路径(换成你的实际路径)
+dsh plugin --profile web add /path/to/hermeslike-moa
+</code></pre>
+<blockquote>
+<p>公开 <code>@deepseek-ai/*</code> 与 <code>cordis</code> 依赖刻意不声明(由 profile 的 pnpm closure 注入)。</p>
+</blockquote>
+<h2>系统设置(推荐)</h2>
+<p>插件融合进 DSH <strong>web 系统设置</strong>——设置页(「设置 → Hermeslike MoA」)由插件自带 client 半渲染(官方 Models 页不渲染第三方 provider,其编辑卡被禁用),实时生效、无需重启。<strong>每个字段旁有 ⓘ 悬停提示</strong>,key 字段下方显示实时健康诊断(<code>keyHealth</code>):</p>
+<ul>
+<li>开关:启用/停用 MoA 聚合</li>
+<li><strong>API key(直接填写,鲁棒优先)</strong>:表单里 <code>DeepSeek API key</code> 与 <code>OpenCode Go API key</code> 两个<strong>只写密码框</strong>——直接在设置界面填写即生效(值存本地 <code>settings.yaml</code>,不回显,wire 上剥离);留空则回退下方的环境变量引用(<code>apiKeyEnv</code>/<code>goApiKeyEnv</code>,经 credentials/环境解析)。两者都为空时:官方 key 缺失 → 请求 401;Go key 缺失 → 仅禁用 Go 通道。key 健康状态实时显示"✓ 有效 / ✗ 格式异常原因"。</li>
+<li><strong>模型混合</strong>:<ul>
+<li><code>参考顾问数量</code>(1–8,默认 3)</li>
+<li><code>参考温度</code>(按顺序对应各参考)</li>
+<li><code>聚合模型</code>:auto(路由器判定)/ flash / pro(受 V4P 闸门约束)——对应 Hermes 的 aggregator slot</li>
+<li><strong><code>参考顾问思考强度</code>(flash)</strong> 与 <strong><code>聚合模型思考强度</code></strong>:每槽独立(off / high / max / auto=跟随会话),透传上游 <code>reasoning_effort</code></li>
+<li><strong><code>参考扇出节奏</code></strong>:<code>user_turn</code>(默认)=每用户轮只跑一次参考,agent 工具步骤复用轮首指导(Hermes 语义,省成本);<code>per_iteration</code>=每步重跑(参考见最新状态,贵)</li>
+<li><strong><code>显示 MoA 进度</code></strong>:在流式输出的思考区显示 "🔄 MoA: 参考 2/3 完成…" / "聚合中…"(可关闭)</li>
+<li><code>优先 Go 通道</code>:OpenCode Go 订阅额度优先,连续 3 次失败切官方</li>
+</ul>
+</li>
+<li><strong>V4P 三重闸门</strong>:预算倍数 / 窗口次数上限 / 最小间隔 / 闸门拦截时降级 Flash</li>
+<li><strong>隐私</strong>:参考输出脱敏级别(display=聚合输入保持原文;full=进入聚合提示词前先脱敏,适合简单/低频场景)</li>
+</ul>
+<p>设置文档存放在 settings 文档的 <code>hermeslike-moa:</code> 分节;<code>cordis.patch.yml</code> 的插件行 <code>config:</code> 作为组合 base 层(用户设置优先)。</p>
+<h2>配置(组合 base 层)</h2>
+<p>以下字段在 <code>cordis.patch.yml</code> 插件行 <code>config:</code> 中作为默认值;用户设置覆盖它们:</p>
+<table>
+<thead>
+<tr>
+<th>配置</th>
+<th>默认</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>apiKeyEnv</code> / <code>DEEPSEEK_API_KEY</code></td>
+<td><code>DEEPSEEK_API_KEY</code></td>
+<td>DeepSeek 官方 key 的环境变量引用</td>
+</tr>
+<tr>
+<td><code>goApiKeyEnv</code> / <code>OPENCODE_GO_API_KEY</code></td>
+<td><code>OPENCODE_GO_API_KEY</code></td>
+<td>OpenCode Go key 引用(留空禁用 Go 通道)</td>
+</tr>
+<tr>
+<td><code>endpoint</code></td>
+<td><code>https://api.deepseek.com/chat/completions</code></td>
+<td>官方端点</td>
+</tr>
+<tr>
+<td><code>goEndpoint</code></td>
+<td><code>https://opencode.ai/zen/go/v1/chat/completions</code></td>
+<td>Go 端点(pi-ai catalog 的 opencode-go 真实地址)</td>
+</tr>
+<tr>
+<td><code>enabled</code></td>
+<td><code>true</code></td>
+<td>总开关</td>
+</tr>
+<tr>
+<td><code>ratio</code></td>
+<td><code>0.5</code></td>
+<td>V4P 前瞻预算池比例(F×ratio−P)</td>
+</tr>
+<tr>
+<td><code>windowMs</code></td>
+<td><code>3600000</code></td>
+<td>记账滚动窗口</td>
+</tr>
+<tr>
+<td><code>refCount</code></td>
+<td><code>3</code></td>
+<td>参考顾问数量</td>
+</tr>
+<tr>
+<td><code>refTemps</code></td>
+<td><code>[0.5,0.8,1.1]</code></td>
+<td>各参考温度</td>
+</tr>
+<tr>
+<td><code>aggregatorModel</code></td>
+<td><code>auto</code></td>
+<td>聚合模型(auto/flash/pro)</td>
+</tr>
+<tr>
+<td><code>referenceReasoningEffort</code></td>
+<td><code>auto</code></td>
+<td>参考顾问思考强度(off/high/max/auto)</td>
+</tr>
+<tr>
+<td><code>aggregatorReasoningEffort</code></td>
+<td><code>auto</code></td>
+<td>聚合模型思考强度(off/high/max/auto)</td>
+</tr>
+<tr>
+<td><code>fanout</code></td>
+<td><code>user_turn</code></td>
+<td>参考扇出节奏(user_turn/per_iteration)</td>
+</tr>
+<tr>
+<td><code>showProgress</code></td>
+<td><code>true</code></td>
+<td>思考区显示 MoA 进度</td>
+</tr>
+<tr>
+<td><code>preferGo</code></td>
+<td><code>true</code></td>
+<td>优先 Go 通道</td>
+</tr>
+<tr>
+<td><code>fallbackToFlash</code></td>
+<td><code>true</code></td>
+<td>闸门拦截 V4P 时降级 V4F</td>
+</tr>
+<tr>
+<td><code>minBudgetMultiple</code></td>
+<td><code>3</code></td>
+<td>闸门:预算倍数</td>
+</tr>
+<tr>
+<td><code>maxProPerWindow</code></td>
+<td><code>3</code></td>
+<td>闸门:窗口内 V4P 次数上限</td>
+</tr>
+<tr>
+<td><code>minProIntervalMs</code></td>
+<td><code>900000</code></td>
+<td>闸门:最小间隔</td>
+</tr>
+<tr>
+<td><code>privacyFilter</code></td>
+<td><code>display</code></td>
+<td>参考输出脱敏(display/full)</td>
+</tr>
+</tbody></table>
+<p>示例:</p>
+<pre><code>- insert:
+    - id: hermeslike-moa
+      name: 'hermeslike-moa'
+      config:
+        apiKeyEnv: DEEPSEEK_API_KEY
+        goApiKeyEnv: OPENCODE_API_KEY
+        ratio: 0.5
+        refCount: 3
+</code></pre>
+<h2>布局</h2>
+<pre><code>hermeslike-moa/
+├── package.json          # 清单(name, exports["./client"], dsh.bundle.patch, dsh.client)
+├── cordis.patch.yml      # bundle 行 insert
+├── index.js              # apply():配置解析 + registerAdapter + /hermeslike 设置 RPC
+├── client/index.js       # web client 半:设置页(settings.section,含 ⓘ 悬停提示)
+├── lib/
+│   ├── adapter.js        # MoaAdapter extends LlmAdapter(双通道 + 故障切换)
+│   ├── pipeline.js       # MoaPipeline:路由 → 参考×N → 聚合 → 流式
+│   ├── router.js         # V4F 路由器 + 关键词兜底
+│   ├── reference.js      # Hermes 顾问视图:渲染/裁剪/脱敏/合成指令
+│   ├── wire.js           # HTTP 单发/流式 + TokenUsage 归一化 + 错误分类
+│   ├── ledger.js         # 花费账本 + V4P 三重闸门
+│   ├── prices.js         # 单价表
+│   ├── prompts.js        # 路由/参考/聚合 三个 system prompt
+│   └── settings.js       # 设置 schema + 配置解析
+├── scripts/smoke.mjs     # 冒烟回归(mock 服务器,8 组断言)
+└── docs/                 # 学习笔记与差异分析
+</code></pre>
+<h2>许可证</h2>
+<p><a href="https://github.com/beimianism/Hermeslike-Mixagent-MoA/blob/HEAD/LICENSE">MIT</a></p>

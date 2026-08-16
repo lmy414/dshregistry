@@ -1,0 +1,281 @@
+<p><a href="https://github.com/JohnXu22786/hooks-adapter/blob/HEAD/README.zh.md">简体中文</a></p>
+<h1>hooks-adapter</h1>
+<p>A <strong>hooks configuration compatibility layer</strong> for DeepSeek Harness (dsh): it reads existing hooks config files from mainstream agent harnesses (such as the hooks declarations in <code>.claude/settings.json</code>, <code>.codex/hooks.json</code>, and the hooks section of <code>opencode.json</code>), maps their lifecycle events to dsh extension points, and executes four kinds of handlers — <strong>shell / webhook / oracle / proxy</strong> — so the same hooks config can be reused as-is across different harnesses.</p>
+<ul>
+<li>Zero runtime dependencies (Node ≥ 18, pure ESM + JSDoc types)</li>
+<li>Config is read-only, not migrated: your existing hooks declarations stay unchanged</li>
+<li>All four handler kinds supported: command execution, HTTP callbacks, LLM evaluation, subagent delegation</li>
+<li>Timeout control, failure degradation policy, and friendly config validation (<code>validate</code> subcommand)</li>
+<li>Three integration modes: dsh plugin (Cordis <code>apply</code>), stdio JSON-lines protocol (any host), one-shot CLI</li>
+</ul>
+<pre><code>hooks-adapter/
+├── package.json        # dsh bundle manifest (dsh.bundle + exports)
+├── cordis.patch.yml    # composite package layer: inserts this plugin into the plugin tree
+├── dsh/plugin.js       # dsh entry: Cordis plugin (name + apply(ctx, config))
+├── lib/                # runtime core (usable independently of dsh)
+│   ├── index.js        # CLI entry + programmatic API exports
+│   ├── events.js       # canonical event catalog + four-dialect mapping table + matcher semantics
+│   ├── discover.js     # config file discovery (global/project/local)
+│   ├── parse.js        # four-dialect parsers (all go through diagnostics, never throw)
+│   ├── config.js       # runtime assembly: merging, disableAllHooks, defaults
+│   ├── contract.js     # stdin JSON contract construction + response decoding + decision folding
+│   ├── execute.js      # four-kind handler executor + timeout + process tree cleanup
+│   ├── dispatch.js     # dispatch pipeline: matcher matching, ordered execution, blockable constraints
+│   └── serve.js        # stdio JSON-lines protocol server
+├── docs/               # config formats, event mapping, contract, integration notes, CLI guide
+├── examples/           # four-dialect example configs + local mock LLM
+└── test/               # node:test tests (107 items)
+</code></pre>
+<h2>What It Can Do</h2>
+<p>Declare hooks in <code>.claude/settings.json</code> (no matter which harness you wrote them for) and they keep working in dsh:</p>
+<pre><code>{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          { "type": "command", "command": "guard.sh", "timeout": 10 }
+        ]
+      }
+    ],
+    "Stop": [
+      { "hooks": [ { "type": "command", "command": "notify-send done" } ] }
+    ]
+  }
+}
+</code></pre>
+<p>Config files must be strict JSON (no comments); see <code>examples/</code> for complete four-dialect examples.</p>
+<ul>
+<li><code>PreToolUse</code> → interception point before tool execution: handler exit code 2 / JSON <code>decision: "block"</code> will <strong>block</strong> the tool call (or turn it into ask for human confirmation)</li>
+<li><code>PostToolUse</code> / <code>PostToolUseFailure</code> → after tool execution (mutually exclusive triggers): reject the write-back as result feedback, append context</li>
+<li><code>UserPromptSubmit</code> / <code>SessionStart</code> / <code>Stop</code> / <code>SubagentStart</code> / <code>SubagentStop</code> / <code>SessionEnd</code> → inject context, reject prompts, force the model to continue</li>
+<li><code>Notification</code> / <code>PreCompact</code> → triggered manually or via the stdio protocol</li>
+</ul>
+<p>The four handler kinds (the <code>type</code> field in config follows each harness's conventions; normalized internally):</p>
+<table>
+<thead>
+<tr>
+<th>Config type</th>
+<th>Internal kind</th>
+<th>Behavior</th>
+<th>Default timeout</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>command</code></td>
+<td><code>shell</code></td>
+<td>spawn a shell process, feed the JSON contract on stdin</td>
+<td>600s</td>
+</tr>
+<tr>
+<td><code>http</code></td>
+<td><code>webhook</code></td>
+<td>POST JSON to a URL, the response body is the decision</td>
+<td>600s</td>
+</tr>
+<tr>
+<td><code>prompt</code></td>
+<td><code>oracle</code></td>
+<td>call an LLM endpoint to evaluate, <code>{ok:false}</code> rejects</td>
+<td>30s</td>
+</tr>
+<tr>
+<td><code>agent</code> / <code>subagent</code></td>
+<td><code>proxy</code></td>
+<td>delegate to a subagent runner (configurable command)</td>
+<td>60s</td>
+</tr>
+</tbody></table>
+<h2>Quick Start</h2>
+<h3>Mode one: dsh plugin (recommended)</h3>
+<pre><code># From a directory containing this plugin checkout
+dsh plugin --profile demo add ./hooks-adapter
+dsh --profile demo
+</code></pre>
+<p>After loading, the plugin automatically discovers hooks configs in project and user directories (see below). You can also override the config line in the profile's <code>cordis.patch.yml</code>:</p>
+<pre><code>- replace:
+    - id: hooks-adapter
+      config:
+        configPath: /abs/path/to/hooks.json   # pin a single file (skip discovery)
+        discover: false
+        llm: { baseUrl: "https://api.example.com/v1", model: "eval-small" }
+        proxy: { command: "dsh run --quiet" }
+</code></pre>
+<p>Integration details: <a href="https://github.com/JohnXu22786/hooks-adapter/blob/HEAD/docs/INTEGRATION.md">docs/INTEGRATION.md</a>.</p>
+<h2>Installing in DSH</h2>
+<p>Install directly from the GitHub repository with the dsh plugin command:</p>
+<pre><code>dsh plugin --profile demo add github:JohnXu22786/hooks-adapter
+</code></pre>
+<p>The package is a dsh bundle (<code>dsh.bundle.patch</code> → <code>cordis.patch.yml</code>); once added, it inserts itself into the plugin tree and automatically discovers hooks configs on the next dsh run. Remove it with:</p>
+<pre><code>dsh plugin --profile demo remove hooks-adapter
+</code></pre>
+<h3>Mode two: stdio protocol (any host)</h3>
+<pre><code>echo '{"op":"ping"}' | node lib/index.js listen --config hooks.json
+echo '{"op":"dispatch","event":"PreToolUse","payload":{"tool_name":"Bash","tool_input":{}}}' | node lib/index.js listen
+</code></pre>
+<p>Protocol details: <a href="https://github.com/JohnXu22786/hooks-adapter/blob/HEAD/docs/CONTRACT.md#stdio-%E5%8D%8F%E8%AE%AE">docs/CONTRACT.md</a>.</p>
+<h3>Mode three: one-shot CLI</h3>
+<pre><code>node lib/index.js validate            # check all discoverable configs, exit code 0/1
+node lib/index.js run --event PreToolUse --payload payload.json
+node lib/index.js dump                # print the merged effective config
+node lib/index.js list                # list discovered config files
+</code></pre>
+<h2>Where the Config Comes From</h2>
+<p>Auto-discovered and merged in order (later files append groups for same-named events; <code>disableAllHooks</code> follows the most specific file):</p>
+<table>
+<thead>
+<tr>
+<th>Order</th>
+<th>File</th>
+<th>Dialect</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>1</td>
+<td><code>~/.claude/settings.json</code></td>
+<td>claude</td>
+</tr>
+<tr>
+<td>2</td>
+<td><code>~/.codex/hooks.json</code></td>
+<td>codex</td>
+</tr>
+<tr>
+<td>3</td>
+<td><code>~/.config/opencode/opencode.json</code></td>
+<td>opencode</td>
+</tr>
+<tr>
+<td>4</td>
+<td><code>~/.config/hooks-adapter/hooks.json</code></td>
+<td>native</td>
+</tr>
+<tr>
+<td>5</td>
+<td><code>&lt;project&gt;/.claude/settings.json</code></td>
+<td>claude</td>
+</tr>
+<tr>
+<td>6</td>
+<td><code>&lt;project&gt;/.codex/hooks.json</code></td>
+<td>codex</td>
+</tr>
+<tr>
+<td>7</td>
+<td><code>&lt;project&gt;/opencode.json</code></td>
+<td>opencode</td>
+</tr>
+<tr>
+<td>8</td>
+<td><code>&lt;project&gt;/.dsh-hooks.json</code></td>
+<td>native</td>
+</tr>
+<tr>
+<td>9</td>
+<td><code>&lt;project&gt;/.claude/settings.local.json</code></td>
+<td>claude</td>
+</tr>
+</tbody></table>
+<ul>
+<li>Environment variables <code>HOOKS_ADAPTER_CONFIG</code> (same as <code>--config</code>) and <code>HOOKS_ADAPTER_HOME</code> (same as <code>--home</code>)</li>
+<li>Any missing file is silently skipped; <strong>if an existing file has issues, it only produces diagnostics</strong>, it never blocks startup</li>
+<li>Config file format details: <a href="https://github.com/JohnXu22786/hooks-adapter/blob/HEAD/docs/CONFIG.md">docs/CONFIG.md</a></li>
+</ul>
+<h2>Event Mapping</h2>
+<p>Every harness's event names map to a set of <strong>canonical events</strong> (<code>session:start</code>, <code>tool:before</code>, ...), which then bind to dsh extension points:</p>
+<table>
+<thead>
+<tr>
+<th>Canonical event</th>
+<th>claude dialect</th>
+<th>codex dialect</th>
+<th>opencode dialect</th>
+<th>dsh extension point</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>session:start</code></td>
+<td><code>SessionStart</code></td>
+<td><code>SessionStart</code></td>
+<td><code>session.created</code></td>
+<td><code>agent/session-start</code></td>
+</tr>
+<tr>
+<td><code>session:end</code></td>
+<td><code>SessionEnd</code></td>
+<td><code>SessionEnd</code></td>
+<td><code>session.deleted</code></td>
+<td><code>session/disposed</code></td>
+</tr>
+<tr>
+<td><code>prompt:submit</code></td>
+<td><code>UserPromptSubmit</code></td>
+<td><code>UserPromptSubmit</code></td>
+<td><code>chat.message</code></td>
+<td><code>agent/pre-step</code></td>
+</tr>
+<tr>
+<td><code>tool:before</code></td>
+<td><code>PreToolUse</code></td>
+<td><code>PreToolUse</code></td>
+<td><code>tool.execute.before</code></td>
+<td><code>tools/pre-execute</code></td>
+</tr>
+<tr>
+<td><code>tool:after</code></td>
+<td><code>PostToolUse</code> / <code>PostToolUseFailure</code></td>
+<td><code>PostToolUse</code></td>
+<td><code>tool.execute.after</code></td>
+<td><code>tools/post-execute</code></td>
+</tr>
+<tr>
+<td><code>turn:stop</code></td>
+<td><code>Stop</code></td>
+<td><code>Stop</code></td>
+<td><code>session.idle</code></td>
+<td><code>agent/turn-stopping</code></td>
+</tr>
+<tr>
+<td><code>subagent:start</code></td>
+<td><code>SubagentStart</code></td>
+<td><code>SubagentStart</code></td>
+<td><code>tool.execute.before.subagent</code></td>
+<td><code>subagent/start</code></td>
+</tr>
+<tr>
+<td><code>subagent:end</code></td>
+<td><code>SubagentStop</code></td>
+<td><code>SubagentStop</code></td>
+<td><code>tool.execute.after.subagent</code></td>
+<td><code>subagent/end</code></td>
+</tr>
+<tr>
+<td><code>notice</code></td>
+<td><code>Notification</code></td>
+<td><code>Notification</code></td>
+<td><code>notification</code></td>
+<td>manual / stdio</td>
+</tr>
+<tr>
+<td><code>compact:before</code></td>
+<td><code>PreCompact</code></td>
+<td>—</td>
+<td><code>experimental.session.compacting</code></td>
+<td>manual / stdio</td>
+</tr>
+</tbody></table>
+<p>Full semantics (blockability, matcher rules, payload fields): <a href="https://github.com/JohnXu22786/hooks-adapter/blob/HEAD/docs/EVENTS.md">docs/EVENTS.md</a>.</p>
+<h2>Contract</h2>
+<ul>
+<li><strong>stdin JSON</strong>: <code>session_id</code>, <code>transcript_path</code>, <code>cwd</code>, <code>hook_event_name</code>, <code>permission_mode</code> + event fields (<code>tool_name</code>/<code>tool_input</code>/<code>tool_use_id</code>/<code>tool_response</code>/<code>prompt</code>/<code>source</code> ...)</li>
+<li><strong>Exit codes</strong>: <code>0</code> = allow (when stdout is JSON, the decision is parsed from it); <code>2</code> = block (stderr is the reason); any other non-zero = non-blocking error</li>
+<li><strong>stdout JSON</strong>: <code>decision</code>, <code>continue</code>/<code>stopReason</code>, <code>systemMessage</code>, <code>hookSpecificOutput.permissionDecision</code> (<code>allow</code>/<code>deny</code>/<code>ask</code>), <code>additionalContext</code>, <code>updatedInput</code>; oracle answers <code>{ok: true|false, reason}</code></li>
+<li><strong>Multi-hook folding</strong>: <code>deny &gt; ask &gt; allow</code>; any <code>continue:false</code> stops; context accumulates in hook order</li>
+<li>Details and the stdio protocol: <a href="https://github.com/JohnXu22786/hooks-adapter/blob/HEAD/docs/CONTRACT.md">docs/CONTRACT.md</a></li>
+</ul>
+<h2>Testing</h2>
+<pre><code>node --test
+</code></pre>
+<p>(The default test-discovery mode runs all 107 tests; helper scripts live in <code>test-support/</code> and are not mistaken for tests.)</p>
+<h2>License</h2>
+<p>Released under the <a href="https://github.com/JohnXu22786/hooks-adapter/blob/HEAD/LICENSE">MIT License</a>.</p>

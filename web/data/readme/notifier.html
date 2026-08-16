@@ -1,0 +1,397 @@
+<p><a href="https://github.com/JohnXu22786/notifier/blob/HEAD/README.zh.md">简体中文</a></p>
+<h1>dsh-chime</h1>
+<p>A desktop alert signal plugin running on dsh (DeepSeek Harness): it pops a system notification on the machine running dsh when <strong>a task finishes, approval is pending, or a run errors out</strong> — and optionally plays a tone. No need to keep watching the terminal or the web UI.</p>
+<p>Zero runtime dependencies: no npm notification libraries required, it calls the OS's built-in capabilities directly (osascript/afplay on macOS, notify-send/audio backends on Linux, native PowerShell components on Windows).</p>
+<hr>
+<h2>Table of Contents</h2>
+<ul>
+<li><a href="#design-philosophy">Design Philosophy</a></li>
+<li><a href="#features">Features</a></li>
+<li><a href="#quick-start">Quick Start</a></li>
+<li><a href="#installing-in-dsh">Installing in DSH</a></li>
+<li><a href="#integration-notes-dsh-loading-mechanism">Integration Notes (dsh loading mechanism)</a></li>
+<li><a href="#event-to-signal-mapping">Event-to-Signal Mapping</a></li>
+<li><a href="#configuration">Configuration</a></li>
+<li><a href="#command-line-tool">Command-Line Tool</a></li>
+<li><a href="#platforms-and-system-dependencies">Platforms and System Dependencies</a></li>
+<li><a href="#troubleshooting">Troubleshooting</a></li>
+<li><a href="#development">Development</a></li>
+<li><a href="#license">License</a></li>
+</ul>
+<h2>Design Philosophy</h2>
+<p>"Remind only when a human needs to come back — never interrupt for every micro-event" is the plugin's core principle. dsh emits a flood of events on every generated response and every tool call; if all of them popped notifications, reminders would become noise. So dsh-chime distills just three kinds of signals:</p>
+<table>
+<thead>
+<tr>
+<th>Signal</th>
+<th>Meaning</th>
+<th>Default tone</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>done</code></td>
+<td>A turn completed fully (generation finished)</td>
+<td>completion tone</td>
+</tr>
+<tr>
+<td><code>blocked</code></td>
+<td>Waiting for a real human to approve / needing human intervention</td>
+<td>alert tone</td>
+</tr>
+<tr>
+<td><code>failed</code></td>
+<td>A turn or request errored</td>
+<td>error tone</td>
+</tr>
+</tbody></table>
+<p>Signals flow internally through a four-stage pipeline, and every stage can be configured or disabled independently:</p>
+<pre><code>Capture (bridge listens to dsh events)
+  → Adjudicate (policy: master switch → per-kind switch → hush window → cadence limit)
+  → Render (templates: title/body templates)
+  → Deliver (channels: desktop notification / tone / terminal bell)
+</code></pre>
+<h2>Features</h2>
+<ul>
+<li><strong>Independent control of the three signal kinds</strong>: done / approval / error can each be toggled, with custom wording and sounds (event-type filtering).</li>
+<li><strong>Cross-platform desktop notifications</strong>: native implementations on macOS, Windows and Linux, no third-party packages.</li>
+<li><strong>Customizable tones</strong>: system sounds or custom audio files, with volume support; can also be fully muted.</li>
+<li><strong>Custom message templates</strong>: placeholders supported in both title and body (session, project, elapsed time, error summary, etc.).</li>
+<li><strong>Custom icon</strong>: the desktop notification icon can point to an image file (<code>.ico</code> required on Windows, any format on Linux).</li>
+<li><strong>Hush window</strong>: supports windows crossing midnight (e.g. 22:00–08:00) and per-weekday activation.</li>
+<li><strong>Cadence limiting</strong>: per-kind minimum interval + global burst cap to prevent notification flooding.</li>
+<li><strong>Approval grace period</strong>: approval requests auto-adjudicated (policy rejection / no responder) never disturb; only real human-waiting approvals alert.</li>
+<li><strong>Per-session elapsed time</strong>: the done notification includes this turn's elapsed time.</li>
+<li><strong>Command-line self-check</strong>: ring a test tone, probe channel availability and view the effective config without starting dsh.</li>
+</ul>
+<h2>Quick Start</h2>
+<p>Prerequisites: Node.js ≥ 22.19 (dsh's runtime requirement), dsh CLI installed and a profile initialized.</p>
+<pre><code># Run from a directory containing this package; link: points to the local directory
+dsh plugin --profile web add link:/absolute/path/notifier
+</code></pre>
+<p>Or after publishing to npm:</p>
+<pre><code>dsh plugin --profile web add dsh-chime
+</code></pre>
+<p>Verify the integration:</p>
+<pre><code># A "# == dsh-chime layer" entry should appear in the config tree
+dsh --profile web --dump-config
+
+# Start dsh and watch for [chime] lines in the log
+dsh --profile web
+</code></pre>
+<p>Test a ring (no need for dsh to be running):</p>
+<pre><code>chime probe          # check availability of each channel
+chime ping done      # pop a "task finished" test notification + tone
+</code></pre>
+<blockquote>
+<p>Note: notifications appear on the machine where the <strong>dsh service process</strong> runs. If dsh runs on a remote server, the reminders appear on the server's desktop, not on yours.</p>
+</blockquote>
+<h2>Installing in DSH</h2>
+<p>Install directly from the GitHub repository with the dsh plugin command:</p>
+<pre><code>dsh plugin --profile demo add github:JohnXu22786/notifier
+</code></pre>
+<p>After installation, the plugin registers itself as a configuration layer (<code>dsh.bundle.patch</code> → <code>cordis.patch.yml</code>) and starts emitting desktop notifications on the next dsh run. Remove it with:</p>
+<pre><code>dsh plugin --profile demo remove notifier
+</code></pre>
+<h2>Integration Notes (dsh loading mechanism)</h2>
+<p>dsh's plugin system is a two-layer model of <strong>bundle (package) + patch (config layer)</strong>. This plugin package contains three elements:</p>
+<h3>1. Bundle declaration (package.json)</h3>
+<pre><code>{
+  "name": "dsh-chime",
+  "type": "module",
+  "main": "dist/index.js",
+  "dsh": { "bundle": { "patch": "./cordis.patch.yml" } }
+}
+</code></pre>
+<p><code>dsh.bundle.patch</code> tells dsh: this package contributes a config layer. Packages without this field are treated as ordinary dependencies and are not activated as plugins.</p>
+<h3>2. Config layer (cordis.patch.yml)</h3>
+<pre><code>- insert:
+    - id: chime
+      name: dsh-chime
+</code></pre>
+<p><code>insert</code> adds one plugin config line into the profile's config tree; <code>id</code> is the line identifier (globally unique, overridable by an upper-layer patch), and <code>name</code> points at the package name, which Node's module resolution uses to load the actual code.</p>
+<h3>3. Entry file (dist/index.js)</h3>
+<p>Following the dsh plugin entry convention, it exports two members:</p>
+<pre><code>export const name = 'dsh-chime';                 // plugin name
+export function apply(ctx, config) { /* ... */ } // plugin body
+</code></pre>
+<ul>
+<li><code>apply</code> is called once config is ready; <code>ctx</code> is the Cordis context and <code>config</code> is the <code>config</code> field of this package's plugin line.</li>
+<li>The plugin only uses <code>ctx.on()</code> to subscribe to events and <code>ctx.effect()</code> to register cleanup on unload; it injects no services, so it does not depend on version details of dsh's internal services.</li>
+<li>All registrations are reversible side effects: dsh automatically revokes listeners when unloading/hot-reloading the plugin, and pending approval timers are cleared by the cleanup function registered via <code>ctx.effect</code>.</li>
+<li>Config edits hot-reload the plugin instance (dsh's HMR), no restart needed.</li>
+</ul>
+<h3>Integration notes</h3>
+<ul>
+<li>dsh is currently in developer preview; the official statement is that event names and interfaces may change incompatibly. Event mapping is centralized in <code>src/bridge.ts</code>, and the event contract is declared in the header comment of <code>src/bridge.ts</code>; if future event renames occur, only that file needs to be updated.</li>
+<li>The plugin has no runtime third-party dependencies; <code>dist/</code> is compiled output. When installing directly from the source directory (<code>link:</code>), run <code>npm run build</code> first (or use the shipped <code>dist/</code>).</li>
+</ul>
+<h2>Event-to-Signal Mapping</h2>
+<table>
+<thead>
+<tr>
+<th>dsh event</th>
+<th>Signal</th>
+<th>Notes</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>session/event</code> (<code>turn/start</code>)</td>
+<td>—</td>
+<td>records turn start time for elapsed-time stats</td>
+</tr>
+<tr>
+<td><code>session/event</code> (<code>turn/end</code>, normal reason)</td>
+<td><code>done</code></td>
+<td>turn completed fully</td>
+</tr>
+<tr>
+<td><code>session/event</code> (<code>turn/end</code>, <code>reason.kind = 'error'</code>)</td>
+<td><code>failed</code></td>
+<td>turn ended in error (detail taken from <code>reason.error</code>)</td>
+</tr>
+<tr>
+<td><code>session/event</code> (<code>turn/end</code>, <code>reason.kind = 'aborted'</code>)</td>
+<td>—</td>
+<td>user aborted, no alert</td>
+</tr>
+<tr>
+<td><code>session/event</code> (<code>approval/asked</code>)</td>
+<td><code>blocked</code> (delayed verdict)</td>
+<td>approval request pending; if <code>approval/decided</code> (auto-adjudication / quick answer) arrives within the grace period (<code>bridge.decisionGraceMs</code>), no alert; the signal fires only when the deadline passes unresolved</td>
+</tr>
+<tr>
+<td><code>agent/error</code></td>
+<td><code>failed</code></td>
+<td>turn/step error (emit event; payload may lack the agent field; when session is unknown, dedupe against a global window to avoid double alerts with the subsequent <code>turn/end</code> failed)</td>
+</tr>
+<tr>
+<td>events listed in <code>bridge.attentionFrom</code></td>
+<td><code>blocked</code></td>
+<td>escape hatch: treat extra events as "waiting for a human" as dsh event names evolve or for custom events</td>
+</tr>
+</tbody></table>
+<p><code>session/event</code> is the persistent session event stream; <code>turn/*</code> and <code>approval/*</code> are event types within it; <code>agent/error</code> is a realtime event. All signal content is extracted defensively (placeholder copy when fields are missing); no malformed event can make the plugin throw.</p>
+<h2>Configuration</h2>
+<p>Config sources, lowest to highest priority:</p>
+<ol>
+<li><p><strong>Built-in defaults</strong> (see <code>DEFAULT_CONFIG</code> in <code>src/config.ts</code>) — the plugin always <strong>deep-merges</strong> with built-in defaults first, so any source only needs to write the keys it wants to change.</p>
+</li>
+<li><p><strong>Plugin-line <code>config</code> field</strong> — users override in their own profile layer's <code>cordis.patch.yml</code> using the same line id (<code>chime</code>). Note dsh's patch-layer semantics: a later layer <strong>wholly replaces</strong> the previous layer's <code>config</code> (no deep merge), but keeps the line's <code>name</code>. For this plugin, the line's name comes from the bundle, so users only need to give the id and the keys to set:</p>
+<p><code>$DSH_HOME/profiles/&lt;profile&gt;/cordis.patch.yml</code>:</p>
+<pre><code>- id: chime
+  config:
+    hush:
+      armed: true
+      from: '22:00'
+      to: '08:00'
+</code></pre>
+<p>Config edits trigger plugin hot-reload (HMR), no dsh restart needed.</p>
+</li>
+<li><p><strong>Config file</strong> (machine-level override, shareable across profiles): <code>$DSH_HOME/chime.config.json</code>, or another path via the environment variable <code>DSH_CHIME_CONFIG</code>. JSONC supported (comments, trailing commas). The file overrides the line config, also merged key-by-key deep:</p>
+<pre><code>// $DSH_HOME/chime.config.json
+{
+  "hush": { "armed": true, "from": "22:00", "to": "08:00" },   // only these keys need to be written
+  "kinds": { "blocked": { "tone": { "mode": "file", "file": "~/sounds/urgent.wav" } } }
+}
+</code></pre>
+<p>On invalid config the plugin <strong>refuses to load</strong> and prints the specific reason (fail loudly, never degrade silently).</p>
+</li>
+</ol>
+<h3>Full config reference</h3>
+<pre><code>{
+  "armed": true,                    // master switch
+  "channels": {
+    "desktop": true,                // desktop notification channel
+    "tone": true,                   // tone channel
+    "bell": false,                  // terminal bell (BEL, interactive terminals only)
+    "toneProgram": "auto"           // Linux audio backend: auto | canberra | paplay | aplay | ffplay
+  },
+  "lingerMs": 8000,                 // notification display duration (ms)
+  "kinds": {
+    "done": {
+      "armed": true,                // done signal switch
+      "title": "任务完成",          // title template
+      "message": "会话 {session} 已完成，耗时 {elapsed}",  // body template
+      "icon": "",                   // custom icon path (`.ico` required on Windows)
+      "urgency": "normal",          // low | normal | critical (Linux only)
+      "tone": {
+        "mode": "system",           // none | system | file
+        "name": "Glass",            // macOS system sound name / Linux canberra theme id
+        "file": "",                 // custom sound file (effective with mode=file; Windows: .wav only)
+        "volume": 60                // volume 0-100 (macOS / some Linux backends)
+      }
+    },
+    "blocked": { /* pending approval: default title "等待批准", urgency critical */ },
+    "failed":  { /* run error: default title "运行出错", urgency critical */ }
+  },
+  "cadence": {
+    "minIntervalMs": 5000,          // minimum interval between same-kind signals
+    "burstLimit": 8,                // burst cap: max messages within the window
+    "burstWindowMs": 60000          // burst stats window
+  },
+  "hush": {
+    "armed": false,                 // hush window switch
+    "from": "22:00",                // start HH:MM (local timezone)
+    "to": "08:00",                  // end HH:MM, supports crossing midnight
+    "weekdays": []                  // active weekdays [0=Sun…6=Sat], empty = every day
+  },
+  "bridge": {
+    "decisionGraceMs": 600,         // approval grace period (ms)
+    "attentionFrom": []             // extra dsh event names treated as "waiting for a human"
+  }
+}
+</code></pre>
+<h3>Template placeholders</h3>
+<p>Title and body templates support the following placeholders (unprovided placeholders are kept <strong>as-is</strong>, so typos are easy to spot):</p>
+<table>
+<thead>
+<tr>
+<th>Placeholder</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>{kind}</code></td>
+<td>signal-kind label (完成 / 等待批准 / 出错)</td>
+</tr>
+<tr>
+<td><code>{session}</code></td>
+<td>session id</td>
+</tr>
+<tr>
+<td><code>{project}</code></td>
+<td>project name (only when provided by dsh)</td>
+</tr>
+<tr>
+<td><code>{subject}</code></td>
+<td>subject (e.g. the tool name that requested approval, an error summary)</td>
+</tr>
+<tr>
+<td><code>{detail}</code></td>
+<td>detail (approval reason, error message)</td>
+</tr>
+<tr>
+<td><code>{elapsed}</code></td>
+<td>this turn's elapsed time (done signal, and failed signals sourced from turn/end)</td>
+</tr>
+<tr>
+<td><code>{source}</code></td>
+<td>the event name that triggered the signal</td>
+</tr>
+<tr>
+<td><code>{time}</code></td>
+<td>trigger time HH:MM</td>
+</tr>
+</tbody></table>
+<h2>Command-Line Tool</h2>
+<p>The package ships a CLI (<code>chime</code> after a global npm install, or <code>node dist/cli.js</code>):</p>
+<pre><code>chime ping [done|blocked|failed]   send a test signal (test ring)
+                                   (exit codes: 0=at least one channel succeeded, 1=no enabled channel or all failed, 2=blocked by policy/usage error)
+chime probe                        self-check channel availability and config sources
+chime config                       print the effective config (JSON)
+chime help                         help
+</code></pre>
+<p>The CLI shares the same config-loading logic as the plugin (defaults + config file; note the CLI does not read the dsh plugin line's config because it runs outside dsh), so <code>chime probe</code> verifies the system channels the plugin will actually use.</p>
+<h2>Platforms and System Dependencies</h2>
+<table>
+<thead>
+<tr>
+<th>Platform</th>
+<th>Desktop notification</th>
+<th>Tone (system)</th>
+<th>Tone (file)</th>
+<th>Icon</th>
+<th>Volume</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>macOS</td>
+<td>osascript (built-in)</td>
+<td>afplay + /System/Library/Sounds/*.aiff</td>
+<td>afplay + any format</td>
+<td>not supported (system notifications have no icon slot)</td>
+<td>afplay -v</td>
+</tr>
+<tr>
+<td>Windows</td>
+<td>PowerShell + NotifyIcon balloon (built-in)</td>
+<td>winmm PlaySound system sound events</td>
+<td>winmm PlaySound, <strong>.wav only</strong></td>
+<td>.ico file</td>
+<td>not supported</td>
+</tr>
+<tr>
+<td>Linux</td>
+<td>notify-send (requires libnotify-bin / libnotify)</td>
+<td>canberra-gtk-play theme sounds</td>
+<td>paplay → aplay → ffplay → canberra(-f) probe chain</td>
+<td>any image format</td>
+<td>paplay/ffplay</td>
+</tr>
+</tbody></table>
+<ul>
+<li>Every platform channel has an availability self-check (<code>chime probe</code>); when unavailable, the reason is logged and other channels are unaffected.</li>
+<li>Linux system tones need <code>canberra-gtk-play</code> (usually bundled with GNOME desktops); <code>kinds.&lt;kind&gt;.tone.name</code> can specify a canberra theme id (e.g. <code>dialog-warning</code>, <code>complete</code>); file tones probe in fallback order <code>paplay</code> (PulseAudio) → <code>aplay</code> (ALSA) → <code>ffplay</code> (ffmpeg) → <code>canberra-gtk-play -f</code>, or force one via <code>channels.toneProgram</code>.</li>
+<li>macOS system sound names: Basso, Blow, Bottle, Frog, Funk, Glass, Hero, Morse, Ping, Pop, Purr, Sosumi, Submarine, Tink.</li>
+<li>Windows desktop notifications are tray-balloon style (shown in the notification center on Windows 10/11). Balloons may not display in headless sessions (service accounts, SSH without a desktop) — that is system behavior.</li>
+</ul>
+<h2>Troubleshooting</h2>
+<table>
+<thead>
+<tr>
+<th>Symptom</th>
+<th>Check</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>No alerts at all</td>
+<td>run <code>chime probe</code> to see channel availability; confirm <code>armed</code> and <code>kinds.*.armed</code> are not off; confirm you are not in a hush window; look at the <code>[chime]</code> log lines for <code>[已发]</code> (sent) vs <code>[拦截]</code> (blocked)</td>
+</tr>
+<tr>
+<td>Desktop notification but no sound</td>
+<td>whether <code>kinds.&lt;kind&gt;.tone.mode</code> is set to none; on Linux switch backends with <code>channels.toneProgram</code>; whether the custom file is supported by the player (Windows: wav only)</td>
+</tr>
+<tr>
+<td>Approval request did not alert</td>
+<td>auto-adjudication happens when the policy is <code>never</code> or there is no responder, and <code>approval/decided</code> arriving within the grace period suppresses the alert (expected behavior); if humans answer very slowly, raise <code>bridge.decisionGraceMs</code></td>
+</tr>
+<tr>
+<td>Error did not alert</td>
+<td>failed signals come from both <code>agent/error</code> and <code>turn/end</code> (<code>reason.kind='error'</code>), merged into one via session-level dedupe; if a dsh version renames events or changes the payload shape, update the extraction logic in <code>src/bridge.ts</code> (or add the new event name to <code>bridge.attentionFrom</code>, which treats it as blocked)</td>
+</tr>
+<tr>
+<td>"duplicate loader entry id" at startup</td>
+<td>usually the same plugin is mounted twice, once in the profile layer and once in the bundle layer (e.g. an old manual <code>insert</code> line coexisting with the <code>dsh plugin add</code> bundle line); delete the old manual line</td>
+</tr>
+<tr>
+<td>Notification flooding</td>
+<td>raise <code>cadence.minIntervalMs</code> or lower <code>burstLimit</code>; or just disable the <code>done</code> kind</td>
+</tr>
+<tr>
+<td>Config change has no effect</td>
+<td>config-file edits need the plugin hot-reload (dsh HMR) to take effect; confirm there is no syntax error (errors refuse to load and print the reason)</td>
+</tr>
+</tbody></table>
+<h2>Development</h2>
+<pre><code>npm install     # install dev dependencies (typescript, tsx, type packages)
+npm test        # run unit tests (node:test + tsx, no test-framework dependency)
+npm run build   # compile to dist/
+</code></pre>
+<p>Code structure:</p>
+<pre><code>src/
+  index.ts      entry (name / apply, assembles the pipeline)
+  bridge.ts     event bridge: dsh events → signals (event contract &amp; mapping centralized here)
+  pipeline.ts   pipeline: adjudicate → render → deliver
+  policy.ts     adjudicate: cadence (frequency) and hush (do-not-disturb)
+  config.ts     config: defaults, JSONC parsing, merge, strict validation
+  templates.ts  template rendering and elapsed-time formatting
+  memory.ts     session memory (turn start times, bounded)
+  desktop.ts    desktop notification channel (three platforms)
+  tone.ts       tone channel (three platforms)
+  runner.ts     subprocess executor (command probing, timeout kill, PowerShell encoded invocation)
+  types.ts      type definitions
+  cli.ts        command-line entry
+test/           unit tests (node:test)
+</code></pre>
+<h2>License</h2>
+<p>Released under the <a href="https://github.com/JohnXu22786/notifier/blob/HEAD/LICENSE">MIT License</a>.</p>

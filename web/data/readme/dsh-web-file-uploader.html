@@ -1,0 +1,269 @@
+<h1>dsh-web-file-uploader</h1>
+<blockquote>
+<p><strong>🌐 Language</strong> · <a href="https://github.com/Mooling0602/dsh-web-file-uploader/blob/HEAD/README.md">English</a> | <a href="https://github.com/Mooling0602/dsh-web-file-uploader/blob/HEAD/README_zh_CN.md">中文</a></p>
+</blockquote>
+<p>A file-upload plugin for the <strong>DeepSeek Harness</strong> web UI. It adds a
+DeepSeek-web-style <strong>paperclip attach button</strong> to the composer input row and
+uploads the selected files to the <strong>DSH host machine</strong> — with <strong>model-aware
+adaptation</strong> so the files are actually usable by the running model, and
+<strong>content-addressed deduplication</strong> so storage never gets flooded by
+re-uploads.</p>
+<ul>
+<li><strong>Repository</strong>: <a href="https://github.com/Mooling0602/dsh-web-file-uploader">https://github.com/Mooling0602/dsh-web-file-uploader</a></li>
+</ul>
+<h2>Features</h2>
+<ul>
+<li>📎 Paperclip attach button in the composer tool row (thin line, circular
+hover background <code>#3D3D3E</code>, matching the toolbar controls)</li>
+<li>Multi-file selection with <strong>preview-style attachment cards</strong> (image
+thumbnails) in the dock above the composer: reading → uploading → saved,
+with copy-path and remove buttons</li>
+<li>Files are stored on the DSH host, never only in the browser</li>
+<li>Name sanitization (path separators, <code>..</code>, control characters rejected) and
+automatic <code>-1</code>/<code>-2</code> collision suffixes for distinct files with the same name</li>
+<li><strong>Content-addressed deduplication</strong> — see <a href="#deduplication">Deduplication</a></li>
+<li>UI strings localized through the app's <code>locale</code> service (zh / en; follows
+the dsh web language setting or the system default)</li>
+</ul>
+<h2>Model-aware adaptation &amp; the attachment-card design</h2>
+<p>Uploaded files are shown as <strong>attachment cards</strong> in the dock above the
+composer. The cards are the source of truth for injection:</p>
+<table>
+<thead>
+<tr>
+<th>State</th>
+<th>Behavior</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>Card present</td>
+<td>The file's absolute path is injected into <strong>every</strong> user message sent while the card is visible</td>
+</tr>
+<tr>
+<td>Card closed (<code>×</code>)</td>
+<td>The plugin calls the host <code>remove</code> RPC — the file is dropped from the pending registry and <strong>no longer injected</strong></td>
+</tr>
+<tr>
+<td>Ctrl+V paste</td>
+<td>Pasted images ride the native draft-image pipeline — no card is created and the plugin never touches them</td>
+</tr>
+</tbody></table>
+<p>This is a deliberate design decision: the cards persist after sending (unlike
+paste previews that clear on send), so you decide how long a file stays
+"attached" to the conversation. Injection is one-shot per message, and the
+injected block lists exactly the files whose cards are currently open.</p>
+<p>Injection is model-aware:</p>
+<table>
+<thead>
+<tr>
+<th>Model type</th>
+<th>Image files (png/jpeg/webp/gif)</th>
+<th>Other files</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong>Multimodal</strong> (reported <code>inputModalities</code> includes <code>image</code>)</td>
+<td>Native <code>ImageBlock</code> via the attachments service — the image is part of the request, like a normal attached image, with <strong>no extra prompt text</strong></td>
+<td>Path text block</td>
+</tr>
+<tr>
+<td><strong>Text-only</strong> (e.g. DeepSeek V4 series)</td>
+<td>Path text block — the model can call read/vision tools to inspect them</td>
+<td>Path text block</td>
+</tr>
+</tbody></table>
+<p>The capability check uses <code>llm.resolveModelInfo().inputModalities</code> (cached for
+10 minutes, safe text-only fallback).</p>
+<p>The injected prompt uses a readable, English-only format (the model reads it):</p>
+<pre><code>-----
+[Attached files] Some files have uploaded with this message:
+- /path/to/file1.txt
+- /path/to/image1.png
+Read the files or use tools to analyse (like vision tools), then answer the user.
+</code></pre>
+<h3>Compatibility with vision-tools and other plugins</h3>
+<ul>
+<li><strong>Zero coupling</strong>: the plugin only injects absolute file paths into the
+prompt. It never calls, wraps, or assumes any auxiliary tool — vision-tools
+or any other reader simply receives the path and works independently.</li>
+<li><strong>Native multimodal path</strong>: for image-capable models, images are injected as
+native <code>ImageBlock</code>s; the model uses its own multimodal ability and is not
+prompted to reach for external tools.</li>
+<li><strong>Non-invasive</strong>: injection targets only real user messages
+(<code>source.kind === 'user'</code>); steering/system messages are never touched, and
+a message that already carries the <code>[Attached files]</code> marker is never
+injected twice (guard against concurrent host instances). Pasting images
+via Ctrl+V is handled entirely by the product's native pipeline.</li>
+</ul>
+<h2>Deduplication</h2>
+<p>Re-uploads cannot flood storage:</p>
+<ol>
+<li>On upload, the plugin computes the <strong>SHA-256</strong> of the decoded bytes
+(dynamic mode pipes <code>base64 -d | sha256sum</code> through the shell service;
+the static bundle uses <code>node:crypto</code>).</li>
+<li>A persisted index at <code>uploads/.dfu-index.json</code> maps <code>hash → stored path</code>.</li>
+<li>If identical content is uploaded again (same name or different name), the
+existing stored copy is <strong>reused</strong> — no new file is written, no <code>-1</code>
+suffix copy is created, and the response carries <code>dedup: true</code>.</li>
+<li>Uploads are serialized through a promise queue so concurrent identical
+uploads cannot race; a stale index entry (file deleted) falls back to a
+fresh store.</li>
+</ol>
+<table>
+<thead>
+<tr>
+<th>Scenario</th>
+<th>Result</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>Same file uploaded N times</td>
+<td>One copy on disk; all uploads resolve to the same path</td>
+</tr>
+<tr>
+<td>Same content, different filename</td>
+<td>Reuses the first stored copy</td>
+</tr>
+<tr>
+<td>Same name, different content</td>
+<td>Normal <code>-1</code> collision handling (correct)</td>
+</tr>
+<tr>
+<td>Process restart</td>
+<td>The index file persists, dedup keeps working</td>
+</tr>
+</tbody></table>
+<h2>Attachment size limits</h2>
+<ul>
+<li><strong>~48 MiB per file</strong> (dynamic mode: 64 MiB base64 payload cap over the RPC,
+≈48 MiB decoded; static mode: the same cap enforced while streaming the
+HTTP body). Files above the cap are rejected with a clear error on the card.</li>
+<li>Images additionally follow the deployment's <code>attachments</code> limits (per-message
+byte/pixel caps) when injected natively for multimodal models.</li>
+</ul>
+<h2>Installation</h2>
+<h3>A. Dynamic plugin (current session, no install)</h3>
+<pre><code>cordis_define + cordis_run   # host = src/host.js, client = src/client.js
+</code></pre>
+<p>Approve the run card and the paperclip button appears immediately. The plugin
+is process-local: after a restart, define and run it again.</p>
+<h3>B. Static bundle (persistent, <code>dsh plugin</code>)</h3>
+<p>The package declares <code>dsh.bundle.patch</code> (see <code>cordis.patch.yml</code>), so
+<code>dsh plugin --profile web add</code> recognizes it as a profile layer. Any
+pnpm-supported source works:</p>
+<pre><code># Git repository (recommended distribution channel)
+dsh plugin --profile web add github:Mooling0602/dsh-web-file-uploader
+
+# Local directory (development)
+dsh plugin --profile web add ../dsh-web-file-uploader
+
+# Tarball
+dsh plugin --profile web add ./dsh-web-file-uploader-0.2.0.tgz
+
+# npm registry (after publishing)
+dsh plugin --profile web add dsh-web-file-uploader
+</code></pre>
+<blockquote>
+<p><strong>Git spec note</strong>: pnpm's git shorthand is <code>github:&lt;owner&gt;/&lt;repo&gt;</code> (e.g.
+<code>github:Mooling0602/dsh-web-file-uploader</code>). A bare <code>github.com/&lt;owner&gt;/&lt;repo&gt;</code>
+is treated by pnpm as a <em>local directory</em> and will fail with a
+"non-existent directory" warning. Other valid forms:
+<code>git+https://github.com/Mooling0602/dsh-web-file-uploader.git</code> or
+<code>https://github.com/Mooling0602/dsh-web-file-uploader.git</code>.</p>
+</blockquote>
+<p>Restart the dsh web process and refresh the page. See
+<a href="https://github.com/Mooling0602/dsh-web-file-uploader/blob/HEAD/PUBLISHING.md">PUBLISHING.md</a> for distribution details and the optional npm
+publish flow (requires your npm credentials).</p>
+<h3>Update</h3>
+<p><code>dsh plugin</code> forwards to pnpm in the profile directory, so update through it
+(never edit <code>~/.dsh/profiles/web/node_modules</code> by hand — the next pnpm
+operation rewrites it):</p>
+<pre><code>dsh plugin --profile web update dsh-web-file-uploader
+# or, if the lockfile-pinned resolution refuses to move:
+dsh plugin --profile web remove dsh-web-file-uploader
+dsh plugin --profile web add github:Mooling0602/dsh-web-file-uploader
+</code></pre>
+<p>Restart the dsh web process afterwards; the served bundle URL carries a
+content-hash revision (<code>?rev=…</code>) so the browser picks up the new build on
+refresh. For local-directory installs, run <code>pnpm build</code> in the checkout
+before re-adding it. Details: <a href="https://github.com/Mooling0602/dsh-web-file-uploader/blob/HEAD/PUBLISHING.md#update">PUBLISHING.md</a>.</p>
+<h2>Architecture</h2>
+<pre><code>Browser (Client)                          DSH host (Host)
+─────────────                             ─────────────────
+conversation.input.left                   harness.handle('upload', …)   [dynamic]
+  └ paperclip ── FileReader ──┐           webServer route POST /upload  [static]
+                              ▼           ┌ sandboxPolicy.resolve() → workspace root
+                    upload payload        ├ session cwd / DSH_HOME + /uploads/
+                              │           ├ SHA-256 → .dfu-index.json dedup
+                              ▼           └ base64 -d (stdin) / node:fs write
+conversation.input.dock
+  └ attachment cards (persist)            harness.handle('remove', …) / remove route
+       └ × closes card → stop injecting     └ pending entry deleted
+                                          agent/pre-step waterfall
+                                             ├ resolveModelInfo → multimodal?
+                                             ├ attachments.saveImage → ImageBlock
+                                             └ path text block (user messages only)
+</code></pre>
+<p>Why <code>base64 -d</code> instead of the Host <code>atob</code>? The Host <code>atob</code> is text-oriented
+(<code>Buffer.from(s, "base64").toString("utf-8")</code>) and the <code>fs</code> service only writes
+UTF-8 text. Piping base64 through the shell service's <code>stdin</code> writes binary
+losslessly with no temp files.</p>
+<h2>Storage location</h2>
+<table>
+<thead>
+<tr>
+<th>Mode</th>
+<th>Destination</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>Dynamic plugin</td>
+<td><code>&lt;session workspace&gt;/uploads/</code> (sandboxed shell/fs cannot leave the workspace)</td>
+</tr>
+<tr>
+<td>Static bundle</td>
+<td><code>$DSH_HOME/uploads</code> (default <code>~/.dsh/uploads</code>) via <code>node:fs</code> — the dsh data directory</td>
+</tr>
+</tbody></table>
+<p>The dedup index (<code>uploads/.dfu-index.json</code>) lives next to the stored files.</p>
+<h2>Repository layout</h2>
+<p>The project follows a <strong>single-source-of-truth core + thin seam</strong> architecture:
+all business logic lives in <code>src/core/*</code>; the dynamic plugin and the static
+bundle are thin adapters over it, so changes are made once and both sides pick
+them up.</p>
+<pre><code>dsh-web-file-uploader/
+├── src/core/
+│   ├── host-core.js        # canonical host logic (transport-agnostic, DI)
+│   └── client-core.js      # canonical client logic (transport-agnostic, DI)
+├── src/seams/
+│   ├── host-dynamic.template.js     # dynamic host seam (harness + shell/fs)
+│   ├── client-dynamic.template.js   # dynamic client seam (host.call + React)
+│   └── client-static.template.js    # static client seam (fetch + module react)
+├── src/host.js             # GENERATED dynamic host (core inlined) — do not edit
+├── src/client.js           # GENERATED dynamic client (core inlined) — do not edit
+├── lib/index.js            # static host seam (imports core; node:fs/crypto/webServer)
+├── client/src/client.js    # GENERATED static client source — do not edit
+├── scripts/
+│   ├── build-dynamic.mjs   # inlines cores into seams -&gt; src/*.js + client/src/client.js
+│   └── build-client.mjs    # wraps client/src/client.js -&gt; lib/client.js
+├── cordis.patch.yml        # dsh.bundle patch (profile layer row)
+├── package.json            # publishable manifest (dsh.bundle + dsh.client)
+├── PUBLISHING.md           # install &amp; npm publish guide
+├── README.md / README_zh_CN.md
+└── LICENSE                 # MIT
+</code></pre>
+<p><strong>How to change code</strong>: edit <code>src/core/*</code> (or a seam), then run
+<code>pnpm build</code> — it regenerates the dynamic sources (<code>src/host.js</code>,
+<code>src/client.js</code>) and the static client bundle (<code>lib/client.js</code>). For the
+running dynamic plugin, redeploy the regenerated <code>src/host.js</code> /
+<code>src/client.js</code> via <code>cordis_define</code> + <code>cordis_run</code>.</p>
+<h2>Development status</h2>
+<ul>
+<li>✅ Dynamic plugin: implemented and verified in live sessions</li>
+<li>✅ Card-driven injection, model-aware adaptation, dedup, i18n UI</li>
+<li>⚠️ Static client module: built by <code>scripts/build-client.mjs</code>, but the
+<code>__ModuleLoader__</code> wrapper must be verified against the real web toolchain
+before distribution</li>
+</ul>
+<h2>License</h2>
+<p>MIT</p>

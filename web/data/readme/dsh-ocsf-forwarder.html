@@ -1,0 +1,555 @@
+<h1>dsh-ocsf-forwarder</h1>
+<p>A read-side SIEM forwarder for <a href="https://github.com/deepseek-ai">DeepSeek Harness</a>. It observes the
+session event firehose, normalises every event to <strong>OCSF 1.9.0</strong> with the native <code>ai_operation</code>
+profile, and writes newline-delimited OCSF JSON to a local append-only spool, optionally shipping it
+to <strong>Splunk HTTP Event Collector</strong> or an <strong>OTLP/HTTP</strong> collector.</p>
+<p><code>PLAN.md</code> holds the design and the complete event → OCSF mapping table for all 44 session event
+types. <code>ADR.md</code> records the decisions that are not obvious from the code.</p>
+<hr>
+<h2>What it does</h2>
+<ul>
+<li>Subscribes to <code>session/event</code>, <code>session/created</code>, and <code>session/disposed</code>, and sweeps
+<code>ctx.sessions.list()</code> at mount.</li>
+<li>Correlates <code>tool/call</code> ↔ <code>tool/result</code> by <code>callId</code> and <code>approval/asked</code> ↔ <code>approval/decided</code> by
+<code>ApprovalRequestId</code>, emitting <strong>approval decision latency</strong> — the approval-fatigue signal.</li>
+<li>Classifies tool calls by what they do: <code>bash</code>/<code>pwsh</code>/<code>run_code</code>/<code>cordis_define</code>/<code>cordis_run</code> →
+Process Activity (1007), <code>read</code>/<code>write</code>/<code>edit</code> → File System Activity (1001),
+<code>web_fetch</code>/<code>web_search</code> → HTTP Activity (4002), approvals and sandbox/permission changes →
+Authorize Session (3003), everything else → API Activity (6003).</li>
+<li>Names the MCP server behind every <code>mcp__&lt;server&gt;__&lt;tool&gt;</code> call, so a SOC can pivot on which
+external server an agent talked to.</li>
+<li>Emits a <strong>high-severity record when a tool hands the task to an external harness</strong>, stating in
+the record that telemetry coverage ends at that boundary. See
+<a href="#delegation-and-the-coverage-boundary">Delegation</a>.</li>
+<li>Emits a periodic <strong>heartbeat</strong> carrying its counters, the live session count and the delivery
+cursor, so a host that goes quiet is distinguishable from one that is idle. See
+<a href="#heartbeat">Heartbeat</a>.</li>
+<li>Replays a resumed or forked session's constructor seed, which never reaches the live firehose.</li>
+<li>Keeps raw values out of the SOC lane: keyed digests, value classifications, and lengths instead.
+File paths, tool names, executable names, and bounded enumerations are the exceptions, and they
+are listed in <a href="#two-lanes">Two lanes</a>.</li>
+</ul>
+<h2>What it does not do</h2>
+<ul>
+<li><strong>It never writes to the session log.</strong> <code>Session.append()</code> cannot set the envelope's <code>ignorable</code>
+flag, so a plugin-owned event type makes the next resume throw <code>SessionFormatUnsupportedError</code>
+and refuse the entire session while <code>list()</code> still shows it. All durable output goes to our own
+sink. The plugin registers no waterfall listener either, so it cannot change a tool call, an
+approval decision, or a model request.</li>
+<li><strong>It is not a containment boundary.</strong> It runs in the agent's process at the agent's uid. An agent
+that can run <code>bash</code> can delete or rewrite the spool. What the plugin buys you is that records
+leave the host promptly when a shipper is configured, and that a gap is visible: <code>metadata.sequence</code>
+holes per session, and a shipper cursor that stopped advancing.</li>
+<li>It ships no detection content, no alerting, and no secret detectors.</li>
+</ul>
+<h2>Install</h2>
+<p>The profile must already compose a runnable agent. A profile carrying only <code>@deepseek-ai/dsh-base</code>
+has no runtime: add <code>@deepseek-ai/dsh-headless</code> (or another runnable bundle) alongside it, otherwise
+the profile boots into a configuration with no agent loop and this plugin observes nothing.</p>
+<pre><code>dsh plugin --profile &lt;name&gt; add @deepseek-ai/dsh-headless@0.1.0-rc.6
+dsh plugin --profile &lt;name&gt; add dsh-ocsf-forwarder
+dsh --profile &lt;name&gt; --dump-config      # verify the row is mounted
+</code></pre>
+<p>Pin <code>@deepseek-ai/dsh-headless</code> explicitly: its npm <code>latest</code> tag still points at
+<code>0.0.1-rc.1</code>, so an unpinned install silently resolves to a much older harness.</p>
+<p><strong>Install from the registry or a packed tarball, not from a git spec.</strong>
+<code>dsh plugin add github:CharlotteN7/dsh-ocsf-forwarder</code> resolves and writes the
+dependency, but <code>lib/</code> is a build output that git does not carry and no
+<code>prepare</code> script rebuilds it, so the row mounts and then fails to load. To
+install from a checkout, build first and add the tarball:</p>
+<pre><code>git clone https://github.com/CharlotteN7/dsh-ocsf-forwarder &amp;&amp; cd dsh-ocsf-forwarder
+pnpm install &amp;&amp; pnpm run build &amp;&amp; pnpm pack
+dsh plugin --profile &lt;name&gt; add ./dsh-ocsf-forwarder-0.1.0.tgz
+</code></pre>
+<p>The bundle patch defaults the spool to <code>dshHomePath('ocsf/session.ocsf.jsonl')</code>. A profile patch
+layer <strong>replaces a row's whole <code>config</code></strong>, so an override must restate every key it wants:</p>
+<pre><code>- id: dsh-ocsf-forwarder
+  config:
+    spoolPath: /var/log/dsh/session.ocsf.jsonl
+    seedReplay: full
+    privacy:
+      hmacKey:
+        source: env
+        variable: DSH_OCSF_HMAC_KEY
+    otlp:
+      endpoint: https://collector.internal:4318
+      headers:
+        authorization: 'Bearer ${COLLECTOR_TOKEN}'
+</code></pre>
+<p>To ship to Splunk instead, replace the <code>otlp</code> block with a <code>splunk</code> one. Exactly one destination
+may be configured: two would share one cursor file and each step it past the other's deliveries,
+so naming both fails at load.</p>
+<pre><code>- id: dsh-ocsf-forwarder
+  config:
+    spoolPath: /var/log/dsh/session.ocsf.jsonl
+    fleet:
+      tenantUid: platform-eng
+      labels: [prod, eu-west]
+      tags:
+        owner: soc
+    splunk:
+      endpoint: https://splunk.internal:8088
+      index: dsh_security
+      token:
+        source: env
+        variable: DSH_SPLUNK_HEC_TOKEN
+</code></pre>
+<h2>Configuration</h2>
+<table>
+<thead>
+<tr>
+<th>Key</th>
+<th>Default</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>spoolPath</code></td>
+<td>required</td>
+<td>Absolute path of the SOC-lane spool. Created 0640, with its parent directories. One process at a time owns a path — see <a href="#delivery-and-failure-modes">Delivery and failure modes</a>.</td>
+</tr>
+<tr>
+<td><code>spoolMaxBytes</code></td>
+<td><code>268435456</code></td>
+<td>Rotate to a new generation at this size.</td>
+</tr>
+<tr>
+<td><code>spoolMaxGenerations</code></td>
+<td><code>16</code></td>
+<td>Rotated generations that may await the shipper. At this count rotation stops and the live file grows past <code>spoolMaxBytes</code> instead.</td>
+</tr>
+<tr>
+<td><code>spoolMaxTotalBytes</code></td>
+<td><code>4294967296</code></td>
+<td>Second stop condition on rotation: bytes across the live spool and every rotated generation. Not a delete policy — see <a href="#delivery-and-failure-modes">Delivery and failure modes</a>.</td>
+</tr>
+<tr>
+<td><code>spoolHighWaterBytes</code></td>
+<td><code>3221225472</code></td>
+<td>Total spool bytes at which the heartbeat is raised to <code>severity_id: 4</code>. Must not exceed <code>spoolMaxTotalBytes</code>, or load fails.</td>
+</tr>
+<tr>
+<td><code>statsIntervalMs</code></td>
+<td><code>300000</code></td>
+<td>How often the forwarder's counters reach the log <strong>and a heartbeat reaches the spool</strong>. <code>0</code> reports and heartbeats only at unload.</td>
+</tr>
+<tr>
+<td><code>restricted.path</code></td>
+<td>—</td>
+<td>Restricted lane: the same records plus the verbatim payload in <code>raw_data</code>. Created 0600.</td>
+</tr>
+<tr>
+<td><code>restricted.acknowledged</code></td>
+<td><code>false</code></td>
+<td>Must be <code>true</code> for the restricted lane to open; the plugin fails at load otherwise.</td>
+</tr>
+<tr>
+<td><code>otlp.endpoint</code></td>
+<td>—</td>
+<td>OTLP collector base URL. <code>/v1/logs</code> is appended when the URL has no path. Absent disables OTLP shipping.</td>
+</tr>
+<tr>
+<td><code>splunk.endpoint</code></td>
+<td>—</td>
+<td>Splunk HEC base URL, typically <code>https://&lt;host&gt;:8088</code> (Splunk Cloud defaults to 443). <code>/services/collector/event</code> is appended when the URL has no path.</td>
+</tr>
+<tr>
+<td><code>splunk.token.source</code> / <code>.variable</code> / <code>.value</code></td>
+<td><code>env</code> / — / —</td>
+<td>Where the HEC token comes from. <code>env</code> names an environment variable; <code>literal</code> carries the token in configuration. Missing or empty fails at load.</td>
+</tr>
+<tr>
+<td><code>splunk.index</code> / <code>host</code> / <code>source</code> / <code>sourcetypePrefix</code></td>
+<td>— / this host / <code>dsh:session</code> / <code>ocsf</code></td>
+<td>HEC event metadata. <code>index</code> is omitted so the token's default index applies. <code>sourcetype</code> is <code>&lt;prefix&gt;:&lt;OCSF class name&gt;</code>.</td>
+</tr>
+<tr>
+<td><code>&lt;shipper&gt;.headers</code> / <code>batchSize</code> / <code>flushIntervalMs</code> / <code>timeoutMs</code> / <code>cursorPath</code></td>
+<td><code>{}</code> / <code>256</code> / <code>5000</code> / <code>10000</code> / <code>&lt;spoolPath&gt;.cursor</code></td>
+<td>Delivery settings, on either shipper block.</td>
+</tr>
+<tr>
+<td><code>&lt;shipper&gt;.maxReadBytes</code> / <code>maxBackoffMs</code> / <code>quarantinePath</code></td>
+<td><code>8388608</code> / <code>300000</code> / <code>&lt;spoolPath&gt;.quarantine</code></td>
+<td>Largest spool region read in one pass, the backoff ceiling, and where refused batches are set aside.</td>
+</tr>
+<tr>
+<td><code>fleet.tenantUid</code> / <code>labels</code> / <code>tags</code></td>
+<td>—</td>
+<td><code>metadata.tenant_uid</code>, <code>metadata.labels</code> (string list) and <code>metadata.tags</code> (a map, rendered as OCSF <code>key_value_object</code> entries). Never inferred.</td>
+</tr>
+<tr>
+<td><code>fleet.installUid</code> / <code>installUidPath</code></td>
+<td>generated / <code>&lt;spoolPath&gt;.install-uid</code></td>
+<td><code>device.uid</code>. Minted once and persisted, so a renamed host is still the same device.</td>
+</tr>
+<tr>
+<td><code>delegationTools</code></td>
+<td><code>{}</code></td>
+<td>Tool name → provider, for delegation tools registry discovery cannot see. An entry may add a name; it may not un-name a discovered one.</td>
+</tr>
+<tr>
+<td><code>privacy.argumentValues</code></td>
+<td><code>digest</code></td>
+<td><code>omit</code>, <code>digest</code>, or <code>full</code> for tool-argument values.</td>
+</tr>
+<tr>
+<td><code>privacy.commandLine</code></td>
+<td><code>digest</code></td>
+<td><code>digest</code> or <code>full</code> for command lines.</td>
+</tr>
+<tr>
+<td><code>privacy.url</code></td>
+<td><code>host</code></td>
+<td><code>host</code>, <code>sanitized</code> (scheme + host + path), or <code>full</code>. A path carries a reset or invite token as readily as a query string does, so <code>sanitized</code> is a deliberate widening.</td>
+</tr>
+<tr>
+<td><code>privacy.hmacKey.source</code></td>
+<td><code>ephemeral</code></td>
+<td><code>ephemeral</code> (random per process), <code>env</code> (+<code>variable</code>), or <code>literal</code> (+<code>value</code>). Configured keys must be ≥ 32 bytes or load fails.</td>
+</tr>
+<tr>
+<td><code>seedReplay</code></td>
+<td><code>full</code></td>
+<td><code>full</code>, <code>boundary</code> (one marker record), or <code>none</code>.</td>
+</tr>
+<tr>
+<td><code>dropEventTypes</code> / <code>includeEventTypes</code></td>
+<td><code>[]</code></td>
+<td>Adjust the drop policy. Dropped by default: <code>assistant/chunk</code>, <code>session/end-seed</code>, <code>session/title</code>, <code>session/title-llm-request</code>, <code>feedback/record</code>, <code>todo/write</code>.</td>
+</tr>
+<tr>
+<td><code>toolClasses</code></td>
+<td><code>{}</code></td>
+<td>Classify tools the built-in table does not know. It cannot reclassify a known tool.</td>
+</tr>
+<tr>
+<td><code>extension.name</code> / <code>extension.placement</code></td>
+<td><code>dsh</code> / <code>unmapped</code></td>
+<td>Key the extension attributes are stored under, and whether they sit under <code>unmapped</code> or at the top level. Every OCSF class is <code>additionalProperties: false</code>, so <code>attribute</code> produces records that fail validation.</td>
+</tr>
+<tr>
+<td><code>extension.uid</code></td>
+<td>—</td>
+<td>OCSF extension uid, as assigned by the OCSF extension registry. <code>metadata.extensions</code> is omitted until one is configured: there is no free private range, and every unassigned value collides with somebody's.</td>
+</tr>
+<tr>
+<td><code>vendorName</code></td>
+<td><code>dsh-security-plugins</code></td>
+<td><code>metadata.product.vendor_name</code>.</td>
+</tr>
+</tbody></table>
+<h2>A record</h2>
+<pre><code>{
+  "class_uid": 1007, "category_uid": 1, "type_uid": 100701, "activity_id": 1,
+  "severity_id": 1, "status_id": 0, "message": "tool call bash",
+  "time": 1786881335332,
+  "metadata": {
+    "product": { "name": "dsh-ocsf-forwarder", "vendor_name": "dsh-security-plugins", "version": "0.1.0" },
+    "version": "1.9.0", "profiles": ["ai_operation", "cloud", "osint"],
+    "log_provider": "deepseek-harness", "log_name": "session",
+    "uid": "01JB0SESSION:7", "correlation_uid": "01JB0SESSION:call_9f2",
+    "sequence": 7, "logged_time": 1786823920155, "original_time": "1786881335332",
+    "tenant_uid": "platform-eng", "labels": ["prod"], "tags": [{ "name": "owner", "value": "soc" }]
+  },
+  "cloud": { "provider": "Other" }, "osint": [],
+  "ai_agent": { "name": "deepseek-harness", "type_id": 1, "instance_uid": "01JB0SESSION" },
+  "actor": { "process": { "pid": 4242, "name": "dsh" }, "user": { "name": "agent", "type_id": 1 } },
+  "device": {
+    "type_id": 0, "hostname": "app-01.example.test",
+    "uid": "0c6f1f1a-9c1e-4f0a-9a63-6a1a6c5f1b2e",
+    "os": { "name": "linux", "type_id": 0 }
+  },
+  "user": { "name": "agent", "type_id": 1 },
+  "process": { "name": "curl", "cmd_line": "hmac-sha256:d7df26fddfd3af030679709c66165379" },
+  "observables": [{ "name": "process.cmd_line", "type_id": 8, "value": "hmac-sha256:d7df26…" }],
+  "unmapped": {
+    "dsh": {
+      "v": 1, "session_id": "01JB0SESSION", "event_type": "tool/call", "seq": 7,
+      "replayed": false, "cwd": "/srv/app", "tool": "bash", "tool_class": "process-launch",
+      "arguments": [{ "key": "command", "class": "command", "length": 53, "digest": "hmac-sha256:d7df26…" }],
+      "turn": 1, "step": 0, "call_id": "call_9f2", "phase": "invoke"
+    }
+  }
+}
+</code></pre>
+<p>The model called <code>bash</code> with <code>curl -s https://api.example.test/v1/x?token=sk-live-1</code>. The record
+says a process was launched, that its executable was <code>curl</code>, how long the command was, and gives a
+digest that joins it to every other occurrence of the same command — and discloses neither the URL
+nor the token.</p>
+<p>Every OCSF class is <code>additionalProperties: false</code>, so the extension attributes live under
+<code>unmapped</code>, which is the base event's own slot for exactly this. <code>cloud</code> and <code>osint</code> are stubs — a
+host agent has no cloud deployment and no open-source intelligence — and <code>metadata.profiles</code>
+declares both, because an attribute whose profile is undeclared fails validation just as an
+undefined one does.</p>
+<h2>Shipping to a SIEM</h2>
+<p>The shipper is a byte cursor over the spool plus a <strong>transport</strong>: an encoder and a status
+classifier, and nothing else. No transport sees the cursor, the spool or the quarantine file, so
+adding a destination cannot change delivery semantics.</p>
+<h3>Splunk HTTP Event Collector</h3>
+<p>Verified against Splunk's documentation on 2026-08-16 (<code>docs.splunk.com</code> now redirects to
+<code>help.splunk.com</code>):</p>
+<table>
+<thead>
+<tr>
+<th></th>
+<th></th>
+</tr>
+</thead>
+<tbody><tr>
+<td>Endpoint</td>
+<td><code>POST {base}/services/collector/event</code> — "which is where all JSON-formatted event requests must go"</td>
+</tr>
+<tr>
+<td>Header</td>
+<td><code>Authorization: Splunk &lt;token&gt;</code>; the REST reference adds "The format is case-sensitive"</td>
+</tr>
+<tr>
+<td>Body</td>
+<td>Event objects stacked one after the other, one per line. Splunk states that "Both concatenated JSON objects and JSON arrays like this are accepted", so the concatenation here is the documented form rather than the only accepted one</td>
+</tr>
+<tr>
+<td><code>time</code></td>
+<td>Epoch <strong>seconds</strong> with a fractional millisecond part — UNIX time "in the format <code>&lt;sec&gt;.&lt;ms&gt;</code>"</td>
+</tr>
+<tr>
+<td><code>sourcetype</code></td>
+<td><code>ocsf:&lt;OCSF class name&gt;</code>, for example <code>ocsf:process_activity</code></td>
+</tr>
+</tbody></table>
+<p>Each event carries <code>time</code>, <code>host</code>, <code>source</code>, <code>sourcetype</code>, optionally <code>index</code>, and the whole OCSF
+record under <code>event</code>.</p>
+<p><strong>Status handling.</strong> Splunk publishes an error-code table but <strong>no</strong> retryable set, so the reading
+below is ours. 2xx is acceptance. 429 ("HEC queue is at capacity") and 503 ("Server is busy",
+"queues are full") are backpressure and hold the cursor. 400 is a content refusal and quarantines
+the batch. <strong>401 and 403 hold the cursor rather than quarantining</strong>, which departs from the
+OpenTelemetry Collector's Splunk exporter: both statuses mean the token is wrong, never that the
+batch is bad, and stepping the cursor over records that would deliver fine once a rotated token is
+fixed would be an unrecoverable loss of delivery. The signal that this is happening is the
+heartbeat's <code>shipper_cursor</code> standing still. Note that Splunk also returns "Invalid token" and
+"Token disabled" as <strong>400</strong> under its codes 21 and 22, so a 400 is not unambiguously a payload
+fault; it is graded as one so that a genuinely malformed batch cannot block every record behind it.</p>
+<p><strong>Splunk configuration.</strong> There is no official Splunk add-on for OCSF and no Splunk-published OCSF
+sourcetype convention, so <code>sourcetype</code> and field extraction are ours to define.
+<a href="https://github.com/CharlotteN7/dsh-ocsf-forwarder/blob/HEAD/splunk/props.conf"><code>splunk/props.conf</code></a> ships beside this plugin with one stanza per class. There
+is deliberately no <code>transforms.conf</code>: HEC sets <code>_time</code>, <code>host</code>, <code>source</code> and <code>sourcetype</code> from the
+event envelope and the payload is JSON, so nothing needs an index-time transform.</p>
+<p><strong>Splunk Cloud.</strong> The hostname needs the HEC prefix — <code>http-inputs-&lt;host&gt;.splunkcloud.com</code> on AWS,
+<code>http-inputs.&lt;host&gt;.splunkcloud.com</code> on GCP and Azure — and the default port is 443, not 8088.</p>
+<h3>OTLP/HTTP</h3>
+<p>Each record becomes one OTLP <code>logRecord</code> whose body is the record's JSON, with <code>ocsf.class_uid</code> and
+<code>ocsf.type_uid</code> as attributes so a collector routes without parsing the payload.</p>
+<h2>Heartbeat</h2>
+<p>A periodic Application Lifecycle (6002) record reporting the live session count, the forwarder's
+counters, the spool size and the shipper cursor. <code>statsIntervalMs</code> sets the cadence; one more is
+written at unload with <code>unmapped.dsh.final: true</code>.</p>
+<p><strong>OCSF has no heartbeat class.</strong> There is no liveness, health-check, keepalive or checkpoint class
+either — enumerating all 87 classes in 1.9.0 and searching name, caption and description for those
+words returns nothing. This is therefore <strong>not</strong> a standard mapping: it is 6002 with
+<code>activity_id: 99</code> (<code>Other</code>), <code>activity_name: "Heartbeat"</code>, and <code>unmapped.dsh.kind: "heartbeat"</code>,
+until OCSF ships a slot.</p>
+<p>A heartbeat belongs to no session. It carries no <code>ai_agent.instance_uid</code> and no
+<code>unmapped.dsh.session_id</code>; its <code>metadata.uid</code> is <code>&lt;install uid&gt;:heartbeat:&lt;n&gt;</code> and
+<code>metadata.sequence</code> is that <code>n</code>, so a <em>missing</em> heartbeat is detectable and not only a malformed
+one. It is deliberately absent from the counters it reports.</p>
+<table>
+<thead>
+<tr>
+<th>Attribute</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>live_sessions</code></td>
+<td>Sessions the store held when the heartbeat was taken.</td>
+</tr>
+<tr>
+<td><code>forwarded</code> / <code>dropped</code> / <code>unreadable</code> / <code>failed</code></td>
+<td>The forwarder's counters.</td>
+</tr>
+<tr>
+<td><code>spool_bytes</code> / <code>spool_high_water_bytes</code> / <code>spool_pressure</code></td>
+<td>Disk the spool occupies, the alarm threshold, and whether it has been crossed.</td>
+</tr>
+<tr>
+<td><code>rotation_stopped</code></td>
+<td>True once a stop condition has held rotation and the live file is growing.</td>
+</tr>
+<tr>
+<td><code>shipper_cursor</code> / <code>shipper_quarantined</code> / <code>shipper_destination</code></td>
+<td>Delivery position, refused records, and which destination. Absent with no shipper configured.</td>
+</tr>
+<tr>
+<td><code>uptime_ms</code> / <code>final</code></td>
+<td>How long this forwarder has been mounted, and whether this is its last heartbeat.</td>
+</tr>
+</tbody></table>
+<p><code>severity_id</code> rises to <code>4</code> when the spool crosses <code>spoolHighWaterBytes</code> or rotation has stopped, so
+the SOC learns from the SIEM rather than from a full disk.</p>
+<p><strong>Detecting absence</strong> is well-trodden on the SIEM side and is not shipped here. Elastic's
+Elasticsearch-query rule supports an "is below" comparator, which is what absence detection needs;
+its separate Threshold rule type is one-directional and cannot express it. Sentinel's idiom is
+<code>summarize max(TimeGenerated) by Computer</code>. In Splunk the pivot is <code>device.uid</code> against the
+<code>ocsf:application_lifecycle</code> sourcetype.</p>
+<h2>Delegation and the coverage boundary</h2>
+<p><code>subagent-claude-code</code> and <code>subagent-codex</code> resolve a real external CLI and spawn it <strong>in the parent
+session's workspace</strong>. There is no DSH session for the child, so no session event describes anything
+it does: this plugin's coverage ends at the tool call. That is the most important gap in what a SOC
+sees, so the call is graded <code>severity_id: 4</code>, classed as Process Activity, and says so in
+<code>message</code>:</p>
+<pre><code>{
+  "class_uid": 1007, "severity_id": 4,
+  "message": "tool call subagent_codex delegates to codex; session telemetry coverage ends at this boundary",
+  "process": { "name": "codex" },
+  "unmapped": { "dsh": {
+    "tool": "subagent_codex", "tool_class": "delegation-external",
+    "delegation_provider": "codex", "delegation_boundary": true, "delegation_coverage": "none"
+  } }
+}
+</code></pre>
+<p>The record carries the tool name and the provider name. It does <strong>not</strong> carry the prompt handed to
+the other harness — that follows the same redaction policy as any other tool argument.</p>
+<p><strong>The mapping is best-effort, and here is why.</strong> The provider name is fixed per plugin row and is
+not in the tool-call payload, so the plugin cannot name the destination harness from the event
+alone. At mount it reads the composed <code>tool-subagent</code> rows out of <code>ctx.registry</code> and pairs each
+row's <code>toolName</code> with its <code>provider</code>. Since <code>toolName</code> is a deployment choice, a row may be composed
+after this plugin mounts, and a deployment may reach an external harness through a plugin this build
+has never heard of, <code>delegationTools</code> lets you name one directly:</p>
+<pre><code>    delegationTools:
+      handoff_to_codex: codex
+</code></pre>
+<p>A configured entry may <strong>add</strong> a name. It cannot un-name one discovery found: repo-local
+configuration is attacker-controlled, and re-pointing a discovered delegation tool at a benign
+provider would silence the loudest record this plugin emits.</p>
+<p><code>spawn</code> and <code>fork</code> subagents are not delegation boundaries. They run in process and are fully
+observed.</p>
+<h2>Fleet identity</h2>
+<p>Every record carries the identity a multi-team SOC filters on. None of it is inferred — an invented
+tenant is worse than an absent one, so an unconfigured field is omitted.</p>
+<table>
+<thead>
+<tr>
+<th>Field</th>
+<th>Source</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>metadata.tenant_uid</code></td>
+<td><code>fleet.tenantUid</code>.</td>
+</tr>
+<tr>
+<td><code>metadata.labels</code></td>
+<td><code>fleet.labels</code>, a string list.</td>
+</tr>
+<tr>
+<td><code>metadata.tags</code></td>
+<td><code>fleet.tags</code>, a map. OCSF types this as an array of <code>key_value_object</code>, so <code>{owner: soc}</code> is emitted as <code>[{"name":"owner","value":"soc"}]</code> — <code>labels</code> is the slot for bare strings.</td>
+</tr>
+<tr>
+<td><code>device.uid</code></td>
+<td><code>fleet.installUid</code>, or a uid minted once and persisted at <code>fleet.installUidPath</code>. A hostname is not an identity: it changes when a laptop is renamed and collides across a fleet imaged from one template.</td>
+</tr>
+<tr>
+<td><code>metadata.original_time</code></td>
+<td>The session log's own rendering of the append time, passed through as a string. OCSF wants "a pass-through string in its native format… not normalized" — the normalised value is <code>time</code> — and says to omit it for generated events, so the heartbeat carries none.</td>
+</tr>
+</tbody></table>
+<h2>Two lanes</h2>
+<p>The SOC lane is metadata, classifications, keyed digests, and lengths. The values it does carry
+verbatim, because they are the security signal rather than its content, are: file paths; tool
+names; executable names, taken after any leading <code>NAME=VALUE</code> assignments are stripped; hostnames;
+URL scheme and host; and bounded enumerations such as an approval outcome, a turn end reason, a
+sandbox mode, a provider error <em>code</em>, and a hook decision drawn from the hook protocol's own
+<code>approve</code>/<code>allow</code>/<code>block</code>/<code>deny</code>/<code>ask</code>. Anything a model, a user, a provider, or a hook composed as
+free text — prompts, completions, commands, <code>grep</code> patterns, approval prompt text, provider failure
+messages, hook findings — reaches the SOC lane only as <code>HMAC-SHA256(key, value)</code> plus a character
+count.</p>
+<p>The restricted lane (<code>restricted.path</code> plus <code>restricted.acknowledged: true</code>, mode 0600) is the same
+records with the verbatim event payload in <code>raw_data</code>, joined to the SOC lane on <code>metadata.uid</code>.</p>
+<h2>Correlation</h2>
+<table>
+<thead>
+<tr>
+<th>Field</th>
+<th>Joins</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>metadata.uid</code> = <code>&lt;session&gt;:&lt;seq&gt;</code></td>
+<td>The idempotency key. Deduplicate on it.</td>
+</tr>
+<tr>
+<td><code>metadata.correlation_uid</code></td>
+<td><code>&lt;session&gt;:&lt;callId&gt;</code> for a tool call and its result, <code>&lt;session&gt;:approval:&lt;id&gt;</code> for an approval pair, <code>&lt;session&gt;:turn:&lt;n&gt;</code>, <code>&lt;session&gt;:&lt;turn&gt;:&lt;step&gt;</code>.</td>
+</tr>
+<tr>
+<td><code>metadata.sequence</code></td>
+<td>The session-log seq — a per-session gap detector.</td>
+</tr>
+<tr>
+<td><code>ai_agent.instance_uid</code> / <code>unmapped.dsh.session_id</code></td>
+<td>The session. <code>parent_session_id</code> and <code>seed_length</code> stitch forks.</td>
+</tr>
+<tr>
+<td><code>unmapped.dsh.turn</code>, <code>.step</code>, <code>.call_id</code>, <code>.approval_id</code></td>
+<td>Agent-loop position and pairing ids.</td>
+</tr>
+</tbody></table>
+<p>Approval latency is on the decision record as <code>duration</code> and <code>unmapped.dsh.approval_latency_ms</code>.</p>
+<h2>Delivery and failure modes</h2>
+<p>The spool is written synchronously before anything is queued for shipping, so:</p>
+<ul>
+<li>A killed process leaves records on disk and a cursor that stopped advancing — a visible gap, not
+silent loss. A sink that refuses a write leaves the session cursor on the unwritten event, so an
+outage delays records rather than consuming them; the counters in the periodic
+<code>forwarded=… dropped=… unreadable=… failed=…</code> log line say which is happening.</li>
+<li>Delivery is <strong>at-least-once</strong>: the cursor advances only after the collector accepts a batch, so a
+crash resends. Deduplicate on <code>metadata.uid</code>.</li>
+<li>Capture is <strong>at-most-once</strong>: <code>session/event</code> fires post-commit but <strong>pre-durable</strong>, so a record can
+describe an event a later crash loses from the session log; conversely an event appended while the
+plugin was unmounted is not on the live path. <code>ctx.sessionQuery.readSession(id)</code> reads a full
+historical log for an offline backfill (it needs the <code>session-query-sqlite</code> row mounted).</li>
+<li>With <code>seedReplay: full</code> a resumed session re-emits its prior log. That is deliberate: coverage
+beats duplication for an audit lane, and <code>metadata.uid</code> makes the duplicates exact.</li>
+</ul>
+<p><strong>Rotation.</strong> At <code>spoolMaxBytes</code> the live file is renamed to a fixed-width timestamped generation —
+<code>&lt;spoolPath&gt;.2026-08-16T11-42-22.123Z-000</code> — and a fresh live file is opened. A generation name is
+never reused, so rotation never overwrites one. The shipper drains generations oldest-first, ahead
+of the live file, and unlinks each only once the collector has acknowledged every byte in it. The
+delivery cursor follows the rename onto the generation it now indexes, so rotation does not resend
+what was already delivered out of that file. Rotation stops at either of two bounds: <code>spoolMaxGenerations</code> un-drained generations, or
+<code>spoolMaxTotalBytes</code> on disk across the live file and every generation. The live file then grows
+past <code>spoolMaxBytes</code> and the plugin logs why. That is deliberate — an audit lane that deletes
+unacknowledged evidence to stay under a size limit is worse than one that gets loud and large. The
+second bound exists because a file count bounds nothing about the disk once the live file is the
+one growing.</p>
+<p>Neither bound is a retention policy and neither ever deletes a record. The alarm is
+<code>spoolHighWaterBytes</code>, which sits below the stop condition and raises the heartbeat to
+<code>severity_id: 4</code> while there is still room; a high-water mark above the stop condition would never
+fire in time, so that combination fails at load.</p>
+<p><strong>One writer per path.</strong> A spool path is held by an exclusive <code>&lt;spoolPath&gt;.lock</code>. Two processes
+sharing one path would each rename the inode the other is writing into, so the second one fails at
+load with the pid that holds it. Give each process its own path — the bundle patch's
+<code>dshHomePath(...)</code> default already does, per <code>$DSH_HOME</code>. A lock left by a process that no longer
+exists is taken over.</p>
+<p><strong>Retry and quarantine.</strong> A batch the destination cannot take right now is retried with
+exponential backoff from <code>flushIntervalMs</code> up to <code>maxBackoffMs</code>, and the cursor does not move. A
+batch it refuses on content is appended to <code>quarantinePath</code> and stepped over, because retrying it
+forever would hold every later record behind one the destination will never accept. Each
+quarantined batch is reported through the plugin logger, naming the destination that refused it.
+Which statuses fall where is the transport's decision: OTLP retries 5xx, timeouts, connection
+failures and 408/425/429 and refuses any other 4xx; Splunk's reading is in
+<a href="#splunk-http-event-collector">Shipping to a SIEM</a> and differs on 401 and 403.</p>
+<h2>Development</h2>
+<pre><code>. ../env.sh                # Node ^22.19.0 || &gt;=24, and pnpm
+pnpm install
+pnpm run typecheck
+pnpm run test            # unit tests
+pnpm run test:coverage   # unit tests with the coverage gate
+pnpm run test:e2e        # builds, then boots a real dsh against a mock model
+DSH_EXAMPLE_MODE=lib pnpm run test:e2e   # the installed form, resolved through package exports
+</code></pre>
+<p>The E2E harness copies this package <strong>and its runtime dependency closure</strong> into a throwaway
+profile's <code>node_modules</code>, so the test exercises an installed plugin rather than one leaning on the
+harness checkout's own modules. It boots the harness from <code>../dsh</code>; set <code>DSH_REPO</code> to point
+elsewhere, or <code>DSH_CLI</code> at an installed <code>dsh</code> bin.</p>

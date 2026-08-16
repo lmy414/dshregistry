@@ -1,0 +1,340 @@
+<h1>dsh-notify</h1>
+<p>A DeepSeek Harness (dsh) task-monitoring notification plugin. While the agent works, it pushes key states to you:</p>
+<ul>
+<li><strong>turn/end</strong>: notifies on task completion/error/blocked/max-tokens (title, reason, duration by default)</li>
+<li><strong>human confirmation needed</strong>: notifies on approval dialogs and <code>ask_user_question</code> (with a question summary)</li>
+<li><strong>confirmation timeout escalation</strong>: after 10 minutes without a decision, re-alerts via SAPI voice + high-priority webhooks</li>
+<li><strong>model-initiated notify tool</strong>: <code>notify</code> tool (off by default) lets the model push a message to you proactively</li>
+</ul>
+<p>Four channel kinds: HTTP webhooks (QQ bot / serverchan / DingTalk / WeCom / ntfy are the same channel with different endpoints), A2A agents (one-way <code>message/send</code>), MCP tools (streamable-http notification bridges), and Windows SAPI local voice. Pure Node, zero runtime dependencies, build-free bundle, installed in the same <code>dsh.bundle.patch</code> shape as dsh-desktop-shell.</p>
+<h2>Installation</h2>
+<pre><code>dsh plugin --profile web add github:ikashana/dsh-notify
+# headless works too (voice/HTTP/A2A/MCP all still send):
+dsh plugin --profile headless add github:ikashana/dsh-notify
+</code></pre>
+<p>The plugin is inserted via a bundle patch and defaults to <strong>listen-only, no disturbance</strong> (no HTTP/A2A/MCP channels, voice off, notify tool off). Configure endpoints by replacing the whole config under the same id in your profile's <code>cordis.patch.yml</code> (<strong>a non-insert patch replaces the target entry's entire config object — rewrite every key you want to keep</strong>):</p>
+<pre><code>- id: notify
+  config:
+    http:
+      channels:
+        - id: ntfy
+          url: 'https://ntfy.sh/my-topic'
+    sapi:
+      enabled: true
+    tools:
+      notify:
+        enabled: true
+</code></pre>
+<blockquote>
+<p>Keep private config (endpoints with secrets) in a local patch/config file and gitignore it; the public repo has zero hardcoded secrets.</p>
+</blockquote>
+<h2>Triggers</h2>
+<h3>1. turn/end (automatic)</h3>
+<p>Listens to <code>session/event</code> <code>turn/end</code>. The <code>reason.kind</code> whitelist defaults to <code>[completed, error, blocked, max-tokens]</code> (aborted is a user-initiated cancel and stays quiet by default; configurable). If a new <code>turn/start</code> appears inside the cooldown window after a turn ends (default 10 s), the pending notification is cancelled — multi-turn jobs report only the final state. Only root sessions notify (subagent children stay silent; configurable). Duration = envelope <code>time</code> of turn/end minus turn/start.</p>
+<p><strong>Dispose resend</strong>: a notification still inside its cooldown window is sent immediately when the plugin disposes (process exit / HMR unload) instead of waiting — for a one-shot headless task that exits right after turn/end, this is the moment the last state gets out. Entries already cancelled by a new turn/start are not resent (the cancel semantics hold).</p>
+<h3>2. Human confirmation needed</h3>
+<ul>
+<li><code>approval/asked</code>: notifies when an approval dialog appears (summary = tool name + reason).</li>
+<li><code>ask_user_question</code> <code>tool/call</code>: parses the arguments JSON for the question summary. <strong>Headless false-positive switch</strong>: headless has no userQuestions provider, so the ask fails immediately but <code>tool/call</code> still fires — <code>askUserQuestion: 'auto'</code> (default) only sends when a web layer is detected (a <code>webServer</code> service exists); <code>'on'</code> forces, <code>'off'</code> disables.</li>
+</ul>
+<p>After the resolution signal arrives (<code>approval/decided</code> by id, <code>tool/result</code> by <code>message.source.callId</code>), the default is silence; <code>notifyDecided: true</code> sends "confirmed/rejected/…".</p>
+<h3>3. Confirmation timeout escalation</h3>
+<p>Per-session pending table + a <code>ctx.timeout()</code> timer (effect-managed, cleaned up on dispose). On timeout (default 10 min, <code>timeoutMs: 0</code> disables) sends a priority escalation: SAPI voice + the high-priority channels in <code>escalation.channelIds</code> (queue-jumping).</p>
+<p><strong>Dispose resend</strong>: if confirmations are still pending when the plugin disposes, one escalation is resent (escalation only — never the confirmation first-report, which was already sent when the event happened); no resend when escalation is disabled (<code>timeoutMs: 0</code>).</p>
+<h3>4. notify tool (model-initiated, off by default)</h3>
+<p>With <code>tools.notify.enabled: true</code>, the model gains a <code>notify</code> tool: <code>{ message: string, channel?: string, priority?: boolean }</code>. <code>message</code> is the model's verbatim text, enqueued as a <code>kind='model-message'</code> notification through the regular channel chain; <code>channel</code> restricts sending to that channel id; <code>priority</code> jumps the queue. Subagent sessions are silently skipped (consistent with the root-session filter).</p>
+<p><strong>Privacy note</strong>: a model-initiated message is explicit content — it bypasses the <code>turnEnd.includeText</code> privacy switch and appears verbatim in the notification. The tool is off by default for exactly this reason: enabling it authorizes the model to push arbitrary text to every configured channel.</p>
+<h2>Channels</h2>
+<h3>HTTP (lib/channels/http.js)</h3>
+<p><code>url</code>/<code>headers</code>/<code>body</code> are fully template-rendered; 10 s timeout + exponential backoff with 2 retries (429/5xx/network errors retry, other 4xx fail over immediately); a failed primary channel falls back to the <code>fallback</code> chain. Secrets never sit in plain text:</p>
+<ul>
+<li><code>${env:XXX}</code> — read from the environment</li>
+<li><code>${credential:REF}</code> — resolved via the dsh credentials service (optional; errors if the service is absent)</li>
+</ul>
+<h3>A2A (lib/channels/a2a.js)</h3>
+<p>One-way send to an A2A protocol 1.0 agent: POST JSON-RPC 2.0 <code>message/send</code> to <code>agentUrl</code> with <code>params.message = { messageId, role: 'agent', parts: [{ kind: 'text', text }] }</code>. Both <code>messageId</code> and the request <code>id</code> use <code>node:crypto</code> random UUIDs (receivers dedupe by messageId to prevent replays). The text renders through the <code>template</code> config (default <code>【{{reason}}】{{title}}｜{{duration}}</code>). No SSE stream, no task polling — a response without a JSON-RPC error means accepted. Failure classification, retries, and fallback behave exactly like the HTTP channel.</p>
+<h3>MCP (lib/channels/mcp.js)</h3>
+<p>A streamable-http MCP server notification bridge: the first send performs one <code>initialize</code> handshake (protocol version tries 2025-03-26 first, falls back to 2024-11-05 if rejected; the server's accepted version wins), the handshake result is cached, and every subsequent notification calls <code>tools/call</code> (<code>{ name: config.tool, arguments: rendered params }</code>), caching and echoing the <code>mcp-session-id</code> response header. Handshake failures are fail-soft: the error goes to the queue's retry/failover chain and the next send re-handshakes automatically. Responses may be SSE (<code>text/event-stream</code>); the minimal implementation parses only the first frame, preferring <code>application/json</code>.</p>
+<h3>SAPI voice (lib/channels/sapi.js, Windows only)</h3>
+<p>Spawns <strong>powershell.exe</strong> (Windows PowerShell 5.1, not pwsh) with <code>-NoProfile -NonInteractive -EncodedCommand</code>; the script travels as UTF-16LE Base64 so Chinese never mangles through GBK; System.Speech synthesizes with an auto-picked zh-CN voice; <code>windowsHide: true</code> + <code>stdio: 'ignore'</code> means no console window, and the child is unref'ed so it plays independently. <strong>Fail-soft</strong>: any failure is silently skipped. Voice queue: at most 1 Speak at a time; new notifications <code>merge</code> (keep the latest) or <code>drop</code>.</p>
+<h3>Queue (lib/queue.js)</h3>
+<p>Concurrency 2, per-channel exponential backoff, primary → fallback failover (fallback ids can reference any channel type), priority queue-jumping; dispose flushes (default 2 s cap — inside the 5 s headless exit grace, so messages get out).</p>
+<h2>Template variables</h2>
+<p><code>{{title}}</code> (session title, 「无标题」/“Untitled” when unavailable), <code>{{reason}}</code>, <code>{{text}}</code>, <code>{{duration}}</code>, <code>{{timestamp}}</code>; missing fields render as empty strings.</p>
+<table>
+<thead>
+<tr>
+<th>reason text</th>
+<th></th>
+</tr>
+</thead>
+<tbody><tr>
+<td>turn/end</td>
+<td>任务完成 / 任务出错 / 任务被阻塞 / 超出 token 上限 / 任务已中止 / 任务中断</td>
+</tr>
+<tr>
+<td>confirmation</td>
+<td>需要人工确认</td>
+</tr>
+<tr>
+<td>decided</td>
+<td>确认已结束 (text carries 已确认/已拒绝/已取消/无法确认/已收到回答)</td>
+</tr>
+<tr>
+<td>escalation</td>
+<td>等待确认超时 (duration = time waited)</td>
+</tr>
+<tr>
+<td>model-message</td>
+<td>模型消息 (text = model's verbatim message)</td>
+</tr>
+</tbody></table>
+<h2>Configuration table (defaults = code DEFAULTS; Config validated with schemastery; all keys optional)</h2>
+<table>
+<thead>
+<tr>
+<th>Key</th>
+<th>Default</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>turnEnd.reasons</code></td>
+<td><code>[completed, error, blocked, max-tokens]</code></td>
+<td>trigger whitelist; explicit <code>[]</code> disables this trigger</td>
+</tr>
+<tr>
+<td><code>turnEnd.cooldownMs</code></td>
+<td><code>10000</code></td>
+<td>quiet window after turn end (ms); a new turn inside it cancels</td>
+</tr>
+<tr>
+<td><code>turnEnd.includeText</code></td>
+<td><code>false</code></td>
+<td>body preview switch (recent assistant text)</td>
+</tr>
+<tr>
+<td><code>turnEnd.textMaxChars</code></td>
+<td><code>500</code></td>
+<td>body truncation length</td>
+</tr>
+<tr>
+<td><code>confirmation.approval</code></td>
+<td><code>true</code></td>
+<td>approval/asked notification switch</td>
+</tr>
+<tr>
+<td><code>confirmation.askUserQuestion</code></td>
+<td><code>'auto'</code></td>
+<td><code>'auto'</code>/<code>'on'</code>/<code>'off'</code>: auto = only with a web layer</td>
+</tr>
+<tr>
+<td><code>confirmation.timeoutMs</code></td>
+<td><code>600000</code></td>
+<td>escalation threshold, <code>0</code> disables</td>
+</tr>
+<tr>
+<td><code>confirmation.notifyDecided</code></td>
+<td><code>false</code></td>
+<td>send “confirmed” after resolution signals</td>
+</tr>
+<tr>
+<td><code>confirmation.includeQuestion</code></td>
+<td><code>true</code></td>
+<td>include the question summary (no option details)</td>
+</tr>
+<tr>
+<td><code>confirmation.questionMaxChars</code></td>
+<td><code>120</code></td>
+<td>question summary truncation</td>
+</tr>
+<tr>
+<td><code>rootOnly</code></td>
+<td><code>true</code></td>
+<td>notify root sessions only (origin/delegationDepth check)</td>
+</tr>
+<tr>
+<td><code>http.timeoutMs</code></td>
+<td><code>10000</code></td>
+<td>HTTP request timeout</td>
+</tr>
+<tr>
+<td><code>http.retries</code></td>
+<td><code>2</code></td>
+<td>per-channel retry count</td>
+</tr>
+<tr>
+<td><code>http.retryBaseMs</code></td>
+<td><code>500</code></td>
+<td>exponential backoff base (500, 1000, 2000…)</td>
+</tr>
+<tr>
+<td><code>http.channels</code></td>
+<td><code>[]</code></td>
+<td>HTTP channel list, see below</td>
+</tr>
+<tr>
+<td><code>a2a.timeoutMs</code> / <code>a2a.retries</code> / <code>a2a.retryBaseMs</code></td>
+<td>same as http</td>
+<td>A2A global defaults</td>
+</tr>
+<tr>
+<td><code>a2a.channels</code></td>
+<td><code>[]</code></td>
+<td>A2A channel list: <code>{ id, agentUrl, template?, fallback? }</code></td>
+</tr>
+<tr>
+<td><code>mcp.timeoutMs</code> / <code>mcp.retries</code> / <code>mcp.retryBaseMs</code></td>
+<td>same as http</td>
+<td>MCP global defaults</td>
+</tr>
+<tr>
+<td><code>mcp.channels</code></td>
+<td><code>[]</code></td>
+<td>MCP channel list: <code>{ id, url, tool, arguments?, headers?, fallback? }</code></td>
+</tr>
+<tr>
+<td><code>tools.notify.enabled</code></td>
+<td><code>false</code></td>
+<td>notify tool switch (model-initiated notifications)</td>
+</tr>
+<tr>
+<td><code>sapi.enabled</code></td>
+<td><code>false</code></td>
+<td>voice switch (Windows only)</td>
+</tr>
+<tr>
+<td><code>sapi.template</code></td>
+<td><code>'任务通知：{{title}}，状态：{{reason}}。'</code></td>
+<td>speech template</td>
+</tr>
+<tr>
+<td><code>sapi.voice</code></td>
+<td><code>'auto'</code></td>
+<td><code>'auto'</code> = auto zh-CN; or a voice-name match (e.g. <code>'Huihui'</code>)</td>
+</tr>
+<tr>
+<td><code>sapi.queue</code></td>
+<td><code>'merge'</code></td>
+<td>at most 1 Speak at a time: <code>merge</code> keeps latest / <code>drop</code> discards</td>
+</tr>
+<tr>
+<td><code>escalation.sapi</code></td>
+<td><code>true</code></td>
+<td>escalation includes voice (requires sapi.enabled)</td>
+</tr>
+<tr>
+<td><code>escalation.channelIds</code></td>
+<td><code>[]</code></td>
+<td>high-priority channel ids for escalation (any channel type)</td>
+</tr>
+<tr>
+<td><code>queue.concurrency</code></td>
+<td><code>2</code></td>
+<td>send concurrency cap</td>
+</tr>
+<tr>
+<td><code>queue.flushTimeoutMs</code></td>
+<td><code>2000</code></td>
+<td>dispose flush wait cap</td>
+</tr>
+</tbody></table>
+<p>Each <code>http.channels</code> entry: <code>{ id, url, method='POST', headers={}, body, timeoutMs, retries, retryBaseMs, fallback: [backup channel ids] }</code>. Object/array <code>body</code> values are JSON-serialized automatically. <code>fallback</code> on <code>a2a.channels</code>/<code>mcp.channels</code> shares the same failover chain and can reference any configured channel id.</p>
+<h2>Platform examples</h2>
+<h3>ntfy (simplest)</h3>
+<pre><code>- id: ntfy
+  url: 'https://ntfy.sh/{{your-topic}}'
+  headers:
+    Authorization: 'Bearer ${env:NTFY_TOKEN}'   # private topics only, optional
+  body: |
+    【{{reason}}】{{title}}
+    时长：{{duration}} ｜ {{timestamp}}
+</code></pre>
+<h3>serverchan</h3>
+<pre><code>- id: serverchan
+  url: 'https://sctapi.ftqq.com/${env:SERVERCHAN_SENDKEY}.send'
+  method: POST
+  headers:
+    Content-Type: 'application/x-www-form-urlencoded'
+  body: 'title={{reason}}：{{title}}&amp;desp={{text}}%0A时长 {{duration}}'
+</code></pre>
+<h3>DingTalk custom robot</h3>
+<pre><code>- id: dingtalk
+  url: 'https://oapi.dingtalk.com/robot/send?access_token=${env:DINGTALK_TOKEN}'
+  headers:
+    Content-Type: 'application/json'
+  body:
+    msgtype: text
+    text:
+      content: '【{{reason}}】{{title}}\n时长：{{duration}}\n{{text}}'
+</code></pre>
+<h3>WeCom robot</h3>
+<pre><code>- id: wecom
+  url: 'https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=${env:WECOM_KEY}'
+  headers:
+    Content-Type: 'application/json'
+  body:
+    msgtype: text
+    text:
+      content: '【{{reason}}】{{title}}\n时长：{{duration}}'
+</code></pre>
+<h3>QQ bot (OneBot 11 HTTP, e.g. NapCat/LLOneBot)</h3>
+<pre><code>- id: qq
+  url: 'http://127.0.0.1:3000/send_private_msg'
+  headers:
+    Authorization: 'Bearer ${env:ONEBOT_TOKEN}'
+    Content-Type: 'application/json'
+  body:
+    user_id: 3021778961        # replace with your QQ id, or use send_group_msg + group_id
+    message: '【{{reason}}】{{title}}\n时长：{{duration}}'
+</code></pre>
+<h3>SAPI voice</h3>
+<pre><code>sapi:
+  enabled: true
+  template: '任务通知：{{title}}，状态：{{reason}}。'
+  voice: auto
+</code></pre>
+<h3>A2A agent</h3>
+<pre><code>a2a:
+  channels:
+    - id: hermes-agent
+      agentUrl: 'http://127.0.0.1:9900/a2a'
+      template: '【{{reason}}】{{title}}｜时长 {{duration}}'
+</code></pre>
+<h3>MCP notification bridge (streamable-http)</h3>
+<pre><code>mcp:
+  channels:
+    - id: mail-bridge
+      url: 'http://127.0.0.1:8080/mcp'
+      headers:
+        Authorization: 'Bearer ${env:MCP_TOKEN}'   # optional
+      tool: send
+      arguments:
+        to: 'you@example.com'
+        text: '【{{reason}}】{{title}}｜时长 {{duration}}'
+</code></pre>
+<h3>Primary/backup failover</h3>
+<pre><code>- id: primary
+  url: 'https://ntfy.sh/a'
+  fallback: ['backup']
+- id: backup
+  url: 'https://sctapi.ftqq.com/${env:SENDKEY}.send'
+  body: 'title={{reason}}：{{title}}'
+</code></pre>
+<h2>Privacy defaults</h2>
+<p>Notifications carry only <strong>title + reason + duration + timestamp</strong> by default. Body preview (<code>turnEnd.includeText</code>) and question details are off; question summaries cap at 120 chars. Secrets go through <code>${env:}</code>/credentials references, never plain config text. <strong>Exception — the notify tool</strong>: a model-initiated message is explicit content, sent verbatim with no privacy filter — the tool is off by default; enabling it is the authorization.</p>
+<h2>Development</h2>
+<pre><code>node --check lib/*.js lib/channels/*.js scripts/smoke.mjs   # syntax gate
+node scripts/smoke.mjs                                     # zero-dependency smoke (32 items; PASS = green)
+</code></pre>
+<p>The smoke suite covers all templates/queue logic, HTTP channel rendering and secret resolution, SAPI script construction, A2A <code>message/send</code> structure, MCP initialize handshake/version fallback/SSE parsing, notify-tool schema projection and execution, and both triggers (fake ctx drives events and timers, including dispose-resend semantics).</p>
+<h2>Known Limitations</h2>
+<ul>
+<li><strong>SMTP not implemented</strong>: email notifications go through an MCP mail bridge (see the example above — any mail MCP server's send tool).</li>
+<li><strong>SAPI unavailable in non-interactive sessions</strong>: System.Speech needs a desktop interactive session (Windows Session 0 services or SSH sessions have no audio device); use webhook/A2A/MCP channels there.</li>
+<li><strong>A2A is one-way <code>message/send</code> only</strong>: no SSE subscription, no task polling — accepted means sent; use a full A2A client if you need to read task results.</li>
+<li><strong>MCP is a minimal implementation</strong>: SSE responses parse only the first frame; an expired session makes the next call fail into the retry/failover chain (the retry re-handshakes, so it self-heals).</li>
+<li>Notifications are not persisted: dispose flushes only 2 s, the rest is dropped.</li>
+<li><code>askUserQuestion: 'auto'</code> treats the <code>webServer</code> service as “has a web layer”; a third-party frontend that doesn't register that service looks like headless — set <code>'on'</code> to force.</li>
+<li>After an escalation fires, that session's pending table is cleared, so later resolution signals no longer trigger “confirmed” (avoids duplicate noise).</li>
+</ul>

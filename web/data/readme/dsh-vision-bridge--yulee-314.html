@@ -1,0 +1,400 @@
+<h1>dsh-vision-bridge</h1>
+<p>A DeepSeek Harness plugin that lets text-only models receive and understand images. The vision work is done by a local model on your machine.</p>
+<p><a href="https://github.com/deepseek-ai/deepseek-harness"><img src="https://img.shields.io/badge/dsh-bundle%20plugin-blue" alt="Plugin"></a>
+<a href="#"><img src="https://img.shields.io/badge/version-2.0.0-green" alt="Version"></a>
+<a href="https://github.com/YuLee-314/dsh-vision-bridge/blob/HEAD/LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License"></a>
+<a href="#"><img src="https://img.shields.io/badge/node-%3E%3D22.19-43853d" alt="Node"></a>
+<a href="#"><img src="https://img.shields.io/badge/platform-win%20%7C%20macOS%20%7C%20linux-lightgrey" alt="Platform"></a></p>
+<p><strong>English</strong> · <a href="https://github.com/YuLee-314/dsh-vision-bridge/blob/HEAD/README.zh-CN.md">简体中文</a></p>
+<hr>
+<h2>What is this?</h2>
+<p>DeepSeek Harness (dsh) is an open-source AI coding environment built entirely from plugins. Its chat models — <code>deepseek-v4-flash</code> and <code>deepseek-v4-pro</code> — are <strong>text-only</strong>: their API rejects image data. As a result, in Harness you cannot paste a screenshot into a session that uses them, attach an image to a message, or use the built-in <code>read_image</code> tool.</p>
+<p>This plugin fixes that. It works in three layers:</p>
+<ol>
+<li><strong>A second model route that accepts images.</strong> The same DeepSeek models are registered again as a "twin" provider (<code>deepseek-vision</code>). Because the twin declares image support, the normal image features work: pasting produces a thumbnail and an image block, and <code>read_image</code> is allowed. Before each request is sent to the DeepSeek API, the plugin converts every image in the conversation into a text description produced by a local vision model. The API only ever receives text; the model answers as if it had seen the image.</li>
+<li><strong>Nine inspection tools.</strong> <code>describe_image</code>, <code>extract_text</code>, <code>structured_scan</code>, <code>query_region</code>, <code>detect_elements</code>, <code>locate_object</code>, <code>compare_images</code>, <code>read_clipboard</code>, and <code>check_health</code> let the model look at an image at different levels of detail — from a general description down to per-element coordinates — and let you do the same through chat.</li>
+<li><strong>Paste routing.</strong> When you paste an image, a small browser component asks the server whether the current model can handle images. If yes (twin route), the paste stays a normal image. If no (official text-only route), the image is saved to a private local file and the path is inserted as text, which the inspection tools can then read.</li>
+</ol>
+<p>The vision model (Ollama + <code>qwen2.5vl</code>) runs on your machine. No image bytes are ever sent to DeepSeek's API or to any cloud vision service.</p>
+<p>If you only use the official route, the plugin still helps: pasted images become local paths and the inspection tools work on them. If you only want the tools, you can ignore the twin route entirely.</p>
+<h2>Table of Contents</h2>
+<ul>
+<li><a href="#what-is-this">What is this?</a></li>
+<li><a href="#the-problem">The Problem</a></li>
+<li><a href="#the-solution">The Solution</a></li>
+<li><a href="#features">Features</a></li>
+<li><a href="#architecture">Architecture</a></li>
+<li><a href="#interaction-logic">Interaction Logic</a></li>
+<li><a href="#installation">Installation</a></li>
+<li><a href="#usage">Usage</a></li>
+<li><a href="#configuration">Configuration</a></li>
+<li><a href="#vision-tools">Vision Tools</a></li>
+<li><a href="#project-structure">Project Structure</a></li>
+<li><a href="#security--privacy">Security &amp; Privacy</a></li>
+<li><a href="#requirements">Requirements</a></li>
+<li><a href="#troubleshooting">Troubleshooting</a></li>
+<li><a href="#license">License</a></li>
+</ul>
+<hr>
+<h2>The Problem</h2>
+<p>DeepSeek's flagship chat models (<code>deepseek-v4-flash</code>, <code>deepseek-v4-pro</code>) are <strong>text-only</strong>: their API
+endpoints cannot receive image bytes, and their model metadata declares <code>inputModalities: ['text']</code>.
+DeepSeek Harness builds on that metadata in three hard places:</p>
+<table>
+<thead>
+<tr>
+<th>Gate</th>
+<th>Location</th>
+<th>Effect</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong>Composer admission</strong></td>
+<td><code>api-proxy</code> <code>prompt</code> handler</td>
+<td>Pasting an image is rejected: "the current model does not support images" — the image part never enters the conversation</td>
+</tr>
+<tr>
+<td><strong><code>read_image</code> tool</strong></td>
+<td><code>dsh-tool-fs</code></td>
+<td>Refuses to read an image into context unless the active route declares image input</td>
+</tr>
+<tr>
+<td><strong>Adapter serializer</strong></td>
+<td><code>llm-deepseek</code></td>
+<td>Core image blocks are rejected (<code>UNSUPPORTED_CONTENT</code>) — images physically cannot reach the provider</td>
+</tr>
+</tbody></table>
+<p>Workarounds in the wild either <strong>fork presets</strong> (fragile), require <strong>cloud vision keys</strong> (Gemini etc.), or
+force you to <strong>switch to a weaker vision model</strong> for the whole session — losing DeepSeek's coding
+ability. None of them deliver what users actually want: <em>DeepSeek, plus native image UX, plus the
+ability to see.</em></p>
+<h2>The Solution</h2>
+<p>One self-contained plugin, three cooperating layers:</p>
+<ol>
+<li><strong>Vision twin route</strong> (<code>deepseek-vision</code>) — the same DeepSeek models re-registered with
+<code>inputModalities: ['text', 'image']</code>. Every native gate opens: paste admission, thumbnails,
+durable image blocks, <code>read_image</code>. Under the hood the twin <strong>intercepts image blocks at the
+request layer</strong>, runs the local vision bridge, and forwards only text to DeepSeek's API.</li>
+<li><strong>Agentic vision tools</strong> — nine native tools (<code>describe_image</code>, <code>structured_scan</code>, <code>query_region</code>,
+...) powered by a local Ollama vision model, with structured output, validation-with-retry, and
+content-addressed caching.</li>
+<li><strong>Paste router</strong> — a browser half that asks the host for a verdict based on <em>real model
+metadata</em>: vision-capable routes keep the native photo flow; text-only routes fall back to a
+local path so the bridge tools can take over.</li>
+</ol>
+<h2>Features</h2>
+<ul>
+<li><strong>Native image experience for text-only models</strong> — paste a screenshot, get a thumbnail, image
+block, and a DeepSeek that actually saw it, without a single image byte ever reaching the API.</li>
+<li><strong>No cloud keys required</strong> — the vision engine is local Ollama (<code>qwen2.5vl</code>); the twin reuses your
+existing <code>DEEPSEEK_API_KEY</code> credential with the official route's own resolution logic.</li>
+<li><strong>Request-layer transparency</strong> — no prompt hacks, no preset forks, no dynamic injection that can
+race; the interception happens in the adapter, exactly once, per request.</li>
+<li><strong>Structured output with coordinates</strong> — element bounding boxes (<code>[0,1000]</code> normalized), region
+cropping, two-stage localization, image comparison, clipboard reads, schema-validated output
+with automatic retry on malformed responses.</li>
+<li><strong>Repeated images are cached</strong> — repeated images hit the content-hash cache: zero extra inference, stable
+prefix-cache behavior.</li>
+<li><strong>Self-contained &amp; distributable</strong> — a single 29 KB tarball with no machine-specific paths;
+installs on any Harness via <code>dsh plugin --profile web add</code>.</li>
+<li><strong>Coexists with the official route</strong> — the official provider stays untouched as the fallback;
+the paste verdict decides per session, from live metadata, which flow runs.</li>
+</ul>
+<h2>Architecture</h2>
+<pre><code>┌──────────────────────────── Browser · client.js ────────────────────────────┐
+│ paste / drop image                                                          │
+│   → capture-phase listener (before the composer's own)                      │
+│   → GET /vision-bridge/paste?model=&lt;selector label&gt;   (host verdict)        │
+│        ├─ takeover:true   (confirmed text-only route)                       │
+│        │    → POST bytes → host saves private temp file → path text         │
+│        │      inserted into the composer; bridge tools take over            │
+│        └─ takeover:false  (image-capable route)                             │
+│             → native paste: image part + thumbnail, untouched               │
+└─────────────────────────────────────┬───────────────────────────────────────┘
+                                      ▼
+┌──────────────────────── Host plugin · lib/index.js ────────────────────────┐
+│  · POST /vision-bridge/paste → magic-byte sniff → 0600 temp file → {path}  │
+│  · 9 tools registered into ctx.tools (native catalog, no mcp__ prefix)     │
+│  · registerAdapter('deepseek-vision', VisionDeepSeekAdapter)               │
+└──────────────┬───────────────────────────────────────────┬─────────────────┘
+               ▼                                           ▼
+     ┌────────────────────┐                  ┌──────────────────────────────┐
+     │ vision-core         │                  │ VisionDeepSeekAdapter (twin) │
+     │ · prepare/validate  │                  │ · listModels/resolveModel:  │
+     │ · queue (serial)    │                  │   image-capable metadata     │
+     │ · LRU cache         │                  │ · stream(): ImageBlock ──►   │
+     │ · 9 tool handlers   │                  │   bridge analysis text ──►   │
+     │                     │                  │   DeepSeek API (text-only)  │
+     └──────────┬──────────┘                  └───────────────┬──────────────┘
+                ▼                                              ▼
+        Ollama · qwen2.5vl                        DeepSeek API · same endpoint,
+        localhost · private · free                same credential as official
+</code></pre>
+<p><code>lib/core/</code> is the host-agnostic vision core shared with the author's MCP vision bridge
+(<code>scripts/sync-core.mjs</code> re-syncs it — one source of truth, two delivery forms).</p>
+<h2>Interaction Logic</h2>
+<h3>1. Paste routing (per paste, decided by live model metadata)</h3>
+<table>
+<thead>
+<tr>
+<th>Session model</th>
+<th>Verdict</th>
+<th>What happens when you paste</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>DeepSeek-V4-Flash/Pro (视觉桥)</code> (twin)</td>
+<td><code>takeover:false</code></td>
+<td><strong>Native photo</strong>: thumbnail + image block; the twin analyses it at the request layer</td>
+</tr>
+<tr>
+<td><code>DeepSeek-V4-Flash</code> (official)</td>
+<td><code>takeover:true</code></td>
+<td>Paste bytes → private temp file → path text; the model calls bridge tools on the path</td>
+</tr>
+<tr>
+<td>Any future vision-capable route</td>
+<td><code>takeover:false</code></td>
+<td>Native paste preserved automatically — the verdict is evidence-based, never a name regex</td>
+</tr>
+</tbody></table>
+<p>The client caches verdicts per selector label (60 s TTL) and refreshes on focus, so the first paste
+of a session is already correct. Unknown metadata <strong>never</strong> hijacks a paste — the native path is
+the safe default.</p>
+<h3>2. Request-layer interception (vision twin only)</h3>
+<pre><code>user pastes image ──► durable image block in session history
+        │
+        ▼
+next model request ──► VisionDeepSeekAdapter.stream()
+        │
+        ▼
+sanitize(): for every image block ──► attachments.readImage(bytes)
+        │                                 │
+        │                                 ▼
+        │               write content-addressed file
+        │               (~/.dsh/vision-bridge/images/&lt;sha1&gt;.png)
+        │                                 │
+        │                                 ▼
+        │               vision-core.describe_image(path)   ← cache hit ⇒ zero inference
+        │                                 │
+        │                                 ▼
+        │               text: [图片（视觉桥分析）] … + local path
+        │
+        ▼
+text-only request ──► DeepSeek API (identical endpoint/credential as official route)
+        │
+        ▼
+DeepSeek answers WITH the vision analysis; it may also call query_region / extract_text
+on the embedded path for deeper, coordinate-accurate inspection.
+</code></pre>
+<h3>3. Tool chain (evidence workflow)</h3>
+<pre><code>structured_scan ──► element list with bboxes (heading/table/chart/button/…)
+        │
+        ├──► query_region(bbox) ──► the region is REALLY cropped and analyzed alone
+        ├──► extract_text(with_coordinates) ──► OCR blocks with normalized coordinates
+        └──► locate_object(desc) ──► coarse locate → crop ×1.3 → fine locate → full-image bbox
+</code></pre>
+<h2>Installation</h2>
+<pre><code># 1. Prerequisites: Ollama running with a vision model (e.g. qwen2.5vl:7b),
+#    and DEEPSEEK_API_KEY stored (for the twin route).
+
+# 2. Install the plugin (any form works)
+dsh plugin --profile web add .\dsh-external-dsh-vision-bridge-2.0.0.tgz   # tarball
+#   dsh plugin --profile web add &lt;directory&gt;                             # checkout
+#   dsh plugin --profile web add &lt;git-repo&gt; | &lt;npm-package&gt;              # remote
+
+# 3. Restart dsh web (bundle layers load at boot)
+</code></pre>
+<h2>Usage</h2>
+<ol>
+<li>In any session, open the <strong>model selector</strong> and pick:<ul>
+<li><strong>DeepSeek (视觉桥) → DeepSeek-V4-Flash (视觉桥)</strong> — recommended: coding + native image UX,
+vision supplied by the bridge.</li>
+<li>Official <code>DeepSeek</code> route — paste falls back to path text; bridge tools remain available.</li>
+</ul>
+</li>
+<li>Paste or drop an image. A thumbnail appears (twin) or a path is inserted (official).</li>
+<li>Ask normally. DeepSeek answers from the bridge analysis; use <code>query_region</code> / <code>extract_text</code>
+for coordinate-level detail.</li>
+</ol>
+<p>To make the twin the default for every new session:</p>
+<pre><code># ~/.dsh/settings.yaml
+agent-default-model:
+  provider: deepseek-vision
+  model: deepseek-v4-flash-vision
+  reasoningEffort: max
+</code></pre>
+<h2>Configuration</h2>
+<table>
+<thead>
+<tr>
+<th>Variable</th>
+<th>Default</th>
+<th>Purpose</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>OLLAMA_BASE_URL</code></td>
+<td><code>http://127.0.0.1:11434/v1</code></td>
+<td>Vision engine endpoint (OpenAI-compatible)</td>
+</tr>
+<tr>
+<td><code>OLLAMA_VISION_MODEL</code></td>
+<td><code>qwen2.5vl:7b-q3_K_M</code></td>
+<td>Vision model used by the bridge tools</td>
+</tr>
+<tr>
+<td><code>OLLAMA_API_KEY</code></td>
+<td><code>ollama</code></td>
+<td>Compatible key for the engine</td>
+</tr>
+<tr>
+<td><code>VISION_MAX_TOKENS</code> / <code>VISION_TEMPERATURE</code> / <code>VISION_MAX_RETRIES</code> / <code>VISION_CONCURRENCY</code></td>
+<td><code>8192</code> / <code>0.1</code> / <code>1</code> / <code>1</code></td>
+<td>Inference parameters</td>
+</tr>
+<tr>
+<td><code>DEEPSEEK_API_KEY</code></td>
+<td>credentials service</td>
+<td>Twin-route key — same source as the official route</td>
+</tr>
+<tr>
+<td><code>DEEPSEEK_BASE_URL</code></td>
+<td>public API</td>
+<td>Twin-route endpoint — same resolution as the official route</td>
+</tr>
+</tbody></table>
+<p>Tool rows are disabled by setting <code>pasteToPath: false</code> on the bundle row if the paste router is
+undesired on a specific deployment.</p>
+<h2>Vision Tools</h2>
+<table>
+<thead>
+<tr>
+<th>Tool</th>
+<th>What it does</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>describe_image</code></td>
+<td>Full-image understanding in Chinese; accepts paths and URLs</td>
+</tr>
+<tr>
+<td><code>extract_text</code></td>
+<td>OCR — plain text, or block-level JSON with normalized coordinates</td>
+</tr>
+<tr>
+<td><code>structured_scan</code></td>
+<td>Element detection (heading/text/table/image/chart/formula/button/list) with bboxes + confidence, schema-validated</td>
+</tr>
+<tr>
+<td><code>query_region</code></td>
+<td>Region-focused query — the region is <strong>really cropped</strong> before inference</td>
+</tr>
+<tr>
+<td><code>detect_elements</code></td>
+<td>Bbox-only localization for selected element types</td>
+</tr>
+<tr>
+<td><code>locate_object</code></td>
+<td>Two-stage localization: coarse full-image → ×1.3 crop → fine → full-image bbox</td>
+</tr>
+<tr>
+<td><code>compare_images</code></td>
+<td>Before/after visual regression: side-by-side composite, structured diff JSON</td>
+</tr>
+<tr>
+<td><code>read_clipboard</code></td>
+<td>Windows clipboard image → exported PNG path</td>
+</tr>
+<tr>
+<td><code>check_health</code></td>
+<td>Ollama reachability, model presence, config summary, cache size — zero inference</td>
+</tr>
+</tbody></table>
+<h2>Project Structure</h2>
+<pre><code>dsh-vision-bridge/
+├── package.json              # dsh.bundle + dsh.client manifests, self-contained deps
+├── cordis.patch.yml          # loader row (bundle layer)
+├── client.js                 # browser half: paste interception + verdict protocol
+├── README.md / README.zh-CN.md
+├── scripts/sync-core.mjs     # re-sync lib/core from the MCP vision bridge
+└── lib/
+    ├── index.js              # host plugin: tools, paste route, adapter registration
+    ├── deepseek-vision.mjs   # vision twin route (extends the official DeepSeek adapter)
+    └── core/                 # host-agnostic vision core (vendored, self-contained)
+        ├── vision-core.mjs   #   tools + prompts + retry/validation orchestration
+        ├── image.js          #   preprocessing, crop, data URLs
+        ├── validate.js       #   schema validation + retry hints
+        ├── cache.js          #   content-hash LRU
+        ├── queue.js          #   serial inference queue
+        ├── errors.js         #   error taxonomy (ollama_down / model_not_found / …)
+        ├── grounding.js      #   two-stage localization math
+        ├── compare.js        #   side-by-side comparison composition
+        └── clipboard.js      #   Windows clipboard reader
+</code></pre>
+<h2>Security &amp; Privacy</h2>
+<ul>
+<li><strong>Images never leave your machine.</strong> The vision engine is localhost Ollama; the twin route
+sends only the bridge's <strong>text analysis</strong> to DeepSeek's API.</li>
+<li>Pasted bytes are magic-byte checked (PNG/JPEG/WebP/GIF), size-capped (25 MB), and stored <code>0600</code>
+in fresh unpredictable temp directories.</li>
+<li>The twin reuses the official route's credential resolution — no second key, no plaintext config.</li>
+<li>Paste hijacking is strictly evidence-based: without a positive text-only confirmation the native
+path stays untouched.</li>
+</ul>
+<h2>Requirements</h2>
+<table>
+<thead>
+<tr>
+<th>Component</th>
+<th>Requirement</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>DeepSeek Harness</td>
+<td>web profile, rc.5+ (tested on 0.1.0-rc.5)</td>
+</tr>
+<tr>
+<td>Node.js</td>
+<td>≥ 22.19</td>
+</tr>
+<tr>
+<td>Ollama</td>
+<td>running, with a vision model (tested: <code>qwen2.5vl:7b</code>)</td>
+</tr>
+<tr>
+<td>API key</td>
+<td><code>DEEPSEEK_API_KEY</code> for the twin route (same as official)</td>
+</tr>
+</tbody></table>
+<h2>Troubleshooting</h2>
+<table>
+<thead>
+<tr>
+<th>Symptom</th>
+<th>Cause / fix</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>Paste still inserts a path text</td>
+<td>The session is on the <strong>official</strong> route — select the <code>(视觉桥)</code> variant, or check the latest <code>verdict</code> entry in <code>~/.dsh/vision-bridge-activity.jsonl</code> for the real selector label</td>
+</tr>
+<tr>
+<td>Tools report <code>[ollama_down]</code></td>
+<td><code>ollama serve</code> not running, or the model missing (<code>ollama pull qwen2.5vl:7b</code>)</td>
+</tr>
+<tr>
+<td>Twin route fails with <code>MISSING_CREDENTIAL</code></td>
+<td>Store <code>DEEPSEEK_API_KEY</code> on the Web Models page or export it in the environment</td>
+</tr>
+<tr>
+<td><code>read_image</code> refuses on the twin</td>
+<td>Only possible if the twin's metadata is not loaded — restart dsh after installing</td>
+</tr>
+<tr>
+<td>Plugin changes not active</td>
+<td>Bundle layers load at boot; restart dsh web after <code>dsh plugin</code> operations</td>
+</tr>
+</tbody></table>
+<h2>License</h2>
+<p>MIT. The vision core originates from the author's MCP vision bridge project.</p>

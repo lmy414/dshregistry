@@ -1,0 +1,270 @@
+<h1>dsh-autoresearch</h1>
+<blockquote>
+<p>Bounded, metric-driven autoresearch plugin for <a href="https://github.com/deepseek-ai/deepseek-harness">DeepSeek Harness</a>.</p>
+</blockquote>
+<p><code>dsh-autoresearch</code> gives a DeepSeek Harness agent a single tool — <code>autoresearch</code> — that runs a <strong>baseline-first, keep/reject optimization loop</strong> inside an isolated Git worktree.</p>
+<p>The design is inspired by <a href="https://github.com/karpathy/autoresearch">Karpathy's <code>autoresearch</code></a>: an autonomous <em>propose → edit → run → measure → keep/revert</em> loop where a coding agent performs the search and a fixed mechanical metric acts as the source of truth. What makes that loop trustworthy is discipline — the agent proposes candidate changes; trusted host code owns evaluation, metric decisions, persistence, cancellation, and recovery. The model never touches the evaluator, the metric, or the database.</p>
+<ul>
+<li><strong>One scalar metric.</strong> Strict <code>minimize</code> / <code>maximize</code> improvement against a measured baseline; no vibes.</li>
+<li><strong>Shell-free evaluator.</strong> Immutable <code>{ command, args, cwd? }</code> argv, final-line JSON scalar parsing, frozen provenance hashes.</li>
+<li><strong>Narrow mutable surface.</strong> Only <code>mutable_globs</code> paths may change; everything else is protected.</li>
+<li><strong>Durable SQLite evidence.</strong> Every run, experiment, attempt, and artifact is recorded with transition-checked state and SHA-256 provenance.</li>
+<li><strong>Background jobs by default.</strong> Runs are <code>dsh-jobs</code> background jobs; inspect or stop them with the generic job tools.</li>
+<li><strong>Resumable.</strong> Crash-safe recovery reconciles in-flight runs from durable state on restart.</li>
+</ul>
+<h2>Requirements</h2>
+<ul>
+<li>Node.js <code>^22.19.0 || &gt;=24.0.0</code> (uses <code>node:sqlite</code>)</li>
+<li>pnpm <code>11.7.0</code></li>
+<li>A DeepSeek Harness deployment with the peer services: <code>@deepseek-ai/cordis</code>, <code>dsh-agent</code>, <code>dsh-jobs</code>, <code>dsh-subprocess</code>, <code>dsh-system-prompt</code>, <code>dsh-tools</code>, <code>dsh-tool-jobs</code>, and friends (see <code>package.json</code> <code>peerDependencies</code>).</li>
+</ul>
+<h2>Install</h2>
+<p>Install the published package through DSH's profile plugin manager:</p>
+<pre><code>dsh plugin --profile &lt;name&gt; add dsh-autoresearch
+dsh --profile &lt;name&gt; --dump-config
+</code></pre>
+<p><code>dsh plugin</code> forwards the package spec to pnpm inside the selected profile, then adds installed packages that declare <code>dsh.bundle</code> to that profile's ordered bundle list. A plain <code>pnpm add</code> does not perform that DSH reconciliation.</p>
+<p>For a release-like installation from this checkout, build and install the packed artifact:</p>
+<pre><code>pnpm install --frozen-lockfile
+pnpm pack
+dsh plugin --profile &lt;name&gt; add ./dsh-autoresearch-0.1.0.tgz
+dsh --profile &lt;name&gt; --dump-config
+</code></pre>
+<p>For local development, install a link to the built checkout instead:</p>
+<pre><code>pnpm install --frozen-lockfile
+pnpm run build
+dsh plugin --profile &lt;name&gt; add .
+dsh --profile &lt;name&gt; --dump-config
+</code></pre>
+<p>DSH anchors relative filesystem specs such as <code>.</code> and <code>./dsh-autoresearch-0.1.0.tgz</code> to the directory where you invoke <code>dsh</code>. The config dump should contain <code>id: autoresearch</code> and <code>name: dsh-autoresearch</code>.</p>
+<p>The package ships a Cordis patch row (<code>cordis.patch.yml</code>) declared via <code>dsh.bundle.patch</code> in <code>package.json</code>. DeepSeek Harness out-of-tree features ship as opt-in bundles: the stable patch inserts an ordinary Cordis plugin row whose config is <strong>replaced whole, not deep-merged</strong>, so every default you want must be explicit in the patch row.</p>
+<h2>How it works</h2>
+<pre><code>┌─────────────┐   proposal    ┌──────────────────┐   evaluate   ┌──────────────┐
+│  proposal   │ ────────────► │ AutoresearchRun  │ ───────────► │  evaluator   │
+│   agent     │ ◄──────────── │    Controller    │ ◄─────────── │ (host-owned) │
+└──────────────┘   history     └────────┬─────────┘   metric     └──────────────┘
+                                        │ persist
+                                        ▼
+                               ┌──────────────────┐
+                               │  DurableTracker  │  SQLite, schema v5
+                               └──────────────────┘
+</code></pre>
+<ol>
+<li><strong>Baseline.</strong> The controller checks out the start commit, runs the evaluator, and records the baseline metric. No baseline → run is <code>baseline-blocked</code>.</li>
+<li><strong>Propose.</strong> A delegated proposal agent (inherited tools: <code>read</code>, <code>write</code>, <code>edit</code>, <code>glob</code>, <code>grep</code>) edits only <code>mutable_globs</code> and reports back via the <code>autoresearch_report</code> tool.</li>
+<li><strong>Evaluate.</strong> The candidate commit is checked out into the worktree and the evaluator argv runs under an immutable boundary; provenance (evaluator files, dataset) is frozen and revalidated.</li>
+<li><strong>Decide.</strong> Strict improvement against the current best → <code>accept</code> (fast-forward the run branch); otherwise <code>reject</code>. A <code>target</code> threshold stops the loop early.</li>
+<li><strong>Persist.</strong> Every transition is written to the SQLite tracker with artifacts, attempts, and SHA-256 hashes. Terminal states: <code>target-reached</code>, <code>budget-limited</code>, <code>baseline-blocked</code>, <code>blocked</code>, <code>round-failed</code>, <code>cancelled</code>.</li>
+</ol>
+<p>Runtime authority lives in <code>AutoresearchRunController</code> (<code>src/controller.ts</code>); it composes the existing <code>agents</code>, <code>jobs</code>, <code>subprocess</code>, <code>systemPrompt</code>, and <code>tools</code> services — no separate workflow engine or subagent service.</p>
+<h2>The <code>autoresearch</code> tool</h2>
+<p>Registered by <code>apply()</code> in <code>src/index.ts</code>. Runs as a <strong>background job</strong> by default; set <code>mode: 'foreground'</code> to block the caller until completion.</p>
+<table>
+<thead>
+<tr>
+<th>Parameter</th>
+<th>Required</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>objective</code></td>
+<td>yes</td>
+<td>Immutable optimization objective.</td>
+</tr>
+<tr>
+<td><code>mutable_globs</code></td>
+<td>yes</td>
+<td>Narrow relative paths/globs the proposal agent may edit.</td>
+</tr>
+<tr>
+<td><code>evaluation</code></td>
+<td>yes</td>
+<td>Shell-free evaluator argv: <code>{ command, args, cwd? }</code>.</td>
+</tr>
+<tr>
+<td><code>metric_name</code></td>
+<td>yes</td>
+<td>Exact JSON scalar key on the evaluator's final output line.</td>
+</tr>
+<tr>
+<td><code>metric_direction</code></td>
+<td>yes</td>
+<td><code>minimize</code> or <code>maximize</code>.</td>
+</tr>
+<tr>
+<td><code>run_tag</code></td>
+<td>one of</td>
+<td>Fresh Git-safe exclusion tag; mutually exclusive with <code>resume_run_id</code>.</td>
+</tr>
+<tr>
+<td><code>resume_run_id</code></td>
+<td>one of</td>
+<td>Durable run id to resume.</td>
+</tr>
+<tr>
+<td><code>constraints</code></td>
+<td>no</td>
+<td>Immutable policy constraints.</td>
+</tr>
+<tr>
+<td><code>exceptional_allowlists</code></td>
+<td>no</td>
+<td>Explicit <code>dependencies</code> / <code>evaluators</code> / <code>datasets</code> / <code>submodules</code> / <code>gitConfig</code> path exceptions.</td>
+</tr>
+<tr>
+<td><code>timeout_ms</code></td>
+<td>no</td>
+<td>Per-attempt timeout, bounded by deployment policy.</td>
+</tr>
+<tr>
+<td><code>max_experiments</code></td>
+<td>no</td>
+<td>Candidate experiment cap (baseline is separate).</td>
+</tr>
+<tr>
+<td><code>target</code></td>
+<td>no</td>
+<td>Finite stopping threshold.</td>
+</tr>
+<tr>
+<td><code>provenance</code></td>
+<td>no</td>
+<td><code>{ evaluator?, dataset? }</code> labels.</td>
+</tr>
+<tr>
+<td><code>environment</code></td>
+<td>no</td>
+<td>Evaluator env overrides; every value a NUL-free string, no reserved <code>DSH_</code> prefix.</td>
+</tr>
+<tr>
+<td><code>mode</code></td>
+<td>no</td>
+<td><code>background</code> (default) or <code>foreground</code>.</td>
+</tr>
+</tbody></table>
+<p><strong>Output</strong> is a discriminated JSON: <code>background</code> (run + job started), <code>background-start-failed</code>, or <code>foreground</code> (full run result). Run results carry <code>status</code>, <code>counts</code>, <code>best</code>, <code>artifacts</code>, and blocker <code>evidence</code>.</p>
+<h2>Configuration</h2>
+<p>The <code>Config</code> schema (<code>src/config.ts</code>) is loaded at deploy time. Defaults (also in <code>cordis.patch.yml</code>):</p>
+<table>
+<thead>
+<tr>
+<th>Key</th>
+<th>Default</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>gitExecutable</code></td>
+<td><code>git</code></td>
+<td>Git binary.</td>
+</tr>
+<tr>
+<td><code>stateRoot</code></td>
+<td><code>dsh-autoresearch</code></td>
+<td>Tracker + worktree state directory.</td>
+</tr>
+<tr>
+<td><code>branchPrefix</code></td>
+<td><code>autoresearch/</code></td>
+<td>Run branch prefix (must end in <code>/</code>).</td>
+</tr>
+<tr>
+<td><code>defaultMaxExperiments</code></td>
+<td><code>20</code></td>
+<td>Default candidate cap.</td>
+</tr>
+<tr>
+<td><code>maxExperiments</code></td>
+<td><code>100</code></td>
+<td>Hard candidate cap.</td>
+</tr>
+<tr>
+<td><code>defaultTimeoutMs</code></td>
+<td><code>900000</code></td>
+<td>15 min per attempt.</td>
+</tr>
+<tr>
+<td><code>maxTimeoutMs</code></td>
+<td><code>3600000</code></td>
+<td>60 min hard per-attempt ceiling.</td>
+</tr>
+<tr>
+<td><code>terminationGraceMs</code></td>
+<td><code>5000</code></td>
+<td>Grace period before killing the evaluator tree.</td>
+</tr>
+<tr>
+<td><code>maxActiveRunsPerRepository</code></td>
+<td><code>1</code></td>
+<td>Concurrent run cap per repo.</td>
+</tr>
+<tr>
+<td><code>maxStdoutBytes</code> / <code>maxStderrBytes</code></td>
+<td><code>1048576</code></td>
+<td>Evaluator output capture limits.</td>
+</tr>
+<tr>
+<td><code>maxResultChars</code></td>
+<td><code>16384</code></td>
+<td>Tool result render limit.</td>
+</tr>
+<tr>
+<td><code>artifactRetentionDays</code></td>
+<td><code>30</code></td>
+<td>Artifact retention window.</td>
+</tr>
+<tr>
+<td><code>retainFailedArtifacts</code></td>
+<td><code>true</code></td>
+<td>Keep artifacts from failed attempts.</td>
+</tr>
+<tr>
+<td><code>retainWorktrees</code></td>
+<td><code>true</code></td>
+<td>Keep worktrees after terminal runs.</td>
+</tr>
+<tr>
+<td><code>cleanupWorktreesOnSuccess</code></td>
+<td><code>false</code></td>
+<td>Remove worktrees on <code>target-reached</code> / <code>budget-limited</code>.</td>
+</tr>
+<tr>
+<td><code>exportTsv</code></td>
+<td><code>true</code></td>
+<td>Export a TSV summary per run.</td>
+</tr>
+<tr>
+<td><code>tsvRetentionDays</code></td>
+<td><code>30</code></td>
+<td>TSV retention window.</td>
+</tr>
+</tbody></table>
+<h2>Project layout</h2>
+<pre><code>src/
+  index.ts            Plugin entry: registers the `autoresearch` tool + direct-human guidance
+  controller.ts       AutoresearchRunController — sole owner of the run state machine
+  config.ts           Config schema, defaults, run-policy normalization
+  types.ts            Tool parameters, output schema, durable state types
+  evaluator.ts        Shell-free evaluator boundary, provenance freezing, final-line JSON metric
+  git.ts              Worktree/lock/claim/commit reconciliation, candidate validation
+  tracker.ts          DurableTracker — SQLite, schema v5, transition-checked state
+  recovery.ts         Crash-safe run reconciliation from durable state
+  agent.ts            Delegated proposal agent + autoresearch_report tool
+  render.ts           Tool result rendering with bounded truncation
+  invariant.ts        Package invariant companion (dsh-invariants)
+  state-layout.ts     SQLite state layout
+  evaluator-artifacts.ts  Evaluator stdout/stderr artifact capture
+</code></pre>
+<h2>Develop</h2>
+<pre><code>pnpm install
+pnpm run typecheck      # tsc --noEmit
+pnpm run test           # vitest run
+pnpm run test:coverage  # vitest run --coverage
+pnpm run build          # tsc -p tsconfig.json → lib/
+pnpm run check          # typecheck + test + build
+pnpm run release:smoke  # packed-artifact release verification
+</code></pre>
+<p>Release verification exercises the packed artifact <strong>outside</strong> the checkout: inspect the allowlist, install without local links, import generated ESM/declarations, and install/dump the real named dsh profile.</p>
+<h2>License</h2>
+<p>MIT © 2026 EveGoodEvening</p>

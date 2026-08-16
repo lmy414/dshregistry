@@ -1,0 +1,176 @@
+<h1>dsh-state-graph</h1>
+<p>把 <strong>StateGraph 有向状态图编排引擎</strong>移植为 <strong>DeepSeek Harness (dsh) 插件</strong>：用声明式的节点 / 静态边 / 条件边把 Harness 单向线性的 ReAct 调度提升为支持多分支条件路由、循环重试与迭代熔断的图编排运行时（子图嵌套可经节点内调用 <code>ctx.graph.create()</code> 组合实现；并行汇聚暂未内置）。</p>
+<pre><code>addNode / addEdge / addConditionalEdge → 纯函数增量补丁 → 迭代熔断 → 轨迹事件流
+</code></pre>
+<h2>这是什么</h2>
+<p><code>dsh-state-graph</code> 是一个 <strong>dsh bundle 包</strong>：导出一个 cordis 插件（<code>state-graph</code>），提供 <code>ctx.graph</code> 服务。插件的核心是设计文档《状态图（StateGraph）编排引擎技术方案与架构设计》中的有向状态图运行时内核：</p>
+<table>
+<thead>
+<tr>
+<th>能力</th>
+<th>落点</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>声明式拓扑构造（Fluent API：addNode / addEdge / addConditionalEdge）</td>
+<td><code>StateGraph</code></td>
+</tr>
+<tr>
+<td>纯函数增量补丁：节点只返回 <code>Partial&lt;State&gt;</code>，引擎不可变合并</td>
+<td><code>StateGraph.run</code></td>
+</tr>
+<tr>
+<td>防死循环熔断（默认 25 次迭代，超限抛错）</td>
+<td><code>StateGraph</code> 内置</td>
+</tr>
+<tr>
+<td>双向事件流观测（<code>graph/*</code> 事件，追加式轨迹）</td>
+<td><code>ctx.emit</code> 事件总线</td>
+</tr>
+<tr>
+<td>隔离的状态图实例工厂</td>
+<td><code>ctx.graph.create()</code></td>
+</tr>
+</tbody></table>
+<h2>核心接口</h2>
+<table>
+<thead>
+<tr>
+<th>接口 / 类型</th>
+<th>签名</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>NodeHandler&lt;T&gt;</code></td>
+<td><code>(state: T, ctx: Context, signal?: AbortSignal) =&gt; Promise&lt;Partial&lt;T&gt;&gt; | Partial&lt;T&gt;</code></td>
+<td>节点业务执行体，返回需合并的状态增量；第二参数仍为 <code>ctx</code>，第三参数接收本次运行的取消信号</td>
+</tr>
+<tr>
+<td><code>ConditionHandler&lt;T&gt;</code></td>
+<td><code>(state: T, ctx: Context, signal?: AbortSignal) =&gt; string | Promise&lt;string&gt;</code></td>
+<td>动态路由，返回下一个 NodeName 或 <code>"__END__"</code>；第二参数仍为 <code>ctx</code>，第三参数接收本次运行的取消信号</td>
+</tr>
+<tr>
+<td><code>GraphExecutionResult&lt;T&gt;</code></td>
+<td><code>{ graphId: string; finalState: T; trajectory: string[]; iterations: number }</code></td>
+<td>实例标识、最终状态、全量跳转轨迹、迭代次数</td>
+</tr>
+<tr>
+<td><code>ctx.graph.create&lt;T&gt;(maxIterations?)</code></td>
+<td>→ <code>StateGraph&lt;T&gt;</code></td>
+<td>创建隔离的图实例</td>
+</tr>
+</tbody></table>
+<p>一次运行可通过 <code>run(initialState, { signal })</code> 传入 <code>AbortSignal</code>；不传第二参数时保持原有调用方式。引擎会在节点执行、节点结果合并、条件路由以及跳转边界检查取消状态，并把同一个 signal 作为 <code>NodeHandler</code> / <code>ConditionHandler</code> 的第三参数传入。</p>
+<h3>事件（<code>ctx.on("graph/…")</code> 订阅）</h3>
+<table>
+<thead>
+<tr>
+<th>事件</th>
+<th>载荷</th>
+<th>时机</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>graph/start</code></td>
+<td><code>{ graphId, initialState, entryPoint }</code></td>
+<td>图开始执行</td>
+</tr>
+<tr>
+<td><code>graph/node-start</code></td>
+<td><code>{ graphId, node, state, iteration }</code></td>
+<td>每个节点执行前</td>
+</tr>
+<tr>
+<td><code>graph/node-end</code></td>
+<td><code>{ graphId, node, state }</code></td>
+<td>节点补丁合并后</td>
+</tr>
+<tr>
+<td><code>graph/node-error</code></td>
+<td><code>{ graphId, node, error }</code></td>
+<td>节点抛错（随后上抛）</td>
+</tr>
+<tr>
+<td><code>graph/error</code></td>
+<td><code>{ graphId, error, state, lastNode }</code></td>
+<td>迭代熔断 / 目标节点缺失 / 路由抛错</td>
+</tr>
+<tr>
+<td><code>graph/end</code></td>
+<td><code>{ graphId, finalState, trajectory, iterations }</code></td>
+<td>仅正常终止（END 或无出边）</td>
+</tr>
+</tbody></table>
+<p><code>graphId</code> 标识每次执行的图实例，用于区分并发图之间可能重名的节点轨迹。<code>graph/end</code> 只在正常终止时发出；<strong>所有异常终止（节点抛错除外，走 <code>graph/node-error</code>）统一发 <code>graph/error</code> 后上抛</strong>——包括迭代熔断、条件路由返回未注册节点名、路由函数抛错。</p>
+<p><code>logTrajectory</code> 开启时，插件订阅 <code>node-start</code>（debug 级）与 <code>end</code>（info 级）把轨迹写入 <code>ctx.logger("graph")</code>。</p>
+<h2>安装</h2>
+<p>作为一个 bundle 包装进某个 profile：</p>
+<pre><code># 发布后
+dsh plugin --profile web add dsh-state-graph
+
+# 本地开发（file: 链接）
+# 在 $DSH_HOME/profiles/&lt;name&gt;/package.json 加依赖并安装
+</code></pre>
+<p>profile 的 <code>dsh.profile.bundles</code> 需要包含 <code>dsh-state-graph</code>（与 <code>@deepseek-ai/dsh-base</code> 一起）。插件无其他注入依赖，任何 profile 均可加载。</p>
+<h2>配置（<code>cordis.patch.yml</code> 的 <code>config</code>）</h2>
+<pre><code>- insert:
+    - id: state-graph
+      name: 'dsh-state-graph'
+      config:
+        defaultMaxIterations: 25   # 防死循环单次执行最大迭代上限
+        logTrajectory: true        # 输出路由轨迹到日志总线
+</code></pre>
+<h2>用法示例：代码生成与双向对齐检查图</h2>
+<pre><code>import { Context } from "@deepseek-ai/cordis";
+
+// 在其他插件 / 工具 / 命令中：
+export function buildGraph(ctx: Context) {
+  return ctx.graph
+    .create() // 隔离实例，maxIterations 默认取插件配置
+    .addNode("generate_code", async (s, ctx, signal) =&gt; {
+      const code = await llmGenerate(ctx, s.task, signal); // 业务函数自行遵守 signal
+      return { code, rev: s.rev + 1 };
+    })
+    .addNode("static_analyze", (s) =&gt; ({ lintOk: lint(s.code).ok }))
+    .addNode("run_unit_test", async (s, ctx) =&gt; ({
+      testOk: (await runTests(ctx, s.code)).passed,
+    }))
+    .addEdge("generate_code", "static_analyze")
+    .addEdge("static_analyze", "run_unit_test")
+    .addConditionalEdge("static_analyze", (s, _ctx, signal) =&gt; {
+      signal?.throwIfAborted();
+      return s.lintOk ? "run_unit_test" : "generate_code";
+    })
+    .addConditionalEdge("run_unit_test", (s) =&gt;
+      s.testOk ? "__END__" : "generate_code",
+    )
+    .setEntryPoint("generate_code");
+}
+
+// 使用：
+const graph = buildGraph(ctx);
+const controller = new AbortController();
+const { finalState, trajectory, iterations } = await graph.run(
+  { rev: 0, task },
+  { signal: controller.signal },
+);
+ctx.logger("app").info(`route: ${trajectory.join(" -&gt; ")} (${iterations} steps)`);
+</code></pre>
+<p>条件边优先于静态边；无出边或条件路由返回 <code>"__END__"</code> 即终止。<strong>条件路由返回未注册节点名、非字符串或 <code>undefined</code>（如忘写 return）时抛错并发 <code>graph/error</code></strong>（熔断语义同上，非静默终止）。</p>
+<h2>运维与性能考量</h2>
+<ol>
+<li><strong>状态合并策略</strong>：默认浅拷贝 + 结构补丁合并（<code>{ ...state, ...patch }</code>）。大对象（文件内容、仓库快照）建议经引用路径或沙箱虚拟文件系统管理，避免全量复制造成 GC 压力。</li>
+<li><strong>取消与异步超时控制</strong>：<code>run(initialState, { signal })</code> 是合作式取消。引擎只在节点、路由和图遍历边界检查 signal，不会强杀忽略 signal 的普通 Promise；NodeHandler / ConditionHandler 也应把第三参数传给所调用的 LLM、工具或外部服务。引擎不内置单节点超时，单节点超时仍由调用方或 handler 自行组合 <code>AbortSignal</code> 与定时器。</li>
+<li><strong>观测</strong>：节点级耗时分析 = 同一节点相邻 <code>node-start</code> / <code>node-end</code> 事件时间差；执行流回放 = 按序消费 <code>graph/*</code> 事件。</li>
+</ol>
+<h2>开发</h2>
+<pre><code>npm install
+npm run build        # tsc → lib/
+npm run typecheck
+npm run smoke        # build + 冒烟测试（设计文档 §5 工作流 + 熔断/入口校验/事件流）
+npm test             # build + node --test（StateGraph.run 全流程 7 用例，stub ctx 驱动）
+</code></pre>
+<h2>许可</h2>
+<p>MIT。实现遵循《DeepSeek Harness (dsh) 状态图（StateGraph）编排引擎技术方案与架构设计》。</p>

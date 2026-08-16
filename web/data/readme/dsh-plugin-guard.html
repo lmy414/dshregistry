@@ -1,0 +1,303 @@
+<h1>dsh-plugin-guard</h1>
+<blockquote>
+<p>Install safety net for <a href="https://github.com/deepseek-ai/dsh">DeepSeek Harness</a>: pre-install snapshots, one-click / automatic rollback, guarded boot, and incident reports that auto-trigger agent analysis.</p>
+<p>DeepSeek Harness 的插件安装安全网：安装前自动快照、一键/自动回退、守护启动、事故报告自动触发 Agent 分析。</p>
+</blockquote>
+<hr>
+<h2>English</h2>
+<h3>What it does</h3>
+<p>A bad plugin install can leave the app unable to boot, and fixing it by hand usually means digging through config files. This plugin automates the whole chain:</p>
+<pre><code>Install a plugin (any method)
+   │  tools.guard hook: automatic snapshot BEFORE the install (in-process)
+   ▼
+Guarded boot (boot-guard script)
+   │  snapshot before boot → start dsh web → health check
+   ├─ healthy ─────────────────────────────► passes through untouched
+   └─ unhealthy ─► auto-rollback to last good snapshot → retry once
+                   → write an incident report + set a pending marker
+                   → the next session's prompt tells the agent to analyze it
+                   → after fixing, call `incident_resolved` to clear the marker
+</code></pre>
+<h3>How it detects problems (important to understand)</h3>
+<p>The guard does <strong>not</strong> statically inspect plugin code, and it does <strong>not</strong> try to "test" a plugin in isolation. Detection works at three levels:</p>
+<ol>
+<li><p><strong>Snapshots are pure file copies.</strong> Taking a snapshot just copies 4 config files (<code>package.json</code>, <code>pnpm-lock.yaml</code>, <code>pnpm-workspace.yaml</code>, <code>cordis.patch.yml</code>). No plugin is run, no behavior is evaluated.</p>
+</li>
+<li><p><strong>Boot-level detection does run the harness — with your plugin loaded.</strong> The <code>boot-guard</code> script starts the whole <code>dsh web</code> process (which loads every installed plugin, including the one you just added) and then health-checks HTTP <code>/</code> within a timeout. If a plugin breaks boot — load error, startup crash, unresponsive server — the check fails, and the guard automatically kills the tree, rolls back to the last good snapshot, and retries once. So <strong>yes</strong>: to catch a boot-breaking plugin, the harness (and therefore that plugin) has to actually start. That is the one moment where "running the plugin" is part of detection.</p>
+</li>
+<li><p><strong>Runtime-only problems are not detected at install time.</strong> If a plugin installs and boots fine but only misbehaves later (crashes under a specific operation, corrupts state, etc.), no generic guard can predict that without running your real workload. When such an incident happens, <code>dsh_rollback action=incident</code> builds a problem-localization report (last boot logs, server stderr, and a diff of the profile config against the last good snapshot) and sets a pending marker so the next session automatically focuses on diagnosing it. And because a snapshot is always taken before any mutation, you can always roll back manually afterwards.</p>
+</li>
+</ol>
+<p>In short: the guard never <em>judges</em> whether a plugin is "good". It guarantees that (a) every mutation is reversible, (b) boot failures roll back automatically, and (c) incidents get analyzed instead of silently breaking your setup.</p>
+<h3>Install</h3>
+<pre><code># From GitHub source (current):
+dsh plugin --profile web add github:lxzy-7/dsh-plugin-guard
+
+# From the tarball stored in the repo:
+dsh plugin --profile web add https://raw.githubusercontent.com/lxzy-7/dsh-plugin-guard/main/dist/dsh-plugin-guard-0.2.0.tgz
+</code></pre>
+<p>Restart <code>dsh web</code>. This is a standard <strong>bundle plugin</strong>: it joins the profile layer stack and takes effect automatically. (Once published to npm, <code>dsh plugin --profile web add dsh-plugin-guard</code> also works.)</p>
+<p><strong>Enable guarded boot (strongly recommended):</strong> launch through <code>scripts/boot-guard.ps1</code> (Windows) or <code>scripts/boot-guard.sh</code> (macOS/Linux) instead of running <code>dsh web</code> directly. Example on Windows, inside your launcher:</p>
+<pre><code>@echo off
+set DSH_HOME=%~dp0.dsh-home
+cd /d %~dp0
+powershell -NoProfile -ExecutionPolicy Bypass -File node_modules\dsh-plugin-guard\scripts\boot-guard.ps1
+</code></pre>
+<p><strong>Optional CLI shim (covers manual terminal installs):</strong> the package ships a <code>dsh-guard</code> bin (<code>scripts/guard-cli.js</code>). Put it on your PATH and run <code>dsh-guard snapshot</code> before <code>dsh plugin add &lt;pkg&gt;</code> from a terminal, or wrap your own <code>dsh</code> wrapper with it. This covers installs that do not go through the in-process <code>tools.guard</code> hook.</p>
+<p><strong>One-click manual rollback (Windows):</strong> the package also ships <code>scripts/rollback.cmd</code>. After install it lives at <code>$DSH_HOME/profiles/&lt;profile&gt;/node_modules/dsh-plugin-guard/scripts/rollback.cmd</code> — right-click → <em>Create shortcut</em> (or copy the file anywhere) and double-click it to restore the last good snapshot of every profile and re-run <code>pnpm install --frozen-lockfile</code>. It works even when the app cannot start, and it self-derives <code>DSH_HOME</code> when the environment does not set it.</p>
+<h3>Usage</h3>
+<p><strong>Settings panel — 备份管理 (Backup Manager).</strong> In the web UI, open <strong>设置 (Settings) → 备份管理</strong>: per-environment snapshot lists, <strong>load a specific backup</strong>, <strong>create a manual snapshot</strong>, and <strong>set how many snapshots each environment keeps (minimum 2)</strong>.</p>
+<p><strong>Agent tools</strong> (registered for every session in the profile):</p>
+<table>
+<thead>
+<tr>
+<th>Tool</th>
+<th>Purpose</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>dsh_snapshot</code></td>
+<td>Manually snapshot one profile or all profiles</td>
+</tr>
+<tr>
+<td><code>dsh_rollback</code></td>
+<td>list / rollback / status / incident (Node-based, cross-platform)</td>
+</tr>
+<tr>
+<td><code>incident_resolved</code></td>
+<td>Mark a pending incident as resolved after analysis/fix</td>
+</tr>
+</tbody></table>
+<p><strong>CLI</strong> (<code>dsh-guard</code>, usable even when the app will not start):</p>
+<pre><code>snapshot  [--profile X] [--tag T] [--reason R] [--force]
+list      [--profile X]
+rollback  [--profile X] [--id I | --good] [--skip-install]
+keep      [N]                     # show or set the per-profile cap (min 2)
+health    [--port N]
+incident  [--kind K] [--no-marker]
+resolve
+profiles
+</code></pre>
+<h3>Configuration</h3>
+<p><code>$DSH_HOME/guard/config.json</code> (auto-created on first write; all optional):</p>
+<pre><code>{
+  "keepSnapshots": 10,
+  "port": 3080
+}
+</code></pre>
+<ul>
+<li><code>keepSnapshots</code> — how many snapshots each profile retains (clamped to 2–100, default 10). Pruning removes older ones.</li>
+<li><code>port</code> — web port used by health checks / incident reports (default 3080). Set it if your <code>dsh web</code> runs on another port. You can also pass <code>--port</code> to the CLI.</li>
+</ul>
+<p>Every path is anchored at <code>$DSH_HOME</code> (defaults to <code>~/.dsh</code> when the env var is unset):</p>
+<pre><code>$DSH_HOME/rollbacks/&lt;profile&gt;/&lt;stamp&gt;/    snapshots (4 config files + manifest.json)
+$DSH_HOME/guard/logs/                     boot/server logs, incident reports, last-boot.txt
+$DSH_HOME/guard/pending-incident.json     pending incident marker
+$DSH_HOME/guard/config.json               guard settings (keepSnapshots, port)
+</code></pre>
+<h3>Rollback semantics</h3>
+<ul>
+<li>Rollback = restore the 4 config files + <code>pnpm install --frozen-lockfile</code> to reproduce <code>node_modules</code> exactly.</li>
+<li>pnpm resolution order: absolute path recorded in the snapshot manifest (same environment as when installed, independent of the current PATH) → <code>DSH_GUARD_PNPM</code> env var → current PATH → harness-local <code>node_modules/.bin</code>.</li>
+<li>Every rollback first writes a <code>pre-rollback</code> snapshot, so <strong>rollback itself is reversible</strong>.</li>
+<li>"Last good" = the newest snapshot not tagged <code>pre-boot</code>/<code>pre-rollback</code>.</li>
+</ul>
+<h3>Platform support</h3>
+<table>
+<thead>
+<tr>
+<th>Component</th>
+<th>Windows</th>
+<th>macOS / Linux</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>Plugin (tools / hooks / prompt injection)</td>
+<td>✅</td>
+<td>✅</td>
+</tr>
+<tr>
+<td><code>dsh-guard</code> CLI</td>
+<td>✅</td>
+<td>✅</td>
+</tr>
+<tr>
+<td>Guarded boot script</td>
+<td>PowerShell</td>
+<td>bash</td>
+</tr>
+</tbody></table>
+<h3>Security notes</h3>
+<ul>
+<li>The plugin only reads/writes profile config files and snapshots; it never executes third-party code. <code>pnpm install --frozen-lockfile</code> restores only the locked dependencies recorded in the snapshot.</li>
+<li>Snapshots and incident reports are local files without credentials (credentials live elsewhere under <code>$DSH_HOME</code>, not in this directory layout).</li>
+<li>Automatic rollback happens only when the boot health check fails; the guard never silently changes config during normal runtime.</li>
+</ul>
+<h3>Known limitations</h3>
+<ul>
+<li>Incident auto-analysis covers <strong>boot-failure class</strong> incidents; for mid-session errors, run <code>dsh_rollback action=incident</code> manually to produce the same report.</li>
+<li>Bundle-plugin changes require a web restart to take effect.</li>
+<li>Corrupted session logs are a data problem and are out of scope for rollback.</li>
+</ul>
+<h3>Development</h3>
+<pre><code>node scripts/smoke-test.js    # engine smoke test (throwaway DSH_HOME, no side effects)
+node scripts/guard-cli.js help
+</code></pre>
+<h3>Publish</h3>
+<p>The package is MIT-licensed and ready to publish to npm (name: <code>dsh-plugin-guard</code>). It ships zero runtime dependencies and runs its engine smoke test automatically before every publish (<code>prepublishOnly</code>), so a broken build can never be published. To publish:</p>
+<pre><code>npm login     # once, on your machine
+npm publish   # runs npm test first, then publishes with public access
+</code></pre>
+<p><code>repository</code> / <code>homepage</code> are optional — add them once you have a GitHub repo (the fields only improve the npm listing).</p>
+<p>Users can install it from the live repo with <code>dsh plugin --profile web add github:lxzy-7/dsh-plugin-guard</code> (or the tarball in <code>dist/</code>); once it reaches npm, <code>dsh plugin --profile web add dsh-plugin-guard</code> also works.</p>
+<h3>License</h3>
+<p>MIT</p>
+<hr>
+<h2>中文</h2>
+<h3>这是什么</h3>
+<p>一次坏的插件安装可能让应用起不来、对话崩溃，修复常常要手动翻配置。本插件把整条链路自动化：</p>
+<pre><code>安装插件(任何途径)
+   │  tools.guard 钩子:安装前自动快照(进程内)
+   ▼
+守护启动(boot-guard 脚本)
+   │  启动前快照 → 启动 dsh web → 健康检查
+   ├─ 正常 ────────────────────────────────► 无感放行
+   └─ 异常 ─► 自动回退到最后良好快照 → 重试一次
+               → 生成事故定位报告 + 待处理标记
+               → 下一次会话的提示词自动告诉 Agent 去分析
+               → 修复后调用 incident_resolved 标记已处理
+</code></pre>
+<h3>它如何检测问题（重要，请理解）</h3>
+<p>Guard <strong>不会</strong>静态分析插件代码，也<strong>不会</strong>单独"测试"某个插件。检测分三层：</p>
+<ol>
+<li><p><strong>快照只是纯文件复制。</strong> 备份只是复制 4 个配置文件，不会运行任何插件，也不评估任何行为。</p>
+</li>
+<li><p><strong>启动级检测确实会运行 harness——连同你装的插件一起。</strong> <code>boot-guard</code> 会启动整个 <code>dsh web</code> 进程（会加载所有已装插件，包括你刚加的），然后在超时内对 HTTP <code>/</code> 做健康检查。如果插件导致启动失败（加载报错、启动崩溃、服务无响应），检查即失败，guard 会自动杀掉进程树、回退到最后良好快照并重试一次。所以<strong>是的</strong>：要抓住"搞坏启动"的插件，harness（连同该插件）必须真正启动一次——这是检测中唯一需要"运行插件"的时刻。</p>
+</li>
+<li><p><strong>只在运行期才出问题的插件，安装时检测不到。</strong> 如果一个插件装得上、启动也正常，只是后来才出错（在某个操作下崩溃、弄坏状态等），任何通用 guard 都无法在不运行你的真实工作负载的情况下预判。这类事故发生后，<code>dsh_rollback action=incident</code> 会生成事故定位报告（最近启动日志、服务端 stderr、profile 配置与最近良好快照的差异），并设置待处理标记，让下一次会话自动聚焦于诊断它。而且任何变更前都会先快照，所以你事后也随时能手动回退。</p>
+</li>
+</ol>
+<p>一句话总结：guard <strong>从不评判</strong>一个插件"好不好"。它保证：(a) 任何变更都可回退；(b) 启动失败自动回退；(c) 事故会被分析，而不是悄悄搞坏你的环境。</p>
+<h3>安装</h3>
+<pre><code># 从 GitHub 源码安装(当前方式)：
+dsh plugin --profile web add github:lxzy-7/dsh-plugin-guard
+
+# 或从仓库里的安装包：
+dsh plugin --profile web add https://raw.githubusercontent.com/lxzy-7/dsh-plugin-guard/main/dist/dsh-plugin-guard-0.2.0.tgz
+</code></pre>
+<p>重启 <code>dsh web</code>。这是标准 <strong>bundle 插件</strong>：加入 profile 层栈自动生效。(发布到 npm 后 <code>dsh plugin --profile web add dsh-plugin-guard</code> 也可用。)</p>
+<p><strong>启用守护启动(强烈推荐)：</strong> 把启动命令改为经过 <code>scripts/boot-guard.ps1</code>(Windows) 或 <code>scripts/boot-guard.sh</code>(macOS/Linux)，而不是直接跑 <code>dsh web</code>。Windows 启动器示例：</p>
+<pre><code>@echo off
+set DSH_HOME=%~dp0.dsh-home
+cd /d %~dp0
+powershell -NoProfile -ExecutionPolicy Bypass -File node_modules\dsh-plugin-guard\scripts\boot-guard.ps1
+</code></pre>
+<p><strong>可选 CLI 垫片(覆盖终端手动安装)：</strong> 包内带 <code>dsh-guard</code> 命令(<code>scripts/guard-cli.js</code>)。加入 PATH 后，在终端执行 <code>dsh plugin add &lt;pkg&gt;</code> 前先 <code>dsh-guard snapshot</code>（或自己包一层包装），覆盖不走进程内 <code>tools.guard</code> 钩子的安装途径。</p>
+<p><strong>一键手动回退(Windows)：</strong> 包内还带 <code>scripts/rollback.cmd</code>。安装后位于 <code>$DSH_HOME\profiles\&lt;profile&gt;\node_modules\dsh-plugin-guard\scripts\rollback.cmd</code>——右键 → 创建快捷方式放到桌面(或把该文件复制到任意位置)后双击，即可把所有 profile 还原到最近一份「良好」快照并重跑 <code>pnpm install --frozen-lockfile</code>。应用完全启动不了时也能用；环境未设置 <code>DSH_HOME</code> 时它会从自身位置自动推导。</p>
+<h3>使用</h3>
+<p><strong>设置面板 — 备份管理。</strong> 网页界面里打开 <strong>设置 → 备份管理</strong>：按环境列出快照、<strong>加载指定备份</strong>、<strong>手动存档</strong>、<strong>设置每个环境保留的快照数量(最少 2)</strong>。</p>
+<p><strong>Agent 工具</strong>(profile 内每个会话都会注册)：</p>
+<table>
+<thead>
+<tr>
+<th>工具</th>
+<th>作用</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>dsh_snapshot</code></td>
+<td>手动快照一个或全部环境</td>
+</tr>
+<tr>
+<td><code>dsh_rollback</code></td>
+<td>list / rollback / status / incident(跨平台 Node 实现)</td>
+</tr>
+<tr>
+<td><code>incident_resolved</code></td>
+<td>分析并修复后标记事故已处理</td>
+</tr>
+</tbody></table>
+<p><strong>CLI</strong>(<code>dsh-guard</code>，应用起不来时也能用)：</p>
+<pre><code>snapshot  [--profile X] [--tag T] [--reason R] [--force]
+list      [--profile X]
+rollback  [--profile X] [--id I | --good] [--skip-install]
+keep      [N]                     # 查看或设置保留快照数(最少 2)
+health    [--port N]
+incident  [--kind K] [--no-marker]
+resolve
+profiles
+</code></pre>
+<h3>配置</h3>
+<p><code>$DSH_HOME/guard/config.json</code>(首次写入时自动创建；全部可选)：</p>
+<pre><code>{
+  "keepSnapshots": 10,
+  "port": 3080
+}
+</code></pre>
+<ul>
+<li><code>keepSnapshots</code> — 每个环境保留多少份快照(钳制 2–100，默认 10)，超出的旧快照会被清理。</li>
+<li><code>port</code> — 健康检查/事故报告用的 web 端口(默认 3080)。如果你的 <code>dsh web</code> 跑在其他端口，改成实际值即可；CLI 也可用 <code>--port</code> 覆盖。</li>
+</ul>
+<p>所有路径都锚定 <code>$DSH_HOME</code>(未设置时默认 <code>~/.dsh</code>)：</p>
+<pre><code>$DSH_HOME/rollbacks/&lt;profile&gt;/&lt;stamp&gt;/   快照(4 个配置文件 + manifest.json)
+$DSH_HOME/guard/logs/                    启动/服务器日志、事故报告、last-boot.txt
+$DSH_HOME/guard/pending-incident.json    待处理事故标记
+$DSH_HOME/guard/config.json              备份设置(keepSnapshots, port)
+</code></pre>
+<h3>回退语义</h3>
+<ul>
+<li>回退 = 恢复 4 个配置文件 + <code>pnpm install --frozen-lockfile</code> 精确还原 node_modules。</li>
+<li>pnpm 定位顺序：快照 manifest 记录的绝对路径(与当初安装同环境，不依赖回退时的 PATH) → <code>DSH_GUARD_PNPM</code> 环境变量 → 当前 PATH → harness 本地 <code>node_modules/.bin</code>。</li>
+<li>每次回退前自动先存一份 <code>pre-rollback</code> 快照：<strong>回退本身可逆</strong>。</li>
+<li>"最后良好" = 最新的非 <code>pre-boot</code>/<code>pre-rollback</code> 标签快照。</li>
+</ul>
+<h3>平台支持</h3>
+<table>
+<thead>
+<tr>
+<th>组件</th>
+<th>Windows</th>
+<th>macOS/Linux</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>插件(工具/钩子/提示注入)</td>
+<td>✅</td>
+<td>✅</td>
+</tr>
+<tr>
+<td><code>dsh-guard</code> CLI</td>
+<td>✅</td>
+<td>✅</td>
+</tr>
+<tr>
+<td>守护启动脚本</td>
+<td>PowerShell</td>
+<td>bash</td>
+</tr>
+</tbody></table>
+<h3>安全说明</h3>
+<ul>
+<li>本插件只<strong>读写 profile 配置文件与快照</strong>，不执行第三方代码；<code>pnpm install --frozen-lockfile</code> 只按快照锁文件还原。</li>
+<li>快照与事故报告是本地文件，不含凭据(凭据在 <code>$DSH_HOME</code> 其他位置，不在此目录约定内)。</li>
+<li>自动回退只发生在"启动健康检查失败"时，运行期不会随意改动配置。</li>
+</ul>
+<h3>已知边界</h3>
+<ul>
+<li>事故自动分析覆盖<strong>启动失败类</strong>事故；对话中途报错可用 <code>dsh_rollback action=incident</code> 手动生成同款报告。</li>
+<li>bundle 插件的加载变化需要重启 web 生效。</li>
+<li>会话日志损坏属于数据问题，不在回退范围。</li>
+</ul>
+<h3>开发</h3>
+<pre><code>node scripts/smoke-test.js    # 引擎冒烟测试(临时 DSH_HOME，无副作用)
+node scripts/guard-cli.js help
+</code></pre>
+<h3>发布</h3>
+<p>MIT 许可，可直接发布到 npm(包名 <code>dsh-plugin-guard</code>)。包零运行时依赖，且 <code>prepublishOnly</code> 会在每次发布前自动跑引擎冒烟测试，坏包永远发不出去：</p>
+<pre><code>npm login     # 在本机登录一次
+npm publish   # 先跑 npm test，再以 public 权限发布
+</code></pre>
+<p><code>repository</code> / <code>homepage</code> 已指向 GitHub 仓库(仅影响 npm 页面的展示)。</p>
+<p>用户可从在线仓库安装：<code>dsh plugin --profile web add github:lxzy-7/dsh-plugin-guard</code>(或下载 <code>dist/</code> 里的 tgz 按路径安装)；发布到 npm 后 <code>dsh plugin --profile web add dsh-plugin-guard</code> 也可用。</p>
+<h3>License</h3>
+<p>MIT</p>

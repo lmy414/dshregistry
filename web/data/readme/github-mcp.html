@@ -1,0 +1,440 @@
+<p><a href="https://github.com/JohnXu22786/github-mcp/blob/HEAD/README.zh.md">简体中文</a></p>
+<h1>repogate — GitHub Developer Workbench (agent tool set)</h1>
+<p><code>repogate</code> is a GitHub workbench for coding agents: it wraps the GitHub REST API into a set of MCP (Model Context Protocol) tools, letting agents perform <strong>repo queries, issue management, PR creation and merging, code review, search</strong>, and other common operations directly in a conversation.</p>
+<ul>
+<li><strong>Zero runtime dependencies</strong>: uses only built-in Node.js capabilities (<code>fetch</code>, <code>node:test</code>); no packages need to be installed to run;</li>
+<li><strong>Standard MCP stdio server</strong>: works with any MCP-capable client (dsh, Claude Code, Codex, opencode, etc.);</li>
+<li><strong>Built for dsh</strong>: ships a dsh bundle (<code>cordis.patch.yml</code> + a self-developed bridge plugin), connected with <code>dsh plugin add</code> in one step — tools appear automatically in the model's tool list (<code>mcp__repogate__*</code>);</li>
+<li><strong>Dual auth channels</strong>: personal access token (PAT) and OAuth device authorization flow, with local token caching;</li>
+<li><strong>Read-only mode</strong>: blocks all write operations with one switch, ideal for research-only sessions;</li>
+<li><strong>Actionable errors</strong>: rate limits, invalid tokens, insufficient permissions, rejected parameters — every error includes a Chinese fix guide;</li>
+<li><strong>Slim output for models</strong>: lists/search return concise summaries instead of full JSON, saving context tokens.</li>
+</ul>
+<hr>
+<h2>Quick Start</h2>
+<h3>Option A: connect directly from any MCP client</h3>
+<pre><code># requires Node.js ≥ 18.17
+REPOGATE_TOKEN=ghp_yourtoken node src/entry.js
+</code></pre>
+<p>Example config line using the official dsh bridge (also works in Claude Code / Codex MCP configs):</p>
+<pre><code># dsh: insert into $DSH_HOME/profiles/&lt;profile&gt;/cordis.patch.yml
+- insert:
+    - id: mcp-repogate
+      name: '@deepseek-ai/dsh-mcp-client'
+      config:
+        serverName: repogate
+        transport: stdio
+        command: node
+        args: ['/absolute/path/to/src/entry.js']
+        env:
+          REPOGATE_TOKEN: !!js process.env.REPOGATE_TOKEN ?? ''
+</code></pre>
+<p>After connecting, the model sees 23 tools such as <code>gh_issue_fetch</code> and <code>gh_pr_merge</code>
+(generic MCP clients see bare names; under dsh they carry the <code>mcp__repogate__</code> prefix, see below).</p>
+<h3>Option B: install as a dsh plugin bundle (recommended)</h3>
+<p>This plugin is declared as a dsh bundle (the <code>dsh.bundle</code> field in <code>package.json</code>). In the plugin checkout directory run:</p>
+<pre><code>dsh plugin --profile web add .
+</code></pre>
+<ul>
+<li>On first use it initializes the <code>web</code> profile automatically and adds this package to <code>dsh.profile.bundles</code>;</li>
+<li>The <code>repogate/bridge</code> plugin defined in the package's <code>cordis.patch.yml</code> launches this MCP server directly inside the dsh process, and after the handshake registers all tools into <code>ctx.tools</code> — <strong>no manual config changes needed</strong>;</li>
+<li>The token is inherited from the dsh process environment by default (<code>REPOGATE_TOKEN</code> or <code>GITHUB_TOKEN</code>);</li>
+<li>Uninstall: <code>dsh plugin --profile web remove repogate</code>.</li>
+</ul>
+<p>After installing, restart dsh and simply say in a session:</p>
+<blockquote>
+<p>"Look at the open issues of the octo/hello repo, close #12, then comment 'fixed, waiting for verification' on #12."</p>
+</blockquote>
+<p>The corresponding tool call chain: <code>mcp__repogate__gh_issue_browse</code> → <code>mcp__repogate__gh_issue_fetch</code> →
+<code>mcp__repogate__gh_issue_edit</code> → <code>mcp__repogate__gh_issue_respond</code>.</p>
+<blockquote>
+<p>Note: dsh does not enable any MCP server by default (each server command is trusted code executed outside the sandbox);
+this plugin's bundle line is the "enable" action itself; only install trusted plugins.</p>
+</blockquote>
+<hr>
+<h2>Installing in DSH</h2>
+<pre><code>dsh plugin --profile demo add github:JohnXu22786/github-mcp
+</code></pre>
+<p>A single command installs this plugin into the dsh <code>demo</code> profile from the GitHub repository. Integration, auth, and lifecycle details follow in the "dsh integration" section below.</p>
+<hr>
+<h2>dsh Integration (how a plugin-style harness loads it)</h2>
+<p>dsh uses the Cordis plugin framework; the unit of composition is a <strong>bundle</strong>: an npm package + a patch layer. The loading chain is as follows:</p>
+<pre><code>package.json (dsh.bundle.patch → ./cordis.patch.yml)
+  └─ a line in cordis.patch.yml: name: 'repogate/bridge'
+       └─ src/bridge/plugin.js (Cordis plugin, inject: ['tools'])
+            ├─ spawns src/entry.js (the MCP server child process, stdio) using Node itself
+            ├─ completes the initialize / tools/list handshake
+            └─ registers each tool as mcp__repogate__&lt;tool name&gt; into ctx.tools
+</code></pre>
+<ul>
+<li><strong>Tool interface</strong>: the tool name visible to the model = <code>mcp__&lt;serverName&gt;__&lt;original tool name&gt;</code>, <code>serverName</code> defaults to <code>repogate</code>;</li>
+<li><strong>Events/skills</strong>: this plugin registers no events or skills; it only exposes capabilities through the <code>ctx.tools</code> tool interface;</li>
+<li><strong>Lifecycle</strong>: handshake and registration happen during the plugin's <code>apply</code>; on unload it kills the child process and unregisters all tools automatically
+(cleanup registered via <code>ctx.effect</code>, so hot reloads/unloads leave no residue);</li>
+<li><strong>Two bridges to choose from</strong>: the bundle's built-in bridge <code>repogate/bridge</code> (zero dependencies, works out of the box) and
+the official dsh <code>@deepseek-ai/dsh-mcp-client</code> config line (see <code>examples/overlay-for-dsh.yml.example</code>);
+the tools are named and behave identically — pick either one, do not enable both;</li>
+<li><strong>Environment variables</strong>: dsh filters credential-type variables from the MCP child process environment, so the official bridge line needs the token written into the
+<code>env</code> config; the built-in bridge's child process inherits the host environment, so <code>REPOGATE_TOKEN</code> is passed through automatically.</li>
+</ul>
+<h3>Common dsh issues</h3>
+<table>
+<thead>
+<tr>
+<th>Symptom</th>
+<th>Treatment</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>Tools don't appear in the list</td>
+<td>Check whether the <code>cordis.patch.yml</code> line took effect (<code>dsh --profile &lt;name&gt; --dump-config</code> to inspect layers), confirm no errors in the startup log</td>
+</tr>
+<tr>
+<td>401 invalid token</td>
+<td>Check the <code>env.REPOGATE_TOKEN</code> config; or ask the model to call <code>mcp__repogate__gh_auth_login</code> in the session to use OAuth</td>
+</tr>
+<tr>
+<td>Want read-only</td>
+<td>Configure <code>args: ['--read-only']</code> on the bridge line, or append <code>--read-only</code> to the official line's args</td>
+</tr>
+<tr>
+<td>pnpm ≥10 rejects prepare scripts on git installs</td>
+<td>This plugin is pure JS with no build script, so it's not affected; install from checkout or tarball</td>
+</tr>
+</tbody></table>
+<hr>
+<h2>Tool List (23 tools)</h2>
+<table>
+<thead>
+<tr>
+<th>Domain</th>
+<th>Tool</th>
+<th>Purpose</th>
+<th>Write op</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>Repo</td>
+<td><code>gh_repo_fetch</code></td>
+<td>Repo details: default branch, stars, language, visibility</td>
+<td></td>
+</tr>
+<tr>
+<td>Repo</td>
+<td><code>gh_repo_browse</code></td>
+<td>List user/org/own repos (paginated)</td>
+<td></td>
+</tr>
+<tr>
+<td>Issue</td>
+<td><code>gh_issue_open</code></td>
+<td>Create an issue (title required, optional labels/assignee)</td>
+<td>✔</td>
+</tr>
+<tr>
+<td>Issue</td>
+<td><code>gh_issue_fetch</code></td>
+<td>View full issue info</td>
+<td></td>
+</tr>
+<tr>
+<td>Issue</td>
+<td><code>gh_issue_browse</code></td>
+<td>Filter by state/labels/assignee/author (pages may exclude PRs)</td>
+<td></td>
+</tr>
+<tr>
+<td>Issue</td>
+<td><code>gh_issue_edit</code></td>
+<td>Edit title/body/state/assignee/labels</td>
+<td>✔</td>
+</tr>
+<tr>
+<td>Issue</td>
+<td><code>gh_issue_respond</code></td>
+<td>Post a comment (works in PR threads too)</td>
+<td>✔</td>
+</tr>
+<tr>
+<td>PR</td>
+<td><code>gh_pr_open</code></td>
+<td>Create a pull request (head/base/draft)</td>
+<td>✔</td>
+</tr>
+<tr>
+<td>PR</td>
+<td><code>gh_pr_fetch</code></td>
+<td>PR details: mergeability, changed stats, review count</td>
+<td></td>
+</tr>
+<tr>
+<td>PR</td>
+<td><code>gh_pr_browse</code></td>
+<td>Filter by state/branch, sort, paginate</td>
+<td></td>
+</tr>
+<tr>
+<td>PR</td>
+<td><code>gh_pr_edit</code></td>
+<td>Edit title/body/state/draft/base branch</td>
+<td>✔</td>
+</tr>
+<tr>
+<td>PR</td>
+<td><code>gh_pr_merge</code></td>
+<td>Merge (method/commit message/delete source branch)</td>
+<td>✔</td>
+</tr>
+<tr>
+<td>Review</td>
+<td><code>gh_review_submit</code></td>
+<td>Submit a full review: approve / request_changes / comment</td>
+<td>✔</td>
+</tr>
+<tr>
+<td>Review</td>
+<td><code>gh_review_comment</code></td>
+<td>Line-level diff comments (including range comments)</td>
+<td>✔</td>
+</tr>
+<tr>
+<td>Review</td>
+<td><code>gh_review_fetch</code></td>
+<td>List all line-level comments</td>
+<td></td>
+</tr>
+<tr>
+<td>Review</td>
+<td><code>gh_review_browse</code></td>
+<td>List submitted full reviews</td>
+<td></td>
+</tr>
+<tr>
+<td>Search</td>
+<td><code>gh_search_repos</code></td>
+<td>Search repos with GitHub search syntax</td>
+<td></td>
+</tr>
+<tr>
+<td>Search</td>
+<td><code>gh_search_issues</code></td>
+<td>Search issues/PRs (<code>type:pr</code> distinguishes)</td>
+<td></td>
+</tr>
+<tr>
+<td>Search</td>
+<td><code>gh_search_code</code></td>
+<td>Search code (requires token, returns file hits)</td>
+<td></td>
+</tr>
+<tr>
+<td>Account</td>
+<td><code>gh_whoami</code></td>
+<td>Current identity, token source, read-only mode, API quota</td>
+<td></td>
+</tr>
+<tr>
+<td>Auth</td>
+<td><code>gh_auth_login</code></td>
+<td>Start OAuth device authorization (requires configured clientId)</td>
+<td></td>
+</tr>
+<tr>
+<td>Auth</td>
+<td><code>gh_auth_check</code></td>
+<td>Poll authorization result once</td>
+<td></td>
+</tr>
+<tr>
+<td>Auth</td>
+<td><code>gh_auth_logout</code></td>
+<td>Clear the local token cache</td>
+<td></td>
+</tr>
+</tbody></table>
+<p>All tools take JSON Schema inputs (<code>name</code>/<code>description</code>/<code>inputSchema</code>) that models can discover on their own;
+write tools are intercepted with a clear message in read-only mode.</p>
+<hr>
+<h2>Configuration</h2>
+<p>Priority: <strong>CLI flags &gt; environment variables &gt; config file &gt; defaults</strong>. The config file is JSON, its path given by <code>--config</code>
+or <code>REPOGATE_CONFIG</code>; see <code>examples/repogate.config.json.example</code>.</p>
+<table>
+<thead>
+<tr>
+<th>Config item</th>
+<th>Environment variable</th>
+<th>Default</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>Access token</td>
+<td><code>REPOGATE_TOKEN</code> (also accepts <code>GITHUB_TOKEN</code> / <code>GH_TOKEN</code>)</td>
+<td>none</td>
+</tr>
+<tr>
+<td>API base URL (enterprise instances)</td>
+<td><code>REPOGATE_BASE_URL</code></td>
+<td><code>https://api.github.com</code></td>
+</tr>
+<tr>
+<td>Read-only mode</td>
+<td><code>REPOGATE_READ_ONLY</code> (<code>1/true/yes/on</code>)</td>
+<td><code>false</code></td>
+</tr>
+<tr>
+<td>Per-request timeout (ms)</td>
+<td><code>REPOGATE_TIMEOUT_MS</code></td>
+<td><code>30000</code></td>
+</tr>
+<tr>
+<td>OAuth Client ID</td>
+<td><code>REPOGATE_OAUTH_CLIENT_ID</code></td>
+<td>none</td>
+</tr>
+<tr>
+<td>OAuth token cache file</td>
+<td><code>REPOGATE_TOKEN_FILE</code></td>
+<td><code>~/.repogate/token.json</code> when <code>oauth.clientId</code> is configured</td>
+</tr>
+<tr>
+<td>Config file path</td>
+<td><code>REPOGATE_CONFIG</code></td>
+<td>none</td>
+</tr>
+<tr>
+<td>Debug logging (stderr)</td>
+<td><code>REPOGATE_DEBUG</code></td>
+<td><code>false</code></td>
+</tr>
+</tbody></table>
+<p>CLI flags: <code>--config</code> <code>--token</code> <code>--read-only</code> <code>--base-url</code> <code>--timeout-ms</code>
+<code>--oauth-client-id</code> <code>--token-file</code> <code>--debug</code> <code>--version</code> <code>--help</code>.</p>
+<hr>
+<h2>Authentication</h2>
+<h3>Personal access token (PAT)</h3>
+<p>Generate one in GitHub's Developer settings (check the repo permissions needed on a fine-grained token), then choose any of:</p>
+<pre><code>REPOGATE_TOKEN=ghp_xxx node src/entry.js          # environment variable
+node src/entry.js --token ghp_xxx                 # CLI flag
+node src/entry.js --config repogate.config.json   # config file (token field)
+</code></pre>
+<p>Token resolution order: <code>--token</code> &gt; <code>REPOGATE_TOKEN</code> &gt; <code>GITHUB_TOKEN</code> &gt; <code>GH_TOKEN</code> &gt; config file &gt; cache file.</p>
+<h3>OAuth device authorization (token-free interactive login)</h3>
+<p>For those who'd rather not assemble a token by hand. You first need a GitHub App's Client ID (the device flow only requires a public client_id):</p>
+<ol>
+<li>Configure <code>oauth.clientId</code> (config file or <code>REPOGATE_OAUTH_CLIENT_ID</code>);</li>
+<li>Ask the model to call <code>gh_auth_login</code> → returns an authorization URL and a one-time code;</li>
+<li>The user opens the URL in a browser, enters the code, and confirms;</li>
+<li>The model calls <code>gh_auth_check</code> (may be called multiple times; each call checks once) → once <code>granted</code>, the token is written to the cache file,
+and all tools become available; the cached token survives process restarts;</li>
+<li><code>gh_auth_logout</code> clears the cache.</li>
+</ol>
+<blockquote>
+<p>Note: the device authorization endpoint always uses github.com; for enterprise instances (custom <code>baseUrl</code>) use a PAT.
+The token cache file is written with 0600 permissions; do not commit the cache file to version control.</p>
+</blockquote>
+<hr>
+<h2>Read-only Mode</h2>
+<pre><code>node src/entry.js --read-only          # or REPOGATE_READ_ONLY=1
+</code></pre>
+<p>When enabled, the 8 write tools (<code>gh_issue_open</code> / <code>gh_issue_edit</code> / <code>gh_issue_respond</code> /
+<code>gh_pr_open</code> / <code>gh_pr_edit</code> / <code>gh_pr_merge</code> / <code>gh_review_submit</code> / <code>gh_review_comment</code>)
+are intercepted after argument validation and return a <code>[readonly]</code> error explaining how to turn it off; query, search, and auth tools are unaffected.</p>
+<hr>
+<h2>Error Handling</h2>
+<p>All failures are returned as structured errors (MCP <code>isError: true</code> + <code>structuredContent.error</code>) in the form
+<code>[error code] reason</code>. Common error codes and typical scenarios:</p>
+<table>
+<thead>
+<tr>
+<th>Error code</th>
+<th>Scenario</th>
+<th>Guide</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>auth</code></td>
+<td>Token missing/invalid (401)</td>
+<td>Configure a token or use OAuth device authorization</td>
+</tr>
+<tr>
+<td><code>ratelimit</code></td>
+<td>Quota exhausted (403/429)</td>
+<td>Report reset time or Retry-After seconds</td>
+</tr>
+<tr>
+<td><code>http</code></td>
+<td>404/403/422/409 etc.</td>
+<td>Explain the specific cause (not found/no permission/params rejected/conflict)</td>
+</tr>
+<tr>
+<td><code>validation</code></td>
+<td>Argument validation failed</td>
+<td>Point out which argument is invalid</td>
+</tr>
+<tr>
+<td><code>readonly</code></td>
+<td>Read-only mode blocks a write</td>
+<td>Explain how to disable</td>
+</tr>
+<tr>
+<td><code>timeout</code></td>
+<td>Request timeout</td>
+<td>Suggest increasing <code>timeoutMs</code></td>
+</tr>
+<tr>
+<td><code>network</code></td>
+<td>Network-layer failure</td>
+<td>Check the network and <code>baseUrl</code></td>
+</tr>
+</tbody></table>
+<p>The gateway automatically retries once on 502/503/504 and network jitter (idempotent read requests only; writes are not retried to avoid duplicate side effects);
+if a 5xx still fails after retry, it returns an <code>http</code> error instead of failing silently.</p>
+<hr>
+<h2>Architecture and Layout</h2>
+<pre><code>src/
+├── entry.js              entry: config parsing → assembly → start the stdio session
+├── protocol/             protocol layer (MCP over stdio, line-delimited JSON-RPC 2.0)
+│   ├── jsonrpc.js        message encoding/decoding and classification
+│   ├── transport.js      stdin/stdout read/write loop (logs go to stderr only)
+│   └── engine.js         session engine: initialize / ping / tools/list / tools/call
+├── core/                 core layer
+│   ├── config.js         layered config merge (flag &gt; env &gt; config file &gt; defaults)
+│   ├── auth.js           credential hub: token resolution + OAuth device auth state machine + cache
+│   ├── gateway.js        REST gateway: request assembly/retry/timeout/status-code mapping
+│   └── errors.js         unified error model with actionable hints
+├── tools/                tool layer
+│   ├── registry.js       registry: argument validation (JSON Schema subset) + read-only gate + dispatch
+│   ├── repo.js / issue.js / pull.js / review.js / search.js / account.js
+│   └── index.js          assembles the 23 tools
+├── bridge/               dsh integration
+│   ├── client.js         MCP stdio client (initialize/list/call, cancellation and timeout)
+│   └── plugin.js         Cordis plugin: spawns the server and registers tools into ctx.tools
+└── util/format.js        output shaping: entity summaries, pagination detection, URL building
+
+test/                     tests (node:test, zero dependencies)
+├── helpers/              fake fetch and a local mock API service
+└── *.test.js             protocol/gateway/config/auth/registry/tool/end-to-end (121 test cases)
+</code></pre>
+<p>Design highlights:</p>
+<ul>
+<li><strong>Layered one-way dependencies</strong>: protocol layer → core layer → tool layer; tools don't know protocol details, and the protocol doesn't know API details;</li>
+<li><strong>On-demand token resolution</strong>: OAuth authorization takes effect after completion without restart (the gateway holds a tokenResolver rather than a static token);</li>
+<li><strong>One codebase, both ends</strong>: <code>bridge/client.js</code> and the server share the same JSON-RPC vocabulary, so handshake and call logic are consistent.</li>
+</ul>
+<hr>
+<h2>Development and Testing</h2>
+<pre><code>node --test          # run all 121 tests (including real child-process end-to-end)
+node src/entry.js --help
+</code></pre>
+<p>Test coverage: protocol handshake and error paths (including interception of uninitialized sessions), gateway retry (idempotent methods only) and status-code mapping,
+the full OAuth state machine (including expiry), config priority, argument validation, the read-only gate, request construction and output shaping for all 23 tools,
+and an end-to-end chain of "real child process + local mock API".</p>
+<h2>Security Notes</h2>
+<ul>
+<li>A token has the same power as the account; do not write it into logs, commit it to version control, or leak it to untrusted conversations;</li>
+<li>Under dsh, MCP server commands are trusted code outside the sandbox; install this plugin only from trusted sources;</li>
+<li>Read-only mode significantly reduces the risk of misuse; research-only sessions are recommended to enable it.</li>
+</ul>
+<hr>
+<h2>License</h2>
+<p><a href="https://github.com/JohnXu22786/github-mcp/blob/HEAD/LICENSE">MIT</a></p>

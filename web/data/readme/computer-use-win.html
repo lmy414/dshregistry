@@ -1,0 +1,419 @@
+<h1>computer-use-win — 给 DeepSeek Harness 装上 Windows 电脑操控能力</h1>
+<p><a href="https://github.com/Yu-tao-Li/computer-use-win/actions/workflows/ci.yml"><img src="https://github.com/Yu-tao-Li/computer-use-win/actions/workflows/ci.yml/badge.svg" alt="CI"></a></p>
+
+
+<p><strong>English:</strong> A Windows computer-use plugin for <a href="https://github.com/deepseek-ai/deepseek-harness">DeepSeek Harness</a> (<code>dsh</code>): an MCP stdio server backed by a PowerShell UI Automation engine. It gives the agent 22 desktop tools — accessibility tree, window-cropped screenshots, mouse/keyboard input (foreground + verified background paths), OCR with word boxes, window management, coordinate homing, an identity guard, and a physical-cursor failsafe. Bridges into DSH through the in-box <code>@deepseek-ai/dsh-mcp-client</code>; no DSH modifications.</p>
+<p><strong>中文</strong>: 一个 <strong>MCP（Model Context Protocol）stdio 服务器 + PowerShell UIA 后端</strong>，让 DSH agent 能
+"看"（UIA 无障碍树 + 截图）和"做"（鼠标 / 键盘 / 语义点击）Windows 桌面应用。
+通过 DSH 内置的 <code>@deepseek-ai/dsh-mcp-client</code> 桥接进 DSH，<strong>无需改 DSH 本体</strong>。</p>
+<h2>截图</h2>
+<table>
+<thead>
+<tr>
+<th>窗口裁剪截图 + UIA 树（<code>snapshot</code>）</th>
+<th>OCR 回退（中文界面识别 + 词框坐标）</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><img src="https://raw.githubusercontent.com/Yu-tao-Li/computer-use-win/HEAD/assets/screenshot-1.png" alt="screenshot 1"></td>
+<td><img src="https://raw.githubusercontent.com/Yu-tao-Li/computer-use-win/HEAD/assets/screenshot-2.png" alt="screenshot 2"></td>
+</tr>
+</tbody></table>
+<pre><code>DSH agent (本 GUI)
+   │  模型看到 mcp__wincu__windows_computer_use_* 工具
+   ▼
+@deepseek-ai/dsh-mcp-client   ← DSH 内置插件（官方 @modelcontextprotocol/sdk 的 StdioClientTransport）
+   │  JSON-RPC 2.0 over stdio（按行分帧的 JSON）
+   ▼
+mcp/server.mjs                ← 本项目：MCP 服务器（Node ≥18，零依赖）
+   │  spawn powershell.exe -NoProfile -File windows-uia.ps1 -Action &lt;动作&gt;
+   │  参数走 stdin（JSON），结果走 stdout（JSON）
+   ▼
+scripts/windows-uia.ps1       ← 本项目：Windows 桌面引擎（PowerShell 5.1 兼容）
+   ├─ UI Automation（UIAutomationClient/UIAutomationTypes 程序集）→ 无障碍树
+   ├─ user32 P/Invoke（SetCursorPos / mouse_event）→ 鼠标
+   ├─ WinForms SendKeys + 剪贴板粘贴 → 键盘与 Unicode 文本
+   └─ System.Drawing.CopyFromScreen → 全屏截图（PNG）
+</code></pre>
+<h2>原理（为什么这样做）</h2>
+<h3>1. 为什么走 MCP 桥接，而不是原生 DSH 插件</h3>
+<ul>
+<li>DSH 一切皆插件，但"注册新工具"需要写 Cordis 插件（注册进 <code>ctx.tools</code>、
+处理审批与权限钩子、打包成 <code>dsh.bundle</code>）。MCP 是更薄的边界：
+官方 <code>dsh-mcp-client</code> 会把任意 MCP server 的工具<strong>原样注册</strong>成
+<code>mcp__&lt;serverName&gt;__&lt;工具名&gt;</code>（serverName 我们在 patch 里取 <code>wincu</code>）。</li>
+<li>好处：后端独立进程、独立语言、可单独测试（<code>--self-test</code>），坏了不影响 DSH 启动
+（<code>failOnStartupError: false</code>）。</li>
+<li>代价：MCP 工具没有 DSH 原生的审批/风险分级钩子，所以安全机制做在 server 内部
+（scope 限定、窗口定位、动作前观察）。</li>
+</ul>
+<h3>2. 感知：UIA 无障碍树（text-first）</h3>
+<p>Windows 上比"截图像素"更可靠的是 <strong>UI Automation</strong> 树：每个控件带
+<code>controlType</code>（Button/Edit/Window…）、<code>name</code>、<code>automationId</code>、<code>boundingBox</code>、
+<code>value</code>、<code>patterns</code>（支持哪些语义操作）。agent 可以<strong>按语义找控件</strong>而不是猜坐标：</p>
+<ul>
+<li>三种视图：<code>control</code>（默认，应用控件级，最常用）/ <code>content</code>（最终用户内容）/ <code>raw</code>（含内部节点）</li>
+<li>元素 id 是<strong>树路径</strong>：<code>uia:active.0.2.1</code>（当前活动窗口下的第 0→2→1 个子控件）。
+注意路径会随 UI 刷新变化（stale），动作前最好重新 snapshot。</li>
+<li><code>find</code> 工具在树里按 name/automationId/class/值 做大小写不敏感子串搜索，
+返回完整节点信息，适合"找到保存按钮"这类任务。</li>
+<li>截图（<code>snapshot</code>）同时给出 PNG <strong>文件路径</strong>——因为 DSH 的 dsh-mcp-client
+会丢弃 MCP 的 image 内容块（只留占位符），所以视觉信息要么让模型用 <code>read_image</code>
+读该 PNG，要么依赖 UIA 文本（推荐，纯文本模型也能干活）。</li>
+</ul>
+<h3>3. 动作：三条路径</h3>
+<table>
+<thead>
+<tr>
+<th>路径</th>
+<th>用什么</th>
+<th>何时用</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>坐标</td>
+<td><code>SetCursorPos</code> + <code>mouse_event</code> P/Invoke</td>
+<td>点元素中心或任意屏幕点</td>
+</tr>
+<tr>
+<td>语义</td>
+<td>UIA patterns：<code>Invoke</code>/<code>Toggle</code>/<code>SelectionItem</code>/<code>ExpandCollapse</code>/<code>Value</code></td>
+<td>优先！不碰鼠标、更稳</td>
+</tr>
+<tr>
+<td>文本</td>
+<td>剪贴板写入 + <code>Ctrl+V</code>（自动还原剪贴板），键组合走 <code>SendKeys</code> 语法（<code>^%+</code>）</td>
+<td>输入含中文/长文本时最可靠</td>
+</tr>
+</tbody></table>
+<p><code>invoke</code>/<code>set_value</code> 带 fallback：pattern 不存在时退回"点中心"或"聚焦+全选+粘贴"。
+<code>keypress</code> 支持 <code>["ctrl","shift","s"]</code> 这类键组合（Win 键不支持，SendKeys 限制）。</p>
+<h3>4. 窗口定位</h3>
+<p>所有工具都接受可选 <code>windowTitle</code>（子串）/ <code>processId</code> / <code>nativeWindowHandle</code>
+指定目标顶层窗口，<code>activate: true</code> 可先置前台。不指定 = 当前前台窗口
+（<code>scope: active_window</code>；<code>scope: desktop</code> = 整个桌面树）。</p>
+<h3>5. 三个真实踩过的坑（安全加固）</h3>
+<p>computer use 在 Windows 上最阴险的失败都是<strong>静默的</strong>——返回 ok 但实际打错了地方。
+本项目内置了三层防御，全部经过本机实测验证：</p>
+<ol>
+<li><strong>前台锁（foreground lock）</strong>：后台进程调 <code>SetForegroundWindow</code> 会被 Windows
+前台锁<strong>静默拒绝</strong>——函数不报错，但窗口根本没切过去，后续按键就全打进了
+用户当前的前台窗口（可能是微信、浏览器）。
+修复：<code>AttachThreadInput</code> 把前台窗口输入线程挂到自己线程 + 模拟按下/抬起
+Alt 键解锁（AutoHotkey 经典技巧）+ <code>ShowWindow</code>/<code>SetForegroundWindow</code>。
+切完<strong>校验前台是否真的变成目标窗口</strong>，结果以 <code>activated: true/false</code> 返回。</li>
+<li><strong>fail-closed 输入守卫</strong>：<code>type_text</code>/<code>keypress</code> 一旦指定了目标窗口，
+发送前校验"前台 == 目标"，不匹配直接抛错，<strong>绝不</strong>把按键打进别的窗口；
+<code>activate:true</code> 激活失败同样抛错。</li>
+<li><strong>激活 ≠ 聚焦</strong>：窗口置前台后，内部编辑框往往<strong>没有键盘焦点</strong>
+（焦点可能停在菜单栏/标题栏），<code>Ctrl+V</code> 会被无声吞掉。
+修复：<code>type_text</code> 在目标窗口内用 UIA 找<strong>最大的启用状态 Edit/Document
+控件</strong>并 <code>SetFocus()</code>，结果里回报 <code>focusedControl</code>（如 <code>Document</code>）。
+实测：新记事本的编辑区是 <code>RichEditD2DPT</code> 的 Document 节点。</li>
+</ol>
+<h2>工具清单（22 个，前缀 <code>mcp__wincu__</code>）</h2>
+<table>
+<thead>
+<tr>
+<th>工具</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>windows_computer_use_health</code></td>
+<td>自检：UIA / 截图 / 前台窗口 / 能力上报</td>
+</tr>
+<tr>
+<td><code>windows_computer_use_snapshot</code></td>
+<td>截图 + UIA 树（主力"观察"工具；捕获链 PrintWindow→WGC→屏幕区域，<code>captureWindow</code>/<code>maxWidth</code> 裁剪降采样）</td>
+</tr>
+<tr>
+<td><code>windows_computer_use_accessibility_tree</code></td>
+<td>只取 UIA 树，不截图</td>
+</tr>
+<tr>
+<td><code>windows_computer_use_list_windows</code></td>
+<td>顶层窗口列表</td>
+</tr>
+<tr>
+<td><code>windows_computer_use_find</code></td>
+<td>按关键词/控件类型找元素（树稀疏时自动提示改用 OCR）</td>
+</tr>
+<tr>
+<td><code>windows_computer_use_element_info</code></td>
+<td>查某个 id 或坐标处的元素</td>
+</tr>
+<tr>
+<td><code>windows_computer_use_click</code> / <code>double_click</code> / <code>move</code> / <code>drag</code> / <code>scroll</code></td>
+<td>鼠标动作（<code>elementId</code> 或 <code>x,y</code>；<code>dispatch: auto/foreground/background</code>；坐标 homing 补偿）</td>
+</tr>
+<tr>
+<td><code>windows_computer_use_type_text</code></td>
+<td>输入文本（<code>method: clipboard/sendinput/background</code>；sendinput 走 KEYEVENTF_UNICODE 不碰剪贴板，background 走 WM_CHAR 不碰前台）</td>
+</tr>
+<tr>
+<td><code>windows_computer_use_keypress</code></td>
+<td>键/键组合（<code>["ctrl","s"]</code>；Win 键被黑名单拦截）</td>
+</tr>
+<tr>
+<td><code>windows_computer_use_focus</code> / <code>invoke</code> / <code>set_value</code></td>
+<td>UIA 语义动作</td>
+</tr>
+<tr>
+<td><code>windows_computer_use_activate_window</code></td>
+<td>把指定窗口置前台（前台锁破解 + 校验）</td>
+</tr>
+<tr>
+<td><code>windows_computer_use_move_window</code></td>
+<td>移动窗口（不抢前台）</td>
+</tr>
+<tr>
+<td><code>windows_computer_use_close_window</code></td>
+<td>优雅关窗（PostMessage WM_CLOSE，应用可弹保存对话框否决）</td>
+</tr>
+<tr>
+<td><code>windows_computer_use_ocr</code></td>
+<td>Windows.Media.Ocr 文字识别（UIA 盲区回退；返回文字 + 屏幕坐标词框）</td>
+</tr>
+<tr>
+<td><code>windows_computer_use_wait_for</code></td>
+<td>服务端轮询等窗口出现/消失（省往返）</td>
+</tr>
+<tr>
+<td><code>windows_computer_use_wait</code></td>
+<td>等待 N ms</td>
+</tr>
+</tbody></table>
+<h3>本轮新增的鲁棒性/兼容性能力</h3>
+<ul>
+<li><strong>坐标 homing</strong>（借鉴 desktop-touch-mcp）：观察窗口时缓存其位置，动作时若窗口被
+移动过就自动补偿 <code>dx,dy</code>，结果里回报 <code>homed: {dx,dy}</code>。实测窗口移动 (+120,+80)
+后旧坐标点击被正确补偿。</li>
+<li><strong>急停 failsafe</strong>（借鉴 desktop-touch-mcp）：物理鼠标停在虚拟屏左上角
+（默认半径 12px）超过 500ms → 所有输入动作被拒（<code>EMERGENCY STOP</code>），
+移开即恢复。可用 <code>WCU_FAILSAFE_CORNER="x,y"</code> / <code>WCU_FAILSAFE_RADIUS</code> /
+<code>WCU_FAILSAFE_HOLD_MS</code> 配置，<code>WCU_FAILSAFE=0</code> 关闭。</li>
+<li><strong>OCR 回退</strong>（借鉴 PeekabooWin / iris-mcp）：游戏/自绘 Tk/Qt/RDP 等 UIA 盲区
+应用，<code>find</code> 返回稀疏树时会提示改用 <code>ocr</code> 工具；OCR 用编译进缓存 DLL 的
+C# WinRT 助手（Windows.Media.Ocr）实现，词框坐标自动换算回屏幕坐标。
+实测中文界面识别正常。</li>
+<li><strong>PostMessage 后台 dispatch</strong>（借鉴 cua / desktop-touch-mcp）：
+<code>dispatch:'background'</code> 把鼠标消息直接 PostMessage 进目标窗口消息队列
+（不碰系统输入队列、不抢前台）；<code>type_text method:'background'</code> 走 WM_CHAR。
+投递是<strong>未验证</strong>的（Chromium/Electron/WinUI 可能丢弃合成消息，如新记事本
+会丢 WM_CHAR）——结果里显式 <code>verified:false</code> + 提示，被拒时报
+<code>background_unavailable</code> 让你显式切 <code>foreground</code>（cua 的诚实报错模式）。
+实测后台 PostMessage 点击真实打开了记事本菜单（UIA 可见）。</li>
+<li><strong>坐标映射修正</strong>：移动改用 <code>SetCursorPos</code>（原始屏幕坐标），弃用 SendInput
+ABSOLUTE 归一化——本机多显示器下 ABSOLUTE 会把 X 恰好减半，已修复并校准到
+1.000 落点。</li>
+<li><strong>DPI 感知顺序</strong>：Per-Monitor V2 必须在 GDI+/WinForms 程序集加载前设置，
+否则进程锁死在虚拟化坐标空间（3414x960 vs 物理 5120x1440）。</li>
+<li><strong>其他</strong>：<code>move_window</code> / <code>close_window</code> / <code>wait_for</code> 动作、截图 GC（30 分钟
+自动清理）、<code>type_text</code> 输入后回读 <code>verifyValue</code> 作为证据。</li>
+<li><strong>WGC 窗口捕获</strong>（Windows.Graphics.Capture）：PrintWindow 对 UWP/WinUI/
+DirectComposition 表面会渲染成纯黑；捕获链检测到纯黑后改用 WGC 从 DWM 合成
+帧读取窗口内容（含被遮挡窗口）。WGC 助手用 csc 编译成缓存 DLL（C# WinRT），
+需要 .NET Core 参考程序集——缺失时<strong>优雅降级</strong>到屏幕区域裁剪（不会卡住/报错）。</li>
+<li><strong>runtimeId 元素 id</strong>：元素 id 用 UIA RuntimeId（进程内稳定）替代树路径，
+窗口重排/刷新后旧 id 仍能解析；过期 id 报 <code>stale</code> 而非点错地方。</li>
+<li><strong>identity guard</strong>：动作前校验目标窗口 HWND/PID 是否变化，窗口被替换时报
+<code>identity_changed</code> 拒绝动作，避免误操作到同名新窗口。</li>
+<li><strong>sendinput 输入路径</strong>：<code>type_text method:'sendinput'</code> 用 KEYEVENTF_UNICODE
+逐字符 SendInput，不碰剪贴板（适合 ASCII/短文本；CJK 仍建议 clipboard）。</li>
+</ul>
+<h2>已接入 DSH（web profile）</h2>
+<p><code>C:\Users\Administrator\.dsh\profiles\web\cordis.patch.yml</code> 已加入：</p>
+<pre><code>- insert:
+    - id: mcp-windows-computer-use
+      name: '@deepseek-ai/dsh-mcp-client'
+      config:
+        serverName: wincu
+        transport: stdio
+        command: node
+        args: ['E:\PythonFiles\computer-use-win\mcp\server.mjs']
+        toolCallTimeoutMs: 90000
+        failOnStartupError: false
+</code></pre>
+<p><strong>需要重启 <code>dsh web</code> 才会加载。</strong> 之后新会话里直接让 agent
+"帮我打开记事本写点东西"即可，工具以 <code>mcp__wincu__windows_computer_use_*</code> 出现。</p>
+<h2>打包与分发（dsh.bundle）</h2>
+<p>本包是一个标准的 DSH bundle（<code>package.json</code> 里声明
+<code>"dsh": { "bundle": { "patch": "./cordis.patch.yml" } }</code>）。<code>cordis.patch.yml</code>
+通过 in-box 的 <code>@deepseek-ai/dsh-mcp-client</code> 挂载 MCP server，<code>command</code> 与
+<code>args[0]</code> 都用 <code>!!js</code> 相对本 patch 文件自身目录（<code>baseUrl</code>）解析，所以在任何
+profile、任何 <code>$DSH_HOME</code> 下都能装，无需硬编码路径：</p>
+<pre><code>command: !!js process.execPath          # 正在跑 DSH 的 node 可执行文件（绝对路径）
+args:
+  - !!js "process.getBuiltinModule('node:url').fileURLToPath(new URL('mcp/server.mjs', baseUrl))"
+</code></pre>
+<p>安装（任选其一，装完重启 <code>dsh web</code>）：</p>
+<pre><code># 从 GitHub（上架后的标准装法，--profile 指定装进哪个 profile）
+dsh plugin --profile web add github:Yu-tao-Li/computer-use-win
+# 本地目录 / 相对路径（开发期）
+dsh plugin add file:E:\PythonFiles\computer-use-win
+# 发布到 npm 后
+dsh plugin add computer-use-win
+</code></pre>
+<p>也可在 DSH 设置里的**插件市场（dshmarket）**搜索 <code>computer-use-win</code> 一键安装
+（上架后）。</p>
+<p><code>dsh plugin add</code> 会把包装进当前 profile 的 <code>node_modules</code> 并加入
+<code>package.json</code> 的 <code>dsh.profile.bundles</code> 列表，下次启动自动加载。
+注意：bundle 行的 id 是 <code>mcp-computer-use-win</code>，与上面 dev 用的
+<code>mcp-windows-computer-use</code> 不同，但 <code>serverName</code> 都是 <code>wincu</code>——<strong>同一时刻只留
+一个</strong>（否则第二个因 serverName 命名空间被占用而启动失败）。</p>
+<h2>测试</h2>
+<pre><code># 1) 后端自检（UIA + 截图）
+node E:\PythonFiles\computer-use-win\mcp\server.mjs --self-test
+
+# 2) MCP 协议测试（initialize → tools/list → tools/call）
+node E:\PythonFiles\computer-use-win\test\mcp-test.mjs
+
+# 3) 直接跑后端某个动作（参数 = 一行 JSON 从 stdin 传入）
+node E:\PythonFiles\computer-use-win\mcp\server.mjs --backend list_windows '{"maxWindows":5}'
+node E:\PythonFiles\computer-use-win\mcp\server.mjs --backend tree '{"maxDepth":2}'
+
+# 4) 端到端输入测试：开记事本→激活→输入→读回→关闭（会真的开一个记事本）
+node E:\PythonFiles\computer-use-win\test\notepad-e2e.mjs
+
+# 5) 延迟基准：persistent 后端（cold 首次含启动 / hot 稳态）
+node E:\PythonFiles\computer-use-win\test\bench-persistent.mjs
+# 6) 窗口裁剪截图验证（PrintWindow 路径）
+node E:\PythonFiles\computer-use-win\test\test-capture.mjs
+# 7) 鲁棒性特性综合测试（后台 WM_CHAR/PostMessage 点击、homing、failsafe、OCR、
+#    wait_for、close_window；会真的开一个记事本并移动它）
+node E:\PythonFiles\computer-use-win\test\test-features.mjs
+</code></pre>
+<p>已验证（2026-07，本机 Windows 11）：</p>
+<ul>
+<li><code>--self-test</code> ✅（persistent 模式、UIA 树、截图）</li>
+<li>MCP 协议三件套 ✅（<strong>22 工具</strong>，<code>list_windows</code> 返回真实窗口）</li>
+<li><strong>端到端输入 ✅</strong>：记事本激活 <code>activated:true</code>、聚焦 <code>focusedControl:Document</code>、
+文本写入并 <code>find</code> 读回命中</li>
+<li><strong>窗口裁剪截图 ✅</strong>：<code>captureWindow:true</code> 走 <code>method:printwindow</code>，记事本窗口
+1962×1265 → 降采样后 <strong>91KB</strong>（全屏原生 3.8MB），带 <code>imageScale/origin</code> 坐标映射</li>
+<li><strong>坐标校准 ✅</strong>：<code>move</code> 到 (200,200)/(1000,500)/(3000,800) 实际落点 ratio=1.000</li>
+<li><strong>后台 dispatch ✅</strong>：PostMessage 点击真实打开记事本菜单（UIA 验证）</li>
+<li><strong>homing ✅</strong>：窗口移动 (+120,+80) 后旧坐标点击补偿 <code>homed:{dx:120,dy:80}</code></li>
+<li><strong>failsafe ✅</strong>：鼠标贴角 250ms 后输入被拒（EMERGENCY STOP），移开恢复</li>
+<li><strong>OCR ✅</strong>：中文界面识别 + 屏幕坐标词框（Windows.Media.Ocr，C# WinRT 助手）</li>
+<li><strong>wait_for/close_window ✅</strong>（close 对 WinUI 应用可能被忽略，见限制）</li>
+</ul>
+<h2>社区项目对比与优化记录（2026-07）</h2>
+<p>调研了 GitHub 上的通用 Windows computer-use 项目（不只服务 DSH）：</p>
+<table>
+<thead>
+<tr>
+<th>项目</th>
+<th>语言</th>
+<th>值得借鉴的设计</th>
+<th>本项目吸收情况</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><a href="https://github.com/trycua/cua">trycua/cua</a>（Cua Driver，ex-MS 团队）</td>
+<td>Rust</td>
+<td>分层输入分发（UIA pattern→PostMessage 后台→SendInput 前台，显式报 <code>background_unavailable</code>）；PrintWindow→WGC→BitBlt 截图链 + 黑帧检测；DWM extended frame bounds 去阴影边</td>
+<td>✅ 截图链（PrintWindow→屏幕区域降级+遮挡标记）、extended frame bounds、诚实报错、后台 dispatch</td>
+</tr>
+<tr>
+<td><a href="https://github.com/Harusame64/desktop-touch-mcp">Harusame64/desktop-touch-mcp</a></td>
+<td>TS+Rust</td>
+<td><strong>常驻 COM 线程</strong>消除 PowerShell 进程启动（366ms→2.2ms）；坐标 homing（窗口移动补偿）；鼠标贴左上角 500ms 急停；Win+R/X/L 组合键黑名单；窗口身份校验</td>
+<td>✅ <strong>persistent 后端</strong>、homing、急停 failsafe、Win 键黑名单（全部实测通过）</td>
+</tr>
+<tr>
+<td><a href="https://github.com/SSCanine/iris-mcp">SSCanine/iris-mcp</a></td>
+<td>Python</td>
+<td>三后端路由（Win32/UIA/OCR）覆盖 UIA 盲区应用（Tk/自绘 Qt/游戏）；<strong>SendInput 替代废弃的 mouse_event</strong>；Per-Monitor V2 DPI；像素级 miss distance 实测 bench</td>
+<td>✅ SendInput、显式 Per-Monitor V2 DPI、bench 方法论、OCR 回退</td>
+</tr>
+<tr>
+<td><a href="https://github.com/wangneal/PeekabooWin">wangneal/PeekabooWin</a></td>
+<td>Python</td>
+<td>UIA 稀疏时 <code>find_element</code> <strong>自动降级 OCR</strong>（结果带 <code>source: ocr_fallback</code> 标记）；<code>wait_for_window</code>/<code>wait_for_element</code> 服务端轮询；<code>move_window</code>/<code>close_window</code>（WM_CLOSE）；环境变量配置体系</td>
+<td>✅ find 稀疏提示、OCR 回退、wait_for、move_window/close_window、WCU_* 环境变量</td>
+</tr>
+<tr>
+<td><a href="https://github.com/doucej/uia-x">doucej/uia-x</a></td>
+<td>Python</td>
+<td>跨平台统一工具面（Win UIA/Linux AT-SPI/macOS AX）；语义动作优先（<code>uia_invoke</code>/<code>uia_set_value</code> 先于 <code>mouse_click</code>）</td>
+<td>✅ 语义优先的 dispatch:auto（元素点击先走 UIA pattern）；跨平台列入 roadmap</td>
+</tr>
+</tbody></table>
+<p><strong>速度优化效果（本机实测，persistent 后端）</strong>：</p>
+<table>
+<thead>
+<tr>
+<th>动作</th>
+<th>优化前（每次新起 powershell）</th>
+<th>优化后 hot</th>
+<th>提升</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>health</td>
+<td>~540ms</td>
+<td><strong>6ms</strong></td>
+<td>~90×</td>
+</tr>
+<tr>
+<td>list_windows</td>
+<td>~600ms</td>
+<td><strong>44ms</strong></td>
+<td>~14×</td>
+</tr>
+<tr>
+<td>tree (depth 2)</td>
+<td>~585ms</td>
+<td><strong>103ms</strong></td>
+<td>~6×</td>
+</tr>
+</tbody></table>
+<p>手段：</p>
+<ol>
+<li><strong>persistent 后端</strong>：MCP server 保活一个 <code>powershell -Persistent</code> 进程，
+JSON 行协议；超时/崩溃 → kill + 下次调用懒重建（隔离性不丢）。
+首个调用 cold <del>500ms（进程+程序集+首次编译），之后稳定 6</del>100ms。</li>
+<li><strong>C# P/Invoke 预编译 DLL 缓存</strong>：按源码 hash 命名存 <code>%TEMP%</code>，
+重启进程免现场编译（~300-500ms/次 → 0）。</li>
+<li><strong>鼠标路径修正</strong>：移动用 <code>SetCursorPos</code>（原始屏幕坐标），按钮/滚轮用
+SendInput 状态事件——本机多显示器下 SendInput ABSOLUTE 归一化会把 X 减半，
+已弃用并校准（落点 ratio 1.000）。</li>
+<li><strong>截图减重</strong>：<code>captureWindow</code>（PrintWindow 窗口裁剪，非前台窗口也能抓）+
+<code>maxWidth</code> 降采样（默认 1600px）+ <code>imageScale/origin</code> 供模型换算坐标 +
+30 分钟自动 GC。全屏 3.8MB → 窗口裁剪 91KB。</li>
+</ol>
+<h2>安全与限制</h2>
+<ul>
+<li><strong>动作是真实的</strong>：click/type 会真的操作前台程序。敏感操作前让 agent 先
+<code>snapshot</code> 观察，重要窗口（终端、密码框）用 <code>windowTitle</code> 明确限定。</li>
+<li><strong>Win 键组合被黑名单拦截</strong>（Win+R/X/L/S 会打开系统对话框），keypress 传
+<code>win</code> 会直接报错——这是设计，不是 bug。</li>
+<li><strong>WinUI/Chromium/Electron 会丢弃 PostMessage 合成消息</strong>：<code>dispatch:'background'</code>
+对这类应用可能无效（实测新记事本会丢 WM_CHAR——消息入队成功但应用静默丢弃，
+读回验证无落盘，结果里 <code>verified:false</code> 会提示）；<code>close_window</code> 对 WinUI 记事本
+实测是<strong>直接干净关闭、不弹"是否保存"对话框</strong>（经典 Win32 应用才会弹）。
+这类目标用 <code>foreground</code>/<code>clipboard</code> 路径。</li>
+<li>提权窗口（UAC / 管理员程序）的 UIA 与合成输入会被 Windows 拦截，读不到也点不了。</li>
+<li>元素路径 id 会 stale：UI 重排后 <code>click</code> 可能点错，先重新 <code>snapshot</code>/<code>find</code>。</li>
+<li>高 DPI 多显示器下坐标以<strong>物理像素</strong>为准（后端显式 Per-Monitor V2 DPI）。</li>
+<li>OCR 对 CJK 文本按<strong>字符</strong>给词框（引擎特性），不是按词；坐标足够点选。</li>
+<li>本项目是 <a href="https://github.com/cgissing/windows-computer-use">cgissing/windows-computer-use</a>
+（MIT）的<strong>衍生作品</strong>：引擎核心与 MCP server 骨架来自上游，<code>docs/wiki/</code> 为其文档原样收录；
+本项目新增了 DSH 集成、WGC/OCR、homing/failsafe/identity guard、测试套件等（详见
+<code>THIRD_PARTY.md</code>，双方版权声明见 <code>LICENSE</code>）。</li>
+</ul>
+<h2>可扩展方向（来自调研，按价值排序）</h2>
+<ol>
+<li><strong>WGC 截图后端</strong>：Windows.Graphics.Capture 替代 PrintWindow——被遮挡窗口、
+最小化窗口、DirectComposition 表面都能抓（cua 的截图链第二级）</li>
+<li><strong>元素 id 改用 UIA <code>runtimeId</code></strong>（进程存活期内稳定，抗 UI 重排）</li>
+<li><strong>窗口身份 guard</strong>：动作前校验进程 PID/HWND 是否被重启替换
+（desktop-touch 的 <code>identity_changed</code>）</li>
+<li><code>type_text</code> 增加 <code>sendinput</code> 模式（KEYEVENTF_UNICODE 逐字符，不碰剪贴板，
+适合密码框）</li>
+<li><strong>OCR → 控件升级</strong>：OCR 找到文字后 <code>ControlFromPoint</code> 升级成控件级点击
+（iris-mcp 的 resolver 路由）</li>
+<li>打包成 <code>dsh.bundle</code> 用 <code>dsh plugin add</code> 一键安装（当前是本地路径 + patch 挂载）</li>
+</ol>

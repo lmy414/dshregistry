@@ -1,0 +1,252 @@
+<p><a href="https://github.com/JohnXu22786/pty-runner/blob/HEAD/README.zh.md">简体中文</a></p>
+<h1>backstage</h1>
+<p><strong>Background terminal job management plugin</strong> that gives <a href="https://github.com/deepseek-ai/deepseek-harness">DeepSeek Harness</a> (dsh) persistent background process (PTY) management.</p>
+<p>When an AI agent runs dev servers, watch tasks or long builds, ordinary one-shot shell calls are not enough: the process is reaped when the call ends, and the agent cannot send interactive input or read later output. This plugin runs such processes in <strong>dedicated background terminal sessions</strong> (jobs) that the agent can, at any time:</p>
+<ul>
+<li>Launch a process that keeps running independently (PTY, interactive programs supported)</li>
+<li>Write input to the process (plain text or control sequences like <code>\x03</code>)</li>
+<li>Page through process output (ring buffer, regex filtering, resume from a breakpoint)</li>
+<li>List all jobs by status/group</li>
+<li>Stop processes gracefully or forcefully, with unified cleanup on plugin unload</li>
+</ul>
+<h2>Feature overview</h2>
+<table>
+<thead>
+<tr>
+<th>Capability</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>Background execution</td>
+<td>Processes run in their own pseudo-terminal; they do not exit when the tool call ends</td>
+</tr>
+<tr>
+<td>Concurrent jobs</td>
+<td>Manage any number of jobs at once, each with its own buffer and state</td>
+</tr>
+<tr>
+<td>Interactive input</td>
+<td>Write plain text and escape control sequences (Ctrl+C, arrow keys, ESC, ...)</td>
+</tr>
+<tr>
+<td>Ring output buffer</td>
+<td>Each job keeps the most recent N lines (default 5000), terminal escape sequences stripped</td>
+</tr>
+<tr>
+<td>Paged reads</td>
+<td>Resume from a global line number; regex filtering (grep-like) and case-insensitivity</td>
+</tr>
+<tr>
+<td>Exit detection</td>
+<td>Distinguishes normal exit (exit 0), crashes (non-zero exit code/signal) and deliberate termination</td>
+</tr>
+<tr>
+<td>Port hints</td>
+<td>Checks target port occupancy before launch; auto-detects service addresses from output (e.g. <code>http://localhost:5173</code>)</td>
+</tr>
+<tr>
+<td>Group management</td>
+<td>Jobs can be tagged with groups; a whole group can be stopped in one call</td>
+</tr>
+<tr>
+<td>Timeout protection</td>
+<td>Optional <code>timeoutMs</code>; jobs are terminated automatically on timeout</td>
+</tr>
+<tr>
+<td>Exit notification</td>
+<td>Optional: inject a notice into the session when a job ends (no polling)</td>
+</tr>
+<tr>
+<td>Cross-platform</td>
+<td>Windows (ConPTY) / macOS / Linux; falls back to a pipe backend when no native module is available</td>
+</tr>
+</tbody></table>
+<h2>Installing in DSH</h2>
+<pre><code>npm i -g @deepseek-ai/dsh        # or npx @deepseek-ai/dsh
+dsh plugin --profile demo add github:JohnXu22786/pty-runner
+dsh --profile demo               # start
+</code></pre>
+<p>Remove with:</p>
+<pre><code>dsh plugin --profile demo remove dsh-backstage
+</code></pre>
+<h2>Installation</h2>
+<p>Requirements: Node.js ≥ 20, npm or pnpm.</p>
+<h3>Option 1: install as a bundle into a profile (recommended)</h3>
+<p>From any directory (for example the directory above this plugin), after installing the dsh CLI:</p>
+<pre><code>npm i -g @deepseek-ai/dsh        # or npx @deepseek-ai/dsh
+dsh plugin --profile demo add /path/to/pty-runner
+dsh --profile demo --dump-config # should show the "# == dsh-backstage" layer
+dsh --profile demo               # start
+</code></pre>
+<p><code>dsh plugin add</code> does three things: links this package into the profile's dependencies, appends <code>dsh-backstage</code> to <code>dsh.profile.bundles</code>, and applies the plugin line declared in this package's <code>cordis.patch.yml</code>. Afterwards <code>dsh plugin --profile demo remove dsh-backstage</code> uninstalls it completely.</p>
+<h3>Option 2: load as an overlay (local development)</h3>
+<p>This package ships a <code>cordis.patch.yml</code> declaring the plugin line; it can also be mounted onto any profile directly with <code>--patch</code>:</p>
+<pre><code># POSIX
+dsh web --patch /path/to/pty-runner/cordis.patch.yml
+</code></pre>
+<blockquote>
+<p><strong>Windows note</strong>: if <code>name</code> in the patch points at a local file, it must be written as a <code>file:///</code> URL,
+otherwise the loader reports <code>ERR_UNSUPPORTED_ESM_URL_SCHEME</code>. Example:</p>
+<pre><code>- insert:
+    - id: backstage
+      name: 'file:///D:/path/to/pty-runner/src/index.js'
+</code></pre>
+<p>When installed as a bundle (Option 1), <code>name</code> resolves to the package name and there is no such restriction.</p>
+</blockquote>
+<p>Load succeeds when the log shows <code>[backstage] ready: backend=auto bufferCapacity=5000 ...</code>.</p>
+<h2>Configuration</h2>
+<p>The plugin accepts optional configuration (in the <code>config</code> block of the patch line or a profile patch layer); everything has a default, and illegal values fail plugin loading rather than running half-configured:</p>
+<pre><code>- insert:
+    - id: backstage
+      name: dsh-backstage
+      config:
+        bufferCapacity: 20000   # output lines kept per job (100-200000, default 5000)
+        defaultGroup: 'default' # default group tag when none is specified
+        backend: 'auto'         # 'pty' (real pseudo-terminal) | 'pipe' (pipe fallback) | 'auto'
+        stopGraceMs: 1500       # grace period for graceful stop, then force kill (50-60000)
+        portScan: true          # check requested port occupancy before launch
+</code></pre>
+<p><code>backend</code> semantics: <code>pty</code> uses node-pty (ConPTY on Windows) and interactive programs behave exactly as on a real terminal; <code>pipe</code> uses a plain subprocess pipe without terminal semantics (programs that only flush when a TTY is present may buffer output), with zero native dependencies; <code>auto</code> prefers pty and degrades to pipe when no native module is available.</p>
+<h2>Tool interface</h2>
+<p>The plugin exposes 7 tools to the model (all prefixed <code>bg_</code> to avoid collisions with built-in tool families):</p>
+<table>
+<thead>
+<tr>
+<th>Tool</th>
+<th>Purpose</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>bg_launch</code></td>
+<td>Launch a background job (command, args, cwd, env, title, group, timeout, port pre-check, exit notification)</td>
+</tr>
+<tr>
+<td><code>bg_send</code></td>
+<td>Write input to a job's terminal (escape control sequences supported)</td>
+</tr>
+<tr>
+<td><code>bg_read</code></td>
+<td>Page through the output buffer (resume <code>from</code>, <code>limit</code>, regex <code>pattern</code>, case-insensitivity)</td>
+</tr>
+<tr>
+<td><code>bg_list</code></td>
+<td>List all jobs or filter by group/status (PID, status, output stats, detected service addresses)</td>
+</tr>
+<tr>
+<td><code>bg_stop</code></td>
+<td>Stop one job (graceful → force kill; <code>drop</code> deletes the record)</td>
+</tr>
+<tr>
+<td><code>bg_stop_group</code></td>
+<td>Stop all jobs in a group</td>
+</tr>
+<tr>
+<td><code>bg_drop</code></td>
+<td>Clear records of finished jobs (by id or by group)</td>
+</tr>
+</tbody></table>
+<h3>Input escapes</h3>
+<p><code>bg_send</code>'s <code>data</code> supports backslash escapes, decoded to real bytes before writing:</p>
+<table>
+<thead>
+<tr>
+<th>Escape</th>
+<th>Meaning</th>
+<th>Escape</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>\xHH</code></td>
+<td>Hex byte (e.g. <code>\x03</code> = Ctrl+C)</td>
+<td><code>\cX</code></td>
+<td>Control character (<code>\cC</code> = Ctrl+C, <code>\c?</code> = DEL)</td>
+</tr>
+<tr>
+<td><code>\n</code> <code>\r</code> <code>\t</code></td>
+<td>newline / CR / tab</td>
+<td><code>\e</code> <code>\a</code> <code>\0</code> <code>\b</code></td>
+<td>ESC / BEL / NUL / backspace</td>
+</tr>
+<tr>
+<td><code>\\</code></td>
+<td>literal backslash</td>
+<td><code>\uXXXX</code></td>
+<td>Unicode character</td>
+</tr>
+</tbody></table>
+<p>Unknown escapes (e.g. <code>\q</code>) are kept as-is and never silently dropped. Under the Windows pty (ConPTY) backend, a bare <code>\n</code> is converted to the <code>\r</code> required by ConPTY line mode (<code>\r\n</code> stays untouched); the pipe backend writes raw bytes.</p>
+<h3>Exit status semantics</h3>
+<p>Each job's <code>status</code> moves through: <code>running</code> → <code>stopping</code> → terminal <code>finished</code> (exit 0) | <code>failed</code> (non-zero exit code or signal, i.e. crash detection) | <code>stopped</code> (terminated by stop/timeout/plugin unload; <code>reason</code> distinguishes <code>user</code> / <code>timeout</code> / <code>shutdown</code> / <code>forced</code>).</p>
+<h3>Output buffer semantics</h3>
+<p>The <code>lines</code> returned by <code>bg_read</code> carry a global line number <code>index</code>; <code>next</code> in the response is the starting point for the next page, and <code>truncated</code> / <code>dropped</code> hint whether history was cut because of the capacity limit. An unterminated trailing line (process still writing) participates in reads as the latest line.</p>
+<h2>Events and the service interface</h2>
+<p>The plugin provides a service under the same name via <code>ctx.provide('backstage', api)</code>; other plugins can <code>inject: ['backstage']</code> to drive jobs programmatically, or subscribe to events:</p>
+<pre><code>export const inject = ['tools', 'backstage']
+export function apply(ctx) {
+  // subscribe to job exit events (returns a disposer; auto-unsubscribed on plugin unload)
+  ctx.backstage.onExit(({ id, status, exitCode, reason }) =&gt; { /* ... */ })
+  // other methods: launch / stop / stopGroup / read / write / list / stats / drop ...
+}
+</code></pre>
+<p>Events: <code>exit</code> (job ended; payload carries id/status/exitCode/reason/info), <code>created</code> (new job), <code>data</code> (output available), <code>dropped</code> (record cleared) — mirrored on the service surface by the <code>onExit</code> / <code>onCreated</code> / <code>onData</code> / <code>onDropped</code> subscription helpers.</p>
+<h3>Exit notification</h3>
+<p>When <code>bg_launch</code> is called with <code>notifyOnExit: true</code>, the plugin injects a <code>notice</code> context into the session via <code>exec.agent.inject()</code> as soon as the job ends (job status, exit code and a reading hint); the next model request sees it — no polling needed. Failed injections (e.g. agent already destroyed) are silently swallowed and do not affect job state settlement.</p>
+<h2>How the harness loads this plugin</h2>
+<p>This plugin follows the dsh (Cordis) plugin contract; it is a standard "bundle-type" plugin package:</p>
+<ol>
+<li><strong>Manifest</strong>: <code>dsh.bundle.patch</code> in <code>package.json</code> points at <code>cordis.patch.yml</code> — the config layer the bundle contributes. Profiles apply bundle layers in <code>dsh.profile.bundles</code> order, then user patch layers on top.</li>
+<li><strong>Entry</strong>: <code>src/index.js</code> is the plugin module; <code>main</code> in <code>package.json</code> points at it. The module declares plugin metadata via named exports, which the harness loader (Cordis) resolves and invokes:<ul>
+<li><code>name</code> — plugin name (<code>backstage</code>)</li>
+<li><code>inject: ['tools']</code> — required harness services; the plugin loads only after all are ready</li>
+<li><code>apply(ctx, config)</code> — registers capabilities: <code>ctx.tools.register(defineTool(...))</code> registers the 7 tools (registration is tied to the plugin lifecycle and auto-unregistered on unload); <code>ctx.provide('backstage', api)</code> provides the service; <code>ctx.effect(...)</code> registers unload cleanup (Cordis awaits that disposer's Promise, so unload stops every job before finishing)</li>
+</ul>
+</li>
+<li><strong>Tool definitions</strong>: <code>src/tools/index.js</code> declares parameter JSON Schemas, canonical outputs and model-facing <code>render</code> with <code>defineTool</code> from <code>@deepseek-ai/dsh-tools</code>; the schemas flow into system prompt assembly automatically.</li>
+<li><strong>Unload</strong>: when the plugin line is removed or the harness shuts down, Cordis runs all effects in reverse order — registered tools, the service and job processes are cleaned up, leaving no background orphans.</li>
+</ol>
+<p>Language-agnostically: <strong>a dsh plugin = a module exporting <code>apply(ctx, config)</code> + a line declaring it in a patch layer</strong>. This plugin's <code>cordis.patch.yml</code> is that line; <code>dsh.bundle</code> in <code>package.json</code> tells the installer which layer it contributes.</p>
+<h2>Examples</h2>
+<h3>Command-line smoke test (no dsh needed)</h3>
+<pre><code>npm install
+node examples/mini-harness.js   # loads the plugin with the bundled mini harness and runs launch → read → write → stop
+npm test                        # 95 unit and integration tests (node --test)
+</code></pre>
+<p><code>examples/mini-harness.js</code> doubles as the smallest readable example of "how a plugin-based harness loads it": it simulates <code>ctx.tools.register</code> / <code>ctx.provide</code> / <code>ctx.effect</code> and calls <code>apply</code> per the real contract.</p>
+<h3>Conversation use case</h3>
+<blockquote>
+<p>User: run the vite dev server in the background, and make sure port 5173 is free.
+agent: <code>bg_launch(command: "npm", args: ["run", "dev"], title: "vite", ports: [5173], notifyOnExit: true)</code>
+→ returns job id <code>bg_xxx</code>, status running, empty warnings (port is free).
+Later, when the agent needs it: <code>bg_read(id, limit: 50)</code> for the latest log; <code>bg_send(id, data: "\\x03")</code> to interrupt; after editing code <code>bg_send(id, data: "rs\\n")</code> to trigger a restart; at wrap-up <code>bg_stop(id, drop: true)</code>.</p>
+</blockquote>
+<h2>Directory structure</h2>
+<pre><code>pty-runner/
+├── package.json          # package metadata + dsh.bundle manifest
+├── cordis.patch.yml      # bundle config layer: declares the plugin line
+├── src/
+│   ├── index.js          # plugin entry: name / inject / apply
+│   ├── core/             # harness-agnostic core (independently testable)
+│   │   ├── registry.js   # job registry and lifecycle state machine
+│   │   ├── launcher.js   # pty / pipe dual-backend process launcher
+│   │   ├── history.js    # line-level ring buffer and paged reads
+│   │   ├── ansi.js       # stateful ANSI escape sequence stripping
+│   │   ├── escape.js     # input escape decoding and echo description
+│   │   ├── portprobe.js  # port occupancy probing and service address detection
+│   │   ├── config.js     # config defaults and validation
+│   │   └── index.js      # core export aggregation (package exports "./core")
+│   ├── tools/index.js    # 7 defineTool definitions
+│   └── host/service.js   # backstage service surface
+├── examples/mini-harness.js
+└── test/                 # node --test tests
+</code></pre>
+<h2>Known limitations</h2>
+<ul>
+<li>The <code>pipe</code> backend has no TTY semantics: line-buffered program output may lag and interactive TUIs are unusable; for production install node-pty (<code>pty</code>/<code>auto</code> backend).</li>
+<li>Process output is treated as text (UTF-8 decoding); no fidelity promise for binary output. Extremely long unterminated lines (beyond 65536 characters, ~64 KiB ASCII) keep their tail and count toward <code>dropped</code>, to keep memory bounded.</li>
+<li>The force-kill fallback of <code>stop</code> waits at most 2 more seconds on extremely stubborn processes, then marks them <code>forced</code> and lets the system reap them.</li>
+<li>On Windows, node-pty's <code>kill()</code> does not accept signal names (it throws); the plugin handles this per-platform. Some Windows environments print node-pty's internal <code>AttachConsole failed</code> noise when creating a ConPTY session (start/stop); it does not affect functionality.</li>
+</ul>
+<h2>License</h2>
+<p>MIT — see <a href="https://github.com/JohnXu22786/pty-runner/blob/HEAD/LICENSE">LICENSE</a>.</p>

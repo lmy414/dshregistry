@@ -1,0 +1,228 @@
+<h1>dsh-tool-pcb-parts-search</h1>
+<p><a href="https://github.com/Huaqiu-Electronics/dsh-pcb-parts-search/blob/HEAD/README.en.md">English</a></p>
+<p>DSH PCB 元器件搜索工具插件 —— 按关键词搜索 IC / 有源 / 无源电子元器件，用于 PCB 设计与 EDA 选型。通过芯灵（eda.cn）queryPage 接口查询，默认只返回带 EDA 模型（原理图符号 / PCB 封装）的器件。</p>
+<p><a href="https://github.com/Huaqiu-Electronics/dsh-pcb-parts-search/blob/HEAD/LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License"></a></p>
+<h2>动机</h2>
+<p>Agent 做 PCB 设计、原理图绘制、BOM 选型时，需要按型号或描述查找电子元器件。现有路径是起 <code>bash</code> 进程让模型现写 <code>curl</code> 脚本调搜索引擎：</p>
+<ol>
+<li><strong>每次调用都起进程</strong>——Windows 上尤其昂贵，且模型手写 HTTP 请求错误率高</li>
+<li><strong>结果不可结构化</strong>——模型从网页 HTML 里提取型号、描述、数据手册地址，字段缺失/格式混乱是常态</li>
+<li><strong>无法保证可设计性</strong>——搜到的器件不一定有 EDA 模型（原理图符号 / PCB 封装），放进设计后发现无法布局连线</li>
+</ol>
+<p>本插件封装芯灵 queryPage 搜索接口为一次函数调用，毫秒级返回结构化 JSON（mpn / 制造商 / 描述 / 数据手册），默认过滤出带 EDA 模型的器件，保证结果可直接用于 PCB 设计。</p>
+<h2>安全模型</h2>
+<ul>
+<li><strong>白名单域名</strong>：仅向写死的 <code>https://www.eda.cn/api/chiplet/products/queryPage</code> 发送 POST 请求，不接受用户传入的 URL</li>
+<li><strong>入口参数双重校验</strong>：工具入口（<code>runSearch</code>）与 API 客户端（<code>queryPageSearch</code>）各自独立校验，不依赖上游 schema<ul>
+<li><code>keyword</code>：非空字符串，≤200 字符</li>
+<li><code>page_size</code>：整数 1–50</li>
+<li><code>require_eda_model</code>：布尔值</li>
+</ul>
+</li>
+<li><strong>HTTP 状态码 + 业务 code 双重校验</strong>：HTTP 200 不代表业务成功，必须再检查响应体 <code>code === 200000</code>（eda.cn 接口的坑，详见 <a href="https://github.com/Huaqiu-Electronics/dsh-pcb-parts-search/blob/HEAD/src/queryPage.ts">queryPage.ts</a> 文件头注释）</li>
+<li><strong>防御性结构解包</strong>：对 <code>result[].queryPartVO.part</code> 做空值过滤，避免下游 <code>map</code> 时 <code>undefined</code> 报错</li>
+<li><strong>字段白名单</strong>：返回只取 <code>mpn</code> / <code>manufacturer_id</code> / <code>part_desc</code> / <code>datasheet</code> 四个字段，不透传接口原始返回的其他字段</li>
+<li><strong>超时兜底</strong>：<code>timeoutMs: 15000</code>（网络请求，高于纯计算工具的 1000ms）</li>
+<li>工具参数会记入会话日志，不要传入敏感数据</li>
+</ul>
+<h2>架构</h2>
+<pre><code>┌──────────────────────────────────────┐
+│            DSH Agent                  │
+│  tool call: pcb_parts_search { ... }  │
+└──────────────┬───────────────────────┘
+               │ ctx.tools.register()
+┌──────────────▼───────────────────────┐
+│         src/index.ts                  │
+│         Cordis 插件入口                │
+│  runSearch() → queryPageSearch()      │
+│  renderResults() → 文本块              │
+└──────────────┬───────────────────────┘
+               │
+┌──────────────▼───────────────────────┐
+│         src/queryPage.ts              │
+│  fetch(SEARCH_URL, POST)              │
+│  HTTP 校验 → code 校验 → 结构拍平       │
+└──────────────────────────────────────┘
+</code></pre>
+<ul>
+<li><code>src/index.ts</code>：Cordis 插件入口（<code>name</code>/<code>inject</code>/<code>apply</code>），注册 <code>pcb_parts_search</code> 工具；含参数防御、结果映射、文本渲染</li>
+<li><code>src/queryPage.ts</code>：<code>queryPageSearch(keyword, options): Promise&lt;QueryPagePart[]&gt;</code>——请求 eda.cn 接口，校验 HTTP + 业务 code，拍平嵌套结构</li>
+<li><code>src/invariant.ts</code>：不变量伴随插件（无运行时不变量，行为由测试覆盖）</li>
+</ul>
+<h2>工具声明</h2>
+<p>注册 <code>pcb_parts_search</code> 工具（<code>@deepseek-ai/dsh-tool-pcb-parts-search</code>，row id <code>tool-pcb-parts-search</code>），输出 JSON 文本字符串。</p>
+<table>
+<thead>
+<tr>
+<th>参数</th>
+<th>类型</th>
+<th>必填</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>keyword</code></td>
+<td>string</td>
+<td>✅</td>
+<td>搜索关键词：型号（如 <code>"STM32F103C8T6"</code>）、描述（如 <code>"32-bit microcontroller 72MHz"</code>）或组合值（如 <code>"0402 10k resistor"</code>）。≤200 字符。模糊匹配，可能返回型号相近的候选</td>
+</tr>
+<tr>
+<td><code>page_size</code></td>
+<td>integer</td>
+<td></td>
+<td>最多返回条数，范围 1–50，默认 5。选型用 5–10 即可；广泛对比可调大</td>
+</tr>
+<tr>
+<td><code>require_eda_model</code></td>
+<td>boolean</td>
+<td></td>
+<td>是否只返回有 EDA 模型（原理图符号 + PCB 封装）的器件，默认 <code>true</code>。仅做调研不需要布局时设 <code>false</code></td>
+</tr>
+</tbody></table>
+<h2>返回格式</h2>
+<p>JSON 数组，每项结构如下：</p>
+<pre><code>[
+  {
+    "mpn": "STM32F103C8T6",
+    "mfgid": "8598",
+    "description": "ARM Cortex-M3 32位微控制器 72MHz 64KB Flash LQFP-48",
+    "datasheet": "//file.eda.cn/web2/M00/1B/31/pYYBAGGCZMuAXwY2AAV0cV9Yibc636.pdf"
+  }
+]
+</code></pre>
+<p>渲染输出（给对话 UI 展示）：</p>
+<pre><code>1. STM32F103C8T6 (mfgid: 8598) — ARM Cortex-M3 32位微控制器 72MHz 64KB Flash LQFP-48
+   datasheet: https://file.eda.cn/web2/M00/1B/31/pYYBAGGCZMuAXwY2AAV0cV9Yibc636.pdf
+</code></pre>
+<blockquote>
+<p><code>datasheet</code> 字段可能是协议相对 URL（<code>//</code> 开头），渲染时自动补 <code>https:</code> 前缀。</p>
+</blockquote>
+<h2>示例</h2>
+<pre><code>pcb_parts_search { keyword: "STM32F103C8T6" }
+  → [{ "mpn": "STM32F103C8T6", "mfgid": "8598", "description": "...", "datasheet": "..." }]
+
+pcb_parts_search { keyword: "0402 10k resistor", page_size: 10 }
+  → [{ "mpn": "RK73H1JTTD1003F", "mfgid": "8598", "description": "0402 10kΩ ±1% 贴片电阻", "datasheet": "..." }, ...]
+
+pcb_parts_search { keyword: "LM358", require_eda_model: false }
+  → [{ "mpn": "LM358", "mfgid": "...", "description": "双运算放大器", "datasheet": "..." }, ...]
+</code></pre>
+<h2>边界行为</h2>
+<table>
+<thead>
+<tr>
+<th>情况</th>
+<th>处理</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>空关键词</td>
+<td>报错：<code>pcb_parts_search: keyword cannot be empty</code></td>
+</tr>
+<tr>
+<td>关键词 &gt;200 字符</td>
+<td>报错：<code>pcb_parts_search: keyword too long (N &gt; 200)</code></td>
+</tr>
+<tr>
+<td><code>page_size</code> 非整数或超出 1–50</td>
+<td>报错：<code>pcb-parts-search: pageSize must be an integer between 1 and 50</code></td>
+</tr>
+<tr>
+<td><code>page_size</code> 非数字</td>
+<td>回退默认值 5</td>
+</tr>
+<tr>
+<td><code>require_eda_model</code> 非布尔</td>
+<td>回退默认值 <code>true</code></td>
+</tr>
+<tr>
+<td>HTTP 非 200</td>
+<td>报错：<code>pcb-parts-search: HTTP &lt;status&gt;</code></td>
+</tr>
+<tr>
+<td>业务 <code>code !== 200000</code></td>
+<td>报错：<code>pcb-parts-search: 接口返回异常: &lt;code&gt; &lt;message&gt;</code></td>
+</tr>
+<tr>
+<td><code>result</code> 数组为空</td>
+<td>返回空数组 <code>[]</code>，渲染输出 <code>No PCB parts matched the search criteria.</code></td>
+</tr>
+<tr>
+<td><code>result[].queryPartVO.part</code> 为 null</td>
+<td>过滤掉该项，不报错</td>
+</tr>
+<tr>
+<td>器件字段缺失</td>
+<td>回退为空串 <code>""</code>，不出现 <code>undefined</code></td>
+</tr>
+<tr>
+<td>datasheet 为协议相对 URL</td>
+<td>渲染时补 <code>https:</code> 前缀；JSON 输出保留原始值</td>
+</tr>
+<tr>
+<td>网络超时</td>
+<td>15s 后工具超时，由 DSH 超时机制处理</td>
+</tr>
+</tbody></table>
+<h2>关键词搜索 vs 精确查询</h2>
+<p>queryPage 的 <code>desc</code> 字段是<strong>模糊关键词匹配</strong>，不是 MPN 精确查询。传入 MPN 当关键词能搜到候选列表，但列表里可能混入型号相近的其他器件，顺序也不保证"精确匹配排最前"。需要精确定位到某一条时，调用方需自行在返回结果里按 <code>mpn</code>（建议大小写不敏感）+ <code>mfgid</code> 做二次过滤。</p>
+<h2>npm 0.1.0-rc.6 兼容</h2>
+<p>本插件遵循 DSH 0.1.0-rc.6（npm）依赖线：</p>
+<ul>
+<li><strong>类型/运行时</strong>：<code>@deepseek-ai/cordis: ^4.0.1</code> + <code>@deepseek-ai/dsh-tools: &gt;=0.0.1-rc.1 &lt;0.2.0</code> + <code>@deepseek-ai/dsh-invariants: &gt;=0.0.1-rc.1 &lt;0.2.0</code>（peer）</li>
+<li><strong>独立构建</strong>：<code>npm install</code>（devDependencies 自包含 typescript/vitest/@types/node）→ <code>npm run typecheck</code> → <code>npm test</code> → <code>npm run build</code> → <code>npm pack</code></li>
+<li><strong>bundle 声明</strong>：<code>package.json</code> 的 <code>dsh.bundle.patch</code>（指向 <code>cordis.patch.yml</code>）+ <code>exports</code> 导出</li>
+<li><strong>patch 格式</strong>：<code>cordis.patch.yml</code> 使用 <code>- insert:</code> 列表（DSH 0.1.0-rc.6 的 patch 是 id-targeted 语义，裸 <code>- id:</code> 条目会报 <code>entry not found</code>）</li>
+<li><strong>files</strong>：发布 tarball 含 <code>lib/</code>、<code>src/</code>、<code>cordis.patch.yml</code></li>
+</ul>
+<h2>安装</h2>
+<h3>Profile Bundle（推荐）</h3>
+<pre><code># 交互式（web）profile
+dsh plugin --profile web add &lt;repo-or-tarball&gt;
+# 一次性任务（headless）profile —— dsh run 默认使用 headless
+dsh plugin --profile headless add &lt;repo-or-tarball&gt;
+</code></pre>
+<p>也可以先用 <code>npm pack</code> 打出 tarball 再安装：</p>
+<pre><code>cd dsh-pcb-parts-search
+npm install &amp;&amp; npm pack
+dsh plugin --profile web add ./deepseek-ai-dsh-tool-pcb-parts-search-*.tgz
+dsh plugin --profile headless add ./deepseek-ai-dsh-tool-pcb-parts-search-*.tgz
+</code></pre>
+<p>包内 <code>dsh.bundle.patch</code>（指向 <code>cordis.patch.yml</code>）会在安装后自动把插件加入 profile 的 layer stack（row id：<code>tool-pcb-parts-search</code>）。插件缺失的 peer 依赖（<code>@deepseek-ai/cordis</code>、<code>@deepseek-ai/dsh-tools</code>、<code>@deepseek-ai/dsh-invariants</code>）由 profile 的 healed <code>profiles/node_modules</code> 回退安装提供。</p>
+<blockquote>
+<p>⚠️ web 与 headless 是<strong>不同 profile</strong>：web 安装不会自动覆盖 headless；<code>dsh run</code> 默认使用 headless profile。Windows 路径使用正斜杠（<code>C:/...</code>）。</p>
+</blockquote>
+<h3>验证安装</h3>
+<pre><code>dsh --profile web --dump-config | grep tool-pcb-parts-search
+</code></pre>
+<h3>运行验证</h3>
+<pre><code>dsh run "使用 pcb_parts_search 工具搜索 STM32F103C8T6"
+</code></pre>
+<h3>源码开发依赖链接</h3>
+<p>本插件 peer 依赖来自 DSH monorepo。源码开发时需链接依赖：</p>
+<pre><code># Windows (PowerShell)
+New-Item -ItemType Junction -Path "node_modules\cordis" -Target "C:\code\deepseek-harness\vendor\cordis" -Force
+New-Item -ItemType Junction -Path "node_modules\@deepseek-ai\dsh-tools" -Target "C:\code\deepseek-harness\packages\core\tools" -Force
+New-Item -ItemType Junction -Path "node_modules\@deepseek-ai\dsh-invariants" -Target "C:\code\deepseek-harness\packages\runtime-diagnostics\invariants" -Force
+</code></pre>
+<h2>用法</h2>
+<p>安装后，agent 自动获得 <code>pcb_parts_search</code> 工具：</p>
+<pre><code>pcb_parts_search { keyword: "STM32F103C8T6", page_size: 10 }  →  [{ "mpn": "...", ... }]
+</code></pre>
+<p>工具名满足 DeepSeek 函数名约束（≤64 字符，<code>[A-Za-z0-9_-]</code>）。注册后自动进入 Code Mode SDK（<code>await tools.pcb_parts_search(...)</code>），canonical 返回值为 JSON 文本字符串。</p>
+<h2>已知限制</h2>
+<ol>
+<li><strong>仅支持关键词搜索</strong>：queryPage 的 <code>desc</code> 是模糊匹配，不是 MPN 精确查询；需要精确定位时调用方需自行二次过滤</li>
+<li><strong>数据源单一</strong>：仅查询芯灵 eda.cn，不聚合 DigiKey / Mouser / LCSC 等其他元器件平台</li>
+<li><strong>需要网络访问</strong>：工具会向 <code>www.eda.cn</code> 发送 HTTPS 请求，离线环境不可用</li>
+<li><strong>接口可用性依赖第三方</strong>：eda.cn 服务不可用时工具会报错，无降级策略</li>
+<li><strong>返回字段有限</strong>：只取 mpn / mfgid / description / datasheet，不包含库存、价格、封装尺寸等采购信息</li>
+</ol>
+<h2>测试</h2>
+<pre><code>npm test
+</code></pre>
+<ul>
+<li><code>register.spec.ts</code>：注册契约（AUDIT-CROSS-02 风格）——验证插件导出 <code>name</code>/<code>inject</code>/<code>apply</code>、工具注册名 <code>pcb_parts_search</code>、参数 schema、render 函数、timeout 配置</li>
+</ul>
+<h2>许可</h2>
+<p>MIT</p>

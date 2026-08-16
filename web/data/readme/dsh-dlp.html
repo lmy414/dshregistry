@@ -1,0 +1,429 @@
+<h1>dsh-dlp</h1>
+<p>Data-loss prevention for <a href="https://github.com/deepseek-ai/deepseek-harness">DeepSeek Harness</a>,
+built as an out-of-repo plugin.</p>
+<p>It does five things:</p>
+<ol>
+<li><strong>Denies credential-file access and secrets bound for the network</strong> — unconditionally, from
+<code>ctx.tools.guard()</code>. It tests the path-typed arguments of a call against a table of
+credential stores, following symlinks first.</li>
+<li><strong>Redacts secrets out of tool results</strong> before the model reads them and before the session
+log records them, and withholds a result it cannot clean.</li>
+<li><strong>Redacts secrets out of exported telemetry</strong>, patching a hole where <code>DSH_TELEMETRY_MODE=FULL</code>
+ships message text, tool arguments, tool results and workspace paths in the clear.</li>
+<li><strong>Strips the invisible characters that carry hidden instructions</strong> out of tool results —
+the Tags block and bidi overrides — and counts the classes it will not touch because they
+also appear in legitimate text.</li>
+<li><strong>Writes an audit record for every decision</strong> to its own sink — rule id, rule version,
+offsets, and a keyed hash. Never the secret, and never the path or command that matched.
+<code>dsh-dlp report</code> reads that sink back.</li>
+</ol>
+<hr>
+<h2>What this is not</h2>
+<p><strong>This is not a containment boundary.</strong> The plugin runs in-process, in the agent's own process,
+at the agent's own uid. Anything the agent can execute — a <code>bash</code> command, a <code>run_code</code>
+program, a mounted MCP server — can read every file the guard denies and can open its own
+sockets without the plugin seeing anything. The guard closes the path where <em>the model</em> asks
+for credential material through a tool. It does not stop code that is already running.</p>
+<p>If you need containment, that is the sandbox, <code>landlock-run</code>, filesystem permissions, and
+egress firewalling. Use this alongside them, not instead of them.</p>
+<p>More limits worth stating up front:</p>
+<ul>
+<li><strong>The shell-command arm is advisory pattern-matching.</strong> A <code>bash</code> command line is split on
+shell-ish separators and each token is tested as a path. That catches an unobfuscated
+<code>cat ~/.ssh/id_rsa</code>. It catches nothing that tries: <code>cat ~/.netr?</code> (one glob character),
+<code>cat ~/.s""sh/id_r""sa</code>, <code>find ~ -name 'id_*' -exec cat {} +</code>, a <code>$(printf ...)</code>
+reassembly, a base64 round-trip of the path, or <code>python3 -c</code> opening the file — every one
+of those was verified to read the file with the guard abstaining. <strong>Do not count this arm
+as a control.</strong> A shell command is a program, not a path, and the only way to decide what
+it will open is to run it. If the agent has a shell, credential files need filesystem
+permissions or a sandbox, not this plugin.</li>
+<li><strong>Tool arguments are never masked.</strong> Model-visible implies logged: arguments are already in
+the session log and already presented to the model, so rewriting them would desynchronise
+the log from what actually ran. Argument-level DLP here is <em>denial with a reason the model
+can act on</em>.</li>
+<li><strong>Already-logged history cannot be rewritten; a not-yet-logged inbound message can.</strong> At
+<code>llm/stream</code> the options are deep-frozen and <code>next()</code> takes no arguments, so a request the
+agent has assembled goes out as it stands and a secret already in the conversation reaches
+the provider. That is not the whole rule, though: <code>agent/pre-step</code> is an async waterfall
+returning <code>{ kind: 'enter'; messages }</code>, and the only production append of <code>user/message</code>
+happens <em>after</em> it, so a message arriving from outside can still be rewritten before it is
+logged or presented. This release does not do that; it is recorded here because the earlier
+flat claim that outbound redaction is impossible was too strong.</li>
+<li><strong>A redacted value is not restored when the agent runs a command.</strong> <code>ctx.shellEnv</code> rebuilds a
+trusted <code>DSH_*</code> namespace for every model shell call, which is a way to hand <code>bash</code> and
+<code>pwsh</code> — and only those two — the real value behind a placeholder without the model ever
+seeing it. Planned work, not implemented here.</li>
+<li><strong>Detection is pattern-based.</strong> A password, an internal token format, or a customer record
+has no recognisable structure and is not detected. Neither is any encoded form: base64,
+hex, URL-escaping and reversal all pass both tiers, as does a secret split across two
+content blocks. <strong>A homoglyph defeats every rule in this package</strong>, including the
+invisible-character ones.</li>
+<li><strong>There is no entropy rule, and that was measured rather than assumed.</strong> Shannon entropy is
+bounded by log₂L for a string of length L, so a 20-character token cannot score above 4.32
+bits per character however random it is. At the threshold where ordinary tool output —
+hashes, minified bundles, base64 blobs, UUIDs — produces no false positives, the miss rate
+is 100% for anything up to 22 characters, which is most of the credential formats worth
+catching. A detector that fires on the long ones the prefix rules already catch and misses
+the rest is not worth the false positives it costs.</li>
+</ul>
+<p>The full list is in <a href="https://github.com/CharlotteN7/dsh-dlp/blob/HEAD/PLAN.md">PLAN.md §8</a>.</p>
+<hr>
+<h2>Install</h2>
+<p>A profile carrying only <code>@deepseek-ai/dsh-base</code> has no agent loop. Add a runnable
+bundle alongside it, or the profile boots with nothing for this plugin to guard:</p>
+<pre><code>dsh plugin --profile &lt;name&gt; add @deepseek-ai/dsh-headless@0.1.0-rc.6
+dsh plugin --profile &lt;name&gt; add dsh-dlp
+dsh --profile &lt;name&gt; --dump-config      # the dsh-dlp row should appear
+</code></pre>
+<p>Pin <code>@deepseek-ai/dsh-headless</code> explicitly: its npm <code>latest</code> tag still points at
+<code>0.0.1-rc.1</code>, so an unpinned install silently resolves to a much older harness.</p>
+<p>The package ships a <code>cordis.patch.yml</code> bundle layer, so listing it in a profile's
+<code>dsh.profile.bundles</code> is enough to mount it with working defaults.</p>
+<p><strong>Install from the registry or a packed tarball, not from a git spec.</strong>
+<code>dsh plugin add github:CharlotteN7/dsh-dlp</code> resolves and writes the dependency,
+but <code>lib/</code> is a build output that git does not carry and no <code>prepare</code> script
+rebuilds it, so the row mounts and then fails to load. To install from a
+checkout, build first and add the tarball:</p>
+<pre><code>git clone https://github.com/CharlotteN7/dsh-dlp &amp;&amp; cd dsh-dlp
+pnpm install &amp;&amp; pnpm run build &amp;&amp; pnpm pack
+dsh plugin --profile &lt;name&gt; add ./dsh-dlp-0.1.0.tgz
+</code></pre>
+<h2>Configure</h2>
+<pre><code>- id: dsh-dlp
+  name: 'dsh-dlp'
+  config:
+    auditLog: /var/log/dsh-dlp.audit.jsonl
+    redactionKeyFile: /var/lib/dsh/dsh-dlp.redaction-key
+    policyFile: ./.dsh-dlp.yml        # optional, lowest trust — see below
+    maxScanBytes: 1048576
+    breadthTier: true
+    resultRedaction: true
+    telemetryRedaction: true
+    redactTelemetryWorkspacePaths: true
+</code></pre>
+<p><code>redactionKeyFile</code> is created on first mount with 32 random bytes at mode <code>0600</code>. Keep it out
+of version control: it is what makes a placeholder's hash keyed rather than a bare digest that
+anyone holding a candidate secret could confirm.</p>
+<p><strong>The guard floor has no configuration.</strong> Credential-path denial and secret-argument denial are
+security invariants, not deployment-varying tunables, so there is no switch that turns them off.</p>
+<h3>Configuration trust ranking</h3>
+<table>
+<thead>
+<tr>
+<th>Rank</th>
+<th>Source</th>
+<th>May</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>1</td>
+<td>invariants compiled into the package</td>
+<td>everything; not configurable</td>
+</tr>
+<tr>
+<td>2</td>
+<td><code>cordis.yml</code> / bundle patch config</td>
+<td>set every field</td>
+</tr>
+<tr>
+<td>3</td>
+<td><code>policyFile</code> — a repo-local YAML file</td>
+<td><strong>tighten only</strong></td>
+</tr>
+</tbody></table>
+<p>Rank 3 is attacker-controlled — a hostile repository ships one, and a prompt-injected agent can
+write one — so it may only add deny patterns, add egress-capable tool names, raise a severity,
+and switch a redaction pass on:</p>
+<pre><code>v: 1
+addCredentialPaths:
+  - id: acme/vault-token
+    pattern: '(^|/)\.vault-token$'
+addEgressTools: [acme_publish]
+raiseSeverity:
+  dsh-dlp/secret-assignment: high
+enable: [telemetryRedaction]
+</code></pre>
+<p>Any other key, and any downgrade, makes the <strong>whole file invalid</strong>: it is reported on
+<code>process.stderr</code> and the deployment's logger, then ignored, never obeyed in part. There is no
+<code>disable</code>, no <code>removeCredentialPaths</code>, and no way to redirect the audit sink. The file is
+parsed with <code>js-yaml</code> under <code>JSON_SCHEMA</code>, so a <code>!!js/function</code> tag is a parse error rather
+than code execution, and it never goes near the Cordis loader.</p>
+<p>A missing <code>policyFile</code> is not an error — it means the workspace ships no policy. The
+recommended value is workspace-relative, so failing the mount would stop <code>dsh</code> from starting in
+every repository without one, and would let a hostile repository remove the floor by shipping a
+broken file. An added <code>pattern</code> is capped at 200 characters and rejected if it nests a
+quantifier inside a quantified group: <code>^(a+)+$</code> blocks the synchronous guard for seconds on a
+27-character path. That check is a heuristic, not a proof of linear-time matching.</p>
+<hr>
+<h2>What gets denied</h2>
+<p><strong>Credential paths named in a path-typed argument</strong>, for every tool: <code>.env</code> and <code>.env.*</code>
+directories (but not <code>.env.example</code>), anything under <code>.ssh/</code>,
+<code>id_rsa</code>/<code>id_ed25519</code>/<code>id_ecdsa</code>/<code>id_dsa</code> and their backups, <code>~/.aws/</code> and <code>~/.azure/</code>,
+<code>$DSH_HOME/.credentials.yaml</code>, <code>.netrc</code>, <code>.npmrc</code>, <code>.pypirc</code>, <code>.git-credentials</code>,
+<code>~/.config/gh/</code>, <code>~/.kube/</code> and <code>kubeconfig*</code>, <code>/etc/kubernetes/*.conf</code>,
+<code>~/.docker/config.json</code> and <code>.dockercfg</code>, gcloud credential files, <code>rclone.conf</code>, <code>.pgpass</code>,
+<code>.my.cnf</code>, <code>*service-account*.json</code>, <code>*.pem</code>/<code>*.p12</code>/<code>*.pfx</code>/<code>*.jks</code>/<code>*.keystore</code>/<code>*.key</code>/
+<code>*.asc</code>/<code>*.gpg</code>, and any file whose name ends in a delimited <code>credential(s)</code>, <code>secret(s)</code> or
+<code>token(s)</code> — which covers <code>.vault-token</code>, <code>.gem/credentials</code>, <code>.cargo/credentials.toml</code>,
+<code>.terraform.d/credentials.tfrc.json</code> and a Kubernetes service-account <code>token</code>. Source and
+documentation extensions are excluded from that last rule, so <code>src/auth/token.ts</code> stays
+readable.</p>
+<p>Also denied for every tool: this plugin's own <code>redactionKeyFile</code> and <code>auditLog</code>.</p>
+<p><strong><code>$DSH_HOME</code> is split by direction.</strong> Every <em>write</em> under the harness home is denied, for
+every tool: editing a profile's <code>cordis.yml</code> mounts an arbitrary plugin, which is the exact
+threat that makes the directory worth protecting. <em>Reads</em> are denied only where the contents
+are credentials — <code>$DSH_HOME/.credentials.yaml</code>, <code>$DSH_HOME/sessions/**</code>, <code>$DSH_HOME/.env</code>,
+this plugin's key file and audit log, and any <code>*.key</code> — so the installed plugin tree under
+<code>profiles/node_modules/</code> and every profile manifest stay readable. A blanket read denial there
+made debugging a plugin, reading a profile, and running the sibling <code>dsh-plugin-inspector</code>
+against an installed tree impossible, with a message saying the denial could not be overridden.</p>
+<p>Which side of that split a call lands on is decided by the tool's name, from a table of tools
+that can only look: <code>read</code>, <code>read_image</code>, <code>glob</code>, <code>grep</code>, <code>lsp</code>, the session-query tools,
+<code>job_list</code>, <code>job_output</code>, <code>terminal_list</code>, <code>terminal_read</code>, <code>list_agents</code>, <code>get_goal</code>.
+Every other name — every shell, every editor, every <code>mcp__*</code> tool, and any tool this build has
+never heard of — is treated as able to write, so a new tool is denied until it is classified.
+A shell is never on the read side even for a command that only reads: a shell that can <code>cat</code> a
+profile can also rewrite it.</p>
+<p>Paths are normalised first — <code>..</code> traversal, <code>~</code>, Windows separators, quoting and a trailing
+slash do not evade the table — and then resolved with <code>realpathSync</code>, so a symlink named
+<code>notes.txt</code> pointing at <code>~/.ssh/id_rsa</code> is denied by what it resolves to. Only path-typed
+argument keys are tested (<code>file_path</code>, <code>path</code>, <code>paths</code>, <code>notebook_path</code>, <code>cwd</code>, <code>command</code>, …).
+File content is never treated as a path: writing a <code>.gitignore</code> that lists <code>.env</code> is ordinary
+work, not an attempt to read a credential store.</p>
+<p><code>$DSH_HOME/.credentials.yaml</code> is on that list because core permits reading it. The harness has
+no file-read restriction in any mode — reads pass through untouched in every permission mode —
+so the provider token the agent authenticates with is agent-readable. That is the specific gap
+this plugin closes.</p>
+<p><strong>Some secrets in arguments</strong>, for tools that can move data off the machine. Local tools
+(<code>read</code>, <code>glob</code>, <code>grep</code>, <code>write</code>, <code>edit</code>, <code>todo_write</code>, the session-query tools, …) are exempt.
+Everything else — every shell, <code>run_code</code>, the web tools, every <code>mcp__*</code> tool, and any tool
+this build has never heard of — is treated as egress-capable. Unknown defaults to the safe side.</p>
+<p>What this arm actually catches is a whole, unencoded secret of <code>high</code> severity or above sitting
+in one argument string. <code>A=ghp_firsthalf; B=…; curl -H "Bearer $A$B"</code>, a base64 round-trip, and
+<code>$(cat ~/.token)</code> all defeat it; a <code>password=</code> assignment is <code>medium</code> and is redacted rather
+than denied. Treat it as a guard against accident, not against an adversary.</p>
+<p>A denial reads like this, and reaches the model as the tool's error result. It names the rule
+and a keyed hash, never the path — a path is itself sensitive, and this string is written to
+the model and, in hashed form, to the audit sink:</p>
+<pre><code>dsh-dlp denied "read": one of its path arguments is credential material (rule
+dsh-dlp/path-aws, keyed hash ca9cad27f2b5). Reading or passing credential files through a
+tool is blocked by policy and cannot be overridden. Ask the user to supply the value you
+need, or use a path that is not a credential store.
+</code></pre>
+<hr>
+<h2>What gets redacted</h2>
+<p>A redacted region becomes:</p>
+<pre><code>[REDACTED:dsh-dlp:slack-token:ca9cad27f2b5]
+</code></pre>
+<p>The hash is <code>HMAC-SHA256(installation key, replaced text)</code> truncated to 12 hex characters. It
+is <strong>stable</strong>: the same secret produces the same placeholder everywhere, so an operator can see
+that one token appeared in four different tool results without the plugin ever writing the
+token down.</p>
+<p>For a successful tool result the plugin replaces the canonical <code>value</code>, which makes the registry
+re-validate the tool's <code>output.schema</code>, re-run <code>output.render()</code> and re-derive
+<code>presentationMeta()</code> — so the value, the model-facing content and the persisted card are all
+redacted from one replacement. That arm is not a preference: the alternative, replacing
+<code>content</code>, leaves <code>{...result}</code> in place, and <code>value</code> and <code>meta</code> go into the session log
+exactly as the tool produced them. A successful result therefore never settles for the content
+arm, which is used only for a failed result (where replacing the value throws) or where the
+persisted surfaces are already clean.</p>
+<p>When neither works — a failed result whose <code>meta</code> carries a secret, or a value that still scans
+dirty after redaction — the result is <strong>withheld</strong>: the plugin returns a <code>block</code> decision, the
+model gets an error naming the rule and the hash, and nothing dirty reaches the log. Blocking
+is the only decision that replaces the whole result, so it is the only way to drop <code>meta</code>.</p>
+<p>Two consequences worth knowing:</p>
+<ul>
+<li>Replacing a value re-validates it against the tool's <code>output.schema</code>, and a schema that pins
+that string — an <code>enum</code>, a <code>const</code>, a <code>oneOf</code> branch it selects — would reject the
+placeholder. The plugin asks that question first and withholds the result with the message
+above, rather than letting the registry raise a <code>ToolOutputError</code> that names a validation
+failure and tells the model nothing it can act on. The call still fails; it fails
+comprehensibly. Where the plugin cannot answer the question — no schema resolved, or a
+schema whose own value it cannot validate — the registry decides as before.</li>
+<li>Redaction is per-detection, and each span grows to the nearest delimiter — whitespace,
+quotes, <code>=</code>, <code>:</code>, <code>,</code>, brackets. A line of minified JSON loses the field that matched, not
+the whole line.</li>
+</ul>
+<p>Replacement runs before the <code>tool/result</code> session event is appended, so the durable log records
+the redacted copy.</p>
+<h2>Detection</h2>
+<p>Two tiers:</p>
+<ul>
+<li><strong>Tier 1</strong>, synchronous and owned by this package: prefix-anchored token formats (AWS,
+GitHub, Slack, Stripe, OpenAI, Anthropic, Google, npm), PEM private-key blocks, JWTs,
+credential-bearing URLs, Slack/Discord/Teams webhook URLs, and high-signal secret
+assignments. This is the tier the guard and the telemetry listener use, because both of
+those seams are synchronous, and it is never capped.</li>
+<li><strong>Tier 2</strong>, <a href="https://github.com/secretlint/secretlint"><code>@secretlint/core</code></a> with the
+recommended preset — 28 maintained rules, in-process, no subprocess. Used at
+<code>tools/pre-execute</code> and <code>tools/post-execute</code>, the two seams that can await. <strong>The telemetry
+seam cannot reach it</strong>: <code>session-telemetry/record</code> returns a record synchronously, so a
+secret only secretlint recognises survives telemetry export.</li>
+</ul>
+<p>A tool result is scanned twice: each of its strings on its own by tier 1, and all of them
+joined by newlines through both tiers. The joined pass finds what no single string reproduces —
+a PEM block arriving as one line per array element, which is exactly the shape <code>read</code> produces.</p>
+<h3>Invisible characters</h3>
+<p>Tier 1 also looks for characters that hide text from the person reading a tool result while
+the model still reads it. The harness strips directional controls in exactly one place —
+session titles — and never on the tool-result path.</p>
+<table>
+<thead>
+<tr>
+<th>Class</th>
+<th>Code points</th>
+<th>What happens</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>Tags block</td>
+<td><code>U+E0000–U+E007F</code></td>
+<td>replaced</td>
+</tr>
+<tr>
+<td>Bidi overrides and isolates</td>
+<td><code>U+202A–U+202E</code>, <code>U+2066–U+2069</code></td>
+<td>replaced</td>
+</tr>
+<tr>
+<td>Zero-width</td>
+<td><code>U+200B–U+200D</code>, <code>U+2060</code>, <code>U+FEFF</code></td>
+<td>counted only</td>
+</tr>
+<tr>
+<td>Bidi marks</td>
+<td><code>U+061C</code>, <code>U+200E–U+200F</code></td>
+<td>counted only</td>
+</tr>
+<tr>
+<td>Variation selectors</td>
+<td><code>U+FE00–U+FE0F</code>, <code>U+E0100–U+E01EF</code></td>
+<td>counted only</td>
+</tr>
+</tbody></table>
+<p>The first two have no legitimate use in tool output — the Tags block is a full invisible ASCII
+alphabet, which is what makes it the standard carrier for a hidden instruction. The last three
+do: <code>U+200D</code> joins an emoji sequence and a variation selector picks a glyph, so replacing them
+would corrupt ordinary text. They are counted in the audit record's <code>unicode</code> field and left
+alone, as a <code>medium</code> finding.</p>
+<p>Every class is <code>medium</code>, below the severity at which the guard floor denies, so an invisible
+character is never turned into a denial. A replaced run becomes an ordinary placeholder and,
+unlike a secret, is replaced exactly: an invisible character is not widened to its surrounding
+delimiters, so the visible word it hid inside survives.</p>
+<p><strong>A homoglyph defeats all of this</strong>, and every other rule in this plugin. A Cyrillic <code>а</code> in
+<code>аdmin</code> is a normal, visible, legitimately-encoded character; detecting it means UTS #39
+confusable tables, which is a data set and a different cost class. This plugin does not attempt
+it, and no rule here should be read as covering it.</p>
+<p>Measured cost of the invisible-character scan over 512 KB, median of 30 runs on an i9-12900H
+under Node 22.23.2:</p>
+<table>
+<thead>
+<tr>
+<th>Input</th>
+<th>Cost</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>clean Latin-1 text</td>
+<td>0.002 ms</td>
+</tr>
+<tr>
+<td>one hidden instruction (69 characters)</td>
+<td>0.355 ms</td>
+</tr>
+<tr>
+<td>7,653 separate runs</td>
+<td>7.9 ms</td>
+</tr>
+<tr>
+<td>512 KB of alternating invisible characters (524,286 runs)</td>
+<td>56–113 ms</td>
+</tr>
+</tbody></table>
+<p>Clean text is free because every character in the table is above <code>U+00FF</code>: the regular
+expression engine rejects a Latin-1 string on its encoding without scanning it. The last row is
+a crafted input, not a plausible one, and it is the only case that leaves the ≤10 ms per result
+budget; <code>maxScanBytes</code> caps tier 2 only, so tier 1 always sees the whole result.</p>
+<p>Measured cost of a tier-2 scan: 0.78 ms at 1 KB, 0.91 ms at 16 KB, 2.22 ms at 128 KB, 5.11 ms
+at 512 KB. <code>maxScanBytes</code> caps <strong>tier 2 only</strong>, once per result, over the joined rendering;
+tier 1 always scans everything. When tier 2 saw less than the whole result the audit record
+says <code>truncatedScan: true</code>, and that record is written even when nothing was found, so a
+partial scan never looks like a clean one.</p>
+<hr>
+<h2>Audit output</h2>
+<p>One JSON object per line in <code>auditLog</code>. Nothing is ever written to the session log: the
+harness's <code>Session.append()</code> cannot set the envelope's <code>ignorable</code> flag, and an out-of-repo
+event type makes the user's next resume refuse the whole session. Each record therefore carries
+its own identity.</p>
+<pre><code>{
+  "v": 1,
+  "time": "2026-08-15T19:44:33.861Z",
+  "kind": "result-redaction",
+  "decisionId": "dlp-1e8ab1bb-5c8d-4410-b98d-39b83037ea63",
+  "tool": "read",
+  "callId": "mock-call-1",
+  "rootCallId": "mock-call-1",
+  "sessionId": "session-880b9ece-3633-427d-b0a8-cf202ea09917",
+  "turn": 1,
+  "step": 1,
+  "spans": [
+    {
+      "ruleId": "dsh-dlp/slack-token",
+      "ruleVersion": 1,
+      "severity": "critical",
+      "start": 17,
+      "end": 73,
+      "hash": "ca9cad27f2b5",
+      "path": "/lines/1/text"
+    }
+  ]
+}
+</code></pre>
+<p><code>kind</code> is one of <code>guard-deny</code>, <code>pre-execute-deny</code>, <code>result-redaction</code>, <code>telemetry-redaction</code>.
+A <code>result-redaction</code> record may also carry <code>unicode</code>, a count of invisible-character runs per
+class — counts only, because a hidden instruction is exactly the content this file must not
+repeat. A record is written whenever there is something to say, including a result that was
+only counted and a result whose tier-2 scan was truncated.
+A record carries no free-text reason: the spans are the whole description of what matched, so
+nothing built from a candidate path or command line can reach the file. An audit write failure
+is reported and swallowed rather than turned into a denial: the sink is evidence, not
+enforcement, and a full disk should not take the agent down.</p>
+<p>Reported means <code>process.stderr</code> <strong>and</strong> <code>ctx.logger</code>, for that failure and for an invalid
+policy file. The logger alone is not enough: its default exporter is an in-memory 1000-entry
+ring buffer and no shipped bundle mounts a console exporter, so a message sent only there is
+invisible on a stock install. <code>process.stderr</code> is what the headless runner itself writes to.</p>
+<hr>
+<h2>Reading the audit log</h2>
+<p>The package installs a <code>dsh-dlp</code> command that reads the JSONL sink and summarises it. It
+imports nothing from the harness, so it runs wherever the package is installed, with no profile
+and no <code>dsh</code> on the path:</p>
+<pre><code>dsh-dlp report                      # everything in $DSH_HOME/dsh-dlp.audit.jsonl
+dsh-dlp report --since 24h          # or an ISO timestamp
+dsh-dlp report --session &lt;id&gt;
+dsh-dlp report --would-have         # only the calls that were let through
+dsh-dlp report --log /var/log/dsh-dlp.audit.jsonl
+</code></pre>
+<p>It prints counts by decision, by rule, by tool and by invisible-character class, then the ten
+most recent decisions. <code>--would-have</code> drops the denials and leaves the redactions and the
+invisible-character findings: those are the calls that ran, with their results rewritten, and
+they are what a policy that denied instead of rewriting would have blocked.</p>
+<p>The sink is append-only and a run can be interrupted mid-append, so a line that does not parse
+as a record is counted and reported rather than trusted. If the deployment set <code>auditLog</code> to
+somewhere other than the default, pass <code>--log</code>; the command says which file it looked at.</p>
+<p>A plugin installed into a profile puts its bin in that profile's <code>node_modules/.bin</code>, which is
+not on <code>PATH</code>. Run it from there, or install the package globally:</p>
+<pre><code>"$DSH_HOME/profiles/&lt;name&gt;/node_modules/.bin/dsh-dlp" report
+</code></pre>
+<hr>
+<h2>Development</h2>
+<pre><code>nvm use 22           # Node ^22.19.0 || &gt;=24, and pnpm 11
+pnpm install
+pnpm run typecheck
+pnpm run test        # unit
+pnpm run test:coverage
+pnpm run test:e2e    # boots a real dsh against a mock model; no API key
+</code></pre>
+<p>The E2E harness boots a <code>dsh</code> checkout beside this one (<code>../dsh</code>); point <code>DSH_REPO</code> elsewhere
+to override. That checkout needs <code>pnpm run build:lib:host</code> to have run at least once. Set
+<code>DSH_CLI</code> to an installed <code>node_modules/@deepseek-ai/dsh/lib/bin.js</code> to run against the
+published CLI instead, which needs no monorepo — that is what CI does.</p>

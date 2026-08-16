@@ -1,0 +1,140 @@
+<h1>dsh-env-profile（骨架）</h1>
+<p>DSH 全局经验插件：自动探测本地环境（依赖工具 / 便捷路径 / 网络 / 磁盘），
+订阅 <code>session/event</code> 折叠每会话统计，沉淀为<strong>跨会话的全局档案</strong>，
+并把低开销摘要注入<strong>每一轮</strong>系统提示——让每个会话开局就知道
+「这台机器有什么、哪些路径靠谱、网络快不快、以往会话里沉淀过什么」，
+减少重复探测与重复解释，加快会话、降低 token 消耗。</p>
+<blockquote>
+<p>状态：<strong>骨架 v0.1</strong>。核心闭环（探测 → 沉淀 → 注入 → 查询）可用，
+LLM 自动抽取知识条目等进阶能力见文末「路线图」。</p>
+</blockquote>
+<h2>安装</h2>
+<blockquote>
+<p><strong>本地开发先读这个坑（本机 2026-08-16 实测）</strong>：<code>dsh plugin --profile web add link:&lt;路径&gt;</code>
+装完会报 <code>Cannot find package '@deepseek-ai/schemastery'</code> 而无法加载。原因：
+官方 <code>@deepseek-ai/*</code> 包不随插件分发，靠「插件的<strong>真实文件</strong>位于 profile 目录树内、
+Node 父目录上溯命中 <code>$DSH_HOME/profiles/node_modules</code> 平铺闭包」解析；
+pnpm 对本地路径依赖一律建 junction（真实路径在 profile 树外），ESM 解析必失败。
+因此本地验证用<strong>物理拷贝</strong>（与 npm/git 安装的真实布局一致）：</p>
+</blockquote>
+<pre><code># 0) 前置：pnpm 需在 PATH（没有就装：npm i -g pnpm；或用 npx --yes pnpm@9 包一层 shim）
+
+# 1) 登记依赖 + bundle 层（profile package.json 的 dsh.profile.bundles 会追加 dsh-env-profile）
+dsh plugin --profile web add "E:\My Documents\DskHarness-PC\dsh-env-profile"
+
+# 2) 用物理拷贝替换 pnpm 建的 junction（官方包解析的关键一步）
+$dst = "$env:USERPROFILE\.dsh\profiles\web\node_modules\dsh-env-profile"
+cmd /c rmdir "$dst"
+Copy-Item -Recurse "E:\My Documents\DskHarness-PC\dsh-env-profile" "$dst"
+
+# 3) 重启 dsh web 生效；改代码后重复 2)+3)（ESM 按 URL 缓存，必须重启）
+</code></pre>
+<p>不装 pnpm 的纯手工路径（等价）：在 <code>$env:USERPROFILE\.dsh\profiles\web\package.json</code>
+的 <code>dsh.profile.bundles</code> 里追加 <code>"dsh-env-profile"</code>，然后直接把插件目录拷到
+<code>$env:USERPROFILE\.dsh\profiles\web\node_modules\dsh-env-profile</code>，重启 web。</p>
+<p><strong>正式分发</strong>（npm / git 源，物理落盘进 profile，无上述问题）：</p>
+<pre><code>dsh plugin --profile web add dsh-env-profile          # 发布到 npm 后
+# 或 git 源（产物已入库 lib/，无 prepare 构建）
+dsh plugin --profile web add "github:Yvesgao/dsh-env-profile#v0.1.0"
+</code></pre>
+<p>重启 <code>dsh web</code> 后验证：</p>
+<ol>
+<li><code>$DSH_HOME/storages/</code> 下出现 <code>env_profile.json</code>（首次探测后，含 tools/paths/network/disk）；</li>
+<li>任意会话的系统提示尾部出现 <code>## Environment profile</code> 段；</li>
+<li>会话里问一句「这台机器装了哪些常用工具？网络到 api.deepseek.com 延迟多少？」
+模型直接答出，不再现场跑命令。</li>
+</ol>
+<blockquote>
+<p>headless profile 同样适用（把上面路径里的 <code>web</code> 换成 <code>headless</code>）。
+卸载：<code>dsh plugin --profile web remove dsh-env-profile</code>。</p>
+</blockquote>
+<h2>闭环架构</h2>
+<pre><code> session/event ──▶ collector ──┐         ┌──▶ systemPrompt.section ──▶ 每轮注入
+ (tool/call,result,turn/end)    │         │      (order 500, 预算 600 字符)
+                               ├── store ─┤
+ 宿主探测(定时/手动) ──▶ probes ─┘  (env_profile 领域)  └──▶ env_profile 工具 ──▶ 按需查全量
+ (where.exe/路径/TCP/磁盘采样)        │
+                           $DSH_HOME/storages/env_profile.json
+</code></pre>
+<table>
+<thead>
+<tr>
+<th>部件</th>
+<th>文件</th>
+<th>职责</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>领域声明</td>
+<td><code>lib/spec.js</code></td>
+<td>zod schema：<code>env</code>（机器档案）/ <code>sessions</code>（会话统计）/ <code>facts</code>（知识条目）三张表</td>
+</tr>
+<tr>
+<td>宿主探测</td>
+<td><code>lib/probes.js</code></td>
+<td><code>where.exe</code> 扫 33 个常见命令、便捷路径存在性、TCP 443 建连耗时、1 MiB 磁盘读写采样；并发 8 路、逐条超时、全 fail-soft</td>
+</tr>
+<tr>
+<td>经验库</td>
+<td><code>lib/store.js</code></td>
+<td>内存镜像 + 写回存储领域；<code>summarize()</code> 同步且<strong>字节确定</strong>（KV cache 稳定的前提）；<code>remember()</code> 知识条目去重沉淀；会话镜像剪枝（留 200 条，存储表同步删旧）</td>
+</tr>
+<tr>
+<td>采集器</td>
+<td><code>lib/collector.js</code></td>
+<td><code>tool/call</code> 记工具名（配对 <code>callId</code>），<code>tool/result</code> 记错误，<code>turn/end</code> 从 <code>sessionProjections</code> 折叠 <code>llmMs/toolMs/token 账</code>；节流写回（事件数/间隔双触发）</td>
+</tr>
+<tr>
+<td>注入器</td>
+<td><code>lib/injector.js</code></td>
+<td><code>systemPrompt.section</code>（order 500）+ <code>variable</code> 每轮求值摘要</td>
+</tr>
+<tr>
+<td>查询工具</td>
+<td><code>lib/tool.js</code></td>
+<td><code>env_profile</code>：<code>scope=summary/env/sessions/facts/all</code>、<code>kind</code> 过滤、<code>refresh</code> 强制重测</td>
+</tr>
+</tbody></table>
+<h2>省 token 的三个机制</h2>
+<ol>
+<li><strong>前缀缓存稳定</strong>：摘要由 <code>store.summarize()</code> 生成——排序、格式全部确定，
+档案状态不变则每轮 system-prompt 逐字节相同，DeepSeek 前缀缓存持续命中；
+段放在 order 500（工具引导之后），即使摘要变化也只使尾缀失效，
+harness 身份 / persona / 工具 schema 这些大块稳定前缀照常命中。</li>
+<li><strong>注入预算硬上限</strong>：默认 600 字符，超限截断并明示「用 env_profile 工具取全量」，
+防止经验注入成本反超收益。</li>
+<li><strong>探测零模型成本</strong>：全部是宿主侧确定性操作（where.exe / 存在性检查 / TCP 建连 /
+1 MiB 读写），不占用任何 token，且按 <code>probeIntervalHours</code>（默认 6h）缓存。</li>
+</ol>
+<h2>配置</h2>
+<p>schema 见 <code>index.js</code> 的 <code>Config</code>，典型覆盖（profile 的 <code>cordis.patch.yml</code>）：</p>
+<pre><code>- patch:
+    - id: env-profile
+      config:
+        injectMaxChars: 400        # 注入预算调小
+        probeIntervalHours: 24     # 探测更懒
+        networkHost: api.deepseek.com
+        trackSessions: true
+</code></pre>
+<h2>已知边界（骨架期）</h2>
+<ul>
+<li><strong>探测只覆盖 Windows</strong>：<code>where.exe</code> 与 <code>%LOCALAPPDATA%</code> 等为 win32 约定；
+POSIX 版本需要改用 <code>command -v</code> 与 <code>$XDG_*</code>（见路线图）。</li>
+<li><strong>版本探测未做</strong>：目前只记「命令是否存在」，不跑 <code>--version</code>（每条多一次子进程）。</li>
+<li><strong>知识条目靠显式写入</strong>：骨架未接 LLM 自动抽取（需要 <code>ctx.llm.stream</code> +
+会话文本复习，参考 dsh-persona-memory 的后台学习；属可选增强）。</li>
+<li><strong>单进程写约束</strong>：json 后端无跨进程写锁，勿在多个 dsh 进程同时写同一 DSH_HOME。</li>
+</ul>
+<h2>路线图</h2>
+<ul>
+<li> POSIX 探测适配（<code>command -v</code> / XDG 目录 / <code>/dev/null</code> 磁盘采样）</li>
+<li> 关键工具版本探测（git/node/npm/pnpm/python）与 PATH 首个命中路径</li>
+<li> LLM 自动抽取知识条目：每 N 轮用会话自身 LLM 复习，提取
+用户偏好 / 项目约定 / 便捷路径（带 <code>(sessionId, seq)</code> 溯源，
+参考 dsh-memory 的引用式记忆）</li>
+<li> 会话结果缓存：常见命令输出（如 <code>git status</code>、目录列表）跨会话复用</li>
+<li> Web 设置页（<code>settings.section</code> slot）查看/编辑档案与条目</li>
+<li> 与 dsh-mnemon / dsh-persona-memory 的记忆仓库互读</li>
+</ul>
+<h2>许可</h2>
+<p>MIT</p>

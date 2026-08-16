@@ -1,0 +1,192 @@
+<h1>dsh-reprolab</h1>
+<blockquote>
+<p>A complete bug-to-proof workflow for DeepSeek Harness: frozen repro tests, RED/GREEN/REGRESSION gates, and replayable evidence.</p>
+</blockquote>
+<p><code>dsh-reprolab</code> (ReproLab) turns an issue, an error message or reproduction steps into auditable fix evidence:</p>
+<pre><code>baseline code + frozen repro test        → must fail     (RED)
+candidate fix + the SAME frozen test     → must pass     (GREEN)
+regression check                         → no new failures (REGRESSION)
+evidence report                          → replayable, redacted (REPORT)
+</code></pre>
+<p>ReproLab is a deterministic bug-proof executor that complements session-level discipline plugins such as dsh-doublecheck. Your Harness session writes the tests and the fix; ReproLab isolates worktrees, freezes inputs, runs the quality gates and produces the evidence.</p>
+<h2>The nine tools</h2>
+<table>
+<thead>
+<tr>
+<th>Tool</th>
+<th>Purpose</th>
+<th>Key result</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>reprolab_start</code></td>
+<td>Resolve repo, freeze baseline, create <code>control</code>/<code>candidate</code> worktrees, optionally record the baseline regression failure set</td>
+<td><code>runId</code>, worktree paths, baseline, <code>baselineRegression</code></td>
+</tr>
+<tr>
+<td><code>reprolab_set_test</code></td>
+<td>Freeze the repro test patch + the target test command</td>
+<td><code>testPatch</code> hash, command hash</td>
+</tr>
+<tr>
+<td><code>reprolab_verify_red</code></td>
+<td>Run the frozen command in <code>control</code> and prove a genuine test failure</td>
+<td><code>verdict: valid_red</code>, failure <code>fingerprint</code></td>
+</tr>
+<tr>
+<td><code>reprolab_set_fix</code></td>
+<td>Freeze the production-only fix patch from <code>candidate</code></td>
+<td><code>fixPatch</code> hash, changed files</td>
+</tr>
+<tr>
+<td><code>reprolab_verify_green</code></td>
+<td>Run the exact same frozen command in <code>candidate</code> and prove it passes</td>
+<td><code>verdict: valid_green</code></td>
+</tr>
+<tr>
+<td><code>reprolab_verify_regression</code></td>
+<td>Compare candidate failures with the recorded baseline set</td>
+<td><code>pass</code> / <code>pass_with_baseline_failures</code> / <code>regression</code> / <code>inconclusive</code></td>
+</tr>
+<tr>
+<td><code>reprolab_status</code></td>
+<td>Structured run state, frozen hashes, report staleness, next legal actions</td>
+<td><code>nextActions</code> — no prose to parse</td>
+</tr>
+<tr>
+<td><code>reprolab_report</code></td>
+<td>Generate/refresh <code>report.json</code> + <code>report.md</code> from one shared model</td>
+<td>report path + recomputable sha256</td>
+</tr>
+<tr>
+<td><code>reprolab_abort</code></td>
+<td>Abort and keep the scene for inspection</td>
+<td>retained paths</td>
+</tr>
+</tbody></table>
+<p>A nonzero exit code alone is <strong>never</strong> RED: test-not-discovered, syntax errors, missing imports, timeouts, crashes and cancellations are all excluded, and RED/GREEN must use identical test-patch and command hashes.</p>
+<h2>Installation</h2>
+<p>DeepSeek Harness <code>0.1.0-rc.6</code>, Node <code>^22.19.0 || &gt;=24.0.0</code>.</p>
+<p>From a packed artifact (built <code>dist/</code> included):</p>
+<pre><code>pnpm pack                                    # → dsh-reprolab-0.1.0.tgz
+dsh plugin --profile &lt;profile&gt; add ./dsh-reprolab-0.1.0.tgz
+dsh --profile &lt;profile&gt;
+</code></pre>
+<p>From the repository directory (dev):</p>
+<pre><code>dsh plugin --profile &lt;profile&gt; add ./dsh-reprolab
+</code></pre>
+<p>Both forms require the host's in-box <code>tools</code> and <code>subprocess</code> services (provided by <code>dsh-base</code> in every profile).</p>
+<h2>Configuration</h2>
+<p>All fields are optional and defaulted by the Schemastery schema. Bundle patch rows replace the whole config per row, so restate every key when overriding.</p>
+<table>
+<thead>
+<tr>
+<th>Key</th>
+<th>Type</th>
+<th>Default</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>runDir</code></td>
+<td>string</td>
+<td><code>.reprolab</code></td>
+<td>Directory (relative to repo root) for runs, worktrees, patches and reports</td>
+</tr>
+<tr>
+<td><code>graceMs</code></td>
+<td>number (≥50)</td>
+<td><code>5000</code></td>
+<td>SIGTERM→SIGKILL grace when terminating child process trees</td>
+</tr>
+<tr>
+<td><code>maxOutputBytes</code></td>
+<td>number (≥1024)</td>
+<td><code>1048576</code></td>
+<td>In-memory output cap per stream; overflow keeps the tail and spills the full stream</td>
+</tr>
+<tr>
+<td><code>spillMaxBytes</code></td>
+<td>number (≥1 MiB)</td>
+<td><code>16777216</code></td>
+<td>Whole-stream spill cap per stream</td>
+</tr>
+<tr>
+<td><code>lockStaleMs</code></td>
+<td>number (≥1000)</td>
+<td><code>300000</code></td>
+<td>Repo write-lock staleness threshold (stealing still requires a dead owner)</td>
+</tr>
+</tbody></table>
+<h2>Permissions and external side effects</h2>
+<p>ReproLab writes <strong>only inside the target repository</strong>: <code>runDir/</code> (default <code>.reprolab/</code>) with run state, patches, reports, and <code>git worktree</code> directories. Side effects:</p>
+<ul>
+<li><strong>Filesystem</strong>: creates <code>runDir/runs/&lt;run-id&gt;/</code>, <code>runDir/worktrees/&lt;run-id&gt;-{control,candidate}/</code>, <code>baseline.patch</code>, <code>test.patch</code>, <code>fix.patch</code>, <code>report.json</code>, <code>report.md</code>; reads repository files.</li>
+<li><strong>Processes</strong>: executes Git (structured <code>argv</code>, explicit <code>cwd</code>, no shell) and the test commands <strong>you declare</strong> (argv arrays only, never shell strings). Cancellation/timeout kills the whole process tree.</li>
+<li><strong>Git</strong>: creates/removes worktrees registered under <code>runDir/worktrees</code>; <strong>never</strong> resets, checks out, cleans or commits on your current branch. Cleanup is a separate explicit primitive (not a tool).</li>
+<li><strong>Network / telemetry / keys</strong>: none. The plugin makes no network calls, sends no telemetry and needs no API keys.</li>
+<li><strong>Credentials</strong>: child environments start from the host's scrubbed base (<code>KEY/PASSWORD/SECRET/TOKEN</code> names and <code>DSH_*</code> are stripped); output is redacted (tokens, Authorization, cookies, passwords, high-entropy strings) before records or reports are written.</li>
+</ul>
+<h2>Quick demo (node:test)</h2>
+<pre><code>&gt; reprolab_start { repoPath: "/path/to/repo", baselineCommand: { argv: ["node","--test"], framework: "node:test" } }
+  → runId run_…, state baseline_checked, control + candidate worktree paths
+# you write the repro test in the candidate worktree
+&gt; reprolab_set_test { runId, declaredTestFiles: ["bug.test.mjs"], command: { argv: ["node","--test","bug.test.mjs"], framework: "node:test" } }
+  → state test_frozen, testPatch hash
+&gt; reprolab_verify_red { runId }
+  → verdict valid_red, failure fingerprint, state red_verified
+# you fix the production code in candidate
+&gt; reprolab_set_fix { runId }                          → state fix_frozen
+&gt; reprolab_verify_green { runId }                     → verdict valid_green
+&gt; reprolab_verify_regression { runId, command: { argv: ["node","--test"], framework: "node:test" } }
+  → verdict pass (or pass_with_baseline_failures), state regression_verified
+&gt; reprolab_report { runId }                           → reportPath, reportHash (sha256 of report.json)
+&gt; reprolab_status { runId }                           → state reported, nextActions []
+</code></pre>
+<p>Report staleness: if any evidence input changes after reporting (e.g. the tests are re-frozen), <code>reprolab_status</code> reports <code>report.stale: true</code>.</p>
+<h2>Compatibility</h2>
+<table>
+<thead>
+<tr>
+<th>Component</th>
+<th>Version</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>DeepSeek Harness</td>
+<td><code>0.1.0-rc.6</code></td>
+</tr>
+<tr>
+<td>@deepseek-ai/cordis</td>
+<td><code>^4.0.1</code> (peer)</td>
+</tr>
+<tr>
+<td>@deepseek-ai/dsh-subprocess / dsh-tools / dsh-brand</td>
+<td><code>0.1.0-rc.6</code></td>
+</tr>
+<tr>
+<td>@deepseek-ai/schemastery</td>
+<td><code>^3.18.1</code></td>
+</tr>
+</tbody></table>
+<p>All host contracts were verified first-hand against the installed official packages and the official docs snapshot.</p>
+<h2>Known limitations</h2>
+<ul>
+<li>One active (non-terminal) run per repository at a time; the write lock is fail-fast (<code>RUN_ALREADY_ACTIVE</code>), not queued.</li>
+<li><code>pytest</code> and <code>jest</code> classification is based on the documented output formats (no local pytest/jest installs were available); <code>vitest</code> and <code>node:test</code> formats were captured from real runs. Python projects use <code>unittest</code> + the <code>generic</code> classifier.</li>
+<li>Test-runner cache artifacts (<code>__pycache__</code>, <code>.pyc</code>, <code>.pytest_cache</code>, <code>.coverage</code>, <code>htmlcov</code>, <code>.vite</code>, <code>node_modules/.cache</code>) are ignored by change detection — an allowlist, not an ignore-all.</li>
+<li>The repository needs at least one commit (worktrees require a baseline commit).</li>
+<li><code>dsh-windtunnel</code>'s scripted adapter is currently incompatible with DSH <code>0.1.0-rc.6</code> (third-party issue). Real-host lifecycle (install/enable/disable/uninstall/reinstall) was verified through the real <code>dsh</code> CLI on a clean headless profile.</li>
+</ul>
+<h2>Uninstall</h2>
+<pre><code>dsh plugin --profile &lt;profile&gt; remove dsh-reprolab
+</code></pre>
+<p>This removes the bundle row and package. Run artifacts (<code>runDir/</code> and worktrees) are <strong>not</strong> deleted by uninstall — remove them explicitly with <code>git worktree remove</code> after inspecting them. Active runs terminate their child processes on plugin unload (host subprocess service disposal).</p>
+<h2>Troubleshooting</h2>
+<p>Recovery guidance for every error code, worktree cleanup, stale locks and invalidated runs: <a href="https://github.com/yuttfu/dsh-reprolab/blob/HEAD/docs/troubleshooting.md"><code>docs/troubleshooting.md</code></a>. Security model: <a href="https://github.com/yuttfu/dsh-reprolab/blob/HEAD/docs/security.md"><code>docs/security.md</code></a>. Architecture: <a href="https://github.com/yuttfu/dsh-reprolab/blob/HEAD/docs/architecture.md"><code>docs/architecture.md</code></a>.</p>
+<h2>Development</h2>
+<pre><code>pnpm install
+pnpm run check            # lint + typecheck + build + verify:manifest
+pnpm pack                 # → dsh-reprolab-0.1.0.tgz (dist/, cordis.patch.yml, README, LICENSE)
+</code></pre>
+<p>MIT License.</p>

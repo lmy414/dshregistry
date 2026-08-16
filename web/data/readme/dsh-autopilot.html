@@ -1,0 +1,227 @@
+<h1>dsh-autopilot</h1>
+<p>Done means verified.</p>
+<p>面向 <a href="https://github.com/deepseek-ai/deepseek-harness">DeepSeek Harness</a> 的验收驱动自动完成引擎。</p>
+<blockquote>
+<p>Agent 说「做完了」，不等于任务完成。</p>
+</blockquote>
+<pre><code>flowchart TD
+    A["Agent：Done."] --&gt; B[Autopilot 独立验收]
+    B --&gt; C["第一轮：Build / Feature 未过"]
+    C --&gt; D[NOT DONE]
+    D --&gt; E[按失败项修复]
+    E --&gt; F["第二轮：全部必选检查通过"]
+    F --&gt; G[VERIFIED COMPLETE]
+</code></pre>
+<table>
+<thead>
+<tr>
+<th>检查</th>
+<th align="center">Agent 自称完成</th>
+<th align="center">修复后再验</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>Tests</td>
+<td align="center">通过</td>
+<td align="center">通过</td>
+</tr>
+<tr>
+<td>Typecheck</td>
+<td align="center">通过</td>
+<td align="center">通过</td>
+</tr>
+<tr>
+<td>Build</td>
+<td align="center"><strong>未过</strong></td>
+<td align="center">通过</td>
+</tr>
+<tr>
+<td>Feature</td>
+<td align="center"><strong>未过</strong></td>
+<td align="center">通过</td>
+</tr>
+<tr>
+<td><strong>结论</strong></td>
+<td align="center"><strong>不能签发</strong></td>
+<td align="center"><strong>VERIFIED COMPLETE</strong></td>
+</tr>
+</tbody></table>
+<p>模型声称完成 ≠ 任务已经完成。只有 <strong>验收标准 → 独立验证 → 全部必选检查通过</strong>，才能签发证书。</p>
+<h2>安装</h2>
+<p>需要 Node.js 20.19+，以及已安装的 DeepSeek Harness（<code>npx @deepseek-ai/dsh web</code> 或源码检出）。</p>
+<h3>作为 Harness 插件</h3>
+<pre><code># 从本仓库安装到某个 Harness profile
+dsh plugin add https://github.com/245678000000/dsh-autopilot
+
+# 或用本地 checkout 做 overlay
+pnpm dsh web --patch /absolute/path/to/dsh-autopilot/cordis.patch.yml
+</code></pre>
+<p>插件入口是 <code>cordis.patch.yml</code>。装好后会在官方 Goal 栈之后插入 Autopilot，不替换 <code>ctx.goals</code>。</p>
+<h3>独立 CLI（不需要跑完整 Harness）</h3>
+<pre><code>git clone https://github.com/245678000000/dsh-autopilot.git
+cd dsh-autopilot
+npm install
+npm run build
+node dist/cli.js evaluate --cwd ./fixtures/file-only
+</code></pre>
+<p>项目里的 shell 验收默认不执行。只有你明确授权时才跑：</p>
+<pre><code>node dist/cli.js evaluate --cwd ./examples/login --allow-commands
+</code></pre>
+<p>常用命令：</p>
+<pre><code>dsh-autopilot evaluate [--cwd &lt;dir&gt;] [--spec &lt;file&gt;] [--allow-commands]
+dsh-autopilot status
+dsh-autopilot criteria
+dsh-autopilot certificate
+</code></pre>
+<hr>
+<h2>它解决什么问题</h2>
+<p>常见 Agent 工作流是：改几个文件，跑一下命令，然后说「Done.」。这句话后面可能藏着测试失败、构建失败、漏掉的需求、残留 <code>TODO</code>，或接口状态码不对。</p>
+<p>Autopilot 挂在官方 <code>agent/turn-stopping</code> 上，用确定性评估器独立验收。只有 <code>canCertifyCompletion()</code> 放行，才会调用 <code>ctx.goals.complete()</code>。</p>
+<h2>验收标准</h2>
+<p>在项目根目录放 <code>.autopilot.yml</code>：</p>
+<pre><code>version: 1
+goal:
+  objective: 实现登录
+budget:
+  maxRepairAttempts: 5
+criteria:
+  - id: tests
+    description: 单元测试通过
+    required: true
+    evaluator:
+      type: command
+      command: npm test
+      expect:
+        exitCode: 0
+</code></pre>
+<p>完整编码示例见 <code>examples/login/.autopilot.yml</code>。</p>
+<h2>完成认证</h2>
+<p>全仓库只有一扇门：<code>canCertifyCompletion()</code>。</p>
+<p>签发 <code>VERIFIED COMPLETE</code> 必须同时满足：</p>
+<ul>
+<li>每一项 <strong>必选</strong> 标准都有当前结果</li>
+<li>结果是 <code>passed</code></li>
+<li>PASS 带有 <strong>可观察证据</strong></li>
+<li>工作区改动后，结果不是 <strong>过期（stale）</strong> 的</li>
+<li>必选但无法验证的项不会被放行</li>
+</ul>
+<p>Worker 说「Done.」只会被记成一份被忽略的提议。</p>
+<p>通过后会写出 <code>CompletionCertificate</code>：</p>
+<pre><code>VERIFIED COMPLETE
+
+6 / 6 required checks passed
+
+✓ tests
+✓ typecheck
+✓ build
+✓ login success case
+✓ login failure case
+✓ no placeholder
+
+Attempts:
+3
+</code></pre>
+<h2>重试与阻断</h2>
+<p>可修复的失败会生成结构化反馈（期望 / 实际 / 输出摘录 / 回归），并用 <code>agent.steer(...)</code> 让当前 turn 继续。若设置 <code>continuationMode: goal-round</code>，则交给官方 <code>@deepseek-ai/dsh-goal-round-driver</code> 排下一轮。</p>
+<p>重试有上限。默认：<code>maxRepairAttempts = 5</code>，<code>maxEvaluations = 10</code>，<code>maxRounds = 8</code>，墙钟 30 分钟。</p>
+<p>不是所有失败都该再试。缺密钥、缺人决策、审批拒绝、必选标准无法验证，会变成 <code>BLOCKED</code>，并写明 <code>need</code> / <code>resolvedWhen</code>。缺 API key 不会空转 20 轮。</p>
+<h2>回归、无进展、振荡</h2>
+<p>每次评估都会和上一轮对比。<code>PASS → FAIL</code> 会标成 <strong>REGRESSION DETECTED</strong>。</p>
+<p>连续三次相同失败指纹是 <code>NO_PROGRESS</code>。A/B 来回翻转是 <code>OSCILLATION</code>。各自最多触发 <strong>一次</strong> 策略重置；再犯就 <code>BLOCKED</code>。</p>
+<h2>和官方 Goal 的关系</h2>
+<p>Autopilot 不替换 <code>@deepseek-ai/dsh-goal</code>。</p>
+<table>
+<thead>
+<tr>
+<th>验收结果</th>
+<th>官方 API</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>认证通过</td>
+<td><code>ctx.goals.complete(agent, ref)</code></td>
+</tr>
+<tr>
+<td>需要人 / 预算耗尽 / 无进展</td>
+<td><code>ctx.goals.block(agent, ref, { code, message })</code></td>
+</tr>
+<tr>
+<td>可修复失败</td>
+<td>Goal 保持 <code>active</code>；<code>steer</code> 或交给官方 driver</td>
+</tr>
+</tbody></table>
+<p>模型调用的 <code>update_goal complete</code> 会在 <code>tools/pre-execute</code> 被拦截，只当提议。</p>
+<p>人类 <code>/goal</code> 不变。Autopilot 额外提供 <code>/autopilot</code>。</p>
+<p>对照的 Harness commit：<code>47f943859b</code>（<code>0.1.0-rc.5</code>）。细节见 <a href="https://github.com/245678000000/dsh-autopilot/blob/HEAD/docs/harness-integration.md"><code>docs/harness-integration.md</code></a>。</p>
+<h2>评估器</h2>
+<table>
+<thead>
+<tr>
+<th>类型</th>
+<th>查什么</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>command</code></td>
+<td>真实 exit code / stdout / stderr</td>
+</tr>
+<tr>
+<td><code>file</code></td>
+<td>exists / contains / notContains / sha256</td>
+</tr>
+<tr>
+<td><code>regex</code></td>
+<td>匹配次数</td>
+</tr>
+<tr>
+<td><code>git</code></td>
+<td>工作区是否脏、允许改哪些路径</td>
+</tr>
+<tr>
+<td><code>http</code></td>
+<td>status / headers / JSON path（防 SSRF）</td>
+</tr>
+<tr>
+<td><code>manual</code></td>
+<td>等人确认，否则 blocked</td>
+</tr>
+<tr>
+<td><code>agent</code></td>
+<td>最后手段的独立评判；schema 校验；从不默认 PASS</td>
+</tr>
+</tbody></table>
+<p>优先级：确定性检查 → 结构化工具检查 → LLM 评判。</p>
+<h2>安全</h2>
+<p><code>.autopilot.yml</code> 视为不可信项目配置。危险命令会拒绝。HTTP 默认只允许 localhost。云 metadata（<code>169.254.169.254</code>）会被拦住。评估器没有工作区写权限。Autopilot 不会绕过 Harness 审批。见 <a href="https://github.com/245678000000/dsh-autopilot/blob/HEAD/docs/security.md"><code>docs/security.md</code></a>。</p>
+<h2>Demo</h2>
+<pre><code>npm run demo
+</code></pre>
+<ol>
+<li>Agent 说「Done!」——构建和错误密码用例失败——修复——<strong>VERIFIED COMPLETE</strong></li>
+<li>自信说错：「测试都过了」对照 <code>exit code 1</code></li>
+<li>连续 4/5 同样失败 → <strong>BLOCKED</strong></li>
+<li>测试先 PASS 再 FAIL → <strong>REGRESSION</strong></li>
+</ol>
+<pre><code>npm run bench
+</code></pre>
+<p>合成场景，只跑控制器，不编造数字。</p>
+<h2>限制</h2>
+<ul>
+<li>没有可观察测试的标准，验不了。</li>
+<li>LLM 评估器是概率性的。非法输出记为 <code>error</code>，不是 <code>pass</code>。</li>
+<li>写坏的验收标准会签发错误证书。</li>
+<li>外部系统可能不可用。</li>
+<li>有些任务必须由人判断。</li>
+<li>测试通过在数学上不能证明软件正确。</li>
+<li>Autopilot 提高完成可靠性，不保证完美结果。</li>
+<li>受信任的进程内插件如果直接调用 <code>ctx.goals.complete()</code>，官方 Goal 服务仍然认。Autopilot 拦截的是模型工具，不是所有 in-process 调用。</li>
+</ul>
+<h2>路线图</h2>
+<ul>
+<li><strong>v0.1</strong> — 编码验收、command/file/http/git、官方 Goal + turn-stopping、修复循环、回归/无进展/振荡、证书</li>
+<li><strong>v0.2</strong> — 浏览器评估器、界面验收、可选 Time Machine 检查点</li>
+<li><strong>v0.3</strong> — 研究 / 数据管道评估器、多 Agent 独立核验</li>
+<li><strong>v0.4</strong> — CI 与 GitHub PR 验收、团队策略包</li>
+</ul>
+<h2>License</h2>
+<p>MIT</p>

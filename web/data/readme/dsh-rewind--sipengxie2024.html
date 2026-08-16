@@ -1,0 +1,63 @@
+<h1>dsh-rewind</h1>
+<p>把 Claude Code 的 rewind 能力移植到 DeepSeek Harness(dsh)的第三方插件:指着历史里任意一条用户消息,把对话、代码或两者一起回退到那个时刻,或从那里开一个摘要分支。</p>
+<p>单包双半:host 半是一个薄 RPC 网关(<code>rewind</code> 命名空间)+ 一个 <code>tools/execute</code> 捕获中间件;client 半以键控槽覆盖(同 key <code>user</code>、priority -1)替换官方用户消息渲染器,加出回退菜单。fork、打开、重发全部复用官方 client sessions 服务,host 不新增会话操作。</p>
+<h2>菜单四项(对位 Claude Code 的 rewind 弹出菜单)</h2>
+<table>
+<thead>
+<tr>
+<th>菜单项</th>
+<th>行为</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>恢复对话(编辑重跑)</td>
+<td>气泡就地变编辑框,确认后 fork 到上一轮 turn/end 边界,打开子会话并重发改写后的消息</td>
+</tr>
+<tr>
+<td>恢复对话与代码</td>
+<td>同上,但 fork 前先展示文件回退卡片;确认时先把勾选文件写回边界前内容,再 fork 重跑</td>
+</tr>
+<tr>
+<td>仅恢复代码</td>
+<td>只做文件回退,不 fork 不发消息,留在当前会话</td>
+</tr>
+<tr>
+<td>摘要至此,开新分支</td>
+<td>fork(含点击轮)→ 打开分支 → 自动执行 <code>/compact</code> 压缩头段历史</td>
+</tr>
+</tbody></table>
+<p>CC 菜单的第五项 <strong>"Summarize from here" 不做</strong>:dsh 的 <code>compactNow</code> 语义是压头段、保近尾,与「压点击处之后」方向相反;<code>compactRegion</code> 要求开轮空闲,菜单时点不可用。机制冲突,不硬凑。</p>
+<p><strong>菜单打开即探测文件变动数</strong>(0.3.2 起):打开菜单时并行调 <code>previewRestore</code>,两个代码恢复项的 label 实时显示「N 个文件有改动」;探测确认 0 变动时这两项置灰并注明「边界后无文件改动」。对位 CC 的设计——CC 在无 tracked file changes 时直接不显示两个代码恢复选项(官方 checkpointing 文档),不显示数量;这里改为显式计数 + 置灰,信息更多一层。Codex 无对位物:其 undo(ghost-commit)功能已移除(feature 表 <code>Stage::Removed</code>),看变动只有 <code>/diff</code> 现场跑 git diff。</p>
+<h2>文件快照与恢复(P1)</h2>
+<ul>
+<li><strong>捕获</strong>:<code>tools/execute</code> waterfall 中间件按工具名过滤 <code>write</code> / <code>edit</code> / <code>str_replace_editor</code>(按名过滤天然覆盖 code preset 的 Code Mode 子调用,且恰好捕获一次)。write/edit 从结果 value 取 before/after;str_replace_editor 无结果 value,在派发前预读。</li>
+<li><strong>账本</strong>:storage-domain <code>rewind</code> 域(snapshots 表,key=callId)+ <code>$DSH_HOME/rewind/objects/</code> 内容寻址对象库(sha256 去重)。重启后从持久层 seed,内存降级模式下 GC 不跑(防误删)。</li>
+<li><strong>恢复</strong>:按边界后每个文件取最早改前快照写回(<code>ctx.fs.writeText</code>,不经 tools waterfall,结构性不会自捕获)。当前磁盘指纹 ≠ 最后一次工具写入指纹的文件标「外部改动」,默认不勾。</li>
+<li><strong>create 的文件只报告「需手动删除」</strong>,插件不删文件(<code>ctx.fs</code> 无删除动词;绕开它走 node:fs 会破坏远端 backend 抽象)。</li>
+<li><strong>GC</strong>:<code>retentionDays</code>(默认 14 天)过期行 + 孤儿对象,boot 后与每 24h 各扫一次。</li>
+</ul>
+<h3>配置(settings.yaml,热生效)</h3>
+<pre><code>rewind:
+  captureEnabled: true   # 关掉即停止捕获(已有快照不动)
+  retentionDays: 14      # 0 = 立即全部过期(下次扫描清空)
+  maxFileBytes: 10485760 # 超过此大小的改前内容不入库(标 lost)
+</code></pre>
+<h2>边界声明(与 Claude Code 相同的边界)</h2>
+<ul>
+<li><strong>bash 及其他副作用工具不兜底</strong>:只捕获三个结构化写工具。模型经 bash 写的文件、跑掉的命令、外部系统副作用,rewind 一概不知情也不回退。</li>
+<li><strong>恢复写回不经审批门</strong>:<code>ctx.fs.writeText</code> 直写,不走 tools waterfall,因此不触发审批/沙箱升级弹窗。恢复是用户在确认卡片上显式发起的工作区全局操作,确认框即授权点。</li>
+<li><strong>带图消息重跑</strong>:读原附件转 base64 重发;读取失败降级为纯文本重发并提示。</li>
+<li><strong>steering 消息不给回退按钮</strong>:fork 是轮粒度,轮中插话没有独立边界,不提供即最诚实的表达。</li>
+<li><strong>首条用户消息禁用回退</strong>(无上一轮边界可回)。</li>
+</ul>
+<h2>构建与安装</h2>
+<pre><code>npm run check   # tsc --noEmit + vitest(56 项)
+npm run build   # tsc + tsdown(client 半闭包工厂 CJS)
+npm pack
+dsh plugin --profile web add dsh-rewind-&lt;version&gt;.tgz   # 每次安装必须 bump version(pnpm 同名同版本去重)
+</code></pre>
+<p>host 半迭代可用 dsh-hot-reload 的 <code>/reload dsh-rewind</code> 免重启;client 半刷新页面即新 bundle。</p>
+<h2>踩坑记录</h2>
+<ul>
+<li><strong>cordis 服务属性可见性</strong>:<code>ctx.fs</code> 这类服务属性只对 <code>inject</code> 声明过该服务的插件存在;<code>ctx.get('fs')</code> 则绕过声明直查注册表。本插件 0.3.0 曾因漏声明 <code>inject: ['fs']</code> 导致捕获的 targetKey 全部走 fallback、恢复预览全报「无法读取」(0.3.1 修复)。</li>
+</ul>

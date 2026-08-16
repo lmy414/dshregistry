@@ -1,0 +1,211 @@
+<h1>dsh-cbx-orch</h1>
+<p>把 cbx-orch 的持久化任务编排能力移植为 <strong>DeepSeek Harness (dsh) 插件</strong>。在 dsh 内直接编排外部编码 CLI（codebuddy / opencode / omp / cline / qwen），任务状态、队列、测试日志、diff、审查报告全部落盘，进程崩溃后可恢复续跑。</p>
+<pre><code>创建任务 → 执行 → 保存原始日志 → 跑测试 → 生成 diff → 审查 → 必要时返工
+</code></pre>
+<h2>这是什么</h2>
+<p><code>dsh-cbx-orch</code> 是一个 <strong>dsh bundle 包</strong>：它导出两个 cordis 插件（core + web），把 cbx-orch 的编排引擎接入 dsh 的插件机制。</p>
+<table>
+<thead>
+<tr>
+<th>能力</th>
+<th>落点</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>编排引擎（状态机/队列/重试/审查/artifact/审批/adaptive）</td>
+<td><code>ctx.cbx</code> 服务 + 移植的引擎模块</td>
+</tr>
+<tr>
+<td>5 个外部执行器适配器（codebuddy/opencode/omp/cline/qwen）+ 自定义插件执行器</td>
+<td>经 <code>ctx.subprocess</code> 拉起子进程</td>
+</tr>
+<tr>
+<td><code>cbx_*</code> 工具</td>
+<td><code>ctx.tools</code>（dsh agent 可直接调用）</td>
+</tr>
+<tr>
+<td><code>/cbx-*</code> 斜杠命令</td>
+<td><code>ctx.commands</code></td>
+</tr>
+<tr>
+<td>Web 仪表盘 + REST + SSE</td>
+<td><code>ctx.webServer</code>，挂在 <code>/cbx</code> 前缀下</td>
+</tr>
+<tr>
+<td><code>.cbx.json</code> 工作区配置</td>
+<td>保留，与插件配置叠加</td>
+</tr>
+</tbody></table>
+<p>与 cbx-orch 原版的差异：MCP server、独立 CLI、TUI 在 dsh 内被原生工具/命令/Web 取代，不再移植。任务 worker 改为<strong>进程内调度</strong>（执行器/测试仍是树级可终止的 <code>ctx.subprocess</code> 子进程），取消时经 job-runtime 终止活动子进程。core/web 插件会为各工作区拉起<strong>常驻调度器</strong>（30s 定时 dispatch + 租约防多实例），崩溃重启后自动回收死 worker 并续跑遗留任务：</p>
+<ul>
+<li><strong>进程内死 worker 即刻回收</strong>：worker 注册表注销即判死（不等 45s 心跳超时），并发槽立即释放。</li>
+<li><strong>僵尸接管</strong>：事件循环阻塞的 worker（心跳停更但进程存活）由调度器接管——写取消标记、终止其子进程、强制释放本进程持有的 <code>run.lock</code>/<code>gate.lock</code> 后重派，不再出现"重派撞锁直到熔断"的永久卡死。</li>
+<li><strong>崩溃续跑跳过已完成 stage</strong>：链式任务的 stage 报告逐个持久化，回收重入时已完成的 stage 直接跳过，不整链重放。</li>
+<li><strong>审批通过原子重入队</strong>：before_run 审批的状态回 queued 与队列条目重新激活在同一事务落盘，不存在"已批准但永不调度"的窗口。</li>
+<li>死 worker 回收按连续计数熔断（3 次后停止重派，指数退避重试）；<code>needs_fix</code>/<code>review_failed</code> 在队列视图中显示真实状态而非 failed。</li>
+</ul>
+<h2>安装</h2>
+<p>作为一个 bundle 包装进某个 profile：</p>
+<pre><code># 发布后
+dsh plugin --profile web add dsh-cbx-orch
+
+# 本地开发（file: 链接）
+# 在 $DSH_HOME/profiles/&lt;name&gt;/package.json 加依赖并安装
+</code></pre>
+<blockquote>
+<p><strong>npm ≥ 11.6 注意</strong>：install-scripts 门控会跳过 <code>better-sqlite3</code> 的 node-gyp 构建（依赖包内声明的 allowScripts 不被认作覆盖），导致启动时报 native binding 缺失。自救：</p>
+<pre><code>npm install-scripts approve better-sqlite3
+npm rebuild better-sqlite3
+</code></pre>
+<p>pnpm 用户在 profile 的 <code>pnpm-workspace.yaml</code> 配 <code>allowBuilds</code>。<code>smoke/pack.sh</code> 已内置该兜底，可作为发布前检查（<code>npm run smoke:pack</code>）。</p>
+</blockquote>
+<p>profile 的 <code>dsh.profile.bundles</code> 需要包含 <code>dsh-cbx-orch</code>（与 <code>@deepseek-ai/dsh-base</code> 一起）。core 插件需要 <code>subprocess</code>/<code>tools</code>/<code>commands</code>（base bundle 提供）；web 插件额外需要 <code>webServer</code>，只在 web profile 激活。</p>
+<blockquote>
+<p>与 harness 原生服务（jobs/schedule/subagents/settings/事件）的边界与互操作设计见 <a href="https://github.com/zerosloney/dsh-cbx-orch/blob/HEAD/docs/alignment.md">docs/alignment.md</a>。</p>
+</blockquote>
+<pre><code>dsh --profile web
+</code></pre>
+<p>启动后访问 <code>http://127.0.0.1:3080/cbx/</code> 查看仪表盘。</p>
+<h2>工具（<code>ctx.tools</code>）</h2>
+<table>
+<thead>
+<tr>
+<th>工具</th>
+<th>作用</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>cbx_run</code></td>
+<td>创建并排队一个任务（task/executor/test/review/isolated/审批门等）</td>
+</tr>
+<tr>
+<td><code>cbx_status</code></td>
+<td>任务状态/阶段/尝试</td>
+</tr>
+<tr>
+<td><code>cbx_list</code></td>
+<td>列出工作区所有任务</td>
+</tr>
+<tr>
+<td><code>cbx_queue</code> / <code>cbx_queue_pause</code> / <code>cbx_queue_resume</code></td>
+<td>队列查看与暂停/恢复</td>
+</tr>
+<tr>
+<td><code>cbx_dispatch</code></td>
+<td>调度队列（回收死 worker + 启动排队任务）</td>
+</tr>
+<tr>
+<td><code>cbx_continue</code></td>
+<td>按 review.md/测试失败返工续跑</td>
+</tr>
+<tr>
+<td><code>cbx_cancel</code></td>
+<td>取消任务并终止执行器进程树</td>
+</tr>
+<tr>
+<td><code>cbx_retry</code></td>
+<td>重试失败任务</td>
+</tr>
+<tr>
+<td><code>cbx_approve</code></td>
+<td>批准等待审批的任务</td>
+</tr>
+<tr>
+<td><code>cbx_result</code> / <code>cbx_artifact</code> / <code>cbx_artifacts</code> / <code>cbx_logs</code></td>
+<td>读 result.json / 任意产物 / 产物列表 / agent.log 增量</td>
+</tr>
+<tr>
+<td><code>cbx_health</code></td>
+<td>队列深度、状态计数、失败/重试、死信（不含任务正文）。<strong>默认只读</strong>；<code>prune: true</code> 时才应用保留期清理</td>
+</tr>
+<tr>
+<td><code>cbx_clean</code></td>
+<td>forget/purge 任务（含 worktree 清理）</td>
+</tr>
+<tr>
+<td><code>cbx_list_workspaces</code></td>
+<td>列出已授权的工作区（不扫描任意 root 或子目录）</td>
+</tr>
+<tr>
+<td><code>cbx_review_gate</code></td>
+<td>对未提交改动跑独立审查</td>
+</tr>
+</tbody></table>
+<blockquote>
+<p>工具参数使用 <strong>snake_case</strong>（如 <code>timeout_ms</code> / <code>max_retries</code> / <code>max_turns</code>）；<code>.cbx.json</code> 配置键与 Web/命令层使用 <strong>camelCase</strong>（<code>timeoutMs</code> / <code>maxRetries</code> / <code>maxTurns</code>）。二者仅命名风格不同，语义一一对应。</p>
+<p><strong>输出上限</strong>：<code>cbx_result</code> / <code>cbx_artifact</code> 的文本输出截断到 64K 字符（保头尾并标注总长）；<code>cbx_status</code> / <code>cbx_cancel</code> / <code>cbx_approve</code> 等返回 state 的工具对超长字符串字段做深截断（8K）。完整内容仍在磁盘工件里，需要时用 <code>cbx_logs</code> 增量读取。</p>
+</blockquote>
+<h2>斜杠命令（<code>ctx.commands</code>）</h2>
+<p><code>/cbx-run &lt;task&gt;</code>、<code>/cbx-status &lt;job_id&gt;</code>、<code>/cbx-continue &lt;job_id&gt; [message]</code>、<code>/cbx-cancel &lt;job_id&gt;</code>、<code>/cbx-list</code>、<code>/cbx-queue [pause|resume]</code>、<code>/cbx-result &lt;job_id&gt;</code>。</p>
+<h2>Web API</h2>
+<p>挂在 <code>/cbx</code> 前缀下（<code>ctx.webServer</code>）。无尾斜杠访问 <code>/cbx</code> 会 301 到 <code>/cbx/</code>（页面内资源与 API 全部相对路径引用，必须停在带尾斜杠的 URL 上）：</p>
+<ul>
+<li><code>GET /cbx/</code> — 仪表盘 HTML（带 <code>default-src 'self'; frame-ancestors 'none'</code> CSP）</li>
+<li><code>GET /cbx/events</code> — SSE 实时事件流（Last-Event-ID 回放，单连接回放上限 1000 条；服务端连接数上限 16，慢客户端背压超限会被断开）</li>
+<li><code>GET /cbx/api/workspaces|jobs|queue|metrics</code></li>
+<li><code>GET /cbx/healthz</code></li>
+<li><code>GET /cbx/api/jobs/&lt;id&gt;[/artifacts|/artifact/&lt;name&gt;|/timeline|/executor|/agent.log]</code></li>
+<li><code>POST /cbx/api/jobs</code>（创建）、<code>/cbx/api/jobs/&lt;id&gt;/approve|cancel|retry|continue|forget|purge</code>、<code>/cbx/api/queue/pause|resume</code></li>
+</ul>
+<p>数据端点鉴权用 <code>Authorization: Bearer &lt;token&gt;</code> 或 HttpOnly cookie <code>cbx_token</code>（HTTPS 下自动追加 <code>Secure</code>；<strong>不接受 URL query token</strong>——会泄漏进浏览器历史与代理日志）。首页、静态资源 <code>/cbx/style.css</code> 与 <code>/cbx/app.js</code>、<code>/cbx/healthz</code> 以及登录端点 <code>POST /cbx/auth</code>（body <code>{"token": "..."}</code>，验证通过才下发 cookie，每 IP 每分钟限 10 次、成功登录即清零计数）开放；其余数据端点（包括 <code>/cbx/api/metrics</code>）需要鉴权。<code>/cbx/healthz</code> 与 <code>/cbx/api/metrics</code> 均为只读（不触发保留期清理）。</p>
+<h2>配置</h2>
+<h3>插件配置（<code>cordis.patch.yml</code> 的 <code>config</code>）</h3>
+<pre><code>- insert:
+    - id: cbx-orch
+      name: 'dsh-cbx-orch'
+      config:
+        executor: codebuddy   # codebuddy / opencode / omp / cline / qwen / 插件路径
+        review: true          # 测试通过后跑独立审查
+        isolated: true        # git worktree 隔离执行
+        workspaces: []        # cbx 工具工作区白名单；空/缺省仅允许 canonical cwd
+    - id: cbx-orch-web
+      name: 'dsh-cbx-orch/web'
+      config:
+        web:
+          token: ''           # 非空 = 使用配置值；空/缺省 = 读取或生成 &lt;首个工作区&gt;/.cbx/web.token（生成时 0600），无免鉴权模式
+          workspaces: []      # ?workspace= 白名单；空 = 当前目录
+</code></pre>
+<p>core 的 <code>workspaces</code> 是 <code>cbx_*</code> 工具的工作区白名单：空或缺省时只允许经 canonical 化后的当前目录；显式列表只授权其中精确的 workspace。路径通过 <code>realpath</code> canonicalize（Windows 下折叠路径大小写），越权、缺失路径或非目录都会拒绝。<code>cbx_list_workspaces</code> 只列出该白名单中的 workspace，不再扫描任意 root 或子目录。</p>
+<p>Web 的 <code>web.workspaces</code> 继续作为 Web <code>?workspace=</code> 选择的独立 allowlist，但使用相同的 <code>WorkspacePolicy</code> 语义（canonicalization、越权/不存在/非目录拒绝）。core 的 <code>workspaces</code> 与 Web 的 <code>web.workspaces</code> 是两个独立配置，不会自动共享配置值。</p>
+<h3>工作区配置（<code>.cbx.json</code>，与 cbx-orch 相同）</h3>
+<p><code>executor</code>、<code>testCommand</code>、<code>review</code>、<code>isolated</code>、<code>timeoutMs</code>、<code>maxRetries</code>、<code>maxTurns</code>、<code>maxConcurrent</code>、<code>reviewRules</code>、<code>approval</code>、<code>git</code>、<code>reviewGate</code>（<code>enabled</code>、<code>failOpen</code>）、<code>notifications</code>（webhook/OTLP outbox）、<code>governance</code>（retention/redact）、<code>telemetry</code>、<code>ui.token</code> 等，见 cbx-orch 文档。</p>
+<h2>行为语义</h2>
+<ul>
+<li><strong>重试预算</strong>：<code>maxRetries</code> = 首次执行失败后允许的重试次数，总执行次数 = 1 + maxRetries（<code>maxRetries: 1</code> 即 2 次执行 + 1 次修复重试）。每个 stage 的预算独立持久化，崩溃重入不重置；用户 resolve Human Gate 或显式 retry 时归零。</li>
+<li><strong>取消语义</strong>：取消先落盘标记再终止子进程；正在收口的 done 遇到取消标记会改按取消收口（state 与队列条目保持一致）。跨进程清理残留执行器时先校验 pid 归属（记录 spawn 时刻，按平台比对进程实际启动时间），pid 已被系统复用时跳过 kill 并落审计事件——宁可留待人工处理，不误杀无关进程树。</li>
+<li><strong>审批流</strong>：before_run 审批通过即原子重入队并立即 dispatch；before_complete 审批在 commit 前后各核一次取消标记，证据哈希与 worktree 快照不符则拒绝完成（<code>completion_evidence_stale</code>）。</li>
+<li><strong>基线漂移（v2 指纹）</strong>：脏指纹只统计已跟踪文件的状态与 diff——工作区里的未跟踪 scratch 文件、其他任务留下的产物不再触发误报。旧任务仍按 v1 比对，显式 <code>refresh_baseline</code> 时升级到 v2。</li>
+<li><strong>依赖守卫</strong>：对修改与<strong>新建</strong>依赖声明/锁文件同责（事件中标注「新增」）；执行器静默引入新依赖会被拦截并要求恢复。</li>
+<li><strong>worktree 自愈</strong>：<code>git worktree add</code> 撞到上次崩溃残留的孤儿目录时自动 prune + 清除 + 重试一次，不再永久失败。</li>
+<li><strong>符号链接</strong>：未跟踪的符号链接/junction 不被跟随——diff 与审计材料记录链接本身而非目标内容，工作区之外的文件不会被吸进任务产物。</li>
+<li><strong>skipReview</strong>：契约中全部 stage 声明 <code>skipReview</code> 时，完成门不再要求 <code>review.md</code> 与 <code>VERDICT: PASS</code>（job 级 <code>review: true</code> 与 stage 级跳过不再互锁死）。</li>
+</ul>
+<h2>数据布局</h2>
+<p>任务数据默认存工作区 <code>.cbx/jobs/&lt;job-id&gt;/</code>（需求、状态、事件流、测试日志、diff、审查报告）+ <code>.cbx/state.sqlite</code>（WAL，队列/outbox/事件 seq 的权威存储；jobs 表为状态权威，state.json 为人类可读镜像）。体量控制：</p>
+<ul>
+<li><code>agent.log</code> / <code>test.log</code>：内存采集尾部 4MB，磁盘落盘上限 32MB（超限留标记停止写入）。</li>
+<li><code>events.ndjson</code>（job 级与工作区级）/ <code>telemetry.ndjson</code>：超 10MB 滚动单代 <code>.1</code>。</li>
+<li><code>active.pid</code>：JSON 记录 <code>{"pid", "startedAt"}</code>，供取消/重试路径做 pid 归属校验。</li>
+</ul>
+<h2>安全说明</h2>
+<ul>
+<li><strong>环境变量继承</strong>：执行器/测试命令的子进程完整继承宿主的 <code>process.env</code>（与终端直接运行一致）。这是有意设计——编码 CLI（codebuddy/opencode/omp/cline/qwen）依赖环境中的 API 凭据才能工作，因此不做变量过滤。</li>
+<li><strong>落盘脱敏</strong>：<code>agent.log</code> / <code>test.log</code> / <code>events.ndjson</code> 在写入边界对常见凭据形状（OpenAI/GitHub/Slack/Google/AWS key、私钥、Bearer token）做正则脱敏（流式跨 chunk 边界保留 16 字节重叠，防 key 被切断漏网）；事件流与遥测 span 中的长字段同时做长度截断，敏感键名（token/password/secret/…）整体替换；<code>plugin-request.json</code>（内嵌完整 prompt）在插件宿主读取后立即删除，不留持久副本。</li>
+<li><strong>测试命令防线</strong>：黑名单在匹配前先归一化（剥引号/反斜杠/<code>${var}</code>/<code>%var%</code>），拦截 <code>r\m</code>、<code>r""m</code> 一类拼接绕过；覆盖 <code>rm -rf</code>/<code>del /s</code>/<code>find -exec</code>/<code>git clean</code>/<code>truncate</code>/<code>dd</code>/<code>shred</code>/首 token <code>eval</code>/PowerShell 全部 <code>-EncodedCommand</code> 缩写；创建时与<strong>执行时各验一次</strong>（context.json 是执行器可写文件）。仍属软防线——非隔离任务请运行在受控环境，敏感场景建议 <code>isolated: true</code>。</li>
+<li><strong>进程终止安全</strong>：跨进程 kill 前按 pid 归属校验（见「行为语义」）；Windows 树杀始终走 <code>taskkill /T /F</code>（不用会漏掉孙进程的 <code>child.kill</code>）；abort 后设硬死线，杀不死的子进程不再让任务永久挂起。</li>
+<li><strong>路径安全</strong>：jobId 全链路校验（字符集白名单 + 拒绝 <code>..</code>/Windows 设备名/尾点段），目录删除与 context 写入共用同一道门；未跟踪符号链接不被跟随。</li>
+<li><strong>Web 鉴权</strong>：<code>web.token</code> 非空时直接使用配置值；为空或缺省时，插件先从首个配置工作区（未配置时为当前目录）的 <code>.cbx/web.token</code> 读取非空值，文件不存在或为空则生成随机 token，并以 <code>0600</code> 权限写入该文件，后续未配置显式 token 的启动会复用它。未配置显式 token 时启动日志只打印 token 文件路径，不打印 token 值；浏览器提示从该文件或日志路径取得 token。<strong>token 无法解析时拒绝挂载 Web 路由（fail-closed）</strong>，绝不退化成无鉴权面。浏览器端首次请求数据端点收到 401，页面弹出 token 输入框，经 <code>POST /cbx/auth</code> 换取 HttpOnly cookie（SameSite=Strict，HTTPS 下加 Secure；token 不出现在页面源码或 URL）。<code>/healthz</code> 与 <code>/api/metrics</code> 均为只读，但只有 <code>/healthz</code> 公开，<code>/api/metrics</code> 仍需鉴权（均不触发保留期清理）。仪表盘带 CSP；SSE 有连接数与背压上限。</li>
+<li><strong>review stop-gate</strong>：审查执行异常/超时/非零退出/无法解析 VERDICT 时默认 <strong>fail-closed 拦截</strong>（门禁的意义就是拦住行为异常的审查代理）；基础设施错误（如配置读取失败）仍放行以维持 hook 契约。需要旧行为配置 <code>reviewGate.failOpen: true</code>。</li>
+<li><strong>执行器插件</strong>：<code>executor</code> 指向工作区内的插件路径时，默认仅告警不强制白名单；生产环境请配置 <code>plugins.enforce=true</code> 与 <code>allowPaths</code>/<code>allowSha256</code>（路径/哈希白名单校验后才加载）。</li>
+</ul>
+<h2>开发</h2>
+<pre><code>npm install
+npm run build        # tsc → lib/
+npm run typecheck
+npm test             # build + node --test（纯函数单测：校验/pid 归属/审计/证据门/上下文包/存储）
+npm run smoke:e2e    # 端到端冒烟：起 dsh profile → 静态面/鉴权/SSE/任务生命周期 21 项断言
+</code></pre>
+<h3>冒烟测试</h3>
+<p>本地 profile（<code>$DSH_HOME/profiles/cbx</code>）已配置为 <code>[dsh-base, dsh-web-app, dsh-cbx-orch]</code>，可 <code>dsh --profile cbx --port 3180</code> 启动后访问 <code>/cbx/</code>。</p>
+<h2>许可</h2>
+<p>MIT。引擎部分移植自 <a href="https://github.com/zerosloney/cbx-orch">cbx-orch</a>（MIT）。</p>

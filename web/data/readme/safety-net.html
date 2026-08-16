@@ -1,0 +1,362 @@
+<p><a href="https://github.com/JohnXu22786/safety-net/blob/HEAD/README.zh.md">简体中文</a></p>
+<h1>Barricade</h1>
+<blockquote>
+<p>A destructive-command interception gate for coding agents: it parses command semantics and judges risk <strong>before</strong> <code>rm -rf</code>, <code>git reset --hard</code>, <code>git push --force</code> and similar commands actually land, then requires human confirmation.</p>
+</blockquote>
+<p>Barricade is a self-contained plugin/CLI with zero runtime dependencies (pure Node.js ESM), designed for any harness that "hands the shell over to an agent". It does not sandbox and does not limit capabilities; it does only one thing: <strong>hold irreversible operations at a confirmation gate</strong> — including those even a sandbox can't stop (<code>git reset --hard</code> discards the working tree, <code>git push --force</code> overwrites remote history, <code>rm -rf</code> deletes untracked files in the workspace).</p>
+<h2>Capabilities at a Glance</h2>
+<ul>
+<li><strong>Semantic-level command parsing</strong>: not string matching. Ships its own POSIX lexer that recognizes quotes, escapes, heredocs, command substitution <code>$(...)</code>, sub-shells and pipeline chains; <code>bash -c "rm -rf /"</code>, <code>sudo rm -rf /</code>, <code>eval "rm -rf /"</code>, <code>echo $(rm -rf /)</code> cannot slip through.</li>
+<li><strong>Per-command verifiers</strong>: git (reset/clean/push/checkout/branch/stash/restore — 13 dangerous forms, supporting long-flag unique prefixes and short-flag unbinding), rm (tiered by target scope: root/home/.git → fatal; outside workspace / dynamic targets → high; inside workspace → medium), dd/mkfs/shred/chmod/chown, find -delete, curl|sh, interpreter one-liners, fork bombs, PowerShell forced deletion — 41 built-in rules.</li>
+<li><strong>Three levels</strong>: <code>relaxed</code> / <code>balanced</code> (default) / <code>vigilant</code>, mapping severity → action (deny/ask/allow) tier by tier; under <code>vigilant</code>, unparseable inputs ask as needed (fail-closed).</li>
+<li><strong>Interactive confirmation</strong>: on a TTY it shows the command and matched rules, supporting run once / deny / allow for this session / allow permanently (written to policy) / show details; non-TTY environments always deny (fail-safe).</li>
+<li><strong>Portable across harnesses</strong>: the verdict core is harness-agnostic (input <code>(command, cwd, level)</code>, output structured verdict); three integration forms to choose from: a dsh in-process plugin, a generic stdin-hook JSON contract, and a <code>gate</code> shell wrapper.</li>
+<li><strong>Audit</strong>: interception and confirmation records are persisted as JSONL; secret-like content is automatically redacted.</li>
+</ul>
+<h2>How It Works</h2>
+<pre><code>agent 准备执行命令
+        │
+        ▼
+┌─────────────────┐   ┌──────────────┐
+│ 接入点(任一)      │──▶│ 命令分析引擎   │
+│ dsh 插件事件      │   │ 分词 → 分段   │
+│ stdin-hook       │   │ 拆包装 → 判定  │
+│ gate 包装        │   └──────┬───────┘
+└─────────────────┘          │
+                             ▼
+                  ┌─ 放行 ──▶ 命令执行
+                  │
+              判定结果
+                  │
+                  └─ 需确认 ─▶ TTY 交互确认 ──▶ 执行/拒绝
+                              非 TTY：拒绝（失败安全）
+</code></pre>
+<p>Key steps of the analysis engine:</p>
+<ol>
+<li><strong>Tokenize</strong>: POSIX-style lexing (quotes/escapes/operators/heredoc bodies/command-substitution extraction); falls back to a coarse-grained pattern scan when input is over the limit or unparseable.</li>
+<li><strong>Segment</strong>: splits command segments by <code>&amp;&amp;</code> <code>||</code> <code>;</code> <code>|</code> <code>&amp;</code> and sub-shells; tracks <code>cd</code> execution directories; each segment is judged independently, and any dangerous segment blocks the whole command.</li>
+<li><strong>Unwrap</strong>: recursively strips wrapper commands like <code>sudo</code> / <code>env</code> / <code>command</code> / <code>timeout</code> and embedded loads in <code>bash -c</code> / <code>sh -c</code> / <code>su -c</code> (depth limit 8; beyond the limit, ask as needed).</li>
+<li><strong>Verdict merge</strong>: fatal first; any deny → deny; any ask → ask; policy <code>overrides</code> can adjust high/medium actions, but <strong>fatal rules cannot be downgraded</strong>.</li>
+</ol>
+<h2>Installation</h2>
+<p>Requires Node.js ≥ 18.13, no npm dependencies.</p>
+<pre><code># 直接运行（无需安装）
+node bin/barricade.js --help
+
+# 作为命令行工具使用（可选）
+npm link          # 之后可直接使用 barricade 命令
+</code></pre>
+<h2>Integrating with dsh (DeepSeek Harness)</h2>
+<p>This repository is a valid dsh bundle: <code>package.json</code> declares <code>dsh.bundle</code>, <code>cordis.patch.yml</code> is the config-layer patch, and <code>plugin.js</code> is the plugin entry point.</p>
+<h3>Installing in DSH</h3>
+<pre><code>dsh plugin --profile demo add github:JohnXu22786/safety-net
+</code></pre>
+<h3>Loading</h3>
+<pre><code># 在目标 profile 中安装本 bundle（本地目录或已发布的 npm 包名）
+dsh plugin --profile web add ../dsh-barricade      # 或 dsh plugin --profile web add dsh-barricade
+
+# 启动
+dsh --profile web
+</code></pre>
+<p>After loading, Cordis inserts the plugin line per <code>cordis.patch.yml</code>:</p>
+<pre><code>- insert:
+    - id: barricade
+      name: dsh-barricade
+</code></pre>
+<h3>Plugin Interface</h3>
+<table>
+<thead>
+<tr>
+<th>Item</th>
+<th>Value</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>Entry</td>
+<td><code>plugin.js</code> (<code>main</code> field), exports <code>name</code> / <code>inject</code> / <code>apply(ctx, config)</code></td>
+</tr>
+<tr>
+<td>Events</td>
+<td>listens to the tool execution pipeline event <code>tools/pre-execute</code> (waterfall), intervening before the tool actually runs</td>
+</tr>
+<tr>
+<td>Interception</td>
+<td>throws <code>BarricadeBlocked</code> when a block verdict is produced; the tool call fails and the reason is visible to the model</td>
+</tr>
+<tr>
+<td>Config</td>
+<td>the <code>config</code> field in <code>cordis.patch.yml</code>, or a <code>dsh --patch</code> overlay</td>
+</tr>
+</tbody></table>
+<p>Available config keys (all optional):</p>
+<table>
+<thead>
+<tr>
+<th>Key</th>
+<th>Default</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>mode</code></td>
+<td><code>"deny"</code></td>
+<td><code>deny</code>: deny on match; <code>ask</code>: request human confirmation through the <code>ctx.approval</code> service; if confirmation is refused or the service is unavailable, treat as deny</td>
+</tr>
+<tr>
+<td><code>toolNames</code></td>
+<td>common shell tool name list</td>
+<td>only intercept these tools; can also be overridden via the <code>BARRICADE_TOOLS</code> env var (comma-separated)</td>
+</tr>
+<tr>
+<td><code>commandPath</code></td>
+<td><code>"args.command"</code></td>
+<td>dot-path to the command text in the tool call; compatible with <code>input.command</code> / <code>command</code> and other shapes</td>
+</tr>
+<tr>
+<td><code>level</code></td>
+<td>policy file</td>
+<td><code>relaxed</code> / <code>balanced</code> / <code>vigilant</code></td>
+</tr>
+</tbody></table>
+<p>Example (written into the profile's <code>cordis.patch.yml</code> or a <code>--patch</code> overlay):</p>
+<pre><code>- insert:
+    - id: barricade
+      name: dsh-barricade
+      config:
+        mode: ask
+        toolNames: [bash, run_code, run_command]
+</code></pre>
+<blockquote>
+<p>Note: dsh is currently in developer preview and its interfaces may evolve. <code>apply</code> defensively recognizes tool-call shapes (<code>name/tool</code>, <code>args/input</code>, etc.) and probes the various calling forms of <code>ctx.approval</code>; if any form is unavailable it falls back to deny, keeping fail-safe. If the upstream event contract changes, just adjust the event name and field paths in <code>plugin.js</code>.</p>
+</blockquote>
+<h3>Other Harness Integration</h3>
+<p>The verdict core depends on no harness; pick any of the three forms:</p>
+<p><strong>① stdin-hook contract</strong> (for harnesses that support "run a hook before tool invocation", such as PreToolUse-style hooks):</p>
+<pre><code>stdin  : {"command": "&lt;待执行命令&gt;", "cwd": "&lt;可选&gt;"}    # 或纯命令文本
+stdout : {"action": "allow|ask|deny", "severity": ..., "matches": [...], "warnings": [...]}
+exit   : 0（正常输出判定）；加 --exit-on-block 时拦截退出 1
+</code></pre>
+<p>Example (point the hook command at <code>node &lt;本目录&gt;/bin/barricade.js hook</code>):</p>
+<pre><code>echo '{"command":"git push --force origin main"}' | node bin/barricade.js hook
+# {"command":"git push --force origin main","action":"ask","severity":"high",
+#  "reason":"强制推送覆盖远端提交历史，可能造成他人工作丢失","matches":[...],"warnings":[]}
+</code></pre>
+<p><strong>② gate wrapper</strong> (swap the harness's shell for <code>barricade gate -- &lt;command&gt;</code>): executes after terminal confirmation; non-terminal environments are blocked outright.</p>
+<p><strong>③ in-process reuse</strong>: <code>createInterceptor(config)</code> returns a pure verdict function callable from any Node in-process harness (see the comments at the top of <code>plugin.js</code>).</p>
+<h2>CLI Usage</h2>
+<pre><code>barricade &lt;子命令&gt; [选项]
+
+  analyze [--json] &lt;命令&gt;              分析并输出判定（不执行；退出码恒 0）
+  check   [--json] [--quiet] &lt;命令&gt;    判定；放行退出 0，拦截退出 1
+  gate -- &lt;命令&gt;                       分析 + 交互确认 + 执行
+  hook                                 见上文 stdin-hook 契约
+  policy --show [--json]               显示合并后的策略
+  policy --validate [--policy F]       校验策略文件
+  rules [--json]                       列出内置规则
+  audit [--tail N]                     查看审计记录
+
+  -c, --command &lt;命令&gt;    --stdin       命令输入方式
+  --level &lt;等级&gt;          --policy &lt;F&gt;  临时等级 / 指定策略文件
+  --json                  --quiet       --exit-on-block
+  -h, --help              -v, --version --tail &lt;N&gt;
+</code></pre>
+<p>Examples:</p>
+<pre><code>barricade check -c "rm -rf /"                 # 退出 1，打印拦截原因
+barricade analyze --json -c "git reset --hard"
+barricade gate -- "npm run build"             # 终端下交互确认
+</code></pre>
+<h2>Policy Configuration</h2>
+<p>Config files: user-level <code>~/.barricade/barricade.json</code> (<code>BARRICADE_HOME</code> to change), project-level <code>.barricade.json</code> (current directory, takes precedence over user-level). Both are JSON; missing/corrupt fields <strong>rescue-fall back to defaults</strong> with a warning — a policy file can never interrupt your workflow.</p>
+<pre><code>{
+  "version": 1,
+  "level": "balanced",
+  "failClosed": false,
+  "allowlist": ["git status", "git log", "ls -la"],
+  "overrides": { "git/tag-delete": "allow" },
+  "rules": [
+    {
+      "id": "custom/dropdb-force",
+      "command": "dropdb",
+      "args": ["--force"],
+      "severity": "high",
+      "reason": "强制删除数据库不可恢复"
+    }
+  ],
+  "confirmation": { "sessionMemory": true, "timeoutSeconds": 0 }
+}
+</code></pre>
+<table>
+<thead>
+<tr>
+<th>Field</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>level</code></td>
+<td><code>relaxed</code> (medium allowed) / <code>balanced</code> (medium asks) / <code>vigilant</code> (+ unparseable input asks as needed)</td>
+</tr>
+<tr>
+<td><code>failClosed</code></td>
+<td>require confirmation even when a command cannot be parsed</td>
+</tr>
+<tr>
+<td><code>allowlist</code></td>
+<td>prefix allowlist (<code>git status</code> allows <code>git status --porcelain</code>)</td>
+</tr>
+<tr>
+<td><code>overrides</code></td>
+<td>adjust per-rule-id actions: <code>allow</code> / <code>ask</code> / <code>deny</code> / <code>off</code>; <strong>fatal rules cannot be downgraded</strong></td>
+</tr>
+<tr>
+<td><code>rules</code></td>
+<td>custom rules: command + optional subcommand + any arg match (short-flag unbinding supported)</td>
+</tr>
+<tr>
+<td><code>confirmation.timeoutSeconds</code></td>
+<td>interactive confirmation timeout (seconds); timeout counts as deny; 0 means no timeout</td>
+</tr>
+</tbody></table>
+<p>Environment variables (raise-only, never lower):</p>
+<table>
+<thead>
+<tr>
+<th>Variable</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>BARRICADE_HOME</code></td>
+<td>data directory (policy, audit logs), default <code>~/.barricade</code></td>
+</tr>
+<tr>
+<td><code>BARRICADE_POLICY</code></td>
+<td>specify a user policy file path</td>
+</tr>
+<tr>
+<td><code>BARRICADE_LEVEL</code></td>
+<td>raise the level (only takes effect when higher than the file level)</td>
+</tr>
+<tr>
+<td><code>BARRICADE_FAIL_CLOSED=1</code></td>
+<td>enable fail-closed</td>
+</tr>
+<tr>
+<td><code>BARRICADE_CONFIRM_TIMEOUT</code></td>
+<td>confirmation timeout seconds</td>
+</tr>
+<tr>
+<td><code>BARRICADE_TOOLS</code></td>
+<td>comma-separated list of tools the dsh plugin intercepts</td>
+</tr>
+<tr>
+<td><code>BARRICADE_NO_COLOR</code> / <code>NO_COLOR</code></td>
+<td>disable colored output</td>
+</tr>
+</tbody></table>
+<h2>Interactive Confirmation</h2>
+<pre><code>⚠️  Barricade 需要确认此命令 [高危]
+命令: git push --force origin main
+  • git/push-force — 强制推送覆盖远端提交历史，可能造成他人工作丢失
+[y] 执行一次  [n] 拒绝  [s] 本会话放行  [a] 永久放行  [d] 详情  [q] 退出
+&gt;
+</code></pre>
+<ul>
+<li><code>a</code> writes the rule into the user policy file (<code>overrides</code>); fatal rules cannot be allowed permanently.</li>
+<li><code>s</code> records the rule into this invocation's session set; within a single <code>gate</code> call it confirms only once, so <code>s</code> is equivalent to <code>y</code>; it can take effect across calls when the same session set is reused in-process.</li>
+<li>Control characters are escaped and the command truncated before display, preventing terminal injection (the verdict text and audit logs are handled the same way).</li>
+</ul>
+<h2>Built-in Rules (excerpt)</h2>
+<table>
+<thead>
+<tr>
+<th>Rule id</th>
+<th>Severity</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>fs/rm-root</code> / <code>fs/rm-home</code></td>
+<td>fatal</td>
+<td>delete root / home directory</td>
+</tr>
+<tr>
+<td><code>fs/rm-git</code></td>
+<td>fatal</td>
+<td>delete/write/move <code>.git</code> internals</td>
+</tr>
+<tr>
+<td><code>fs/mkfs-device</code> / <code>fs/dd-device</code></td>
+<td>fatal/high</td>
+<td>format or write block devices (safe targets such as <code>/dev/null</code> excluded)</td>
+</tr>
+<tr>
+<td><code>fs/rm-outside</code> / <code>fs/rm-dynamic</code> / <code>fs/rm-workspace</code></td>
+<td>high/high/medium</td>
+<td>rm -rf target scope tiers</td>
+</tr>
+<tr>
+<td><code>fs/find-delete</code> / <code>fs/shred</code> / <code>fs/chmod-recursive</code> / <code>fs/chown-recursive</code></td>
+<td>high/high/medium/medium</td>
+<td>bulk or recursive destructive operations</td>
+</tr>
+<tr>
+<td><code>git/reset-hard</code> / <code>git/clean-force</code> / <code>git/push-force</code> / <code>git/push-delete</code></td>
+<td>high/high/high/medium</td>
+<td>overwrite history, discard uncommitted changes, delete remote branches</td>
+</tr>
+<tr>
+<td><code>git/checkout-force</code> / <code>git/checkout-discard</code> / <code>git/switch-force</code> / <code>git/restore-worktree</code></td>
+<td>high</td>
+<td>discard working-tree changes</td>
+</tr>
+<tr>
+<td><code>git/branch-delete-force</code> / <code>git/stash-drop</code> / <code>git/stash-clear</code> / <code>git/tag-delete</code></td>
+<td>high/high/high/medium</td>
+<td>unrecoverable ref/stash operations</td>
+</tr>
+<tr>
+<td><code>git/fetch-force</code> / <code>git/ssh-env</code></td>
+<td>medium/high</td>
+<td>overwrite remote refs / GIT_SSH* combined with network subcommands</td>
+</tr>
+<tr>
+<td><code>shell/curl-pipe-sh</code> / <code>shell/fork-bomb</code> / <code>interp/embedded</code></td>
+<td>high</td>
+<td>remote-script piping, fork bombs, interpreter-embedded deletion code</td>
+</tr>
+<tr>
+<td><code>sys/shutdown</code> / <code>sys/reboot</code> / <code>sys/powershell-remove</code> / <code>sys/cmd-del</code></td>
+<td>high/high/medium/medium</td>
+<td>system-level operations</td>
+</tr>
+</tbody></table>
+<p>The full list and action mapping: <code>barricade rules</code>.</p>
+<h2>Security Model and Known Boundaries</h2>
+<ul>
+<li><strong>Not a sandbox</strong>, and not a privilege boundary. It intercepts "commands the harness issues through supported entry points"; bypassing the integration (e.g. writing files directly with an editor tool, executing manually outside a container) is out of protection scope.</li>
+<li><strong>Inherent limits of static analysis</strong>: runtime-only content such as <code>bash &lt;unknown script&gt;</code> and <code>eval "$X"</code> cannot be inspected — under <code>vigilant</code> they require confirmation; under the default level they pass (tightenable with <code>failClosed</code> or custom rules).</li>
+<li>Analysis handles command text with POSIX path semantics, independent of the running platform; on Windows, <code>gate</code> runs via <code>cmd /c</code>, while the command itself is still parsed with POSIX syntax.</li>
+<li>Input size limit 128 KiB and nesting depth limit 8; beyond the limits it falls back to coarse-grained scanning or asks as needed, preventing malformed input from stalling analysis.</li>
+</ul>
+<h2>Development</h2>
+<pre><code>node --test        # 或 npm test；测试用例见 test/ 目录
+</code></pre>
+<p>Structure:</p>
+<pre><code>bin/barricade.js    CLI 入口
+plugin.js           dsh（Cordis）插件入口
+src/
+  tokenizer.js      词法分析（引号/heredoc/命令替换）
+  analyzer.js       命令段组织、包装拆解、分命令判定
+  rules.js          内置规则库与等级映射
+  verdict.js        判定合并模型
+  policy.js         策略加载与挽救式校验
+  prompt.js         交互确认
+  audit.js          审计日志（脱敏）
+  executor.js       gate 执行器
+cordis.patch.yml    dsh 配置层补丁
+examples/           示例配置与 hook 契约样例
+test/               181 个测试用例
+</code></pre>
+<h2>License</h2>
+<p><a href="https://github.com/JohnXu22786/safety-net/blob/HEAD/LICENSE">MIT</a></p>

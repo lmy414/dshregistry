@@ -1,0 +1,250 @@
+<h1>dsh-qqbot</h1>
+<p>把 <a href="https://github.com/deepseek-ai/deepseek-harness">DeepSeek Harness</a>（DSH）接入
+QQ 机器人的插件，<strong>支持两种接入通道</strong>：</p>
+<table>
+<thead>
+<tr>
+<th>通道</th>
+<th><code>transport</code></th>
+<th>适用</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>OneBot 11</td>
+<td><code>onebot</code>（默认）</td>
+<td>NapCat / Lagrange / LLOneBot 等协议端</td>
+<td>正向 WebSocket，功能全（群聊任意消息、图片等）</td>
+</tr>
+<tr>
+<td>QQ 官方开放平台</td>
+<td><code>official</code></td>
+<td>q.qq.com 官方机器人</td>
+<td>AppID/AppSecret 直连，群聊（@触发）/单聊/频道</td>
+</tr>
+</tbody></table>
+<p>两种通道下行为一致：</p>
+<ul>
+<li><strong>每个 QQ 会话一个持久 Agent</strong>：私聊、每个群、每个频道各自独立上下文，历史跨重启保留
+（会话日志持久化到 <code>$DSH_HOME/sessions</code>）；</li>
+<li><strong>完整工具链</strong>：Agent 挂载部署的 Agent 预设（web profile 下为 <code>standard</code>），
+拥有文件读写、Shell/PowerShell、网页搜索、子代理、任务清单等 DSH 全部能力；</li>
+<li><strong>Agent 可主动发消息</strong>：注册 <code>qq_send</code> 工具，Agent 可以主动向对话方汇报进度、
+提问或输出结果；</li>
+<li>本地命令 <code>#help</code> / <code>#status</code> / <code>#reset</code>，长回复自动分块，断线自动重连。</li>
+</ul>
+<h2>工作原理</h2>
+<pre><code>QQ 消息 ──► OneBot 实现 / QQ 官方开放平台
+                │  正向 WebSocket / 官方 WS 长连接（q.qq.com）
+                ▼
+        dsh-qqbot 插件（web profile 内）
+                │  ctx.agents.create / resume（每个 QQ 会话一个 Agent）
+                ▼
+        DeepSeek Harness Agent（模型 + 工具 + 预设）
+                │  回复文本
+                ▼
+        send_*_msg / 官方 OpenAPI ──► QQ
+</code></pre>
+<h2>安装</h2>
+<h3>1. 准备 QQ 接入端</h3>
+<p><strong>OneBot 通道</strong>（默认）：任选一个协议实现，例如 <a href="https://napcat.napneko.icu/">NapCat</a>：
+登录机器人 QQ 号，开启「网络监听 → WebSocket 客户端（正向 WS）」，记下地址
+（默认 <code>ws://127.0.0.1:3001</code>），可选设置 access token。</p>
+<p><strong>QQ 官方通道</strong>：到 <a href="https://q.qq.com">QQ 开放平台</a> 创建机器人，在「开发设置」
+拿到 <strong>AppID</strong> 与 <strong>AppSecret</strong>；在「沙箱配置」添加测试群/私聊用户（或发布后使用）。
+群聊中机器人只会收到 @它的消息；单聊需用户主动发起。</p>
+<h3>2. 安装插件到 DSH web profile</h3>
+<pre><code>dsh plugin --profile web add file:C:\path\to\dsh-qqbot
+</code></pre>
+<blockquote>
+<p>等价于在 <code>$DSH_HOME/profiles/web</code> 下执行 <code>pnpm add file:...</code>，
+并把 <code>dsh-qqbot</code> 加入该 profile 的 bundle 列表。</p>
+</blockquote>
+<p>然后<strong>重启 <code>dsh web</code></strong>（先 Ctrl+C 停掉旧进程再启动）。启动日志出现
+<code>qqbot: connected to ...</code> 即成功。</p>
+<h3>3. 配置</h3>
+<p><strong>OneBot 通道</strong>：默认连接 <code>ws://127.0.0.1:3001</code>，可设环境变量：</p>
+<pre><code>set QQBOT_WS_URL=ws://127.0.0.1:3001
+set QQBOT_ACCESS_TOKEN=你的token
+dsh web
+</code></pre>
+<p><strong>QQ 官方通道</strong>（任选其一）：</p>
+<p>方式 A —— 环境变量：</p>
+<pre><code>set QQBOT_TRANSPORT=official
+set QQBOT_APP_ID=你的AppID
+set QQBOT_APP_SECRET=你的AppSecret
+dsh web
+</code></pre>
+<p>方式 B —— profile 的 <code>cordis.patch.yml</code>（<code>$DSH_HOME/profiles/web/cordis.patch.yml</code>）：</p>
+<pre><code>- id: qqbot
+  config:
+    transport: official
+    appId: '你的AppID'
+    clientSecret: '你的AppSecret'
+    # sandbox: true          # 沙箱域名（默认正式环境）
+    # groupMentionOnly: true # 群聊只在 @机器人 时回复（官方通道天然只收 @）
+    # allowedUsers: ['xxx']  # 只允许这些用户 openid（空 = 全部）
+    # allowedGroups: ['xxx'] # 只回复这些群 openid（空 = 全部）
+</code></pre>
+<p>配置项见插件 <code>Config</code>（<code>lib/index.js</code>）与下方「配置项一览」。</p>
+<h2>使用</h2>
+<table>
+<thead>
+<tr>
+<th>命令</th>
+<th>作用</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>任意消息</td>
+<td>交给本会话的 Agent 处理并回复</td>
+</tr>
+<tr>
+<td><code>#help</code></td>
+<td>显示帮助</td>
+</tr>
+<tr>
+<td><code>#status</code></td>
+<td>显示接入通道、连接与会话状态</td>
+</tr>
+<tr>
+<td><code>#reset</code></td>
+<td>重置当前会话（清空上下文）</td>
+</tr>
+</tbody></table>
+<p>每个 QQ 会话的工作目录位于 <code>&lt;dsh 启动目录&gt;/qqbot-chats/&lt;会话键&gt;</code>（可在
+<code>workspaceRoot</code> 配置中改；建议保持在 DSH 沙箱根内，否则文件类工具会被拦截）。</p>
+<h2>Agent 主动发消息（qq_send）</h2>
+<p>插件向所有 Agent（包括 web GUI 会话）注册 <code>qq_send</code> 工具：把文本发送给
+“当前正在与这个 Agent 对话的 QQ 会话”。例如 Agent 在长时间任务中可以汇报进度，
+或向用户提问。非 QQ 会话调用会得到明确报错。</p>
+<blockquote>
+<p>注意：QQ 官方开放平台自 2025-04-21 起已停用主动消息能力，因此官方通道中的
+<code>qq_send</code> 会明确报错；OneBot 通道不受此限制。官方被动回复仍受平台窗口和
+“同一条入站消息最多回复 5 次”等限制，插件会在分块超过 5 条时拒绝发送，避免静默丢尾。</p>
+</blockquote>
+<h2>配置项一览</h2>
+<table>
+<thead>
+<tr>
+<th>键</th>
+<th>默认</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>transport</code></td>
+<td><code>onebot</code></td>
+<td><code>onebot</code>（OneBot 11）或 <code>official</code>（QQ 官方）</td>
+</tr>
+<tr>
+<td><code>url</code></td>
+<td><code>ws://127.0.0.1:3001</code></td>
+<td>OneBot 正向 WS 地址</td>
+</tr>
+<tr>
+<td><code>accessToken</code></td>
+<td><code>''</code></td>
+<td>OneBot token（Bearer）</td>
+</tr>
+<tr>
+<td><code>reconnectDelayMs</code></td>
+<td><code>3000</code></td>
+<td>重连初始延迟，指数退避封顶 60s</td>
+</tr>
+<tr>
+<td><code>appId</code></td>
+<td><code>''</code></td>
+<td>QQ 官方机器人 AppID</td>
+</tr>
+<tr>
+<td><code>clientSecret</code></td>
+<td><code>''</code></td>
+<td>QQ 官方机器人 AppSecret</td>
+</tr>
+<tr>
+<td><code>apiBase</code></td>
+<td><code>https://api.sgroup.qq.com</code></td>
+<td>官方 OpenAPI 域名</td>
+</tr>
+<tr>
+<td><code>tokenUrl</code></td>
+<td><code>https://bots.qq.com/app/getAppAccessToken</code></td>
+<td>access_token 接口</td>
+</tr>
+<tr>
+<td><code>sandbox</code></td>
+<td><code>false</code></td>
+<td>使用沙箱域名 <code>sandbox.api.sgroup.qq.com</code></td>
+</tr>
+<tr>
+<td><code>gatewayUrl</code></td>
+<td><code>''</code></td>
+<td>强制指定官方 WS 网关；留空自动获取</td>
+</tr>
+<tr>
+<td><code>replyMaxChars</code></td>
+<td><code>4500</code></td>
+<td>单条回复字符上限，超出分块（官方通道另限 3000 字节）</td>
+</tr>
+<tr>
+<td><code>workspaceRoot</code></td>
+<td><code>&lt;cwd&gt;/qqbot-chats</code></td>
+<td>会话工作目录根</td>
+</tr>
+<tr>
+<td><code>persona</code></td>
+<td>内置默认</td>
+<td>附加到每个 QQ Agent 的系统提示词</td>
+</tr>
+<tr>
+<td><code>preset</code></td>
+<td><code>''</code>（部署默认）</td>
+<td>QQ Agent 挂载的 Agent 预设 id</td>
+</tr>
+<tr>
+<td><code>allowedUsers</code></td>
+<td><code>[]</code></td>
+<td>允许私聊的 QQ 号/openid（空=全部）</td>
+</tr>
+<tr>
+<td><code>allowedGroups</code></td>
+<td><code>[]</code></td>
+<td>允许回复的群号/群 openid/频道键 <code>&lt;guild_id&gt;-&lt;channel_id&gt;</code>（空=全部）</td>
+</tr>
+<tr>
+<td><code>groupMentionOnly</code></td>
+<td><code>false</code></td>
+<td>群聊仅 @机器人 时回复</td>
+</tr>
+<tr>
+<td><code>maxTurnMs</code></td>
+<td><code>600000</code></td>
+<td>单轮回复最长等待，超时后取消当前任务并提示</td>
+</tr>
+<tr>
+<td><code>httpTimeoutMs</code></td>
+<td><code>15000</code></td>
+<td>QQ 官方 token/OpenAPI HTTP 请求超时（ms）</td>
+</tr>
+<tr>
+<td><code>registerSendTool</code></td>
+<td><code>true</code></td>
+<td>是否注册 <code>qq_send</code> 工具</td>
+</tr>
+</tbody></table>
+<h2>卸载</h2>
+<pre><code>dsh plugin --profile web remove dsh-qqbot
+</code></pre>
+<h2>安全注意</h2>
+<ul>
+<li>QQ 机器人是<strong>无认证</strong>的入口：任何能向你机器人发消息的人都能使用 DSH 的
+Agent 能力（包括 Shell）。请务必通过 <code>allowedUsers</code> / <code>allowedGroups</code>
+限制可用范围，并只登录可信的 QQ 号。</li>
+<li>审批（approval）弹窗仍会出现在 web GUI 中（policy 为 <code>ask</code> 时）；如果
+需要 QQ 内审批，请自行扩展（例如把 <code>qq_send</code> 接到审批 answerer）。</li>
+<li>工作目录默认位于 DSH 沙箱根内；改到别处时请同步调整
+<code>fs-sandbox.workspaceRoot</code>，否则文件类工具会被沙箱拦截。</li>
+</ul>
+<h2>License</h2>
+<p>MIT</p>

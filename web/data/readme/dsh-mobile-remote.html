@@ -1,0 +1,229 @@
+<h1>dsh-mobile-remote</h1>
+<p><strong>Your phone's WeChat becomes the remote control for your DeepSeek Harness agent.</strong></p>
+<p><a href="https://github.com/good-boy4069/dsh-mobile-remote/blob/HEAD/README.md">English</a> | <a href="https://github.com/good-boy4069/dsh-mobile-remote/blob/HEAD/README.zh.md">中文</a></p>
+<p>Scan a QR code to bind a WeChat bot, then drive your dsh agent from WeChat over any network (4G / any WiFi): send commands, assign tasks, receive results, browse directories with <code>/ls</code> — plus <strong>two-way file transfer</strong>, <strong>proactive notifications</strong>, and <strong>multi-session switching</strong>.</p>
+<ul>
+<li>Full-permission mode: the agent can use every tool without confirmation (a <code>strict</code> escape hatch is reserved via <code>permissionMode</code>)</li>
+<li>Voice messages: never stored or transcribed; replies「无法识别语音消息」(voice message not recognized)</li>
+<li>Messages transit Tencent iLink servers (WeChat has no third-party API) — <strong>not end-to-end encrypted</strong>; see "Risks &amp; Boundaries"</li>
+</ul>
+<h2>Why this plugin</h2>
+<p>Compared with other dsh WeChat bridges (<code>dsh-weixin</code>, <code>dsh-chatnode-wechat</code>, <code>dsh-im-bridge</code>, …):</p>
+<ol>
+<li><strong>Protocol fidelity</strong>: every wire detail was verified line-by-line against Tencent's official openclaw-weixin SDK v2.4.6 (notes and reference sources in <code>docs/</code>) — outbound <code>aes_key</code> encoding, the two separate media-type numbering schemes, and the CDN upload/download flows all match the official SDK. Both inbound AES key encodings (base64 of raw bytes / base64 of hex) are supported, with explicit errors on bad keys (no silent truncation)</li>
+<li><strong>Two-way file transfer</strong>: inbound images/files/videos are downloaded, decrypted and saved automatically (stable naming to prevent crash-replay duplicates + plaintext MD5 verification + 100 MB cap); outbound via the <code>/send</code> command or a <code>[[send-file:path]]</code> line in the model's reply — both share a single allowlist path check (symlink escapes, out-of-root paths and directories are rejected)</li>
+<li><strong>Proactive notifications</strong>: a <code>weixin_send</code> model tool (text + file) plus completion notifications for unbound sessions (rule-based dedup against double-send). Expired session tokens (<code>-14</code>) return an exact message, the health panel degrades and prompts a re-scan, and re-scanning while running <strong>hot-rotates credentials</strong> without a restart</li>
+<li><strong>Multi-session remote control</strong>: <code>/sessions</code> listing + <code>/switch</code> with number/title dual semantics; when a session is taken over by another chat, the previous chat is notified — no cross-window output mixing</li>
+<li><strong>Reliability engineering</strong> (rare among peers): an exactly-once processing pipeline (queue + cursor atomically persisted), an at-least-once delivery outbox with crash recovery, a global processing limiter (8) + download semaphore (3) + backpressure throttling, drain re-entrancy mutexes and cursor identity checks, redundant credential persistence; <strong>182 automated tests green</strong>, strict typecheck, and a zero-value-import gate for host packages</li>
+<li><strong>Observability</strong>: a <code>/health</code> endpoint (allowlisted fields, no internal identifiers), a three-state status bar on the login page (running / missing credential / stopped + reason), and a <code>gateway.log</code> file log (1 MB rotation, 0600)</li>
+<li><strong>Clear security boundaries</strong>: the allowlist is the only usage boundary, the login page is loopback-only, error texts never leak keys or paths, and <code>weixin_send</code> file sending is constrained by the same path allowlist as <code>/send</code></li>
+</ol>
+<h2>Install</h2>
+<pre><code># 1. Install the plugin into the web profile
+npx @deepseek-ai/dsh plugin --profile web add dsh-mobile-remote
+
+# 2. Start (or restart) dsh web
+dsh web
+</code></pre>
+<h2>QR login</h2>
+<ol>
+<li>With <code>dsh web</code> running, open <code>http://127.0.0.1:3080/mobile-remote-weixin/login</code> in a browser <strong>on this machine</strong></li>
+<li>Scan the QR code with WeChat and confirm (if WeChat shows a numeric code, enter it on the page)</li>
+<li>Once confirmed, message the bot from WeChat</li>
+</ol>
+<p>The login page shows a gateway status bar (green = running / yellow = missing credential / red = stopped + reason); <code>GET /mobile-remote-weixin/health</code> returns a health snapshot (loopback-only, no internal identifiers).</p>
+<h2>Commands</h2>
+<table>
+<thead>
+<tr>
+<th>Command</th>
+<th>Effect</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>/status</code></td>
+<td>Session state + session id + workspace</td>
+</tr>
+<tr>
+<td><code>/new</code></td>
+<td>Unbind current session; next message starts a new one</td>
+</tr>
+<tr>
+<td><code>/stop</code></td>
+<td>Stop the running task</td>
+</tr>
+<tr>
+<td><code>/reply &lt;text&gt;</code></td>
+<td>Follow up on the current task</td>
+</tr>
+<tr>
+<td><code>/sessions</code></td>
+<td>Last 10 sessions (current binding marked ⭐)</td>
+</tr>
+<tr>
+<td><code>/switch &lt;number-or-title&gt;</code></td>
+<td>Switch session: pure digits resolve by <code>/sessions</code> number first, fall back to title match</td>
+</tr>
+<tr>
+<td><code>/切换聊天窗口：&lt;title&gt;</code></td>
+<td>Always match by title (use this for titles that are pure digits)</td>
+</tr>
+<tr>
+<td><code>/send &lt;file-path&gt;</code></td>
+<td>Send a file from the workspace/inbox to WeChat</td>
+</tr>
+<tr>
+<td><code>/ls [path]</code></td>
+<td>List a computer directory</td>
+</tr>
+<tr>
+<td><code>/workspace</code></td>
+<td>Show the current workspace</td>
+</tr>
+<tr>
+<td><code>/help</code></td>
+<td>Show the command list again</td>
+</tr>
+</tbody></table>
+<h2>File transfer</h2>
+<ul>
+<li><strong>Inbound</strong>: images/files/videos sent from WeChat are downloaded, decrypted and saved to <code>&lt;workspace&gt;/.wechat-inbox/&lt;date&gt;/</code> (name = original + message hash, stable naming prevents crash-replay duplicates; <code>maxMediaBytes</code> cap, 100 MiB default). The model sees a <code>[received file] &lt;absolute path&gt;</code> hint and can continue with vision tools.</li>
+<li><strong>Outbound</strong>: <code>/send &lt;path&gt;</code> sends directly; the agent can also put a single <code>[[send-file:path]]</code> line in its final reply (the line itself is never shown to the user). Paths must be inside the workspace or the inbox directory (one shared check; symlink escapes and out-of-root paths are rejected).</li>
+<li>Voice messages stay rejected: not downloaded, not stored.</li>
+</ul>
+<h2>Proactive notifications</h2>
+<ul>
+<li><strong><code>weixin_send</code> tool</strong>: agents in WeChat sessions can push text/files to WeChat (to the bound chat window; falls back to <code>notifyChatId</code> when unbound). Disable with <code>enableWeixinSendTool: false</code>.</li>
+<li><strong>Completion notifications</strong>: configure <code>notifyChatId</code> + <code>notifyOnTurnEnd: true</code>, and when a task finishes in a session <strong>not bound</strong> to WeChat, a <code>✅ Task complete: session「title」</code> push goes to the notification target (bound sessions are never double-notified; deduped when the tool already pushed this turn).</li>
+</ul>
+<h2>Configuration (all optional)</h2>
+<p>Environment variables:</p>
+<table>
+<thead>
+<tr>
+<th>Variable</th>
+<th>Default</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>WEIXIN_BOT_TOKEN</code></td>
+<td>none</td>
+<td>Login token (auto-saved after QR login; normally not needed)</td>
+</tr>
+<tr>
+<td><code>WEIXIN_ALLOWED_USERS</code></td>
+<td>the scanner</td>
+<td>Allowed user ids, comma-separated</td>
+</tr>
+<tr>
+<td><code>WEIXIN_ALLOWED_GROUPS</code></td>
+<td>empty</td>
+<td>Allowed group ids (groups need user+group match)</td>
+</tr>
+<tr>
+<td><code>WEIXIN_BOT_API_BASE</code></td>
+<td><code>https://ilinkai.weixin.qq.com</code></td>
+<td>iLink gateway</td>
+</tr>
+<tr>
+<td><code>WEIXIN_CDN_BASE</code></td>
+<td><code>https://novac2c.cdn.weixin.qq.com/c2c</code></td>
+<td>Media CDN</td>
+</tr>
+<tr>
+<td><code>WEIXIN_MAX_MESSAGE_CHARS</code></td>
+<td>3500</td>
+<td>Reply chunk length</td>
+</tr>
+<tr>
+<td><code>WEIXIN_MAX_MEDIA_BYTES</code></td>
+<td>100 MiB</td>
+<td>Media size cap</td>
+</tr>
+<tr>
+<td><code>WEIXIN_PERMISSION_MODE</code></td>
+<td><code>full</code></td>
+<td><code>full</code> = full permission; <code>strict</code> = reserved escape hatch</td>
+</tr>
+<tr>
+<td><code>WEIXIN_DSH_WORKSPACE</code></td>
+<td>auto</td>
+<td>Default workspace for new WeChat sessions (this var &gt; explicit config &gt; dsh current workspace &gt; process cwd)</td>
+</tr>
+</tbody></table>
+<p>cordis config keys:</p>
+<table>
+<thead>
+<tr>
+<th>Key</th>
+<th>Default</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>inboxDir</code></td>
+<td>'' (=workspace/.wechat-inbox)</td>
+<td>Inbox directory; out-of-root values fall back with a warning</td>
+</tr>
+<tr>
+<td><code>enableWeixinSendTool</code></td>
+<td><code>true</code></td>
+<td>Master switch for the weixin_send tool</td>
+</tr>
+<tr>
+<td><code>notifyChatId</code></td>
+<td>''</td>
+<td>Notification target / tool fallback (Web sessions can also push once set)</td>
+</tr>
+<tr>
+<td><code>notifyOnTurnEnd</code></td>
+<td><code>false</code></td>
+<td>Push completion notifications for unbound sessions</td>
+</tr>
+<tr>
+<td><code>logDir</code></td>
+<td>'' (=state dir)</td>
+<td>Gateway log directory (<code>gateway.log</code>, 1 MB rotation)</td>
+</tr>
+<tr>
+<td><code>statePath</code></td>
+<td><code>~/.dsh/mobile-remote-weixin/gateway-state.json</code></td>
+<td>Gateway state file</td>
+</tr>
+</tbody></table>
+<h2>Health &amp; logs</h2>
+<ul>
+<li>Health snapshot (<code>/health</code>): running state, poll activity, consecutive error count, binding counts, backlog, credential presence, start-failure reason — allowlisted fields only, never chat/session ids or progress.</li>
+<li>File log: <code>gateway.log</code> (append-only, 0600, 1 MB single-generation rotation, silent degradation on write failure), tee'd to the dsh logger.</li>
+</ul>
+<h2>Risks &amp; boundaries (please read)</h2>
+<ul>
+<li><strong>Full-permission mode</strong>: no human in the loop; the allowlist is the only boundary — <strong>only add your own WeChat account</strong>.</li>
+<li><strong><code>weixin_send</code> outbound surface</strong>: the tool is visible to in-scope agents; injected inbound messages could convince the model to push workspace text/files to WeChat. <code>filePath</code> is constrained by the same allowlist as <code>/send</code>, but text content is not path-checked — do not use in untrusted groups.</li>
+<li><strong>Privacy</strong>: messages transit Tencent iLink servers (not end-to-end encrypted); decrypted media lands in the workspace <code>.wechat-inbox</code>.</li>
+<li><strong>Account coexistence</strong>: driving the same WeChat account with another iLink client (e.g. OpenClaw) will steal messages — disable one of them.</li>
+<li><strong>Credentials</strong>: the token is stored locally (credentials service + managed fallback file, 0600); a leak equals account control.</li>
+<li><strong>Platform risk</strong>: iLink is an undocumented bot API that may drift; rule-breaking use risks a ban — at your own risk.</li>
+</ul>
+<h2>Limitations &amp; not-supported (honest disclosure)</h2>
+<ul>
+<li><strong>No voice recognition</strong>: voice messages always get「无法识别语音消息」(not downloaded/transcribed/stored) — a deliberate design decision</li>
+<li><strong>No multimodal pipeline</strong>: images/files are only saved to disk with a path hint for the model; the plugin does not parse content (pair with a vision tool such as <code>vision_analyze</code>)</li>
+<li><strong>No scheduled tasks</strong>: no cron-style "do X every day"</li>
+<li><strong>No remote approval buttons</strong>: full-permission mode means no human-in-the-loop confirmations and no approve/reject interaction in WeChat; <code>strict</code> mode is a reserved escape hatch (approval flow not implemented)</li>
+<li><strong>Depends on an undocumented protocol</strong>: iLink may drift and break features; misuse risks a ban</li>
+<li><strong>Single account binding</strong>: one credential set per dsh instance; multiple WeChat accounts need multiple profile instances (no built-in multi-instance management)</li>
+<li><strong>No content-level file dedup</strong>: resending the same file in different messages lands duplicate copies (only crash replays of the same message are deduplicated)</li>
+<li><strong>Chinese-only commands and copy</strong>: slash commands, help text and prompts are Chinese; no English/i18n</li>
+<li><strong>No graphical settings panel</strong>: all configuration is via environment variables / cordis patch (the login page only offers QR scan, a status bar and the health endpoint)</li>
+<li><strong>Requirements</strong>: Node ≥ 22.12, a dsh web profile, and a WeChat account that can scan-bind an iLink bot</li>
+</ul>
+<h2>Development</h2>
+<pre><code>npm install
+npm run typecheck
+npm test
+npm run build
+</code></pre>
+<h2>License</h2>
+<p>MIT</p>

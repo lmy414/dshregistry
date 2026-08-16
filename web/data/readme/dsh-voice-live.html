@@ -1,0 +1,114 @@
+<h1>@deepseek-ai/dsh-client-ui-voice-live</h1>
+<p>English | <a href="https://github.com/tangzheng202202/dsh-voice-live/blob/HEAD/README.zh.md">中文</a></p>
+<p>Real-time voice interaction for DSH: press the composer mic, speak, and the
+assistant replies aloud. The package ships two halves:</p>
+<ul>
+<li><strong>Host half</strong> registers the <code>/voice</code> WebSocket upgrade route inside the DSH
+host process. One connection carries a session that feeds microphone PCM to
+Volcengine streaming ASR (bigmodel_async with server-side VAD endpointing)
+and streams assistant reply text to Volcengine streaming TTS
+(seed-tts-2.0). The upgrade is gated by a loopback-Host + same-origin trust
+fence; every async operation has one lifecycle owner, audio flows through a
+bounded queue, and TTS is a single serial worker.</li>
+<li><strong>Client half</strong> renders the composer mic control (<code>conversation.input.left</code>)
+and the Voice settings section (<code>settings.section</code>). A per-session
+<code>VoiceController</code> state machine owns all resources — <code>AudioCapture</code>
+(MediaStream/AudioContext/AudioWorklet), <code>VoiceTransport</code> (WebSocket) and
+<code>PlaybackQueue</code> (audio) — and rejects stale/late messages by generation.</li>
+</ul>
+<p>The API key is read from <code>process.env.VOLCENGINE_API_KEY</code> on the host; the
+browser never holds or transmits a key.</p>
+<h2>Interaction model</h2>
+<ul>
+<li>Tap the mic to start. While active the button renders a tech orb with pulse
+rings; speech is recognized incrementally into the composer draft.</li>
+<li>Endpointing is server-side: after ~1.5 s of silence a definite ASR final is
+emitted and submitted <strong>without pressing stop</strong>. <code>stop()</code> is still "send end
+and await the final"; <code>cancel()</code> discards.</li>
+<li>After submission the connection stays open in <em>reply mode</em>: the assistant's
+streaming text is synthesized sentence by sentence and played only after its
+<code>tts_done</code> completion event. When <strong>reply-first</strong> is enabled (default), the
+voice replies "好的，我去查一下。" immediately, then queues the real answer.</li>
+<li>Speaking again mid-reply <strong>interrupts</strong>: playback stops, TTS is cancelled,
+the in-flight agent turn is cancelled through DSH's agents service, old
+message ids are invalidated, and a new recognition starts.</li>
+<li>A dropped connection while listening auto-reconnects (single reconnecter,
+exponential backoff, max 5 attempts).</li>
+</ul>
+<h2>Settings</h2>
+<p>The Voice section lets you pick a voice (30 verified Volcengine voices),
+preview it, and toggle reply-first. The preview connects over the same <code>/voice</code>
+route and is completion-event driven (no fixed sleep).</p>
+<h2>Protocol (browser ↔ host, one WebSocket)</h2>
+<ul>
+<li>browser → host: binary = 16 kHz Int16 mono mic PCM; control frames
+<code>config</code> (provider/voice/dshSessionId), <code>asr_start</code>, <code>asr_end</code>, <code>asr_cancel</code>,
+<code>tts_push</code>, <code>tts_flush</code>, <code>tts_cancel</code>.</li>
+<li>host → browser: <code>ready</code>, <code>asr_partial</code>/<code>asr_final</code> (with voiceSessionId,
+utteranceId, sequence), <code>tts_start</code> + binary audio + <code>tts_done</code>, <code>tts_error</code>,
+<code>tts_idle</code>, <code>error</code>.</li>
+<li>Control frames carrying a <code>voiceSessionId</code> must match the session; oversized
+frames and malformed JSON are dropped; a forged Host gets a 403.</li>
+</ul>
+<h2>Model Experience</h2>
+<h3>Voice path</h3>
+<h4>What the model sees</h4>
+<p>Nothing: the microphone stream goes to Volcengine ASR and the assistant reply text to Volcengine TTS over the host <code>/voice</code> route, and neither request composes, appends, or rewrites any LLM prompt (the assistant turn is DSH's ordinary agent loop).</p>
+<h4>Token effect</h4>
+<p>None: this package assembles and sends no model request, so it meters no tokens; any metering belongs entirely to the agent loop that services the submitted prompt.</p>
+<h4>KV Cache effect</h4>
+<p>None; this package neither assembles nor sends a provider request.</p>
+<h2>Known Limitations and Deferred Work</h2>
+<ul>
+<li><strong>Wake word</strong> ships as a Web Speech API implementation (Chrome/Safari,
+zh-CN, keyword match on the recognized transcript). It is off by default
+(keeps the mic held). Two constraints are documented rather than papered
+over:<ul>
+<li>Chrome's Web Speech recognition routes through Google's cloud
+recognizer, which is unreachable from mainland networks — the settings
+probe (<code>检测唤醒可用性</code>) surfaces the exact <code>onerror</code> reason
+(e.g. <code>network</code>) instead of failing silently; Safari (Apple's service)
+is the working browser on macOS.</li>
+<li>The preferred local offline engine, sherpa-onnx WASM keyword spotting,
+is blocked upstream: the <code>sherpa-onnx-wasm</code> npm package is deleted (404
+on npm/jsdelivr/unpkg/npmmirror) and the current GitHub release assets
+are task-specific builds whose wasm binaries contain no KWS kernel
+(verified: no <code>sherpa_onnx_*_kws</code> symbols). vosk-browser was evaluated as
+a fallback but its fixed Chinese model vocabulary cannot constrain custom
+keywords such as the default wake phrase. The <code>WakeWordDetector</code> interface
+keeps the seam for a future local WASM engine once a distribution exists.</li>
+</ul>
+</li>
+<li><strong>Echo cancellation</strong> relies on the browser's AEC (Chrome AEC3) applied to
+the WebRTC mic track. <code>VoiceController.getMicAec()</code> reports whether the
+browser actually applied AEC. <code>new Audio()</code> playback is not covered by
+Chrome's AEC (Chromium bug 687574), so the loop stays half-duplex: mic frames
+are gated while TTS plays, and barge-in stops playback before new recognition.
+The controlled echo test (speaker vs headphone, AEC on/off) is documented in
+the deliverable notes; the runtime decision is half-duplex + interrupt.</li>
+<li><strong>Live captions</strong> surface as the incremental composer draft (asr_partial);
+there is no floating caption overlay yet.</li>
+<li>Server-side endpointing depends on Volcengine's optimized bidirectional
+endpoint (<code>bigmodel_async</code> + <code>enable_nonstream</code>); a plain <code>bigmodel</code> stream
+only returns partials and never finalizes on its own.</li>
+<li>The package's <code>*.host.spec.ts</code> tests are excluded from the repository host
+aggregate's typecheck (TS6307 tripped by the aggregate excluding
+<code>packages/client/*/src/**</code>); they run under vitest and the host half builds
+through the package <code>tsc -b</code>.</li>
+</ul>
+<h2>Standalone package status</h2>
+<p>This repository is the plugin source extracted from the DSH monorepo
+(<code>packages/client/ui-voice-live</code>). It ships 137 tests with 100% per-file
+coverage and is registered for DSH web via <code>cordis.patch.yml</code> in the
+monorepo bundle.</p>
+<p><strong>npm / dshmarket status — blocked upstream (honest note):</strong> publishing
+<code>dsh-voice-live</code> as an installable npm package is currently blocked by an
+incomplete official package chain: <code>@deepseek-ai/dsh-client-runtime@0.0.1-rc.1</code>
+hard-depends on <code>@deepseek-ai/dsh-compact</code>, which is <strong>not published to npm</strong>
+(registry 404), so no plugin that depends on the DSH client runtime can be
+installed standalone today. Community plugins avoid this by shipping zero
+DSH dependencies. Options once the official chain is fixed: swap
+<code>workspace:*</code> deps for the published versions and <code>npm publish</code>.</p>
+<p>Until then, build and run inside the DSH monorepo (the fork at
+<code>github.com/tangzheng202202/deepseek-harness</code>), or vendor the missing
+packages yourself.</p>

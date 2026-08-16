@@ -1,0 +1,490 @@
+<p><a href="https://github.com/JohnXu22786/task-board/blob/HEAD/README.zh.md">简体中文</a></p>
+<h1>dsh-slate · Work Board</h1>
+<p>A cross-session work ledger plugin: registration, tracking, state transitions and completion records for tasks/issues, all persisted by <strong>event sourcing</strong> — every operation is an append-only, immutable event, history is fully traceable, and any session that opens the same board picks up where the last one left off.</p>
+<ul>
+<li>Zero runtime dependencies (pure Node.js ESM, only TypeScript build output)</li>
+<li>Distributed as a <strong>DeepSeek Harness (dsh) bundle</strong>, also usable as a standalone CLI</li>
+<li>Board digest is automatically injected into the model context of every turn (systemPrompt section)</li>
+<li>Built-in priority, due dates, overdue detection, kanban export, git commit linking</li>
+</ul>
+<hr>
+<h2>Contents</h2>
+<ul>
+<li><a href="#installing-in-dsh">Installing in DSH</a></li>
+<li><a href="#concepts">Concepts</a></li>
+<li><a href="#quick-start-cli">Quick start (CLI)</a></li>
+<li><a href="#integrating-with-dsh">Integrating with dsh</a></li>
+<li><a href="#tools-at-a-glance">Tools at a glance</a></li>
+<li><a href="#query-language">Query language</a></li>
+<li><a href="#data-and-storage-format">Data and storage format</a></li>
+<li><a href="#configuration">Configuration</a></li>
+<li><a href="#skill-file-optional">Skill file (optional)</a></li>
+<li><a href="#full-example">Full example</a></li>
+<li><a href="#troubleshooting">Troubleshooting</a></li>
+<li><a href="#development">Development</a></li>
+<li><a href="#license">License</a></li>
+</ul>
+<hr>
+<h2>Installing in DSH</h2>
+<p>The plugin is published for <a href="https://github.com/deepseek-ai/deepseek-harness">DeepSeek Harness (dsh)</a>. Install it into a profile with:</p>
+<pre><code>dsh plugin --profile demo add github:JohnXu22786/task-board
+</code></pre>
+<p>Remove it with:</p>
+<pre><code>dsh plugin --profile demo remove dsh-slate
+</code></pre>
+<hr>
+<h2>Concepts</h2>
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>Board</td>
+<td>A persistent collection of items, located in a data directory, with a name and an id prefix</td>
+</tr>
+<tr>
+<td>Item</td>
+<td>The smallest unit of work on a board (task/issue/todo), numbered like <code>S-0001</code></td>
+</tr>
+<tr>
+<td>Journal</td>
+<td>The append-only event log (<code>events.jsonl</code>), the single source of truth for board state</td>
+</tr>
+<tr>
+<td>Snapshot</td>
+<td>A periodic cache of materialized state (<code>snapshot.json</code>), speeding up startup; deletable and rebuilt at any time</td>
+</tr>
+<tr>
+<td>Settle</td>
+<td>An item reaches a terminal state: <code>fulfilled</code> (done) or <code>withdrawn</code> (cancelled)</td>
+</tr>
+<tr>
+<td>Undo</td>
+<td>Appends a compensating event that reverses an item's most recent operation (registration and undo themselves are excluded)</td>
+</tr>
+</tbody></table>
+<p><strong>State machine</strong></p>
+<pre><code>recorded (todo) ──► active (in progress) ──► parked (on hold)
+      ▲                    │                 │
+      └────────────────────┴─────────────────┘    (free transitions between non-terminal states)
+      ▲
+      └────────── reopen ◄── settled (terminal state)
+</code></pre>
+<p><strong>Design highlights</strong></p>
+<ul>
+<li>Append-only, never mutate: every write operation is a new event; old events never change.</li>
+<li>Crash-safe: each event is fsync'd after writing; a half-written line left by an interrupted crash is discarded with a warning on open.</li>
+<li>Auditable: <code>show</code>/<code>ledger</code> replay the full operation sequence for any item or the whole board (who, when, what).</li>
+<li>Multi-writer: the long-running process (dsh) holds no write lock; the CLI uses a write lock; every read operation syncs with disk first, and appends realign with the disk sequence numbers first.</li>
+</ul>
+<hr>
+<h2>Quick start (CLI)</h2>
+<p>Requires: Node.js ≥ 20.6.</p>
+<pre><code># Run the repo build directly (or unpack after npm pack)
+node dist/cli.js --help
+
+# Or install as a global command
+npm install -g .
+slate --help
+</code></pre>
+<pre><code>export SLATE_HOME=~/.slate/my-project    # data directory (default &lt;cwd&gt;/.slate)
+slate init --name demo                   # initialize a board
+
+slate register --title "Fix login race" --priority urgent --due 2026-08-18 --tag bug
+slate shift --id S-0001 --to active --note kickoff
+slate link --id S-0001 --commits a1b2c3d4
+slate settle --id S-0001 --kind fulfilled --note done
+slate digest                            # current state overview
+slate query --where "status:open" --sort due
+slate kanban --file kanban.md           # export kanban
+slate undo --id S-0001                  # undo the most recent operation
+</code></pre>
+<p>The full command table is in <code>slate --help</code> (including the common parameters <code>--home</code>/<code>--by</code>/<code>--json</code>/<code>--help</code>).</p>
+<hr>
+<h2>Integrating with dsh</h2>
+<h3>Plugin shape</h3>
+<p>This package ships as a standard dsh <strong>bundle</strong>:</p>
+<pre><code>package.json        # dsh.bundle manifest (patch entry) + peerDependencies
+cordis.patch.yml    # plugin line: id / package name / default config
+dist/index.js       # plugin entry: apply(ctx, config)
+dist/cli.js         # bundled CLI (bin: slate)
+skills/slate.md     # optional skill file (see below)
+</code></pre>
+<p>The entry module follows the dsh official docs:</p>
+<pre><code>export const name = 'dsh-slate';
+export const inject = ['tools', 'systemPrompt'];   // depends on the tools and system-prompt services
+export function apply(ctx: Context, config?: unknown) { ... }
+</code></pre>
+<p>Inside <code>apply()</code>: host version guard → config validation → open the board (background async, non-blocking load) → register 13 <code>slate_*</code> tools → register the <code>slate-digest</code> prompt section. All registrations are cleaned up automatically on plugin unload (<code>ctx.effect</code>).</p>
+<h3>Installation</h3>
+<p>Requires a host dsh that provides <code>@deepseek-ai/dsh-tools &gt;= 0.1.0-rc.6</code> (<code>@deepseek-ai/dsh</code> 0.1.0-rc.6 or newer; the <code>next</code> release line is verified).</p>
+<pre><code># Pack from the source directory
+npm pack                 # produces dsh-slate-0.1.0.tgz
+
+# Install into a profile (e.g. web)
+dsh plugin --profile web add ./dsh-slate-0.1.0.tgz
+
+# Verify the plugin line is active
+dsh --profile web --dump-config | grep slate
+
+# Start
+dsh web
+</code></pre>
+<p>A startup log line <code>[dsh-slate] Board ready: workspace @ ...</code> means the load succeeded.</p>
+<h3>How loading works</h3>
+<ol>
+<li><code>dsh plugin add</code> installs the bundle into the profile's dependencies and <code>dsh.profile.bundles</code> list.</li>
+<li>At startup, <code>cordis.patch.yml</code> is applied in layer order: it inserts a plugin line with <code>id: slate-board</code>, <code>name: dsh-slate</code> plus the default <code>config</code>.</li>
+<li>The loader resolves the <code>dsh-slate</code> package, waits for the <code>tools</code> and <code>systemPrompt</code> services, then calls <code>apply(ctx, config)</code>.</li>
+<li>Tools register into <code>ctx.tools</code> via <code>defineTool</code>; schemas automatically enter the tool manifest of the system prompt.</li>
+<li>The <code>slate-digest</code> section registered via <code>ctx.systemPrompt.section()</code> is assembled on every request — <strong>board state is automatically injected into session context</strong> (counts + overdue/in-progress/due-soon lists), so the model senses the current work without querying. The digest section renders synchronously: it syncs with disk immediately before every tool call, and the plugin also runs a background sync every 30 seconds, so external writers' changes lag by at most one cycle.</li>
+</ol>
+<h3>Overriding the default config</h3>
+<p>Users can override the line by id in their own profile <code>cordis.patch.yml</code> (dsh rule: a later layer with the same id replaces the whole line — all keys must be supplied):</p>
+<pre><code>- id: slate-board
+  name: dsh-slate
+  config:
+    dataDir: /absolute/path/to/board
+    boardName: my-project
+    idPrefix: W
+    snapshotEvery: 500
+    writerName: agent
+    digestEnabled: true
+    digestOrder: 160
+    digestMaxActive: 8
+</code></pre>
+<p>Note: <code>boardName</code>/<code>idPrefix</code>/<code>snapshotEvery</code> in plugin config are <strong>declarative overrides</strong> — only explicitly configured keys are written into the board metadata; unset keys fully respect the board's existing <code>config.json</code> (e.g. a board name and id prefix initialized via CLI), and are not reset to defaults on every startup.</p>
+<h3>Sharing a board with the CLI</h3>
+<p>The dsh process and the CLI can read and write the same data directory: in-process, every tool call syncs with disk first; the CLI syncs before every operation too. Keep the convention "only one side writes at a time" — the write lock only prevents mutual exclusion between CLIs; if the long-running process and a CLI write concurrently, event sequence numbers may collide (surfacing as log gap errors, never silent corruption).</p>
+<hr>
+<h2>Tools at a glance</h2>
+<p>All tools return a canonical JSON string (<code>slate_kanban</code> excepted — it returns the Markdown kanban text directly).</p>
+<table>
+<thead>
+<tr>
+<th>Tool</th>
+<th>Description</th>
+<th>Key parameters</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>slate_register</code></td>
+<td>Register a new item</td>
+<td><code>title</code> (required), <code>description</code>, <code>priority</code>, <code>dueDate</code>, <code>tags</code></td>
+</tr>
+<tr>
+<td><code>slate_update</code></td>
+<td>Partially update fields (only actual changes are recorded)</td>
+<td><code>id</code>, <code>title</code>/<code>description</code>/<code>priority</code>/<code>dueDate</code>/<code>tags</code></td>
+</tr>
+<tr>
+<td><code>slate_shift</code></td>
+<td>Advance state (free transitions between non-terminal states)</td>
+<td><code>id</code>, <code>to</code> (recorded/active/parked), <code>note</code></td>
+</tr>
+<tr>
+<td><code>slate_settle</code></td>
+<td>Settle into a terminal state</td>
+<td><code>id</code>, <code>kind</code> (fulfilled/withdrawn), <code>note</code></td>
+</tr>
+<tr>
+<td><code>slate_reopen</code></td>
+<td>Reopen a settled item</td>
+<td><code>id</code>, <code>note</code></td>
+</tr>
+<tr>
+<td><code>slate_comment</code></td>
+<td>Append a timestamped comment</td>
+<td><code>id</code>, <code>text</code></td>
+</tr>
+<tr>
+<td><code>slate_link</code></td>
+<td>Link git commit hashes (append-only)</td>
+<td><code>id</code>, <code>commits</code></td>
+</tr>
+<tr>
+<td><code>slate_undo</code></td>
+<td>Undo the most recent operation (compensation event persisted)</td>
+<td><code>id</code>, <code>note</code></td>
+</tr>
+<tr>
+<td><code>slate_query</code></td>
+<td>Conditional query (see <a href="#query-language">Query language</a>)</td>
+<td><code>where</code>, <code>sort</code>, <code>limit</code></td>
+</tr>
+<tr>
+<td><code>slate_show</code></td>
+<td>Item details + full history (audit)</td>
+<td><code>id</code></td>
+</tr>
+<tr>
+<td><code>slate_ledger</code></td>
+<td>Recent event log</td>
+<td><code>limit</code>, <code>itemId</code></td>
+</tr>
+<tr>
+<td><code>slate_digest</code></td>
+<td>Board digest (counts/overdue/in-progress/due-soon)</td>
+<td>—</td>
+</tr>
+<tr>
+<td><code>slate_kanban</code></td>
+<td>Kanban Markdown export</td>
+<td>—</td>
+</tr>
+</tbody></table>
+<p>Parameters are first validated by the <code>defineTool</code> schema (types, required, enums), then domain rules validate semantics (state machine, date authenticity, hash format, etc.). Domain errors carry error codes, e.g. <code>[ITEM_NOT_FOUND] Item not found: S-9999</code>.</p>
+<hr>
+<h2>Query language</h2>
+<p><code>where</code> is a comma-separated list of <code>key:value</code> conditions, AND-ed together; <code>has-commit</code> is a valueless condition.</p>
+<table>
+<thead>
+<tr>
+<th>Key</th>
+<th>Values</th>
+<th>Semantics</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>status</code></td>
+<td><code>recorded</code> / <code>active</code> / <code>parked</code> / <code>settled</code> / <code>open</code> / <code>overdue</code></td>
+<td><code>open</code> = unsettled; <code>overdue</code> = unsettled and due before today</td>
+</tr>
+<tr>
+<td><code>priority</code></td>
+<td><code>urgent</code> / <code>high</code> / <code>normal</code> / <code>low</code></td>
+<td>exact match</td>
+</tr>
+<tr>
+<td><code>tag</code></td>
+<td>any string</td>
+<td>contains the tag (repeatable)</td>
+</tr>
+<tr>
+<td><code>creator</code></td>
+<td>operator id</td>
+<td>the <code>by</code> of registration</td>
+</tr>
+<tr>
+<td><code>due</code></td>
+<td><code>YYYY-MM-DD</code> (real date)</td>
+<td>due date ≤ that day (combine with <code>status:overdue</code>)</td>
+</tr>
+<tr>
+<td><code>has-commit</code></td>
+<td>—</td>
+<td>linked to at least one commit</td>
+</tr>
+</tbody></table>
+<p>Examples:</p>
+<pre><code>status:active,priority:high
+status:overdue
+priority:urgent,status:open,tag:auth
+</code></pre>
+<p><code>sort</code>: <code>default</code> (unsettled first → priority → due date → registration order), <code>priority</code>, <code>due</code>, <code>newest</code>, <code>oldest</code>.
+<code>limit</code>: integer from 1 to 500.</p>
+<hr>
+<h2>Data and storage format</h2>
+<pre><code>&lt;dataDir&gt;/
+  config.json      board metadata: { boardName, idPrefix, snapshotEvery }
+  events.jsonl     append-only event log (single source of truth), one JSON event per line
+  snapshot.json    materialized state snapshot (atomically written cache, deletable)
+  .lock            CLI write lock (a stale lock older than 15 seconds is taken over)
+</code></pre>
+<p>Event types and payloads:</p>
+<table>
+<thead>
+<tr>
+<th>Event</th>
+<th>Payload essentials</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>registered</code></td>
+<td>title, description, priority, due date, tags</td>
+</tr>
+<tr>
+<td><code>field_changed</code></td>
+<td><code>change: { field, from, to }</code> (reversible snapshot)</td>
+</tr>
+<tr>
+<td><code>state_changed</code></td>
+<td><code>from</code> / <code>to</code> / optional <code>note</code></td>
+</tr>
+<tr>
+<td><code>settled</code></td>
+<td><code>kind</code> (fulfilled/withdrawn), <code>fromState</code> (pre-settle state) / optional <code>note</code></td>
+</tr>
+<tr>
+<td><code>reopened</code></td>
+<td>original <code>kind</code> (for chained undo)</td>
+</tr>
+<tr>
+<td><code>comment_added</code></td>
+<td>comment text</td>
+</tr>
+<tr>
+<td><code>action_reverted</code></td>
+<td>reverted event sequence number, summary, compensation payload (persistent snapshot of the undo intent)</td>
+</tr>
+</tbody></table>
+<p>Every event carries <code>seq</code> (globally sequential), <code>itemId</code>, <code>at</code> (ISO time), <code>by</code> (operator). Updating multiple fields produces multiple <code>field_changed</code> events (each field change is an independent audit record); undo reverses them one by one. Event format evolves with v0.x and is not guaranteed backward compatible; migrate from an export file when upgrading.</p>
+<p><strong>Recovery semantics</strong>: on open, the snapshot accelerates materialization, then events after the snapshot are replayed; a missing/corrupt snapshot, illegal item structure, or a snapshot lagging the log triggers a full replay automatically. A gap in log sequence numbers or a corrupt line mid-file (including lines that are "valid JSON but illegal structure") is treated as data corruption and rejected with a <code>CORRUPT_LOG</code> error. The export command produces a git-friendly full-state file:</p>
+<pre><code>slate export --file board.json    # { items, events, ... }, committable and diffable
+</code></pre>
+<hr>
+<h2>Configuration</h2>
+<table>
+<thead>
+<tr>
+<th>Key</th>
+<th>Default</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>dataDir</code></td>
+<td><code>.slate</code></td>
+<td>Board data directory; relative paths resolve against the dsh process cwd</td>
+</tr>
+<tr>
+<td><code>boardName</code></td>
+<td><code>workspace</code></td>
+<td>Board name (2–40 chars)</td>
+</tr>
+<tr>
+<td><code>idPrefix</code></td>
+<td><code>S</code></td>
+<td>Item id prefix (1–4 uppercase letters)</td>
+</tr>
+<tr>
+<td><code>snapshotEvery</code></td>
+<td><code>200</code></td>
+<td>Write a snapshot every N events (≥5)</td>
+</tr>
+<tr>
+<td><code>writerName</code></td>
+<td><code>agent</code></td>
+<td>Operator id used when this process writes events</td>
+</tr>
+<tr>
+<td><code>digestEnabled</code></td>
+<td><code>true</code></td>
+<td>Whether to register the session digest section</td>
+</tr>
+<tr>
+<td><code>digestOrder</code></td>
+<td><code>160</code></td>
+<td>Digest section ordering (tool description band 100–199)</td>
+</tr>
+<tr>
+<td><code>digestMaxActive</code></td>
+<td><code>6</code></td>
+<td>Max items listed per class in the digest (1–20)</td>
+</tr>
+</tbody></table>
+<p>On the CLI side, the data directory is set by the <code>SLATE_HOME</code> environment variable or the <code>--home</code> argument.</p>
+<hr>
+<h2>Skill file (optional)</h2>
+<p><code>skills/slate.md</code> is a dsh skill description (tool usage and workflow suggestions). dsh's local skill provider scans user/project skill directories; copy the file over:</p>
+<pre><code>mkdir -p ~/.dsh/skills &amp;&amp; cp skills/slate.md ~/.dsh/skills/slate.md
+# or place it in the project: .dsh/skills/slate.md
+</code></pre>
+<hr>
+<h2>Full example</h2>
+<pre><code>$ SLATE_HOME=~/boards/webapp slate init --name webapp
+Board ready: /home/you/boards/webapp
+
+$ slate register --title "Refactor auth module" --description "Split OAuth from local login" --priority high --due 2026-08-25 --tag auth
+Registered S-0001 [high] Refactor auth module (due 2026-08-25)
+
+$ slate register --title "Add unit tests" --priority normal --tag test
+Registered S-0002 [normal] Add unit tests
+
+$ slate shift --id S-0001 --to active --note kickoff
+Advanced S-0001 [high] Refactor auth module (due 2026-08-25)
+
+$ slate link --id S-0001 --commits 9f8e7d6c
+Linked S-0001 [high] Refactor auth module (due 2026-08-25 · 1 commit)
+
+$ slate settle --id S-0002 --kind fulfilled --note 42 tests
+Settled S-0002 [normal] Add unit tests (kind: fulfilled)
+
+$ slate query --where "status:open" --sort due
+S-0001 [high] Refactor auth module (due 2026-08-25 · 1 commit)
+
+$ slate show --id S-0001
+S-0001 [high] Refactor auth module (due 2026-08-25 · 1 commit)
+
+History:
+  #1 2026-08-16T09:00:01.000Z cli registered "Refactor auth module" · S-0001
+  #2 2026-08-16T10:12:00.000Z cli advanced recorded → active · S-0001
+  #3 2026-08-16T11:03:22.000Z cli changed commits: [] → [9f8e7d6c] · S-0001
+
+$ slate undo --id S-0001 --note wrong hash
+Undid S-0001 [high] Refactor auth module (due 2026-08-25)
+
+$ slate ledger --limit 4
+#1 2026-08-16T09:00:01.000Z cli registered "Refactor auth module" · S-0001
+#2 2026-08-16T10:12:00.000Z cli advanced recorded → active · S-0001
+#3 2026-08-16T11:03:22.000Z cli changed commits: [] → [9f8e7d6c] · S-0001
+#4 2026-08-16T11:05:40.000Z cli undid #3 (changed commits: [] → [9f8e7d6c]) · S-0001
+</code></pre>
+<p>In a dsh session, the same operations happen through the <code>slate_register</code>, <code>slate_shift</code>, <code>slate_settle</code> etc. tools; every turn's system prompt carries the current board digest automatically — no explicit query needed.</p>
+<hr>
+<h2>Troubleshooting</h2>
+<table>
+<thead>
+<tr>
+<th>Symptom</th>
+<th>Fix</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>Plugin doesn't load; logs mention <code>dsh-slate needs ... @deepseek-ai/dsh-tools</code></td>
+<td>Host dsh is too old. Upgrade: <code>pnpm dlx @deepseek-ai/dsh@0.1.0-rc.6</code>, then re-install with <code>dsh plugin --profile web add</code></td>
+</tr>
+<tr>
+<td><code>[BOARD_LOCKED]</code></td>
+<td>Another CLI process holds the write lock; once confirmed no other process is running, delete <code>&lt;dataDir&gt;/.lock</code></td>
+</tr>
+<tr>
+<td>Log gap error <code>日志序号断裂</code> / <code>[CORRUPT_LOG]</code></td>
+<td>Sequence collision from concurrent writers or manual log edits; avoid writing to the same board from the long-running process and a CLI at the same time, or give them different data directories</td>
+</tr>
+<tr>
+<td><code>slate: [ITEM_NOT_FOUND]</code></td>
+<td>Id doesn't exist; verify with <code>slate query</code></td>
+</tr>
+<tr>
+<td>Corrupt snapshot file</td>
+<td>Delete <code>snapshot.json</code>; the log will rebuild it via full replay</td>
+</tr>
+</tbody></table>
+<hr>
+<h2>Development</h2>
+<pre><code>npm install
+npm run typecheck    # tsc --noEmit
+npm test             # build + node --test (35 tests: domain rules/storage/queries/views/CLI/dsh adapter)
+npm pack             # produces the distributable bundle
+</code></pre>
+<p>Module structure:</p>
+<pre><code>src/
+  index.ts           dsh entry: version guard, config, tool registration, digest section
+  guard.ts           host dependency version validation
+  cli.ts             standalone command line
+  engine/
+    types.ts         domain vocabulary and types (events/items/state machine)
+    rules.ts         pure rules: replay, input validation, command → event, undo compensation
+    journal.ts       append-only log + snapshot + lock + external-writer sync
+    board.ts         command facade (shared by CLI and adapter layer)
+    queries.ts       query language parsing and execution
+    views.ts         digest/kanban/single-line rendering
+test/                node:test cases (run against the build output)
+</code></pre>
+<p>The engine is pure Node with no framework dependencies and can be reused directly in other plugins/harnesses: <code>Board</code>, <code>Journal</code> and all types are exported from <code>dist/index.js</code>.</p>
+<h2>License</h2>
+<p>MIT — see <a href="https://github.com/JohnXu22786/task-board/blob/HEAD/LICENSE">LICENSE</a>.</p>

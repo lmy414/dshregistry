@@ -1,0 +1,373 @@
+<p><a href="https://github.com/JohnXu22786/docs-retriever/blob/HEAD/README.zh.md">简体中文</a></p>
+<h1>doctrove — Versioned library documentation retrieval (agent toolset)</h1>
+<p><code>doctrove</code> is a <strong>versioned documentation retrieval</strong> plugin for coding agents: it maintains a "library documentation catalog index", letting agents fetch <strong>accurate, versioned, traceable</strong> API documentation snippets on demand while writing code — instead of guessing API usage from training memory — and thereby avoiding "APIs that don't exist in the docs", "outdated signatures", and "fabricated parameters".</p>
+<ul>
+<li><strong>Zero runtime dependencies</strong>: uses only Node.js built-ins (<code>fetch</code>, <code>node:test</code>), runs without installing any package;</li>
+<li><strong>Standard MCP stdio server</strong>: any MCP-capable client (dsh, Claude Code, Codex, opencode, etc.) can connect;</li>
+<li><strong>Built for dsh</strong>: ships a dsh bundle (<code>cordis.patch.yml</code> + a self-built bridge plugin), one-step integration via <code>dsh plugin add</code>, tools automatically appear in the model's tool list (<code>mcp__doctrove__*</code>);</li>
+<li><strong>Versioned</strong>: every entry carries multiple documentation volumes, supporting "latest stable / exact version / prefix version (<code>4</code> → 4.21.x)" selection;</li>
+<li><strong>Scored, ranked results</strong>: entry retrieval and documentation snippets both carry 0–1 relevance scores and hit signals, so the model can verify "why it ranked first";</li>
+<li><strong>Offline-capable</strong>: ships with a built-in local demo index (<code>data/index.json</code>), runs without networking or remote sources;</li>
+<li><strong>Self-hostable remote index</strong>: the index is an open JSON format that can be hosted on any static hosting (a zero-dependency hosting script is included);</li>
+<li><strong>Smart caching</strong>: TTL + LRU in-memory cache, remote index and query results expire automatically per configuration, <code>--no-cache</code> disables it in one shot;</li>
+<li><strong>Graceful degradation</strong>: when the remote index is unreachable, falls back to the local index automatically, results are tagged with <code>source</code> so the agent can tell data provenance.</li>
+</ul>
+<hr>
+<h2>Quick start</h2>
+<h3>Method A: connect directly from any MCP client</h3>
+<pre><code># Requires Node.js &gt;= 18.17; no arguments means offline mode (built-in index)
+node src/entry.js
+</code></pre>
+<p>Example config line using the official dsh bridge (also applies to Claude Code / Codex MCP config):</p>
+<pre><code># dsh: insert into $DSH_HOME/profiles/&lt;profile&gt;/cordis.patch.yml
+- insert:
+    - id: mcp-doctrove
+      name: '@deepseek-ai/dsh-mcp-client'
+      config:
+        serverName: doctrove
+        transport: stdio
+        command: node
+        args: ['/absolute/path/src/entry.js']
+</code></pre>
+<p>Once connected, the model sees 3 tools: <code>catalog_lookup</code>, <code>catalog_releases</code>, <code>doc_extract</code>
+(generic MCP clients see the bare names; in the dsh scenario they carry the <code>mcp__doctrove__</code> prefix, see below).</p>
+<h3>Method B: install as a dsh plugin bundle (recommended)</h3>
+<p>This plugin is declared as a dsh bundle (the <code>dsh.bundle</code> field in <code>package.json</code>). Run the following in the plugin checkout directory:</p>
+<pre><code>dsh plugin --profile web add .
+</code></pre>
+<ul>
+<li>On first use it automatically initializes the <code>web</code> profile and adds this package to <code>dsh.profile.bundles</code>;</li>
+<li>The <code>doctrove/bridge</code> plugin defined in <code>cordis.patch.yml</code> spawns this MCP server inside the dsh process,
+and after the handshake registers all tools into <code>ctx.tools</code>, <strong>no manual config changes needed</strong>;</li>
+<li>Offline-capable: the built-in index is loaded by default; to use a remote index, configure <code>args: ['--index-url', ...]</code> on the bridge line (see below);</li>
+<li>Uninstall: <code>dsh plugin --profile web remove doctrove</code>.</li>
+</ul>
+<h3>Installing in DSH</h3>
+<pre><code>dsh plugin --profile demo add github:JohnXu22786/docs-retriever
+</code></pre>
+<ul>
+<li><code>demo</code> is a dsh profile: it is created automatically on first use, and the package is added to <code>dsh.profile.bundles</code>;</li>
+<li>The <code>cordis.patch.yml</code> inside the package defines the <code>doctrove/bridge</code> plugin, which starts this MCP server within the dsh process and registers all tools into <code>ctx.tools</code> after the handshake — no manual configuration needed;</li>
+<li>Offline-capable out of the box: the built-in index is loaded by default; configure <code>args: ['--index-url', ...]</code> on the bridge line to use a remote index (see below);</li>
+<li>Removal:</li>
+</ul>
+<pre><code>dsh plugin --profile demo remove doctrove
+</code></pre>
+<p>After installing, restart dsh, then in a session you can simply say:</p>
+<blockquote>
+<p>"Write an Express 5 endpoint with <code>:id</code> route params and a JSON response — look up the exact route-param syntax first"</p>
+</blockquote>
+<p>The corresponding tool call chain: <code>mcp__doctrove__catalog_lookup</code> (confirm express) →
+<code>mcp__doctrove__doc_extract</code> (id=express, focus=route parameters).</p>
+<blockquote>
+<p>Note: dsh enables no MCP servers by default (every server command is trusted code executed outside the sandbox),
+and this plugin's bundle line is the "enable" action itself; only install plugins you trust.</p>
+</blockquote>
+<hr>
+<h2>dsh integration notes (how the pluginized harness loads it)</h2>
+<p>dsh uses the Cordis plugin framework, and the composition unit is a <strong>bundle</strong>: an npm package + a patch layer. The loading chain is:</p>
+<pre><code>package.json（dsh.bundle.patch → ./cordis.patch.yml）
+  └─ one line in cordis.patch.yml: name: 'doctrove/bridge'
+       └─ src/bridge/plugin.js（Cordis plugin, inject: ['tools']）
+            ├─ spawns src/entry.js with Node itself（MCP server subprocess, stdio）
+            ├─ completes the initialize / tools/list handshake
+            └─ registers each tool as mcp__doctrove__&lt;toolname&gt; into ctx.tools
+</code></pre>
+<ul>
+<li><strong>Tool interface</strong>: the model-visible tool names are <code>mcp__&lt;serverName&gt;__&lt;raw tool name&gt;</code>, <code>serverName</code> defaults to <code>doctrove</code>;</li>
+<li><strong>Events/skills</strong>: this plugin registers no events or skills; it exposes capabilities only through the <code>ctx.tools</code> tool interface (read-only tools, no side effects);</li>
+<li><strong>Lifecycle</strong>: the handshake and registration happen during the plugin's <code>apply</code>; on unload the subprocess is killed and all tools are deregistered automatically
+(registered via <code>ctx.effect</code> cleanup, no leftovers after hot reload/unload);</li>
+<li><strong>Two bridge options</strong>: the self-built bridge <code>doctrove/bridge</code> bundled with this package (zero-dependency, works out of the box) and the
+official <code>@deepseek-ai/dsh-mcp-client</code> config line (see <code>examples/overlay-for-dsh.yml.example</code>);
+tool naming and behavior are identical — pick either one, don't enable both;</li>
+<li><strong>Environment variables</strong>: dsh filters credential-like variables from MCP subprocess environments; the self-built bridge's subprocess inherits the host environment,
+so <code>DOCTROVE_INDEX_URL</code> and similar pass through, and can also be set explicitly with <code>env:</code> on the bridge line.</li>
+</ul>
+<h3>Common dsh issues</h3>
+<table>
+<thead>
+<tr>
+<th>Symptom</th>
+<th>Fix</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>Tools missing from the list</td>
+<td>Check that the <code>cordis.patch.yml</code> line took effect (<code>dsh --profile &lt;name&gt; --dump-config</code> to inspect layers), confirm no startup log errors</td>
+</tr>
+<tr>
+<td>Want a remote index</td>
+<td>Configure <code>args: ['--index-url', 'https://your-index-url']</code> on the bridge line (directory root), or <code>env: { DOCTROVE_INDEX_URL: '...' }</code></td>
+</tr>
+<tr>
+<td>Want looser caching</td>
+<td>Configure <code>args: ['--cache-ttl', '3600']</code> on the bridge line; use <code>--no-cache</code> for testing/debugging</td>
+</tr>
+<tr>
+<td>pnpm &gt;=10 rejects git-installed prepare scripts</td>
+<td>This plugin is pure JS with no build script, so it is not affected; install from checkout or tarball</td>
+</tr>
+</tbody></table>
+<hr>
+<h2>Tool list (3 tools, all read-only)</h2>
+<table>
+<thead>
+<tr>
+<th>Tool</th>
+<th>Purpose</th>
+<th>Main parameters</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>catalog_lookup</code></td>
+<td>Search the doc catalog by name/description, return candidates with scores and hit signals</td>
+<td><code>query</code> (required), <code>limit</code></td>
+</tr>
+<tr>
+<td><code>catalog_releases</code></td>
+<td>List available and recommended versions of an entry</td>
+<td><code>id</code> (required)</td>
+</tr>
+<tr>
+<td><code>doc_extract</code></td>
+<td>Extract doc snippets for an entry/version/focus (relevance-ranked)</td>
+<td><code>id</code> (required), <code>version</code>, <code>focus</code>, <code>maxSections</code></td>
+</tr>
+</tbody></table>
+<h3>catalog_lookup</h3>
+<p>Search the doc catalog. When unsure of a library's canonical id, call this first, then use the returned <code>id</code> with <code>doc_extract</code>.</p>
+<pre><code>// request
+{ "query": "express", "limit": 5 }
+// response (structuredContent summary)
+{
+  "results": [{
+    "id": "express", "name": "Express", "summary": "Minimal web framework for Node.js",
+    "score": 1.0, "matches": ["exact name match"],
+    "versions": ["5.1.0", "4.21.2"], "latest": "5.1.0", "source": "local:.../data/index.json"
+  }],
+  "total": 1, "sources": ["local:.../data/index.json"]
+}
+</code></pre>
+<h3>catalog_releases</h3>
+<p>View an entry's version list and recommended version, useful for checking whether a target version is available (<code>doc_extract</code> supports the same version syntax).</p>
+<pre><code>{ "id": "express" }
+// → { "id": "express", "name": "Express", "latest": "5.1.0",
+//     "versions": ["5.1.0", "4.21.2"], "source": "local:..." }
+</code></pre>
+<h3>doc_extract</h3>
+<p>Extract documentation. <code>focus</code> describes one concept at a time (e.g. "route parameters"); split cross-concept questions into multiple calls
+to avoid diluted results; <code>version</code> defaults to the latest stable release.</p>
+<pre><code>{ "id": "express", "version": "5", "focus": "wildcard" }
+// → {
+//     "id": "express", "name": "Express", "version": "5.1.0",
+//     "releaseKind": "prefix", "releaseNote": "prefix match 5.x → latest 5.x release",
+//     "sections": [{ "heading": "Wildcard routes", "score": 0.5, "matches": ["heading hit: 1 word"], ... }],
+//     "source": "local:..."
+//   }
+</code></pre>
+<p>Errors are always structured <code>isError</code> results, with <code>error.code</code> taking one of: <code>validation</code> / <code>not-found</code> / <code>version</code> /
+<code>network</code> / <code>timeout</code> / <code>internal</code>, and <code>message</code> carrying actionable hints (e.g. candidate versions when the requested one is unavailable).
+Parameter-validation failures are likewise folded into <code>isError</code> (rather than the protocol-level <code>-32602</code>), so the model sees a structured error code in one call and can self-correct.</p>
+<hr>
+<h2>Scoring and ranking algorithm</h2>
+<h3>Entry retrieval (catalog_lookup)</h3>
+<p>Score = signal-tier score + popularity fine-tuning, both capped at 1.0:</p>
+<table>
+<thead>
+<tr>
+<th>Signal</th>
+<th>Base score</th>
+<th>Notes</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>Exact name match (case-insensitive)</td>
+<td>1.0</td>
+<td>name or id exactly equals the query</td>
+</tr>
+<tr>
+<td>Exact alias match</td>
+<td>0.95</td>
+<td>e.g. query <code>expressjs</code> hits an alias</td>
+</tr>
+<tr>
+<td>Name prefix match</td>
+<td>0.90</td>
+<td>e.g. query <code>expr</code></td>
+</tr>
+<tr>
+<td>Alias prefix match</td>
+<td>0.85</td>
+<td></td>
+</tr>
+<tr>
+<td>Name token overlap</td>
+<td>0.60–0.83</td>
+<td>proportional to hit tokens; ceiling deliberately below the alias-prefix tier to keep tier order invariant</td>
+</tr>
+<tr>
+<td>Summary token overlap</td>
+<td>0.30–0.50</td>
+<td>when the name is completely unrelated</td>
+</tr>
+</tbody></table>
+<ul>
+<li>Popularity fine-tuning = <code>(1 − raw) × min(0.1, log₁₀(popularity)/100)</code>, applied only within the <strong>headroom of the current signal tier</strong>, so "exact &gt; alias &gt; prefix &gt; token overlap" can never be inverted by popularity;</li>
+<li>Tokenization: English by word, Chinese per character (space-less languages);</li>
+<li>Ties are broken by popularity, descending (stable sort).</li>
+</ul>
+<h3>Doc snippet ranking (doc_extract focus)</h3>
+<ul>
+<li>Snippet score = <code>(2 × heading hit words + body hit words) / (2 × query words)</code>;</li>
+<li>Heading hits count double the body; zero-hit snippets are filtered out; truncated past <code>maxSections</code>;</li>
+<li>Without <code>focus</code>, snippets return in the index's original order.</li>
+</ul>
+<h3>Version selection (catalog_releases / doc_extract version)</h3>
+<p><code>latest</code> / default → latest stable release (or latest prerelease when no stable exists);
+exact version → unique match (a <code>v</code>/<code>V</code> prefix is tolerated; build metadata such as <code>+build.2</code> does not participate in comparison);
+prefix (<code>5</code> / <code>5.1</code> / <code>5.1.x</code> / <code>5.1.*</code>) → latest release matching the prefix;
+prerelease identifiers compare per semver rules (<code>rc.10</code> &gt; <code>rc.9</code>);
+no match → <code>version</code> error with a candidate list attached.</p>
+<hr>
+<h2>Caching strategy</h2>
+<ul>
+<li>One <strong>TTL + LRU</strong> in-memory cache per process (default 256 entries, 600 s lifetime), caching:
+remote index fetches and query results; the local index itself is parsed once per process (static data);</li>
+<li>TTL is configurable: <code>--cache-ttl &lt;sec&gt;</code> (0–86400, 0 = disabled), <code>--no-cache</code> is a shortcut for disabled;</li>
+<li><strong>Failure cooldown (negative caching)</strong>: after a remote index fetch fails, a 30-second cooldown kicks in during which the plugin falls back to local
+and does not repeat the network request (avoiding a timeout wait on every query while the source is down); after the cooldown it retries automatically and heals itself once the source recovers.
+Note: cooldown depends on cache storage, so it does not apply under <code>--no-cache</code> / <code>--cache-ttl 0</code> (every failure then really retries);</li>
+<li>LRU evicts by access order; cache stats (hits/misses/evictions) are printed to stderr at exit with <code>--debug</code>;</li>
+<li>Local-index cold start is free (synchronous read); after the first remote fetch, all queries hit the cache.</li>
+</ul>
+<hr>
+<h2>Offline mode and remote index</h2>
+<h3>Offline mode (default)</h3>
+<p>Without <code>--index-url</code> the plugin is fully offline: it uses the built-in <code>data/index.json</code> (3 demo entries:
+Express 5.1/4.21 dual versions, Zod 3.24/3.23, Day.js 1.11, including a version-difference demo).
+The built-in index can be replaced with your own (<code>--local-index &lt;path&gt;</code>), see the format below.</p>
+<h3>Remote index</h3>
+<p>The index is an <strong>open JSON format</strong> hostable on any static HTTP service (GitHub Pages, object storage, intranet file servers all work):</p>
+<pre><code>index URL（--index-url / DOCTROVE_INDEX_URL，the URL of the directory containing index.json）
+   └─ &lt;url&gt;/index.json   ← fetched by the plugin along this path
+</code></pre>
+<p>Minimal local hosting (zero dependencies, supports ETag conditional requests; by default listens on the local loopback only — change <code>host</code> yourself to expose on LAN):</p>
+<pre><code>node scripts/serve-index.mjs [dir] [port]   # default ./data, port 8730
+node src/entry.js --index-url http://localhost:8730
+</code></pre>
+<p>Relationship between remote and local: <strong>remote first, local as fallback</strong>. When the remote fetch fails (offline/timeout/non-2xx/invalid format),
+the plugin degrades to the local index and keeps serving; every entry and result carries a <code>source</code> tag so the model can judge data freshness.</p>
+<h3>Index format specification</h3>
+<pre><code>{
+  "format": "doctrove-index@1",          // required, versioned format identifier
+  "updatedAt": "2026-08-16T00:00:00.000Z",
+  "entries": [{
+    "id": "express",                      // required, canonical id (globally unique)
+    "name": "Express",                    // required, display name
+    "summary": "Minimal web framework for Node.js",
+    "aliases": ["expressjs"],             // search aliases (array of strings)
+    "homepage": "https://expressjs.com",
+    "popularity": 1200,                   // popularity weight (scoring fine-tuning)
+    "versions": ["5.1.0", "4.21.2"],      // required, available versions
+    "volumes": {                          // required, version → documentation volume
+      "5.1.0": {
+        "summary": "highlights of this version (optional)",
+        "sections": [{                    // required, doc snippets (elements must be non-array objects)
+          "heading": "Route handlers",    // snippet title (2x ranking weight)
+          "path": "https://expressjs.com/en/5x/api.html#app.METHOD",  // provenance link (optional)
+          "body": "snippet body (may include code examples)"
+        }]
+      }
+    }
+  }]
+}
+</code></pre>
+<p>Validation rules: <code>format</code> must be <code>doctrove-index@1</code>; <code>entries</code> must be an array; id/name non-empty and id unique;
+<code>aliases</code> must be an array of strings; every version in <code>versions</code> must have a matching <code>volumes</code> volume,
+and a volume's <code>sections</code> must be a valid array of objects.
+Invalid indexes are rejected (remote sources report <code>network</code> and degrade to local; local sources report <code>config</code> and exit).</p>
+<hr>
+<h2>Configuration reference</h2>
+<p>Precedence: <strong>command line &gt; environment variables &gt; config file &gt; defaults</strong>.</p>
+<table>
+<thead>
+<tr>
+<th>Setting</th>
+<th>CLI</th>
+<th>Environment variable</th>
+<th>Config file key</th>
+<th>Default</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>Remote index URL</td>
+<td><code>--index-url &lt;url&gt;</code></td>
+<td><code>DOCTROVE_INDEX_URL</code></td>
+<td><code>indexUrl</code></td>
+<td>none (offline)</td>
+</tr>
+<tr>
+<td>Local index path</td>
+<td><code>--local-index &lt;path&gt;</code></td>
+<td><code>DOCTROVE_LOCAL_INDEX</code></td>
+<td><code>localIndex</code></td>
+<td>built-in <code>data/index.json</code></td>
+</tr>
+<tr>
+<td>Cache lifetime (s)</td>
+<td><code>--cache-ttl &lt;sec&gt;</code> / <code>--no-cache</code></td>
+<td><code>DOCTROVE_CACHE_TTL</code></td>
+<td><code>cacheTtl</code></td>
+<td>600</td>
+</tr>
+<tr>
+<td>Remote timeout (ms)</td>
+<td><code>--timeout-ms &lt;ms&gt;</code></td>
+<td><code>DOCTROVE_TIMEOUT_MS</code></td>
+<td><code>timeoutMs</code></td>
+<td>15000</td>
+</tr>
+<tr>
+<td>Debug logging</td>
+<td><code>--debug</code></td>
+<td><code>DOCTROVE_DEBUG</code></td>
+<td><code>debug</code></td>
+<td>false</td>
+</tr>
+<tr>
+<td>Config file</td>
+<td><code>--config &lt;path&gt;</code></td>
+<td><code>DOCTROVE_CONFIG</code></td>
+<td>—</td>
+<td>none</td>
+</tr>
+</tbody></table>
+<p>The config file is JSON (example: <code>examples/doctrove.config.example.json</code>). All configuration is read-only:
+the plugin performs no writes and persists no local state. Empty-string environment variables count as unset (defaults apply);
+<code>cacheTtl: 0</code> is a valid value (cache disabled).</p>
+<hr>
+<h2>Testing</h2>
+<pre><code>node --test        # 93 cases: scoring/versions/cache/config/JSON-RPC/engine/e2e/index hosting
+</code></pre>
+<p>Coverage: scoring-ranking boundaries (tier order can never be inverted by popularity), version selection (latest/exact/prefix/prerelease/
+build metadata), multi-source merge and degradation self-healing, failure cooldown, cache TTL/LRU, config precedence plus invalid values and empty strings,
+MCP protocol (uninitialized gate, version negotiation, error folding, conflicting messages), subprocess-level end-to-end
+(handshake + 3 tools + error paths + graceful exit), index hosting (ETag/304/traversal protection/symlink escape/malformed encodings).</p>
+<hr>
+<h2>Directory structure</h2>
+<pre><code>src/
+  entry.js            CLI entry: config → assembly → stdio MCP session
+  core/               config (layered config), errors (unified error model), version
+  vault/ttl.js        TTL + LRU in-memory cache
+  catalog/            scoring (scoring/ranking), releases (version selection), store (catalog hub)
+  supply/provider.js  data sources: LocalSource / RemoteSource + index validation
+  protocol/           jsonrpc / engine (MCP session engine) / transport (stdio line protocol)
+  tools/              registry (registry + parameter validation), definitions (3 tools)
+  bridge/             plugin.js (dsh Cordis plugin), client.js (MCP stdio client)
+data/index.json       built-in offline index (demo data, replaceable)
+scripts/serve-index.mjs  zero-dependency index hosting script
+test/                 93 test cases
+</code></pre>
+<h2>License</h2>
+<p>MIT (see <a href="https://github.com/JohnXu22786/docs-retriever/blob/HEAD/LICENSE">LICENSE</a>).</p>

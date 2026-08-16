@@ -1,0 +1,88 @@
+<p><img src="https://raw.githubusercontent.com/philmingdao/anno-dsh-native/HEAD/assets/cover.jpg" alt="Anno for DeepSeek Harness"></p>
+<h1>Anno for DeepSeek Harness (native)</h1>
+<p><code>@philmingdao/anno-dsh-native</code> is a <strong>native</strong> DeepSeek Harness plugin for <a href="https://github.com/philmingdao/anno">Anno</a> — a local-first HTML review, editing, and annotation workspace for coding agents.</p>
+<p>Unlike <a href="https://github.com/philmingdao/anno/tree/main/adapters/dsh"><code>@philmingdao/anno-dsh</code></a>, which bridges the MCP server through the official DSH MCP client, this package runs Anno <strong>in-process</strong>: the local review HTTP server, the on-disk session store, and the six <code>html_review_*</code> model tools all live inside the Harness process. There is no MCP layer, no child <code>npx</code> process, and no separate server to launch.</p>
+<h2>What it provides</h2>
+<ul>
+<li><p>A loopback-only HTTP review server (<code>127.0.0.1</code>, ephemeral port).</p>
+</li>
+<li><p>Persistent review sessions under <code>$ANNO_DATA_DIR</code> (default <code>~/.anno/sessions</code>); the source file is never overwritten and outputs are versioned (<code>-reviewed.html</code>, <code>-reviewed-v2.html</code>, …).</p>
+</li>
+<li><p>Six model tools, registered with DSH's native tool registry:</p>
+<ul>
+<li><code>html_review_start_session</code></li>
+<li><code>html_review_get_session</code></li>
+<li><code>html_review_claim_handoff</code></li>
+<li><code>html_review_mark_handoff_sent</code></li>
+<li><code>html_review_list_sessions</code></li>
+<li><code>html_review_register_final</code></li>
+</ul>
+</li>
+<li><p>A <code>tool:anno</code> system-prompt section that teaches the agent the start → review → claim → resolve workflow.</p>
+</li>
+</ul>
+<h2>Requirements</h2>
+<ul>
+<li>DeepSeek Harness <code>&gt;=0.1.0-rc.6 &lt;0.2.0</code></li>
+<li>Node.js 22 or newer</li>
+</ul>
+<h2>Install</h2>
+<p>The package is a DSH profile bundle: <code>dsh plugin add</code> installs it and applies its <code>cordis.patch.yml</code>, which inserts the <code>anno-native</code> row into the profile (host) composition.</p>
+<pre><code>dsh plugin --profile web add @philmingdao/anno-dsh-native
+# or from a source checkout:
+dsh plugin --profile web add .
+</code></pre>
+<p>Then start Harness normally:</p>
+<pre><code>dsh web
+</code></pre>
+<p>The tools appear as <code>html_review_*</code> (no MCP namespace prefix). Because the row sits on the host plane, every agent on that profile shares one review server and one session store.</p>
+<h3>Source checkout</h3>
+<pre><code>npm install
+npm test
+dsh plugin --profile web add "$(pwd)"
+</code></pre>
+<p>Use a temporary <code>--dsh-home</code> when testing without changing your normal profiles.</p>
+<h2>Use</h2>
+<p>Ask Harness to open or review an HTML file. It calls <code>html_review_start_session</code> with the absolute source path and opens the returned <code>review_url</code> for the user.</p>
+<p>When the user clicks <strong>提交给 Agent</strong> in the browser editor, the review server prepares the handoff and pushes it straight back into the originating agent conversation: the plugin captures the calling agent when the session is created and, on submission, queues an ordinary follow-up turn (<code>agent.followup</code>) carrying the full review — in-place text edits, format changes, element/area annotations, and page notes — so the agent claims the handoff immediately and resolves it into a verified standalone HTML file via <code>html_review_register_final</code>, without any manual polling.</p>
+<p>The receiving turn's prompt instructs the agent to call <code>html_review_claim_handoff</code> first (durable receipt), then <code>html_review_get_session</code> to reload the full session and apply the edits and annotations against the draft HTML, then <code>html_review_register_final</code>. The in-process push is best-effort: if the originating agent is no longer live, the handoff is still persisted on disk and the agent can claim it through the ordinary <code>html_review_*</code> tools.</p>
+<h2>Architecture</h2>
+<pre><code>DSH profile composition
+  -&gt; @philmingdao/anno-dsh-native  (cordis plugin + bundle patch)
+    -&gt; anno-core.js                (HTTP server + on-disk session/review/handoff store, node-only)
+    -&gt; index.js                    (registers html_review_* tools + tool:anno prompt section)
+</code></pre>
+<p><code>lib/anno-core.js</code> is deliberately free of DSH imports and is unit-tested directly (<code>npm test</code>). It exposes an <code>onHandoff</code> hook (invoked by the HTTP <code>generate</code> endpoint with the full review payload) and a <code>hasHostTarget</code> predicate (reported as <code>has_host_target</code> on the session projection) so the host binding can deliver handoffs without the core depending on any host runtime.</p>
+<p><code>lib/index.js</code> is the thin Cordis binding that injects <code>tools</code>, <code>systemPrompt</code>, and <code>agents</code>, starts the server as a fiber-owned effect, and registers the tools using raw JSON-Schema definitions directly against the <code>tools</code> registry. It captures the calling agent on <code>html_review_start_session</code> and, through <code>onHandoff</code>, delivers the submission back as an <code>agent.followup</code> notice. It imports no <code>@deepseek-ai/dsh-tools</code> (or any other DSH package) — the follow-up user message is built from the same shape <code>createUserMessage</code> produces, using only <code>node:crypto</code> — so the package keeps zero external dependencies and loads from any location (including a <code>link:</code>-installed source checkout).</p>
+<h2>Configuration</h2>
+<p>The <code>anno-native</code> row accepts:</p>
+<table>
+<thead>
+<tr>
+<th>Field</th>
+<th>Default</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>host</code></td>
+<td><code>dsh</code></td>
+<td>Host kind stamped on session records.</td>
+</tr>
+<tr>
+<td><code>dataDir</code></td>
+<td><code>$ANNO_DATA_DIR</code> or <code>~/.anno</code></td>
+<td>Root for persisted review sessions.</td>
+</tr>
+<tr>
+<td><code>assetsDir</code></td>
+<td>package <code>assets/</code></td>
+<td>Directory holding <code>editor.html</code> / <code>handoff.html</code>.</td>
+</tr>
+</tbody></table>
+<h2>Uninstall</h2>
+<pre><code>dsh plugin --profile web remove @philmingdao/anno-dsh-native
+</code></pre>
+<p>Existing review sessions under the data directory are left in place.</p>
+<h2>License</h2>
+<p>MIT. The editor UI is the same Anno asset set; see the <a href="https://github.com/philmingdao/anno">main Anno repository</a> for the bundled font's SIL Open Font License.</p>

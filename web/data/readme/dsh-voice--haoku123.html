@@ -1,0 +1,116 @@
+<h1>dsh-voice</h1>
+<p>Full-duplex voice mode for DeepSeek Harness: streamed ASR → LLM → TTS with barge-in.</p>
+<h2>Status</h2>
+<p><strong>v0.5.0 — SenseVoice (sherpa-onnx) host-side ASR.</strong></p>
+<p>Speak into the composer mic: the assistant silences itself (playback stops,
+host synthesis queue drops), the running turn is cancelled (the stop-button
+route), and your speech is transcribed by the host (SenseVoice, CN-native
+simplified-Chinese ASR with punctuation + ITN) and submitted. The reply
+streams back as spoken audio with live captions.</p>
+<p>Known limitation: barge-in detection is triggered by the mic's leading
+speech edge, which relies on browser-level echo cancellation
+(<code>getUserMedia({ echoCancellation: true })</code>). Loud TTS playback may leak
+into the mic on some platforms; there is no JS-level AEC.</p>
+<h2>Demo</h2>
+<p><img src="https://raw.githubusercontent.com/haoku123/dsh-voice/HEAD/docs/demo.gif" alt="dsh-voice demo"></p>
+<p>The loop: a user prompt streams back as spoken audio sentence-by-sentence,
+then the user's voice interrupts playback and stops the running turn
+mid-reply (true barge-in). The mic keeps recording the new speech.</p>
+<h2>How it works</h2>
+<pre><code>input:  mic ──RMS endpoint detection──▶ POST /asr (raw f32 PCM)
+                                           │ text (SenseVoice)
+                                           ▼
+        composer draft ──submit──▶ model stream ──llm/stream tap──▶ SentenceSegmenter
+                                                                     │
+        browser ◀── SSE /dsh-voice-api/stream ── TtsQueue (msedge-tts) ◀──┘
+                  (base64 MP3 frames + caption text)
+
+barge-in: speech edge ──▶ engine.skip() + POST /cancel (epoch bump)
+                         + session.cancel() when a turn is running
+</code></pre>
+<ul>
+<li>The <code>llm/stream</code> tap is <strong>lossless</strong>: every chunk is yielded unchanged, the
+segmenter only observes. The model stream is never blocked by synthesis.</li>
+<li>ASR runs <strong>host-side</strong> with <a href="https://github.com/k2-fsa/sherpa-onnx">sherpa-onnx</a>
+(Apache-2.0) running <strong>SenseVoice</strong> — the CN-native speech model that
+outperforms whisper on Chinese: native simplified output, punctuation,
+inverse text normalization (ITN) and 50+ language auto-detection. The
+browser only records and posts raw little-endian f32 PCM.</li>
+<li>Model files stream through a <strong>cache-through proxy</strong> at
+<code>/dsh-voice-api/hf</code> and are mirrored to disk
+(<code>~/.cache/dsh-voice/models/</code>, configurable via <code>cacheDir</code>), so every
+browser/recognizer load after the first is served from local disk.
+Downloads resume from partial <code>.part</code> files when interrupted. Use
+<code>npm run prefetch</code> to warm the cache once.</li>
+<li>RMS endpoint detection: 16kHz getUserMedia, 2s trailing-silence cutoff,
+max 30s segment, pre/post padding. Zero dependencies.</li>
+<li>Barge-in is three-layered: local playback queue cleared, host <code>TtsQueue</code>
+epoch bumped (queued AND in-flight synthesis dropped), and the running
+turn cancelled when <code>session.running</code> is true. An aborted turn never
+flushes its trailing half-sentence — exactly what the user interrupted.</li>
+<li><code>modelHost</code> accepts any HF-compatible mirror (e.g. <code>https://hf-mirror.com</code>
+for CN networks).</li>
+</ul>
+<h2>API</h2>
+<table>
+<thead>
+<tr>
+<th>Route</th>
+<th>Purpose</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>GET /dsh-voice-api/stream</code></td>
+<td>SSE; <code>event: audio</code> frames <code>{sessionId, seq, text, audio(base64 MP3)}</code></td>
+</tr>
+<tr>
+<td><code>POST /dsh-voice-api/asr</code></td>
+<td>raw little-endian f32 PCM body → <code>{text}</code> via SenseVoice</td>
+</tr>
+<tr>
+<td><code>POST /dsh-voice-api/cancel</code></td>
+<td><code>{sessionId}</code> drops queued + in-flight synthesis (epoch bump)</td>
+</tr>
+<tr>
+<td><code>GET /dsh-voice-api/config</code></td>
+<td>ASR runtime config <code>{asr: {...}}</code> for the mic button</td>
+</tr>
+<tr>
+<td><code>GET /dsh-voice-api/hf/*</code></td>
+<td>cache-through HF model proxy (mirrors to <code>cacheDir</code>)</td>
+</tr>
+<tr>
+<td><code>GET /dsh-voice-api/*</code></td>
+<td>ping: <code>{ok, name, enabled}</code></td>
+</tr>
+</tbody></table>
+<p>Config (bundle patch row):</p>
+<pre><code>- id: voice
+  name: '@haoku123/dsh-voice'
+  config:
+    voice: zh-CN-XiaoxiaoNeural
+    cacheDir: ~/.cache/dsh-voice/models   # optional, on-disk model cache
+    asr:
+      model: csukuangfj/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17
+      modelHost: https://huggingface.co   # or https://hf-mirror.com
+      language: auto                      # auto | zh | en | ja | ko | yue
+      useItn: true                        # inverse text normalization
+      autoSend: false
+      mode: toggle                        # toggle | hold
+</code></pre>
+<p>Model files are fetched through the proxy on first use; warm the cache once
+with the dsh host running:</p>
+<pre><code>npm run prefetch          # uses http://127.0.0.1:3080 by default
+</code></pre>
+<h2>Install</h2>
+<pre><code>dsh plugin --profile web add &lt;repo-url-or-path&gt;
+dsh --profile web
+</code></pre>
+<p>Note: needs Node ≥ 22.19 or ≥ 24 (<code>node:zlib</code> zstd APIs).</p>
+<h2>Tests</h2>
+<pre><code>npm test                                # segmenter unit tests (pure, no network)
+node test/host.integration.test.mjs     # llm/stream tap + real Edge TTS + SSE + /config
+node test/bargein.test.mjs              # client inject face wiring (skipPlayback/cancelTurn)
+node test/bargein-semantics.test.mjs    # aborted turn no-flush + cancel drops in-flight
+node verify-client.mjs                  # client bundle registration/exports/slots/dynamic-import
+</code></pre>

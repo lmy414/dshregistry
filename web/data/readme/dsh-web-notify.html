@@ -1,0 +1,680 @@
+<h1>dsh-web-notify</h1>
+<p><a href="https://www.npmjs.com/package/dsh-web-notify"><img src="https://img.shields.io/npm/v/dsh-web-notify.svg" alt="npm version"></a>
+<a href="https://github.com/renpengfei1027/dsh-web-notify/blob/HEAD/LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License: MIT"></a></p>
+<p><a href="#dsh-web-notify-english">English version</a> · 默认中文</p>
+<blockquote>
+<p>本插件由 <strong>DeepSeek Harness</strong>（官方 cordis / <code>@deepseek-ai/dsh-*</code> 插件栈）驱动，结合 <strong>DeepSeek-V4-Flash-0731</strong> 模型参数的官方事件帧构建。</p>
+<p><strong>当前 DeepSeek Harness 处于开发预览快速迭代期</strong>，推荐以<strong>开发调试模式</strong>（<code>link:</code> 本地仓库）挂载本插件：改代码后 <code>npm run build</code> 即时生效，配合 <code>window.__NOTIFICATIONS__</code> diagnostics 排查问题最顺手；当然也提供了 npm 一键挂载的备选方式。</p>
+</blockquote>
+<p>DSH Web GUI 的<strong>审批注意力插件</strong>：当任意会话出现待处理的审批 / 计划审批 / 提问时，浏览器不再静默——提示音、标签页标题与 Favicon 徽标、OS 通知、右下角通知中心同步呈现；会话完成、任务失败、连接掉线、模型/工具异常（429 配额等）也有提醒。检测管道覆盖全部会话行（含子代理）；受运行时委派策略约束，被委派的子代理实际上不会产生待审批/提问，其完成 / 失败 / 异常提醒照常生效（详见下文「子代理通知可达性」）。</p>
+<p>纯插件形态：host 半（<code>lib/index.js</code>）+ client 半（<code>lib/client.js</code>，loader 格式），通过 profile patch 挂载。</p>
+<h2>快速上手（推荐路径）</h2>
+<pre><code>① 克隆仓库 → 安装依赖 → 构建产物
+        ↓
+② link:仓库目录 挂入 web profile
+        ↓
+③ 放行设置命名空间（patch 脚本）
+        ↓
+④ 重启 dsh web → 设置页找到「通知」卡片 → 按自己需求开关通道/音量/免打扰
+        ↓
+⑤ DevTools 控制台观察 window.__NOTIFICATIONS__ ：
+     applied / cardRegistered / monitors / lastHeartbeatAt
+     hostStatuses / hostStatusCounts  ← 宿主投递的 job 状态词汇
+     feedCounters                     ← 每类事件计数
+     jobSamples / seenStatuses        ← 浏览器侧采样环
+     demo() / demoSound()             ← 一键 UI / 音频 demo
+</code></pre>
+<h2>场景应用</h2>
+<h3>1. 待处理审批 / 计划审批 / 提问到达</h3>
+<p>任意会话（包括未打开过的子代理）出现 <code>pendingInteraction</code> 即触发；同一 (会话, kind) 在冷却期（默认 5s）内不重复报警。</p>
+<table>
+<thead>
+<tr>
+<th>通道</th>
+<th>表现</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>提示音</td>
+<td>WebAudio E5-G5-B5 三连音</td>
+</tr>
+<tr>
+<td>标签页标题</td>
+<td><code>⚠ N 待审批 — &lt;原标题&gt;</code>，MutationObserver 对抗 shell 标题写入</td>
+</tr>
+<tr>
+<td>标签页 Favicon</td>
+<td>32×32 红底白字徽章（≤9 显示数字，&gt;9 显示红点）</td>
+</tr>
+<tr>
+<td>OS 通知</td>
+<td>按会话 tag 去重，<strong>点击跳转对应会话 + 聚焦窗口</strong>；<code>approval</code> 类型 <code>requireInteraction: true</code> 持久显示直到处理</td>
+</tr>
+<tr>
+<td>PWA 任务栏徽标</td>
+<td>已安装的 PWA 窗口在任务栏/应用图标显示数字（<code>navigator.setAppBadge</code>）</td>
+</tr>
+<tr>
+<td>通知中心 Dock</td>
+<td>右下角 FAB（实时计数）+ 展开面板列出<strong>全部</strong>待处理；按会话标题 + kind 圆点着色「去处理」一键跳转；归零自动收起；新到达时 FAB 脉冲高亮</td>
+</tr>
+</tbody></table>
+<p><strong>当前会话降级</strong>：页面可见且新审批属于当前打开的会话时，提示音与 OS 通知静默（用户眼睛就在这），仅保留视觉通道；切走或最小化后恢复全通道。</p>
+<p><strong>子代理通知可达性</strong>：会话列表是客户端 lineage 展开后的同一张表（子代理行 <code>origin: 'subagent'</code> 按 <code>parentSessionId</code> 嵌套），因此检测管道天然覆盖子代理行——一旦某个子代理行挂上 <code>pendingInteraction</code>，提示音 / 徽标 / OS 通知 / Dock 全通道照常触发。但按当前 DSH 委派语义，被委派的子代理实际上<strong>不会</strong>产生这三种待处理状态：</p>
+<ul>
+<li><strong>审批</strong>：<code>dsh-subagent</code> 在委派边界把子代理的审批策略固定为 <code>'never'</code>（无论父级策略如何），任何需审批操作（如 sandbox 升权）被确定性拒绝，不产生 <code>approval/requested</code> 帧，也就没有 <code>pendingInteraction</code>；</li>
+<li><strong>提问 / 计划审批</strong>：<code>dsh-user-questions</code> 对受父级持有的调用方抛 <code>DELEGATED_CALLER</code>，子代理只能把未决问题写进最终结果，由父级代为询问；计划审批只是 <code>intent.kind === 'plan-review'</code> 的提问分类，同样不会产生；</li>
+<li>因此通知中心里只可能出现<strong>父会话</strong>的审批条目，子代理行永远不会亮起待处理点。</li>
+</ul>
+<p>与之相对，子代理的<strong>完成、任务失败、模型/工具异常</strong>走 <code>session/event</code> 流与 jobs 归集，覆盖所有会话，提醒照常生效。</p>
+<h3>2. 会话 / 子代理完成</h3>
+<p>任意会话 <code>turn/end</code> 完成 → 完成 toast 卡片（右上角，done 变体）+ 完成单音 + 可选 OS 通知。</p>
+<ul>
+<li>页面可见 + 当前会话完成：toast / OS 静默，仅兜底播一声软完成音（用户可能滚走）</li>
+<li>页面隐藏：无 toast（看不到），改用 tab 标题脉冲 + PWA 角标 + 提示音 + OS 通知</li>
+</ul>
+<h3>3. 任务失败</h3>
+<p><code>jobsBySession</code> 中 job 状态为 <code>failed</code> / <code>killed</code>、或 <code>completed</code> 但 detail 非空且非 <code>exit code: 0</code>（DSH 真机异常终态映射）→ error 变体 toast + 提示音 + 可选 OS 通知。按 job 注册号只报一次。</p>
+<h3>4. 模型 / 工具运行异常（429 配额等）</h3>
+<p>宿主订阅官方 <code>session/event</code> 流，捕获 <code>llm/retry</code>（429 配额 / 限流）、<code>turn/end</code> 的 <code>error</code> / <code>max-tokens</code> / <code>interrupted</code>、<code>tool/result</code> 的 <code>error</code> / <code>isError</code> → error 变体 toast（错误原文进 body，截 240 字符）+ 提示音 + 可选 OS 通知。同会话同 kind 在冷却期内不重复。</p>
+<h3>5. 掉线 / 重连</h3>
+<p>共享 <code>connection</code> 服务断线持续超过 <code>connectionAlertAfterMs</code>（默认 10s）→ warning toast + 提示音；恢复时轻 toast + 完成单音。快速闪断（未跨阈值）不报。启动期从未连上过不报。</p>
+<h2>配置参数</h2>
+<p>设置卡片注册进 DSH Web 设置页的「插件配置」→「通知」（官方 <code>settings.plugin.item</code> 槽位），改完即生效（120 ms debounce 热重配，无需重启）。</p>
+<table>
+<thead>
+<tr>
+<th>字段</th>
+<th>类型</th>
+<th>默认</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>sound</code></td>
+<td>boolean</td>
+<td><code>true</code></td>
+<td>提示音主开关</td>
+</tr>
+<tr>
+<td><code>volume</code></td>
+<td>number 0–1</td>
+<td><code>0.15</code></td>
+<td>提示音音量</td>
+</tr>
+<tr>
+<td><code>badge</code></td>
+<td>boolean</td>
+<td><code>true</code></td>
+<td>标签页标题徽标 + Favicon 徽章 + PWA 任务栏徽标（同一开关）</td>
+</tr>
+<tr>
+<td><code>toast</code></td>
+<td>boolean</td>
+<td><code>true</code></td>
+<td>一次性事件卡片（完成 / 失败 / 断线）</td>
+</tr>
+<tr>
+<td><code>notify</code></td>
+<td>boolean</td>
+<td><code>true</code></td>
+<td>OS 通知主开关（首次触发在下一个用户手势请求 <code>Notification</code> 权限）</td>
+</tr>
+<tr>
+<td><code>dock</code></td>
+<td>boolean</td>
+<td><code>true</code></td>
+<td>通知中心 Dock（右下角 FAB + 展开面板）</td>
+</tr>
+<tr>
+<td><code>completion</code></td>
+<td>boolean</td>
+<td><code>true</code></td>
+<td>① 会话 / 子代理完成提醒</td>
+</tr>
+<tr>
+<td><code>completionSound</code></td>
+<td>boolean</td>
+<td><code>true</code></td>
+<td>完成时播放轻单音</td>
+</tr>
+<tr>
+<td><code>completionNotify</code></td>
+<td>boolean</td>
+<td><code>true</code></td>
+<td>完成也走 OS 通知</td>
+</tr>
+<tr>
+<td><code>connection</code></td>
+<td>boolean</td>
+<td><code>true</code></td>
+<td>② 掉线 / 重连提醒</td>
+</tr>
+<tr>
+<td><code>connectionAlertAfterMs</code></td>
+<td>number ≥1000</td>
+<td><code>10000</code></td>
+<td>断线持续超过该毫秒数才提醒</td>
+</tr>
+<tr>
+<td><code>jobFailure</code></td>
+<td>boolean</td>
+<td><code>true</code></td>
+<td>③ 后台任务失败提醒</td>
+</tr>
+<tr>
+<td><code>failureNotify</code></td>
+<td>boolean</td>
+<td><code>false</code></td>
+<td>③ 任务失败 + ④ 任务异常共用一个 OS 通知开关</td>
+</tr>
+<tr>
+<td><code>agentError</code></td>
+<td>boolean</td>
+<td><code>true</code></td>
+<td>④ 模型 / 工具运行异常（429 配额、输出上限、中断、工具失败）</td>
+</tr>
+<tr>
+<td><code>cooldownMs</code></td>
+<td>number ≥0</td>
+<td><code>5000</code></td>
+<td>同会话同 kind 去重冷却</td>
+</tr>
+<tr>
+<td><code>alertKinds</code></td>
+<td>string[]</td>
+<td><code>["approval","plan-review","question"]</code></td>
+<td>触发待处理提醒的 kind 白名单</td>
+</tr>
+<tr>
+<td><code>quiet</code></td>
+<td>object</td>
+<td><code>{enabled:false, start:"23:00", end:"08:00"}</code></td>
+<td>免打扰时段（仅静音，视觉通道照常）</td>
+</tr>
+<tr>
+<td><code>soundResolved</code></td>
+<td>boolean</td>
+<td><code>false</code></td>
+<td>审批解决时播放下行柔和音</td>
+</tr>
+<tr>
+<td><code>diagnostics</code></td>
+<td>boolean</td>
+<td><code>true</code></td>
+<td>on-device 观测仪（采样最近 60 次会话快照，含 job 状态；状态集合始终自动收集）</td>
+</tr>
+</tbody></table>
+<p><strong>几个常用调法示例</strong>：</p>
+<ul>
+<li><strong>只要审批不要失败/断线</strong>：<code>completion=false</code>、<code>connection=false</code>、<code>jobFailure=false</code>、<code>agentError=false</code></li>
+<li><strong>只想听响，不喜欢卡片弹</strong>：<code>toast=false</code>、<code>notify=false</code>，保留 <code>sound + badge + dock</code></li>
+<li><strong>夜间开发免打扰</strong>：<code>quiet.enabled=true</code>、<code>quiet.start=22:00</code>、<code>quiet.end=09:00</code>，提示音全关、视觉照常</li>
+<li><strong>只接 PWA / 任务栏，系统通知弹了嫌吵</strong>：<code>notify=false</code>、<code>badge=true</code>、<code>dock=true</code></li>
+</ul>
+<h2>安装</h2>
+<p>DSH 插件通过 <code>dsh plugin</code> 命令安装进 <strong>profile</strong>（<code>dsh web</code> 对应 <code>web</code> profile）。考虑到 DeepSeek Harness 当前处于开发预览快速迭代期，<strong>推荐开发调试模式挂载</strong>，便于即时迭代与 diagnostics 排查；当然也提供了 npm 一键挂载的备选方式。</p>
+<h3>前提条件</h3>
+<ul>
+<li><strong>Node.js &gt;= 22</strong></li>
+<li><strong>pnpm</strong> — <code>dsh plugin</code> 内部使用 pnpm 安装依赖：<code>npm install -g pnpm</code></li>
+<li><strong>dsh CLI</strong> — 若未全局安装，所有 <code>dsh</code> 命令前缀 <code>npx @deepseek-ai/dsh</code>，如 <code>npx @deepseek-ai/dsh plugin --profile web add dsh-web-notify</code></li>
+</ul>
+<h3>方式一：开发调试模式挂载（当前推荐）</h3>
+<pre><code># 1. 克隆仓库
+git clone https://github.com/renpengfei1027/dsh-web-notify.git
+cd dsh-web-notify
+
+# 2. 安装依赖并构建（需要 Node.js &gt;= 22）
+npm install
+npm run build
+
+# 3. 把仓库挂进 web profile（link: 指向仓库根目录）
+dsh plugin --profile web add link:$(pwd)
+# Windows PowerShell: dsh plugin --profile web add link:$PWD.Path
+
+# 4. 重启 dsh web，设置页「插件配置」下即出现「通知」卡片
+dsh web
+</code></pre>
+<h3>方式二：npm 一键挂载</h3>
+<pre><code>dsh plugin --profile web add dsh-web-notify
+</code></pre>
+<h3>AI 编码工具 / 沙箱环境注意事项</h3>
+<p>在 TRAE、Cursor 等 AI 编码工具中安装本插件时，需注意：</p>
+<ol>
+<li><strong>沙箱写限制</strong>：AI 工具的沙箱通常阻止写入 <code>~/.dsh/</code> 目录，而 <code>dsh plugin</code> 和 <code>dsh web</code> 都需要写 profile 文件。<strong>必须在 AI 工具外部的普通终端中执行这些命令</strong>。</li>
+<li><strong>切勿手动 <code>npm install</code></strong>：手动把包塞进 <code>~/.dsh/profiles/web/node_modules/</code> 会绕过 <code>dsh plugin</code> 的依赖链接逻辑，导致插件的 <code>@deepseek-ai/*</code> peer 依赖与 DSH host 的模块树脱节，<code>settings</code> 服务不可达，命名空间注册静默失败（卡片永远只读）。</li>
+<li><strong>始终用 <code>dsh plugin --profile web add</code></strong>：这是唯一正确的安装方式，它会通过 pnpm 正确链接依赖、更新 <code>package.json</code> 和 <code>cordis.patch.yml</code>。</li>
+</ol>
+<h3>安装后校验</h3>
+<p>安装完成并重启 <code>dsh web</code> 后，检查以下文件和指标：</p>
+<table>
+<thead>
+<tr>
+<th>校验项</th>
+<th>位置 / 命令</th>
+<th>预期</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>profile dependencies</td>
+<td><code>~/.dsh/profiles/web/package.json</code></td>
+<td><code>dependencies</code> 含 <code>dsh-web-notify</code></td>
+</tr>
+<tr>
+<td>profile patch</td>
+<td><code>~/.dsh/profiles/web/cordis.patch.yml</code></td>
+<td>含 <code>- id: notifications</code> 插入行</td>
+</tr>
+<tr>
+<td>包已安装</td>
+<td><code>~/.dsh/profiles/web/node_modules/dsh-web-notify/</code></td>
+<td>目录存在，含 <code>lib/</code>、<code>cordis.patch.yml</code></td>
+</tr>
+<tr>
+<td>命名空间已注册</td>
+<td>DevTools Console: <code>__NOTIFICATIONS__.scopeStatus</code></td>
+<td><code>"ready"</code>（非 <code>"unavailable"</code>）</td>
+</tr>
+<tr>
+<td>卡片可编辑</td>
+<td>设置页 → 插件配置 → 通知</td>
+<td>字段可编辑（非只读）</td>
+</tr>
+</tbody></table>
+<h3>放行设置命名空间（可选，但推荐）</h3>
+<p>DSH 官方 apiproxy 的 <code>WEB_SETTINGS_NAMESPACES</code> 是硬编码白名单，第三方命名空间默认只读。运行一次本仓库的 patch 脚本把 <code>notifications</code> 注入白名单：</p>
+<pre><code>node scripts/patch-apiproxy.mjs
+</code></pre>
+<p>之后设置卡片可读可写；不放行则卡片只读，<code>DEFAULTS</code> 生效。<strong><code>dsh</code> 升级后需重跑此脚本</strong>（脚本幂等，从旧的 <code>approval-alerter</code> 命名空间升级也支持原地替换）。</p>
+<h3>Diagnostics 观察调试</h3>
+<p>插件加载后，在 DSH Web 页面打开 DevTools Console：</p>
+<pre><code>// 插件是否完整挂载
+&gt; __NOTIFICATIONS__.applied, __NOTIFICATIONS__.cardRegistered
+  true, true
+
+// 绑定到了哪个 settings provider，sessions / connection 服务是否可用
+&gt; __NOTIFICATIONS__.binder, __NOTIFICATIONS__.sessions, __NOTIFICATIONS__.connAvailable
+  "settingsScope", true, true
+
+// 宿主事件通道健康度（~30s 一次心跳；lastHeartbeatAt 不变表示 host feed 断了）
+&gt; __NOTIFICATIONS__.feedCounters, __NOTIFICATIONS__.lastHeartbeatAt
+  { heartbeat: 4, "agent-error": 1, … }, 1756789012345
+
+// 宿主投递的 job 状态全量词汇（可对照 sentinel / lifecycle 对哪些终态做判断）
+&gt; __NOTIFICATIONS__.hostStatuses, __NOTIFICATIONS__.hostStatusCounts
+  ["failed","killed","completed","running",…], { completed: 8, failed: 2, … }
+
+// 浏览器侧采样（diagnostics=true 时开启，最近 60 帧）
+&gt; __NOTIFICATIONS__.jobSamples[0]
+  { ts, sessionId, sessionTitle, jobs: [{ jobId, status }], alerts: [] }
+
+// 一键 demo 卡片 / demo 提示音（排查 UI 与音频是否能响）
+&gt; __NOTIFICATIONS__.demo("error")     // 弹 error 变体卡片
+&gt; __NOTIFICATIONS__.demoSound(0.3)    // 以指定音量播放完成单音
+</code></pre>
+<h3>生效</h3>
+<p><strong>插件集合变更必须重启 <code>dsh web</code></strong>——仅刷新页面不会注册新包（官方 client-modules 文档明确：包元数据按名缓存且永不过期）。白名单 patch 之后也要重启。</p>
+<h3>验证</h3>
+<ol>
+<li>设置页「插件配置」下出现独立的「通知」卡片，字段可编辑</li>
+<li>触发一个待审批：标签页标题出现 <code>⚠ 1 待审批 —</code>，Favicon 显示红底数字 1，右下角 Dock 出现 FAB 与列表，播放三连音，OS 通知弹出（首次需授权）</li>
+<li>点击 OS 通知或 Dock 行的「去处理」→ 窗口聚焦并打开对应会话</li>
+<li>完成一个会话：右上角弹完成 toast + 完成单音</li>
+<li>DevTools 控制台可见 <code>[notifications]</code> 前缀的日志；<code>window.__NOTIFICATIONS__</code> 暴露 apply 分步记录与 <code>jobSamples</code> 采样环</li>
+</ol>
+<h3>卸载</h3>
+<pre><code>dsh plugin --profile web remove dsh-web-notify
+</code></pre>
+<p>或删除本地 profile 的 <code>cordis.patch.yml</code> 插入行与 <code>node_modules</code> junction。</p>
+<h2>限制</h2>
+<ul>
+<li>提醒粒度是<strong>会话级</strong>（列表行只有 kind 状态）；任务失败能到 job 级（含命令 label 与 exit detail），模型 / 工具异常走事件流原文（截 240 字符）</li>
+<li>子代理可达性：子代理行位于检测管道内（与会话同一张 lineage 表），但被委派子代理的审批策略固定为 <code>'never'</code>、提问被拒，实际不会产生待审批/计划审批/提问条目——只可能出现父会话的审批；完成 / 失败 / 异常提醒照常覆盖子代理（见上文「子代理通知可达性」）</li>
+<li>提示音需要页面有过用户手势（浏览器音频策略）；无手势时静默降级为视觉通道</li>
+<li>OS 通知权限在首次提醒后的下一次点击时请求；若 Windows 不弹，检查浏览器站点设置（127.0.0.1 通知权限）与 Windows「专注助手」</li>
+<li>设置卡片走 settings scope；若宿主 apiproxy 未放行第三方命名空间，卡片只读，<code>DEFAULTS</code> 生效</li>
+</ul>
+<h2>项目结构</h2>
+<pre><code>dsh-web-notify/
+├── package.json          # dsh.client.platform=web + inject + dsh.bundle.patch
+├── cordis.patch.yml      # 插件行 insert
+├── src/
+│   ├── index.ts          # host 半：settings 命名空间 + systemPrompt 通告 + 事件流转发
+│   └── client/           # 浏览器半（零 @deepseek-ai 运行时依赖）
+│       ├── index.ts      #   入口：apply/inject/mount + settings scope 热重配 + 卡片注册
+│       ├── types.ts      #   本地结构类型 + DEFAULTS
+│       ├── locales.ts    #   zh/en 词典 + t()
+│       ├── channels.ts   #   WebAudio 提示音 / 免打扰 / OS 通知 / jumpToSession
+│       ├── badge.ts      #   标题徽标 + Favicon 徽章（canvas）+ PWA 徽标
+│       ├── stores.ts     #   toast / dock 两个 uSES store
+│       ├── toast-ui.tsx  #   toast 卡片 + 堆栈
+│       ├── toast-mount.tsx
+│       ├── sentinel.ts   #   待处理边沿哨兵（Dock 承担视觉，仅打脉冲）
+│       ├── lifecycle.ts  #   ① 完成 + ③ 任务失败 + ② 连接监视
+│       ├── dock.ts       #   Dock FAB + 面板 + mount + startDock
+│       └── settings-card.tsx # 设置卡片
+└── scripts/
+    ├── build.mjs         # esbuild 构建 → lib/{index.js,client.js}（loader 包装）
+    ├── smoke.mjs         # 运行时冒烟（9 场景，对生成产物跑）
+    ├── patch-apiproxy.mjs # 把 notifications 注入 apiproxy 白名单
+    └── release.mjs       # 发布流水线：build → smoke → pack → publish
+</code></pre>
+<h2>License</h2>
+<p>MIT</p>
+<hr>
+<h1>dsh-web-notify (English)</h1>
+<p><a href="#dsh-web-notify">中文版</a> · Chinese by default</p>
+<blockquote>
+<p>Built on the <strong>DeepSeek Harness</strong> (official cordis / <code>@deepseek-ai/dsh-*</code> plugin stack) against event frames produced by the <strong>DeepSeek-V4-Flash-0731</strong> model parameters.</p>
+<p><strong>DeepSeek Harness is currently in a fast-iterating dev-preview phase.</strong> Mounting this plugin via the <strong>dev / debug mode</strong> (<code>link:</code> local repo) is recommended: after <code>npm run build</code> changes land immediately, and <code>window.__NOTIFICATIONS__</code> diagnostics makes troubleshooting smoothest. An npm one-shot install is also provided as an alternative.</p>
+</blockquote>
+<p><strong>Approval-attention plugin for the DSH Web GUI</strong>: whenever any session has a pending approval / plan-review / question, the browser rings back — chime, tab-title + favicon badge, OS notification, and a corner dock all surface the event at once. The detection pipe covers every session row including subagents; delegated subagents cannot actually raise approval/question waits under the current runtime delegation policy (see "Subagent notification reachability" below) while their completion / failure / runtime-error alerts work normally. Completions, job failures, disconnects, and model/tool runtime errors (429 quota, etc.) also alert.</p>
+<p>Pure plugin form: a host half (<code>lib/index.js</code>) plus a browser half (<code>lib/client.js</code>, loader format), mounted via a profile patch.</p>
+<h2>Quick start (recommended path)</h2>
+<pre><code>(1) Clone → install deps → build artefacts
+        ↓
+(2) Link repo root into the web profile
+        ↓
+(3) Whitelist the settings namespace (patch script)
+        ↓
+(4) Restart `dsh web` → find the "Notifications" card in Settings →
+    turn channels / volume / quiet-hours on and off as you like
+        ↓
+(5) In DevTools console, inspect `window.__NOTIFICATIONS__`:
+       applied / cardRegistered / monitors / lastHeartbeatAt
+       hostStatuses / hostStatusCounts ← job status vocab the host emits
+       feedCounters                    ← per-event counters
+       jobSamples / seenStatuses       ← browser-side sample ring
+       demo() / demoSound()            ← one-shot UI / audio demos
+</code></pre>
+<h2>Use cases</h2>
+<h3>1. Pending approval / plan-review / question arrives</h3>
+<p>Fires on a <code>pendingInteraction</code> edge for any session (including never-opened subagents). The same (session, kind) is not re-alerted during the cooldown window (default 5 s).</p>
+<table>
+<thead>
+<tr>
+<th>Channel</th>
+<th>Behaviour</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>Chime</td>
+<td>WebAudio tri-tone: E5–G5–B5</td>
+</tr>
+<tr>
+<td>Tab title</td>
+<td><code>⚠ N approval pending — &lt;original title&gt;</code>; a MutationObserver fights the shell's own title writes</td>
+</tr>
+<tr>
+<td>Tab Favicon</td>
+<td>32×32 red badge with white digits (a plain red dot when count &gt; 9)</td>
+</tr>
+<tr>
+<td>OS notification</td>
+<td>Deduplicated per-session via a tag; <strong>click jumps to the session and focuses the window</strong>; <code>approval</code> notifications set <code>requireInteraction: true</code> so they stay until handled</td>
+</tr>
+<tr>
+<td>PWA taskbar badge</td>
+<td>When installed as a PWA, the taskbar/app icon shows the count (<code>navigator.setAppBadge</code>)</td>
+</tr>
+<tr>
+<td>Notifications dock</td>
+<td>A corner FAB with a live count, plus an expandable panel listing <strong>every</strong> pending item; coloured dots per (title, kind); a one-tap "Handle" jumps to the session; auto-collapses at zero; the FAB pulses on new arrivals</td>
+</tr>
+</tbody></table>
+<p><strong>Current-session degrade</strong>: while the page is visible and the new pending item belongs to the currently open session, chime + OS notify are silenced (you're looking right at it), only the visual surfaces stay active. Switching tabs or minimising restores the full surface.</p>
+<p><strong>Subagent notification reachability</strong>: the session list is one flattened lineage table (subagent rows with <code>origin: 'subagent'</code> nest under their <code>parentSessionId</code>), so the detection pipe covers subagent rows by construction — any <code>pendingInteraction</code> on a subagent row would fire every channel (chime / badge / OS notify / dock). Under the current DSH delegation semantics, however, a delegated subagent can never actually produce one of the three pending states:</p>
+<ul>
+<li><strong>Approval</strong>: <code>dsh-subagent</code> pins the child's approval policy to <code>'never'</code> at the delegation boundary (regardless of the parent's policy), so any approval-requiring operation (e.g. a sandbox escalation) is deterministically rejected — no <code>approval/requested</code> frame is ever emitted, hence no <code>pendingInteraction</code>;</li>
+<li><strong>Question / plan-review</strong>: <code>dsh-user-questions</code> throws <code>DELEGATED_CALLER</code> for callers owned by another live agent, so a subagent can only fold the unresolved question into its final result for the parent to ask; plan-review is merely the <code>intent.kind === 'plan-review'</code> classification of a question frame and cannot occur either;</li>
+<li>As a result only <strong>parent-session</strong> approval entries can ever show up in the notification dock — a subagent row never lights up a pending marker.</li>
+</ul>
+<p>By contrast, subagent <strong>completions, job failures and model/tool runtime errors</strong> ride the <code>session/event</code> stream and the jobs grouping, which cover every session, and alert normally.</p>
+<h3>2. Session / subagent completes</h3>
+<p>A session finishes on <code>turn/end</code> → completion toast card (top-right, "done" variant) + a single completion chime + optional OS notify.</p>
+<ul>
+<li>Visible + current session completion: toast + OS notify are silenced, a soft completion chime plays as a safety net (you might have scrolled away)</li>
+<li>Hidden page: no toast (nobody sees it) — tab-title pulse + PWA badge + chime + OS notify instead</li>
+</ul>
+<h3>3. Job failure</h3>
+<p>Any job in <code>jobsBySession</code> whose status is <code>failed</code> / <code>killed</code>, or <code>completed</code> with a non-empty, non-<code>exit code: 0</code> detail (the DSH real-machine abnormal-terminal mapping) → error-variant toast + chime + optional OS notify. Reported once per registered job id.</p>
+<h3>4. Model / tool runtime errors (429 quota, etc.)</h3>
+<p>The host subscribes to the official <code>session/event</code> stream and catches: <code>llm/retry</code> (429 / rate-limit), <code>turn/end</code> flavours <code>error</code> / <code>max-tokens</code> / <code>interrupted</code>, and <code>tool/result</code> with <code>error</code> or <code>isError</code> content → error-variant toast carrying the raw provider message (capped at 240 chars) + chime + optional OS notify. Deduplicated per (session, kind) during the cooldown.</p>
+<h3>5. Disconnect / reconnect</h3>
+<p>The shared <code>connection</code> service stays down for longer than <code>connectionAlertAfterMs</code> (default 10 s) → warning toast + chime. On reconnect, a light toast + completion chime. Quick blips that never cross the threshold stay silent. Boot phases where it was never connected never alert.</p>
+<h2>Configuration</h2>
+<p>The settings card registers under <strong>Plugin settings → Notifications</strong> in the DSH Web Settings page (official <code>settings.plugin.item</code> slot). Changes take effect hot (120 ms debounce, no restart).</p>
+<table>
+<thead>
+<tr>
+<th>Field</th>
+<th>Type</th>
+<th>Default</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>sound</code></td>
+<td>boolean</td>
+<td><code>true</code></td>
+<td>Chime master switch</td>
+</tr>
+<tr>
+<td><code>volume</code></td>
+<td>number 0–1</td>
+<td><code>0.15</code></td>
+<td>Chime loudness</td>
+</tr>
+<tr>
+<td><code>badge</code></td>
+<td>boolean</td>
+<td><code>true</code></td>
+<td>Tab-title badge + Favicon badge + PWA taskbar badge (one shared switch)</td>
+</tr>
+<tr>
+<td><code>toast</code></td>
+<td>boolean</td>
+<td><code>true</code></td>
+<td>One-shot corner toasts (completion / failure / disconnect)</td>
+</tr>
+<tr>
+<td><code>notify</code></td>
+<td>boolean</td>
+<td><code>true</code></td>
+<td>OS notify master switch; <code>Notification</code> permission is requested on the next user gesture after the first trigger</td>
+</tr>
+<tr>
+<td><code>dock</code></td>
+<td>boolean</td>
+<td><code>true</code></td>
+<td>Notifications dock: corner FAB + expandable panel</td>
+</tr>
+<tr>
+<td><code>completion</code></td>
+<td>boolean</td>
+<td><code>true</code></td>
+<td>① Session / subagent completion alerts</td>
+</tr>
+<tr>
+<td><code>completionSound</code></td>
+<td>boolean</td>
+<td><code>true</code></td>
+<td>Play a soft chime on completion</td>
+</tr>
+<tr>
+<td><code>completionNotify</code></td>
+<td>boolean</td>
+<td><code>true</code></td>
+<td>Also send an OS notify on completion</td>
+</tr>
+<tr>
+<td><code>connection</code></td>
+<td>boolean</td>
+<td><code>true</code></td>
+<td>② Disconnect / reconnect alerts</td>
+</tr>
+<tr>
+<td><code>connectionAlertAfterMs</code></td>
+<td>number ≥1000</td>
+<td><code>10000</code></td>
+<td>Milliseconds of outage before alerting</td>
+</tr>
+<tr>
+<td><code>jobFailure</code></td>
+<td>boolean</td>
+<td><code>true</code></td>
+<td>③ Background job failure alerts</td>
+</tr>
+<tr>
+<td><code>failureNotify</code></td>
+<td>boolean</td>
+<td><code>false</code></td>
+<td>Shared OS-notify switch for ③ failures + ④ runtime errors</td>
+</tr>
+<tr>
+<td><code>agentError</code></td>
+<td>boolean</td>
+<td><code>true</code></td>
+<td>④ Model / tool runtime errors: 429 quota, output limit, interruption, tool failure</td>
+</tr>
+<tr>
+<td><code>cooldownMs</code></td>
+<td>number ≥0</td>
+<td><code>5000</code></td>
+<td>Per-session per-kind dedupe window</td>
+</tr>
+<tr>
+<td><code>alertKinds</code></td>
+<td>string[]</td>
+<td><code>["approval","plan-review","question"]</code></td>
+<td>Kind whitelist for pending alerts</td>
+</tr>
+<tr>
+<td><code>quiet</code></td>
+<td>object</td>
+<td><code>{enabled:false, start:"23:00", end:"08:00"}</code></td>
+<td>Quiet hours (only mutes; visual surfaces stay)</td>
+</tr>
+<tr>
+<td><code>soundResolved</code></td>
+<td>boolean</td>
+<td><code>false</code></td>
+<td>Soft downstream chime when a pending approval resolves</td>
+</tr>
+<tr>
+<td><code>diagnostics</code></td>
+<td>boolean</td>
+<td><code>true</code></td>
+<td>On-device observer (last 60 session snapshots incl. job status; the status set is always auto-collected)</td>
+</tr>
+</tbody></table>
+<p><strong>A few common recipes</strong>:</p>
+<ul>
+<li><strong>Approvals only, no failures / disconnects</strong>: <code>completion=false</code>, <code>connection=false</code>, <code>jobFailure=false</code>, <code>agentError=false</code></li>
+<li><strong>Just the chime, hate popping cards</strong>: <code>toast=false</code>, <code>notify=false</code>, keep <code>sound + badge + dock</code></li>
+<li><strong>Late-night silence</strong>: <code>quiet.enabled=true</code>, <code>quiet.start=22:00</code>, <code>quiet.end=09:00</code> — chimes fully off, visuals remain</li>
+<li><strong>Only PWA / taskbar, OS notify is too loud</strong>: <code>notify=false</code>, <code>badge=true</code>, <code>dock=true</code></li>
+</ul>
+<h2>Install</h2>
+<p>DSH plugins are installed into a <strong>profile</strong> via the <code>dsh plugin</code> command (<code>dsh web</code> uses the <code>web</code> profile). Given the DeepSeek Harness is currently in a fast-iterating dev-preview phase, the <strong>dev / debug mode mount is recommended</strong> for immediate iteration and diagnostics troubleshooting. An npm one-shot install is also provided as an alternative.</p>
+<h3>Method 1: dev / debug mode mount (recommended right now)</h3>
+<pre><code># 1. clone the repo
+git clone https://github.com/renpengfei1027/dsh-web-notify.git
+cd dsh-web-notify
+
+# 2. install dependencies and build (Node.js &gt;= 22 required)
+npm install
+npm run build
+
+# 3. link the repo root into the web profile
+dsh plugin --profile web add link:$(pwd)
+
+# 4. restart `dsh web` — a standalone Notifications card
+#    appears under Settings → Plugin settings
+dsh web
+</code></pre>
+<h3>Method 2: npm one-shot install</h3>
+<pre><code>dsh plugin --profile web add dsh-web-notify
+</code></pre>
+<h3>Whitelist the settings namespace (optional, but recommended)</h3>
+<p>DSH's own <code>WEB_SETTINGS_NAMESPACES</code> inside <code>dsh-host-apiproxy</code> is a hardcoded allowlist — third-party namespaces are read-only by default. Run the patch script once to inject <code>notifications</code> into the allowlist:</p>
+<pre><code>node scripts/patch-apiproxy.mjs
+</code></pre>
+<p>Afterwards the settings card is read+write. Without this patch the card falls back to read-only and <code>DEFAULTS</code> apply. <strong>Re-run after every <code>dsh</code> upgrade</strong>; the script is idempotent and can also upgrade an earlier <code>approval-alerter</code> allowlist in-place.</p>
+<h3>Diagnostics for debugging</h3>
+<p>Once the plugin has loaded, open the DSH Web DevTools console:</p>
+<pre><code>// Mounting health
+&gt; __NOTIFICATIONS__.applied, __NOTIFICATIONS__.cardRegistered
+  true, true
+
+// Which settings binder we got; are sessions/connection services available?
+&gt; __NOTIFICATIONS__.binder, __NOTIFICATIONS__.sessions, __NOTIFICATIONS__.connAvailable
+  "settingsScope", true, true
+
+// Host event-feed health (heartbeat ~ every 30 s; a stale lastHeartbeatAt means the host feed broke)
+&gt; __NOTIFICATIONS__.feedCounters, __NOTIFICATIONS__.lastHeartbeatAt
+  { heartbeat: 4, "agent-error": 1, … }, 1756789012345
+
+// Complete job-status vocabulary emitted by the host — use it to double-check
+// which terminal states the sentinel/lifecycle guards react to.
+&gt; __NOTIFICATIONS__.hostStatuses, __NOTIFICATIONS__.hostStatusCounts
+  ["failed","killed","completed","running",…], { completed: 8, failed: 2, … }
+
+// Browser-side samples (captured while diagnostics=true; last 60 frames)
+&gt; __NOTIFICATIONS__.jobSamples[0]
+  { ts, sessionId, sessionTitle, jobs: [{ jobId, status }], alerts: [] }
+
+// One-shot UI / audio demos (confirm surfaces are wired and audio can play)
+&gt; __NOTIFICATIONS__.demo("error")     // push an error-variant card
+&gt; __NOTIFICATIONS__.demoSound(0.3)    // completion chime at a given volume
+</code></pre>
+<h3>Take effect</h3>
+<p><strong>Plugin-roster changes require <code>dsh web</code> to be restarted</strong> — a page refresh alone never registers a new package (the official client-modules docs explicitly state package metadata is cached by name and never expires). A whitelist patch also needs a restart.</p>
+<h3>Verify</h3>
+<ol>
+<li>Under <strong>Plugin settings</strong> in the Settings page, a standalone <strong>Notifications</strong> card appears with editable fields</li>
+<li>Trigger a pending approval: the tab title shows <code>⚠ 1 approval pending — </code>, favicon draws a red <code>1</code>, the corner dock FAB + list appear, the tri-tone chime plays, and an OS notification pops (allow on first time)</li>
+<li>Click the OS notification or "Handle" on a dock row → window focuses and that session opens</li>
+<li>Finish a session: a completion toast appears top-right + the single completion chime</li>
+<li>DevTools console shows <code>[notifications]</code> log lines; <code>window.__NOTIFICATIONS__</code> exposes the apply breakdown + <code>jobSamples</code> ring</li>
+</ol>
+<h3>Uninstall</h3>
+<pre><code>dsh plugin --profile web remove dsh-web-notify
+</code></pre>
+<p>…or remove the insert row from the profile's <code>cordis.patch.yml</code> and delete the <code>node_modules</code> junction.</p>
+<h2>Limits</h2>
+<ul>
+<li>Granularity is <strong>session-level</strong> for pending (list rows only carry a kind state); job failures reach job-level (command label + exit detail); model/tool errors carry the event-stream raw message capped at 240 chars</li>
+<li>Subagent reachability: subagent rows sit inside the detection pipe (same flattened lineage table), but a delegated subagent's approval policy is pinned to <code>'never'</code> and user questions are rejected — no approval/plan-review/question entries ever appear for subagents, only parent-session ones; completion / failure / runtime-error alerts still cover subagents (see "Subagent notification reachability" above)</li>
+<li>Chimes need a prior user gesture on the page (browser autoplay policy); without one it silently degrades to visual surfaces only</li>
+<li>OS-notify permission is requested on the first click after the first trigger; if nothing ever appears on Windows, check the browser site settings (127.0.0.1 notify permission) and Windows Focus Assist</li>
+<li>The card rides the settings scope; if the host apiproxy hasn't whitelisted the namespace, the card is read-only and <code>DEFAULTS</code> apply</li>
+</ul>
+<h2>Project layout</h2>
+<pre><code>dsh-web-notify/
+├── package.json          # dsh.client.platform=web + inject + dsh.bundle.patch
+├── cordis.patch.yml      # plugin-row insert
+├── src/
+│   ├── index.ts          # host half: settings NS + systemPrompt notice + event forwarder
+│   └── client/           # browser half (zero @deepseek-ai runtime deps)
+│       ├── index.ts      #   entry: apply/inject/mount + settings-scope hot reconfig + card
+│       ├── types.ts      #   local types + DEFAULTS
+│       ├── locales.ts    #   zh/en dicts + minimal t()
+│       ├── channels.ts   #   WebAudio chime / quiet-hours / OS notify / jumpToSession
+│       ├── badge.ts      #   title badge + canvas favicon badge + PWA badge
+│       ├── stores.ts    #   uSES stores for toast + dock
+│       ├── toast-ui.tsx  #   toast cards + stack
+│       ├── toast-mount.tsx
+│       ├── sentinel.ts   #   pending-edge sentinel (dock owns visuals; just pulses)
+│       ├── lifecycle.ts  #   ① completion + ③ job-failure + ② connection monitor
+│       ├── dock.ts       #   dock FAB + panel + mount + startDock
+│       └── settings-card.tsx # settings card
+└── scripts/
+    ├── build.mjs         # esbuild → lib/{index.js,client.js} (loader-wrapped)
+    ├── smoke.mjs         # runtime smoke (9 scenarios, runs on built artefacts)
+    ├── patch-apiproxy.mjs # inject notifications into apiproxy allowlists
+    └── release.mjs       # release pipeline: build → smoke → pack → publish
+</code></pre>
+<h2>License</h2>
+<p>MIT</p>

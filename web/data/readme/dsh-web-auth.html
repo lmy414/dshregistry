@@ -1,0 +1,487 @@
+<h1>dsh-web-auth</h1>
+<p><a href="https://www.npmjs.com/package/@summersec/dsh-web-auth"><img src="https://img.shields.io/npm/v/@summersec/dsh-web-auth.svg" alt="npm"></a>
+<a href="https://nodejs.org/"><img src="https://img.shields.io/badge/node-%3E%3D22-brightgreen" alt="Node.js"></a>
+<a href="https://github.com/SummerSec/dsh-web-auth/blob/HEAD/LICENSE"><img src="https://img.shields.io/badge/License-MIT-blue.svg" alt="License: MIT"></a>
+<a href="https://github.com/topics/dsh-plugin"><img src="https://img.shields.io/badge/topic-dsh--plugin-111827" alt="topic: dsh-plugin"></a></p>
+<p>Transport-level authentication for the <a href="https://github.com/deepseek-ai">DeepSeek Harness</a> (DSH) Web GUI.</p>
+<p>Official DSH <code>webserver</code> serves the GUI, plugin bundles, <code>/api</code>, SSE, and WebSocket traffic without a login boundary. This plugin <strong>disables</strong> that unauthenticated carrier and replaces it with a drop-in <code>webServer</code> service that authenticates every request <strong>before</strong> it reaches application routes.</p>
+<p>中文文档：<a href="https://github.com/SummerSec/dsh-web-auth/blob/HEAD/README.zh-CN.md">README.zh-CN.md</a></p>
+<hr>
+<h2>Login page</h2>
+<p><img src="https://raw.githubusercontent.com/SummerSec/dsh-web-auth/HEAD/docs/assets/dsh-web-auth-login-v0.1.2.png" alt="DeepSeek Harness authentication page"></p>
+<hr>
+<h2>Why this exists</h2>
+<p>DSH’s stock web host is convenient for local use, but it is not a product auth layer:</p>
+<ul>
+<li>Binding to <code>0.0.0.0</code> or putting the port behind a reverse proxy can expose the full control surface.</li>
+<li>A frontend-only “login page” does not protect <code>/api</code>, static plugin assets, SSE, or WebSocket upgrades.</li>
+<li>Session and password handling need to live on the HTTP carrier itself.</li>
+</ul>
+<p><code>@summersec/dsh-web-auth</code> sits at the transport layer:</p>
+<ol>
+<li>Disable <code>@deepseek-ai/dsh-host-webserver</code>.</li>
+<li>Insert <code>webserver-auth</code> with the same <code>ctx.webServer</code> contract (<code>register</code>, <code>registerUpgrade</code>, <code>registerFallback</code>, <code>tapIndex</code>, <code>host</code>, <code>port</code>).</li>
+<li>Gate HTTP and upgrade traffic with a server-side session cookie.</li>
+</ol>
+<p>Other plugins keep registering routes as usual; they do not need to know auth exists.</p>
+<hr>
+<h2>Features</h2>
+<table>
+<thead>
+<tr>
+<th>Area</th>
+<th>Behavior</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>Coverage</td>
+<td>HTTP routes <strong>and</strong> WebSocket / HTTP upgrade paths</td>
+</tr>
+<tr>
+<td>Default mode</td>
+<td><code>always</code> — login required even on <code>127.0.0.1</code></td>
+</tr>
+<tr>
+<td>Optional mode</td>
+<td><code>non-loopback</code> — skip auth only when bound to loopback</td>
+</tr>
+<tr>
+<td>Passwords</td>
+<td>scrypt hashes (<code>scrypt$N$r$p$salt$key</code>); plaintext env only for temporary use</td>
+</tr>
+<tr>
+<td>Sessions</td>
+<td>32-byte random tokens, in-memory store, sliding TTL</td>
+</tr>
+<tr>
+<td>Cookies</td>
+<td><code>HttpOnly</code>, <code>SameSite=Strict</code>, optional <code>Secure</code></td>
+</tr>
+<tr>
+<td>Abuse control</td>
+<td>Per-client-IP login attempt limiter with <code>Retry-After</code></td>
+</tr>
+<tr>
+<td>Login UX</td>
+<td>Built-in <code>/auth/login</code> page (light/dark), form + JSON body</td>
+</tr>
+<tr>
+<td>Hardening</td>
+<td>Origin check on login/logout, open-redirect sanitization, CSP and frame denial on auth responses</td>
+</tr>
+</tbody></table>
+<hr>
+<h2>Requirements</h2>
+<ul>
+<li><strong>Node.js</strong> <code>&gt;= 22</code></li>
+<li><strong>DeepSeek Harness</strong> with a <code>web</code> profile (peer: <code>@deepseek-ai/cordis</code> <code>^4.0.1</code>)</li>
+<li>A password <strong>hash</strong> in the process environment (recommended), or a temporary plaintext password</li>
+</ul>
+<hr>
+<h2>Quick start</h2>
+<pre><code># 1) Generate a random password + scrypt hash (save the password offline)
+npx --yes @summersec/dsh-web-auth generate
+
+# 2) Export the hash for this shell session (do not commit it)
+$env:WEB_AUTH_PASSWORD_HASH = 'scrypt$...'
+$env:WEB_AUTH_USERNAME = 'admin'
+
+# 3) Install into the web profile
+dsh plugin --profile web add @summersec/dsh-web-auth
+
+# 4) Start the GUI
+dsh web
+</code></pre>
+<p>Open the usual DSH URL. Unauthenticated browser navigations redirect to <code>/auth/login</code>. API and other non-HTML clients receive <code>401</code> JSON:</p>
+<pre><code>{ "error": "authentication_required" }
+</code></pre>
+<p>After login you get a session cookie and continue to the original path. The injected browser bootstrap makes same-origin API, SSE, and plugin requests use that session cookie explicitly. If an in-memory session expires or the service restarts, a JSON <code>authentication_required</code> response sends the browser back to the login page instead of leaving the plugin in a silent transport-failure state.</p>
+<blockquote>
+<p><strong>Do not</strong> put the password or hash into the project <code>.env</code> if that file is shared or committed. Prefer the process environment, a secrets manager, or a private host-level env file outside the repo.</p>
+</blockquote>
+<hr>
+<h2>Install from source</h2>
+<pre><code>git clone https://github.com/SummerSec/dsh-web-auth.git
+cd dsh-web-auth
+npm install
+
+node .\bin\dsh-web-auth.js generate
+$env:WEB_AUTH_PASSWORD_HASH = 'scrypt$...'
+
+# From the parent directory that hosts your DSH workspace, or via local path:
+dsh plugin --profile web add &lt;path-to-dsh-web-auth&gt;
+dsh web
+</code></pre>
+<p>Hash an existing password (minimum <strong>12</strong> characters):</p>
+<pre><code>$env:WEB_AUTH_PASSWORD = 'your-long-passphrase'
+node .\bin\dsh-web-auth.js hash-password
+Remove-Item Env:WEB_AUTH_PASSWORD
+</code></pre>
+<p>Or pipe stdin (the CLI never accepts the password as a command-line argument):</p>
+<pre><code>'your-long-passphrase' | node .\bin\dsh-web-auth.js hash-password
+</code></pre>
+<hr>
+<h2>Authentication modes</h2>
+<table>
+<thead>
+<tr>
+<th><code>authMode</code> / <code>WEB_AUTH_MODE</code></th>
+<th>When auth runs</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>always</code> (<strong>default</strong>)</td>
+<td>Always, including <code>host: 127.0.0.1</code></td>
+</tr>
+<tr>
+<td><code>non-loopback</code></td>
+<td>Only when <code>host</code> is not <code>127.0.0.1</code> (e.g. <code>0.0.0.0</code>)</td>
+</tr>
+</tbody></table>
+<pre><code># Default: always require login
+$env:WEB_AUTH_MODE = 'always'
+dsh web
+
+# Loopback without login; enable gate when binding non-loopback
+$env:WEB_AUTH_MODE = 'non-loopback'
+dsh web --host 0.0.0.0
+</code></pre>
+<p>If authentication is active and neither <code>passwordHash</code> nor <code>password</code> is configured, the plugin <strong>throws at startup</strong> so you never ship an open server by accident.</p>
+<hr>
+<h2>Environment variables</h2>
+<p>The bundle (<code>cordis.patch.yml</code>) wires these into plugin config:</p>
+<table>
+<thead>
+<tr>
+<th>Variable</th>
+<th>Default</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>WEB_AUTH_MODE</code></td>
+<td><code>always</code></td>
+<td><code>always</code> or <code>non-loopback</code></td>
+</tr>
+<tr>
+<td><code>WEB_AUTH_USERNAME</code></td>
+<td><code>admin</code></td>
+<td>Login username</td>
+</tr>
+<tr>
+<td><code>WEB_AUTH_PASSWORD_HASH</code></td>
+<td><em>(none)</em></td>
+<td>Preferred scrypt hash from <code>generate</code> / <code>hash-password</code></td>
+</tr>
+<tr>
+<td><code>WEB_AUTH_PASSWORD</code></td>
+<td><em>(none)</em></td>
+<td>Plaintext password for temporary / lab use only</td>
+</tr>
+</tbody></table>
+<p>Prefer <code>WEB_AUTH_PASSWORD_HASH</code>. Keep <code>WEB_AUTH_PASSWORD</code> for short-lived local experiments.</p>
+<hr>
+<h2>Advanced configuration</h2>
+<p>The bundle:</p>
+<ol>
+<li>Sets the stock <code>webserver</code> row to <code>disabled: true</code>.</li>
+<li>Inserts <code>webserver-auth</code> with name <code>@summersec/dsh-web-auth</code>.</li>
+</ol>
+<p>DSH patches replace config <strong>as a whole</strong>. To override advanced fields, restate the full <code>webserver-auth</code> block in the profile patch (e.g. profile <code>cordis.patch.yml</code>):</p>
+<pre><code>- id: webserver-auth
+  name: '@summersec/dsh-web-auth'
+  inject: [webStartup]
+  config:
+    host: !!js ctx.webStartup.host ?? '127.0.0.1'
+    port: !!js ctx.webStartup.port ?? 3080
+    authMode: always
+    username: admin
+    passwordHash: !!js process.env.WEB_AUTH_PASSWORD_HASH
+    sessionTtlMinutes: 720
+    maxAttempts: 5
+    attemptWindowSeconds: 300
+    secureCookie: auto
+    trustProxy: false
+</code></pre>
+<h3>Config reference</h3>
+<table>
+<thead>
+<tr>
+<th>Field</th>
+<th>Type / values</th>
+<th>Default</th>
+<th>Notes</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>host</code></td>
+<td><code>127.0.0.1</code> | <code>0.0.0.0</code></td>
+<td><code>127.0.0.1</code></td>
+<td>Listen address (from web startup)</td>
+</tr>
+<tr>
+<td><code>port</code></td>
+<td><code>0</code>–<code>65535</code></td>
+<td><code>3080</code></td>
+<td>Listen port; <code>0</code> for ephemeral</td>
+</tr>
+<tr>
+<td><code>authMode</code></td>
+<td><code>always</code> | <code>non-loopback</code></td>
+<td><code>always</code></td>
+<td>See <a href="#authentication-modes">Authentication modes</a></td>
+</tr>
+<tr>
+<td><code>username</code></td>
+<td>string</td>
+<td><code>admin</code></td>
+<td>Single shared account</td>
+</tr>
+<tr>
+<td><code>password</code></td>
+<td>string</td>
+<td>—</td>
+<td>Plaintext; avoid in production</td>
+</tr>
+<tr>
+<td><code>passwordHash</code></td>
+<td><code>scrypt$...</code></td>
+<td>—</td>
+<td>Required format from the CLI</td>
+</tr>
+<tr>
+<td><code>sessionTtlMinutes</code></td>
+<td><code>1</code>–<code>43200</code></td>
+<td><code>720</code> (12h)</td>
+<td>Sliding window on each authenticated request</td>
+</tr>
+<tr>
+<td><code>maxAttempts</code></td>
+<td><code>1</code>–<code>1000</code></td>
+<td><code>5</code></td>
+<td>Failed logins per IP per window</td>
+</tr>
+<tr>
+<td><code>attemptWindowSeconds</code></td>
+<td><code>1</code>–<code>86400</code></td>
+<td><code>300</code></td>
+<td>Attempt window length</td>
+</tr>
+<tr>
+<td><code>secureCookie</code></td>
+<td><code>auto</code> | <code>always</code> | <code>never</code></td>
+<td><code>auto</code></td>
+<td>When to set the <code>Secure</code> flag</td>
+</tr>
+<tr>
+<td><code>trustProxy</code></td>
+<td>boolean</td>
+<td><code>false</code></td>
+<td>Trust <code>X-Forwarded-*</code> only behind a locked-down proxy</td>
+</tr>
+</tbody></table>
+<h3><code>secureCookie</code> and <code>trustProxy</code></h3>
+<table>
+<thead>
+<tr>
+<th>Scenario</th>
+<th>Suggested settings</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>Local HTTP on loopback</td>
+<td><code>secureCookie: auto</code>, <code>trustProxy: false</code></td>
+</tr>
+<tr>
+<td>Direct TLS on the Node process</td>
+<td><code>secureCookie: auto</code> (sets <code>Secure</code> when the socket is encrypted)</td>
+</tr>
+<tr>
+<td>HTTPS terminated at nginx / Caddy / Cloudflare</td>
+<td><code>secureCookie: auto</code> or <code>always</code>, <strong><code>trustProxy: true</code></strong>, and <strong>only</strong> the proxy may reach DSH’s port</td>
+</tr>
+</tbody></table>
+<p>If <code>trustProxy</code> is true while the port is reachable by untrusted clients, attackers can spoof <code>X-Forwarded-For</code> / <code>X-Forwarded-Proto</code> and weaken IP limits or cookie security. Lock network access first.</p>
+<hr>
+<h2>Brute-force protection</h2>
+<p>Failed logins are limited by client IP. With the default configuration, an IP may fail 5 times within 300 seconds. Further attempts receive <code>429 Too Many Requests</code> and a <code>Retry-After</code> header until the window expires. A successful login clears that IP's failure count.</p>
+<p>Configure the threshold with:</p>
+<pre><code>maxAttempts: 5
+attemptWindowSeconds: 300
+</code></pre>
+<p>The limiter is intentionally small and local:</p>
+<ul>
+<li>Counters are stored in process memory, so a restart clears them and multiple instances do not share state.</li>
+<li>It limits IP addresses, not accounts. Attackers rotating source IPs can avoid a single-IP threshold.</li>
+<li>With <code>trustProxy: false</code>, the socket address is used. With <code>trustProxy: true</code>, the first <code>X-Forwarded-For</code> value is trusted, so the DSH port must only accept traffic from the configured proxy.</li>
+</ul>
+<p>For an Internet-facing deployment, keep this limiter enabled and add rate limiting at the reverse proxy or firewall. It is not a replacement for HTTPS, network isolation, or a strong password.</p>
+<hr>
+<h2>Auth HTTP API</h2>
+<table>
+<thead>
+<tr>
+<th>Method</th>
+<th>Path</th>
+<th>Purpose</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>GET</code> / <code>HEAD</code></td>
+<td><code>/auth/login</code></td>
+<td>Login HTML page; <code>?next=/path</code> for post-login redirect</td>
+</tr>
+<tr>
+<td><code>POST</code></td>
+<td><code>/auth/login</code></td>
+<td>Authenticate (<code>application/x-www-form-urlencoded</code> or <code>application/json</code>)</td>
+</tr>
+<tr>
+<td><code>POST</code></td>
+<td><code>/auth/logout</code></td>
+<td>Clear session cookie and redirect to login</td>
+</tr>
+<tr>
+<td><code>GET</code></td>
+<td><code>/auth/status</code></td>
+<td><code>{ authenticated, required, username? }</code> — <code>200</code> or <code>401</code></td>
+</tr>
+</tbody></table>
+<h3>Login body (JSON)</h3>
+<pre><code>{
+  "username": "admin",
+  "password": "...",
+  "next": "/"
+}
+</code></pre>
+<h3>Behavior notes</h3>
+<ul>
+<li>Successful form login responds with <code>303</code> + <code>Set-Cookie</code> (<code>dsh_web_auth</code>) and <code>Location</code> set to a <strong>sanitized</strong> relative path (blocks <code>//evil</code>, absolute URLs, and header-injection characters).</li>
+<li>Failed login returns the login page with an error message (<code>401</code>) or rate-limit page (<code>429</code> + <code>Retry-After</code>).</li>
+<li>Login and logout require a matching <code>Origin</code> when the header is present (CSRF-oriented check).</li>
+<li>WebSocket upgrades without a valid session are closed with <code>401</code> and a JSON error body.</li>
+<li>Auth HTML responses set <code>Cache-Control: no-store</code>, a strict CSP, <code>X-Frame-Options: DENY</code>, and related headers.</li>
+</ul>
+<hr>
+<h2>How it fits into DSH</h2>
+<pre><code>Browser / client
+       │
+       ▼
+┌──────────────────────┐
+│  dsh-web-auth        │  ← session cookie / login routes
+│  (Authenticated      │
+│   WebServer service) │
+└──────────┬───────────┘
+           │ authenticated only
+           ▼
+  GUI · plugin bundles · /api · SSE · WS
+  (registered via ctx.webServer.*)
+</code></pre>
+<p>Compatible surface with the stock web server service:</p>
+<ul>
+<li><code>register({ kind, path, handler })</code></li>
+<li><code>registerUpgrade({ path, handler })</code></li>
+<li><code>registerFallback(handler)</code></li>
+<li><code>tapIndex(transform)</code></li>
+<li><code>host</code> / <code>port</code> getters</li>
+</ul>
+<hr>
+<h2>CLI</h2>
+<p>Package binary: <code>dsh-web-auth</code></p>
+<pre><code>dsh-web-auth generate
+  Print WEB_AUTH_PASSWORD=... and WEB_AUTH_PASSWORD_HASH=...
+
+dsh-web-auth hash-password
+  Read password from WEB_AUTH_PASSWORD or stdin; print scrypt hash only
+</code></pre>
+<h3>Password hashing algorithm</h3>
+<p>The CLI uses Node.js <code>crypto.scryptSync</code>, an RFC 7914 scrypt password-based key derivation function. It is designed to make large-scale password guessing more expensive in both CPU time and memory than a fast general-purpose hash.</p>
+<p>For each password, the plugin:</p>
+<ol>
+<li>Generates a new 16-byte random salt with <code>crypto.randomBytes</code>.</li>
+<li>Derives a 64-byte key with <code>N=16384</code>, <code>r=8</code>, and <code>p=1</code>.</li>
+<li>Stores the algorithm name, parameters, salt, and derived key in one string. The salt and key use unpadded Base64URL encoding.</li>
+<li>During login, derives the key again with the stored parameters and compares it with <code>crypto.timingSafeEqual</code>.</li>
+</ol>
+<p>The password itself is not stored, and the encoded value is not encryption that can be decrypted. Passwords passed to the hashing CLI must contain at least <strong>12</strong> characters.</p>
+<p>Stored format:</p>
+<pre><code>scrypt$N$r$p$&lt;salt-base64url&gt;$&lt;key-base64url&gt;
+</code></pre>
+<p>Default parameters: <code>N=16384</code> (CPU/memory cost), <code>r=8</code> (block size), <code>p=1</code> (parallelization), a 64-byte derived key, and a 16-byte salt. The Node.js scrypt memory ceiling is set to at least 64 MiB for these operations.</p>
+<hr>
+<h2>Verification</h2>
+<pre><code>npm run check          # syntax check + unit tests
+npm pack --dry-run     # publish file set
+dsh --profile web --dump-config
+</code></pre>
+<p>In the dump, confirm:</p>
+<ul>
+<li>Stock <code>webserver</code> has <code>disabled: true</code></li>
+<li>A <code>webserver-auth</code> row exists with name <code>@summersec/dsh-web-auth</code></li>
+<li>Startup logs do not show <code>FAILED</code></li>
+</ul>
+<p>Manual smoke:</p>
+<ol>
+<li>Open the GUI without a cookie → redirect to <code>/auth/login</code>.</li>
+<li>Log in → land on the app; cookie <code>dsh_web_auth</code> present.</li>
+<li><code>GET /auth/status</code> with cookie → <code>authenticated: true</code>.</li>
+<li><code>POST /auth/logout</code> → session cleared.</li>
+<li>Exceed failed attempts → <code>429</code> until the window resets.</li>
+</ol>
+<hr>
+<h2>Publish to npm</h2>
+<p>Package name: <code>@summersec/dsh-web-auth</code> (public scope).</p>
+<pre><code>cd D:\ghproject\dsh-web-auth
+npm login
+npm whoami
+npm run check
+npm pack --dry-run
+npm publish --access public
+# with 2FA: npm publish --access public --otp=123456
+</code></pre>
+<p>Later releases:</p>
+<pre><code>npm version patch   # or minor / major
+npm publish --access public
+npm view @summersec/dsh-web-auth version
+</code></pre>
+<hr>
+<h2>Limitations</h2>
+<ul>
+<li><strong>In-memory sessions</strong> — process restart invalidates all logins; no multi-instance sticky session store.</li>
+<li><strong>Single shared account</strong> — one username/password boundary, not multi-user RBAC or audit roles.</li>
+<li><strong>Only the DSH web carrier</strong> — other ports or sidecars need their own protection.</li>
+<li><strong>Not a substitute for TLS</strong> — put HTTPS in front for any non-loopback or multi-user network.</li>
+<li><strong><code>trustProxy</code> is dangerous if mis-scoped</strong> — only enable when the listen port is exclusive to a trusted reverse proxy.</li>
+</ul>
+<hr>
+<h2>Security notes</h2>
+<ul>
+<li>Prefer scrypt hashes over plaintext env passwords.</li>
+<li>Default <code>always</code> mode avoids “I thought loopback was enough” surprises on shared machines.</li>
+<li>Cookie flags and Origin checks reduce common session theft and CSRF patterns; they do not replace network isolation and HTTPS.</li>
+<li>Report security issues privately if you find one; do not open a public issue with exploit details.</li>
+</ul>
+<hr>
+<h2>Project layout</h2>
+<pre><code>dsh-web-auth/
+├── bin/dsh-web-auth.js   # generate / hash-password CLI
+├── cordis.patch.yml      # DSH bundle: disable stock webserver, insert webserver-auth
+├── src/
+│   ├── auth.js           # scrypt, sessions, attempt limiter, cookie helpers
+│   └── index.js          # AuthenticatedWebServer service + login UI
+├── test/                 # node:test unit tests
+├── package.json
+├── README.md
+└── README.zh-CN.md
+</code></pre>
+<hr>
+<h2>Links</h2>
+<ul>
+<li>Repository: <a href="https://github.com/SummerSec/dsh-web-auth">github.com/SummerSec/dsh-web-auth</a></li>
+<li>npm: <a href="https://www.npmjs.com/package/@summersec/dsh-web-auth">@summersec/dsh-web-auth</a></li>
+<li>Topic: <a href="https://github.com/topics/dsh-plugin">dsh-plugin</a></li>
+<li>Friends: <a href="https://linux.do/">LINUX DO</a></li>
+</ul>
+<hr>
+<h2>License</h2>
+<p><a href="https://github.com/SummerSec/dsh-web-auth/blob/HEAD/LICENSE">MIT</a></p>

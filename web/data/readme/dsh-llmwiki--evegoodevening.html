@@ -1,0 +1,395 @@
+<h1>dsh-llmwiki</h1>
+<p>Local-first, evidence-backed Markdown wiki plugin for <a href="https://github.com/deepseek-ai/deepseek-harness">DeepSeek Harness</a> (dsh).</p>
+<p>Inspired by <a href="https://gist.github.com/karpathy/442a6bf555914893e9891c11519de94f">Karpathy's <code>llm-wiki.md</code></a> concept: raw sources are preserved immutably and an LLM owns a navigable Markdown wiki derived from those sources.</p>
+<p><code>dsh-llmwiki</code> gives a dsh agent durable, evidence-grounded memory: immutable source records are preserved by content hash, synthesized Markdown pages cite those source IDs, and a deterministic section index backs lexical search. Everything lives on the local filesystem under a single wiki root — no external service, no model calls for maintenance.</p>
+<ul>
+<li><strong>Immutable sources.</strong> <code>llmwiki_add_source</code> stores exact UTF-8 bytes; the source ID is the SHA-256 of the content. Sources are never mutated or deleted by the plugin.</li>
+<li><strong>Evidence-backed pages.</strong> <code>llmwiki_upsert_page</code> writes canonical Markdown whose frontmatter must list real preserved source IDs. Pages are synthesized notes; sources are the evidence.</li>
+<li><strong>Deterministic search.</strong> <code>llmwiki_search</code> ranks page sections by a reproducible BM25-style score over a derived index (<code>formatVersion: 1</code>). A stale or missing index is rebuilt on demand; durable artifacts are never touched.</li>
+<li><strong>Read-only lint.</strong> <code>llmwiki_lint</code> and <code>/wiki lint</code> report structural, integrity, and index diagnostics without fixing anything.</li>
+<li><strong>Safe filesystem.</strong> The wiki root must be a real directory; symbolic links are rejected below it and all derived paths are confined to the root.</li>
+</ul>
+<h2>Requirements</h2>
+<ul>
+<li>Node.js <code>^22.19.0 || &gt;=24</code></li>
+<li>pnpm <code>11.7.0</code> (required for development and must be on <code>PATH</code> for <code>dsh plugin</code>)</li>
+<li>For profile installation: <code>@deepseek-ai/dsh@0.1.0-rc.6</code> (the tested host version)</li>
+<li>For direct Cordis loading: a host providing the <code>tools</code>, <code>commands</code>, and <code>systemPrompt</code> services plus the exact peer dependencies in <code>package.json</code></li>
+</ul>
+<h2>Install</h2>
+<h3>npm package name</h3>
+<p>This repository uses the controlled npm package name <code>@evegoodevening/dsh-llmwiki</code>. The unscoped npm name <a href="https://www.npmjs.com/package/dsh-llmwiki"><code>dsh-llmwiki</code></a> is owned by a different maintainer and resolves to a different implementation from <a href="https://github.com/chancelu/dsh-llmwiki"><code>chancelu/dsh-llmwiki</code></a>.</p>
+<p>Always use the scoped package specifier for registry installs, Loader rows, imports, and profile removal. Never substitute the unscoped name.</p>
+<h3>As a dsh profile bundle (recommended)</h3>
+<p>For a registry release, install through the dsh profile manager. The commands assume <code>dsh</code> is <code>@deepseek-ai/dsh@0.1.0-rc.6</code>; replace <code>web</code> with another profile name if needed.</p>
+<pre><code>dsh plugin --profile web add @evegoodevening/dsh-llmwiki
+dsh --profile web --dump-config
+</code></pre>
+<p>For local checkout validation before publishing, install the generated tarball instead:</p>
+<pre><code>pnpm install
+PACK_DIR="$(mktemp -d)"
+pnpm pack --pack-destination "$PACK_DIR"
+dsh plugin --profile web add --ignore-scripts "$PACK_DIR/evegoodevening-dsh-llmwiki-0.1.0.tgz"
+dsh --profile web --dump-config
+</code></pre>
+<p><code>dsh plugin</code> is the required profile-management path. It runs pnpm inside <code>$DSH_HOME/profiles/web</code>, detects this package's <code>dsh.bundle.patch</code>, and adds the installed package to the profile's ordered bundle list. No separate manual “apply bundle” step is needed. The config dump should contain an <code>@evegoodevening/dsh-llmwiki</code> layer and the <code>llmwiki</code> row.</p>
+<p>Restart a running profile after installation, then use <code>/wiki status</code> or <code>/wiki lint</code>. To uninstall the bundle without deleting the wiki data:</p>
+<pre><code>dsh plugin --profile web remove @evegoodevening/dsh-llmwiki
+</code></pre>
+<h3>As a direct Cordis plugin</h3>
+<p>After creating the tarball above, install it into the Cordis consumer together with the exact runtime Loader dependencies:</p>
+<pre><code>pnpm add --ignore-scripts \
+  "$PACK_DIR/evegoodevening-dsh-llmwiki-0.1.0.tgz" \
+  @deepseek-ai/cordis@4.0.1 \
+  @deepseek-ai/cordis-plugin-loader@1.0.2 \
+  @deepseek-ai/dsh-brand@0.1.0-rc.6 \
+  @deepseek-ai/dsh-commands@0.1.0-rc.6 \
+  @deepseek-ai/dsh-session@0.1.0-rc.6 \
+  @deepseek-ai/dsh-system-prompt@0.1.0-rc.6 \
+  @deepseek-ai/dsh-tools@0.1.0-rc.6 \
+  node-addon-require-builtin@0.1.4
+</code></pre>
+<p>Load it through the Cordis plugin Loader with <code>inject: ['tools', 'commands', 'systemPrompt']</code>. See <a href="https://github.com/EveGoodEvening/dsh-llmwiki/blob/HEAD/examples/README.md"><code>examples/README.md</code></a> for a complete runnable demo that builds, packs, installs, and exercises the plugin from clean directories.</p>
+<h2>Configuration</h2>
+<p>All keys are optional; defaults are shown.</p>
+<table>
+<thead>
+<tr>
+<th>key</th>
+<th>type</th>
+<th>default</th>
+<th>constraint</th>
+<th>meaning</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>root</code></td>
+<td>string</td>
+<td><code>.llmwiki</code></td>
+<td>non-empty</td>
+<td>Wiki root directory, resolved from the process working directory</td>
+</tr>
+<tr>
+<td><code>maxSourceBytes</code></td>
+<td>integer</td>
+<td><code>2097152</code> (2 MiB)</td>
+<td><code>&gt;= 1</code></td>
+<td>Maximum UTF-8 byte length of a single source <code>content</code></td>
+</tr>
+<tr>
+<td><code>maxPageBytes</code></td>
+<td>integer</td>
+<td><code>524288</code> (512 KiB)</td>
+<td><code>&gt;= 1</code></td>
+<td>Maximum rendered byte length of a page body</td>
+</tr>
+<tr>
+<td><code>maxResults</code></td>
+<td>integer</td>
+<td><code>20</code></td>
+<td><code>1..100</code></td>
+<td>Cap on <code>llmwiki_search</code> hits</td>
+</tr>
+<tr>
+<td><code>maxSnippetBytes</code></td>
+<td>integer</td>
+<td><code>1200</code></td>
+<td><code>64..16384</code></td>
+<td>Cap on per-hit snippet length</td>
+</tr>
+<tr>
+<td><code>commandDiagnosticLimit</code></td>
+<td>integer</td>
+<td><code>20</code></td>
+<td><code>1..100</code></td>
+<td>Diagnostics printed by <code>/wiki lint</code> before an omission notice</td>
+</tr>
+</tbody></table>
+<p>Unknown config keys are rejected at load time.</p>
+<h2>Storage layout</h2>
+<pre><code>&lt;root&gt;/
+  schema.md                  # human-readable wiki schema (UTF-8)
+  sources/
+    &lt;sha256&gt;/                # source ID = lowercase hex SHA-256 of content
+      content                # exact immutable UTF-8 bytes
+      metadata.json          # { id, name, mediaType, byteCount, capturedAt, origin? }
+  pages/
+    &lt;page-id&gt;.md             # canonical Markdown (see Page format)
+  .index/
+    search.json              # derived section search index, formatVersion 1
+    state.json               # index fingerprint/state, formatVersion 1
+</code></pre>
+<p><code>&lt;page-id&gt;</code> is a normalized POSIX relative path with no leading slash and no <code>.md</code> suffix (e.g. <code>getting-started</code>, <code>guides/install</code>). Empty, <code>.</code>, <code>..</code>, backslash, percent, and control-character segments are rejected.</p>
+<h3>Page format</h3>
+<p>Pages are canonical Markdown with a required frontmatter block:</p>
+<pre><code>---
+title: "Getting Started"
+summary: "Concise evidence-backed summary."
+sources:
+  - "e74435c7a03ec6b7e8ce437e27975f4a7c5c83e4d26bbc529412807f054fb0a6"
+---
+
+# Getting Started
+
+Body Markdown organized under ATX headings. Every cited source ID must exist under sources/.
+</code></pre>
+<p><code>title</code> and <code>summary</code> are double-quoted single-line strings. <code>sources</code> is a sorted, unique list of 64-character lowercase hex source IDs. The body is rendered canonically before storage and bounded by <code>maxPageBytes</code>.</p>
+<h2>Tools</h2>
+<p>Registered with the dsh <code>tools</code> service. Read-only tools are concurrency-safe.</p>
+<table>
+<thead>
+<tr>
+<th>tool</th>
+<th>kind</th>
+<th>parameters</th>
+<th>purpose</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>llmwiki_status</code></td>
+<td>read</td>
+<td>none</td>
+<td>Report initialization, source/page counts, schema text, and index freshness</td>
+</tr>
+<tr>
+<td><code>llmwiki_add_source</code></td>
+<td>edit</td>
+<td><code>name</code>, <code>content</code>, <code>mediaType?</code>, <code>origin?</code></td>
+<td>Preserve exact UTF-8 evidence; returns source ID and dedupe state</td>
+</tr>
+<tr>
+<td><code>llmwiki_read_source</code></td>
+<td>read</td>
+<td><code>id</code>, <code>offset?</code>, <code>limit?</code></td>
+<td>Read immutable source content with provenance metadata</td>
+</tr>
+<tr>
+<td><code>llmwiki_search</code></td>
+<td>search</td>
+<td><code>query</code>, <code>limit?</code></td>
+<td>Rank page sections by lexical score; may rebuild a stale derived index</td>
+</tr>
+<tr>
+<td><code>llmwiki_read_page</code></td>
+<td>read</td>
+<td><code>id</code></td>
+<td>Read one synthesized page by logical page ID</td>
+</tr>
+<tr>
+<td><code>llmwiki_upsert_page</code></td>
+<td>edit</td>
+<td><code>id</code>, <code>title</code>, <code>summary</code>, <code>sources</code>, <code>body</code></td>
+<td>Atomically create or update a page; requires real source IDs</td>
+</tr>
+<tr>
+<td><code>llmwiki_lint</code></td>
+<td>read</td>
+<td>none</td>
+<td>Run deterministic read-only validation; reports diagnostics and counts</td>
+</tr>
+</tbody></table>
+<h2>Model experience</h2>
+<p>The plugin registers a system-prompt section named <code>tool:llmwiki</code>, ordered at <code>116</code>:</p>
+<pre><code>Use the llmwiki as durable, evidence-backed memory:
+- Call llmwiki_status before relying on the wiki.
+- Search first, then read only the relevant pages and immutable source records.
+- Treat wiki pages as synthesized notes; source records are the preserved evidence.
+- Cite real source IDs in every page write. Never invent a source ID.
+- Use llmwiki_upsert_page only when new evidence changes durable knowledge.
+- llmwiki_lint is read-only. Do not claim that it repaired anything.
+</code></pre>
+<h2>Command</h2>
+<p><code>/wiki [status|lint|reindex]</code> — local, no model invocation.</p>
+<ul>
+<li><code>status</code> (default): prints initialization, source/page counts, and index state.</li>
+<li><code>lint</code>: prints error/warning counts and up to <code>commandDiagnosticLimit</code> diagnostics.</li>
+<li><code>reindex</code>: rebuilds the derived search index and reports page/section counts and format version.</li>
+</ul>
+<h2>Lint diagnostics</h2>
+<p><code>llmwiki_lint</code> and <code>/wiki lint</code> report these codes. Severity is <code>error</code> unless noted.</p>
+<table>
+<thead>
+<tr>
+<th>code</th>
+<th>severity</th>
+<th>meaning</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>ROOT_MISSING</code></td>
+<td>error</td>
+<td>Wiki root directory is missing</td>
+</tr>
+<tr>
+<td><code>ROOT_NOT_DIRECTORY</code></td>
+<td>error</td>
+<td>Wiki root is not a directory</td>
+</tr>
+<tr>
+<td><code>UNSAFE_SYMLINK</code></td>
+<td>error</td>
+<td>Symbolic link found in or below the wiki root</td>
+</tr>
+<tr>
+<td><code>REQUIRED_DIRECTORY_MISSING</code></td>
+<td>error</td>
+<td>A required wiki directory is missing</td>
+</tr>
+<tr>
+<td><code>REQUIRED_PATH_NOT_DIRECTORY</code></td>
+<td>error</td>
+<td>A required path that should be a directory is not</td>
+</tr>
+<tr>
+<td><code>SCHEMA_MISSING</code></td>
+<td>error</td>
+<td><code>schema.md</code> is missing</td>
+</tr>
+<tr>
+<td><code>INVALID_UTF8</code></td>
+<td>error</td>
+<td>A required file is not valid UTF-8</td>
+</tr>
+<tr>
+<td><code>SOURCE_INVALID_ID</code></td>
+<td>error</td>
+<td>A source directory name is not a lowercase SHA-256 ID</td>
+</tr>
+<tr>
+<td><code>SOURCE_CONTENT_MISSING</code></td>
+<td>error</td>
+<td>Source <code>content</code> file is missing</td>
+</tr>
+<tr>
+<td><code>SOURCE_CONTENT_NOT_FILE</code></td>
+<td>error</td>
+<td>Source <code>content</code> is not a regular file</td>
+</tr>
+<tr>
+<td><code>SOURCE_HASH_MISMATCH</code></td>
+<td>error</td>
+<td>Source ID does not match the SHA-256 of its content</td>
+</tr>
+<tr>
+<td><code>SOURCE_METADATA_MISSING</code></td>
+<td>error</td>
+<td>Source <code>metadata.json</code> is missing</td>
+</tr>
+<tr>
+<td><code>SOURCE_METADATA_NOT_FILE</code></td>
+<td>error</td>
+<td>Source <code>metadata.json</code> is not a regular file</td>
+</tr>
+<tr>
+<td><code>SOURCE_METADATA_MALFORMED</code></td>
+<td>error</td>
+<td>Source metadata is not valid UTF-8 JSON</td>
+</tr>
+<tr>
+<td><code>SOURCE_METADATA_INVALID</code></td>
+<td>error</td>
+<td>Source metadata does not match the required schema</td>
+</tr>
+<tr>
+<td><code>SOURCE_METADATA_UNKNOWN_KEY</code></td>
+<td>error</td>
+<td>Source metadata contains an unknown key</td>
+</tr>
+<tr>
+<td><code>SOURCE_METADATA_ID_MISMATCH</code></td>
+<td>error</td>
+<td>Source metadata <code>id</code> does not match its directory name</td>
+</tr>
+<tr>
+<td><code>SOURCE_METADATA_BYTE_COUNT_MISMATCH</code></td>
+<td>error</td>
+<td>Source metadata <code>byteCount</code> does not match content bytes</td>
+</tr>
+<tr>
+<td><code>PAGE_INVALID_PATH</code></td>
+<td>error</td>
+<td>Page path is not a normalized relative <code>.md</code> path</td>
+</tr>
+<tr>
+<td><code>PAGE_INVALID_MARKDOWN</code></td>
+<td>error</td>
+<td>Page is not valid canonical wiki Markdown</td>
+</tr>
+<tr>
+<td><code>PAGE_MISSING_SOURCE</code></td>
+<td>error</td>
+<td>A page cites a missing or invalid source ID</td>
+</tr>
+<tr>
+<td><code>DUPLICATE_TITLE</code></td>
+<td>warning</td>
+<td>Page title duplicates another after Unicode normalization</td>
+</tr>
+<tr>
+<td><code>ORPHAN_PAGE</code></td>
+<td>warning</td>
+<td>Page has no incoming links from another page</td>
+</tr>
+<tr>
+<td><code>LINK_ESCAPES_PAGES</code></td>
+<td>error</td>
+<td>A relative page link escapes the pages directory</td>
+</tr>
+<tr>
+<td><code>BROKEN_PAGE_LINK</code></td>
+<td>error</td>
+<td>A page link targets a non-existent page</td>
+</tr>
+<tr>
+<td><code>INDEX_MISSING</code></td>
+<td>warning</td>
+<td>Derived search index is missing (search will rebuild it)</td>
+</tr>
+<tr>
+<td><code>INDEX_MALFORMED</code></td>
+<td>error</td>
+<td>Index file is not valid canonical JSON for format version 1</td>
+</tr>
+<tr>
+<td><code>INDEX_INCOMPATIBLE</code></td>
+<td>error</td>
+<td>Index uses an unsupported format version</td>
+</tr>
+<tr>
+<td><code>INDEX_STALE</code></td>
+<td>warning</td>
+<td>Index fingerprints do not match current pages</td>
+</tr>
+<tr>
+<td><code>TEMP_FILE_ABANDONED</code></td>
+<td>warning</td>
+<td>An abandoned atomic-write temporary file was found</td>
+</tr>
+</tbody></table>
+<h2>Error codes</h2>
+<p>Tool and command failures surface <code>LlmWikiError</code> with one of these codes:</p>
+<p><code>NOT_INITIALIZED</code>, <code>INVALID_PATH</code>, <code>SOURCE_NOT_FOUND</code>, <code>PAGE_NOT_FOUND</code>, <code>INVALID_PAGE</code>, <code>LIMIT_EXCEEDED</code>, <code>ABORTED</code>, <code>UNSAFE_FILESYSTEM</code>, <code>INDEX_CORRUPT</code>.</p>
+<h2>Development</h2>
+<pre><code>pnpm install
+pnpm run build          # tsc + tsdown -&gt; lib/
+pnpm run typecheck      # tsc --noEmit
+pnpm run lint           # eslint . --max-warnings 0
+pnpm test               # vitest run
+pnpm run test:coverage  # vitest run --coverage
+pnpm run test:e2e       # end-to-end specs (vitest.e2e.config.ts)
+pnpm run check:determinism  # scripts/check-determinism.ts
+pnpm run smoke          # scripts/smoke.ts
+</code></pre>
+<p>The test suite lives under <code>tests/</code>; fixtures under <code>tests/fixtures/</code>. The committed <code>examples/demo-wiki</code> corpus intentionally omits <code>.index</code> so lint first reports <code>INDEX_MISSING</code> and search rebuilds the derived index.</p>
+<h2>Exports</h2>
+<pre><code>export { Config } from '@evegoodevening/dsh-llmwiki'
+export type { Config as LlmWikiConfig, ResolvedConfig } from '@evegoodevening/dsh-llmwiki'
+export { LLMWIKI_ERROR_CODES, LlmWikiError, isLlmWikiError } from '@evegoodevening/dsh-llmwiki'
+export type { LlmWikiErrorCode, SerializedLlmWikiError } from '@evegoodevening/dsh-llmwiki'
+export { isPageId, isSourceId, pageId, sourceId } from '@evegoodevening/dsh-llmwiki'
+export type { PageId, SourceId } from '@evegoodevening/dsh-llmwiki'
+export { LlmWikiService } from '@evegoodevening/dsh-llmwiki'
+export type * from '@evegoodevening/dsh-llmwiki'   // all public types from types.ts
+</code></pre>
+<h2>License</h2>
+<p>MIT (c) EveGoodEvening. See <a href="https://github.com/EveGoodEvening/dsh-llmwiki/blob/HEAD/LICENSE">LICENSE</a>.</p>

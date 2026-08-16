@@ -1,0 +1,176 @@
+<h1>dsh-llm-codex-auth-native-compact-image</h1>
+<p><a href="https://github.com/thaning0/dsh-llm-codex-auth-native-compact-image/blob/HEAD/README.en.md">English</a> | 中文</p>
+<blockquote>
+<p>本项目由 DeepSeek-V4-Pro 在 DeepSeek Harness 用时约 3h 不到完成，未进行完整 Code Review，仅人工审查确保基础功能可用，使用前需了解安全风险并自行为此负责。</p>
+</blockquote>
+<p>在 dsh（DeepSeek Harness）里使用你的 <strong>ChatGPT / Codex 订阅</strong>（Plus / Pro / Business / Edu）。插件通过 OpenAI Codex 的 OAuth 流程登录 ChatGPT 账号，把订阅额度暴露成 dsh 的 <code>codex-oauth</code> 模型提供方。</p>
+<p>本插件同时集成 provider-native compaction。同一个 npm 包分别提供 Host 认证/transport 入口和 agent-scoped compaction 入口；<code>codex-native</code> preset 用后者替换 <code>compaction-basic</code>，使 <code>/compact</code>、80% 上下文压力触发和 overflow 恢复都使用 opaque native checkpoint。完整契约见 <a href="https://github.com/thaning0/dsh-llm-codex-auth-native-compact-image/blob/HEAD/docs/native-compact-design.md"><code>docs/native-compact-design.md</code></a>。原版 OAuth 插件与本插件不得同时加载，否则会重复注册同一 provider。</p>
+<blockquote>
+<p>⚠️ <strong>风险提示</strong>：本插件调用 ChatGPT 网页版后端（<code>chatgpt.com/backend-api</code>），这是一个未公开、官方不支持的接口，违反 OpenAI 服务条款的风险真实存在，可能导致账号受限。请自行评估后使用。</p>
+</blockquote>
+<h2>目录</h2>
+<ul>
+<li><a href="#dsh-llm-codex-auth-native-compact-image">dsh-llm-codex-auth-native-compact-image</a><ul>
+<li><a href="#%E7%9B%AE%E5%BD%95">目录</a></li>
+<li><a href="#%E5%8A%9F%E8%83%BD%E7%89%B9%E6%80%A7">功能特性</a></li>
+<li><a href="#%E5%AE%89%E8%A3%85">安装</a><ul>
+<li><a href="#%E5%85%8D-pnpm-%E7%9A%84%E4%B8%80%E9%94%AE%E5%AE%89%E8%A3%85%E6%9C%AC%E5%9C%B0--%E5%BC%80%E5%8F%91%E7%94%A8%E8%B7%A8%E5%B9%B3%E5%8F%B0">免 pnpm 的一键安装（本地 / 开发用，跨平台）</a></li>
+<li><a href="#%E6%89%8B%E5%8A%A8%E5%91%BD%E4%BB%A4%E8%A1%8C%E5%AE%89%E8%A3%85">手动命令行安装</a></li>
+<li><a href="#%E9%AA%8C%E8%AF%81%E5%AE%89%E8%A3%85%E5%AE%8C%E6%88%90">验证安装完成</a></li>
+</ul>
+</li>
+<li><a href="#%E4%BD%BF%E7%94%A8">使用</a></li>
+<li><a href="#%E5%B7%A5%E4%BD%9C%E5%8E%9F%E7%90%86">工作原理</a></li>
+<li><a href="#%E5%BC%80%E5%8F%91">开发</a></li>
+<li><a href="#%E5%AE%89%E5%85%A8%E4%B8%8E%E5%90%88%E8%A7%84">安全与合规</a></li>
+<li><a href="#license">License</a></li>
+</ul>
+</li>
+</ul>
+<h2>功能特性</h2>
+<ul>
+<li><strong>订阅模型接入</strong>：把 pi-ai 内置的 <code>openai-codex</code> provider（<code>openai-codex-responses</code> 线上协议）注册为 dsh LLM seam 的 <code>codex-oauth</code> 提供方；模型目录随所装 pi-ai 维护（如 <code>gpt-5.3-codex-spark</code>、<code>gpt-5.4</code>、<code>gpt-5.5</code>、<code>gpt-5.6-*</code> 等）。</li>
+<li><strong>OAuth 设备码登录</strong>：走 <code>auth.openai.com</code>（与 Codex CLI 同一 OAuth client），headless 友好，无需本地回调服务器。</li>
+<li><strong>凭据安全</strong>：refresh / access token 只存在 dsh 凭据库 <code>$DSH_HOME/.credentials.yaml</code>（0600），<strong>不进配置、不进会话日志、不进本仓库</strong>；access token 过期时由 pi-ai 在串行化的写路径里自动用 refresh token 续期。</li>
+<li><strong>登录与订阅用量</strong>：设置页「Codex 订阅 (ChatGPT)」区块提供登录 / 登出、5 小时与 7 天窗口的剩余用量百分比、重置时间及手动刷新；对话侧可用 <code>/codex-status</code>、<code>/codex-usage</code>、<code>/codex-logout</code>。</li>
+<li><strong>多轮对话</strong>：完整保留 provider 原生回放元数据（签名等），支持跨轮次多轮请求。</li>
+<li><strong>瞬时错误恢复</strong>：将 Codex/pi-ai 已知的 WebSocket、DNS、连接、提前断流、限流、服务不可用及 provider 重试提示归入 DSH 的 <code>TRANSPORT</code>、<code>RATE_LIMIT</code> 或 <code>SERVER</code> 退避重试，并保留 provider request ID；直接抛出的 transport 异常也会保留可重试错误码。context-size overflow 改走原生压缩恢复，未知 <code>CODEX_ERROR</code> 和确定性 model-not-found 不会盲目重试。</li>
+<li><strong>多模态图片输入</strong>：对声明 image capability 的 Codex 模型，将用户附件、<code>read_image</code> 延迟上下文及工具结果中的 PNG/JPEG/WebP/GIF durable attachment 转成请求期 Responses <code>input_image</code> base64 data URL；普通回放、手动/自动 native compact 与 checkpoint replay 使用同一路径，checkpoint 只落 attachment ref、不落图片 base64。</li>
+<li><strong>共享原生压缩 transport</strong>：发布不暴露 token 的 <code>codexOAuthTransport</code> Cordis 服务；OAuth 刷新、ChatGPT 账号 Header、端点隔离、V2 <code>compaction_trigger</code> 与 opaque item 回放全部留在认证插件内部，调用方不会收到凭据材料。</li>
+<li><strong>手动与自动原生压缩</strong>：<code>/compact</code>、80% 压力触发和 context-overflow 恢复都将旧历史替换为版本化 opaque checkpoint；落盘/重启后由 Codex adapter 在通用消息转换前原样回放。跨 provider、model 或账号 identity 会在联网前失败，绝不回退到文本摘要。</li>
+</ul>
+<h2>安装</h2>
+<h3>免 pnpm 的一键安装（本地 / 开发用，跨平台）</h3>
+<p>不想装 pnpm、也不想手动找 profile 目录时，仓库脚本会替你复制插件并登记 bundle（Windows / macOS / Linux 通用，用 Node 即可，无需 bash）：</p>
+<pre><code>node scripts/install.mjs            # 默认装到 web profile
+node scripts/install.mjs headless   # 指定其他 profile
+</code></pre>
+<p>脚本会自动定位 <code>$DSH_HOME</code>（默认 <code>~/.dsh</code>），把插件复制进 DSH 实际优先解析的 <code>node_modules</code> 并写入 bundle 列表，全程不碰 pnpm。Windows 上在 cmd / PowerShell 里直接运行同一命令即可，插件本身是纯 Node 实现，不依赖 bash / pwsh。</p>
+<p>更新已有安装前先停止对应的 dsh 进程，然后重复运行同一命令。脚本会识别脚本管理的共享安装和 profile 内由 pnpm 管理的安装，在目标旁完成暂存与可回滚替换，并删除会遮蔽新版的重复副本。OAuth 凭据位于 <code>$DSH_HOME/.credentials.yaml</code>，刷新插件目录不会读取、移动或删除凭据。</p>
+<p>对应的卸载脚本：</p>
+<pre><code>node scripts/uninstall.mjs            # 从 web profile 卸载
+node scripts/uninstall.mjs headless   # 从其他 profile 卸载
+</code></pre>
+<p>（若当初是用 <code>dsh plugin add</code>（pnpm）安装的，优先用官方 <code>dsh plugin --profile &lt;name&gt; remove dsh-llm-codex-auth-native-compact-image</code>；卸载脚本也会顺带清掉 manifest 里的条目作为兜底。）</p>
+<h3>手动命令行安装</h3>
+<pre><code># 前置 1：需要 pnpm（dsh plugin 转发给它）。没有的话先：npm install -g pnpm
+# 前置 2：需要 dsh CLI，二选一：
+#   · 全局安装（推荐）：npm install -g @deepseek-ai/dsh
+#   · 临时使用：把下面命令里的 dsh 换成 npx @deepseek-ai/dsh
+
+# 已全局安装 dsh 时：
+dsh plugin --profile web add file:/path/to/dsh-llm-codex-auth-native-compact-image
+
+# 未全局安装、临时用 npx 时：
+npx @deepseek-ai/dsh plugin --profile web add file:/path/to/dsh-llm-codex-auth-native-compact-image
+
+# 重启 dsh web 使新 bundle 生效
+</code></pre>
+<blockquote>
+<p><strong>必须用 <code>file:</code> 前缀</strong>。直接传目录路径时 pnpm 会以 <code>link:</code>（软链到本仓库）安装，
+Node 按真实路径解析插件内部依赖时会找不到 <code>node_modules</code> 而加载失败；
+<code>file:</code> 会把包复制进 profile 的依赖树（已实测验证）。
+pnpm 11 的 minimum-release-age 门禁会自动放行本插件依赖的 rc 包，无需额外配置。</p>
+<p><strong>pnpm 11 的 ignored-builds 提示会让 <code>dsh plugin</code> 报 "pnpm failed"</strong>（依赖其实已装好）。
+修复：把 profile 目录 <code>pnpm-workspace.yaml</code> 里 pnpm 生成的 <code>allowBuilds:</code> 占位值改为 <code>false</code>
+（<code>@google/genai</code>、<code>protobufjs</code> 的构建脚本对本插件无关紧要），然后重跑同一命令完成 bundle 对账。</p>
+</blockquote>
+<h3>验证安装完成</h3>
+<p>安装后 <code>dsh --profile web --dump-config</code>（或 <code>npx @deepseek-ai/dsh --profile web --dump-config</code>）应能看到 <code>llm-codex-auth-native-compact-image</code> 行。</p>
+<blockquote>
+<p><strong>更新插件代码</strong>：<code>file:</code> 安装是硬链接快照，编辑器替换式写入不会被 pnpm 感知，直接重跑
+<code>add</code> 可能不会刷新。推荐先停止 dsh，再从仓库运行一键脚本；它会刷新当前真正生效的安装位置，
+不需要为本地迭代反复 bump version：</p>
+<pre><code>node scripts/install.mjs
+</code></pre>
+<p>如果坚持只使用 pnpm，则必须完整 remove/add：</p>
+<pre><code>dsh plugin --profile web remove dsh-llm-codex-auth-native-compact-image
+dsh plugin --profile web add file:/path/to/dsh-llm-codex-auth-native-compact-image
+# 未全局安装 dsh 时，把上面的 dsh 换成 npx @deepseek-ai/dsh
+</code></pre>
+</blockquote>
+<h2>使用</h2>
+<ol>
+<li>重启 dsh 后打开<strong>设置页</strong>，侧栏选择「Codex 订阅 (ChatGPT)」。</li>
+<li>点击「登录 ChatGPT 账号」，按提示打开验证网址、输入设备码并登录；登录后该区块会显示 5 小时和 7 天窗口的剩余百分比，每分钟自动更新，也可点「刷新用量」。</li>
+<li>新建会话时选择 <code>Codex Native</code> agent preset（本机配置可把它设为默认），并在 <strong>Models 设置页</strong>选择 <code>codex-oauth</code> 下的模型；已经用 <code>standard</code> 创建的旧会话不会热切换 compaction provider。</li>
+<li>agent 空闲且至少有两条可压缩 surface 消息时可输入 <code>/compact</code>；opaque checkpoint 本身约有千 token 级固定成本，短会话可能因“checkpoint 不比历史更小”而安全拒绝且不替换。正常对话达到模型 context window 的 80% 时会在 step 前自动 native compact，provider 报 context overflow 时也会尝试一次 native compact 后重试。</li>
+<li>展开 GUI 的压缩条目，应看到 <code>Provider-native Codex compaction checkpoint</code>；折叠态“已压缩 N 条历史记录”是所有 backend 共用文案，不能单独证明 native。</li>
+<li><code>/codex-usage</code> 可在对话中强制刷新并查看剩余百分比；登出可回设置页点「登出」或输入 <code>/codex-logout</code>，<code>/codex-status</code> 可随时查看登录状态。</li>
+</ol>
+<h2>工作原理</h2>
+<table>
+<thead>
+<tr>
+<th>组件</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>src/adapter.js</code></td>
+<td><code>LlmAdapter</code> 实现：codex 流 → dsh <code>StreamChunk</code> 协议、签名与 native checkpoint 回放、错误分类、空闲看门狗</td>
+</tr>
+<tr>
+<td><code>src/transport.js</code></td>
+<td>认证隔离的 Responses/V2 compact transport；只返回 opaque provider output 和非秘密 identity</td>
+</tr>
+<tr>
+<td><code>src/checkpoint.js</code></td>
+<td>版本化 checkpoint carrier、lossless JSON 与 provider/model/identity 兼容性验证</td>
+</tr>
+<tr>
+<td><code>src/engine.js</code></td>
+<td>native-aware 压力计量、manual/pressure/overflow <code>ctx.compaction</code>、tool-pairing 边界、日志 bracket、replacement 与 Scheme A flush</td>
+</tr>
+<tr>
+<td><code>src/compaction-plugin.js</code></td>
+<td>agent-scoped preset 入口：发布隔离的 <code>ctx.compaction</code>、<code>/compact</code> 和自动触发监听器</td>
+</tr>
+<tr>
+<td><code>src/native-compact.js</code></td>
+<td><code>/compact</code> 与跨 provider 的联网前 replay 守卫</td>
+</tr>
+<tr>
+<td><code>src/store.js</code></td>
+<td>pi-ai <code>CredentialStore</code> ↔ dsh 凭据库的桥（串行化读写，token 不出宿主）</td>
+</tr>
+<tr>
+<td><code>src/login.js</code></td>
+<td>设备码登录编排（pi-ai 官方流，自动持久化凭据）</td>
+</tr>
+<tr>
+<td><code>src/usage.js</code></td>
+<td>WHAM 用量响应白名单化、剩余百分比计算、60 秒宿主缓存与命令格式化</td>
+</tr>
+<tr>
+<td><code>src/server.js</code></td>
+<td>宿主 <code>webServer</code> 挂 <code>/codex-oauth</code> HTTP 路由（status / usage / login / logout），供浏览器半调用</td>
+</tr>
+<tr>
+<td><code>src/client.js</code></td>
+<td>浏览器半：设置页登录与用量进度条，经 <code>build.mjs</code> 打包成 client-modules 工厂格式</td>
+</tr>
+<tr>
+<td><code>src/commands.js</code></td>
+<td>命令 <code>/codex-status</code>、<code>/codex-usage</code>、<code>/codex-logout</code></td>
+</tr>
+</tbody></table>
+<h2>开发</h2>
+<ul>
+<li>纯 ESM JavaScript；宿主半无构建步骤（命名导出 <code>apply</code> / <code>inject</code> / <code>name</code>）。</li>
+<li>浏览器半用 esbuild 打包：<code>node build.mjs</code>（React 外部化为 <code>require("react")</code>，复用宿主实例）。</li>
+<li><code>dsh.bundle.patch</code> 指向 <code>cordis.patch.yml</code>，<code>dsh plugin add</code> 安装后自动加入 profile 的 bundle 层。</li>
+<li><code>npm test</code> 在临时 <code>DSH_HOME</code> 中验证重复安装、pnpm 内层快照刷新、凭据不变和 profile 路径校验，无需网络或真实凭据。</li>
+<li>测试套件在 <code>test/</code>：<code>smoke.mjs</code>（provider 路由 / HTTP 端点 / 命令 / 凭据库）、<code>stream-test.mjs</code>（流翻译、回放、错误分类、选项装配，含多轮回放回归用例）、<code>login-smoke.mjs</code>（设备码流联网冒烟，不涉及账号）。它们通过 profile 依赖树解析依赖，放进已安装本插件的 profile 目录运行：<pre><code>cp test/*.mjs .testhome/profiles/codex-test2/ &amp;&amp; cd .testhome/profiles/codex-test2
+node smoke.mjs &amp;&amp; node stream-test.mjs &amp;&amp; node login-smoke.mjs
+</code></pre>
+</li>
+<li>已知限制：自动 native compaction 只处理 <code>codex-oauth</code>；其他 provider 不会回退到 <code>compaction-basic</code>，而已经含 native checkpoint 的会话也不能跨 provider/model/account 回放。GUI 的通用 token meter 不读取 opaque source，engine 会按 Codex 对 remote-compaction ciphertext 的 model-visible 估算规则修正自身压力判断。图片仅走 durable attachment → base64 data URL，不支持远程图片 URL 或 OAuth Files API <code>file_id</code>。</li>
+</ul>
+<h2>安全与合规</h2>
+<ul>
+<li>仓库内不包含任何秘密。推送到 GitHub（公开或私有）前请确认 <code>.gitignore</code> 生效，<strong>永远不要</strong>提交 <code>$DSH_HOME/.credentials.yaml</code> 或其中内容。</li>
+<li>本插件使用未公开的 ChatGPT 后端接口，存在违反 OpenAI 条款、账号受限的风险，使用者自担风险。</li>
+</ul>
+<h2>License</h2>
+<p>MIT</p>

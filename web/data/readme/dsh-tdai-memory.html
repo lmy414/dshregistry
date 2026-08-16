@@ -1,0 +1,128 @@
+<h1>dsh-tdai-memory</h1>
+<p><a href="https://github.com/Scorp1o117/dsh-tdai-memory/blob/HEAD/README.zh.md"><img src="https://img.shields.io/badge/%E4%B8%AD%E6%96%87%E6%96%87%E6%A1%A3-blue" alt="中文文档"></a></p>
+<p><strong>GitHub</strong>: <a href="https://github.com/Scorp1o117/dsh-tdai-memory">Scorp1o117/dsh-tdai-memory</a> · <strong>npm</strong>: <a href="https://www.npmjs.com/package/dsh-tdai-memory">dsh-tdai-memory</a></p>
+<p><a href="https://github.com/Scorp1o117/dsh-enhancement-suite"><img src="https://img.shields.io/badge/part%20of-Enhancement%20Suite-3964fe" alt="Enhancement Suite"></a> <a href="https://www.npmjs.com/package/dsh-enhancement-suite"><img src="https://img.shields.io/npm/v/dsh-enhancement-suite" alt="npm"></a></p>
+<p>Part of the <a href="https://github.com/Scorp1o117/dsh-enhancement-suite">DeepSeek Harness Enhancement Suite</a> — Vision · Soul/Persona · Long-term Memory · Plugin Marketplace.</p>
+<p>A port of <strong>TencentDB Agent Memory</strong> (Tencent Cloud's open-source four-layer
+memory system, originally an OpenClaw plugin) into DeepSeek Harness.</p>
+<h2>Features</h2>
+<ul>
+<li><strong>L0 conversation capture</strong>: every turn (turn end, request boundary) is
+written to raw conversation storage (JSONL + SQLite + FTS + vectors)</li>
+<li><strong>L1 structured memory</strong>: a background pipeline uses an LLM to extract
+facts / preferences / events (persona / episodic / instruction) from
+conversations, stored in <code>records/</code> + SQLite + FTS + vectors</li>
+<li><strong>L2 scenes / L3 persona</strong>: scene blocks and user profile generation
+(pipeline-scheduled)</li>
+<li><strong>Automatic recall injection</strong>: on every prompt assembly, relevant memories
+and the user profile are retrieved by the current user message and injected
+as dynamic context (the model "just remembers")</li>
+<li><strong>Tools</strong>: <code>tdai_memory_search</code> (L1 structured search),
+<code>tdai_conversation_search</code> (L0 raw-text search)</li>
+</ul>
+<p>The data directory reuses the existing <code>~/.memory-tencentdb/memory-tdai</code>, so
+<strong>previously accumulated memories carry over seamlessly</strong>.</p>
+<h2>Architecture (porting approach)</h2>
+<table>
+<thead>
+<tr>
+<th>Layer</th>
+<th>Content</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>Core</td>
+<td>The host-neutral core of <code>tdai-memory-openclaw-plugin</code> (<code>src/core</code>, <code>src/utils</code>), tsc-compiled to ESM (<code>dist-dsh/</code>), zero changes</td>
+</tr>
+<tr>
+<td>Host adapter</td>
+<td><code>StandaloneHostAdapter</code> (official standalone mode, direct OpenAI-compatible calls)</td>
+</tr>
+<tr>
+<td>dsh shell</td>
+<td><code>index.js</code>: config mapping, <code>session/event</code> + <code>session/flush</code> capture, <code>system-prompt/assemble</code> recall injection on <code>agent.ctx</code>, tool registration, lifecycle</td>
+</tr>
+<tr>
+<td>Fallback</td>
+<td><code>recall-inject.js</code>: preset-row recall injection (used when mounted inside an agent preset)</td>
+</tr>
+</tbody></table>
+<p>Hard-won wiring details:</p>
+<ul>
+<li><strong>Capture</strong>: <code>session/flush</code> listener (await semantics; must complete before
+headless exits); <code>turn/start</code> timestamps as the L0 cursor floor; turn-id dedup</li>
+<li><strong>Headless one-shot runs</strong>: wait for <code>core.handleSessionEnd()</code> inside flush
+(L1 extraction finishes before exit; otherwise the 5s shutdown timeout kills it)</li>
+<li><strong>Recall injection</strong>: must be registered on <strong><code>agent.ctx</code></strong> (assembly runs in
+the agent scope; root listeners never see it); attach one tick after
+<code>session/created</code> by resolving the agent from the <code>agents</code> service</li>
+</ul>
+<h2>Configuration (profile patch + settings)</h2>
+<p>Configuration is <strong>settings-namespace driven</strong>: the profile patch is the base
+layer, and the <code>tdai-memory:</code> section of <code>$DSH_HOME/settings.yaml</code> overrides it
+(LLM/embedding keys live in settings.yaml). The <strong>Web UI Settings → 记忆</strong>
+section edits every field (v0.2.0, write-only keys); TdaiCore is built at
+startup, so changes apply <strong>after a restart</strong>.</p>
+<pre><code># $DSH_HOME/settings.yaml
+tdai-memory:
+  llm:
+    apiKey: 'sk-...'
+  embedding:
+    apiKey: 'local-no-key'
+</code></pre>
+<pre><code># profile patch (base layer)
+- id: tdai-memory
+  name: 'dsh-tdai-memory'
+  config:
+    extraction:
+      enabled: true
+      enableDedup: false      # dedup LLM output parsing is flaky; off by default
+    llm:                      # L1/L2/L3 extraction model (OpenAI-compatible)
+      baseUrl: 'https://opencode.ai/zen/go/v1'
+      model: 'mimo-v2.5'      # deepseek-v4-flash produces invalid extraction JSON
+    embedding:                # vectors (OpenAI-compatible /v1/embeddings)
+      baseUrl: 'http://127.0.0.1:8088/v1'
+      model: 'Qwen3-Embedding-0.6B'
+      dimensions: 1024
+      sendDimensions: false
+</code></pre>
+<h2>Install</h2>
+<pre><code>dsh plugin --profile web add dsh-tdai-memory
+</code></pre>
+<p>then mount it in <code>$DSH_HOME/profiles/web/cordis.patch.yml</code>:</p>
+<pre><code>- insert:
+    - id: tdai-memory
+      name: 'dsh-tdai-memory'
+      config: {}          # keys can live in settings.yaml instead
+</code></pre>
+<p>and restart <code>dsh web</code>. LLM/embedding API keys can be set in the Web UI
+settings page (记忆 / Memory) or directly in <code>settings.yaml</code> under
+<code>tdai-memory:</code>.</p>
+<blockquote>
+<p><strong>Note for users</strong></p>
+<ul>
+<li>This plugin is a standard <strong>profile bundle</strong> (<code>dsh.bundle.patch</code>):
+<code>dsh plugin --profile web add dsh-tdai-memory</code> installs and mounts it in
+one step — no manual <code>cordis.patch.yml</code> edits needed.</li>
+<li>The settings section needs the <code>dsh-host-apiproxy</code> namespace allowlist;
+the plugin patches it automatically on first start — <strong>restart <code>dsh web</code>
+once more</strong> and the section appears. A dsh update overwrites the patch;
+the next plugin start re-applies it.</li>
+<li>Settings changes apply <strong>after a restart</strong> (TdaiCore is built at startup).</li>
+<li>Tested against DSH <code>0.1.0-rc.6</code>.</li>
+</ul>
+</blockquote>
+<h2>Known trade-offs</h2>
+<ul>
+<li><strong>Extraction model</strong>: <code>mimo-v2.5</code> extracts correctly but takes 20-30s per
+call (background execution, does not block the conversation);
+<code>deepseek-v4-flash</code> is fast but its JSON output is non-compliant (extracts 0)</li>
+<li><strong>dedup</strong>: LLM conflict-detection output parsing is unstable (once caused
+stored=0); off by default; enable only with a more reliable model</li>
+<li><strong>L1 memory vectors</strong>: written with storage (8088 embedding is fast); L0
+vectors run as a background task, drained by <code>destroy()</code> on headless exit</li>
+<li><strong>Upgrades</strong>: after pulling new upstream code, rerun
+<code>npx tsc -p dsh-tsconfig.json</code> in the tdai project dir (output in <code>dist-dsh/</code>)</li>
+</ul>
+<h2>License</h2>
+<p>MIT</p>

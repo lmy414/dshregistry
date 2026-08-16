@@ -1,0 +1,108 @@
+<h1>dsh-session-delete</h1>
+
+
+  DSH 会话删除插件：在「归档会话」下方新增「删除会话」<br><br>
+  <code>一键删除</code> <code>二次确认</code> <code>宿主推送即时刷新</code> <code>同名会话多选</code><br><br>
+  永久删除 会话及其全部消息记录（日志文件 + 工作区账目 + 投影缓存），
+  列表通过 DSH 宿主推送自动刷新，无需刷新页面。
+
+
+<h2>✨ 功能</h2>
+<ul>
+<li><strong>🗑️ 菜单注入</strong>：每个会话行的 <code>⋯</code> 操作菜单里，在「归档会话」正下方新增「删除会话」——红色危险配色（跟随主题 <code>--dsw-alias-state-error-primary</code>）+ 垃圾桶图标 + 危险态悬停底色；</li>
+<li><strong>🛡️ 二次确认</strong>：危险操作弹窗（跟随主题变量），确认前不会删除任何数据；</li>
+<li><strong>🪞 同名会话多选</strong>：存在多个同名会话时，弹窗列出全部候选（标题 + id + 相对时间），由你选择；</li>
+<li><strong>⚡ 即时刷新</strong>：删除通过 DSH 既有 wire 推送（<code>host/session-removed</code> / <code>host/workspace-changed</code> / <code>host/archived-sessions-changed</code>）更新会话列表，<strong>不需要刷新页面</strong>；删除当前会话时自动回到「新会话」视图；</li>
+<li><strong>🧹 干净删除</strong>：不只删日志文件——同时清理工作区账目（<code>workspace.sessionIds</code>）、归档集合（<code>archivedSessionIds</code>）与投影缓存（<code>session_projcache</code>），重启后不会出现幽灵会话；</li>
+<li><strong>🔒 与官方同源的安全围栏</strong>：删除接口复用 <code>/api</code> 网关同款的浏览器信任围栏（loopback Host 或受信主机 + 同源检查）。</li>
+</ul>
+<h2>📦 安装（Profile Bundle，推荐）</h2>
+<pre><code># 在插件目录构建并打包（已打包可直接用 dsh-session-delete-0.2.0.tgz）
+cd D:/Developments/Workspace/DSH-SessionDelete
+npm install &amp;&amp; npm run build &amp;&amp; npm pack
+
+# 挂载到 web profile（路径用正斜杠）
+dsh plugin --profile web add "D:/Developments/Workspace/DSH-SessionDelete/dsh-session-delete-0.2.0.tgz"
+</code></pre>
+<blockquote>
+<p>若 <code>pnpm</code> 报 <code>ERR_PNPM_UNEXPECTED_STORE</code>（profile 的 node_modules 与当前 store 不一致，
+通常是 pnpm 版本/配置变更导致），先在 profile 目录重装对齐：</p>
+<pre><code>cd ~/.dsh/profiles/web
+pnpm install --no-frozen-lockfile --config.confirmModulesPurge=false
+</code></pre>
+<p>再重新执行上面的 <code>dsh plugin --profile web add</code>。</p>
+</blockquote>
+<h2>✅ 验证安装</h2>
+<pre><code>dsh --profile web --dump-config | grep session-delete
+# → # == dsh-session-delete
+#   - id: session-delete
+#     name: dsh-session-delete
+</code></pre>
+<p><strong>重启 <code>dsh web</code> 使插件生效</strong>，然后刷新浏览器页面：
+在左侧会话列表任意会话行的 <code>⋯</code> 菜单中，「归档会话」下方即出现「删除会话」。</p>
+<h2>🚀 使用</h2>
+<ol>
+<li>将鼠标移到会话行上，点击行尾的 <code>⋯</code>；</li>
+<li>在菜单中点击「归档会话」下方的 <strong>删除会话</strong>；</li>
+<li>在确认弹窗中核对会话标题（多个同名会话时先选择目标）；</li>
+<li>点击「删除」，等待「会话已删除」提示——列表自动移除该会话。</li>
+</ol>
+<blockquote>
+<p>⚠️ 删除<strong>不可恢复</strong>：会话日志文件会被永久移除。请谨慎操作。</p>
+</blockquote>
+<h2>🔧 工作原理</h2>
+<h3>客户端（lib/client.js，纯 DOM，无框架依赖）</h3>
+<ul>
+<li><code>MutationObserver</code> 监听 <code>document.body</code>，发现包含「归档会话」项的行操作菜单时，
+克隆该项并改标为「删除会话」插入其正下方（同一哈希类名 → 样式一致）；</li>
+<li>会话标题取自触发按钮的 <code>aria-label</code>（「会话“xxx”的操作」/「Session actions for xxx」，
+全角/半角引号都兼容），再通过客户端会话列表（<code>ctx.sessions.list</code>）解析出会话 id；标题重复时列出候选；</li>
+<li>删除成功后调用 <code>ctx.sessions.refresh()</code> 重拉会话基线，配合宿主推送保证
+工作区分组、未分组列表即时同步移除；</li>
+<li>删除请求发往插件自有的 fenced 路由 <code>POST /session-delete/api/delete { sessionId }</code>。</li>
+</ul>
+<h3>服务端（lib/index.js）</h3>
+<p>删除事务（<code>src/delete-session.ts</code>）按顺序执行：</p>
+<ol>
+<li><strong>运行守卫</strong>：live 会话若其 agent 仍处于 <code>running</code>，直接拒绝（返回 <code>agent-running</code>，
+客户端给出友好提示），避免运行中的回合在目录删除后继续落盘重建文件；</li>
+<li><strong>flush + detach</strong>：若会话在内存 store 中（live），先走 store 自有的
+<code>sessions.flush</code>（官方指定的持久化入口，无监听时回退 <code>session/flush</code> emit），
+再 detach（触发 <code>session/disposed</code> → 持久化协调器排空写后批次），并等待 300ms
+写批窗口，<strong>避免迟到批次在目录删除后重建文件</strong>；</li>
+<li><strong>删除文件（双路径定位）</strong>：先用 <code>sessionPersistence.locate(header)</code> 按会话头的
+cwd 计算目录；<strong>目录不存在或头里没有 cwd 时，回退扫描持久化根目录下所有工作区
+目录</strong>（<code>&lt;root&gt;/&lt;工作区&gt;/&lt;encodeSegment(id)&gt;</code>，即「按工作区存储」的布局），
+校验目录名 === <code>encodeSegment(sessionId)</code>（防误删）后 <code>rm -rf</code>；两条路径
+同时命中且不一致时拒绝删除（防歧义）；</li>
+<li><strong>工作区账目</strong>：从每个 workspace 记录移除该 id（走 <code>workspaceRegistry</code> 实体
+的 <code>detachSession</code> 官方写路径，缓存与持久域同步），并从全局 <code>archivedSessionIds</code>
+中移除该 id（经 storage-domain 全局写入）；两者都触发 <code>domain/changed</code> →
+宿主推送 <code>host/workspace-changed</code> / <code>host/archived-sessions-changed</code>；</li>
+<li><strong>投影缓存</strong>：从 <code>session_projcache</code> 域删除该会话行（fail-soft）。</li>
+</ol>
+<p>每一步都幂等：对已删除的会话重复执行不报错、无副作用。</p>
+<h2>📌 边界与说明</h2>
+<ul>
+<li><strong>附件</strong>：会话附件（<code>~/.dsh/attachments</code>）按对象寻址、无会话索引，删除时<strong>不清理</strong>附件对象；</li>
+<li><strong>内容搜索索引</strong>：若部署启用了会话内容搜索（session-query），旧索引行可能残留，
+不影响列表显示；重启后索引重建会自然失效；</li>
+<li><strong>当前打开的会话</strong>：删除后自动回到「新会话」视图；</li>
+<li><strong>live 会话</strong>：会话在内存中时先 flush 再 detach 后删除；<strong>正在运行 agent 的会话
+会被拒绝删除</strong>（提示等待运行结束），避免运行中的回合重建已删除的目录；</li>
+<li><strong>菜单注入是 DOM 级</strong>：依赖「归档会话」菜单项的稳定文案与 role 契约；若未来
+DSH 官方 UI 重构该菜单结构，需要同步更新注入逻辑。</li>
+</ul>
+<h2>🔧 开发</h2>
+<pre><code>npm install          # devDependencies 自包含
+npm run typecheck    # tsc --noEmit
+npm test             # vitest（29 个契约测试）
+npm run build        # tsc（server lib/）+ tsdown（client bundle lib/client.js）
+npm pack             # 发布 tarball
+</code></pre>
+<h2>🗑️ 卸载</h2>
+<pre><code>dsh plugin --profile web remove dsh-session-delete
+</code></pre>
+<p>移除后重启 <code>dsh web</code>，菜单恢复原样。</p>
+<h2>📄 License</h2>
+<p>MIT</p>

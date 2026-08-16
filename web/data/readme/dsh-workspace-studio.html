@@ -1,0 +1,179 @@
+<h1>dsh-workspace-studio</h1>
+<p><a href="https://github.com/houlain/dsh-workspace-studio/blob/HEAD/LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License: MIT"></a>
+<img src="https://img.shields.io/badge/platform-Windows%20(verified)-orange" alt="Platform"></p>
+<blockquote>
+<p>⚠️ <strong>Platform status: Windows verified only.</strong>
+This plugin has been tested on <strong>Windows</strong> (PowerShell). It has <strong>NOT been verified on Linux or macOS</strong> — path handling, shell behavior, and sandbox interactions may differ on those platforms. <strong>Use with caution on non-Windows systems.</strong></p>
+</blockquote>
+<p>A <a href="https://github.com/deepseek-ai/deepseek-harness">DeepSeek Harness</a> (<code>dsh</code>) plugin that turns the Web UI into a lightweight coding workspace with <strong>Trae-style partial revert</strong>:</p>
+<ol>
+<li><strong>Workspace file browser</strong> — collapsible file tree; build-artifact noise filtered; folders containing changed files are auto-expanded with count badges; modified files are marked with a dot.</li>
+<li><strong>Code viewer</strong> — click any file to view its content with line numbers.</li>
+<li><strong>Change review (git-style diff)</strong> — every <code>write</code> / <code>edit</code> the agent makes is tracked with full before/after snapshots and rendered as line-level diff hunks, with live SSE updates.</li>
+<li><strong>Per-hunk partial revert / accept</strong> — revert <strong>one change block at a time</strong> (like Trae), or mark it as <strong>accepted</strong>; resolved changes stop being shown and stop being marked. Conflict protection rejects reverts when the region was modified afterwards.</li>
+</ol>
+<hr>
+<h2>⚠️ Important notes</h2>
+<ul>
+<li><strong>Windows-only (verified).</strong> Linux/macOS are <strong>unverified</strong> — use at your own risk on those platforms.</li>
+<li>Change tracking is <strong>per session</strong> — a session only sees its own changes (by design).</li>
+<li>Only <code>write</code> / <code>edit</code> tool calls are tracked. Direct file edits made outside those tools (e.g. in your own editor) are not recorded.</li>
+</ul>
+<h2>Install</h2>
+<h3>From GitHub (recommended)</h3>
+<pre><code>dsh plugin --profile web add github:houlain/dsh-workspace-studio
+</code></pre>
+<p>Then restart <code>dsh web</code> and open a <strong>new session</strong>.</p>
+<h3>Manually (no pnpm required)</h3>
+<ol>
+<li><p>Copy the package into the profile's <code>node_modules</code>:</p>
+<pre><code>$src = "&lt;your-clone-path&gt;\dsh-workspace-studio"
+$dst = "$env:USERPROFILE\.dsh\profiles\web\node_modules\dsh-workspace-studio"
+Copy-Item -Recurse -Force $src $dst
+</code></pre>
+</li>
+<li><p>Register it in the profile's <code>package.json</code>:</p>
+<pre><code>{
+  "dependencies": { "dsh-workspace-studio": "0.1.0" },
+  "dsh": { "profile": { "bundles": ["@deepseek-ai/dsh-base", "@deepseek-ai/dsh-web-app", "dsh-workspace-studio"] } }
+}
+</code></pre>
+</li>
+<li><p>Restart <code>dsh web</code>.</p>
+</li>
+</ol>
+<blockquote>
+<p>The package ships pre-built (<code>lib/</code>), so no build step is needed for installation.
+The installed copy must be a <strong>copy</strong>, not a symlink into a directory you keep editing — rebuild and re-copy after updating.</p>
+</blockquote>
+<h2>Usage</h2>
+<ol>
+<li>Open a session in the Web UI and switch to the <strong>「Studio」</strong> tab (next to Chat).</li>
+<li>The left pane shows the workspace file tree:<ul>
+<li>Folders are collapsible (<code>▸</code> / <code>▾</code>); folders containing pending changes show a <strong>count badge</strong> and auto-expand.</li>
+<li>Files modified by the agent carry a <strong>●</strong> marker.</li>
+</ul>
+</li>
+<li>Click a file to view its content (top-right) and its change panel (bottom-right).</li>
+<li>Each change operation shows one or more <strong>change blocks (hunks)</strong> with two actions:<ul>
+<li><strong>「撤回此块」(Revert this block)</strong> — undoes only that block; other blocks stay. A confirm dialog appears, then the file is rewritten on disk.</li>
+<li><strong>「认可」(Accept)</strong> — keeps the change; the block stops being shown/marked and can no longer be reverted.</li>
+</ul>
+</li>
+<li><strong>「撤回全部修改」(Revert all)</strong> restores the file to its state before this session's first recorded change (files created in this session are deleted).</li>
+<li><strong>「清空」(Clear)</strong> removes this session's change records (does not touch file contents).</li>
+<li>The <strong>Studio tab label</strong> shows a badge with the number of files that still have pending changes; it and all markers update in real time via SSE when the agent edits files.</li>
+</ol>
+<h3>Revert safety rules</h3>
+<ul>
+<li>A hunk can only be reverted if <strong>its exact lines are still present</strong> in the file. If a later change modified that region, the revert is <strong>rejected with a hint</strong> (conflict protection).</li>
+<li>A hunk that was reverted or accepted cannot be acted on again.</li>
+<li>Reverting a hunk of an old operation works even when later operations shifted line numbers elsewhere.</li>
+</ul>
+<h2>Architecture</h2>
+<p>One package, two halves (<code>dsh.bundle</code> + <code>dsh.client</code> manifests), mounted as a <strong>single</strong> loader entry:</p>
+<pre><code>dsh-workspace-studio/
+├── src/
+│   ├── core/        # Pure logic, zero deps, fully unit-tested
+│   │   ├── diff.ts       # LCS line diff → hunks with context
+│   │   ├── ledger.ts     # before/after snapshot ledger + persistence
+│   │   ├── hunkRevert.ts # per-hunk reverse apply + conflict detection
+│   │   └── fileTree.ts   # tree builder with ignore rules
+│   ├── host/        # Node half: tools/result listener, HTTP/SSE routes, ctx.fs
+│   ├── client/      # Browser half: Studio view (React, no external deps)
+│   └── shared/      # Payload types shared by both halves
+├── lib/             # Pre-built bundles (lib/index.js host, lib/client.js browser)
+└── tests/           # 67 tests (node:test, no test framework dependency)
+</code></pre>
+<h3>HTTP routes (same-origin, all under <code>/ws-studio/*</code>)</h3>
+<table>
+<thead>
+<tr>
+<th>Route</th>
+<th>Method</th>
+<th>Purpose</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>/ws-studio/tree?root=</code></td>
+<td>GET</td>
+<td>Workspace file tree</td>
+</tr>
+<tr>
+<td><code>/ws-studio/file?path=</code></td>
+<td>GET</td>
+<td>File content (size-capped)</td>
+</tr>
+<tr>
+<td><code>/ws-studio/ops?session=</code></td>
+<td>GET</td>
+<td>Change operations with hunks (pending only in the file list)</td>
+</tr>
+<tr>
+<td><code>/ws-studio/revert?session=</code></td>
+<td>POST</td>
+<td>Revert one hunk, or the whole file (no <code>op</code>/<code>hunk</code>)</td>
+</tr>
+<tr>
+<td><code>/ws-studio/accept?session=</code></td>
+<td>POST</td>
+<td>Accept one hunk</td>
+</tr>
+<tr>
+<td><code>/ws-studio/clear?session=</code></td>
+<td>POST</td>
+<td>Clear the session's change records</td>
+</tr>
+<tr>
+<td><code>/ws-studio/context?session=</code></td>
+<td>GET</td>
+<td>Session working directory</td>
+</tr>
+<tr>
+<td><code>/ws-studio/events</code></td>
+<td>GET (SSE)</td>
+<td>Live change notifications</td>
+</tr>
+</tbody></table>
+<h3>Data &amp; persistence</h3>
+<ul>
+<li>Change snapshots persist to <code>&lt;profile-dir&gt;/ws-studio-state.json</code> (e.g. <code>~/.dsh/profiles/web/ws-studio-state.json</code>), debounced, atomic write, flushed on exit.</li>
+<li>Per-file capacity guards: max 100 operations per file, 120 KB per snapshot (oversized operations are recorded without content — visible but not revertible).</li>
+</ul>
+<h3>Sandbox awareness</h3>
+<ul>
+<li>Revert writes go through the harness filesystem service (<code>ctx.fs</code>) with a <strong>session-level sandbox policy</strong> (<code>workspace-write</code> + the session's workspace root), so writes outside the session workspace are rejected by the harness sandbox itself.</li>
+<li>File tree and reads also go through <code>ctx.fs</code> when available (fallback: <code>node:fs</code>).</li>
+</ul>
+<h2>Security &amp; privacy</h2>
+<ul>
+<li><strong>No telemetry, no analytics, no external network calls.</strong> All routes are same-origin; the plugin never contacts any third-party server.</li>
+<li>The plugin does <strong>not</strong> read or store credentials, API keys, environment secrets, or OS/user metadata.</li>
+<li>The only data stored on disk is the change ledger (file paths + file contents that were edited during a session) plus UI state.</li>
+<li>Sandbox policies of the harness still apply to revert writes.</li>
+</ul>
+<h2>Configuration</h2>
+<p>The file tree ignores common noise by default (<code>.git</code>, <code>node_modules</code>, <code>dist</code>, <code>build</code>, lockfiles, <code>coverage</code>, etc.). The ignore list lives in <code>src/core/fileTree.ts</code> (<code>DEFAULT_TREE_OPTIONS</code>) — rebuild if you want to customize it.</p>
+<h2>Development</h2>
+<p>Requirements: <strong>Node.js ≥ 22.6</strong> (tests run via Node's native TypeScript type-stripping — no build needed for tests), npm.</p>
+<pre><code>npm install        # dev dependency: esbuild
+npm run build      # bundles lib/index.js (host) + lib/client.js (browser)
+npm test           # 67 tests via node --test
+</code></pre>
+<p>Notes for contributors:</p>
+<ul>
+<li>The browser half uses <code>React.createElement</code> (no JSX) and a tiny local <code>react</code> stub under <code>node_modules/react</code> so tests can assert the rendered element tree without a DOM. Do <strong>not</strong> delete the stub; a real <code>npm install react</code> would replace it.</li>
+<li>Code must stay <strong>erasable-syntax TypeScript</strong> (no enums, no parameter properties) so Node's type-stripping can run the tests directly.</li>
+<li>Relative imports use explicit <code>.ts</code> extensions (NodeNext).</li>
+</ul>
+<h2>Known limitations</h2>
+<ul>
+<li><strong>Platform</strong>: verified on Windows only; Linux/macOS untested — use with caution.</li>
+<li>Change tracking is per-session and covers only <code>write</code>/<code>edit</code> tool calls.</li>
+<li>Diff is line-based LCS; hunk display is simplified (no intra-line character diff).</li>
+<li>Reverting a middle hunk of an old operation requires the region's lines to still be intact; overlapping later edits reject the revert.</li>
+<li>Whole-file revert restores the state before the session's <em>first</em> recorded operation on that file.</li>
+<li>Very large files (&gt; 2 MB) are refused by the viewer; oversized change snapshots (&gt; 120 KB) are not revertible.</li>
+</ul>
+<h2>License</h2>
+<p><a href="https://github.com/houlain/dsh-workspace-studio/blob/HEAD/LICENSE">MIT</a> © 2026 houlain</p>

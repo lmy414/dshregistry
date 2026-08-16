@@ -1,0 +1,256 @@
+<h1>dsh-memory-hermes</h1>
+<p>Hermes 式有界策划记忆,做成 DeepSeek Harness(dsh)的用户侧插件。不改 dsh 本体,<code>dsh plugin add</code> 即装即用。</p>
+<p>设计蓝本是 Nous Research Hermes Agent 的记忆系统:<strong>小容量、模型自己策划、每 session 冻结注入</strong>。与「越攒越多的记忆库」相反,它逼着模型维护一份精炼的长期事实清单。v2 起,配置、可观测性、检索全部落在 dsh 自己的机制面上(settings 命名空间、storage-domain sidecar、projection、sessionQuery),不再是插件私有轮子。</p>
+<h2>机制速览</h2>
+<table>
+<thead>
+<tr>
+<th>机制</th>
+<th>行为</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>双文件</td>
+<td><code>MEMORY.md</code>(agent 笔记,默认 2,200 字符)+ <code>USER.md</code>(用户画像,默认 1,375 字符),存于 <code>$DSH_HOME/memory/</code></td>
+</tr>
+<tr>
+<td>单工具</td>
+<td><code>memory</code>,action 枚举 <code>add / replace / remove</code>,<strong>没有 read</strong>——内容已在系统提示里</td>
+</tr>
+<tr>
+<td>冻结快照</td>
+<td>session 开始时读一次注入系统提示,会话内不再变(prompt-cache 友好);会话内写入落盘、工具结果回显实时态,下个 session 才进快照</td>
+</tr>
+<tr>
+<td>定位条目</td>
+<td><code>replace</code>/<code>remove</code> 用唯一子串匹配,<strong>条目全文精确匹配优先</strong>(条目互为子串时的逃生口);0 命中或多命中报错,错误里附<strong>锁内实时盘面</strong>的条目全文(快照可能过期,这是模型的自救通道)</td>
+</tr>
+<tr>
+<td>溢出纪律</td>
+<td><strong>增长型</strong>超限写入不落盘,报错附当前全部条目,并要求<strong>当轮合并重试、不丢新信息</strong>;缩小型操作(remove/变短的 replace)总是放行——文件已超限(调小上限/手改)时才能逐步收敛回来</td>
+</tr>
+<tr>
+<td>安全扫描</td>
+<td>写入时 + 注入渲染时 + <strong>错误载荷</strong>三处同一规则表:不可见 Unicode、注入话术、外传形状;命中即拒/隐藏</td>
+</tr>
+<tr>
+<td>审批闸门</td>
+<td><code>approval: true</code> 时每次写弹审批——实现为 dsh 设计的 <code>tools/pre-execute</code> 策略监听器(ask 决策),工具本体无策略;无审批渠道时运行时 fail-closed(默认关)</td>
+</tr>
+<tr>
+<td>并发安全</td>
+<td>进程内 promise 链串行 + 跨进程 <code>.lock</code> 文件锁 + 原子写(照 dsh settings-file 同款姿势)</td>
+</tr>
+<tr>
+<td>后台自省</td>
+<td>后台 fork 循环重看会话,双路分流:<strong>memory 路</strong>收窄(用户画像/行为期望/当前状态),<strong>skill 路</strong>沉淀技术经验进 skill 库;触发:turn 结束(按策略)、compaction 收割、<code>/memory review [focus]</code></td>
+</tr>
+<tr>
+<td>自省可观测</td>
+<td>每次 review 落一条记录进 storage-domain sidecar(<code>memory_hermes</code> 域),设置页「活动」页签可查:跑了没、存了几条、为何失败、<strong>逐步工具调用 trace</strong></td>
+</tr>
+<tr>
+<td>skill 库</td>
+<td>技术经验落地 <code>$DSH_HOME/skills/</code>(dsh 自带用户 skill 根,watcher 热发现):类级 skill + references/templates/scripts/assets;<code>created_by: agent</code> 标记的才归 curator 管,手写的一律受保护</td>
+</tr>
+<tr>
+<td>记忆活动投影</td>
+<td>注册 sessionProjections 单元 <code>memoryActivity</code>,从本会话日志 fold 出 memory 工具调用统计——日志派生物,resume 免费</td>
+</tr>
+<tr>
+<td>设置页与命令</td>
+<td>dsh web 设置导航「记忆」页(文件 + 活动两个页签)+ <code>/memory</code>、<code>/memory review [focus]</code>、<code>/memory compact</code>、<code>/memory skills</code> 斜杠命令</td>
+</tr>
+<tr>
+<td>检索层(可选)</td>
+<td>配合 dsh 船载 session-query(sqlite 全文索引)实现跨会话检索,见下文「配套:会话检索」</td>
+</tr>
+</tbody></table>
+<h2>安装</h2>
+<p>前置:Node 22+(dsh 要求 ^22.19 || &gt;=24),dsh CLI 可用(<code>npm install -g @deepseek-ai/dsh@0.1.0-rc.6</code>,钉版本)。</p>
+<pre><code>cd dsh-memory-hermes
+npm install
+npm run build
+npm pack
+</code></pre>
+<pre><code>dsh plugin --profile web add "./dsh-memory-hermes-&lt;version&gt;.tgz"
+</code></pre>
+<p>两条硬规矩(2026-08-15 实测教训,违反会得到两种运行时崩溃):</p>
+<ul>
+<li><strong>必须用 <code>npm pack</code> 出的 tgz 安装,不要裸目录/<code>link:</code></strong>。链接安装时 Node 会顺着 realpath 解析到插件自己 devDeps 的 <code>node_modules</code>,<code>TypertRemoteService</code> 等基类变成插件本地副本,宿主认不出这个服务 → 面板 RPC 全部 404。</li>
+<li><strong>装进内置 profile(web/tui/headless),不要在自定义 profile 里手动补装 <code>@deepseek-ai/dsh-web-app</code></strong>。dsh 把运行时物化在 <code>$DSH_HOME/profiles/node_modules</code> 共享层,自定义 profile 里 pnpm 装的 web-app 副本会遮蔽它,工具调度器的 Symbol 跨副本查空 → 每次工具调用整轮失败(<code>Cannot read properties of undefined (reading 'prepare')</code>)。内置 web profile 的模板自带 base + web-app,从共享层单树解析。</li>
+</ul>
+<p>装完 <code>dsh --profile web --dump-config</code> 应能看到 <code>memory-hermes</code> 层。改代码后的更新:<code>npm run build &amp;&amp; npm pack</code>,重新 <code>add</code>;<strong>host 半边的更新要重启 dsh 才生效</strong>,client 半边(设置页)刷新页面即可。</p>
+<h2>配置</h2>
+<p>v2 起配置走 dsh <strong>settings 服务</strong>:插件注册 <code>memory-hermes</code> 命名空间,bundle patch 的 entry config 作为 <code>base</code>(组合层打底),<code>$DSH_HOME/settings.yaml</code> 文档里的同名 section 作为用户层覆盖,<strong>热生效</strong>(<code>settings/updated</code> 驱动,限额/扫描/review 策略即时切换;已冻结的会话快照不变)。没有 settings 服务的 profile 退化为只用 entry config。</p>
+<p>注意(rc.6 边界):dsh web 的设置 GUI 只暴露白名单内的命名空间(apiproxy 硬编码;「插件自暴露」在官方 deferred work 清单里),所以本插件的配置通道是 <strong>settings.yaml 文档</strong>——在文档里加:</p>
+<pre><code>memory-hermes:
+  memoryCharLimit: 3000   # 只写要覆盖的字段,其余回 base/默认
+</code></pre>
+<p>保存即生效,无需重启(已实测:外部编辑 → chokidar 监视 → 热发布)。</p>
+<p>全部配置项(schema 默认兜底;写在 profile 用户层 patch <code>$DSH_HOME/profiles/web/cordis.patch.yml</code>):</p>
+<pre><code>- id: memory-hermes
+  name: dsh-memory-hermes
+  config:
+    memoryCharLimit: 2200        # MEMORY.md 上限(codepoint 计),最小 200
+    userCharLimit: 1375          # USER.md 上限,最小 200
+    securityScan: true           # 写入+注入双侧扫描
+    approval: false              # true = 每次写弹审批(同时抑制后台 review)
+    backgroundReview: true       # 后台自省总开关
+    reviewTrigger: token-delta   # every-turn | token-delta | manual
+    reviewTokenDeltaTokens: 4000 # token-delta 触发阈值(tokenMeter 估算)
+    compactionHarvest: true      # compaction/start 时做收割 review
+    reviewMaxTokens: 1000        # 单次 review 的输出 token 预算
+    reviewTimeoutMs: 60000       # 单次 review 超时(毫秒),最小 1000
+    reviewHistoryLimit: 200      # sidecar 保留的 review 记录条数
+    consolidateMaxTokens: 2000   # /memory compact 合并调用的输出预算
+    skillReview: true            # v3:review 的 skill 路(技术经验进 skill 库)
+    reviewMaxSteps: 8            # fork 循环的最大 LLM 步数
+    skillMaxBytes: 65536         # 单个 skill 文件的字节上限
+    # skillRoot: C:/Users/&lt;你&gt;/.dsh/skills  # skill 库根;默认就是 dsh 用户 skill 根
+    # reviewProvider: deepseek   # review/compact 换模型用;默认跟主会话(吃前缀缓存)
+    # reviewModel: deepseek-chat
+    curatorEnabled: true         # v4:库维护层总开关(遥测+标记+调度+LLM pass)
+    curatorConsolidate: true     # LLM 归并 pass(有意与 Hermes 默认相反:开)
+    curatorIntervalHours: 168    # 两次 curator run 的最小间隔(Hermes 7 天)
+    curatorMinIdleHours: 2       # 触发前要求的用户空闲时长
+    curatorStaleAfterDays: 30    # stale 标记窗口(never-used 宽限同窗)
+    curatorMaxSteps: 16          # curator fork 循环的最大 LLM 步数
+    curatorMaxTokens: 4000       # 单步输出 token 预算
+    curatorTimeoutMs: 300000     # 整个 curator run 的超时(毫秒)
+    curatorMaxBackups: 5         # run 前快照保留份数(轮替删最老)
+    # curatorProvider: deepseek  # curator 换模型用;缺省回落 reviewProvider/Model,再回落会话默认模型
+    # curatorModel: deepseek-chat
+    topicsEnabled: true          # v5:主题文件细节层(关 = 动作运行时拒绝,schema 需重载插件才变)
+    topicMaxBytes: 32768         # 单个主题文件存储上限(字节),最小 4096
+    topicMaxFiles: 100           # 主题文件数量上限
+    topicReadLines: 400          # topic_read 默认(也是最大)行窗
+    topicReadMaxBytes: 8192      # topic_read 单次读出字节帽
+    # topicRoot: C:/Users/&lt;你&gt;/.dsh/memory/topics  # 主题目录覆盖;默认 $DSH_HOME/memory/topics
+</code></pre>
+<p>注意:id 覆盖是<strong>整体替换 config,不深合并</strong>——要改就把想要的字段写全(未写的字段回 schema 默认,恰好也是安全的)。</p>
+<h2>后台自省(background review)</h2>
+<p>每个正常完成(completed)的 turn 结束后(按触发策略),插件在后台发起一次独立 LLM 调用重看本会话,提取「值得长期记住、且记忆里还没有」的事实,按 memory 工具同一套写入语义存盘。主对话不被打断,也看不到这次调用。</p>
+<ul>
+<li><strong>触发策略</strong>(<code>reviewTrigger</code>):<ul>
+<li><code>every-turn</code>:每个 completed turn 都跑(前缀缓存友好的 provider 划算);</li>
+<li><code>token-delta</code>(默认):用 host 的 tokenMeter 估算会话压力,自上次 review 增长超过 <code>reviewTokenDeltaTokens</code> 才跑——无缓存 provider 不再每 turn 付一次全前缀;无 tokenMeter 时退化为 every-turn;session 首次接触只建基线,长会话恢复不会立刻触发;</li>
+<li><code>manual</code>:只有 <code>/memory review</code> 和 compaction 收割会跑。</li>
+</ul>
+</li>
+<li><strong>compaction 收割</strong>(<code>compactionHarvest</code>):dsh 真正的遗忘点是上下文折叠,不是 turn 结束。插件监听 <code>compaction/start</code> 事件,<strong>在回调里同步快照</strong>当前消息再异步跑收割 review——折叠先落地也丢不了输入。</li>
+<li><strong>可观测性</strong>:每次 review 结束落一条记录(触发类型、turn、存/弃条数、条目摘要、错误)进 storage-domain sidecar(<code>memory_hermes</code> 域的 <code>runs</code> 表,环形保留 <code>reviewHistoryLimit</code> 条),设置页「活动」页签拉取展示。「跑了没存」和「没跑」从此可分。</li>
+<li><strong>抢占</strong>:同一会话新触发会作废(abort)还没跑完的旧 review——新调用覆盖到最新的全会话视图。</li>
+<li><strong>与审批互斥</strong>:<code>approval: true</code> 时 review 触发被抑制——后台写无法弹审批,绕过闸门又违背开审批的本意(v2 起改为触发时判定,配置热切换即时生效)。</li>
+<li><strong>失败静默</strong>:review 调用出错只记 warn 日志 + sidecar 错误记录,不重试、不打扰主对话。</li>
+</ul>
+<h2>记忆/技能分流(v3)</h2>
+<p>v2 及以前,review 把所有类别(技术经验、环境事实、用户偏好)都塞进 2200 码点的 MEMORY.md——长得快是必然的。v3 对齐 Hermes 的真实分流(依据 <code>agent/background_review.py</code> 与 <code>tools/skill_manager_tool.py</code> 源码):</p>
+<table>
+<thead>
+<tr>
+<th>路</th>
+<th>存什么</th>
+<th>存到哪</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong>memory 路</strong></td>
+<td>用户是谁:persona、偏好、个人细节、对 agent 的行为期望、当前状态</td>
+<td>有界双文件(不变)</td>
+</tr>
+<tr>
+<td><strong>skill 路</strong></td>
+<td>怎么干这类活:技术教训、工作流修正、踩坑修复</td>
+<td><code>$DSH_HOME/skills/</code> 无界 skill 库</td>
+</tr>
+</tbody></table>
+<ul>
+<li><strong>fork 循环</strong>:review 从"一次 LLM 调用"升级为有界 agent 循环(默认最多 <code>reviewMaxSteps: 8</code> 步):模型可以 <code>skills_list</code>(L0 目录)→ <code>skill_view</code>(L1 正文 / L2 支持文件)→ <code>skill_manage</code>(六动作 create/edit/patch/delete/write_file/remove_file)逐步干活;每步的工具调用与结果写进 sidecar 的 <strong>trace</strong>(活动页签可见)。</li>
+<li><strong>两道保护闸</strong>(对齐 Hermes):① <strong>provenance</strong>——只有带 <code>created_by: agent</code> frontmatter 标记的 skill 归 curator 管,你手写的 skill 一律拒改(fail-closed);② <strong>read-before-write</strong>——fork 必须先 <code>skill_view</code> 读过目标才能 patch/edit 它,不许凭对话印象盲改。</li>
+<li><strong>catalog 集成零接线</strong>:skill 落点就是 dsh 自带的用户 skill 根(<code>$DSH_HOME/skills</code>,含 junction 联接),dsh 的 filesystem skill provider 热发现——新 skill 自动出现在所有会话的 skill 目录里,前台用原生 <code>skill</code> 工具加载;<code>skillReview: false</code> 可关掉 skill 路(退回纯 memory review)。</li>
+<li><strong>模型路由</strong>(对齐 Hermes):review 默认跟会话同 provider/model 全量重放(吃前缀缓存);<code>reviewProvider</code>/<code>reviewModel</code> 指到异模型时改发 digest 回放(末尾 24 条 + 早期合成摘要),冷缓存省 token。</li>
+<li>与 Hermes 的三处有意偏差:provenance 标记存 frontmatter 而非遥测台账(规避记录缺失竞态);skill 工具只在 fork 循环内注册(前台创建 skill 用普通文件工具,产物无标记即受保护);不移植 skill_usage 使用遥测。</li>
+<li>注意:skill 建的勤不勤取决于模型对指令的遵守度(Hermes 原文同款提示词;"Be ACTIVE");库全是 user-owned 时弱模型可能保守地说"Nothing to save"——<code>/memory review &lt;focus&gt;</code> 可以点名让它建。</li>
+</ul>
+<h2>库维护(curator,v4)</h2>
+<p>skill 库只进不出会退化成一堆一次性窄条目。v4 移植 Hermes 的第二层维护(<code>agent/curator.py</code> 的 curator run):与 turn 级 review 独立的周期性<strong>库自身</strong>审查。五件事:</p>
+<ol>
+<li><strong>使用遥测</strong>:前台每次真实使用 skill(dsh 原生 <code>skill</code> 工具成功加载,或 <code>/名字</code> 手动调用)在 sidecar 的 <code>skill_usage</code> 表记一笔(次数、时刻)。fork 内部的巡库读取<strong>不</strong>计数——维护性读取计入会把所有 skill 刷成 active,致盲 stale 检测。</li>
+<li><strong>确定性 stale 标记</strong>(零破坏):每次 curator run 先重算生命周期状态——用过但超过 <code>curatorStaleAfterDays</code> 没再用 → 标 <code>stale</code>;从没用过的给一个同窗宽限(「无使用是证据缺失,不是过时证据」);pinned 一律豁免;再次被用即回 <code>active</code>。标记只是给 LLM pass 的证据输入,自己不动任何文件。</li>
+<li><strong>LLM 归并 pass</strong>(<code>curatorConsolidate</code>,默认开):后台 fork(Hermes CURATOR_REVIEW_PROMPT 平移)对着全库清单做 umbrella 化——前缀簇归并成带小节的类级 skill、窄条目降级成 <code>references/</code> 支持文件、确认废弃的删除。硬规则:只动 <code>created_by: agent</code> 的;pinned 禁碰;删除前必须本 run 内 <code>skill_view</code> 过(read-before-write 闸强制);umbrella 必须建在库根层(dsh 只发现深度 1)。</li>
+<li><strong>run 前快照</strong>:每次将要有损的 run 前,把全部 curator-managed skill 目录 + 遥测表复制到 <code>$DSH_HOME/skill-backups/&lt;时间戳&gt;/</code>,保留 <code>curatorMaxBackups</code> 份轮替。<strong>恢复是手工的</strong>:把 <code>&lt;时间戳&gt;/&lt;名字&gt;/</code> 拷回 <code>$DSH_HOME/skills/</code> 即可;<strong>不要</strong>贴回旧遥测——旧的 lastUsedAt 会让它立刻再被标 stale,让下个 run 重新 seed(宽限重启)才对。</li>
+<li><strong>调度</strong>:常驻 server 没有「agent 空闲」原语,用近似——每小时探一次,<code>用户空闲 ≥ curatorMinIdleHours</code> 且 <code>距上次 run ≥ curatorIntervalHours</code> 才触发;活跃度只认真实用户动作(用户消息、turn 结束),标题补写等后台事件不算。首次装载只锚定周期不立刻跑;重启后至少等满一个空闲窗。同一时刻只允许一个 run(手动/调度撞车,后到者拒绝)。</li>
+</ol>
+<p>与 Hermes 的两处<strong>有意偏离</strong>:归并 pass 默认<strong>开</strong>(Hermes 默认关——我们的定位是无人审查的自动库,靠快照+read-before-write 兜底而非人审);<strong>无 archive 层</strong>,delete 就是真删(Hermes 的 <code>.archive/</code> 90 天档在无人审查前提下是死重)。</p>
+<h2>主题文件(渐进式披露细节层,v5)</h2>
+<p>注入侧本来已是渐进式(条目一行一条,索引即全文)。v5 补的是<strong>索引后面的那一层</strong>(蓝本:Claude Code auto memory——MEMORY.md 索引每会话只注前 200 行/25KB,主题文件按需读,2026-08-16 官方文档核实):</p>
+<ul>
+<li><strong>结构</strong>:<code>~/.dsh/memory/topics/&lt;名字&gt;.md</code>(kebab-case 命名)。细节(命令示例、排错叙事、部署拓扑)写进主题文件;索引条目保持一行,行尾挂指针 <code>→ topics/&lt;名字&gt;.md</code>。<strong>主题文件不进系统提示</strong>,模型按需用 <code>memory_topic</code> 工具的 <code>topic_read</code> 读。</li>
+<li><strong><code>memory_topic</code> 工具</strong>五动作:<code>topic_list</code> / <code>topic_read</code> / <code>topic_write</code> / <code>topic_append</code> / <code>topic_remove</code>。与 <code>memory</code> 工具分立(dsh 输出 schema 方言限制,且读写契约更干净)。</li>
+<li><strong>读出默认有界</strong>:<code>topic_read</code> 默认返回前 <code>topicReadLines</code>(400)行 + <code>topicReadMaxBytes</code>(8192)字节帽,截断会教模型用 <code>offset=N</code> 续读(1-based,对齐 dsh read 工具)。存储上限(32768)和读出上限是两个数。</li>
+<li><strong>分级 read-before-write 闸</strong>:覆盖已存在文件、删除,要求本上下文先<strong>完整读</strong>过(截断读不开闸,报错教「读完剩余部分再重试」);追加只需任意读过;新建免读;<strong>写入即知情</strong>(topic_write 后该文件算完全知情,append 不升级)。粒度:前台按会话、后台 fork 按 run。闸的补偿效应:被删/被覆盖的正文必然完整进过会话日志,误删可从 session log 人工捞回——这是主题层不上快照的底气。</li>
+<li><strong>扫描是子集</strong>(<code>scanBulk</code>):主题内容只在显式 topic_read 时以工具结果出现(与 fs 读普通文件同级,dsh fs 读零扫描),所以条目扫描里的语义规则(injection.*、exfil.send-url)和多行禁令不作用于主题文件;保留的只有隐蔽夹带三规则(zero-width/bidi/tags)和 exfil.md-image(防的是人——markdown 预览会拉远程图;报错教改成普通链接)。</li>
+<li><strong>指针保全</strong>:compact 指令、溢出报错、GUIDANCE 三处都写明「<code>→ topics/&lt;name&gt;.md</code> 结尾的条目是索引指针,合并时必须保留」——否则压缩会把指针条目当普通条目丢掉,细节文件变孤儿。孤儿(没有任何索引引用的主题文件)在 <code>/memory topics</code> 和设置页文件页签可见。</li>
+<li><strong>review fork 自动获得</strong>:fork 的工具面来自会话 header,工具注册即到位;review 指令在 topicsEnabled 时追加一段 TOPIC_ADDENDUM(两个正例一个反例:部署拓扑→主题文件;怎么调试一类崩溃→skill references,不是主题文件)。</li>
+<li>索引预算 2200/1375 <strong>不动</strong>——溢出压力正是把细节赶进主题层的动力。</li>
+</ul>
+<h2>设置页与 /memory 命令</h2>
+<ul>
+<li><strong>设置页</strong>:dsh web 设置导航里的「记忆」页(settings.section 注册),三个页签:<ul>
+<li><strong>文件</strong>:MEMORY.md / USER.md 两区,各带用量条与条目列表;条目可内联编辑、两击确认删除、输入框新增;尾部列主题文件清单(名称/大小/孤儿徽标,只读)。面板编辑<strong>不走审批闸、不受扫描拒写</strong>(操作者就是审批人);会被扫描命中的条目带三角警示标记,仅提示不拦截。</li>
+<li><strong>技能</strong>:后台 review 沉淀的 curator skill 一览(只显示 <code>created_by: agent</code> 的;你手写的 skill 不属于这里),v4 起每行带遥测:用过几次/最近何时、沉寂(stale)标记、置顶(pinned)标记。</li>
+<li><strong>活动</strong>:后台 review 与 curator 记录列表(curator run 显示为「库维护」)。每条一行摘要(时间、类型、人话结论:存了几条/动了哪些 skill/没有新内容)+ 人性化时长;失败行只显示清理后的错误单行(嵌套 JSON 已解开);逐步工具调用 trace 收在「过程(N 步)」折叠里,Refresh 拉取。</li>
+</ul>
+</li>
+<li><strong><code>/memory</code></strong>:输出两文件用量头与条目全文(任意端)。</li>
+<li><strong><code>/memory review [focus]</code></strong>:立刻对当前会话跑一次后台 review(绕过触发策略,记为 manual);focus 文本会追加进 review 指令(对齐 Hermes 的 /refine 聚焦语义),如 <code>/memory review 把刚才的调试过程存成 skill</code>。</li>
+<li><strong><code>/memory skills</code></strong>:列出 skill 库(名称 + 描述 + user-owned 标记 + 遥测列 <code>[use=N state=… pinned]</code>)。</li>
+<li><strong><code>/memory topics</code></strong>:列出主题文件(名称 + 大小),没有任何索引条目引用的标 <code>[orphan]</code>。</li>
+<li><strong><code>/memory compact</code></strong>:一次 LLM 调用产出合并方案并<strong>直接应用</strong>(store.rewrite,同锁内原子写路径)——跑这条命令本身就是授权,没有审批环节;回复里给出前后条目数与用量对比。方案畸形或安全扫描命中时一个字不写。</li>
+<li><strong><code>/memory curator</code></strong>:立刻跑一次库维护 pass(绕过 idle/interval 门,与调度触发互斥);回复里带 sweep 结果、动作计数、快照位置。</li>
+<li><strong><code>/memory curator status</code></strong>:上次 run/下次预计/最近用户活跃/库形状(curator-managed、stale、pinned、user-owned 各几个)。</li>
+<li><strong><code>/memory pin &lt;名字&gt;</code> / <code>/memory unpin &lt;名字&gt;</code></strong>:置顶豁免——pinned 的 skill 跳过 stale 标记、LLM pass 硬规则禁碰。</li>
+<li><strong><code>/memory adopt &lt;名字&gt;</code></strong>:把你手写的 skill 移交给 curator 管(frontmatter 补 <code>created_by: agent</code>,其余键原样保留)——移交后它进入自动归并/删除的管辖范围。</li>
+<li>profile 没装 commands 插件时命令静默不注册。</li>
+</ul>
+<h2>preset 交互与 tools.restrict</h2>
+<p>工具从 bundle 层注册进 dsh-tools 的<strong>全局层</strong>,所有 preset(standard/code/minimal/cordis)的会话都能看见 memory 工具。但 minimal preset 的 persona 是 <code>complete: true</code>,装配期追加被抑制——minimal 会话<strong>没有</strong> Persistent memory 快照段落,模型只能靠工具描述自行发现。</p>
+<p>不想让某个 preset 看到 memory 工具?组合问题在组合层解决:dsh-tools 提供作用域 <code>restrict</code> 缝,preset 作者在自己 preset 的某个插件行里调一行即可:</p>
+<pre><code>// Inside any plugin row of your preset copy — scoped to that preset's agents.
+ctx.tools.restrict({ deny: ['memory'] })
+</code></pre>
+<p>(「插件全局注册 + preset 用 restrict 退出」,选择权在 preset 作者。)</p>
+<h2>配套:会话检索(session-query)</h2>
+<p>记忆是有界策划;原始历史的全文检索是 dsh 船载能力(sessionQuery + sqlite 后端 + tool-session-query 五个工具,默认未启用)。启用方法见 <a href="https://github.com/SipengXie2024/dsh-memory-hermes/blob/HEAD/docs/session-query.snippet.yml">docs/session-query.snippet.yml</a>:插工具行 + 把 sqlite 后端从 <code>:memory:</code>/never 指向持久路径。启用后「save a pointer」纪律闭环:记忆里可以只存指针,模型用 session_search 自己搜回细节(搜索范围按 workspace 限定)。</p>
+<h2>数据与卸载</h2>
+<ul>
+<li>记忆数据:<code>$DSH_HOME/memory/MEMORY.md</code> 与 <code>USER.md</code>。纯文本,每行一条 <code>- </code> 前缀,可手工检查/编辑;手改在<strong>下个 session</strong> 生效。</li>
+<li>主题文件:<code>$DSH_HOME/memory/topics/&lt;名字&gt;.md</code>(v5 细节层)。纯文本,可手工检查/编辑/删除;删了记得把指向它的索引条目一并清掉(否则留下死指针,反之则成孤儿)。</li>
+<li>skill 库:<code>$DSH_HOME/skills/</code>(dsh 自带用户根,与手写 skill 混居,靠 <code>created_by: agent</code> 区分管辖)。</li>
+<li>curator 快照:<code>$DSH_HOME/skill-backups/&lt;时间戳&gt;/</code>(每次有损 run 前自动留,轮替保 <code>curatorMaxBackups</code> 份)。</li>
+<li>review / curator 记录与使用遥测:storage-domain sidecar(<code>memory_hermes</code> 域,后端介质由 storage 层决定)。</li>
+<li>卸载:<code>dsh plugin --profile web remove dsh-memory-hermes</code>。数据文件不会被删,不要了手工删 <code>$DSH_HOME/memory/</code>、<code>$DSH_HOME/skill-backups/</code>;<code>$DSH_HOME/skills/</code> 里的 skill 是通用资产,留不留看你。</li>
+</ul>
+<h2>已知边界(设计取舍,非 bug)</h2>
+<ul>
+<li><strong>扫描是启发式 denylist,不是完整防御</strong>。真正的边界是:记忆文件是你本地的、可手工检查的纯文本。已知误伤(接受并文档化):<ul>
+<li>ZWJ 组合 emoji(如家庭 emoji)会被 <code>invisible.zero-width</code> 拒——零宽段整段拒收;</li>
+<li>"post/send … https://…" 的名词歧义句可能被 <code>exfil.send-url</code> 误拒;</li>
+<li>「system prompt」这个短语<strong>刻意不封</strong>(harness 研究笔记的合法高频词)。</li>
+</ul>
+</li>
+<li>条目里的相邻花括号 <code>{{</code> 在系统提示里显示为 <code>{ {</code>(盘上原文不变)——dsh 对提示 section 做严格 <code>{{name}}</code> 模板插值,不打断会让整个 session 组装崩溃。</li>
+<li>写入用 0o600/0o700 权限位;<strong>Windows(NTFS)上 Node 只落实只读位</strong>,「仅属主可读写」不生效,真正的访问控制靠 <code>~/.dsh</code> 继承的用户目录 ACL。别把 0o600 当成 POSIX 级「仅我可读」。</li>
+<li>记忆文件目录并发写有跨进程 <code>.lock</code> 文件锁;若写入进程被强杀留下孤儿锁,后续写会等 2 秒后报 <code>MEMORY_LOCK_BUSY</code>,错误里带锁文件路径——确认没有别的 dsh 进程在跑后手工删掉即可。</li>
+<li>原子写不 fsync(与 dsh settings 同款):崩溃可能丢最后一笔写,下个 session 读盘上现状即可。</li>
+<li>错误的 <code>code</code> 字段是 best-effort:<code>link:</code> 安装可能出现 <code>HarnessError</code> 双副本导致 code 丢失,因此<strong>模型需要的信息全部在 message 文本里</strong>,不依赖 code。</li>
+<li>溢出上限按 codepoint 计(与 Hermes 的 Python <code>len()</code> 一致);中文信息密度高,同字符数装得下更多事实,嫌紧可调大。</li>
+<li>review 失败静默是取舍:后台调用出错只记日志与 sidecar,不重试,主对话永远不因 review 受影响;「没存上」在设置页活动页签可见。</li>
+<li>review 的写入质量(存不存、存多准)取决于模型对 review 指令的遵守度,因模型而异;不满意就关掉或换 <code>reviewModel</code>。</li>
+<li><code>topicsEnabled</code> 的行为半边(动作运行时拒绝、review 不追加 addendum)热生效,但工具 schema 是 apply 时静态注册的——schema 半边(动作从工具列表消失)要重载插件才变。同理,minimal preset 的会话没有 GUIDANCE 段落(persona complete 抑制装配期追加),memory_topic 只能靠工具描述自行发现,与 memory 工具现状一致。</li>
+<li>面板刷新是拉取不是推送(dsh 的 client 推送通道是白名单制,插件进不去):别处写入(模型工具 / review / 另一进程)后,点 Refresh 或重开设置页才可见。</li>
+<li>插件<strong>不</strong>往 session 日志 append 自定义事件类型:dsh 的日志事件词汇是白名单制,未知类型会让整份日志重放被拒。自省可观测性走 sidecar,不走日志。</li>
+</ul>
+<h2>实测</h2>
+<p>装载后按 <a href="https://github.com/SipengXie2024/dsh-memory-hermes/blob/HEAD/docs/playbook.zh.md">docs/playbook.zh.md</a> 走一遍:写入→fresh 召回→冻结→溢出→扫描→审批→session-query→并发→模型矩阵→卸载→后台自省→设置页。</p>

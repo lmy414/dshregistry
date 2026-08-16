@@ -1,0 +1,105 @@
+<h1>dsh-omni-bridge</h1>
+<p>Multi-channel message bridge for <a href="https://github.com/deepseek-ai/DeepSeek-Harness">DeepSeek Harness</a> (DSH): route <strong>WeChat (ClawBot/iLink)</strong>, <strong>QQ</strong>, and <strong>Feishu (Lark)</strong> chat messages to a DSH agent, and relay the agent's replies back to the sender.</p>
+<p>多通道桥接插件：把微信 ClawBot / QQ / 飞书的消息接入 DSH agent，并把回复回传给发消息的人。</p>
+<h2>Channels</h2>
+<table>
+<thead>
+<tr>
+<th>通道</th>
+<th>收消息</th>
+<th>发消息</th>
+<th>凭据</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>微信 ClawBot</td>
+<td>iLink 拉模式 (<code>/ilink/bot/getupdates</code>)</td>
+<td><code>/ilink/bot/sendmessage</code>（带 <code>client_id</code> + <code>base_info</code> + 回传 <code>context_token</code>）</td>
+<td><code>botToken</code>（扫码登录）</td>
+</tr>
+<tr>
+<td>QQ</td>
+<td>官方网关 WebSocket（长连接）</td>
+<td>`POST /v2/users</td>
+<td>groups/{openid}/messages<code>（被动消息带 </code>msg_id`）</td>
+</tr>
+<tr>
+<td>飞书</td>
+<td>官方 SDK 长连接（<code>@larksuiteoapi/node-sdk</code>，订阅 <code>im.message.receive_v1</code>）</td>
+<td><code>tenant_access_token</code> + <code>im/v1/messages</code></td>
+<td><code>appId</code> + <code>appSecret</code></td>
+</tr>
+</tbody></table>
+<ul>
+<li>微信/QQ：<strong>无默认 openid</strong> —— 谁发消息就回谁；群内 @机器人 就回群里（被动消息）。</li>
+<li>飞书：群内默认需 @机器人 才回复（<code>requireMention</code>），私聊始终回复。</li>
+<li>每个通道一个独立 DSH 会话（<code>omni-bridge-&lt;channel&gt;</code>），回复去重用 <code>sessionPersistence.readFrom</code> 水位（持久化 seq），解决「只有第一条回复」的问题。</li>
+</ul>
+<h2>形式说明</h2>
+<p>当前以 <strong>DSH 持久化 bundle</strong> 形式提供（host + client 打包进 profile，跨 DSH 重启生效）：</p>
+<ul>
+<li><code>lib/index.js</code> —— host 半区：三个通道的收发 + 会话桥接 + 定时轮询，通过 <code>webServer</code> 路由对外提供 RPC（<code>/omni-bridge/*</code>）。</li>
+<li><code>lib/client.js</code> —— client 半区：设置页（微信/QQ/飞书三张卡片），通过 <code>fetch</code> 调用 host 路由。</li>
+<li><code>lib/feishu-ws.cjs</code> —— 飞书长连接子进程（由 host 用 <code>node</code> 拉起）。</li>
+</ul>
+<h2>安装（bundle）</h2>
+<p><strong>方式一：从 npm 安装（推荐）</strong></p>
+<pre><code># 在 profile（如 ~/.dsh/profiles/web）目录执行
+pnpm add dsh-omni-bridge
+</code></pre>
+<p>然后在 profile 的 <code>package.json</code> 的 <code>dsh.profile.bundles</code> 追加 <code>"dsh-omni-bridge"</code>，重启 DSH 生效。</p>
+<p><strong>方式二：本地 tgz 安装</strong></p>
+<ol>
+<li><code>npm pack</code> 打包成 tgz（或直接用仓库目录）。</li>
+<li>在 profile（如 <code>~/.dsh/profiles/web</code>）的 <code>package.json</code>：<ul>
+<li><code>dsh.profile.bundles</code> 追加 <code>"dsh-omni-bridge"</code>；</li>
+<li><code>dependencies</code> 追加 <code>"dsh-omni-bridge": "file:&lt;tgz 路径&gt;"</code>。</li>
+</ul>
+</li>
+<li>在 profile 目录执行 <code>pnpm install</code>（会自动安装 <code>@larksuiteoapi/node-sdk</code> 依赖）。</li>
+<li>重启 DSH（bundle 层在启动时组合，需重启生效）。</li>
+</ol>
+<h2>依赖</h2>
+<p>飞书长连接依赖官方 SDK，由 bundle 的 <code>dependencies</code> 自动安装：</p>
+<pre><code>pnpm add @larksuiteoapi/node-sdk   # 或随 bundle 一起 pnpm install
+</code></pre>
+<p><code>lib/feishu-ws.cjs</code> 通过 <code>require('@larksuiteoapi/node-sdk')</code> 加载 SDK，Node 从该脚本所在目录向上解析到 profile 的 <code>node_modules</code>。</p>
+<h2>配置</h2>
+<p>配置文件位于 <code>~/.dsh/omni-bridge-config.json</code>：</p>
+<pre><code>{
+  "runtime": { "provider": "deepseek-official", "model": "deepseek-v4-flash" },
+  "channels": {
+    "weixin": { "enabled": true, "botToken": "...", "defaultTarget": "" },
+    "qq":      { "enabled": true, "appId": "...", "secret": "..." },
+    "feishu":  { "enabled": true, "appId": "cli_...", "appSecret": "...", "requireMention": true }
+  }
+}
+</code></pre>
+<h3>微信</h3>
+<ol>
+<li>在设置页点「获取二维码」→ 手机扫码登录，自动回填 <code>botToken</code>。</li>
+<li><code>defaultTarget</code> 留空则回复私信者。</li>
+</ol>
+<h3>QQ</h3>
+<ol>
+<li><a href="https://bot.qq.com">QQ 开放平台</a> 建机器人，拿 <code>appId</code> / <code>secret</code>。</li>
+<li>订阅「单聊消息」「群聊@消息」事件、开启被动消息权限。</li>
+<li>私信即回该用户；群里 @机器人 即回该用户。</li>
+</ol>
+<h3>飞书</h3>
+<ol>
+<li><a href="https://open.feishu.cn">飞书开放平台</a> 建「自建应用」，拿 App ID / App Secret。</li>
+<li>权限管理：添加 <code>im:message</code>（含 <code>im:message.group_at_msg</code>、<code>im:message.p2p_msg</code>、<code>im:message:send_as_bot</code>）。</li>
+<li>事件与回调：订阅方式选「使用长连接接收事件」，事件订阅添加 <code>im.message.receive_v1</code>。</li>
+<li>版本管理与发布：<strong>创建版本并发布</strong>（不发布权限和订阅不生效）。</li>
+<li>机器人加入会话/群。</li>
+</ol>
+<h2>使用</h2>
+<p>安装并重启后，设置页出现「远程桥接」卡片（微信/QQ/飞书三张配置卡）。</p>
+<h2>已知限制</h2>
+<ul>
+<li>飞书被动回复有时效（收到消息后有限时间内回复）。</li>
+<li><code>weixin-qr</code> / <code>weixin-poll</code> 使用 iLink 扫码登录流程，<code>botToken</code> 会写入 <code>~/.dsh/omni-bridge-config.json</code>。</li>
+</ul>
+<h2>License</h2>
+<p>MIT</p>

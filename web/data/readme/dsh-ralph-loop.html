@@ -1,0 +1,93 @@
+<h1>dsh-ralph-loop</h1>
+<p>RALPH 认知闭环插件：把 <strong>Reflect（反思）→ Assess（评估）→ Learn（学习）→ Plan（规划）→ Handle（执行）</strong> 的五阶段状态机接入 DeepSeek Harness (dsh)。针对传统 ReAct 循环的盲目试错、错误震荡与缺乏经验沉淀问题，提供确定性、可自愈的自主代码生成与错误修复闭环。</p>
+<pre><code>Plan ➔ Handle（写文件 + 跑测试）➔ Reflect（根因分析）➔ Assess（退出码门禁）➔ Learn（负向约束沉淀）
+</code></pre>
+<h2>这是什么</h2>
+<p><code>dsh-ralph-loop</code> 是一个 <strong>dsh bundle 包</strong>，导出单个 cordis 插件：</p>
+<table>
+<thead>
+<tr>
+<th>能力</th>
+<th>落点</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>ctx.ralph</code> 服务：<code>execute(task, testCmd, initialFiles)</code> 一键闭环</td>
+<td>服务注册（<code>RalphService</code>）</td>
+</tr>
+<tr>
+<td>五阶段状态机 + 不可变状态快照 + <code>maxCycles</code> 硬上限</td>
+<td>状态引擎（<code>engine.ts</code>）</td>
+</tr>
+<tr>
+<td><code>run_ralph_loop</code> 工具，LLM 可自主触发子图自愈</td>
+<td><code>ctx.tools</code></td>
+</tr>
+<tr>
+<td><code>ralph/*</code> 生命周期事件（start / cycle-start / reflect / learn / success / cycle-end / end）</td>
+<td><code>ctx.emit</code> 事件总线</td>
+</tr>
+<tr>
+<td>每次执行独立的临时工作目录；测试 shell 通过 Harness Sandbox 约束</td>
+<td>沙箱适配（<code>ctx.sandbox.confine</code> + <code>ctx.subprocess</code> + <code>node:fs</code>）</td>
+</tr>
+</tbody></table>
+<h2>设计要点（与设计文档的适配）</h2>
+<ul>
+<li>文档伪代码中的 <code>ctx.llm.chat(...)</code> 落地为 harness 原生 <code>ctx.llm.stream(GenerateOptions)</code> + 权威 <code>BlockAssembler</code>；Handle 的 JSON 生成经 <code>chatJson</code> + 容错 <code>extractJson</code>（去围栏/平衡括号提取）。</li>
+<li><strong>LLM 失败显式化</strong>：harness 语义下适配器/路由错误（provider 未注册、限流、网络失败）不抛异常，而是以终止性 finish 块结束流——<code>chatText</code> 迭代后检查 <code>finish.kind</code>，<code>error</code>/<code>aborted</code> 转为异常上抛。配错 provider 会立刻报错并触发退避重试，而不是静默返回空串、把 <code>maxCycles</code> 个周期空烧完。</li>
+<li>测试命令先构造当前平台的精确 shell argv，经 <code>ctx.sandbox.confine(argv, { mode: "workspace-write", workspaceRoot: &lt;本次临时目录&gt; })</code> 获得受限 argv，再交给 <code>ctx.subprocess.spawn</code>（collect 模式、树级终止、abort 超时）。Sandbox 缺失或不可用时 fail-closed，绝不回退到原始命令；插件自身仍使用 <code>node:fs</code> 准备/清理临时目录并执行路径守卫。</li>
+<li><strong>Sandbox 边界</strong>：<code>ctx.sandbox</code> 主要约束测试进程的文件效果，不等于网络、凭据或全系统隔离；Windows 或其他后端可能报告 <code>partial</code>。<code>confined.enforcement</code> 不是 <code>full</code>（包括 <code>partial</code>）时默认 fail-closed，不执行测试命令，也不裸回退到原始 argv。<code>testCmd</code> 仍是任意 shell 命令，只应在受控任务和受信任的 Harness profile 中使用。</li>
+<li>门禁唯一客观判据：退出码 <code>0</code>。测试命令超时（<code>testTimeoutMs</code>）按退出码 <code>-1</code> 走失败循环。</li>
+<li>Plan/Reflect 的提示词同时携带上次执行的 <strong>stdout 与 stderr</strong>（各尾部截断约 4KB——pytest/jest/go test 的失败摘要在 stdout 末尾），失败根因对反思节点完整可见。</li>
+<li>代码生成 JSON 解析失败不抛错：作为一次失败循环（stderr 记录 <code>RALPH 方案解析失败</code>）进入 Reflect/Learn，下一轮自愈。</li>
+<li>超过 <code>maxCycles</code> 硬上限自动终止，返回带累积 <code>lessonsLearned</code> 的最终快照（<code>isPassed: false</code>）。<code>maxCycles</code> 在工具 schema 与引擎双重钳制在 1-20，防误调用烧配额。</li>
+<li>整个闭环有总预算（<code>totalTimeoutMs</code>，默认 30 分钟；<code>execute</code> 可经 <code>deadlineMs</code> 覆盖）：预算通过内部 <code>AbortSignal</code> 主动中止正在进行的 <code>llm.stream</code> 与测试 subprocess（实际停止仍取决于适配器遵守取消信号），并返回带 <code>timedOut: true</code> 的最终快照、正常发出一次 <code>ralph/end</code>，防止挂起调用把工具调用钉死。外层 tool caller 自己 abort 时保留调用方原始取消 reason 并直接取消，不发正常 <code>ralph/end</code>。</li>
+<li><code>autoReflectOnFailure: false</code> 时失败反思退化为确定性 stderr 片段，零模型调用。</li>
+</ul>
+<h2>安装</h2>
+<pre><code># 发布后
+dsh plugin --profile web add dsh-ralph-loop
+
+# 本地开发（file: 链接）
+# 在 $DSH_HOME/profiles/&lt;name&gt;/package.json 加依赖并安装
+</code></pre>
+<p>profile 的 <code>dsh.profile.bundles</code> 需要包含 <code>dsh-ralph-loop</code>；插件依赖 Harness 的 <code>llm</code> / <code>tools</code> / <code>subprocess</code> / <code>sandbox</code> 服务（通常由 base bundle 提供）。宿主 profile 必须挂载可用的 Sandbox provider；<code>dsh-ralph-loop</code> 不自带 <code>dsh-sandbox-local</code>。</p>
+<h2>工具（<code>ctx.tools</code>）</h2>
+<table>
+<thead>
+<tr>
+<th>工具</th>
+<th>作用</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>run_ralph_loop</code></td>
+<td>在隔离沙箱中跑一轮 RALPH 闭环：<code>task</code> / <code>test_cmd</code> 必填，<code>files</code> / <code>max_cycles</code> / <code>provider</code> / <code>model</code> 可选。返回最终状态：验证通过的 <code>files</code>、测试输出、反思、累积负向约束。</td>
+</tr>
+</tbody></table>
+<h2>事件（<code>ctx.emit</code>）</h2>
+<p><code>ralph/start</code>、<code>ralph/cycle-start</code>、<code>ralph/reflect</code>、<code>ralph/learn</code>、<code>ralph/success</code>、<code>ralph/cycle-end</code>、<code>ralph/end</code>。全部载荷为不可变 <code>RalphState</code> 快照，可直接对接 dsh Trajectory 回放。</p>
+<h2>配置（<code>cordis.patch.yml</code> 的 <code>config</code>）</h2>
+<pre><code>- insert:
+    - id: ralph-loop
+      name: 'dsh-ralph-loop'
+      config:
+        maxCycles: 5            # 硬循环上限（工具调用可覆盖，钳制在 1-20）
+        autoReflectOnFailure: true  # false = 确定性 stderr 反思
+        verboseLogging: false   # 逐阶段日志
+        provider: ''            # LLM provider（执行时必填，工具调用可覆盖）
+        model: ''               # LLM model（执行时必填，工具调用可覆盖）
+        codegenMaxTokens: 0     # Handle 代码生成的 maxTokens 硬上限；0 = 不设
+        testTimeoutMs: 120000   # 单次测试命令超时
+        totalTimeoutMs: 1800000 # 整个闭环的总 wall-clock 预算（默认 30 分钟）
+</code></pre>
+<h2>开发</h2>
+<pre><code>npm install
+npm run build        # tsc → lib/
+npm run typecheck
+npm test             # build + node --test（pure.ts 解析/状态/提示词，8 用例）
+</code></pre>
+<p>引擎为纯函数 + 注入式服务 seam：<code>engine.ts</code> / <code>pure.ts</code> 可在无 harness 环境下用假 llm/subprocess 直测（状态流转、事件序列、熔断、解析自愈）。</p>
+<h2>许可</h2>
+<p>MIT。</p>

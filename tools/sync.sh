@@ -65,6 +65,13 @@ else
   log "WARN: sitemap 生成失败（继续）"
 fi
 
+# 2.6) 拆分单插件数据（详情页性能优化: 每插件独立 JSON + 分类子集）
+if node tools/split-data.js >> "$LOG_FILE" 2>&1; then
+  log "单插件数据拆分成功"
+else
+  log "WARN: 数据拆分失败（继续）"
+fi
+
 # 3) 有变更则提交推送（推当前分支，不直接推主干）
 if ! git diff --quiet -- web/data/ web/sitemap.xml; then
   CHANGE_INFO=$(git diff --stat -- web/data/ web/sitemap.xml | tail -1)

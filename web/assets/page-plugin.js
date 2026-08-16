@@ -9,7 +9,6 @@
   const pathMatch = location.pathname.match(/^\/p\/([^/]+)\.html$/)
   const slug = pathMatch ? decodeURIComponent(pathMatch[1]) : new URLSearchParams(location.search).get('slug')
   let plugin = null
-  let all = []
   let meta = {}
 
   function setText(selector, text) {
@@ -207,38 +206,49 @@
     }
   }
 
-  function renderRelated() {
-    const grid = document.querySelector('.related-grid')
-    if (!grid) return
-    const related = all.filter((p) => p.slug !== plugin.slug && p.category === plugin.category).slice(0, 4)
-    const pool = related.length > 0 ? related : all.filter((p) => p.slug !== plugin.slug).slice(0, 3)
-    grid.innerHTML = pool.map((p) => `<a href="/p/${encodeURIComponent(p.slug)}.html" class="related-card">
-      <div class="related-card-top">
-        <span class="related-card-name">${DSHR.escapeHtml(p.name)}</span>
-        ${DSHR.badgeHtml(p.state)}
-      </div>
-      <div class="related-card-desc">${DSHR.escapeHtml(p.description || '')}</div>
-    </a>`).join('')
-  }
-
   function renderAll() {
-    renderStatics(); renderStats(); renderHeader(); renderInstall(); renderMeta(); renderRisk(); renderRelated()
+    renderStatics(); renderStats(); renderHeader(); renderInstall(); renderMeta(); renderRisk()
   }
 
   DSHR.onReady(async () => {
     try {
-      ;[all, meta] = await DSHR.loadData()
+      // 性能优化: 只加载当前插件数据 (~1KB), 不再全量下载 plugins.json (2.27MB)
+      const res = await DSHR.fetchJson(`/data/plugin/${encodeURIComponent(slug)}.json`)
+      plugin = res
     } catch (e) {
-      console.error('[dshregistry] data load failed', e)
-      all = []
+      console.error('[dshregistry] plugin data load failed', e)
+      plugin = null
     }
-    plugin = all.find((p) => p.slug === slug)
     if (!plugin) {
       location.replace('404.html')
       return
     }
+    // 统计条数据 (meta.json 仅 136B, 并行加载不阻塞)
+    DSHR.fetchJson('/data/meta.json').then((m) => { meta = m || {}; renderStats() }).catch(() => {})
     renderAll()
     await renderReadme()
+    loadRelated()
   })
   DSHR.onLangChange(() => { if (plugin) renderAll() })
+
+  /** 相关推荐: 延迟加载分类子集 (小文件), 不阻塞首屏 */
+  async function loadRelated() {
+    try {
+      const cat = plugin.category || 'other'
+      const list = await DSHR.fetchJson(`/data/by-cat/${encodeURIComponent(cat)}.json`)
+      const related = list.filter((p) => p.slug !== plugin.slug).slice(0, 4)
+      const grid = document.querySelector('.related-grid')
+      if (grid) {
+        grid.innerHTML = related.map((p) => `<a href="/p/${encodeURIComponent(p.slug)}.html" class="related-card">
+          <div class="related-card-top">
+            <span class="related-card-name">${DSHR.escapeHtml(p.name)}</span>
+            ${DSHR.badgeHtml(p.state)}
+          </div>
+          <div class="related-card-desc">${DSHR.escapeHtml(p.description || '')}</div>
+        </a>`).join('')
+      }
+    } catch (e) {
+      console.warn('[dshregistry] related load failed', e)
+    }
+  }
 })()

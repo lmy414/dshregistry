@@ -154,7 +154,7 @@
       try {
         // 片段由爬虫在构建期渲染并白名单清洗,见 tools/crawl.js
         // readmeUrl 可能是相对路径 (data/readme/xxx.html), 在 /p/ 或 /c/ 页面需转绝对路径
-        const readmeUrl = plugin.readmeUrl.startsWith('/') ? plugin.readmeUrl : `/${plugin.readmeUrl}`
+        const readmeUrl = DSHR.assertLocalUrl(plugin.readmeUrl.startsWith('/') ? plugin.readmeUrl : `/${plugin.readmeUrl}`)
         const res = await fetch(readmeUrl)
         if (!res.ok) throw new Error(`HTTP ${res.status}`)
         body.innerHTML = await res.text()
@@ -211,9 +211,11 @@
   }
 
   DSHR.onReady(async () => {
+    // slug 白名单: 仅字母数字 . _ -(与爬虫 slug 规则一致), 其余一律 404
+    if (!/^[a-z0-9._-]+$/i.test(slug)) { location.replace('404.html'); return }
     try {
       // 性能优化: 只加载当前插件数据 (~1KB), 不再全量下载 plugins.json (2.27MB)
-      const res = await DSHR.fetchJson(`/data/plugin/${encodeURIComponent(slug)}.json`)
+      const res = await DSHR.fetchJson('plugin', slug)
       plugin = res
     } catch (e) {
       console.error('[dshregistry] plugin data load failed', e)
@@ -224,7 +226,7 @@
       return
     }
     // 统计条数据 (meta.json 仅 136B, 并行加载不阻塞)
-    DSHR.fetchJson('/data/meta.json').then((m) => { meta = m || {}; renderStats() }).catch(() => {})
+    DSHR.fetchJson('meta').then((m) => { meta = m || {}; renderStats() }).catch(() => {})
     renderAll()
     await renderReadme()
     loadRelated()
@@ -234,8 +236,10 @@
   /** 相关推荐: 延迟加载分类子集 (小文件), 不阻塞首屏 */
   async function loadRelated() {
     try {
-      const cat = plugin.category || 'other'
-      const list = await DSHR.fetchJson(`/data/by-cat/${encodeURIComponent(cat)}.json`)
+      // 分类白名单: 只允许固定 8 类(与爬虫 VALID_CATEGORIES 一致), 未知分类回退 other
+      const CAT_WHITELIST = ['tool', 'vision', 'dashboard', 'bridge', 'launcher', 'mcp', 'skill', 'other']
+      const cat = CAT_WHITELIST.includes(plugin.category) ? plugin.category : 'other'
+      const list = await DSHR.fetchJson('by-cat', cat)
       const related = list.filter((p) => p.slug !== plugin.slug).slice(0, 4)
       const grid = document.querySelector('.related-grid')
       if (grid) {

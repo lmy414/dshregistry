@@ -87,10 +87,29 @@
   }
 
   // ------------------------------------------------------------------ 数据
-  async function fetchJson(url) {
-    const res = await fetch(url)
-    if (!res.ok) throw new Error(`${url}: HTTP ${res.status}`)
-    return res.json()
+  /** 只允许站内相对路径:纯静态站不 fetch 任何外部资源;带协议/协议相对的 URL 一律拒绝。 */
+  function assertLocalUrl(url) {
+    if (typeof url !== 'string') throw new Error(`[dshregistry] 非法数据源: ${String(url)}`)
+    if (/^[a-z][a-z0-9+.-]*:\/\//i.test(url) || url.startsWith('//')) {
+      throw new Error(`[dshregistry] 拒绝外部数据源: ${url}`)
+    }
+    return url
+  }
+  /** 数据路由白名单: 只允许 4 个固定数据模式;参数仅作文件名片段并经 encodeURIComponent 消毒。 */
+  const DATA_ROUTES = {
+    plugins: () => '/data/plugins.json',
+    meta: () => '/data/meta.json',
+    plugin: (slug) => `/data/plugin/${encodeURIComponent(slug)}.json`,
+    'by-cat': (cat) => `/data/by-cat/${encodeURIComponent(cat)}.json`,
+  }
+  function fetchJson(key, arg) {
+    const build = DATA_ROUTES[key]
+    if (typeof build !== 'function') throw new Error(`[dshregistry] 未知数据源: ${String(key)}`)
+    const url = assertLocalUrl(build(arg))
+    return fetch(url).then((res) => {
+      if (!res.ok) throw new Error(`${url}: HTTP ${res.status}`)
+      return res.json()
+    })
   }
   /** 带 sessionStorage 缓存的加载: 切换页面不重复下载 (首页数据 2.27MB 关键优化) */
   const DATA_CACHE_KEY = 'dsh-data-v1'
@@ -102,7 +121,7 @@
         if (t && Date.now() - t < 10 * 60 * 1000) return Promise.resolve([plugins, meta])
       } catch { /* 缓存损坏则重取 */ }
     }
-    return Promise.all([fetchJson('/data/plugins.json'), fetchJson('/data/meta.json')]).then(([plugins, meta]) => {
+    return Promise.all([fetchJson('plugins'), fetchJson('meta')]).then(([plugins, meta]) => {
       try {
         sessionStorage.setItem(DATA_CACHE_KEY, JSON.stringify({ t: Date.now(), plugins, meta }))
       } catch { /* 存储满则忽略 */ }
@@ -181,7 +200,7 @@
   }
 
   window.DSHR = {
-    t, loadData, fetchJson, escapeHtml, badgeHtml, categoryLabel, relativeTime, setTrailingText,
+    t, loadData, fetchJson, assertLocalUrl, escapeHtml, badgeHtml, categoryLabel, relativeTime, setTrailingText,
     CATEGORIES, SVG_USER, SVG_STAR,
     onReady: (fn) => document.addEventListener('dsh:ready', fn),
     onLangChange: (fn) => document.addEventListener('dsh:lang', fn),

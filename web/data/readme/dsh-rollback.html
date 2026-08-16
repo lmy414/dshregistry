@@ -1,0 +1,201 @@
+<h1>dsh-rollback</h1>
+<p><a href="https://www.npmjs.com/package/dsh-rollback"><img src="https://img.shields.io/npm/v/dsh-rollback.svg" alt="npm version"></a>
+<a href="https://github.com/Taler97/dsh-rollback/blob/HEAD/LICENSE"><img src="https://img.shields.io/badge/License-MIT-yellow.svg" alt="License: MIT"></a></p>
+<p>English | <a href="https://github.com/Taler97/dsh-rollback/blob/HEAD/README.zh.md">中文</a></p>
+<p>File-mutation rollback plugin for <a href="https://github.com/deepseek-ai/deepseek-harness">DeepSeek Harness</a>: it observes every successful tool result for the pre-image a <code>write</code>/<code>edit</code> mutation reports, checkpoints that pre-image into the workspace git object database or a snapshot store, and exposes restore through a model-facing <code>rollback_files</code> tool and a <code>/rollback</code> human command. It registers no service and changes no loop code — capture rides the <code>tools/result</code> observation event, and restore writes files directly (never through the fs policy seam or the sandbox, because undoing a mutation must not be gated by the policy the mutation passed).</p>
+<h2>Install</h2>
+<p>The package is an installable <strong>bundle</strong> (declares <code>dsh.bundle</code>), so it plugs into a profile without touching the harness. All you need is a <code>dsh</code> CLI; the runtime peer packages (<code>@deepseek-ai/dsh-tools</code>, <code>@deepseek-ai/cordis</code>, ...) resolve from the dsh installation itself, so nothing else is installed.</p>
+<h3>Prerequisites</h3>
+<ul>
+<li>A <code>dsh</code> CLI on the machine (<code>dsh plugin</code> shells out to <code>pnpm</code>, so <code>pnpm</code> must be on <code>PATH</code>).</li>
+<li>A profile to install into — <code>demo</code> below is initialized on first use; use any name.</li>
+</ul>
+<h3>Install from npm (recommended)</h3>
+<pre><code>dsh plugin --profile demo add dsh-rollback
+</code></pre>
+<p>Other sources work the same way:</p>
+<pre><code># straight from git (sources are built by the prepare script; pin a commit)
+dsh plugin --profile demo add github:you/dsh-rollback#&lt;sha&gt;
+
+# or from a local tarball
+dsh plugin --profile demo add ./dsh-rollback-0.1.0.tgz
+</code></pre>
+<h3>Verify the install</h3>
+<ol>
+<li>The profile manifest under <code>$DSH_HOME/profiles/demo/</code> (<code>$DSH_HOME</code> defaults to <code>~/.dsh</code>) now lists <code>dsh-rollback</code> in <code>dependencies</code> <strong>and</strong> in <code>dsh.profile.bundles</code> — the reconciler adds it automatically because the package declares <code>dsh.bundle</code>. The equivalent manual patch layer row:</li>
+</ol>
+<pre><code>- id: rollback
+  name: dsh-rollback
+  config:
+    mode: auto          # auto | git | snapshot
+    storeDir: ''        # '' = &lt;harness home&gt;/rollback
+    maxRecords: 200
+    gitPath: git
+</code></pre>
+<ol>
+<li>Start a session. Any of these proves the plugin is live:<ul>
+<li>the model sees a <code>rollback_files</code> tool in its tool list,</li>
+<li>typing <code>/rollback</code> answers <code>rollback: nothing to restore</code> (instead of an unknown-command error) before any mutation happened.</li>
+</ul>
+</li>
+</ol>
+<h2>Usage</h2>
+<h3>30-second quickstart</h3>
+<ol>
+<li>Open a session whose working directory is a git repository.</li>
+<li><code>write</code> a file <code>notes.md</code> with the content <code>hello</code>.</li>
+<li><code>write</code> it again with <code>goodbye</code> — the first content is silently checkpointed.</li>
+<li>Tell the model <em>"restore the file you just overwrote"</em> (it calls <code>rollback_files</code>), or type <code>/rollback</code> yourself.</li>
+<li>Read <code>notes.md</code>: it says <code>hello</code> again.</li>
+</ol>
+<h3>For humans — <code>/rollback [count]</code></h3>
+<p>Type it in the chat input (base <code>web</code> and <code>headless</code> profiles mount the command registry the command needs):</p>
+<ul>
+<li><code>/rollback</code> — undo the single most recent captured mutation in this session's working directory,</li>
+<li><code>/rollback 3</code> — undo the three most recent ones.</li>
+</ul>
+<p>The output lists every restored file and its action:</p>
+<pre><code>rollback: restored 2 file mutation(s):
+  restored  /ws/src/lib/parse.ts
+  deleted   /ws/src/lib/generated.ts
+</code></pre>
+<h3>For models — <code>rollback_files</code></h3>
+<p>One model-facing tool, <code>rollback_files {count}</code> (no prompt section). It is meant for the model to undo its own <code>write</code>/<code>edit</code> mistakes instead of asking the user. Restores are scoped to the calling session's working directory and reported as a per-file summary — restored file contents are not echoed.</p>
+<h3>What is captured</h3>
+<p>Only successful <code>write</code>/<code>edit</code> tool results that carry a <code>before</code> pre-image. Mutations through <code>bash</code>, <code>str_replace_editor</code>, or raw subprocesses carry no pre-image and are not captured (see <a href="#known-limitations-and-deferred-work">Known Limitations</a>). A session can only restore records at or under its own working directory.</p>
+<h2>Demo: before and after</h2>
+<p>One <code>write</code> overwrite, undone. Same file, four states:</p>
+<table>
+<thead>
+<tr>
+<th>Step</th>
+<th>Action</th>
+<th><code>notes.md</code></th>
+</tr>
+</thead>
+<tbody><tr>
+<td>1</td>
+<td>original state</td>
+<td><code>hello</code></td>
+</tr>
+<tr>
+<td>2</td>
+<td>model <code>write</code>s a broken edit — pre-image captured</td>
+<td><code>goodbye</code></td>
+</tr>
+<tr>
+<td>3</td>
+<td>model calls <code>rollback_files {"count": 1}</code></td>
+<td>(transparent)</td>
+</tr>
+<tr>
+<td>4</td>
+<td>restored, byte-for-byte</td>
+<td><code>hello</code></td>
+</tr>
+</tbody></table>
+<p>The full transcript of that turn:</p>
+<pre><code># 1. original
+$ cat /ws/notes.md
+hello
+
+# 2. the model overwrites it; tools/result carries the pre-image "hello",
+#    and the capture listener checkpoints it into the git object database
+&gt; tool/call   write {"path": "/ws/notes.md", "content": "goodbye"}
+&gt; tool/result {"path": "/ws/notes.md", "before": "hello", ...}
+
+# 3. the model realizes the mistake and undoes it
+&gt; tool/call   rollback_files {"count": 1}
+&gt; tool/result "rollback: restored 1 file mutation(s):
+               restored  /ws/notes.md"
+
+# 4. back to the pre-mutation content
+$ cat /ws/notes.md
+hello
+</code></pre>
+<p>Under the hood: <code>git hash-object -w</code> wrote the pre-image into git's object database (zero index/branch/working-tree pollution), and one line was appended to the durable <code>manifest.jsonl</code> — the same undo works after a restart.</p>
+<h2>How it works</h2>
+<pre><code>flowchart TD
+    M[模型调用 write/edit] --&gt; R["tools/result 观察事件"]
+    R --&gt; C{结果带 before 改前映像?}
+    C -- 否 --&gt; X[忽略]
+    C -- 是 --&gt; S[CheckpointStore 捕获]
+    S --&gt; G{工作区是 git 仓库?}
+    G -- 是 --&gt; B["git hash-object -w 存 blob"]
+    G -- 否 --&gt; P["写 storeDir/snapshots/ 快照"]
+    S --&gt; MF["追加 manifest.jsonl"]
+    U["模型调 rollback_files / 用户 /rollback"] --&gt; RS["restore 按 session.cwd 作用域"]
+    RS --&gt; RR["git cat-file / 快照 / 删除文件"]
+</code></pre>
+<p>The diagram above is a full worked example with a before/after transcript — see <a href="#demo-before-and-after">Demo</a>.</p>
+<h2>Plugin (namespace: <code>rollback</code>)</h2>
+<p>A function/namespace plugin (<code>name</code> / <code>inject</code> / <code>Config</code> / <code>apply</code>), not a service. It is a loop-hygiene guard in the same family as <code>dsh-tool-call-timeout-policy</code>: it layers a safety net over the documented <code>tools/*</code> extension points instead of touching the agent loop.</p>
+<h3>Config</h3>
+<table>
+<thead>
+<tr>
+<th>Key</th>
+<th>Type</th>
+<th>Default</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>mode</code></td>
+<td><code>'auto' | 'git' | 'snapshot'</code></td>
+<td><code>'auto'</code></td>
+<td><code>git</code> checkpoints every pre-image as a git blob (requires a repository; a non-repository path fails loud and captures nothing); <code>snapshot</code> always copies pre-images under <code>storeDir/snapshots/</code>; <code>auto</code> picks git per file when the workspace is a repository and snapshots otherwise.</td>
+</tr>
+<tr>
+<td><code>storeDir</code></td>
+<td>string</td>
+<td><code>''</code></td>
+<td>Root holding the durable <code>manifest.jsonl</code> and <code>snapshots/</code>. Empty resolves to <code>rollback</code> under the Harness home.</td>
+</tr>
+<tr>
+<td><code>maxRecords</code></td>
+<td>number</td>
+<td><code>200</code></td>
+<td>Upper bound on in-memory records per store; the oldest are dropped beyond it (the durable manifest keeps everything).</td>
+</tr>
+<tr>
+<td><code>gitPath</code></td>
+<td>string</td>
+<td><code>'git'</code></td>
+<td>Git executable name or absolute path.</td>
+</tr>
+</tbody></table>
+<h3>Behavior</h3>
+<p><strong>Capture.</strong> A <code>tools/result</code> listener converts a successful <code>write</code>/<code>edit</code> outcome into a checkpoint: the outcome's <code>before</code> field is the pre-mutation content (<code>null</code> records a file that did not exist). <code>blob</code> pre-images are written with <code>git hash-object -w --stdin</code> inside the file's repository (discovered by walking up to <code>.git</code>, cached per directory) — zero index/branch/working-tree pollution, content-addressed and deduplicated by git itself. Every record is appended as one JSONL line to <code>manifest.jsonl</code>; a store replay on plugin load restores the in-memory list, so restores survive restarts. Only absolute local display paths are captured; relative or remote display paths (non-local filesystem backends) are ignored.</p>
+<p><strong>Restore.</strong> <code>restore(count, under)</code> re-materializes the <code>count</code> most-recent records whose path lies at or under <code>under</code> (the calling agent's session working directory): <code>blob</code> via <code>git cat-file blob &lt;hash&gt;</code>, <code>snapshot</code> from <code>storeDir/snapshots/&lt;ref&gt;</code>, and <code>absent</code> by deleting the file. Writes are atomic (temp file + rename) and create parent directories. Restored records are removed from the in-memory list; the manifest stays append-only, so a restart replays the same records and a later restore re-applies the identical pre-image (idempotent, no double-undo).</p>
+<p><strong>Exposure.</strong></p>
+<ul>
+<li><code>rollback_files</code> tool — model-facing restore, parameter <code>count</code> (integer, default 1). Registered on <code>ctx.tools</code>; not concurrency-safe. It refuses when the calling execution has no session working directory.</li>
+<li><code>/rollback [count]</code> command — the same restore for the receiving agent's session; the command child activates only when a command registry is composed (base <code>web</code> and <code>headless</code> profiles mount <code>dsh-commands</code>).</li>
+</ul>
+<h3>Why git, and why direct spawn</h3>
+<p>Git blobs are the same mechanism ccAgent uses: <code>hash-object -w</code> writes the pre-image without touching index, refs, or the working tree; <code>cat-file</code> restores bytes verbatim; unreferenced blobs are reclaimed by git's own gc. Git is spawned directly via <code>node:child_process</code> (never through <code>ctx.shell</code> or <code>ctx.subprocess</code>): a restore is a deliberate system-level undo, so it must not be confined by the sandbox or shell policy it is undoing.</p>
+<h2>Model Experience</h2>
+<h3>Model-facing restore tool</h3>
+<h4>What the model sees</h4>
+<p>This plugin adds one model-facing tool, <code>rollback_files</code> (integer parameter <code>count</code>, string output), and no prompt section. It changes no other tool's schema or system prompt. The <code>/rollback</code> command is a human command plane entry; it never reaches the model.</p>
+<h4>Token effect</h4>
+<p>Zero tokens on normal operation. A <code>rollback_files</code> call adds its small tool/result pair; the restored file content is not echoed (only a summary line). Capture itself is invisible to the model.</p>
+<h4>KV Cache effect</h4>
+<p>Append-only; the added tool schema and result follow the reusable request prefix and do not invalidate existing KV-cache entries.</p>
+<h2>Known Limitations and Deferred Work</h2>
+<ul>
+<li><strong>Only <code>write</code>/<code>edit</code> mutations are checkpointed</strong> — mutations made through <code>bash</code>, <code>str_replace_editor</code>, or raw subprocesses carry no <code>before</code> pre-image in their result and are not captured. A plan-scoped batch backup (capture every file a plan touches before execution) is the corresponding generalization, deferred.</li>
+<li><strong>UTF-8 text only</strong> — pre-images travel as strings; binary content is outside scope (matching the fs tools' text-only contract).</li>
+<li><strong>Restores are workspace-scoped</strong> — records outside the calling agent's session working directory are never restored by that caller; there is no cross-directory or global restore entry point.</li>
+<li><strong>Append-only manifest, no pruning</strong> — restored records remain in <code>manifest.jsonl</code> and re-appear on replay (idempotent re-restore, never a double-undo), but a long-lived harness home grows without compaction.</li>
+<li><strong>Git gc can prune long-lived blobs</strong> — default gc reclaims unreferenced objects after a retention window; checkpoints older than that window may fail to restore. A keep-alive ref namespace is deferred.</li>
+<li><strong>No automatic restore on failure</strong> — <code>restoreOnFailure</code> is deliberately not offered in v1; auto-restore would need to attribute failure to specific mutations first.</li>
+</ul>
+<h2>Development</h2>
+<pre><code>pnpm install     # peer packages resolve from npm releases
+pnpm run build   # tsdown -&gt; lib/ (ESM + d.mts), self-contained
+pnpm test        # vitest, 9 store-level tests
+</code></pre>
+<h2>License</h2>
+<p>MIT</p>

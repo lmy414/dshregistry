@@ -1,0 +1,127 @@
+<p><a href="https://github.com/ShiraGawaAnri/dsh-vision-bridge/blob/HEAD/README.zh.md">中文</a> | <a href="https://github.com/ShiraGawaAnri/dsh-vision-bridge/blob/HEAD/README.md">English</a></p>
+<h1>dsh-vision-bridge</h1>
+<p>A DSH profile bundle for sessions running models that cannot accept image
+input (DeepSeek and similar). Instead of the native "the current model does
+not support images" rejection, the plugin runs the following pipeline:</p>
+<ol>
+<li>materializes the image into the session workspace (<code>.dsh-vision-bridge/</code>);</li>
+<li>rewrites the user message (via the sanctioned <code>agent/pre-step</code> channel) into
+a <code>[图片桥接]</code> instruction carrying the image paths;</li>
+<li>registers a <strong>system-prompt rule</strong> (order 150) requiring the model to call
+the configured vision tool (default <code>vision_glance</code>, fuzzy-selectable such
+as <code>glance</code> / <code>ground</code> / <code>detect</code>, matched against the agent's actual
+toolset) and answer from its analysis — the tool-call card and its result
+appear in the conversation;</li>
+<li>patches <code>llm.stream</code> to strip image blocks — including images nested inside
+tool results — replacing them with a placeholder before a text-only adapter
+serializes the conversation.</li>
+</ol>
+<p>Sessions whose agent preset matches <strong>excluded presets</strong> (default <code>minimal</code>,
+the two-tool preset) are NOT bridged: their images are replaced with the
+original "model does not support images" notice text. The preset a session
+runs is resolved the same way DSH itself resolves it: the newest
+<code>agent-preset/selected</code> event wins, with the creation-time header as fallback.</p>
+<h2>Why the native rejection happens (DSH itself)</h2>
+<ul>
+<li><code>dsh-host-apiproxy</code>'s <code>prompt</code> RPC rejects image messages <em>before</em> they enter
+the session when <code>llm.resolveModelInfo().inputModalities</code> lacks <code>image</code>
+(that is the banner shown in the UI).</li>
+<li>The DeepSeek adapter throws <code>UNSUPPORTED_CONTENT</code> on any message containing
+image blocks at serialization time.</li>
+</ul>
+<p>This plugin intervenes at three layers:</p>
+<table>
+<thead>
+<tr>
+<th>Layer</th>
+<th>Mechanism</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>Admission</td>
+<td>Patches <code>llm.resolveModelInfo</code> so bridged models report an <code>image</code> input modality</td>
+</tr>
+<tr>
+<td>Current message</td>
+<td><code>agent/pre-step</code> materializes the image and injects the vision-tool instruction</td>
+</tr>
+<tr>
+<td>History</td>
+<td>Patches <code>llm.stream</code> to strip image blocks before adapter serialization</td>
+</tr>
+</tbody></table>
+<h2>Settings (Settings → 视觉桥接)</h2>
+<table>
+<thead>
+<tr>
+<th>Setting</th>
+<th>Default</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>Enable vision bridge</td>
+<td>on</td>
+<td>Off = restore native DSH blocking entirely</td>
+</tr>
+<tr>
+<td>Vision tool (fuzzy input)</td>
+<td><code>vision_glance</code></td>
+<td>The tool the model must call; fuzzy-matched against the agent's real toolset</td>
+</tr>
+<tr>
+<td>Custom prompt (optional)</td>
+<td>empty</td>
+<td>Extra instruction passed to the vision tool</td>
+</tr>
+<tr>
+<td>Bridge models</td>
+<td><code>deepseek-official*,deepseek*</code></td>
+<td><code>provider[:model]</code> patterns, <code>*</code> wildcards</td>
+</tr>
+<tr>
+<td>Excluded session presets</td>
+<td><code>minimal</code></td>
+<td>Multi-select + extra wildcard patterns; matched sessions are NOT bridged (original blocking text)</td>
+</tr>
+</tbody></table>
+<p>Configuration is persisted through the DSH settings service (namespace
+<code>vision-bridge</code>); it survives restarts.</p>
+<h2>Platforms: WSL/Ubuntu and Windows</h2>
+<ul>
+<li>Image bytes are written via <code>ctx.shell</code> with <strong>base64 on stdin</strong> (no huge
+command lines): <code>bash</code> (<code>base64 -d</code>) on Linux/WSL, PowerShell
+(<code>[IO.File]::WriteAllBytes</code>) on native Windows — the shell flavor is
+auto-detected once (<code>Write-Output</code> probe + <code>resolveExecutable('pwsh')</code>
+fallback).</li>
+<li>Shell commands carry the <strong>session-resolved sandbox policy</strong> (like the bash
+tool): <code>danger-full-access</code> sessions run without a sandbox backend; confined
+sessions run inside the workspace fence when a backend exists.</li>
+<li>The vision tools themselves are native DSH tools (vision-tools skill); their
+runtime already handles cross-platform execution.</li>
+</ul>
+<h2>Requirements</h2>
+<ul>
+<li>The session must have the vision-tools skill loaded (or another vision
+plugin) so a vision tool exists in the agent's toolset; otherwise the bridge
+degrades to a self-heal instruction (load the skill first) or a clear notice.</li>
+<li>Standard/cordis presets have the <code>skill</code> tool; the <code>minimal</code> preset does not
+(it is excluded by default).</li>
+</ul>
+<h2>Installation</h2>
+<p>Unzip the bundle, then add it to a profile:</p>
+<pre><code>unzip dsh-vision-bridge.zip -d dsh-vision-bridge
+dsh plugin --profile web add ./dsh-vision-bridge
+</code></pre>
+<p>(<code>dsh plugin</code> forwards to pnpm in the profile directory. Alternatively, copy
+the extracted folder into the profile's <code>node_modules/@dsh-external/</code> and
+reconcile plugins.)</p>
+<h2>Known limitations</h2>
+<ul>
+<li>The admission patch is process-wide, so excluded sessions cannot get the
+native error banner — the same reason is rendered as text instead.</li>
+<li>Multiple sessions share the plugin's global effects (llm patches, pre-step
+listener, system rule) while the plugin is mounted.</li>
+<li>Bridged models never receive image blocks (the adapter forbids them); the
+attachment stays available in the session.</li>
+</ul>

@@ -1,0 +1,462 @@
+<h1>DeepSeek Harness Lark / 飞书</h1>
+<p><code>@sugarforever/dsh-lark</code> 是一个 DeepSeek Harness Host 插件。安装后，用户可以直接从飞书或 Lark 与 Harness Agent 对话，并继续使用 Harness 中配置的模型、工具、系统提示和会话存储。</p>
+<p>插件使用飞书官方 <code>@larksuiteoapi/node-sdk</code> 的 Channel API，通过 WebSocket 长连接接收消息，不需要公网服务器、域名或 Webhook 回调地址。官方 SDK 负责连接、自动重连、消息去重、过期事件过滤、同一聊天的串行处理、消息格式转换和发送回复；插件负责把飞书会话映射到 Harness Session，再把消息交给 Agent。</p>
+<h2>功能</h2>
+<ul>
+<li>支持飞书中国版和国际版 Lark。</li>
+<li>使用 WebSocket 长连接接收事件，无需公网回调地址。</li>
+<li>单聊和普通群聊按聊天复用 Harness Session。</li>
+<li>话题群按线程使用独立 Harness Session。</li>
+<li>回复会关联原始消息，并保留在原来的话题线程中。</li>
+<li>群聊默认需要 @机器人，单聊默认开放。</li>
+<li>可以通过白名单限制群聊和单聊用户。</li>
+<li>可以沿用 Harness 默认模型，也可以为飞书渠道指定模型。</li>
+<li>会话标识经过 SHA-256 处理，不会把原始 <code>chat_id</code> 写进 Session ID。</li>
+<li>Harness 内部错误不会直接发送给飞书用户。</li>
+</ul>
+<h2>运行要求</h2>
+<ul>
+<li>Node.js <code>^22.19.0</code> 或 <code>&gt;=24.0.0</code>。</li>
+<li>已安装或能够通过 <code>npx</code> 运行 DeepSeek Harness。</li>
+<li>一个飞书或 Lark 自建应用。</li>
+<li>应用已经启用机器人能力。</li>
+<li>应用使用长连接接收事件，并订阅 <code>im.message.receive_v1</code>。</li>
+</ul>
+<p>如果尚未运行过 Harness，可以先启动一次 Web Profile：</p>
+<pre><code>npx @deepseek-ai/dsh web
+</code></pre>
+<p>首次启动会创建 <code>web</code> Profile。默认目录是 <code>~/.dsh/profiles/web</code>；如果设置了 <code>DSH_HOME</code>，则位于 <code>$DSH_HOME/profiles/web</code>。</p>
+<h2>创建飞书应用</h2>
+<p>以下名称在飞书中国版和国际版 Lark 控制台中可能略有区别，但配置内容相同。</p>
+<h3>创建自建应用</h3>
+<ol>
+<li>打开飞书或 Lark 开发者后台。</li>
+<li>创建一个企业自建应用。</li>
+<li>填写应用名称、描述和图标。</li>
+<li>进入“凭证与基础信息”，记录 App ID 和 App Secret。</li>
+</ol>
+<p>不要把 App Secret 直接写进仓库中的 YAML 文件。后续通过环境变量传给插件。</p>
+<h3>启用机器人</h3>
+<ol>
+<li>进入“添加应用能力”。</li>
+<li>添加“机器人”能力。</li>
+<li>设置机器人名称和头像。</li>
+</ol>
+<h3>添加权限</h3>
+<p>默认配置下，应用需要开通以下三个权限：</p>
+<table>
+<thead>
+<tr>
+<th>权限标识</th>
+<th>控制台中的权限名称</th>
+<th>用途</th>
+<th>是否必需</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>im:message.p2p_msg:readonly</code></td>
+<td>获取用户发给机器人的单聊消息</td>
+<td>接收用户与机器人的单聊消息</td>
+<td>是</td>
+</tr>
+<tr>
+<td><code>im:message.group_at_msg:readonly</code></td>
+<td>获取群组中 @机器人的消息</td>
+<td>接收群聊中明确 @机器人的消息</td>
+<td>是</td>
+</tr>
+<tr>
+<td><code>im:message:send_as_bot</code></td>
+<td>以应用的身份发消息</td>
+<td>让机器人回复单聊、群聊和话题消息</td>
+<td>是</td>
+</tr>
+</tbody></table>
+<p>飞书控制台中显示的中文名称可能随平台版本略有调整，应以权限标识为准。添加 <code>im.message.receive_v1</code> 事件时，控制台通常也会提示补充前两个接收权限。</p>
+<p>如果开发者后台支持批量导入权限，可以直接复制下面的配置：</p>
+<pre><code>{
+  "scopes": {
+    "tenant": [
+      "im:message.group_at_msg:readonly",
+      "im:message.p2p_msg:readonly",
+      "im:message:send_as_bot"
+    ],
+    "user": []
+  }
+}
+</code></pre>
+<p>这组配置对应插件的默认行为：接收单聊消息、接收群聊中 @机器人的消息，以及以机器人身份发送回复。导入后仍需在事件订阅中添加 <code>im.message.receive_v1</code>，并发布新版本，权限和事件配置才会应用到已安装的机器人。</p>
+<p>如果需要让机器人处理群聊中没有 @机器人的普通消息，还要额外开通：</p>
+<table>
+<thead>
+<tr>
+<th>权限标识</th>
+<th>控制台中的权限名称</th>
+<th>用途</th>
+<th>是否必需</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>im:message.group_msg</code></td>
+<td>获取群组中所有消息</td>
+<td>配合 <code>requireMention: false</code> 接收群内全部消息</td>
+<td>仅关闭 @限制时需要</td>
+</tr>
+</tbody></table>
+<p><code>im:message.group_msg</code> 的权限范围更大，通常需要企业管理员审批。默认的 <code>requireMention: true</code> 不需要申请这个权限。</p>
+<p>有些企业会直接批准范围更大的 <code>im:message</code> 权限，它也可以覆盖消息读取和发送场景，但本插件不要求使用这个宽泛权限。优先申请上表中的最小权限即可。</p>
+<p>权限变更可能需要企业管理员审批。测试时如果机器人能够加入聊天，但收不到消息或不能回复，先检查权限是否仍处于待审批状态。</p>
+<h3>配置长连接事件</h3>
+<ol>
+<li>进入“事件与回调”或“事件订阅”。</li>
+<li>在事件接收方式中选择“使用长连接接收事件”。</li>
+<li>不要填写 Webhook 请求地址。</li>
+<li>添加事件 <code>im.message.receive_v1</code>。</li>
+<li>保存配置。</li>
+</ol>
+<p>长连接模式由插件主动连接飞书，因此本地电脑、内网服务器和没有公网入口的开发环境都可以运行。</p>
+<h3>发布并安装应用</h3>
+<ol>
+<li>创建应用版本。</li>
+<li>提交审核或发布到测试范围。</li>
+<li>将应用安装到当前企业或测试企业。</li>
+<li>在飞书中找到机器人并发起单聊，或者把机器人加入测试群。</li>
+</ol>
+<p>只修改后台配置但没有发布新版本时，事件和权限通常不会在正式应用中生效。</p>
+<h2>安装插件</h2>
+<p>从 npm 安装到 Harness Web Profile：</p>
+<pre><code>npx @deepseek-ai/dsh plugin --profile web add @sugarforever/dsh-lark
+</code></pre>
+<p>查看已经安装的插件：</p>
+<pre><code>npx @deepseek-ai/dsh plugin --profile web list
+</code></pre>
+<p>开发本项目时，也可以安装本地目录：</p>
+<pre><code>git clone https://github.com/sugarforever/dsh-lark.git
+cd dsh-lark
+npm install
+npm test
+npm run typecheck
+npm run build
+npx @deepseek-ai/dsh plugin --profile web add "$PWD"
+</code></pre>
+<p>插件自带的 <code>cordis.patch.yml</code> 默认处于禁用状态，避免安装后在没有凭据的情况下反复连接。下一步需要在 Web Profile 中启用实例。</p>
+<h2>配置环境变量</h2>
+<p>在启动 Harness 的同一个终端中设置凭据：</p>
+<pre><code>export FEISHU_APP_ID=cli_xxxxxxxxxxxxxxxx
+export FEISHU_APP_SECRET=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+</code></pre>
+<p>也可以把变量放进仅限当前用户读取的启动脚本或服务配置中。不要提交包含真实凭据的 <code>.env</code>、YAML 或 Shell 文件。</p>
+<p>如果使用国际版 Lark，变量名仍然可以保持不变，平台由后面的 <code>domain</code> 配置决定。</p>
+<h2>启用插件实例</h2>
+<p>打开 Web Profile 的 <code>cordis.patch.yml</code>。默认路径：</p>
+<pre><code>~/.dsh/profiles/web/cordis.patch.yml
+</code></pre>
+<p>插件安装后，bundle 层已经创建了一个禁用状态的 <code>lark-channel</code> 实例。Profile patch 应覆盖并启用这个实例，不要再次使用 <code>insert</code> 创建同名实例：</p>
+<pre><code>- id: lark-channel
+  disabled: false
+  config:
+    appId: !!js process.env.FEISHU_APP_ID
+    appSecret: !!js process.env.FEISHU_APP_SECRET
+    domain: feishu
+    requireMention: true
+    dmMode: open
+</code></pre>
+<p>如果使用 <code>LARK_APP_ID</code> 和 <code>LARK_APP_SECRET</code> 作为环境变量，只需修改映射：</p>
+<pre><code>- id: lark-channel
+  disabled: false
+  config:
+    appId: !!js process.env.LARK_APP_ID
+    appSecret: !!js process.env.LARK_APP_SECRET
+    domain: lark
+    requireMention: true
+    dmMode: open
+</code></pre>
+<p>如果启动时报 <code>duplicate loader entry id: lark-channel</code>，说明 Profile patch 中使用了 <code>insert</code>，与插件 bundle 自带的实例发生重复。删除 <code>insert</code> 和重复的 <code>name</code>，改成上面的 id-targeted 覆盖格式。</p>
+<p>国际版 Lark 使用：</p>
+<pre><code>domain: lark
+</code></pre>
+<p><code>workspace</code> 和 <code>agentPreset</code> 是可选配置项。默认情况下，不需要把它们加入 Profile patch，也不需要修改插件自带的 <code>cordis.patch.yml</code>：</p>
+<ul>
+<li>未配置 <code>workspace</code> 时，插件使用 Harness 中第一个已注册的 Workspace。</li>
+<li>未配置 <code>agentPreset</code> 时，插件使用 Harness 当前的默认 Agent Preset。</li>
+</ul>
+<p>如果机器人只应操作一个固定项目，可以在现有实例的 <code>config</code> 下增加：</p>
+<pre><code>- id: lark-channel
+  disabled: false
+  config:
+    appId: !!js process.env.LARK_APP_ID
+    appSecret: !!js process.env.LARK_APP_SECRET
+    domain: lark
+    workspace: /Users/you/github/project
+    agentPreset: coding
+</code></pre>
+<p>这里仍然是覆盖已有的 <code>lark-channel</code> 实例，不要添加 <code>insert</code> 或重复的 <code>name</code>。</p>
+<h2>启动 Harness</h2>
+<p>确认环境变量已经设置，再启动 Web Profile：</p>
+<pre><code>npx @deepseek-ai/dsh web
+</code></pre>
+<p>连接成功后，终端会出现：</p>
+<pre><code>dsh-lark: WebSocket connected
+</code></pre>
+<p>运行期间如果网络中断，官方 SDK 会尝试重新连接，并输出 <code>WebSocket reconnecting</code> 和 <code>WebSocket reconnected</code>。</p>
+<h2>验证对话</h2>
+<h3>单聊</h3>
+<ol>
+<li>在飞书中打开机器人。</li>
+<li>发送一条普通文本消息。</li>
+<li>等待 Harness 完成当前 Agent turn。</li>
+<li>机器人会回复这次 turn 最后生成的 assistant 文本。</li>
+</ol>
+<p>同一个单聊中的后续消息会继续使用同一个 Harness Session，因此能够保留前文。</p>
+<h3>群聊</h3>
+<ol>
+<li>把机器人加入群聊。</li>
+<li>使用 <code>@机器人</code> 加上问题。</li>
+<li>机器人会回复触发它的那条消息。</li>
+</ol>
+<p>默认配置下，没有 @机器人的群消息会被忽略。如果关闭 <code>requireMention</code>，还需要确保应用获得接收群内全部消息的权限，并经过企业管理员批准。</p>
+<h3>话题群</h3>
+<p>话题中的消息会使用 <code>chat_id + thread_id</code> 建立独立 Session。不同话题不会共享对话记录，机器人回复会留在原来的话题中。</p>
+<h2>完整配置</h2>
+<p>下面的例子包含目前支持的所有配置项：</p>
+<pre><code>- id: lark-channel
+  disabled: false
+  config:
+    appId: !!js process.env.FEISHU_APP_ID
+    appSecret: !!js process.env.FEISHU_APP_SECRET
+    domain: feishu
+    requireMention: true
+    dmMode: open
+    groupAllowlist:
+      - oc_xxxxxxxxxxxxxxxx
+    dmAllowlist:
+      - ou_xxxxxxxxxxxxxxxx
+    provider: deepseek-official
+    model: deepseek-v4-flash
+    workspace: /absolute/path/to/workspace
+    agentPreset: coding
+    errorMessage: 抱歉，处理这条消息时遇到了问题，请稍后重试。
+</code></pre>
+<table>
+<thead>
+<tr>
+<th>配置项</th>
+<th>必填</th>
+<th>默认值</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>appId</code></td>
+<td>是</td>
+<td>无</td>
+<td>飞书或 Lark 应用的 App ID</td>
+</tr>
+<tr>
+<td><code>appSecret</code></td>
+<td>是</td>
+<td>无</td>
+<td>应用的 App Secret，建议从环境变量读取</td>
+</tr>
+<tr>
+<td><code>domain</code></td>
+<td>否</td>
+<td><code>feishu</code></td>
+<td>中国版使用 <code>feishu</code>，国际版使用 <code>lark</code></td>
+</tr>
+<tr>
+<td><code>requireMention</code></td>
+<td>否</td>
+<td><code>true</code></td>
+<td>群聊是否必须 @机器人</td>
+</tr>
+<tr>
+<td><code>dmMode</code></td>
+<td>否</td>
+<td><code>open</code></td>
+<td>单聊策略：<code>open</code>、<code>allowlist</code> 或 <code>disabled</code></td>
+</tr>
+<tr>
+<td><code>groupAllowlist</code></td>
+<td>否</td>
+<td><code>[]</code></td>
+<td>允许使用机器人的群 <code>chat_id</code> 列表；空数组表示不限制</td>
+</tr>
+<tr>
+<td><code>dmAllowlist</code></td>
+<td>否</td>
+<td><code>[]</code></td>
+<td><code>dmMode: allowlist</code> 时允许访问的用户 <code>open_id</code> 列表</td>
+</tr>
+<tr>
+<td><code>provider</code></td>
+<td>否</td>
+<td>Harness 默认值</td>
+<td>为这个渠道指定模型 Provider</td>
+</tr>
+<tr>
+<td><code>model</code></td>
+<td>否</td>
+<td>Harness 默认值</td>
+<td>为这个渠道指定模型</td>
+</tr>
+<tr>
+<td><code>workspace</code></td>
+<td>否</td>
+<td>第一个已注册 Workspace；没有时为 DSH 进程工作目录</td>
+<td>Agent 使用的工作目录；显式路径优先</td>
+</tr>
+<tr>
+<td><code>agentPreset</code></td>
+<td>否</td>
+<td>Harness 当前默认 Preset</td>
+<td>Agent 使用的 Preset，决定工具、系统提示等组合</td>
+</tr>
+<tr>
+<td><code>errorMessage</code></td>
+<td>否</td>
+<td>内置中文提示</td>
+<td>Agent 执行失败时返回给用户的文本，最长 500 个字符</td>
+</tr>
+</tbody></table>
+<p><code>provider</code> 和 <code>model</code> 建议同时设置。如果都不设置，插件会读取 Harness 当前的默认模型配置。</p>
+<h3>Workspace 和 Agent Preset</h3>
+<p>飞书会话创建 Agent 时会沿用 Harness Web 客户端的两项关键行为：挂载 Agent Preset，并把 Session 关联到 Workspace。Preset 提供该会话的工具、系统提示和其他 Agent 级能力；Workspace 提供 <code>cwd</code>，并让会话出现在对应工作区中。</p>
+<ul>
+<li>未配置 <code>workspace</code>：使用 Harness Workspace 列表中的第一个工作区。</li>
+<li>已配置 <code>workspace</code>：始终使用该路径；如果它已经注册为 Workspace，Session 同时关联到该 Workspace。</li>
+<li>Harness 尚无 Workspace：回退到启动 DSH 时的进程工作目录。</li>
+<li>未配置 <code>agentPreset</code>：解析 Harness 当前默认 Preset。</li>
+<li>已配置 <code>agentPreset</code>：使用指定 Preset；名称不存在时，本次会话创建会失败并向飞书返回安全错误提示。</li>
+</ul>
+<p>如果希望机器人始终操作固定项目，建议显式配置：</p>
+<pre><code>workspace: /Users/you/github/project
+agentPreset: coding
+</code></pre>
+<p>升级到包含 Workspace/Preset 关联的版本后，同一飞书聊天会创建新的 v2 Session；旧版本产生的未关联 Session 不会被继续复用。</p>
+<h2>访问控制</h2>
+<p>只允许指定群聊使用机器人：</p>
+<pre><code>requireMention: true
+groupAllowlist:
+  - oc_group_one
+  - oc_group_two
+</code></pre>
+<p>只允许指定用户发起单聊：</p>
+<pre><code>dmMode: allowlist
+dmAllowlist:
+  - ou_user_one
+  - ou_user_two
+</code></pre>
+<p>完全关闭单聊：</p>
+<pre><code>dmMode: disabled
+</code></pre>
+<p>群聊白名单使用 <code>chat_id</code>，单聊白名单使用发送者的 <code>open_id</code>。这些标识可以通过飞书 API、事件调试信息或管理员工具取得。生产环境不要开启原始事件日志后长期保留消息内容。</p>
+<h2>会话与并发行为</h2>
+<ul>
+<li>普通单聊和群聊使用聊天级 Session。</li>
+<li>话题消息使用线程级 Session。</li>
+<li>Session 会挂载所选 Agent Preset，并在能匹配注册 Workspace 时关联到该 Workspace。</li>
+<li>飞书 SDK 会对同一聊天中的事件串行处理，避免两个 Agent turn 同时修改同一会话。</li>
+<li>重复事件会在 SDK 的去重窗口内被忽略。</li>
+<li>超过五分钟的延迟事件不会当作新消息处理。</li>
+<li>每次 Agent turn 结束后，插件会要求 Harness 刷新 Session 存储。</li>
+<li>回复只读取当前消息之后产生的 assistant 文本，不会误发上一轮回答。</li>
+</ul>
+<h2>安全说明</h2>
+<ul>
+<li>App Secret 只应存在于环境变量或 Secret Manager 中。</li>
+<li><code>cordis.patch.yml</code> 应通过 <code>process.env</code> 读取凭据。</li>
+<li>插件不会记录 App ID 和 App Secret。</li>
+<li>Agent 的异常堆栈不会发送给飞书用户。</li>
+<li>用户只能看到 <code>errorMessage</code> 中配置的失败提示。</li>
+<li>Session ID 不包含原始飞书 <code>chat_id</code> 或 <code>thread_id</code>。</li>
+<li>一个飞书应用不宜同时运行多个长连接消费者。平台可能在连接之间分发事件，导致单个实例只能收到部分消息。</li>
+</ul>
+<h2>常见问题</h2>
+<h3>启动时提示鉴权失败</h3>
+<p>检查 App ID 和 App Secret 是否来自同一个应用，环境变量是否在启动 DSH 的进程中可见。如果凭据曾经泄露，应先在开发者后台轮换 App Secret。</p>
+<h3>终端显示连接成功，但机器人收不到消息</h3>
+<p>依次检查：</p>
+<ul>
+<li>应用是否已经发布并安装到当前企业。</li>
+<li>机器人是否已经加入目标群聊。</li>
+<li>是否订阅了 <code>im.message.receive_v1</code>。</li>
+<li>事件接收方式是否为长连接。</li>
+<li>消息权限是否已经通过管理员审批。</li>
+<li>群聊消息是否包含 @机器人。</li>
+<li><code>groupAllowlist</code> 是否排除了当前群聊。</li>
+</ul>
+<h3>机器人能收到消息，但不能回复</h3>
+<p>检查应用是否拥有发送消息权限，并查看终端中的飞书 API 错误。回复目标被撤回时，官方 SDK 会尝试降级为普通消息；其他权限错误仍需要在应用后台处理。</p>
+<h3>单聊被拒绝</h3>
+<p>检查 <code>dmMode</code>。当它是 <code>allowlist</code> 时，发送者的 <code>open_id</code> 必须出现在 <code>dmAllowlist</code> 中；当它是 <code>disabled</code> 时，所有单聊都会被忽略。</p>
+<h3>群聊中不 @机器人也希望触发</h3>
+<p>把 <code>requireMention</code> 改成 <code>false</code>，并为应用申请接收群内全部消息的权限。这个权限通常需要管理员审批，开启前应同步评估群消息的隐私范围和模型调用成本。</p>
+<h3>长连接反复重连</h3>
+<p>检查运行环境能否访问飞书的 HTTPS 和 WebSocket 服务，并检查企业代理、防火墙、TLS 中间人或网络出口限制。不要为同一个应用启动多个插件实例。</p>
+<h3>修改配置后没有生效</h3>
+<p>停止并重新启动 Harness。插件实例和 WebSocket 连接在 Profile 启动时创建，修改 YAML 后需要重新加载。</p>
+<h2>升级和卸载</h2>
+<p>升级插件：</p>
+<pre><code>npx @deepseek-ai/dsh plugin --profile web remove @sugarforever/dsh-lark
+npx @deepseek-ai/dsh plugin --profile web add @sugarforever/dsh-lark
+</code></pre>
+<p>卸载插件：</p>
+<pre><code>npx @deepseek-ai/dsh plugin --profile web remove @sugarforever/dsh-lark
+</code></pre>
+<p>卸载后再检查 Web Profile 的 <code>cordis.patch.yml</code>，确认没有残留的手工配置实例。环境变量可以随后从服务配置或启动脚本中移除。</p>
+<h2>本地开发</h2>
+<pre><code>npm install
+npm test
+npm run typecheck
+npm run build
+npm pack --dry-run
+</code></pre>
+<h2>版本与发布</h2>
+<p>仓库中的 <code>.github/workflows/publish.yml</code> 由已发布的 GitHub Release 触发。工作流会依次完成以下操作：</p>
+<ul>
+<li>检查 Release tag 是否与 <code>package.json</code> 版本一致。</li>
+<li>使用 <code>npm ci</code> 安装锁定版本的依赖。</li>
+<li>运行测试、类型检查和构建。</li>
+<li>创建 npm tarball，并上传为 GitHub Actions artifact。</li>
+<li>把同一个 tarball 添加到对应的 GitHub Release。</li>
+<li>通过 npm Trusted Publishing 和 GitHub OIDC 发布到 npm。</li>
+</ul>
+<p>工作流不使用 <code>NPM_TOKEN</code>。如果 npm 中已经存在完全相同的版本，工作流会跳过不可重复的 npm 发布，但仍会生成并上传 GitHub artifact 和 Release 附件。</p>
+<h3>首次发布</h3>
+<p>如果 <code>@sugarforever/dsh-lark</code> 尚未在 npm 中创建，需要先从本地发布第一个版本：</p>
+<pre><code>npm login
+npm ci
+npm test
+npm run typecheck
+npm run build
+npm pack --dry-run
+npm publish --access public
+</code></pre>
+<p>首个版本发布后，在 npmjs.com 打开 <code>@sugarforever/dsh-lark</code> 的 Settings → Trusted Publisher，选择 GitHub Actions，并填写：</p>
+<ul>
+<li>Organization or user：<code>sugarforever</code></li>
+<li>Repository：<code>dsh-lark</code></li>
+<li>Workflow filename：<code>publish.yml</code></li>
+<li>Allowed action：<code>npm publish</code></li>
+</ul>
+<p>除非 GitHub 工作流也配置了完全相同的 Environment，否则 Trusted Publisher 中不要填写 Environment name。</p>
+<h3>发布新版本</h3>
+<p>根据改动范围选择 SemVer 版本类型：</p>
+<pre><code>npm version patch
+# 或 npm version minor
+# 或 npm version major
+</code></pre>
+<p><code>npm version</code> 会同时更新 <code>package.json</code> 和 <code>package-lock.json</code>，创建版本提交并生成匹配的 tag。例如版本 <code>0.1.1</code> 对应 <code>v0.1.1</code>。</p>
+<p>把提交和 tag 推送到 GitHub：</p>
+<pre><code>git push origin main --follow-tags
+</code></pre>
+<p>然后在 GitHub 中为该 tag 创建并发布 Release。发布 Release 后，GitHub Actions 会自动执行 npm 发布流程。如果 tag 去掉 <code>v</code> 后与 <code>package.json</code> 中的版本不同，工作流会在发布前失败。</p>
+<p>创建 Release 前，可以在本地运行同样的检查：</p>
+<pre><code>npm ci
+npm test
+npm run typecheck
+npm run build
+npm pack --dry-run
+</code></pre>
+<p>架构和生命周期说明见 <a href="https://github.com/sugarforever/dsh-lark/blob/HEAD/docs/architecture.md">docs/architecture.md</a>。</p>

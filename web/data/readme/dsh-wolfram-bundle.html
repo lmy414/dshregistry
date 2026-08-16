@@ -1,0 +1,329 @@
+<h1>dsh-wolfram</h1>
+<p>把 <strong>Wolfram 官方 <code>Wolfram/AgentTools</code> MCP Server</strong> 接进 <strong>DeepSeek Harness (DSH)</strong> 的专用集成 bundle。</p>
+<p>它是一层薄集成，不重写任何一方：MCP 协议交给 DSH 通用的 <code>@deepseek-ai/dsh-mcp-client</code>，Wolfram 工具由官方 Paclet 提供。本包只补三件中间缺口：</p>
+<ol>
+<li><strong>内核发现</strong> —— 自动找到本机的 Wolfram 可执行文件（注册表 / 标准安装根目录 / <code>wolframscript</code>），也支持显式覆盖。</li>
+<li><strong>Windows 透明 stdio supervisor</strong> —— 保证连接关闭、HMR 重载、DSH 退出后，<strong>只有本插件自己启动的那棵 Wolfram 进程树</strong>被终止，绝不碰你已经开着的 Mathematica 前端、笔记本内核，或别的客户端启动的 AgentTools server。</li>
+<li><strong>DSH 原生权限策略</strong> —— 求值、跑测试、读写 notebook 这类有副作用的工具执行前先经 DSH 的审批链；未知的新工具默认也要问。</li>
+</ol>
+<pre><code>DSH 工具注册表
+   ├── dsh-wolfram/policy   ← tools/pre-execute：分级 → ask / 交给后续策略
+   └── dsh-wolfram          ← 发现内核，挂载子插件 ↓
+         └── @deepseek-ai/dsh-mcp-client  (DSH 通用，未修改)
+               └── node src/supervisor-main.js   ← 本包的 supervisor
+                     └── wolfram.exe -run PacletSymbol["Wolfram/AgentTools", …][] -noinit -noprompt
+</code></pre>
+<hr>
+<h2>前置条件</h2>
+<ul>
+<li><p>DeepSeek Harness（提供 <code>dsh</code> 命令）。</p>
+</li>
+<li><p>Node.js <code>^22.19 || &gt;=24</code>、<code>pnpm</code>（<code>dsh plugin</code> 转发给 pnpm）。</p>
+</li>
+<li><p>已安装 Wolfram 桌面产品或 Wolfram Engine，且已安装 <code>Wolfram/AgentTools</code> Paclet：</p>
+<pre><code>PacletInstall["Wolfram/AgentTools"]
+</code></pre>
+<p>验证：<code>PacletObject["Wolfram/AgentTools"]["Version"]</code> 应返回 <code>2.2.0</code> 或更高。</p>
+</li>
+</ul>
+<hr>
+<h2>安装</h2>
+<pre><code>dsh plugin --profile &lt;你的 profile&gt; add D:\dsh-dev\dsh-wolfram
+</code></pre>
+<p><code>add</code> 后面可以是本地目录、tarball、git URL 或已发布的包名。<code>dsh plugin</code> 会在
+<code>$DSH_HOME/profiles/&lt;profile&gt;/</code> 里初始化 profile（如果还没有）、调用 pnpm 安装，然后检测到本包声明了
+<code>dsh.bundle</code> 并把它追加进 <code>dsh.profile.bundles</code> 层列表。</p>
+<p>确认它进了组合树：</p>
+<pre><code>dsh --profile &lt;你的 profile&gt; --dump-config
+</code></pre>
+<p>输出里应该出现 <code>id: wolfram</code> 与 <code>id: wolfram-permission</code> 两行。</p>
+<p>启动后日志里会打印实际选中的内核，例如：</p>
+<pre><code>wolfram: kernel D:\mathematica\Mathematica 15.0\wolfram.exe (via windows-registry), server WolframLanguage, tools under mcp__wolfram__*
+</code></pre>
+<h3>想先在隔离环境里试</h3>
+<p>profile 完全由 <code>$DSH_HOME</code> 决定，所以换一个 <code>DSH_HOME</code> 就是一个干净的沙盒，不会碰你现有的 profile：</p>
+<pre><code>$env:DSH_HOME = 'D:\tmp\dsh-home-试用'
+dsh plugin --profile wolfram-试用 add D:\dsh-dev\dsh-wolfram
+dsh --profile wolfram-试用 --dump-config
+</code></pre>
+<hr>
+<h2>装上之后有什么</h2>
+<p>默认连接内置的 <code>WolframLanguage</code> server，模型会看到 7 个工具，名字统一带 <code>mcp__wolfram__</code> 前缀：</p>
+<table>
+<thead>
+<tr>
+<th>工具</th>
+<th>作用</th>
+<th>默认权限</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>WolframLanguageEvaluator</code></td>
+<td>求值任意 Wolfram 代码</td>
+<td><strong>ask</strong> —— 无沙箱，可写文件、起进程、访问网络</td>
+</tr>
+<tr>
+<td><code>TestReport</code></td>
+<td>运行 <code>.wlt</code> 测试文件</td>
+<td><strong>ask</strong> —— 在新内核里执行任意代码</td>
+</tr>
+<tr>
+<td><code>WriteNotebook</code></td>
+<td>Markdown 转 <code>.nb</code> 并写盘</td>
+<td><strong>ask</strong> —— 写任意路径</td>
+</tr>
+<tr>
+<td><code>ReadNotebook</code></td>
+<td>读 <code>.nb</code> 为 markdown</td>
+<td><strong>ask</strong> —— 读任意路径</td>
+</tr>
+<tr>
+<td><code>CodeInspector</code></td>
+<td>静态检查代码/文件/目录</td>
+<td><strong>ask</strong> —— 可递归读整个目录</td>
+</tr>
+<tr>
+<td><code>WolframLanguageContext</code></td>
+<td>文档语义检索</td>
+<td>交给后续策略（只读元数据）</td>
+</tr>
+<tr>
+<td><code>SymbolDefinition</code></td>
+<td>取符号定义</td>
+<td>交给后续策略（只读元数据）</td>
+</tr>
+</tbody></table>
+<p><code>ask</code> 走 DSH 自己的审批链（<code>ctx.approval</code>）。会话审批策略是 <code>never</code> 时，这些调用会被直接拒绝——这是 DSH 的既有语义，本插件不另开后门。</p>
+<p><strong>未列出的 Wolfram 工具默认也是 <code>ask</code>。</strong> 官方 Paclet 升级后可能新增工具，没有分级信息之前先问人，而不是先放行。</p>
+<blockquote>
+<p>官方 server 的 <code>tools/list</code> 只在 <code>annotations</code> 里给 <code>title</code>，没有 <code>readOnlyHint</code> / <code>destructiveHint</code>，所以分级只能按工具名做，未知即 ask。</p>
+</blockquote>
+<hr>
+<h2>配置项</h2>
+<p>两行都可以在 profile 的 <code>cordis.patch.yml</code> 里按 id 覆盖。<strong>一次 patch 会替换该行的整个 <code>config</code></strong>，所以要把想保留的字段一起写上。</p>
+<h3><code>wolfram</code> 行</h3>
+<table>
+<thead>
+<tr>
+<th>字段</th>
+<th>默认值</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>serverName</code></td>
+<td><code>wolfram</code></td>
+<td>工具名命名空间，模型看到 <code>mcp__&lt;serverName&gt;__&lt;工具名&gt;</code></td>
+</tr>
+<tr>
+<td><code>mcpServerName</code></td>
+<td><code>WolframLanguage</code></td>
+<td>启动哪个内置 AgentTools server（<code>MCP_SERVER_NAME</code>）。可选 <code>Wolfram</code>、<code>WolframAlpha</code>、<code>WolframPacletDevelopment</code></td>
+</tr>
+<tr>
+<td><code>command</code></td>
+<td>自动发现</td>
+<td>显式指定 Wolfram 可执行文件，原样使用，跳过全部探测</td>
+</tr>
+<tr>
+<td><code>installationDirectory</code></td>
+<td>自动发现</td>
+<td>显式指定安装目录，按平台拼可执行文件</td>
+</tr>
+<tr>
+<td><code>args</code></td>
+<td>官方启动参数</td>
+<td>覆盖传给 Wolfram 的参数（高级用法）</td>
+</tr>
+<tr>
+<td><code>env</code></td>
+<td><code>{}</code></td>
+<td>额外环境变量，合并在 <code>MCP_SERVER_NAME</code> 之上</td>
+</tr>
+<tr>
+<td><code>cwd</code></td>
+<td>继承</td>
+<td>Wolfram 进程的工作目录</td>
+</tr>
+<tr>
+<td><code>graceMs</code></td>
+<td><code>1000</code></td>
+<td>关闭内核 stdin 后等多久再强杀进程树。必须 &lt; 2000（见下）</td>
+</tr>
+<tr>
+<td><code>recordDirectory</code></td>
+<td><code>$DSH_HOME/.dsh-wolfram</code></td>
+<td>supervisor 记录自己子进程的位置</td>
+</tr>
+<tr>
+<td><code>reclaimOrphans</code></td>
+<td><code>true</code></td>
+<td>装载/卸载时回收被强杀的 supervisor 遗留的 Wolfram 进程树</td>
+</tr>
+<tr>
+<td><code>probeWolframScript</code></td>
+<td><code>true</code></td>
+<td>允许用 <code>wolframscript</code> 探测安装目录（最后一步，要启内核，慢）</td>
+</tr>
+<tr>
+<td><code>probeTimeoutMs</code></td>
+<td><code>30000</code></td>
+<td>上述探测的超时</td>
+</tr>
+<tr>
+<td><code>toolCallTimeoutMs</code></td>
+<td><code>120000</code></td>
+<td>单次工具调用的传输超时</td>
+</tr>
+<tr>
+<td><code>failOnStartupError</code></td>
+<td><code>false</code></td>
+<td>首次连接失败时是否让插件装载失败</td>
+</tr>
+<tr>
+<td><code>reconnect</code></td>
+<td>mcp-client 默认</td>
+<td>断线重连策略，原样透传给 mcp-client</td>
+</tr>
+</tbody></table>
+<h3><code>wolfram-permission</code> 行</h3>
+<table>
+<thead>
+<tr>
+<th>字段</th>
+<th>默认值</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>serverName</code></td>
+<td><code>wolfram</code></td>
+<td>必须和 <code>wolfram</code> 行一致，策略靠它认出自己要守的工具</td>
+</tr>
+<tr>
+<td><code>unknown</code></td>
+<td><code>ask</code></td>
+<td>未分级 Wolfram 工具的决策，可改成 <code>deny</code></td>
+</tr>
+<tr>
+<td><code>ask</code></td>
+<td>见上表</td>
+<td>整表替换：工具名 → 审批理由</td>
+</tr>
+<tr>
+<td><code>additionalAsk</code></td>
+<td><code>{}</code></td>
+<td>在生效表之上追加条目，不丢默认值</td>
+</tr>
+<tr>
+<td><code>delegate</code></td>
+<td><code>[WolframLanguageContext, WolframAlphaContext, SymbolDefinition]</code></td>
+<td>整表替换：交给后续策略的只读工具</td>
+</tr>
+</tbody></table>
+<h3>覆盖示例</h3>
+<p>写在 <code>$DSH_HOME/profiles/&lt;profile&gt;/cordis.patch.yml</code>：</p>
+<pre><code># 指定内核、加长求值超时、把只读元数据工具也纳入审批
+- id: wolfram
+  config:
+    serverName: wolfram
+    mcpServerName: WolframLanguage
+    command: 'D:\mathematica\Mathematica 15.0\wolfram.exe'
+    graceMs: 1000
+    toolCallTimeoutMs: 300000
+    reclaimOrphans: true
+
+- id: wolfram-permission
+  config:
+    serverName: wolfram
+    unknown: deny
+    delegate: []
+</code></pre>
+<p>只想临时关掉权限策略（不推荐）：</p>
+<pre><code>- id: wolfram-permission
+  disabled: true
+</code></pre>
+<hr>
+<h2>卸载</h2>
+<pre><code>dsh plugin --profile &lt;你的 profile&gt; remove dsh-wolfram
+</code></pre>
+<p><code>dsh plugin</code> 会在 pnpm 成功后把它从 <code>dsh.profile.bundles</code> 里摘掉。确认：</p>
+<pre><code>dsh --profile &lt;你的 profile&gt; --dump-config
+</code></pre>
+<p>不再出现 <code>id: wolfram</code> 即可。</p>
+<p>残留清理（可选）：删除 <code>$DSH_HOME/.dsh-wolfram/</code>。里面只有 supervisor 的子进程记录文件，正常退出时会自己删掉。</p>
+<hr>
+<h2>排障</h2>
+<h3>找不到内核</h3>
+<p>启动时抛出 <code>dsh-wolfram: no Wolfram kernel found. Tried: …</code>，错误里会逐条列出试过的路径。按顺序确认：</p>
+<ol>
+<li><p>Wolfram 是否真的装了：<code>wolframscript -code '$InstallationDirectory'</code>；</p>
+</li>
+<li><p>用返回的目录直接指定：</p>
+<pre><code>- id: wolfram
+  config:
+    serverName: wolfram
+    installationDirectory: 'D:\mathematica\Mathematica 15.0'
+</code></pre>
+</li>
+<li><p>或者用环境变量临时覆盖，不改配置：<code>DSH_WOLFRAM_COMMAND=…\wolfram.exe</code>。</p>
+</li>
+</ol>
+<p>发现顺序是：<code>config.command</code> → <code>DSH_WOLFRAM_COMMAND</code> → <code>config.installationDirectory</code> → <code>WOLFRAM_INSTALLATION_DIRECTORY</code> → Windows 注册表 → 平台标准安装根目录 → <code>PATH</code> → <code>wolframscript</code> 探测。</p>
+<h3>连上了但工具是空的</h3>
+<p>多半是 Paclet 没装或版本太老。先手工跑一遍 server，看它有没有正常应答：</p>
+<pre><code>node D:\dsh-dev\dsh-wolfram\src\supervisor-main.js `
+  --command 'D:\mathematica\Mathematica 15.0\wolfram.exe' `
+  --arg -run --arg 'PacletSymbol["Wolfram/AgentTools","Wolfram`AgentTools`StartMCPServer"][]' `
+  --arg -noinit --arg -noprompt
+</code></pre>
+<p>（需要设 <code>MCP_SERVER_NAME=WolframLanguage</code>。）然后往 stdin 粘一行 <code>initialize</code> 请求。stdout 只会有协议字节，supervisor 自己的日志都在 stderr，带 <code>[dsh-wolfram-supervisor]</code> 前缀。</p>
+<p>更省事的做法是跑本仓库的实测用例，它会完成真实握手、列工具、做一次无副作用求值，并检查退出后没有进程残留：</p>
+<pre><code>npm run test:live
+</code></pre>
+<h3>工具每次都要点确认</h3>
+<p>这是设计如此。要放宽某个工具，把它从 <code>ask</code> 表移到 <code>delegate</code>：</p>
+<pre><code>- id: wolfram-permission
+  config:
+    serverName: wolfram
+    unknown: ask
+    delegate: [WolframLanguageContext, SymbolDefinition, ReadNotebook]
+</code></pre>
+<p>注意 <code>delegate</code> 是<strong>整表替换</strong>，写全你要放行的名字。</p>
+<h3>怀疑有 Wolfram 进程残留</h3>
+<p>先看基线，再对比。<strong>永远不要按进程名批量杀</strong>——你自己的 Mathematica 前端和别的 MCP 客户端的 server 长得一模一样：</p>
+<pre><code>Get-CimInstance Win32_Process |
+  Where-Object { $_.Name -match 'wolfram' } |
+  Select-Object ProcessId, ParentProcessId, Name, CreationDate, CommandLine | Format-List
+</code></pre>
+<p>本插件启动的 Wolfram 进程，其父进程是一个跑 <code>supervisor-main.js</code> 的 <code>node.exe</code>。正常关闭后两者都会消失。</p>
+<p>即使 supervisor 被强杀（来不及运行任何清理代码），内核多半也会跟着退出：supervisor 一死，内核 stdin 的写端就关了，AgentTools 把 EOF 当关机信号，实测约 1 秒内自行 <code>Exit[0]</code>。万一没退，下一次插件装载或卸载时会自动回收——前提是那个进程通过身份三重校验（映像名、命令行、创建时间窗口）确实是记录里的那一个；有任何一项对不上，就只删记录、不动进程。</p>
+<h3><code>graceMs</code> 为什么不能调大</h3>
+<p>MCP SDK 的 <code>StdioClientTransport.close()</code> 在关闭 stdin 后 2000ms 就会对 supervisor 发 <code>SIGTERM</code>；Windows 上那等于 <code>TerminateProcess</code>，没有任何 JavaScript 能执行。<code>graceMs</code> 一旦 ≥ 2000，进程树清理这一步永远轮不到运行。所以配置校验会直接拒绝，并把原因写在错误里。</p>
+<hr>
+<h2>安全边界</h2>
+<ul>
+<li><strong>只终止自己的进程树。</strong> 代码里没有任何按进程名或命令行模糊匹配的终止路径。终止只发生在 supervisor 仍持有未回收的子进程句柄时（此时 PID 不可能被系统复用），或孤儿回收通过三重身份校验之后。</li>
+<li><strong><code>WolframLanguageEvaluator</code> 没有沙箱。</strong> 它能读写文件、启动进程、访问网络。本插件的边界是「执行前必须有人点头」，不是「执行被限制」。真要限制，用 DSH 自己的 sandbox / approval 组合。</li>
+<li><strong>stdout 只走协议。</strong> supervisor 的所有诊断都在 stderr，任何写进 stdout 的东西都会破坏 JSON-RPC 流。</li>
+<li><strong>不注入 system prompt。</strong> 模型可见文本会进每一次请求前缀，属于产品决策，交给使用者自己的 patch 层。</li>
+<li><strong>凭据清洗沿用 DSH。</strong> 子进程环境由 <code>dsh-mcp-client</code> 的 <code>scrubbedParentEnv()</code> 过滤（丢弃 <code>*KEY*</code> / <code>*SECRET*</code> / <code>*TOKEN*</code> / <code>*PASSWORD*</code> 与 <code>DSH_*</code>），本包只在其上叠加 <code>MCP_SERVER_NAME</code> 和你显式配置的 <code>env</code>。</li>
+</ul>
+<p>设计取舍与证据来源见 <a href="https://github.com/Zhen-WushuiLingchun/dsh-wolfram-bundle/blob/HEAD/docs/design.md">docs/design.md</a>。</p>
+<hr>
+<h2>开发</h2>
+<pre><code>npm install        # 只装 typescript / yaml / @types/node，零运行时依赖
+npm run typecheck  # tsc --checkJs，严格模式
+npm test           # 单元 + 真实子进程集成用例（不需要 Wolfram）
+npm run test:live  # 真实 Wolfram MCP 握手（需要本机装了 Wolfram + AgentTools）
+</code></pre>
+<p><code>npm test</code> 里的进程用例会真的拉起进程树、强杀、并断言一个无关的对照进程还活着——那条断言才是这套清理逻辑的意义所在。</p>
+<h2>已知限制</h2>
+<ul>
+<li><strong>Windows 强杀窗口无法完全消除。</strong> supervisor 被 <code>SIGKILL</code> / <code>TerminateProcess</code> 时不会运行任何 JavaScript，这一瞬间无法保证子进程立即死亡；孤儿回收是事后补救，不是实时保证。彻底消除需要 Windows Job Object（<code>KILL_ON_JOB_CLOSE</code>），那要原生模块。</li>
+<li><strong>孤儿回收的身份校验只在 Windows 上完整。</strong> POSIX 分支退化为 <code>ps</code> 命令行比对，没有创建时间，尚未在真实 macOS / Linux 上验证；这些平台上 supervisor 自己的进程组终止仍然生效。</li>
+<li><strong>只桥接 MCP Tools。</strong> DSH 通用 mcp-client 目前不桥接 Resources 与 Prompts，本包不在其上另开旁路，所以 AgentTools 的 <code>WolframLanguageSearch</code> / <code>Notebook</code> 等 prompt 用不到。</li>
+<li><strong>审批没有「记住选择」。</strong> DSH 审批语义只有一次性授权，会话级策略只有 <code>ask</code> / <code>never</code>；本插件不自建第二套授权存储。</li>
+<li><strong><code>toolCallTimeoutMs</code> 与内核的 <code>TimeConstraint</code> 是两个预算。</strong> 前者是传输超时，后者是 Wolfram 自己的求值上限（默认 60s），改一个不会改另一个。</li>
+<li><strong>工具自身的失败属于上游。</strong> 实测本机 <code>WolframLanguageContext</code> 会返回 <code>AgentTools::Internal::Path@@Kernel/Tools/Context.wl</code> 内部错误；调用链本身是通的（请求送达、错误原样回传并映射成 <code>isError</code>），但那条工具的实现问题要报给 <a href="https://github.com/WolframResearch/AgentTools/issues">WolframResearch/AgentTools</a>，本插件不做补丁。</li>
+</ul>

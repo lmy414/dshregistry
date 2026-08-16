@@ -1,0 +1,80 @@
+<h1>dsh-subagent-vision</h1>
+<p>English | <a href="https://github.com/niuniuaba/dsh-subagent-vision/blob/HEAD/README.zh-CN.md">中文</a></p>
+<p>A <a href="https://github.com/deepseek-ai/deepseek-harness">DeepSeek Harness</a> bundle plugin that lets a <strong>text-only</strong> main agent (DeepSeek) read images <strong>in the same session</strong>: when a task needs vision, the main agent delegates to a fresh subagent routed to a <strong>vision-capable model you pick in the settings</strong> (configured under Settings &gt; Models, chosen under Settings &gt; 视觉处理模型; the factory default is <code>qwen3.8-max</code> — see <a href="#configure">Configure</a>), and the child's text result is merged back. <strong>Pasting or dropping an image just works</strong>: intake stays native (thumbnail rail, remove/undo); when you hit send on a text-only session, the browser half uploads each draft image to a private temp file and appends the paths to your prompt, so the request never trips image admission and the text-only agent can delegate the paths to the vision subagent. No model switching, no second session, no copy-paste.</p>
+<h2>Why</h2>
+<p>DeepSeek chat models cannot take image input, and the harness refuses to switch a session that contains images to a text-only model (and a text-only adapter would reject the image at request time anyway). The harness does have a first-class subagent seam (<code>subagent</code> / <code>subagent_fork</code> tools) whose children can be routed to any registered provider/model — this bundle simply exposes a second delegation tool pinned to the vision route you pick in the settings, plus a send-time image-to-path conversion so images reach that tool as file paths without tripping admission.</p>
+<h2>How it works</h2>
+<p>The bundle's <code>cordis.patch.yml</code> inserts two rows into the profile composition:</p>
+<ul>
+<li><strong><code>tool-subagent-vision</code></strong> — a second <code>@deepseek-ai/dsh-tool-subagent</code> instance (<code>toolName: subagent_vision</code>, <code>provider: spawn</code>, <code>backgroundMode: one-shot</code>). The row starts with the factory-default <code>agentOptions</code> in the shipped <code>cordis.patch.yml</code> (qwen/qwen3.8-max) so the tool works out of the box; picking a different model in Settings &gt; 视觉处理模型 rewrites that file (the new route applies from the next restart, and immediately too when the live sync works); if anything breaks, edit the <code>agentOptions</code> block directly in that file. Image blocks never enter the parent's session: the parent passes a <strong>file path or URL</strong> in the tool prompt, the vision child reads it with its own <code>read_image</code> tool (its execution gate checks the <em>child's</em> routed model, which declares image input), and only the child's final <strong>text</strong> returns as the tool result.</li>
+<li><strong><code>subagent-vision</code></strong> — this package's root plugin, which does three things:<ul>
+<li><strong>Guidance</strong>: registers one prompt section telling the model when to use <code>subagent_vision</code> (the stock subagent tool description says nothing about vision). With no route configured it tells the model <em>not</em> to call the tool and to ask the user to configure one first.</li>
+<li><strong>Vision-route settings</strong>: a settings section (<code>subagent-vision</code> namespace, persisted in <code>settings.yaml</code>) plus a Settings &gt; 视觉处理模型 entry rendered by the browser half. The dropdown lists the models this deployment has actually configured with image input declared (from <code>llm.listConfigurableProviders</code> plus each provider's settings document — the same metadata the paste verdict trusts); when none exist it shows "configure a vision-capable model in Settings &gt; Models first". The choice is synced onto the tool row's <code>agentOptions</code> at registration and whenever the setting changes — and also persisted into this bundle's own <code>cordis.patch.yml</code>, so the tool row starts with the chosen route on the next boot even if the live sync cannot apply it; a saved model that no longer resolves, or that doesn't declare image input, is refused.</li>
+<li><strong>Paste-to-path route</strong> (<code>/subagent-vision/paste</code>): <code>GET</code> answers whether a given <code>provider</code>/<code>model</code> is positively confirmed text-only (from <code>inputModalities</code>, never a name guess); <code>POST</code> sniffs image magic bytes (PNG/JPEG/GIF/WebP/HEIC/HEIF), enforces a 25 MB cap, writes a private <code>0600</code> temp file, and returns its path.</li>
+</ul>
+</li>
+<li><strong>Browser half</strong> (<code>client.js</code>, loaded automatically through the package's <code>dsh.client</code> manifest): <strong>intake is left fully native</strong> — pasting or dropping an image shows the composer's own thumbnail rail, native caret behaviour, and native remove/undo. The plugin's only interception is at <strong>send time</strong>: when the draft carries image attachments and the target session's model is positively confirmed text-only (the host's verdict, cached 60 s and re-asked when stale), each draft image is uploaded to the host route (POST /subagent-vision/paste -&gt; private temp path), the draft is released, and the paths are appended to the prompt text before the real send — so the request carries text only and never trips image admission. Image-capable models and unknown models send natively (attachments go through unchanged).</li>
+</ul>
+<p>The child is composed like any in-process subagent: its own session, its own tools (the parent's preset composition, including <code>read_image</code> when attachments are mounted), and the standard delegation policy (child approval pinned to <code>never</code>, sandbox inherited). The child's internal image blocks stay in the child's own log.</p>
+<h2>Requirements</h2>
+<ul>
+<li>A dsh installation whose base bundle mounts the subagent capability, tool-fs (<code>read_image</code>), attachments, and the Web surface (the stock <code>web</code> profile does; the browser half needs the Web GUI).</li>
+<li>At least one vision-capable model configured through <strong>Settings &gt; Models</strong> (model metadata declaring image input). The shipped patch's factory default is <code>qwen/qwen3.8-max</code>: if that model isn't configured in your deployment, either configure it, pick your own model in Settings &gt; 视觉处理模型, or edit the <code>agentOptions</code> field in the bundle's <code>cordis.patch.yml</code>.</li>
+<li>The pasted image must fit the route cap (25 MB default); the child's <code>read_image</code> applies the deployment's canonical image limits when it reads the file.</li>
+<li>Runtime dependencies resolved from the profile (<code>@deepseek-ai/dsh-settings</code>, <code>@deepseek-ai/schemastery</code> host-side; <code>react</code> from the client module system).</li>
+</ul>
+<h2>Install</h2>
+<pre><code># from npm (fastest — works with the official registry or CN mirrors)
+dsh plugin --profile web add dsh-subagent-vision
+
+# from GitHub (pnpm shorthand; append #&lt;tag-or-branch&gt; to pin a revision)
+dsh plugin --profile web add github:niuniuaba/dsh-subagent-vision
+
+# from GitHub (explicit git URL)
+dsh plugin --profile web add git+https://github.com/niuniuaba/dsh-subagent-vision.git
+
+# from a local checkout
+dsh plugin --profile web add /path/to/plugins/dsh-subagent-vision
+</code></pre>
+<p>Restart dsh, then confirm with <code>dsh plugin --profile web list</code>.</p>
+<h2>Use</h2>
+<p>Paste an image, drag one into the composer textarea, or give the agent a path/URL, and state a task. On a text-only model the intake becomes a file path in the composer; on a vision model it stays a normal thumbnail paste. Either way, tell the agent what you need:</p>
+<blockquote>
+<p>Read the pasted image and summarize what it shows, then continue from there.</p>
+</blockquote>
+<p>The main agent calls <code>subagent_vision</code> with the path; the child reads it and returns text; the conversation continues in the same session.</p>
+<h2>Configure</h2>
+<p><strong>Factory default: <code>qwen3.8-max</code>.</strong> The shipped <code>cordis.patch.yml</code> pins <code>qwen/qwen3.8-max</code> as the vision processing model, so the tool works out of the box. To use your own model:</p>
+<ol>
+<li>Configure it under <strong>Settings &gt; Models</strong> — a provider whose model declares image input (e.g. <code>qwen3.8-max</code> with <code>input: [text, image]</code>).</li>
+<li>Open <strong>Settings &gt; 视觉处理模型</strong>, pick your model from the dropdown, and save. The choice is written to <code>settings.yaml</code> and persisted into this bundle's own <code>cordis.patch.yml</code> (applies from the next restart; the live loader sync also tries to apply it immediately).</li>
+</ol>
+<p>If something goes wrong, you can edit the <code>agentOptions</code> field directly in the bundle's patch file:</p>
+<pre><code>$DSH_HOME/profiles/web/node_modules/dsh-subagent-vision/cordis.patch.yml
+</code></pre>
+<pre><code>agentOptions:
+  provider: qwen        # use a provider your deployment actually has
+  model: qwen3.8-max
+  maxTokens: 16384
+</code></pre>
+<p>(A row with the same id in your profile's own <code>cordis.patch.yml</code> also overrides this one — later patch layers win.) If the dropdown instead shows "没有可用的视觉处理模型，请先在「设置 &gt; 模型」中配置一个支持图片输入的模型", go configure a vision-capable model first, then reload the settings page — the list is re-read live.</p>
+<p>The host plugin is configurable through the <code>subagent-vision</code> row's config: <code>toolName</code>, <code>modelHint</code>, <code>order</code>, <code>visionSettings: false</code> (turns the settings section and picker off), <code>pasteToPath: false</code> (turns the takeover off; the client stands down when the route 404s), <code>maxBytes</code>, <code>verdictTtlMs</code>.</p>
+<h2>Verify</h2>
+<p>From the repository root:</p>
+<pre><code>node verify-settings.mjs          # settings section, enumeration, picker route, tool-row sync
+node browser-verify/driver.mjs    # browser half in real Chrome (see browser-verify/README.md)
+</code></pre>
+<p><code>verify-settings.mjs</code> runs the host plugin against a real cordis context with stub <code>llm</code>/<code>settings</code>/<code>loader</code> services and asserts: the settings section registers under <code>subagent-vision</code>, its dropdown options are exactly the configured image-declaring models, registration and settings changes sync the tool row's <code>agentOptions</code> (preserving the rest of the config), unresolvable or non-image routes are refused, the picker's HTTP route serves and persists the choice, and the no-model hint renders. The browser suite drives the shipped <code>client.js</code> in Chrome against the real paste route and the send-time conversion (native intake untouched, drafts converted on send for text-only sessions, native send for vision/unknown models, upload failures abort the send).</p>
+<p>(The repo-layout-dependent <code>verify.mjs</code> from the plugin's original checkout asserts the tool/subagent wiring itself; it needs the full harness repo tree.)</p>
+<h2>Limitations</h2>
+<ul>
+<li><strong>No per-call model selection</strong>: the child route is the deployment-configured <code>agentOptions</code>, not a tool argument the model can change mid-task. (This is a stock <code>tool-subagent</code> schema constraint, not this bundle's.)</li>
+<li><strong>Send-time conversion is all-or-nothing per send</strong>: a draft's images are all converted before the send; a failed upload aborts the send (the composer restores the draft and thumbnails, so nothing is lost).</li>
+<li><strong>Temp files accumulate</strong>: pasted images land in the OS temp directory under <code>subagent-vision-paste-*</code>; nothing deletes them (the OS temp cleaner will).</li>
+<li><strong>One-shot children</strong>: the child settles and its conversation is read-only afterwards (use the stock <code>subagent</code>/continuable tools if you need to keep talking to a child).</li>
+<li><strong>The parent model never sees the image itself</strong> — only the child's text reading of it.</li>
+</ul>
+<h2>Credits</h2>
+<p>The image-to-path pattern (magic-byte sniffing, private temp files, host-side verdict) follows <a href="https://github.com/liustack/modlens">ModLens</a> (MIT); this bundle differs by resolving the current model from the client object layer instead of the model-selector DOM label, converting at send time instead of intercepting intake, and delegating to a vision subagent instead of an external vision engine.</p>
+<h2>License</h2>
+<p>MIT</p>

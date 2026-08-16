@@ -1,0 +1,278 @@
+<h1>dsh-btw — 给 DeepSeek Harness 加 Claude Code 原版 <code>/btw</code> 侧边提问 + <code>/remember</code> 会话备忘</h1>
+<p>一个零依赖的 dsh 插件包（bundle），为你的 profile 注册两个斜杠命令：</p>
+<ul>
+<li><strong><code>/btw &lt;问题&gt;</code></strong> —— <strong>Claude Code 原版形态的侧边提问（side question）</strong>：fork 一个禁工具的轻量子代理、用当前会话上下文回答、答案作为命令结果显示，<strong>不打断主线、不进主对话历史、不落盘</strong>；</li>
+<li><strong><code>/remember &lt;备忘&gt;</code></strong> —— 原来的备忘功能整体搬到这里：<strong>记录一条 by-the-way 笔记，让模型在本次会话里一直记得它</strong>（steer 即时回应 + 每次请求注入 + 磁盘持久化）。</li>
+</ul>
+<pre><code>/btw 刚才那个配置文件叫什么来着？   → 子代理在后台回答，主线不中断
+/btw                                → 提示用法（必须带问题）
+
+/remember 用户姓张，称呼"张工"      → 记录备忘，模型本轮之后一直记得
+/remember                           → 列出本会话已记录的备忘
+/remember clear                     → 清空本会话备忘
+/remember forget 2                  → 删除第 2 条备忘
+</code></pre>
+<hr>
+<h2>1. Claude Code 原版 <code>/btw</code> 是什么</h2>
+<p>Claude Code 2.0 引入的 <a href="https://code.claude.com/docs/en/commands"><code>/btw</code> 命令</a>，官方描述是 <strong>"Ask a quick side question without interrupting the main conversation"</strong>——<strong>侧边提问（side question）</strong>，不是记笔记。从源码（<code>commands/btw/btw.tsx</code>、<code>utils/sideQuestion.ts</code>、<code>utils/forkedAgent.ts</code>；第三方源码分析见 <a href="https://ugorange.com/blog/claude-code-btw-side-question/">Claude Code 的 /btw 为什么很妙</a>、<a href="https://www.working-ref.com/zh/reference/claude-code-btw-side-questions">不打断主线的旁路提问</a>）看，它的机制是：</p>
+<ol>
+<li><strong>fork 一个轻量子代理</strong>（<code>runSideQuestion → runForkedAgent</code>）回答你的问题，主线程完全不动——问答<strong>不进入主对话历史</strong>，关掉浮层即消失（官方 issue <a href="https://github.com/anthropics/claude-code/issues/37582">#37582</a> 确认它是 ephemeral）；</li>
+<li><strong>有完整上下文，但禁用一切工具</strong>：只能基于当前对话里已有的信息回答，不能读文件、不能执行命令、不能搜索；</li>
+<li><strong>强制单轮</strong>：<code>maxTurns = 1</code>，一问一答，不支持追问；</li>
+<li><strong>复用主线程的 prompt cache</strong>：额外成本压到最低，问答本身也不消耗上下文窗口；</li>
+<li><strong>答案以浮层显示</strong>，Space / Enter / Esc 关闭，不落盘、不可恢复。</li>
+</ol>
+<p>一句话：<strong>共享上下文但不共享控制权，共享缓存但不污染主线。</strong></p>
+<h2>2. 本插件与 Claude Code 原版的对应关系</h2>
+<p>v0.2.0 起，插件按<strong>原版形态</strong>重做：</p>
+<table>
+<thead>
+<tr>
+<th>Claude Code 原版</th>
+<th>dsh-btw（本插件）</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>/btw &lt;问题&gt;</code>：fork 子代理、禁工具、单轮、答案不进历史</td>
+<td><strong><code>/btw &lt;问题&gt;</code>（原版形态）</strong>：<code>ctx.subagents</code> fork provider、<code>toolFilter: { allow: [] }</code> 全禁工具、in-process driver 天然单轮、答案作为命令结果（log-only，永不进模型上下文）、不落盘</td>
+</tr>
+<tr>
+<td>——（原版没有对应物）</td>
+<td><strong><code>/remember &lt;备忘&gt;</code></strong>：原 <code>/btw</code> 的备忘语义，steer 即时回应 + system-prompt 每次注入 + <code>$DSH_HOME/btw/notes.json</code> 持久化</td>
+</tr>
+</tbody></table>
+<p>两套机制在 dsh 里的具体差异：</p>
+<table>
+<thead>
+<tr>
+<th>维度</th>
+<th><code>/btw</code> 侧边提问</th>
+<th><code>/remember</code> 会话备忘</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>本质</td>
+<td>提问 → 一次性<strong>答案</strong></td>
+<td>记录 → 会话级<strong>记忆</strong></td>
+</tr>
+<tr>
+<td>执行体</td>
+<td>fork 出的轻量子代理（sidecar）</td>
+<td>主线程本身（<code>agent.steer</code> + system-prompt 注入）</td>
+</tr>
+<tr>
+<td>工具</td>
+<td><strong>完全禁用</strong>（<code>toolFilter: { allow: [] }</code>）</td>
+<td>注入主线后，后续轮次<strong>有全部工具</strong></td>
+</tr>
+<tr>
+<td>是否进历史</td>
+<td><strong>不进</strong>（command/run·command/done 是 log-only，永不进模型上下文）</td>
+<td><strong>进</strong>（先作为一条 user message，之后每次请求都注入）</td>
+</tr>
+<tr>
+<td>轮次</td>
+<td>单轮（in-process driver 一次 turn 一个 result）</td>
+<td>持续生效，直到 <code>/remember forget</code> / <code>/remember clear</code></td>
+</tr>
+<tr>
+<td>成本</td>
+<td>子代理一次请求（继承父上下文前缀）</td>
+<td>每轮多注入一段 section（上限 20 条、单条 500 字符）</td>
+</tr>
+<tr>
+<td>持久化</td>
+<td>无</td>
+<td><code>$DSH_HOME/btw/notes.json</code>，resume 可恢复</td>
+</tr>
+<tr>
+<td>管理命令</td>
+<td>无（一问一答）</td>
+<td><code>/remember</code> 列表、<code>/remember clear</code>、<code>/remember forget &lt;n&gt;</code></td>
+</tr>
+</tbody></table>
+<h2>3. dsh 原本有没有类似的命令？</h2>
+<p><strong>没有内置 <code>/btw</code>。</strong> 我在 dsh 源码（<code>packages/interaction/commands</code>）和 dsh-cc-tui 里全文检索过 <code>btw</code>，没有任何实现。dsh 的斜杠命令体系是<strong>插件注册制</strong>：任何插件用 <code>ctx.commands.register({ name, description, input, handler })</code> 就能挂一个 <code>/命令</code>，Web 端输入框敲 <code>/</code> 会弹出命令菜单（<code>ui-input-trigger</code> 的 slash 菜单）。</p>
+<p>当前 web profile 里实际可用的内置命令（逐包核对源码）：</p>
+<table>
+<thead>
+<tr>
+<th>命令</th>
+<th>作用</th>
+<th>注册包</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>/compact</code></td>
+<td>压缩旧对话历史</td>
+<td><code>@deepseek-ai/dsh-command-compact</code></td>
+</tr>
+<tr>
+<td><code>/goal</code></td>
+<td>查看/设置长任务目标</td>
+<td><code>@deepseek-ai/dsh-command-goal</code></td>
+</tr>
+<tr>
+<td><code>/plan [off|message]</code></td>
+<td>进入/退出计划模式</td>
+<td><code>@deepseek-ai/dsh-plan-mode</code></td>
+</tr>
+<tr>
+<td><code>/feedback &lt;text&gt;</code></td>
+<td>记录反馈</td>
+<td><code>@deepseek-ai/dsh-command-feedback</code></td>
+</tr>
+<tr>
+<td><code>/permission &lt;preset&gt;</code></td>
+<td>切换权限预设</td>
+<td><code>@deepseek-ai/dsh-permission-presets</code></td>
+</tr>
+<tr>
+<td><code>/export</code></td>
+<td>导出会话日志 ZIP</td>
+<td><code>@deepseek-ai/dsh-session-log-export</code></td>
+</tr>
+</tbody></table>
+<p>最接近的官方替代品：</p>
+<ul>
+<li><strong><code>/goal &lt;目标&gt;</code></strong> —— "让模型记住一件事"的持久语义最接近（跨多轮自动延续），但它是任务目标，不是随手笔记；</li>
+<li><strong><code>~/.dsh/AGENTS.md</code></strong>（用户级全局指令）—— 会被注入<strong>每一个</strong>会话（<code>dsh-agent-instructions</code> 的 <code>user-global</code> 作用域），适合"永远记住"；要改文件、要重启，不是运行时命令。</li>
+</ul>
+<p>本插件补上的是**"运行时、会话级、不换任务"**两块空缺：<code>/btw</code> 管"顺手问一句"，<code>/remember</code> 管"顺手记一笔"。</p>
+<h2>4. <code>/btw</code> 侧边提问的工作原理（源码层面）</h2>
+<p><code>/btw &lt;问题&gt;</code> 的执行链路（<code>executeSideQuestion</code>）：</p>
+<ol>
+<li><strong>解析</strong>：整段输入就是问题，空输入返回用法错误；超过 2000 字符截断（<code>parseSideQuestion</code>）；</li>
+<li><strong>取服务</strong>：<code>ctx.get('subagents')</code> 惰性解析（可选服务，不在 <code>inject</code> 里声明）——profile 没有 subagents 服务或没有 <code>fork</code> provider 时返回明确的错误，<code>/remember</code> 不受影响；</li>
+<li><strong>fork 子代理</strong>：<code>subagents.start('fork', { label: 'btw', prompt, parent: agent, signal, toolFilter: { allow: [] } })</code>：<ul>
+<li><code>fork</code> provider（<code>packages/subagent/subagent-fork-in-process</code>）会把父会话<strong>已完成的 turn 前缀</strong>作为 seed 注入子会话——子代理"有完整上下文"；</li>
+<li><code>toolFilter: { allow: [] }</code> —— allow 语义是"只保留列出的工具"，空数组 = <strong>全部工具消失且拒绝执行</strong>（fork 支持 toolFilter 能力）；</li>
+<li>单轮由 <code>subagent-in-process-driver</code> 保证（"owns exactly one turn with one result"）；</li>
+<li>prompt 文本（<code>renderSideQuestionPrompt</code>）带固定指令：这是 side question、直接简洁回答、<strong>不要调用任何工具、不要承诺采取行动</strong>（对应 Claude Code 的 system reminder）；</li>
+</ul>
+</li>
+<li><strong>取结果</strong>：<code>run.result</code> 给出 <code>{ output, stopReason }</code>；<code>completed</code> → 提取 text block 作为成功答案；<code>aborted</code>（用户取消/信号触发）→ "Side question cancelled."；<code>refusal</code> → 拒绝回答；<code>max-tokens</code>/<code>error</code> → 报错并保留部分回答；</li>
+<li><strong>收尾</strong>：无论成败都 <code>await run.dispose()</code>（释放子代理）；结果作为命令结果返回——<code>command/run</code>/<code>command/done</code> 是 <strong>log-only 事件，永不进模型上下文</strong>，所以问答<strong>不污染主线</strong>（<code>packages/interaction/commands/src/types.ts</code> 明确标注 "Log-only (never model surface)"）；</li>
+<li><strong>取消</strong>：命令 invocation 的 <code>signal</code> 直接传给子代理，UI 请求中止时子代理同步取消。</li>
+</ol>
+<h2>5. <code>/remember</code> 会话备忘的工作原理（源码层面）</h2>
+<p><code>/remember &lt;note&gt;</code> 一次做三件事：</p>
+<table>
+<thead>
+<tr>
+<th>行为</th>
+<th>机制</th>
+<th>效果</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>① 即时响应</td>
+<td>把笔记作为一条用户消息注入会话（<code>agent.steer</code>）</td>
+<td>模型下一轮就会回应它</td>
+</tr>
+<tr>
+<td>② 会话记忆</td>
+<td>笔记注入本会话<strong>每一次</strong>模型请求的 system prompt（<code>ctx.systemPrompt.section</code>，name <code>remember:notes</code>，order 60）</td>
+<td>模型在本会话持续"记得"，不靠上下文里的偶然提及</td>
+</tr>
+<tr>
+<td>③ 跨重启持久</td>
+<td>写入 <code>$DSH_HOME/btw/notes.json</code>（按 session id 分桶）</td>
+<td>resume 会话后笔记还在</td>
+</tr>
+</tbody></table>
+<blockquote>
+<p>② 的 section 文本同时带<strong>行为引导</strong>：笔记是"背景上下文，不是指令"——无关时不要复述、被用户点名时<strong>简短回应不展开</strong>。这是对"顺手记一条却换来长篇大论"这类模型行为的抑制杠杆（插件无法强制模型，但每轮注入的引导能显著压低这种倾向）。</p>
+</blockquote>
+<h3>命令语法</h3>
+<pre><code>/remember                列出本会话已记录的备忘（1-based 编号；超过 50 条只显示前 50 并提示其余）
+/remember &lt;note&gt;         记录备忘 + 注入给模型；超过 500 字符截断
+/remember clear          清空本会话全部备忘
+/remember forget &lt;n&gt;     删除第 n 条备忘
+</code></pre>
+<p><code>clear</code> / <code>forget</code> 是<strong>精确匹配</strong>的控制词：<code>/remember clear the cache</code> 会被当作一条普通备忘（与 <code>/goal</code> 的解析规则一致）。</p>
+<h2>6. 兼容性</h2>
+<ul>
+<li><strong>零运行时依赖</strong>：只 import <code>node:*</code>，通过注入的 <code>commands</code>/<code>systemPrompt</code> 服务和惰性的 <code>ctx.get('subagents')</code> 与 harness 交互——web profile 的 node_modules 里没有 <code>@deepseek-ai/*</code> 包，任何带 <code>@deepseek-ai/*</code> import 的插件都会 <code>ERR_MODULE_NOT_FOUND</code>；本插件任何 profile 都能直接加载；</li>
+<li><code>/btw</code> 需要 profile 提供 <code>subagents</code> 服务 + <code>fork</code> provider（<code>dsh-base</code> bundle 自带），缺失时该命令报错、<code>/remember</code> 照常工作；</li>
+<li>peerDependencies 范围为 <code>&gt;=0.1.0-rc.5 &lt;0.2.0</code>（含 <code>@deepseek-ai/dsh-subagent</code>），全部标记 optional（运行时零 import，声明仅作文档用途）；</li>
+<li>Web、TUI、headless 等一切带命令注册表的 profile 都可用（dsh-cc-tui 会把注册表命令合并进它的 <code>/</code> 菜单）。</li>
+</ul>
+<h2>7. 目录结构</h2>
+<pre><code>D:\dsh\btw\
+├── package.json        # dsh.bundle.patch → cordis.patch.yml；零依赖
+├── cordis.patch.yml    # bundle 补丁：insert 一行 { id: btw, name: dsh-btw }
+├── src\
+│   └── index.js        # 插件本体（纯 ESM + JSDoc，零构建；两个命令 + section）
+├── test\
+│   └── btw.test.mjs    # node:test 单测 + 桩 ctx 集成测试（零依赖，31 个用例）
+└── README.md
+</code></pre>
+<h2>8. 安装（web profile）</h2>
+<p>在 <strong>dsh 源码仓库根目录</strong>（<code>D:\dsh\deepseek-harness</code>）执行：</p>
+<pre><code>cd D:\dsh\deepseek-harness
+pnpm dsh plugin --profile web add "link:D:\dsh\btw"
+</code></pre>
+<ul>
+<li><code>link:</code> 是<strong>链接安装</strong>：改 <code>D:\dsh\btw</code> 源码即生效（重启后），适合迭代；想要拷贝一份独立安装可改用 <code>file:D:\dsh\btw</code>；</li>
+<li>纯本地路径，不需要网络、不需要 git/SSH（避开你环境里 github 连不上的问题）；</li>
+<li>该命令会在 profile 的 <code>package.json</code> 加上 <code>dsh-btw</code> 依赖，并自动把它并入 <code>dsh.profile.bundles</code>。</li>
+</ul>
+<p>验证：</p>
+<pre><code>pnpm dsh --profile web --dump-config   # 应看到 # == dsh-btw 层
+</code></pre>
+<p>然后<strong>重启客户端</strong>（bundle 层在启动时组装，package.json / 插件源码变更不会热重载）。重启后在输入框敲 <code>/</code>，命令菜单里应出现 <code>btw</code> 和 <code>remember</code>。</p>
+<blockquote>
+<p>不想重启的替代法：手动 <code>pnpm add</code> 该包后，把 <code>- id: btw / name: dsh-btw</code> 这两行写进 profile 的 <code>cordis.patch.yml</code>——profile 自己的补丁层支持热重载（<code>watchUserPatches</code>）。</p>
+</blockquote>
+<h2>9. 使用示例</h2>
+<pre><code>你: /btw 刚才那个配置文件叫什么来着？
+dsh: （子代理在后台用当前会话上下文回答）
+     配置文件是 src/config.ts，第 12 行导出 CONFIG 对象。
+     （主线继续干活，这段问答不进主对话、不落盘）
+
+你: /remember 用户姓张，称呼"张工"
+dsh: Noted (1 by-the-way note this session).
+模型: 好的，记下了——后续涉及称呼我会用"张工"。
+
+你: /remember
+dsh: By-the-way notes (2):
+1. 用户姓张，称呼"张工"
+2. 测试环境地址是 http://10.0.0.5:8080
+
+你: /remember forget 2
+dsh: Forgot note 2.
+</code></pre>
+<h2>10. 测试</h2>
+<pre><code>cd D:\dsh\btw
+node --test        # 31 个用例：侧问解析/提示/子代理流（含取消/拒绝/部分回答/失败兜底/始终 dispose）、
+                   # 备忘语法、存储/持久化/损坏回退、渲染上限、apply() 装配、steer 失败兜底
+</code></pre>
+<h2>11. 卸载</h2>
+<pre><code>pnpm dsh plugin --profile web remove dsh-btw
+</code></pre>
+<p>（同时会从 <code>dsh.profile.bundles</code> 移除该层；如需清理数据，删除 <code>C:\Users\hukou\.dsh\btw\</code> 目录。）</p>
+<h2>12. 限制与已知问题</h2>
+<ul>
+<li><strong><code>/btw</code> 的上下文是"上一个已完成 turn"</strong>：fork provider 的 seed 截止到父会话最后一次 <code>turn/end</code>（当前进行中的 tool-call turn 无法回放为合法子会话）。主线正在干活时提问，子代理看到的是最近一个完整回合的上下文——与 Claude Code"每轮结束后快照"的取舍一致；</li>
+<li><strong><code>/btw</code> 不做 prompt cache 复用</strong>：dsh 的 fork 子代理是独立的一次请求（继承了上下文前缀，但不会像 Claude Code 那样保证与主线程字节级一致的 cache key），成本低于开新会话但高于纯缓存命中；子代理自身的请求<strong>不写回主线上下文窗口</strong>；</li>
+<li><strong><code>/btw</code> 答案的呈现</strong>：作为命令结果行显示（相当于浮层），关闭/翻页即不可恢复；想要保留就复制，或用 <code>/remember</code> 记下来；</li>
+<li><strong><code>/remember</code> 注入每次模型请求</strong>：带备忘的会话每个请求都会携带 section 文本，有 token 成本；<code>maxNotes</code>（默认 20 条）和单条 500 字符上限约束它。想彻底清空用 <code>/remember clear</code>；</li>
+<li><strong>持久化是进程内快照 + JSON 文件</strong>：并发写多个会话时以最后一次 <code>save()</code> 为准；<code>$DSH_HOME/btw/notes.json</code> 可手工编辑，但建议通过命令操作；</li>
+<li><strong>数据存明文</strong>：<code>notes.json</code> 在 <code>$DSH_HOME</code> 下，别往里写密钥；</li>
+<li><strong>TUI 注意</strong>：<code>dsh-cc-tui</code> 自带一套本地命令（<code>/clear</code>、<code>/cost</code> 等）且需要 TTY——你的 client 是无 TTY 的 Web 会话，用的是本插件的 registry 命令，两者不冲突。</li>
+</ul>
+<h2>13. 版本历史</h2>
+<ul>
+<li><strong>0.2.0</strong>（本次重构）：<code>/btw</code> 改为 <strong>Claude Code 原版形态的侧边提问</strong>（fork 子代理 → 禁工具 → 单轮 → 答案作为命令结果，不进主对话、不落盘，需要 profile 提供 <code>subagents</code> + <code>fork</code> provider）；原备忘功能整体迁移到 <strong><code>/remember</code></strong>（存储文件路径不变，旧笔记无缝延续；prompt section 更名 <code>remember:notes</code>）。新增 12 个侧问相关测试用例（共 31 个）。</li>
+<li><strong>0.1.1</strong>：优化备忘提示词（"背景上下文，非指令，点名时简短回应"）+ 列表上限 <code>LIST_CAP=50</code>。</li>
+<li><strong>0.1.0</strong>：首个可用版本，<code>/btw</code> 为"会话备忘"形态（steer + system-prompt 注入 + 持久化）。</li>
+</ul>
+<h2>14. 参考资料</h2>
+<ul>
+<li><a href="https://code.claude.com/docs/en/commands">Claude Code Commands 官方文档</a></li>
+<li><a href="https://ugorange.com/blog/claude-code-btw-side-question/">Claude Code 的 /btw 为什么很妙：Side Question 的 sidecar 架构（源码分析）</a></li>
+<li><a href="https://www.working-ref.com/zh/reference/claude-code-btw-side-questions">Claude Code /btw — 不打断 AI 编码的旁路提问（机制与成本）</a></li>
+<li><a href="https://github.com/anthropics/claude-code/issues/37582">anthropics/claude-code#37582 — /btw 响应临时性的官方讨论与实现细节</a></li>
+<li>dsh 源码：<code>packages/interaction/commands</code>（命令注册表）、<code>packages/core/system-prompt</code>（section/context 注入）、<code>packages/subagent</code>（<code>ctx.subagents</code>、fork provider、in-process driver）、<code>packages/plan/plan-mode</code>（<code>/plan</code> + <code>agent.steer</code> 先例）、<code>apps/cli/src/plugin.ts</code>（bundle 安装/对账）</li>
+</ul>

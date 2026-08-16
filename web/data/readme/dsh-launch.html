@@ -1,0 +1,81 @@
+<h1>dsh-launch</h1>
+<p><a href="https://www.npmjs.com/package/dsh-launch"><img src="https://img.shields.io/npm/v/dsh-launch" alt="npm version"></a></p>
+<p>DSH 服务管理插件：在<strong>独立 broker 进程</strong>中监督长驻服务（dev server、watcher、mock API、worker），服务在对话回合结束、会话关闭、甚至 DSH 自身重启后继续运行。<strong>单包发布</strong>——Service 侧边栏 tab、broker、模型工具全部在此包内；better-sidebar 只负责承载 tab（经其扩展 API 注入，无需任何 better-sidebar 改动）。</p>
+<ul>
+<li><strong>根因</strong>：<code>pwsh</code> 后台任务（jobs）绑定在 owner 会话作用域上，会话/回合结束时 <code>dsh-jobs-local</code> 会取消归属任务。</li>
+<li><strong>解法</strong>（机制参考 <a href="https://github.com/oh-my-pi/pi-coding-agent">omp 的 launch daemon broker</a>）：服务由 detached broker 进程以 <code>detached + stdio 落盘</code> 方式拉起；broker 只做监督（日志增量、pid 探活、就绪检测、崩溃退避重启），自身空闲即退；DSH 下次启动时重新拉起 broker 并按 pid 收养仍在运行的服务。</li>
+</ul>
+<h2>安装</h2>
+<p>前置：DSH web 环境 +（可选，仅 UI 需要）<a href="https://www.npmjs.com/package/dsh-better-sidebar">dsh-better-sidebar</a>。</p>
+<pre><code>dsh plugin --profile web add dsh-launch
+</code></pre>
+<p>一条命令完成安装 + 自动挂载（包内 <code>cordis.patch.yml</code> 注册进 <code>dsh.profile.bundles</code>）。装完<strong>重启 <code>dsh web</code></strong> + 硬刷新浏览器（Cmd/Ctrl+Shift+R）。没有 better-sidebar 时插件以 headless 模式运行（工具可用，无 UI tab）。</p>
+<h2>能力</h2>
+<table>
+<thead>
+<tr>
+<th>入口</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong>Service tab</strong>（侧边栏）</td>
+<td>服务卡片：标题 / logo（可选，URL 或图片路径）/ 状态徽标 / PID·运行时长·重启次数 / <strong>启动 / 停止 / 重启 / 日志</strong>；可见时轮询本插件自有的 fenced <code>/launch/api</code> 路由</td>
+</tr>
+<tr>
+<td><code>service_start</code></td>
+<td>启动长驻服务：<code>name</code> + <code>command</code>（+ 可选 <code>cwd/title/logo/env/readyLog/readyPort/restart</code>），等待就绪后返回；就绪判定会<strong>先剥离 ANSI 转义</strong>并对 <strong>IPv4/IPv6 双栈</strong>探测端口</td>
+</tr>
+<tr>
+<td><code>service_stop</code> / <code>service_restart</code> / <code>service_list</code> / <code>service_logs</code></td>
+<td>模型工具：停止（整树杀）/ 重启 / 列举 / 读日志尾</td>
+</tr>
+<tr>
+<td><code>ctx.launch</code>（cordis 服务）</td>
+<td><code>ping / list / start / stop / restart / describe / logs</code>，供其他插件消费</td>
+</tr>
+</tbody></table>
+<h2>架构</h2>
+<pre><code>DSH 宿主进程 ──────────────►  dsh-launch broker（detached 独立进程）
+ dsh-launch 插件(host)         ┌ 命名管道 NDJSON 协议（token 认证，管道名按
+  ├ ctx.provide('launch')     │   runtimeDir 哈希，多部署不冲突）
+  ├ service_* 模型工具         │ 每服务状态机：starting→running→ready→
+  ├ /launch/api fenced 路由    │   stopping→exited/failed (+restarting 退避)
+  └ presence 文件注册          └ 每服务：daemons/&lt;name&gt;/{meta.json, output.log}
+         │                              │ spawn detached + unref
+         ▼                              ▼
+ dsh-launch 插件(client) ◄─────── 服务子进程 ×N（stdio→output.log，存活于一切之外）
+  └ ctx.betterSidebar.registerTab('service')
+</code></pre>
+<ul>
+<li><strong>运行时目录</strong>：<code>~/.dsh/tmp/dsh-launch/</code>（插件配置 <code>runtimeDir</code> 可覆盖）：<code>broker.token</code>、<code>broker.pid</code>（单实例租约）、<code>presence/*.json</code>（DSH 存活标记）、<code>daemons/&lt;name&gt;/</code>（元数据 + 日志，8MB 轮转）。</li>
+<li><strong>就绪检测</strong>：<code>readyLog</code>（输出正则，ANSI 已剥离）和/或 <code>readyPort</code>（TCP 探测，无 host 时同时探 <code>127.0.0.1</code> 与 <code>::1</code>）；<code>start</code>/<code>restart</code> 等待就绪（默认 20s，上限 60s）；broker 重启收养 <code>starting</code> 记录时会<strong>重扫日志尾部</strong>的已滚过就绪标记。</li>
+<li><strong>重启策略</strong>：<code>no / on-failure（默认）/ always</code>，指数退避 1s→30s。</li>
+<li><strong>Windows 命令执行</strong>：<code>command</code> 字符串服务经 <code>cmd.exe /d /c &lt;command.cmd&gt;</code> 由内置 node 启动器（<code>broker/launcher.cjs</code>）执行——detached 的 cmd 会丢失批处理子进程输出，启动器规避了该问题；整树停止用 <code>taskkill /T</code>。</li>
+</ul>
+<h2>测试</h2>
+<pre><code>npm test
+# broker 冒烟 15 项：启动/就绪(ANSI·IPv6)/日志/停止/重启/持久化/杀 broker 后收养/收养尾部重扫
+# 接线 13 项：服务提供/工具注册/presence/真实 broker 往返/fenced 路由信封/围栏拒绝/客户端契约
+</code></pre>
+<h2>安全说明</h2>
+<ul>
+<li>服务以运行 DSH 的同一用户身份、<strong>脱离任何沙箱</strong>执行（这是服务存活的前提）。服务等同于用户在终端启动的进程。</li>
+<li><code>/launch/api</code> 与 <code>/launch/service-logo</code> 全部经过 Host 头信任围栏（loopback 或 <code>trustedHosts</code>）；broker 管道仅绑定本机（命名管道 + token）。</li>
+<li>插件卸载（HMR/禁用）<strong>不会</strong>停止服务或 broker；broker 在无 presence 且空闲 15s 后自行退出，服务继续运行。</li>
+</ul>
+<h2>配置</h2>
+<p>插件行可选 <code>config</code>：</p>
+<pre><code>- id: dsh-launch
+  name: dsh-launch
+  config:
+    runtimeDir: '~/.dsh/tmp/dsh-launch'   # 覆盖运行时目录（默认同左）
+    idleGraceMs: 15000                     # 无客户端/无 presence 后的退出宽限
+    maxLogBytes: 8388608                   # 单服务日志轮转阈值
+</code></pre>
+<h2>限制</h2>
+<ul>
+<li>服务名全局唯一（全机一个 broker 作用域）。</li>
+<li>无 PTY / 无 stdin：交互式进程请用 better-sidebar 终端。</li>
+<li>broker 死亡窗口内（DSH 未运行且 broker 已退出）崩溃的服务不会自动重启（detached 服务本身不受影响）。</li>
+</ul>

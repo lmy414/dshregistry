@@ -1,0 +1,114 @@
+<h1>dsh-pref-kit</h1>
+<p>在数据流层面削减 DSH 会话事件量的性能插件：在 <code>llm/stream</code> 瀑布上合并模型流式输出的同类 delta，
+减少写入日志、磁盘与推送到前端的会话记录。</p>
+<h2>功能</h2>
+<ul>
+<li>合并 <code>text-delta</code> / <code>reasoning-delta</code>（仅同一 block index、同一类型；30ms 窗口，0–200ms 可调，0 = 关闭）</li>
+<li><code>assistant/chunk</code> 事件量显著下降（离线基准实测 54–70%，见<a href="#%E5%9F%BA%E5%87%86%E6%B5%8B%E8%AF%95">基准测试</a>），宿主内存 / JSONL 磁盘 / 推送字节同步下降</li>
+<li>Settings → Plugins 提供 <code>dsh-pref-kit</code> 配置卡片（windowMs 字段，与内置插件卡片同款折叠样式 + 保存/放弃按钮，保存后热生效、跨重启保留，无需重启）</li>
+<li>不改渲染、不改事件语义与线上协议</li>
+</ul>
+<h2>安装</h2>
+<p>插件按官方 bundle 形式发布：包自带 <code>cordis.patch.yml</code>（<code>dsh.bundle.patch</code>），
+<code>dsh plugin add</code> 会自动把插件行挂入 profile 组合，无需手工编辑 patch 文件。</p>
+<pre><code># 1. 构建插件模块（产出 dist/host/plugin.js、lib/client.js 与 typert 工件）
+cd dsh-pref-kit
+npm run build
+
+# 2. 将 bundle 装入目标 profile（以 web 为例；自动注册 dsh.profile.bundles 并挂载插件行）
+dsh plugin --profile web add "file:$(pwd)"
+
+# 3. 检查组合结果（应出现 pref-kit 行）
+dsh --profile web --dump-config | grep -A3 'id: pref-kit'
+
+# 4. 重启 DSH 生效（启动日志出现 [dsh-pref-kit] llm/stream coalescer active）
+</code></pre>
+<p>卸载：<code>dsh plugin --profile web remove dsh-pref-kit</code>（插件行随 bundle 一并移除）。</p>
+<p>更新：重新 <code>npm run build</code> 后先 <code>dsh plugin --profile web remove dsh-pref-kit</code> 再 <code>add</code>（<code>file:</code> 依赖按拷贝安装，需要 remove+add 刷新）。</p>
+<h2>配置</h2>
+<table>
+<thead>
+<tr>
+<th>配置项</th>
+<th>位置</th>
+<th>默认</th>
+<th>范围</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>合并窗口 windowMs</td>
+<td>Settings → Plugins → dsh-pref-kit 卡片</td>
+<td>30 ms</td>
+<td>0–200 ms（0 = 关闭合并）</td>
+</tr>
+</tbody></table>
+<p>组合行 <code>config.windowMs</code> 是设置值的 base 层（初始默认）；UI 修改写入用户设置层并热生效，
+恢复默认即回到组合值。窗口越小流式显示越即时，越大事件削减越多（首 chunk 延迟 ≈ 窗口）。</p>
+<p>实现说明：Host 侧为类插件（<code>PrefKitPlugin extends TypertRemoteService</code>，<code>@Remote('get'/'set')</code>），
+Remote 端点由 <code>typert-loader</code> 依据本包 <code>exports["./typert"]</code> 清单自动注册进 typert 注册表；
+Client 侧配置卡片经标准客户端 RPC 通道（<code>connection.rpc.call('/api', 'prefKit/…')</code>，与内置
+Remote 相同）读写，仅注册 Settings → Plugins 卡片，不触碰渲染器与原版样式。</p>
+<h2>基准测试</h2>
+<p>离线基准（uv 隔离环境：不连接 DSH、合成数据、虚拟时钟、确定性复现）实测 30ms 窗口的削减效果：</p>
+<table>
+<thead>
+<tr>
+<th>场景</th>
+<th>事件数（基线 → 合并）</th>
+<th>线上+日志字节（基线 → 合并）</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>短回复（600 token + 推理 + 2 工具）</td>
+<td>810 → 375（−53.7%）</td>
+<td>0.2MB → 0.1MB（−49.9%）</td>
+</tr>
+<tr>
+<td>长回复（8000 token + 推理 + 4 工具）</td>
+<td>9674 → 3281（−66.1%）</td>
+<td>2.2MB → 0.8MB（−62.6%）</td>
+</tr>
+<tr>
+<td>6 个并发 agent（各 5000 token）</td>
+<td>35592 → 10847（−69.5%）</td>
+<td>8.1MB → 2.7MB（−66.0%）</td>
+</tr>
+</tbody></table>
+<p>窗口灵敏度（100 条 delta、4ms 间隔）：窗口 0/30/100ms → 100/13/4 个事件，首个 chunk 延迟 0/32/100ms（≈窗口大小）。</p>
+<p><img src="https://raw.githubusercontent.com/gameswu/dsh-pref-kit/HEAD/docs/figures/fig1-coalescer-baseline.png" alt="fig1：合并器离线基准"></p>
+<p>运行：<code>npm run benchmark</code>（或 <code>uv run --project benchmark python benchmark/benchmark.py</code>）。</p>
+<h2>项目结构</h2>
+<pre><code>dsh-pref-kit/
+├── package.json            # typecheck / build / benchmark / verify；dsh.bundle + dsh.client 声明
+├── tsconfig.json
+├── cordis.patch.yml        # bundle 补丁层：插入 pref-kit 插件行（config.windowMs 为 base 层）
+├── build.mjs               # 客户端打包（src/client → lib/client.js，__ModuleLoader__ bundle）
+├── src/
+│   ├── types.ts            # 编译期类型
+│   ├── host/
+│   │   ├── plugin.ts       # Host 插件（类形态：TypertRemoteService + @Remote；settings 持久层）
+│   │   └── typert.ts       # exports["./typert"] 工件：prefKit/get|set 严格 Remote 清单
+│   └── client/entry.ts     # Client 插件：Settings → Plugins 配置卡片
+├── lib/client.js           # 客户端 bundle（构建产物，纳入版本控制）
+├── scripts/
+│   └── verify-session-log.js
+├── benchmark/              # 离线基准（uv 隔离环境，Python + matplotlib）
+│   ├── benchmark.py        # 脚本（生产合并逻辑的忠实镜像）
+│   └── pyproject.toml / uv.lock / .python-version
+├── docs/
+│   ├── perf-bottlenecks.md
+│   └── figures/fig1-coalescer-baseline.png  # 基准图表（fig1，由 benchmark 产物复制）
+└── dist/                   # host/plugin.js 等（构建产物，不纳入版本控制）
+</code></pre>
+<h2>开发</h2>
+<pre><code>npm run typecheck  # 严格模式类型检查
+npm run build      # 编译插件模块到 dist/ 与 lib/
+npm run benchmark  # 离线基准（uv run，输出图表与数据到 benchmark/）
+npm run verify     # 校验会话日志完整性
+</code></pre>
+<h2>文档</h2>
+<ul>
+<li><a href="https://github.com/gameswu/dsh-pref-kit/blob/HEAD/docs/perf-bottlenecks.md">分析报告</a></li>
+</ul>
+<h2>许可证</h2>
+<p><a href="https://github.com/gameswu/dsh-pref-kit/blob/HEAD/LICENSE">MIT</a></p>

@@ -139,7 +139,9 @@
     } else {
       try {
         // 片段由爬虫在构建期渲染并白名单清洗,见 tools/crawl.js
-        const res = await fetch(plugin.readmeUrl)
+        // readmeUrl 可能是相对路径 (data/readme/xxx.html), 在 /p/ 或 /c/ 页面需转绝对路径
+        const readmeUrl = plugin.readmeUrl.startsWith('/') ? plugin.readmeUrl : `/${plugin.readmeUrl}`
+        const res = await fetch(readmeUrl)
         if (!res.ok) throw new Error(`HTTP ${res.status}`)
         body.innerHTML = await res.text()
         body.querySelectorAll('a[href]').forEach((a) => { a.target = '_blank'; a.rel = 'noopener' })

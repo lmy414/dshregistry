@@ -81,6 +81,13 @@ else
   log "WARN: 数据拆分失败（继续）"
 fi
 
+# 2.7) 预渲染静态页（web/p/ 详情页 + web/c/ 分类页，产物不入库，Caddy 直接服务）
+if node tools/prerender.js >> "$LOG_FILE" 2>&1; then
+  log "预渲染生成成功"
+else
+  log "WARN: 预渲染失败（继续）"
+fi
+
 # 3) 有变更则提交推送（推当前分支，不直接推主干）
 if ! git diff --quiet -- web/data/ web/sitemap.xml; then
   CHANGE_INFO=$(git diff --stat -- web/data/ web/sitemap.xml | tail -1)

@@ -65,7 +65,15 @@ pnpm serve                       # 本地预览 http://127.0.0.1:4815/
 pnpm crawl                       # 增量收集(默认每轮最多 300 个新仓库)
 ```
 
-爬虫环境变量:`GITHUB_TOKEN`(缺省读 `gh auth token`)、`CRAWL_MAX_NEW`(每轮上限)、`CRAWL_FULL=1`(全量重扫)、`CRAWL_SKIP_SEARCH=1`(仅跑 seeds,调试用)、`CRAWL_ONLY=<子串>`(定向单仓)。收录规则:声明 `dsh.bundle.patch` + 有 LICENSE + 有 README;缓存与已收录清单位于 `tools/.cache/`(不入库)。
+生成静态产物(爬虫后执行):
+
+```bash
+node tools/gen-sitemap.js   # sitemap.xml(入库)
+node tools/split-data.js    # web/data/plugin/<slug>.json + by-cat/(入库)
+node tools/prerender.js     # web/p/<slug>.html 详情页 + web/c/<cat>.html 分类页(不入库)
+```
+
+爬虫环境变量:`GITHUB_TOKEN`(缺省读 `gh auth token`)、`CRAWL_MAX_NEW`(每轮上限)、`CRAWL_FULL=1`(全量重扫)、`CRAWL_SKIP_SEARCH=1`(仅跑 seeds,调试用)、`CRAWL_ONLY=<子串>`(定向单仓)。收录规则:声明 `dsh.bundle.patch` + 有 LICENSE + 有 README;缓存与已收录清单位于 `tools/.cache/`(不入库)。服务器定时同步见 `tools/sync.sh`(爬虫 → sitemap → 拆分 → 预渲染 → 提交推送,分支跟随 + 飞书告警)。
 
 ## 信任模型
 

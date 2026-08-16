@@ -22,11 +22,16 @@ const urls = []
 // 静态页面
 urls.push({ loc: `${BASE}/`, prio: '1.0', freq: 'daily' })
 urls.push({ loc: `${BASE}/about.html`, prio: '0.5', freq: 'monthly' })
-// 全部插件详情页（核心：让 Google 无需 JS 渲染即可发现）
+// P1-9: 8 个分类独立页
+const CATS = ['tool', 'vision', 'dashboard', 'bridge', 'launcher', 'mcp', 'skill', 'other']
+for (const c of CATS) {
+  urls.push({ loc: `${BASE}/c/${c}.html`, prio: '0.6', freq: 'weekly' })
+}
+// 全部插件详情页（路径式 URL，Google 无需 JS 渲染即可发现）
 for (const p of plugins) {
   if (!p.slug) continue
   urls.push({
-    loc: `${BASE}/plugin.html?slug=${encodeURIComponent(p.slug)}`,
+    loc: `${BASE}/p/${encodeURIComponent(p.slug)}.html`,
     prio: p.stars >= 20 ? '0.8' : '0.6',
     freq: 'weekly',
     lastmod: p.pushedAt || undefined,

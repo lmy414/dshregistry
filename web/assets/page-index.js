@@ -9,6 +9,15 @@
   const SORTS = ['updated', 'stars', 'firstSeen']   // 与 .sort-select option 顺序一致
   const PAGE_SIZE = 60                              // 大数据量分批渲染,加载更多递增
 
+  // P1-9: 从 URL 参数恢复初始状态 (分类/搜索),支持 /c/<cat>.html 与 ?cat=&q=
+  function initStateFromUrl() {
+    const params = new URLSearchParams(location.search)
+    const cat = params.get('cat')
+    if (cat && DSHR.CATEGORIES.includes(cat)) state.category = cat
+    const q = params.get('q')
+    if (q) state.query = q
+  }
+
   function filtered() {
     const q = state.query.trim().toLowerCase()
     let list = state.plugins
@@ -22,8 +31,14 @@
     return [...list].sort(by)
   }
 
+  // P1-9: 分类页可分享 URL (/c/tool.html)
+  function categoryUrl(cat) {
+    if (cat === 'all') return 'index.html'
+    return `c/${cat}.html`
+  }
+
   function cardHtml(p) {
-    return `<a href="plugin.html?slug=${encodeURIComponent(p.slug)}" class="plugin-card" data-dom-id="card-${DSHR.escapeHtml(p.slug)}">
+    return `<a href="p/${encodeURIComponent(p.slug)}.html" class="plugin-card" data-dom-id="card-${DSHR.escapeHtml(p.slug)}">
       <div class="card-top">
         <div class="card-title-group">
           <div class="card-title">${DSHR.escapeHtml(p.name)}</div>
@@ -109,18 +124,38 @@
     const input = document.querySelector('.search-box input')
     if (input) {
       input.setAttribute('data-i18n-placeholder', '#search.placeholder')
-      input.value = ''
+      input.value = state.query
       input.addEventListener('input', () => { state.query = input.value; state.shown = PAGE_SIZE; render() })
     }
+    // P1-9: 分类 chip 改为链接到独立分类页 (/c/<cat>.html)，支持分享与收录
     document.querySelectorAll('.chip-row .chip').forEach((chip, i) => {
-      chip.addEventListener('click', () => { state.category = DSHR.CATEGORIES[i]; state.shown = PAGE_SIZE; syncChips(); render() })
+      const cat = DSHR.CATEGORIES[i]
+      chip.classList.toggle('active', cat === state.category)
+      chip.textContent = DSHR.categoryLabel(cat)
+      chip.style.cursor = 'pointer'
+      chip.addEventListener('click', () => {
+        if (cat !== state.category) location.href = categoryUrl(cat)
+      })
     })
     const select = document.querySelector('.sort-select')
     if (select) {
       select.selectedIndex = 0
       select.addEventListener('change', () => { state.sort = SORTS[select.selectedIndex] || 'updated'; state.shown = PAGE_SIZE; render() })
     }
-    syncChips()
+    // P1-9: 加载更多按钮改为 ?page=N 可分享分页 URL
+    const params = new URLSearchParams(location.search)
+    const page = Number(params.get('page') || 1)
+    state.shown = PAGE_SIZE * page
+    document.addEventListener('click', (e) => {
+      const btn = e.target.closest('#loadmore-btn')
+      if (!btn) return
+      const next = Math.floor(state.shown / PAGE_SIZE) + 1
+      const p = new URLSearchParams(location.search)
+      p.set('page', String(next))
+      history.replaceState(null, '', `${location.pathname}?${p.toString()}`)
+      state.shown += PAGE_SIZE
+      render()
+    })
   }
 
   DSHR.onReady(async () => {
@@ -131,6 +166,7 @@
     } catch (e) {
       console.error('[dshregistry] data load failed', e)
     }
+    initStateFromUrl()
     wire()
     syncTitle()
     renderStats()

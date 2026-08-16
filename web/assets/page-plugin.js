@@ -30,7 +30,7 @@
   /** SEO: 按插件动态覆盖 meta / canonical / OG / JSON-LD */
   function updateSeo() {
     if (!plugin) return
-    const url = `https://dshregistry.xyz/plugin.html?slug=${encodeURIComponent(slug)}`
+    const url = `https://dshregistry.xyz/p/${encodeURIComponent(slug)}.html`
     const desc = (plugin.description || plugin.name || '').slice(0, 160)
     const setMeta = (attr, key, value) => {
       let el = document.querySelector(`meta[${attr}="${key}"]`)
@@ -186,7 +186,7 @@
     if (!grid) return
     const related = all.filter((p) => p.slug !== plugin.slug && p.category === plugin.category).slice(0, 4)
     const pool = related.length > 0 ? related : all.filter((p) => p.slug !== plugin.slug).slice(0, 3)
-    grid.innerHTML = pool.map((p) => `<a href="plugin.html?slug=${encodeURIComponent(p.slug)}" class="related-card">
+    grid.innerHTML = pool.map((p) => `<a href="p/${encodeURIComponent(p.slug)}.html" class="related-card">
       <div class="related-card-top">
         <span class="related-card-name">${DSHR.escapeHtml(p.name)}</span>
         ${DSHR.badgeHtml(p.state)}

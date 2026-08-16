@@ -41,6 +41,22 @@ dshregistry/
 
 **方式二(被动)**:给仓库添加 `dsh-plugin` topic,并推荐在 `package.json` 声明 `dsh.registry` 元数据;爬虫每 6 小时扫描自动发现。
 
+## Git 协作约定
+
+> **主干 `main` 只接受功能性改动**;服务器端(运维 AI)的一切改动只提交分支,数据同步同样走分支。
+
+| 通道 | 内容 | 分支 |
+|---|---|---|
+| **功能性改动** | 新功能、修复、文档、配置调整 | 直接提交 `main`(或经 PR review 合并) |
+| **服务器端改动** | 运维 AI 的脚本调整、部署配置 | 只在分支提交,经确认后合并主干 |
+| **数据同步** | 爬虫产物 `web/data/*.json`、`web/sitemap.xml` | 跟随服务器工作区当前分支,不直接推主干 |
+
+**服务器端纪律**:
+- 服务器工作区(git)所在分支即线上站点数据源;`sync.sh` 自动跟随当前分支执行 `pull → crawl → 生成 sitemap → commit → push`
+- 服务器端**禁止**直接向 `main` push 数据/运维改动;如需上线分支内容,由人工 review 后合并
+- 运维提交使用独立身份 `hermes-ops <hermes-ops@dshregistry.xyz>`,与开发者提交区分
+- 禁止 `force-push`、改写已推送历史;本地与远端分叉时使用 `pull --rebase` 保持线性历史
+
 ## 本地预览与爬虫
 
 ```bash

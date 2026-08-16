@@ -24,6 +24,56 @@
     const titles = document.querySelectorAll('main .section-title')
     const keys = ['section.install', 'section.intro', 'section.meta', 'section.related']
     titles.forEach((el, i) => { if (keys[i]) el.textContent = DSHR.t(keys[i]) })
+    updateSeo()
+  }
+
+  /** SEO: 按插件动态覆盖 meta / canonical / OG / JSON-LD */
+  function updateSeo() {
+    if (!plugin) return
+    const url = `https://dshregistry.xyz/plugin.html?slug=${encodeURIComponent(slug)}`
+    const desc = (plugin.description || plugin.name || '').slice(0, 160)
+    const setMeta = (attr, key, value) => {
+      let el = document.querySelector(`meta[${attr}="${key}"]`)
+      if (!el) {
+        el = document.createElement('meta')
+        el.setAttribute(attr, key)
+        document.head.appendChild(el)
+      }
+      el.setAttribute('content', value)
+    }
+    document.title = `${plugin.name} · DSH-Registry`
+    setMeta('name', 'description', desc)
+    let canonical = document.querySelector('link[rel="canonical"]')
+    if (!canonical) { canonical = document.createElement('link'); canonical.rel = 'canonical'; document.head.appendChild(canonical) }
+    canonical.href = url
+    setMeta('property', 'og:title', `${plugin.name} · DSH-Registry`)
+    setMeta('property', 'og:description', desc)
+    setMeta('property', 'og:url', url)
+    setMeta('name', 'twitter:title', `${plugin.name} · DSH-Registry`)
+    setMeta('name', 'twitter:description', desc)
+    // JSON-LD: SoftwareApplication 结构化数据
+    let ld = document.getElementById('ld-plugin')
+    if (!ld) {
+      ld = document.createElement('script')
+      ld.id = 'ld-plugin'
+      ld.type = 'application/ld+json'
+      document.head.appendChild(ld)
+    }
+    ld.textContent = JSON.stringify({
+      '@context': 'https://schema.org',
+      '@type': 'SoftwareApplication',
+      name: plugin.name,
+      description: desc,
+      url,
+      applicationCategory: 'DeveloperApplication',
+      operatingSystem: 'DeepSeek Harness (DSH)',
+      author: { '@type': 'Organization', name: plugin.repo ? plugin.repo.split('/')[0] : undefined, url: plugin.githubUrl || undefined },
+      codeRepository: plugin.githubUrl || undefined,
+      dateModified: plugin.pushedAt || undefined,
+      datePublished: plugin.firstSeenAt || undefined,
+      aggregateRating: plugin.stars ? undefined : undefined,
+      offers: { '@type': 'Offer', price: '0', priceCurrency: 'USD' },
+    })
   }
 
   function renderStats() {

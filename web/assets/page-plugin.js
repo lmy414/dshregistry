@@ -26,7 +26,22 @@
     const titles = document.querySelectorAll('main .section-title')
     const keys = ['section.install', 'section.intro', 'section.meta', 'section.related']
     titles.forEach((el, i) => { if (keys[i]) el.textContent = DSHR.t(keys[i]) })
+    renderWarningCallout()
     updateSeo()
+  }
+
+  /** 信任状态差异化警示条: unreviewed=红色强警示, community=琥珀温和提醒, flagged=红色 */
+  function renderWarningCallout() {
+    const el = document.querySelector('[data-dom-id="warning-callout"]')
+    if (!el || !plugin) return
+    const state = plugin.state || 'unreviewed'
+    if (state === 'community') {
+      el.className = 'warning-callout vouched'
+      el.innerHTML = DSHR.t('risk.warning.vouched')
+    } else {
+      el.className = 'warning-callout'
+      el.innerHTML = DSHR.t('risk.warning.unreviewed')
+    }
   }
 
   /** SEO: 按插件动态覆盖 meta / canonical / OG / JSON-LD */

@@ -6,11 +6,12 @@ import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { createCheerioRunner } from '../lib/crawler.js'
+import { CRAWL_UA } from '../lib/http.js'
 
 async function fakeSite(pages) {
   const hits = []
   const server = http.createServer((req, res) => {
-    hits.push({ url: req.url, at: Date.now() })
+    hits.push({ url: req.url, at: Date.now(), ua: req.headers['user-agent'] })
     if (!pages[req.url]) { res.writeHead(404); return res.end() }
     res.writeHead(200, { 'content-type': 'text/html' }); res.end(pages[req.url])
   })
@@ -40,4 +41,31 @@ test('per-domain 限速:同域两次请求间隔 ≥ minIntervalMs', async () =>
   await c.run([`${base}/a`, `${base}/b`])
   assert.ok(hits[1].at - hits[0].at >= 110, `间隔 ${hits[1].at - hits[0].at}ms`)
   server.close(); await rm(dir, { recursive: true, force: true })
+})
+
+test('UA: 出站请求头 User-Agent === DSHRegistryBot/1.0', async () => {
+  const { server, hits, base } = await fakeSite({ '/a': '<h1>a</h1>' })
+  const dir = await mkdtemp(join(tmpdir(), 'crawlee-'))
+  const c = createCheerioRunner({ storageDir: dir, minIntervalMs: 0, requestHandler: async () => {} })
+  await c.run([`${base}/a`])
+  assert.equal(hits[0].ua, CRAWL_UA)
+  server.close(); await rm(dir, { recursive: true, force: true })
+})
+
+test('白名单:非白名单 URL 请求失败且不触达网络', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'crawlee-'))
+  const failed = []
+  const c = createCheerioRunner({
+    storageDir: dir, minIntervalMs: 0,
+    requestHandler: async () => { throw new Error('不应触达 requestHandler') },
+    failedRequestHandler: async ({ request, error }) => {
+      failed.push({ url: request.url, msg: error?.message ?? '', cause: error?.cause?.message ?? '' })
+    },
+  })
+  await c.run(['https://evil.com/x'])
+  assert.equal(failed.length, 1, '非白名单 URL 应走 failedRequestHandler')
+  assert.equal(failed[0].url, 'https://evil.com/x')
+  const text = `${failed[0].msg} | ${failed[0].cause}`
+  assert.match(text, /禁止抓取非白名单/, `失败原因应为白名单拒绝而非网络错误: ${text}`)
+  await rm(dir, { recursive: true, force: true })
 })

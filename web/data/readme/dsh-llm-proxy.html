@@ -1,0 +1,110 @@
+<h1>dsh-llm-proxy</h1>
+<blockquote>
+<p>DeepSeek Harness (dsh) 的全局 HTTP 代理插件：用 undici <code>setGlobalDispatcher</code> + <code>EnvHttpProxyAgent</code> 接管 dsh 所有 LLM 请求的代理路由。配置化、热切换、可观测。</p>
+</blockquote>
+<p><a href="https://github.com/Ye-Yu-Mo/dsh-llm-proxy/blob/HEAD/LICENSE"><img src="https://img.shields.io/badge/License-MIT-blue.svg" alt="License"></a>
+<a href="https://github.com/Ye-Yu-Mo/dsh-llm-proxy/blob/HEAD/package.json"><img src="https://img.shields.io/badge/Node-%3E%3D24-brightgreen" alt="Node"></a>
+<a href="https://github.com/Ye-Yu-Mo/dsh-llm-proxy/blob/HEAD/package.json"><img src="https://img.shields.io/badge/DeepSeek%20Harness-0.1.x-6b3fa0" alt="dsh"></a></p>
+<hr>
+<h2>为什么需要它</h2>
+<p>dsh（DeepSeek Harness）用 node 内置 <code>fetch</code>（undici）发 LLM 请求，而 undici <strong>默认不读 <code>http_proxy</code>/<code>https_proxy</code> 环境变量</strong>。如果你的 LLM 端点（如 llm-proxy 网关）必须走代理才能访问，dsh 会直连超时。</p>
+<p>本插件在 dsh 进程内用 <code>setGlobalDispatcher(new EnvHttpProxyAgent(...))</code> 全局接管 fetch 的代理路由：</p>
+<ul>
+<li>✅ 让 dsh 所有 LLM 请求走你配置的代理</li>
+<li>✅ <strong>热切换</strong>：设置变更即时生效，无需重启</li>
+<li>✅ <strong>可逆</strong>：插件停止/禁用时恢复基线 dispatcher，不留进程级残留</li>
+<li>✅ <strong>可观测</strong>：<code>/api/llm-proxy/status</code> 查看当前生效模式，<code>/api/llm-proxy/test</code> 测试任意代理连通性</li>
+</ul>
+<h2>安装</h2>
+<p>本插件是 <strong>bundle</strong> 包（<code>dsh.bundle.patch</code> 清单）：<code>dsh plugin add</code> 会把它装进 profile 依赖并自动加入 <code>dsh.profile.bundles</code>，下次启动自动激活，<strong>无需手动加 patch 行</strong>。</p>
+<pre><code># 一键安装（发布到 npm 后可直接用包名）
+dsh plugin --profile web add dsh-llm-proxy
+# 或直接从 GitHub 安装
+dsh plugin --profile web add github:Ye-Yu-Mo/dsh-llm-proxy
+</code></pre>
+<p>开发调试（本地 link）：</p>
+<pre><code>git clone https://github.com/Ye-Yu-Mo/dsh-llm-proxy
+dsh plugin --profile web add link:$(pwd)/dsh-llm-proxy
+</code></pre>
+<p>安装后<strong>重启 dsh web</strong> 使 bundle 补丁生效；<code>~/.dsh/dsh.log</code> 出现 <code>[llm-proxy]</code> 日志（未启用时为「恢复基线」一行）即装载成功。</p>
+<h2>配置</h2>
+<p>通过 dsh 设置页的「LLM 代理」项，或直接编辑 <code>~/.dsh/settings.yaml</code>：</p>
+<pre><code>llm-proxy:
+  enabled: true
+  url: http://127.0.0.1:7891        # 你的 HTTP(S) 代理地址
+  noProxy:
+    - localhost
+    - 127.0.0.1
+    - ::1
+</code></pre>
+<table>
+<thead>
+<tr>
+<th>字段</th>
+<th>类型</th>
+<th>默认</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>enabled</code></td>
+<td>boolean</td>
+<td><code>false</code></td>
+<td>是否启用代理接管</td>
+</tr>
+<tr>
+<td><code>url</code></td>
+<td>string</td>
+<td><code>''</code></td>
+<td>HTTP(S) 代理地址，如 <code>http://127.0.0.1:7891</code></td>
+</tr>
+<tr>
+<td><code>noProxy</code></td>
+<td>string[]</td>
+<td><code>['localhost','127.0.0.1','::1']</code></td>
+<td>不走代理的地址</td>
+</tr>
+</tbody></table>
+<blockquote>
+<p>⚠️ dsh 设置页只暴露白名单内的配置命名空间。若设置页显示「表单不可用」，需把 <code>llm-proxy</code> 加入 <code>dsh-host-apiproxy</code> 的 <code>WEB_SETTINGS_NAMESPACES</code>（当前为 dsh 已知限制，见下）。</p>
+</blockquote>
+<h2>HTTP API</h2>
+<p>插件注册两个宿主路由（loopback-only，防 LAN 探测）：</p>
+<h3><code>GET /api/llm-proxy/status</code></h3>
+<p>当前生效模式：</p>
+<pre><code>{
+  "effective": { "mode": "setting", "url": "http://127.0.0.1:7891" },
+  "env": { "httpProxy": "http://127.0.0.1:7891", "httpsProxy": "http://127.0.0.1:7891" }
+}
+</code></pre>
+<p><code>mode</code> 取值：</p>
+<ul>
+<li><code>setting</code>：走设置的 <code>url</code></li>
+<li><code>env</code>：读环境变量代理（<code>HTTP(S)_PROXY</code>）</li>
+<li><code>direct</code>：直连（无代理）</li>
+</ul>
+<h3><code>POST /api/llm-proxy/test</code></h3>
+<p>测试任意代理到目标端点的连通性：</p>
+<pre><code>// 请求
+{ "url": "http://127.0.0.1:7891", "probeUrl": "https://llm-proxy.ftai.chat/v1/models", "timeoutMs": 8000 }
+// 响应
+{ "ok": true, "latencyMs": 246, "status": 200 }
+</code></pre>
+<h2>开发</h2>
+<pre><code>pnpm install
+pnpm test        # 单元测试（logic/http-utils）
+node scripts/... # 见 scripts/
+</code></pre>
+<p>目录结构：</p>
+<pre><code>lib/
+  index.js       # 宿主核心：settings + dispatcher 接管 + HTTP 路由
+  logic.js       # 纯函数配置判定（可单测）
+  http-utils.js  # loopback 校验 / JSON 读写
+  client.js      # 设置面板「LLM 代理」页
+test/            # 单元测试
+</code></pre>
+<h2>已知限制</h2>
+<p>dsh 设置页的配置命名空间白名单（<code>dsh-host-apiproxy</code> 的 <code>WEB_SETTINGS_NAMESPACES</code>）是硬编码的，第三方插件无法自注册暴露。目前需要手动把 <code>llm-proxy</code> 加入白名单才能让设置页表单可用（dsh 官方已将"插件自注册"列为延后工作）。</p>
+<p>已在上游提交讨论：<a href="https://github.com/deepseek-ai/deepseek-harness/discussions/1196">Third-party plugins cannot expose settings namespaces to the web settings page</a>（Ideas 分类）。</p>
+<h2>License</h2>
+<p>MIT</p>

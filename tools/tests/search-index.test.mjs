@@ -38,7 +38,7 @@ test('stem 回归:双写折叠仅作用于剥后缀中间串,无二次剥除', (
   ]) expect(input, term)
   for (const [input, term] of [
     ['kissing', 'ki'], ['passing', 'pa'], ['missing', 'mi'],
-    ['wedding', 'we'], ['adding', 'ad'], ['kissing', 'ki'],
+    ['wedding', 'we'], ['messing', 'me'], ['adding', 'ad'], ['kiss', 'ki'],
   ]) deny(input, term)
 })
 

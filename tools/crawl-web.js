@@ -105,7 +105,7 @@ export async function runWebCrawl({ dataDir, cacheDir, now, maxPages = Infinity,
   await atomicWriteJson(pluginsFile, mergedPlugins)
   // 独立留存网页文档:与旧留存并集合并(每轮全量覆盖会让第二轮起页面搜索覆盖崩塌)。
   // 旧条目三选:① url 命中本轮新页 → 弃旧用新;② repoUrl 解析后命中 knownRepoKeys(仓库已转正)→ 剔除;
-  // ③ 其余保留。合并结果 = 保留旧条目 + 本轮新页(按 url 去重)。
+  // ③ 其余保留。合并结果 = 保留旧条目 + 本轮新页,按条目身份去重。
   const pagesFile = join(dataDir, 'pages.json')
   const oldPages = JSON.parse(await readFile(pagesFile, 'utf8').catch(() => '{"pages":[]}'))
   const newByUrl = new Set(pages.map((p) => p.url))
@@ -114,11 +114,15 @@ export async function runWebCrawl({ dataDir, cacheDir, now, maxPages = Infinity,
     const u = parseGithubRepoUrl(p.repoUrl)
     return !(u && knownRepoKeys.has(keyOf(u.fullName)))
   })
+  // 去重键必须含条目身份:url 仅对 dshfind 页天然唯一,hub 全部条目 url 恒为 LISTING_URL,
+  // 纯按 url 去重会把整目录 hub 折叠成 1 条 → external id 参与键(name 兜底)。
+  const pageKey = (p) => `${p.url}#${p.external?.[p.source]?.id ?? p.name ?? ''}`
   const mergedPages = []
-  const seenUrl = new Set()
+  const seenKey = new Set()
   for (const p of [...kept, ...pages]) {
-    if (seenUrl.has(p.url)) continue
-    seenUrl.add(p.url)
+    const k = pageKey(p)
+    if (seenKey.has(k)) continue
+    seenKey.add(k)
     mergedPages.push(p)
   }
   await atomicWriteJson(pagesFile, { version: 1, updatedAt: now, pages: mergedPages })

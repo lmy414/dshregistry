@@ -163,3 +163,41 @@ test('runWebCrawl: dshfind sitemap 失败不抛,hub 合并照常落盘', async (
   assert.deepEqual(plugins[0].listedOn.map((l) => l.source), ['dshhub'], 'dshfind 失败不影响 hub 合并')
   assert.equal(result.merges.length, 1)
 })
+
+// 复审 round 2(修复波次):合并去重键若按 url,hub 全部条目(LISTING_URL 恒同)会被折叠成 1 条
+// 修复:去重键 = url#external.id(name 兜底)——hub 重复 url 但 id 不同必须全部保留
+test('runWebCrawl: pages.json 去重按条目身份——3 个 hub 条目同 url 不同 id 全部保留', async (t) => {
+  const LISTING = 'https://hub.omdsh.dev/projects.html'
+  const server = http.createServer((req, res) => {
+    if (req.url === '/catalog.json') {
+      const body = JSON.stringify({ schema: 'v0.4', packages: [
+        { id: 'hub1', name: 'hub-one', description: 'a', repository: 'https://github.com/None/hub-a', author: { name: 'A' } },
+        { id: 'hub2', name: 'hub-two', description: 'b', repository: 'https://github.com/None/hub-b', author: { name: 'B' } },
+        { id: 'hub3', name: 'hub-three', description: 'c', repository: 'https://github.com/None/hub-c', author: { name: 'C' } },
+      ] })
+      res.writeHead(200, { 'content-type': 'application/json' }); return res.end(body)
+    }
+    if (req.url === '/sitemap.xml') { res.writeHead(200, { 'content-type': 'text/xml' }); return res.end('<urlset/>') }
+    res.writeHead(404); res.end()
+  })
+  await new Promise((r) => server.listen(0, r))
+  const base = `http://127.0.0.1:${server.address().port}`
+  const dataDir = await mkdtemp(join(tmpdir(), 'data-'))
+  const cacheDir = await mkdtemp(join(tmpdir(), 'cache-'))
+  t.after(async () => { server.close(); await rm(dataDir, { recursive: true, force: true }); await rm(cacheDir, { recursive: true, force: true }) })
+  await writeFile(join(dataDir, 'plugins.json'), JSON.stringify([]))
+  // 预置旧留存:3 个 hub 条目(同 LISTING_URL,不同 external.dshhub.id)+ 1 个 dshfind 页
+  const hubDoc = (id) => ({ type: 'page', source: 'dshhub', url: LISTING, name: `hub-${id}`, author: 'A', description: 'd', category: null, repoUrl: null, external: { dshhub: { id } } })
+  await writeFile(join(dataDir, 'pages.json'), JSON.stringify({ version: 1, updatedAt: '2026-08-16', pages: [
+    hubDoc('hub1'), hubDoc('hub2'), hubDoc('hub3'),
+    { type: 'page', source: 'dshfind', url: `${base}/zh/plugins/Old/ghost`, name: 'old-ghost', author: 'Old', description: 'legacy', category: null, repoUrl: 'https://github.com/Old/ghost', external: { dshfind: {} } },
+  ] }))
+
+  await runWebCrawl({ dataDir, cacheDir, now: '2026-08-17', maxPages: 10, minIntervalMs: 0, dshfindBase: base, dshhubBase: base })
+
+  const pages = JSON.parse(await readFile(join(dataDir, 'pages.json'), 'utf8'))
+  const hubIds = pages.pages.filter((p) => p.source === 'dshhub').map((p) => p.external.dshhub.id).sort()
+  assert.deepEqual(hubIds, ['hub1', 'hub2', 'hub3'], 'hub 重复 url 但 id 不同,3 条必须全部保留')
+  assert.ok(pages.pages.some((p) => p.source === 'dshfind' && p.name === 'old-ghost'), '无关 dshfind 旧页保留')
+  assert.equal(pages.pages.length, 4, '4 = 3 hub + 1 dshfind')
+})

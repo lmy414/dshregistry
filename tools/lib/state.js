@@ -5,14 +5,28 @@ import { dirname } from 'node:path'
 const DAY = 86400000
 
 export async function loadState(file) {
-  return JSON.parse(await readFile(file, 'utf8').catch(() => '{"version":1,"urls":{}}'))
+  try {
+    return JSON.parse(await readFile(file, 'utf8'))
+  } catch {
+    // 文件缺失 / 崩溃窗口残留非法 JSON:回退空态(全量重抓是安全降级)
+    return { version: 1, urls: {} }
+  }
 }
 
+let tmpCounter = 0
+let saveChain = Promise.resolve()
 export async function saveState(file, state) {
   await mkdir(dirname(file), { recursive: true })
-  const tmp = `${file}.tmp`
-  await writeFile(tmp, JSON.stringify(state), 'utf8')
-  await rename(tmp, file)
+  // per-call 唯一 tmp 名:并发 writeFile 互不覆写,快照均为完整 JSON;
+  // 写入+rename 挂模块级串行链:Windows 上并发 rename 到同一目标文件会互斥
+  // (实测 EPERM operation not permitted),排队后 last-writer-wins 按调用序确定。
+  const tmp = `${file}.${process.pid}.${tmpCounter++}.tmp`
+  const run = saveChain.then(async () => {
+    await writeFile(tmp, JSON.stringify(state), 'utf8')
+    await rename(tmp, file)
+  })
+  saveChain = run.catch(() => {})   // 单次失败不打断后续排队
+  await run
 }
 
 /** 记录一次抓取结果:changed 复位 unchangedRounds 并更新 lastChangedAt;未变递增。 */

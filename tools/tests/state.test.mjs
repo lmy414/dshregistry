@@ -1,7 +1,10 @@
 // tools/tests/state.test.mjs
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { noteChecked, planRefresh, planGithubRefresh } from '../lib/state.js'
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { noteChecked, planRefresh, planGithubRefresh, loadState, saveState } from '../lib/state.js'
 
 const NOW = Date.parse('2026-08-17T00:00:00Z')
 const DAY = 86400000
@@ -54,4 +57,29 @@ test('planGithubRefresh: wrap-around 轮转,T mod R ≠ 0 时不饥饿', () => {
     for (const repo of r) if (repo.startsWith('o/tail')) union.add(repo)
   }
   assert.equal(union.size, 20, '4 轮(T=20, rest=6, ceil=4)tail 入选并集应覆盖全部 20 个')
+})
+
+test('saveState 并发:20 次并发写同一文件,最终为合法 JSON 且等于某次完整快照', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'state-'))
+  const file = join(dir, 'state.json')
+  const snapshots = Array.from({ length: 20 }, (_, i) => {
+    const urls = {}
+    for (let k = 0; k <= i; k++) urls[`u${k}`] = { lastCheckedAt: i * 1000 + k, hash: 'x'.repeat(1000 + i * 100) }
+    return { version: 1, urls }
+  })
+  await Promise.all(snapshots.map((s) => saveState(file, s)))
+  const parsed = JSON.parse(await readFile(file, 'utf8'))   // 非法 JSON(混合/截断)在此抛错即失败
+  const texts = snapshots.map((s) => JSON.stringify(s))
+  assert.ok(texts.includes(JSON.stringify(parsed)), '最终文件应为某次完整快照,而非混合/截断内容')
+  const n = Object.keys(parsed.urls).length
+  assert.ok(n >= 1 && n <= 20, `urls 数 ${n} 应在 1..20`)
+  await rm(dir, { recursive: true, force: true })
+})
+
+test('loadState: 非法 JSON 文件回退空态而非抛错', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'state-'))
+  const file = join(dir, 'broken.json')
+  await writeFile(file, '{broken json', 'utf8')
+  assert.deepEqual(await loadState(file), { version: 1, urls: {} })
+  await rm(dir, { recursive: true, force: true })
 })

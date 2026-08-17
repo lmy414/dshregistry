@@ -30,6 +30,8 @@ import createDOMPurify from 'dompurify'
 import { sleep, makeGate, assertAllowed, makeGhApi } from './lib/http.js'
 import { planGithubRefresh } from './lib/state.js'
 import { preserveCrossSource, keyOf } from './lib/resolve.js'
+import { makeEntry, appendEntries } from './lib/changelog.js'
+import { diffStars } from './lib/trending.js'
 
 const execFileAsync = promisify(execFile)
 
@@ -576,6 +578,33 @@ async function main() {
     flaggedCount: blocked.length,
     updatedAt: new Date().toISOString(),
   }, null, 2) + '\n')
+
+  // 8.5) changelog:added = firstSeenAt 为今天的记录;updated = fresh 替换且 latestCommit 变化;removed = 下架
+  const changelogFile = join(DATA_DIR, 'changelog.json')
+  const changelog = JSON.parse(await readFile(changelogFile, 'utf8').catch(() => '{"version":1,"entries":[]}'))
+  const entries = []
+  for (const r of newRecords) {
+    if (r.firstSeenAt === today) entries.push(makeEntry('added', r.slug, { source: r.source, now: today }))
+    else {
+      const old = oldIndex.find((o) => o.repo === r.repo)
+      if (old && old.latestCommit !== r.latestCommit) entries.push(makeEntry('updated', r.slug, { source: r.source, now: today }))
+    }
+  }
+  for (const fullName of removed) {
+    const old = oldIndex.find((o) => o.repo === fullName)
+    if (old) entries.push(makeEntry('removed', old.slug, { source: old.source ?? 'github-topic', now: today }))
+  }
+  if (entries.length > 0) {
+    const next = appendEntries(changelog, entries, { now: Date.now() })
+    await atomicWrite(changelogFile, JSON.stringify({ ...next, updatedAt: new Date().toISOString() }, null, 2) + '\n')
+  }
+
+  // 8.6) trending:与上轮快照 diff;随后写本轮快照
+  const snapFile = join(ROOT, 'tools', '.cache', 'star-snap.json')
+  const snap = JSON.parse(await readFile(snapFile, 'utf8').catch(() => '{}'))
+  const items = diffStars(snap, merged, { top: 20 })
+  await atomicWrite(join(DATA_DIR, 'trending.json'), JSON.stringify({ updatedAt: new Date().toISOString(), window: '24h', items }, null, 2) + '\n')
+  await atomicWrite(snapFile, JSON.stringify(Object.fromEntries(merged.map((r) => [r.repo, r.stars]))))
 
   const minutes = ((Date.now() - startedAt) / 60000).toFixed(1)
   console.log(`[crawl] 完成:索引共 ${merged.length}(本轮新增/更新 ${newRecords.length};community ${merged.filter((r) => r.state === 'community').length} / flagged ${blocked.length}),用时 ${minutes} 分钟`)

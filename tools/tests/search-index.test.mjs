@@ -27,3 +27,17 @@ test('assertBudget: 超限抛出并报告体积', () => {
   assert.throws(() => assertBudget('{"a":"xxxx"}', { maxBytes: 5 }), /预算/)
   assert.equal(assertBudget('{"a":1}', { maxBytes: 100 }), 7)
 })
+
+test('stem 回归:双写折叠仅作用于剥后缀中间串,无二次剥除', () => {
+  const expect = (input, term) => assert.ok(tokenize(input).includes(term), `${input} 应产出 ${term}`)
+  const deny = (input, term) => assert.ok(!tokenize(input).includes(term), `${input} 不应产出 ${term}`)
+  for (const [input, term] of [
+    ['running', 'run'], ['hopping', 'hop'], ['banned', 'ban'], ['kissing', 'kis'],
+    ['passing', 'pas'], ['missing', 'mis'], ['wedding', 'wed'], ['messing', 'mes'],
+    ['adding', 'add'], ['kiss', 'kis'], ['class', 'clas'],
+  ]) expect(input, term)
+  for (const [input, term] of [
+    ['kissing', 'ki'], ['passing', 'pa'], ['missing', 'mi'],
+    ['wedding', 'we'], ['messing', 'me'], ['adding', 'ad'], ['kiss', 'ki'],
+  ]) deny(input, term)
+})

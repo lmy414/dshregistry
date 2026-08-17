@@ -3,10 +3,14 @@
 const STOP_EN = new Set(['the', 'a', 'an', 'and', 'or', 'of', 'to', 'in', 'for', 'on', 'with', 'is', 'are', 'by', 'at', 'from', 'as', 'it', 'its', 'this', 'that', 'you', 'your', 'we', 'our', 'dsh', 'plugin', 'plugins', 'deepseek', 'harness'])
 const STOP_ZH = new Set(['的', '了', '和', '与', '在', '是', '有', '为', '及', '或'])
 
-// 最小词干:先折叠双写收尾(running→run,hopping→hop),再去 ing/ed/es/s 且词干 ≥3 字符
-const stem = (w) => w
-  .replace(/(.)\1(ing|ed)$/, (m0, c) => (w.length - m0.length >= 2 ? c : m0))
-  .replace(/(ing|ed|es|s)$/, (m0) => (w.length - m0.length >= 3 ? '' : m0))
+// 最小词干:先剥后缀(词干 ≥3 字符),再对剥后的中间串折叠双写收尾(折叠后 ≥3 字符);
+// 分步用中间变量,守卫各按当前串长度判定,避免旧长度二次剥除(passing→pa 之类)。
+const stem = (w) => {
+  const m = w.match(/(ing|ed|es|s)$/)
+  if (!m || w.length - m[0].length < 3) return w
+  const s = w.slice(0, -m[0].length)
+  return s.length >= 4 ? s.replace(/(.)\1$/, (_, c) => c) : s
+}
 
 export function tokenize(text) {
   if (!text) return []

@@ -27,6 +27,7 @@ import { promisify } from 'node:util'
 import { marked } from 'marked'
 import { JSDOM } from 'jsdom'
 import createDOMPurify from 'dompurify'
+import { sleep, makeGate, assertAllowed, makeGhApi } from './lib/http.js'
 
 const execFileAsync = promisify(execFile)
 
@@ -51,17 +52,6 @@ const ONLY = process.env.CRAWL_ONLY                     // 只处理 full_name �
 
 // ---------------------------------------------------------------- 基础工具
 
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
-
-/** 出站请求白名单(SSRF 防护):仅允许 https + 固定公共主机,拒绝一切内网/环回地址。 */
-const ALLOWED_HOSTS = new Set(['api.github.com', 'cdn.jsdelivr.net'])
-function assertPublicHttps(url) {
-  const u = new URL(url)
-  if (u.protocol !== 'https:' || !ALLOWED_HOSTS.has(u.hostname)) {
-    throw new Error(`[crawl] 禁止抓取非白名单地址: ${url}`)
-  }
-}
-
 function getToken() {
   if (process.env.GITHUB_TOKEN) return process.env.GITHUB_TOKEN
   try {
@@ -71,6 +61,7 @@ function getToken() {
   }
 }
 const TOKEN = getToken()
+const ghApi = makeGhApi(TOKEN)   // GitHub REST:白名单 + 限速 + 403/429 退避(见 lib/http.js)
 if (!TOKEN) console.warn('[crawl] WARN: 无 GITHUB_TOKEN/gh 登录,速率限制将非常严格')
 
 /** 简单并发池 */
@@ -87,64 +78,15 @@ async function pool(items, size, worker) {
   return results
 }
 
-/** 速率门:同一闸口内两次放行至少间隔 minIntervalMs。 */
-function makeGate(minIntervalMs) {
-  let last = 0
-  let chain = Promise.resolve()
-  return () => {
-    chain = chain.then(async () => {
-      const wait = Math.max(0, last + minIntervalMs - Date.now())
-      if (wait > 0) await sleep(wait)
-      last = Date.now()
-    })
-    return chain
-  }
-}
+/** 速率门(见 lib/http.js):search ≤28/min、core ≤4/s。 */
 const searchGate = makeGate(SEARCH_MIN_INTERVAL_MS)
 const coreGate = makeGate(CORE_MIN_INTERVAL_MS)
-
-/** GitHub REST 调用,带限速、限流退避与网络级故障重试。 */
-async function ghApi(url, gate, retries = 4) {
-  assertPublicHttps(url)
-  for (let attempt = 0; ; attempt++) {
-    await gate()
-    let res
-    try {
-      res = await fetch(url, {
-        headers: {
-          Accept: 'application/vnd.github+json',
-          'X-GitHub-Api-Version': '2022-11-28',
-          ...(TOKEN ? { Authorization: `Bearer ${TOKEN}` } : {}),
-        },
-      })
-    } catch (error) {
-      // ECONNRESET/超时等网络层故障:重试,而非整轮崩盘
-      if (attempt < retries) {
-        console.warn(`[crawl] 网络故障(${error.cause?.code ?? error.message})${url} → ${3 * (attempt + 1)}s 后重试`)
-        await sleep(3000 * (attempt + 1))
-        continue
-      }
-      throw error
-    }
-    if (res.ok) return res.json()
-    const remaining = res.headers.get('x-ratelimit-remaining')
-    if ((res.status === 403 || res.status === 429) && attempt < retries) {
-      const resetAt = Number(res.headers.get('x-ratelimit-reset') || 0) * 1000
-      const wait = remaining === '0' && resetAt > Date.now() ? resetAt - Date.now() + 1000 : 5000 * (attempt + 1)
-      console.warn(`[crawl] ${res.status} ${url} → ${Math.round(wait / 1000)}s 后重试`)
-      await sleep(wait)
-      continue
-    }
-    if (res.status === 404) return null
-    throw new Error(`GitHub API ${res.status}: ${url}`)
-  }
-}
 
 /** 仓库文件拉取:走 jsDelivr CDN(不占 REST 配额;raw.githubusercontent 在部分网络下被压速)。
  *  不带分支名时 jsDelivr 自动解析默认分支;404 返回 null。 */
 async function rawFetch(repoPath, retries = 2) {
   const url = `https://cdn.jsdelivr.net/gh/${repoPath}`
-  assertPublicHttps(url)
+  assertAllowed(url)
   for (let attempt = 0; ; attempt++) {
     try {
       const res = await fetch(url, { redirect: 'follow' })

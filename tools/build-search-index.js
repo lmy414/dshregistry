@@ -3,7 +3,7 @@ import { readFile } from 'node:fs/promises'
 import { mkdir, rename, writeFile } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { buildIndex, assertBudget } from './lib/search-index.js'
+import { buildIndex, assertBudget, pageSlugOf } from './lib/search-index.js'
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..')
 const DATA = join(ROOT, 'web', 'data')
@@ -13,7 +13,7 @@ const pages = JSON.parse(await readFile(join(DATA, 'pages.json'), 'utf8').catch(
 
 const docs = [
   ...plugins.map((p) => ({ slug: p.slug, name: p.name, author: p.repo.split('/')[0], tags: p.tags ?? [], desc: (p.description ?? '').slice(0, 300) })),
-  ...pages.pages.map((w) => ({ slug: `page:${w.source}:${w.url}`, name: w.name ?? '', author: w.author ?? '', tags: [], desc: w.description ?? '' })),
+  ...pages.pages.map((w, i) => ({ slug: pageSlugOf(w, i), name: w.name ?? '', author: w.author ?? '', tags: [], desc: w.description ?? '' })),
 ]
 const index = buildIndex(docs, { maxDocsPerTerm: 200 })
 const meta = docs.map((d, i) => {

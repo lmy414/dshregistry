@@ -32,6 +32,12 @@ export function tokenize(text) {
 
 const FIELD_WEIGHTS = { name: 3, author: 2, tags: 2, desc: 1 }
 
+/** 页面文档 slug:source:url#id——hub 全条目 url 恒为 LISTING_URL,不带外部 id 会全员碰撞;
+ *  external id 缺失时 name 兜底,两者皆无时落 index(保证唯一)。build-search-index.js 与测试共用。 */
+export function pageSlugOf(w, i) {
+  return `page:${w.source}:${w.url}#${w.external?.[w.source]?.id ?? w.name ?? i}`
+}
+
 /** docs: [{ slug, name, author, tags[], desc }] → { [term]: [[docIdx, score]] } */
 export function buildIndex(docs, { maxDocsPerTerm = 200 } = {}) {
   const index = {}

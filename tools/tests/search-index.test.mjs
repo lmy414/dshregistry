@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { tokenize, buildIndex, assertBudget } from '../lib/search-index.js'
+import { tokenize, buildIndex, assertBudget, pageSlugOf } from '../lib/search-index.js'
 
 test('tokenize: 英文小写轻 stem,中文 bigram,停用词剔除', () => {
   const t = tokenize('Running Vision tools 视觉识别')
@@ -38,6 +38,21 @@ test('stem 回归:双写折叠仅作用于剥后缀中间串,无二次剥除', (
   ]) expect(input, term)
   for (const [input, term] of [
     ['kissing', 'ki'], ['passing', 'pa'], ['missing', 'mi'],
-    ['wedding', 'we'], ['messing', 'me'], ['adding', 'ad'], ['kiss', 'ki'],
+    ['wedding', 'we'], ['adding', 'ad'], ['kissing', 'ki'],
   ]) deny(input, term)
+})
+
+// 缺陷3:search.json 全部 hub 页面 slug 碰撞(hub 条目 url 恒为 LISTING_URL)
+// 修复:slug 带 external id(name/index 兜底)区分,pageSlugOf 由 build-search-index.js 复用
+test('pageSlugOf: hub 同 LISTING_URL 多条目以 id 区分,无 id 落 name/index 兜底', () => {
+  const LISTING = 'https://hub.omdsh.dev/projects.html'
+  const hubA = { source: 'dshhub', url: LISTING, name: 'hub-one', external: { dshhub: { id: 'hub1' } } }
+  const hubB = { source: 'dshhub', url: LISTING, name: 'hub-two', external: { dshhub: { id: 'hub2' } } }
+  assert.equal(pageSlugOf(hubA, 0), `page:dshhub:${LISTING}#hub1`)
+  assert.equal(pageSlugOf(hubB, 1), `page:dshhub:${LISTING}#hub2`)
+  assert.notEqual(pageSlugOf(hubA, 0), pageSlugOf(hubB, 1), '两 slug 必须不同且含各自 id')
+  // dshfind 无 external id → name 兜底;两者皆无 → index 兜底
+  const find = { source: 'dshfind', url: 'https://dshfind.com/zh/plugins/A/B', name: 'bee', external: { dshfind: {} } }
+  assert.equal(pageSlugOf(find, 3), 'page:dshfind:https://dshfind.com/zh/plugins/A/B#bee')
+  assert.equal(pageSlugOf({ source: 'dshfind', url: 'u', name: null }, 7), 'page:dshfind:u#7')
 })

@@ -9,7 +9,7 @@ import { fileURLToPath } from 'node:url'
 import { fetchText, makeGate, makeAssertAllowed, DEFAULT_ALLOWED_HOSTS } from './lib/http.js'
 import { createCheerioRunner } from './lib/crawler.js'
 import { loadState, saveState, noteChecked, planRefresh } from './lib/state.js'
-import { keyOf, resolveDocs, mergeListedOn } from './lib/resolve.js'
+import { keyOf, parseGithubRepoUrl, resolveDocs, mergeListedOn } from './lib/resolve.js'
 import * as dshfind from './sources/dshfind.js'
 import * as dshhub from './sources/dshhub.js'
 
@@ -87,15 +87,41 @@ export async function runWebCrawl({ dataDir, cacheDir, now, maxPages = Infinity,
   const plugins = JSON.parse(await readFile(pluginsFile, 'utf8'))
   const knownRepoKeys = new Set(plugins.map((p) => keyOf(p.repo)))
   const webDocs = []
-  await crawlDshfind({ base: dshfindBase, cacheDir, now, maxPages, minIntervalMs, webDocs })
-  await crawlDshhub({ base: dshhubBase, cacheDir, now, webDocs })
+  // 单源故障隔离:任一流失败降级继续(另一源已收集的 webDocs 照常进入 resolve/合并;dshfind 的 state 已逐页落盘)
+  try {
+    await crawlDshfind({ base: dshfindBase, cacheDir, now, maxPages, minIntervalMs, webDocs })
+  } catch (e) {
+    console.warn(`[crawl-web] dshfind 抓取失败,降级继续: ${e.message}`)
+  }
+  try {
+    await crawlDshhub({ base: dshhubBase, cacheDir, now, webDocs })
+  } catch (e) {
+    console.warn(`[crawl-web] dshhub 抓取失败,降级继续: ${e.message}`)
+  }
 
   const { merges, backfills, pages } = resolveDocs(webDocs, knownRepoKeys, { backfillCap: 100, now })
   // 主索引:listedOn/external 合并写回(M-A 不做 listedOn 下架,防抖动)
   const { plugins: mergedPlugins, mergedCount } = mergeListedOn(plugins, merges, { now })
   await atomicWriteJson(pluginsFile, mergedPlugins)
-  // 独立留存网页文档(未命中仓库的)
-  await atomicWriteJson(join(dataDir, 'pages.json'), { version: 1, updatedAt: now, pages })
+  // 独立留存网页文档:与旧留存并集合并(每轮全量覆盖会让第二轮起页面搜索覆盖崩塌)。
+  // 旧条目三选:① url 命中本轮新页 → 弃旧用新;② repoUrl 解析后命中 knownRepoKeys(仓库已转正)→ 剔除;
+  // ③ 其余保留。合并结果 = 保留旧条目 + 本轮新页(按 url 去重)。
+  const pagesFile = join(dataDir, 'pages.json')
+  const oldPages = JSON.parse(await readFile(pagesFile, 'utf8').catch(() => '{"pages":[]}'))
+  const newByUrl = new Set(pages.map((p) => p.url))
+  const kept = oldPages.pages.filter((p) => {
+    if (newByUrl.has(p.url)) return false
+    const u = parseGithubRepoUrl(p.repoUrl)
+    return !(u && knownRepoKeys.has(keyOf(u.fullName)))
+  })
+  const mergedPages = []
+  const seenUrl = new Set()
+  for (const p of [...kept, ...pages]) {
+    if (seenUrl.has(p.url)) continue
+    seenUrl.add(p.url)
+    mergedPages.push(p)
+  }
+  await atomicWriteJson(pagesFile, { version: 1, updatedAt: now, pages: mergedPages })
   // 反哺候选:与历史候选按 repo 去重合并,crawl.js 下轮消费
   const backfillFile = join(cacheDir, 'backfill.json')
   const oldBackfill = JSON.parse(await readFile(backfillFile, 'utf8').catch(() => '{"candidates":[]}'))
@@ -105,8 +131,8 @@ export async function runWebCrawl({ dataDir, cacheDir, now, maxPages = Infinity,
     if (!seen.has(keyOf(b.repo))) { seen.add(keyOf(b.repo)); candidates.push(b) }
   }
   await atomicWriteJson(backfillFile, { updatedAt: now, candidates })
-  console.log(`[crawl-web] 完成:合并 ${mergedCount} 条 listedOn,留存 ${pages.length} 页,反哺候选 ${candidates.length}`)
-  return { pages, merges, backfills: candidates }
+  console.log(`[crawl-web] 完成:合并 ${mergedCount} 条 listedOn,留存 ${mergedPages.length} 页,反哺候选 ${candidates.length}`)
+  return { pages: mergedPages, merges, backfills: candidates }
 }
 
 // CLI

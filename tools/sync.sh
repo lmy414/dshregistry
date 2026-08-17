@@ -67,8 +67,8 @@ else
   exit 1
 fi
 
-# 2.1) 网页源抓取(dshfind / DSH Hub)
-if env timeout 1200 node tools/crawl-web.js >> "$LOG_FILE" 2>&1; then
+# 2.1) 网页源抓取(dshfind / DSH Hub);timeout 与 workflow 360 分钟一致(首轮全量约 2.5h)
+if env timeout 10800 node tools/crawl-web.js >> "$LOG_FILE" 2>&1; then
   log "网页源抓取成功"
 else
   log "WARN: 网页源抓取失败(继续,主索引不受影响)"

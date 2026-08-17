@@ -28,6 +28,8 @@ import { marked } from 'marked'
 import { JSDOM } from 'jsdom'
 import createDOMPurify from 'dompurify'
 import { sleep, makeGate, assertAllowed, makeGhApi } from './lib/http.js'
+import { planGithubRefresh } from './lib/state.js'
+import { preserveCrossSource, keyOf } from './lib/resolve.js'
 
 const execFileAsync = promisify(execFile)
 
@@ -63,6 +65,30 @@ function getToken() {
 const TOKEN = getToken()
 const ghApi = makeGhApi(TOKEN)   // GitHub REST:白名单 + 限速 + 403/429 退避(见 lib/http.js)
 if (!TOKEN) console.warn('[crawl] WARN: 无 GITHUB_TOKEN/gh 登录,速率限制将非常严格')
+
+/** 记录渠道标记:seeds 人工收录 > 网页源反哺 > topic 扫描。 */
+export function sourceOf(repo) {
+  if (repo._seedCategory) return 'seeds'
+  if (repo._backfillFrom) return `backfill:${repo._backfillFrom}`
+  return 'github-topic'
+}
+
+/** fresh 替换 old 的合并:跨源字段保留(listedOn/external 由 crawl-web 维护),source 继承 fresh 渠道。 */
+export function mergeOldRecord(old, fresh) {
+  const out = preserveCrossSource(old, fresh)
+  out.type = 'plugin'
+  out.source = fresh.source ?? old.source ?? 'github-topic'
+  return out
+}
+
+/** 消费反哺候选:读取 backfill.json 并清空(crawl-web 下轮重新产出未转正者)。 */
+export async function consumeBackfill(cacheDir) {
+  const file = join(cacheDir, 'backfill.json')
+  const data = JSON.parse(await readFile(file, 'utf8').catch(() => '{"candidates":[]}'))
+  const candidates = data.candidates ?? []
+  if (candidates.length > 0) await atomicWrite(file, JSON.stringify({ updatedAt: new Date().toISOString(), candidates: [] }))
+  return candidates
+}
 
 /** 简单并发池 */
 async function pool(items, size, worker) {
@@ -333,6 +359,35 @@ async function main() {
       console.warn(`[crawl] 种子不可达: ${seed.repo}`)
     }
   }
+  // 2.5) 存量 refresh:活跃窗口全量 + 长尾轮转;404/删除标记下架
+  const REFRESH_BUDGET = Number(process.env.CRAWL_REFRESH || 500)
+  const round = Math.floor(Date.now() / 86400000)   // 以天为轮转单位
+  const refreshList = planGithubRefresh(oldIndex, { now: Date.now(), budget: REFRESH_BUDGET, round })
+    .filter((fullName) => !byName.has(fullName))
+  const removed = []
+  let checked = 0
+  await pool(refreshList, API_CONCURRENCY, async (fullName) => {
+    const repo = await ghApi(`https://api.github.com/repos/${fullName}`, coreGate)
+    if (repo === null) {
+      removed.push(fullName)
+      delete pkgCache[fullName]
+      console.warn(`[crawl] 下架(404/删除): ${fullName}`)
+      return
+    }
+    byName.set(fullName, repo)
+    if (++checked % 100 === 0) console.log(`[crawl] 存量刷新进度 ${checked}/${refreshList.length}`)
+  })
+  if (removed.length > 0) console.log(`[crawl] 本轮下架 ${removed.length} 个`)
+
+  // 2.6) 反哺候选:与 seeds 同级补查元数据(仍须过 dsh.bundle.patch + LICENSE + README 门槛)
+  const backfills = await consumeBackfill(join(ROOT, 'tools', '.cache'))
+  for (const cand of backfills) {
+    if (byName.has(cand.repo)) continue
+    const repo = await ghApi(`https://api.github.com/repos/${cand.repo}`, coreGate)
+    if (repo) { repo._backfillFrom = cand.from; byName.set(cand.repo, repo) }
+  }
+  if (backfills.length > 0) console.log(`[crawl] 反哺候选 ${backfills.length} 个(成功补查计入管道)`)
+
   const repos = [...byName.values()].filter((r) => !r.disabled)
   if (MAX_REPOS > 0) {
     console.log(`[crawl] 冒烟模式:仅处理前 ${MAX_REPOS} 个`)
@@ -439,18 +494,20 @@ async function main() {
       state,
       stateReasons: reasons,
       basicCheck: true,   // 收录即通过:dsh.bundle.patch 声明 + README 均为硬性收录条件
+      type: 'plugin',
+      source: sourceOf(repo),
     }
   })
 
   // 6) 合并旧索引:本轮新记录覆盖同 repo 旧记录;其余旧记录保留,并按最新 flags/日期
   //    阈值重算信任状态(否则"社区认可"永不到达)
   const freshByRepo = new Map(newRecords.map((r) => [r.repo, r]))
-  const merged = []
+  let merged = []
   for (const old of oldIndex) {
     const fresh = freshByRepo.get(old.repo)
     if (fresh !== undefined) {
       freshByRepo.delete(old.repo)
-      merged.push(fresh)
+      merged.push(mergeOldRecord(old, fresh))
       continue
     }
     const flagged = flags[old.slug]?.state === 'flagged'
@@ -461,6 +518,11 @@ async function main() {
     merged.push({ ...old, state, stateReasons: reasons })
   }
   merged.push(...freshByRepo.values())
+
+  // 剔除下架仓库:removed 中的旧记录不得进入 merged(其 README 片段由 step 7 的
+  // keepFragments GC 自然清理——不在 merged 即不列入保留集)
+  const removedKeys = new Set(removed.map(keyOf))
+  if (removedKeys.size > 0) merged = merged.filter((r) => !removedKeys.has(keyOf(r.repo)))
 
   // slug 唯一化:同名不同主的仓库,低星者带作者后缀(同名再撞则数字后缀)
   merged.sort((a, b) => b.stars - a.stars)
@@ -507,6 +569,7 @@ async function main() {
   const blocked = merged.filter((r) => r.state === 'flagged').map((r) => r.slug)
   await atomicWrite(join(DATA_DIR, 'blocklist.json'), JSON.stringify({ blocked, updatedAt: new Date().toISOString() }, null, 2) + '\n')
   await atomicWrite(join(DATA_DIR, 'meta.json'), JSON.stringify({
+    schemaVersion: '1.1',
     pluginCount: merged.length,
     categoryCount: new Set(merged.map((r) => r.category)).size,
     communityCount: merged.filter((r) => r.state === 'community').length,
@@ -518,7 +581,7 @@ async function main() {
   console.log(`[crawl] 完成:索引共 ${merged.length}(本轮新增/更新 ${newRecords.length};community ${merged.filter((r) => r.state === 'community').length} / flagged ${blocked.length}),用时 ${minutes} 分钟`)
 }
 
-main().catch((e) => {
-  console.error('[crawl] 失败:', e)
-  process.exit(1)
-})
+// CLI 入口:测试 import 纯函数时不执行
+if (process.argv[1] === fileURLToPath(import.meta.url)) {
+  main().catch((e) => { console.error('[crawl] 失败:', e); process.exit(1) })
+}

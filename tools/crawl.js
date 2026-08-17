@@ -83,6 +83,17 @@ export function mergeOldRecord(old, fresh) {
   return out
 }
 
+/** 存量旧记录回填(schema 1.1):旧记录无 type/source 时按 seeds 命中与否补渠道标记,已有则保留。 */
+export function migrateOldRecord(old, seedRepos, { state, reasons }) {
+  return {
+    ...old,
+    type: old.type ?? 'plugin',
+    source: old.source ?? (seedRepos.has(old.repo) ? 'seeds' : 'github-topic'),
+    state,
+    stateReasons: reasons,
+  }
+}
+
 /** 消费反哺候选:读取 backfill.json 并清空(crawl-web 下轮重新产出未转正者)。 */
 export async function consumeBackfill(cacheDir) {
   const file = join(cacheDir, 'backfill.json')
@@ -502,7 +513,8 @@ async function main() {
   })
 
   // 6) 合并旧索引:本轮新记录覆盖同 repo 旧记录;其余旧记录保留,并按最新 flags/日期
-  //    阈值重算信任状态(否则"社区认可"永不到达)
+  //    阈值重算信任状态(否则"社区认可"永不到达),同时回填 schema 1.1 的 type/source
+  const seedRepos = new Set(seeds.map((s) => s.repo))
   const freshByRepo = new Map(newRecords.map((r) => [r.repo, r]))
   let merged = []
   for (const old of oldIndex) {
@@ -517,7 +529,7 @@ async function main() {
       stars: old.stars, forks: old.forks,
       authorCreatedAt: old.authorCreatedAt ?? null, pushedAt: old.pushedAt, flagged,
     })
-    merged.push({ ...old, state, stateReasons: reasons })
+    merged.push(migrateOldRecord(old, seedRepos, { state, reasons }))
   }
   merged.push(...freshByRepo.values())
 

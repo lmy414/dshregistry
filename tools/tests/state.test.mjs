@@ -38,3 +38,20 @@ test('planGithubRefresh: 活跃窗口全选,长尾确定性轮转,预算上限',
   assert.deepEqual(planGithubRefresh(plugins, args), r0, '同 round 结果必须确定')
   assert.notDeepEqual(planGithubRefresh(plugins, { ...args, round: 1 }), r0, '不同 round 轮转不同切片')
 })
+
+test('planGithubRefresh: wrap-around 轮转,T mod R ≠ 0 时不饥饿', () => {
+  const plugins = [
+    { repo: 'o/active1', pushedAt: '2026-08-10' },
+    { repo: 'o/active2', pushedAt: '2026-07-01' },
+    ...Array.from({ length: 20 }, (_, i) => ({ repo: `o/tail${String(i).padStart(2, '0')}`, pushedAt: '2025-01-01' })),
+  ]
+  const args = { now: NOW, budget: 8, activeWindowDays: 90 }
+  const union = new Set()
+  for (let round = 0; round < 4; round++) {
+    const r = planGithubRefresh(plugins, { ...args, round })
+    assert.deepEqual(planGithubRefresh(plugins, { ...args, round }), r, `round ${round} 同输入必须确定`)
+    assert.ok(r.length <= args.budget, `round ${round} 长度不超过预算`)
+    for (const repo of r) if (repo.startsWith('o/tail')) union.add(repo)
+  }
+  assert.equal(union.size, 20, '4 轮(T=20, rest=6, ceil=4)tail 入选并集应覆盖全部 20 个')
+})

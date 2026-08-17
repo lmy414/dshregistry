@@ -40,7 +40,9 @@ export function planRefresh(state, urls, { now, maxAgeMs, budget }) {
 }
 
 /** GitHub 存量刷新:活跃窗口(pushedAt ≤ activeWindowDays)全选,长尾按 round 确定性轮转补齐预算。
- *  确定性:排序 + stride 轮转,不依赖随机数,便于测试与复跑。 */
+ *  确定性:排序 + wrap-around 分块轮转,不依赖随机数,便于测试与复跑。
+ *  wrap-around:round r 从 (r*rest) % T 起连续取 rest 个,块在环上首尾相接,ceil(T/rest) 轮并集覆盖全部长尾;
+ *  修复 stride 切片在 T mod rest ≠ 0 时类内末尾项永久饥饿的问题。 */
 export function planGithubRefresh(plugins, { now, budget = 500, activeWindowDays = 90, round = 0 }) {
   const active = [], tail = []
   for (const p of plugins) {
@@ -50,9 +52,9 @@ export function planGithubRefresh(plugins, { now, budget = 500, activeWindowDays
   const picked = active.slice(0, budget)
   const rest = budget - picked.length
   if (rest > 0 && tail.length > 0) {
-    const stride = Math.max(1, Math.floor(tail.length / rest))
-    for (let i = 0; i < tail.length && picked.length < budget; i++) {
-      if ((i + round) % stride === 0) picked.push(tail[i])
+    const start = (round * rest) % tail.length
+    for (let i = 0; i < rest && i < tail.length; i++) {
+      picked.push(tail[(start + i) % tail.length])
     }
   }
   return picked.sort()

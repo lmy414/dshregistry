@@ -15,11 +15,13 @@
 - **问题**:搜索只匹配名称/描述;功能词往往只出现在 README;2207 个片段 ~20MB 无法前端全量加载。
 - **方案**:爬虫构建轻量 `web/data/search.json`(每插件:名称/描述/tags + README 关键词抽取:标题、加粗词、代码块、前 N 字),前端本地索引即时搜索;随爬虫增量更新。
 - **验收**:输入仅存在于 README 的功能词能命中;`search.json` < 5MB。
+- **状态**:已交付(数据侧,M-A)——倒排索引构建器 `tools/build-search-index.js` 已落地,`web/data/search.json` 随爬虫链(Actions 定时 workflow / `tools/sync.sh` 回退链)生成,中英分词 + 字段加权 + <3MB 预算护栏;**前端消费在 M-B**。
 
 ### 2. 已收录仓库的新鲜度跟踪
 - **问题**:增量只收新仓库;已收录插件的 commit pin / 描述会过期(安装命令锁的是旧 commit)。
 - **方案**:每轮增量后追加"活跃更新窗口"——按 `pushedAt` 取已收录前 200 个,校验变化重抓(复用 pkgCache 的 pushedAt 机制);变化者更新 latestCommit/描述/片段。
 - **验收**:重跑后活跃插件的 `latestCommit` 更新,不活跃的零成本跳过。
+- **状态**:已交付(数据侧,M-A)——refresh planner 已落地(`tools/lib/state.js` 的 noteChecked/planRefresh/planGithubRefresh 确定性轮转),crawl.js 双流程(存量 refresh + 404 下架 + changelog `removed` 流)已上线;**前端展示在 M-B**。
 
 ### 3. 分类推断加强
 - **问题**:`other` 占 1059/2207(48%),推断过弱。

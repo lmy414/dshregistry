@@ -67,11 +67,25 @@ else
   exit 1
 fi
 
+# 2.1) 网页源抓取(dshfind / DSH Hub)
+if env timeout 1200 node tools/crawl-web.js >> "$LOG_FILE" 2>&1; then
+  log "网页源抓取成功"
+else
+  log "WARN: 网页源抓取失败(继续,主索引不受影响)"
+fi
+
 # 2.5) 重新生成 sitemap（保持详情页静态入口新鲜）
 if node tools/gen-sitemap.js >> "$LOG_FILE" 2>&1; then
   log "sitemap 重新生成成功"
 else
   log "WARN: sitemap 生成失败（继续）"
+fi
+
+# 2.5.1) 构建倒排索引
+if node tools/build-search-index.js >> "$LOG_FILE" 2>&1; then
+  log "倒排索引构建成功"
+else
+  log "WARN: 倒排索引构建失败(继续)"
 fi
 
 # 2.6) 拆分单插件数据（详情页性能优化: 每插件独立 JSON + 分类子集）

@@ -1,6 +1,6 @@
 # DSH-Registry 搜索引擎形态设计(索引优先)
 
-> 状态:设计定稿(2026-08-17;同日站长确认愿景与内容边界),UI 原型见 `docs/ui-prototype/index.html`。
+> 状态:M-A 已实施(2026-08-17),UI 原型见 `docs/ui-prototype/index.html`。
 > 定位:**做索引,不做市场**——本站在生态中的角色是"DSH 生态的谷歌":抓取、索引、检索;安装只是附带的。
 
 ## 0. 方案总览(2026-08-17,站长审查版)
@@ -52,9 +52,9 @@
 
 ### 0.9 执行顺序
 
-1. **Spike**(半天):dshfind 适配器原型(~50 行),验证三件事——目标站 SSR 还是 SPA(决定 Cheerio/Playwright)、队列断点续跑、per-domain 限速包装;
-2. **M-A 实施计划**:spike 结论出来后按 writing-plans 出详细计划(M-A = 混合架构 + 双流程 + 网页源适配器 + 多源标记 + 倒排索引);
-3. 按计划实施 M-A。
+1. **Spike**(半天):dshfind 适配器原型(~50 行),验证三件事——目标站 SSR 还是 SPA(决定 Cheerio/Playwright)、队列断点续跑、per-domain 限速包装 → **已完成**(2026-08-17,结论:SSR 用 Cheerio、Crawlee 持久队列断点续跑、makeGate 包装限速,落地于 §4.0);
+2. **M-A 实施计划**:spike 结论出来后按 writing-plans 出详细计划(M-A = 混合架构 + 双流程 + 网页源适配器 + 多源标记 + 倒排索引) → **已完成**(2026-08-17,计划与任务台账见 `.superpowers/sdd/2026-08-17-search-engine-m-a/`);
+3. 按计划实施 M-A → **已完成**(2026-08-17,数据侧全链交付:`pages.json`/`changelog.json`/`trending.json`/`search.json` 四个新产物 + GitHub Actions 定时爬虫 workflow + `tools/sync.sh` 回退链;前端消费在 M-B)。
 
 ## 1. 定位与心智
 

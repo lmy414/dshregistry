@@ -6,6 +6,14 @@
 # 纪律: 服务器端改动只提交当前分支，不直接推 main（主干只做功能性改动）
 set -uo pipefail
 
+# 互斥锁: 全量运行中时增量自动跳过
+LOCKFILE="/var/run/dshregistry-sync.lock"
+exec 200>"$LOCKFILE"
+if ! flock -n 200; then
+  echo "[$(date '+%Y-%m-%d %H:%M:%S')] 另一个 sync.sh 正在运行，跳过本次执行"
+  exit 0
+fi
+
 REPO_DIR="/root/dshregistry"
 LOG_DIR="/var/log/dshregistry"
 LOG_FILE="$LOG_DIR/sync.log"

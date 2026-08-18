@@ -23,14 +23,14 @@ test('runWebCrawl: discover → 抽取 → 归一 → 实体解析 → 产物', 
       '/sitemap.xml': `<urlset><url><loc>BASE/zh/plugins/Acme/known</loc></url><url><loc>BASE/zh/plugins/Bob/fresh</loc></url></urlset>`,
       '/zh/plugins/Acme/known': detailA,
       '/zh/plugins/Bob/fresh': detailB,
-      '/catalog.json': JSON.stringify({ schema: 'v0.4', packages: [
-        { id: 'hub1', name: 'hub-one', description: 'h', repository: 'https://github.com/Acme/known', author: { name: 'Acme' } },
+      '/api/v1/plugins.json': JSON.stringify({ schema: 'omdsh-ai-market/v1', projects: [
+        { id: 'hub1', name: 'hub-one', summary: 'h', source: { repository: 'https://github.com/Acme/known' }, identity: { fullName: 'Acme/known' } },
       ] }),
     }
     const body = routes[req.url]?.replaceAll('BASE', `http://127.0.0.1:${server.address().port}`)
     if (body === undefined) { res.writeHead(404); return res.end() }
     // CheerioCrawler 校验 MIME(只收 html/xml/json),假站必须显式声明(同 crawler.test.mjs fakeSite 惯例)
-    const type = req.url === '/catalog.json' ? 'application/json' : req.url === '/sitemap.xml' ? 'text/xml' : 'text/html'
+    const type = req.url === '/api/v1/plugins.json' ? 'application/json' : req.url === '/sitemap.xml' ? 'text/xml' : 'text/html'
     res.writeHead(200, { 'content-type': type }); res.end(body)
   })
   await new Promise((r) => server.listen(0, r))
@@ -69,14 +69,14 @@ test('runWebCrawl: pages.json 跨轮并集——转正页剔除、新页并入�
   const detailFresh = DETAIL('fresh-plugin', 'Bob', 'fresh')
   const detailNewest = DETAIL('newest-plugin', 'Dave', 'newest')
   const routes = {
-    '/catalog.json': JSON.stringify({ schema: 'v0.4', packages: [] }),
+    '/api/v1/plugins.json': JSON.stringify({ schema: 'omdsh-ai-market/v1', projects: [] }),
     '/zh/plugins/Bob/fresh': detailFresh,
     '/zh/plugins/Dave/newest': detailNewest,
   }
   const server = http.createServer((req, res) => {
     const body = routes[req.url]?.replaceAll('BASE', `http://127.0.0.1:${server.address().port}`)
     if (body === undefined) { res.writeHead(404); return res.end() }
-    const type = req.url === '/catalog.json' ? 'application/json' : req.url === '/sitemap.xml' ? 'text/xml' : 'text/html'
+    const type = req.url === '/api/v1/plugins.json' ? 'application/json' : req.url === '/sitemap.xml' ? 'text/xml' : 'text/html'
     res.writeHead(200, { 'content-type': type }); res.end(body)
   })
   await new Promise((r) => server.listen(0, r))
@@ -114,7 +114,7 @@ test('runWebCrawl: pages.json 跨轮并集——转正页剔除、新页并入�
 test('runWebCrawl: hub catalog 500 不抛,dshfind listedOn 合并照常落盘', async (t) => {
   const detailA = DETAIL('known-plugin', 'Acme', 'known')
   const server = http.createServer((req, res) => {
-    if (req.url === '/catalog.json') { res.writeHead(500); return res.end('boom') }
+    if (req.url === '/api/v1/plugins.json') { res.writeHead(500); return res.end('boom') }
     const routes = {
       '/sitemap.xml': '<urlset><url><loc>BASE/zh/plugins/Acme/known</loc></url></urlset>',
       '/zh/plugins/Acme/known': detailA,
@@ -144,8 +144,8 @@ test('runWebCrawl: hub catalog 500 不抛,dshfind listedOn 合并照常落盘', 
 test('runWebCrawl: dshfind sitemap 失败不抛,hub 合并照常落盘', async (t) => {
   const server = http.createServer((req, res) => {
     if (req.url === '/sitemap.xml') { res.writeHead(404); return res.end() }
-    if (req.url === '/catalog.json') {
-      const body = JSON.stringify({ schema: 'v0.4', packages: [{ id: 'hub1', name: 'hub-one', description: 'h', repository: 'https://github.com/Acme/known', author: { name: 'Acme' } }] })
+    if (req.url === '/api/v1/plugins.json') {
+      const body = JSON.stringify({ schema: 'omdsh-ai-market/v1', projects: [{ id: 'hub1', name: 'hub-one', summary: 'h', source: { repository: 'https://github.com/Acme/known' }, identity: { fullName: 'Acme/known' } }] })
       res.writeHead(200, { 'content-type': 'application/json' }); return res.end(body)
     }
     res.writeHead(404); res.end()
@@ -169,11 +169,11 @@ test('runWebCrawl: dshfind sitemap 失败不抛,hub 合并照常落盘', async (
 test('runWebCrawl: pages.json 去重按条目身份——3 个 hub 条目同 url 不同 id 全部保留', async (t) => {
   const LISTING = 'https://hub.omdsh.dev/projects.html'
   const server = http.createServer((req, res) => {
-    if (req.url === '/catalog.json') {
-      const body = JSON.stringify({ schema: 'v0.4', packages: [
-        { id: 'hub1', name: 'hub-one', description: 'a', repository: 'https://github.com/None/hub-a', author: { name: 'A' } },
-        { id: 'hub2', name: 'hub-two', description: 'b', repository: 'https://github.com/None/hub-b', author: { name: 'B' } },
-        { id: 'hub3', name: 'hub-three', description: 'c', repository: 'https://github.com/None/hub-c', author: { name: 'C' } },
+    if (req.url === '/api/v1/plugins.json') {
+      const body = JSON.stringify({ schema: 'omdsh-ai-market/v1', projects: [
+        { id: 'hub1', name: 'hub-one', summary: 'a', source: { repository: 'https://github.com/None/hub-a' }, identity: { fullName: 'None/hub-a' } },
+        { id: 'hub2', name: 'hub-two', summary: 'b', source: { repository: 'https://github.com/None/hub-b' }, identity: { fullName: 'None/hub-b' } },
+        { id: 'hub3', name: 'hub-three', summary: 'c', source: { repository: 'https://github.com/None/hub-c' }, identity: { fullName: 'None/hub-c' } },
       ] })
       res.writeHead(200, { 'content-type': 'application/json' }); return res.end(body)
     }

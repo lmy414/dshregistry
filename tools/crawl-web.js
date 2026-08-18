@@ -67,15 +67,15 @@ async function crawlDshfind({ base, cacheDir, now, maxPages, minIntervalMs, webD
   await saveState(stateFile, state)
 }
 
-/** hub 流:catalog.json 条件请求(ETag),全量归一(JSON 便宜)。 */
+/** hub 流:官方 api/v1/plugins.json 条件请求(ETag),全量归一(JSON 便宜)。 */
 async function crawlDshhub({ base, cacheDir, now, webDocs }) {
   const stateFile = join(cacheDir, 'state-dshhub.json')
   const state = await loadState(stateFile)
   const etag = state.urls.catalog?.hash
   const assert = assertForBase(base)
-  const res = await fetchText(`${base}/catalog.json`, { headers: etag ? { 'If-None-Match': etag } : {}, ...(assert ? { assert } : {}) })
+  const res = await fetchText(`${base}${dshhub.API_PATH}`, { headers: etag ? { 'If-None-Match': etag } : {}, ...(assert ? { assert } : {}) })
   if (res.status === 304) { console.log('[crawl-web] dshhub: 304 未变化,跳过'); return }
-  if (!res.text) throw new Error('[crawl-web] dshhub catalog 拉取失败')
+  if (!res.text) throw new Error('[crawl-web] dshhub api 拉取失败')
   for (const entry of dshhub.parseCatalog(res.text)) webDocs.push(dshhub.normalizeEntry(entry))
   noteChecked(state, 'catalog', { now: Date.parse(now), changed: true, hash: res.etag ?? hashOf(res.text) })
   await saveState(stateFile, state)

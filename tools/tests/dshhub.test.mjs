@@ -3,27 +3,36 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { parseCatalog, normalizeEntry } from '../sources/dshhub.js'
 
+// 官方 api/v1/plugins.json(omdsh-ai-market/v1)形态
 const SAMPLE = JSON.stringify({
-  schema: 'dsh-hub-index/v0.4',
-  packages: [
-    { id: 'acme-vision', name: 'ACME 视觉', description: 'OCR 与截图理解', kind: 'ui', category: 'interface',
-      tags: ['ocr'], author: { name: 'Acme', url: 'https://github.com/Acme' },
-      repository: 'https://github.com/omdsh-dev/acme-vision', ref: 'abc123', updatedAt: '2026-08-13T20:55:45+08:00',
-      version: '0.4.0', license: 'MIT', status: 'beta', featured: true, compatibility: '已验证' },
-    { id: 'no-repo', name: '无仓库条目', description: '边界样本' },
+  schema: 'omdsh-ai-market/v1',
+  projects: [
+    { id: 'acme-vision', name: 'ACME 视觉', summary: 'OCR 与截图理解', kind: 'ui',
+      categories: ['interface', 'vision'], tags: ['ocr'],
+      source: { repository: 'https://github.com/omdsh-dev/acme-vision', ref: 'abc123', path: null },
+      identity: { fullName: 'omdsh-dev/acme-vision', repository: 'https://github.com/omdsh-dev/acme-vision' },
+      review: { state: 'pending-review' },
+      verification: { state: 'current-baseline-passed', baseline: '@deepseek-ai/dsh@0.1.0-rc.6' },
+      registry: { state: 'ineligible' },
+      discovery: { createdAt: '2026-08-13T13:02:29.000Z' } },
+    { id: 'no-repo', name: '无仓库条目', summary: '边界样本' },
   ],
 })
 
-test('parseCatalog: 取 packages 数组', () => {
+test('parseCatalog: 取 projects 数组;schema 不符抛错', () => {
   assert.equal(parseCatalog(SAMPLE).length, 2)
+  assert.throws(() => parseCatalog('{"schema":"v0.4","packages":[]}'), /projects/)
 })
 
 test('normalizeEntry: 契约 + 缺字段容忍', () => {
   const [a, b] = parseCatalog(SAMPLE).map(normalizeEntry)
   assert.equal(a.type, 'page'); assert.equal(a.source, 'dshhub')
   assert.equal(a.repoUrl, 'https://github.com/omdsh-dev/acme-vision')
-  assert.equal(a.author, 'Acme')
-  assert.equal(a.external.dshhub.featured, true)
-  assert.equal(a.external.dshhub.status, 'beta')
+  assert.equal(a.author, 'omdsh-dev')
+  assert.deepEqual(a.external.dshhub.categories, ['interface', 'vision'])
+  assert.equal(a.external.dshhub.review, 'pending-review')
+  assert.equal(a.external.dshhub.verification, 'current-baseline-passed')
+  assert.equal(a.external.dshhub.registry, 'ineligible')
   assert.equal(b.repoUrl, null); assert.equal(b.author, null)
+  assert.ok(b.description.length <= 200)
 })

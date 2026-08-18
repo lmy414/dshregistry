@@ -68,11 +68,23 @@ assert(/找到 \d+ 个结果 · 用时 \d+ ms/.test(stats), `统计行格式 ("$
 const visionCount = Number((stats.match(/找到 (\d+) 个结果/) || [])[1])
 assert(visionCount === visionTotal, `cat:vision 直达过滤到 ${visionTotal} 个结果(实际 ${visionCount})`)
 const rows = window.document.querySelectorAll('#resultsList .result-row')
-assert(rows.length === visionTotal, `结果行渲染 ${rows.length} 条`)
+assert(rows.length === 50, `增量渲染每屏 50 条 (实际 ${rows.length})`)
+const moreBtn = window.document.querySelector('#resultsList .load-more-btn')
+assert(!!moreBtn, '结果超 50 条时显示"加载更多"按钮')
+assert(visionTotal > 50, `vision 总数 ${visionTotal} 超过 50(分页前提成立)`)
+moreBtn.click()
+await sleep(300)
+const rows2 = window.document.querySelectorAll('#resultsList .result-row')
+assert(rows2.length === 100, `点击加载更多后 100 条 (实际 ${rows2.length})`)
 const markCount = window.document.querySelectorAll('#resultsList mark').length
 assert(markCount === 0, 'cat:vision 无裸词 mark 高亮(维度过滤不产词高亮)')
-// 搜索框已回填查询语法
-assert(window.document.getElementById('catSearchInput').value === 'cat:vision', '搜索框回填 cat:vision')
+// URL cat 参数 = Facet 预勾选:搜索框不含查询词,分类 checkbox 勾选 vision
+assert(window.document.getElementById('catSearchInput').value === '', '搜索框无查询词(cat 由 Facet 勾选)')
+const checkedCats = [...window.document.querySelectorAll('#facetCategory input:checked')].map((i) => i.value)
+assert(checkedCats.includes('vision') && checkedCats.length === 1, `分类 Facet 预勾选 vision (实际 ${checkedCats.join(',')})`)
+// 其他分类计数保留全站(不因 cat 过滤归零,可切换)
+const catCountsUrl = [...window.document.querySelectorAll('#facetCategory .facet-item .facet-count')].map((el) => Number(el.textContent))
+assert(catCountsUrl.some((n) => n > 0) && catCountsUrl.length === 12, '全部分类计数保留(facet 可切换)')
 
 console.log('== facet 面板 ==')
 const cats = window.document.querySelectorAll('#facetCategory .facet-item').length
@@ -104,11 +116,26 @@ const featBadge = featuredCard.querySelector('.score-badge')
 assert(!!featBadge, `精选卡含 score-badge ("${featBadge?.textContent}")`)
 
 console.log('== 网页行(清除维度后) ==')
+// 取消 vision Facet 勾选(URL 直达为 Facet 预勾选,需模拟用户取消)
+const visionCb = [...window.document.querySelectorAll('#facetCategory input')].find((i) => i.value === 'vision')
+if (visionCb) {
+  visionCb.checked = false
+  visionCb.dispatchEvent(new window.Event('change', { bubbles: true }))
+}
+await sleep(150)
 const catInput = window.document.getElementById('catSearchInput')
 catInput.value = 'desktop'
 catInput.dispatchEvent(new window.KeyboardEvent('keydown', { key: 'Enter', bubbles: true }))
-await sleep(300)
-const pageRows = window.document.querySelectorAll('#resultsList .result-row.result-page')
+await sleep(400)
+// 网页行在结果尾部,增量渲染(每屏 50)下需加载更多几次直到出现
+let pageRows = window.document.querySelectorAll('#resultsList .result-row.result-page')
+for (let i = 0; i < 6 && pageRows.length === 0; i++) {
+  const more = window.document.querySelector('#resultsList .load-more-btn')
+  if (!more) break
+  more.click()
+  await sleep(200)
+  pageRows = window.document.querySelectorAll('#resultsList .result-row.result-page')
+}
 assert(pageRows.length > 0, `网页行渲染 ${pageRows.length} 条`)
 const firstPageRow = pageRows[0]
 assert(firstPageRow.querySelector('.result-cat-tag')?.textContent.includes('网页'), '网页行分类标签为"网页"')

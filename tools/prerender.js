@@ -27,7 +27,7 @@ const CAT_LABELS = {
   skill: ['技能', 'Skills'], memory: ['记忆', 'Memory'], security: ['安全', 'Security'],
   media: ['媒体', 'Media'], integration: ['集成', 'Integration'], other: ['其他', 'Other'],
 }
-const BADGE_TEXT = { unreviewed: ['未审计', 'Unreviewed'], vouched: ['社区认可', 'Community-Vouched'], flagged: ['有风险报告', 'Flagged'] }
+const BADGE_TEXT = { unreviewed: ['未审计', 'Unreviewed'], vouched: ['维护活跃', 'Actively Maintained'], flagged: ['有风险报告', 'Flagged'] }
 const BADGE_CLASS = { unreviewed: 'unreviewed', community: 'vouched', flagged: 'flagged' }
 
 function esc(s) {
@@ -139,7 +139,7 @@ function indexedOnHtml(p) {
 function warningHtml(p) {
   const state = p.state || 'unreviewed'
   if (state === 'community') {
-    return '<div class="warning-callout vouched" data-dom-id="warning-callout"><strong>社区认可:</strong>该插件已通过社区信任门槛(stars/活跃度等),但<strong>仍未经过人工安全审计</strong>。插件将以你运行 DSH 的用户权限执行代码,建议安装前先查看源码自行评估。</div>'
+    return '<div class="warning-callout vouched" data-dom-id="warning-callout"><strong>维护活跃:</strong>该插件已通过维护活跃门槛(stars/活跃度等),但<strong>仍未经过人工安全审计</strong>。插件将以你运行 DSH 的用户权限执行代码,建议安装前先查看源码自行评估。</div>'
   }
   return '<div class="warning-callout" data-dom-id="warning-callout"><strong>安装前必读:</strong>此插件未经人工安全审计。安装后将以你运行 DSH 的用户权限执行任意代码,可读写你的文件、访问网络。仅安装你信任的来源。</div>'
 }

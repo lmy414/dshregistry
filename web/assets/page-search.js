@@ -198,14 +198,7 @@ if (typeof document !== 'undefined' && typeof window !== 'undefined') {
       const el = document.getElementById('quickChips')
       if (!el) return
       const cats = DSHR.CATEGORIES.filter((c) => c !== 'all')
-      el.innerHTML = cats.map((c) => `<button type="button" class="chip" data-cat="${DSHR.escapeHtml(c)}">${DSHR.escapeHtml(DSHR.categoryLabel(c))}</button>`).join('')
-      el.querySelectorAll('.chip').forEach((chip) => {
-        chip.addEventListener('click', () => {
-          const input = document.getElementById('searchInput')
-          if (input) input.value = `cat:${chip.dataset.cat}`
-          runSearch()
-        })
-      })
+      el.innerHTML = cats.map((c) => `<a class="chip" href="/category.html?cat=${encodeURIComponent(c)}" data-cat="${DSHR.escapeHtml(c)}">${DSHR.escapeHtml(DSHR.categoryLabel(c))}</a>`).join('')
     }
 
     // ---------- 联想下拉 ----------

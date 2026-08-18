@@ -76,7 +76,7 @@ async function bootPage(html, pageFile, coreFiles) {
 console.log('== 文档页:结构 ==')
 const wDocs = await bootPage(await loadFile(join(WEB, 'docs.html')), 'page-docs.js', ['docs-core.js'])
 const dd = wDocs.document
-assert(dd.title === '文档 · dshregistry', `页面 title ("${dd.title}")`)
+assert(dd.title === 'DSH-Registry · 文档', `页面 title ("${dd.title}")`)
 const sectionIds = ['about', 'submit', 'api', 'resources', 'friends']
 for (const id of sectionIds) {
   assert(!!dd.getElementById(id), `section #${id} 存在`)
@@ -93,6 +93,15 @@ assert(dd.getElementById('stat-plugins').textContent === String(metaCount.plugin
 assert(dd.getElementById('stat-cats').textContent === String(metaCount.categoryCount), `分类数 (页面 "${dd.getElementById('stat-cats').textContent}" vs meta "${metaCount.categoryCount}")`)
 assert(dd.getElementById('stat-community').textContent === String(metaCount.communityCount), `社区认可数 (页面 "${dd.getElementById('stat-community').textContent}" vs meta "${metaCount.communityCount}")`)
 assert(/^\d{4}-\d{2}-\d{2}$/.test(dd.getElementById('stat-updated').textContent), `更新时间 YYYY-MM-DD ("${dd.getElementById('stat-updated').textContent}")`)
+
+console.log('== 文档页:服务透明度声明(14 项) ==')
+const trans = dd.querySelectorAll('#transparency .transparency-item')
+assert(trans.length === 14, `透明度 14 项 (实际 ${trans.length})`)
+const transTerms = [...trans].map((t) => t.querySelector('.transparency-term')?.textContent)
+for (const expected of ['服务与链接', '运营者与控制者', '目的', '收录来源', '抓取与站点友好', '审阅范围与未覆盖', '排序、赞助与利益冲突', '版本、制品、依赖与更新模型', '运行风险信号', '维护权转移', '暂停、下架、通知与申诉', '数据、隐私与保留', '停运与导出', '最后复审']) {
+  assert(transTerms.includes(expected), `透明度条目 "${expected}"`)
+}
+assert(dd.querySelector('#transparency .section-note')?.textContent.includes('不构成安全认证'), '透明度声明尾注(不构成安全认证)')
 
 console.log('== 文档页:数据 API 端点表 ==')
 const apiRows = dd.querySelectorAll('#apiEndpoints tr')
@@ -124,7 +133,7 @@ assert(dd.querySelector('#about .compliance-callout li:nth-child(1)').textConten
 console.log('== 文档页:语言切换(EN) ==')
 wDocs.document.querySelectorAll('.lang-toggle button')[1].click()
 await sleep(400)
-assert(wDocs.document.title === 'Docs · dshregistry', `EN title ("${wDocs.document.title}")`)
+assert(wDocs.document.title === 'DSH-Registry · Docs', `EN title ("${wDocs.document.title}")`)
 assert(wDocs.document.querySelector('.docs-hero-title').textContent === 'Docs', 'EN hero 标题')
 assert(wDocs.document.querySelector('.nav-links a[data-dom-id="nav-docs"]').textContent === 'Docs', 'EN 导航文档')
 assert(wDocs.document.querySelector('.nav-links a[data-dom-id="nav-stickers"]').textContent === 'Merch', 'EN 导航周边')
@@ -133,7 +142,7 @@ assert(wDocs.document.querySelector('#apiEndpoints tr:nth-child(1) .api-desc').t
 console.log('== 周边页:结构 ==')
 const wStickers = await bootPage(await loadFile(join(WEB, 'stickers.html')), 'page-stickers.js')
 const ds = wStickers.document
-assert(ds.title === '周边 · 鲸鱼娘素材 · dshregistry', `页面 title ("${ds.title}")`)
+assert(ds.title === 'DSH-Registry · 周边 · 鲸鱼娘素材', `页面 title ("${ds.title}")`)
 const cards = ds.querySelectorAll('.sticker-card')
 assert(cards.length === 13, `贴纸卡 ${cards.length} 张`)
 assert(cards.length === new Set([...cards].map((c) => c.querySelector('img')?.src)).size, '13 张预览图 src 各不相同')
@@ -160,7 +169,7 @@ assert(ds.querySelector('.license-footer').textContent.includes('下载使用即
 console.log('== 周边页:语言切换(EN) ==')
 wStickers.document.querySelectorAll('.lang-toggle button')[1].click()
 await sleep(400)
-assert(wStickers.document.title === 'Merch · Whale Girl Stickers · dshregistry', `EN title ("${wStickers.document.title}")`)
+assert(wStickers.document.title === 'DSH-Registry · Merch · Whale Girl Stickers', `EN title ("${wStickers.document.title}")`)
 assert(wStickers.document.querySelector('#zipDownloadBtn').textContent.includes('Download All'), 'EN ZIP 按钮文案')
 assert(wStickers.document.querySelector('.license-point:nth-child(1) .license-point-title').textContent === 'Attribution', 'EN license 署名')
 assert(wStickers.document.querySelector('.license-footer').textContent.includes('agree to the license'), 'EN 同意文案')

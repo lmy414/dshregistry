@@ -6,7 +6,7 @@ import http from 'node:http'
 import { mkdtemp, readFile, writeFile, rm, mkdir } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { runWebCrawl } from '../crawl-web.js'
+import { runWebCrawl, dedupePagesByRepo } from '../crawl-web.js'
 
 const DETAIL = (name, owner, repo) => `<html><body>
 <h1>${name}<span title="综合评分">A<span class="opacity-80">90</span></span></h1>
@@ -200,4 +200,20 @@ test('runWebCrawl: pages.json 去重按条目身份——3 个 hub 条目同 url
   assert.deepEqual(hubIds, ['hub1', 'hub2', 'hub3'], 'hub 重复 url 但 id 不同,3 条必须全部保留')
   assert.ok(pages.pages.some((p) => p.source === 'dshfind' && p.name === 'old-ghost'), '无关 dshfind 旧页保留')
   assert.equal(pages.pages.length, 4, '4 = 3 hub + 1 dshfind')
+})
+
+// 跨源去重:同 repo 在 dshfind 与 hub 各一条 → 只留 dshfind(评分数据优先)
+test('dedupePagesByRepo: 同仓库跨源只留 dshfind;无仓库条目不聚合', () => {
+  const docs = [
+    { type: 'page', source: 'dshhub', url: 'https://hub.omdsh.dev/projects.html', name: 'dsh-trellis', repoUrl: 'https://github.com/1264459640/dsh-trellis', external: { dshhub: { id: 'dsh-trellis' } } },
+    { type: 'page', source: 'dshfind', url: 'https://dshfind.com/zh/plugins/1264459640/dsh-trellis', name: 'dsh-trellis', repoUrl: 'https://github.com/1264459640/dsh-trellis', external: { dshfind: { grade: 'B', score: 55 } } },
+    { type: 'page', source: 'dshfind', url: 'https://dshfind.com/zh/plugins/A/solo', name: 'solo', repoUrl: 'https://github.com/A/solo', external: { dshfind: {} } },
+    { type: 'page', source: 'dshhub', url: 'https://hub.omdsh.dev/projects.html', name: '无仓库', repoUrl: null, external: { dshhub: { id: 'norepo' } } },
+  ]
+  const out = dedupePagesByRepo(docs)
+  assert.equal(out.length, 3, '4→3: dsh-trellis 合并为 dshfind 一条')
+  const t = out.find((d) => d.repoUrl?.includes('dsh-trellis'))
+  assert.equal(t.source, 'dshfind', '保留 dshfind 条目(评分优先)')
+  assert.ok(out.some((d) => d.name === 'solo'))
+  assert.ok(out.some((d) => d.name === '无仓库'))
 })

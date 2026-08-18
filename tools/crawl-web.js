@@ -85,6 +85,21 @@ async function crawlDshhub({ base, cacheDir, now, webDocs }) {
   console.log(`[crawl-web] dshhub: 归一 ${webDocs.length} 文档`)
 }
 
+/** 跨源去重:按 repoUrl 聚合,dshfind 优先(带评分/增长),hub 兜底;无 repoUrl 原样保留。 */
+export function dedupePagesByRepo(docs) {
+  const byRepo = new Map()
+  for (const d of docs) {
+    if (!d.repoUrl) { byRepo.set(`__solo__${d.url}#${d.name}`, d); continue }
+    const key = d.repoUrl.toLowerCase()
+    const prev = byRepo.get(key)
+    if (!prev) { byRepo.set(key, d); continue }
+    // 已有 dshfind 或新条目不优于现有 → 跳过;dshfind 覆盖 hub
+    if (prev.source === 'dshfind' || d.source !== 'dshfind') continue
+    byRepo.set(key, d)
+  }
+  return [...byRepo.values()]
+}
+
 export async function runWebCrawl({ dataDir, cacheDir, now, maxPages = Infinity, minIntervalMs = 1500, dshfindBase = 'https://dshfind.com', dshhubBase = 'https://hub.omdsh.dev' }) {
   const pluginsFile = join(dataDir, 'plugins.json')
   const plugins = JSON.parse(await readFile(pluginsFile, 'utf8'))
@@ -128,7 +143,9 @@ export async function runWebCrawl({ dataDir, cacheDir, now, maxPages = Infinity,
     seenKey.add(k)
     mergedPages.push(p)
   }
-  await atomicWriteJson(pagesFile, { version: 1, updatedAt: now, pages: mergedPages })
+  // 跨源去重:同一仓库在多个网页源各有一条文档(dshfind + hub 常见),
+  // 按 repoUrl 聚合只留一条——dshfind 优先(带评分/增长数据),hub 兜底;无 repoUrl 原样保留。
+  await atomicWriteJson(pagesFile, { version: 1, updatedAt: now, pages: dedupePagesByRepo(mergedPages) })
   // 反哺候选:与历史候选按 repo 去重合并,crawl.js 下轮消费
   const backfillFile = join(cacheDir, 'backfill.json')
   const oldBackfill = JSON.parse(await readFile(backfillFile, 'utf8').catch(() => '{"candidates":[]}'))

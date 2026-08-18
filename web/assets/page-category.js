@@ -38,7 +38,9 @@ if (typeof document !== 'undefined' && typeof window !== 'undefined') {
       sort: 'relevance',
       facets: { source: [], category: [], trust: [], author: [], stars: '' }, // stars '' = 不限
       authorExpanded: false, // 作者 facet 是否展开全部
+      visible: 50,           // 结果区每屏渲染条数(增量渲染,避免大结果集一次渲染卡顿)
     }
+    const PAGE_SIZE = 50
     const SORTS = ['relevance', 'stars', 'updated']
 
     /** 站内数据一律走 shared.js 白名单路由(DSHR.fetchJson),本文件不做任何 URL 构造。 */
@@ -351,10 +353,25 @@ if (typeof document !== 'undefined' && typeof window !== 'undefined') {
       })))
       const listEl = document.getElementById('resultsList')
       if (listEl) {
-        listEl.innerHTML = rows.length
-          ? rows.map((r) => r.kind === 'plugin' ? pluginRowHtml(r.item, parsed.terms) : pageRowHtml(r.item, parsed.terms)).join('')
-          : zeroStateHtml()
-        wireZeroChips()
+        if (!rows.length) {
+          listEl.innerHTML = zeroStateHtml()
+          wireZeroChips()
+        } else {
+          const shown = rows.slice(0, state.visible)
+          listEl.innerHTML = shown.map((r) => r.kind === 'plugin' ? pluginRowHtml(r.item, parsed.terms) : pageRowHtml(r.item, parsed.terms)).join('')
+          // 增量渲染:结果超出当前可见数 → 底部"加载更多"
+          if (rows.length > state.visible) {
+            const more = document.createElement('button')
+            more.type = 'button'
+            more.className = 'load-more-btn'
+            more.textContent = `${DSHR.t('loadMore') || '加载更多'} (${rows.length - state.visible})`
+            more.addEventListener('click', () => {
+              state.visible += PAGE_SIZE
+              applyAndRender()   // 不走 runSearch:不重置 visible,不重新触发 pages 懒加载
+            })
+            listEl.appendChild(more)
+          }
+        }
       }
       renderFacets()
     }
@@ -363,24 +380,27 @@ if (typeof document !== 'undefined' && typeof window !== 'undefined') {
     /** 从 URL 参数合成查询串(?q= / ?cat= / ?author=)。 */
     function paramsToQuery() {
       const params = new URLSearchParams(location.search)
-      const parts = []
       const q = (params.get('q') || '').trim()
+      // cat/author 参数 = Facet 预勾选(计数保留全站、可切换),不进查询词
       const cat = (params.get('cat') || '').trim().toLowerCase()
       const author = (params.get('author') || '').trim().toLowerCase()
-      if (q) parts.push(q)
-      if (cat) parts.push(`cat:${cat}`)
-      if (author) parts.push(`author:${author}`)
-      return parts.join(' ')
+      if (cat && DSHR.CATEGORIES.includes(cat) && !state.facets.category.includes(cat)) {
+        state.facets.category = [...state.facets.category, cat]
+      }
+      if (author && !state.facets.author.includes(author)) {
+        state.facets.author = [...state.facets.author, author]
+      }
+      return q
     }
 
     /** 写回地址栏:cat/author 独立参数,其余维度与裸词并入 q;replaceState 不产生历史项。 */
     function syncUrl() {
       if (!history || !history.replaceState || typeof history.replaceState !== 'function') return
-      const parsed = parseQuery(state.query)
       const url = new URL(location.href)
       url.search = ''
-      const cat = parsed.filters.cat[0]
-      const author = parsed.filters.author[0]
+      // cat/author 来自 Facet 预勾选
+      const cat = state.facets.category[0]
+      const author = state.facets.author[0]
       if (cat) url.searchParams.set('cat', cat)
       if (author) url.searchParams.set('author', author)
       const rest = []
@@ -399,6 +419,21 @@ if (typeof document !== 'undefined' && typeof window !== 'undefined') {
     function runSearch() {
       const input = document.getElementById('catSearchInput')
       state.query = input ? input.value : ''
+      state.visible = PAGE_SIZE   // 查询/过滤变化重置增量渲染
+      // pages 懒加载:网页行只在有查询词时展示;下载期间先渲染插件结果(不阻塞首屏),到位后补一次带网页行的渲染
+      if (state.query && !state.pagesLoaded && !state.pagesLoading) {
+        state.pagesLoading = true
+        DSHR.fetchJson('pages').then((d) => {
+          state.pages = (d && d.pages) || []
+          state.pagesLoaded = true
+          state.pagesLoading = false
+          runSearch()
+        }).catch(() => {
+          state.pages = []
+          state.pagesLoaded = true
+          state.pagesLoading = false
+        })
+      }
       applyAndRender()
       hideSuggest()
       syncUrl()
@@ -490,12 +525,17 @@ if (typeof document !== 'undefined' && typeof window !== 'undefined') {
     }
 
     function wireFacets() {
+      // 防抖 120ms:连续勾选/取消只合并为一次渲染(全量重建 DOM 开销大,连点会卡)
+      let facetTimer = null
       ;['facetSource', 'facetCategory', 'facetTrust', 'facetAuthorList', 'facetStars'].forEach((id) => {
         const el = document.getElementById(id)
         if (!el) return
         el.addEventListener('change', () => {
-          readFacetsFromDom()
-          runSearch()
+          clearTimeout(facetTimer)
+          facetTimer = setTimeout(() => {
+            readFacetsFromDom()
+            runSearch()
+          }, 120)
         })
       })
       const authorSearch = document.getElementById('facetAuthorSearch')
@@ -570,31 +610,14 @@ if (typeof document !== 'undefined' && typeof window !== 'undefined') {
     }
 
     // ---------- 启动 ----------
+    // 加载策略(优化 2026-08-18):plugins.json 先到先渲染(Facet 计数/分类浏览/榜单都不依赖其余文件);
+    // search.json 后台并行补全(仅相关度排序/查询词需要);pages.json 懒加载(网页行只在有查询词时展示)。
     async function boot() {
       try {
         const [plugins] = await DSHR.loadData()
         state.plugins = plugins
       } catch (e) {
         console.error('[page-category] plugins load failed', e)
-      }
-      try {
-        state.search = await DSHR.fetchJson('search')
-        for (let i = 0; i < (state.search.docs || []).length; i++) {
-          const d = state.search.docs[i]
-          if (d.type === 'plugin' && !state.docIdxOf.has(d.slug)) state.docIdxOf.set(d.slug, i)
-        }
-      } catch (e) {
-        console.error('[page-category] search.json load failed', e)
-      }
-      try {
-        state.pages = (await DSHR.fetchJson('pages')).pages || []
-      } catch (e) {
-        console.error('[page-category] pages.json load failed', e)
-      }
-      try {
-        state.trending = await DSHR.fetchJson('trending')
-      } catch (e) {
-        console.error('[page-category] trending.json load failed', e)
       }
       state.maxStars = Math.max(1, ...state.plugins.map((p) => p.stars || 0))
       wireSearch()
@@ -606,6 +629,29 @@ if (typeof document !== 'undefined' && typeof window !== 'undefined') {
       const input = document.getElementById('catSearchInput')
       if (input) input.value = q
       runSearch()
+      loadSearchIndex()   // 后台补全相关度数据,不阻塞首屏
+      loadTrending()      // 零结果态的热门推荐
+    }
+
+    async function loadSearchIndex() {
+      try {
+        state.search = await DSHR.fetchJson('search')
+        for (let i = 0; i < (state.search.docs || []).length; i++) {
+          const d = state.search.docs[i]
+          if (d.type === 'plugin' && !state.docIdxOf.has(d.slug)) state.docIdxOf.set(d.slug, i)
+        }
+        if (state.query) runSearch()   // 有查询词时重算相关度排序
+      } catch (e) {
+        console.error('[page-category] search.json load failed', e)
+      }
+    }
+
+    async function loadTrending() {
+      try {
+        state.trending = await DSHR.fetchJson('trending')
+      } catch (e) {
+        console.error('[page-category] trending.json load failed', e)
+      }
     }
 
     DSHR.onReady(() => boot().catch((e) => console.error('[page-category] boot failed', e)))

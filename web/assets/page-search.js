@@ -469,7 +469,8 @@ if (typeof document !== 'undefined' && typeof window !== 'undefined') {
         btn.addEventListener('click', () => {
           const it = items[Number(btn.dataset.index)]
           if (!it) return
-          input.value = it.value
+          // 裸词联想项无 value(只有 label),维度项两者都有
+          input.value = it.value ?? it.label ?? ''
           box.hidden = true
           input.setAttribute('aria-expanded', 'false')
           runSearch()

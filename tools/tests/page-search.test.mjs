@@ -102,3 +102,16 @@ test('fmtNum / pluginSources / pageStars', () => {
   assert.equal(pageStars({ source: 'dshhub', external: { dshhub: { stars: 3 } } }), 3)
   assert.equal(pageStars({}), null)
 })
+
+test('回归: 联想项必须能解析出非空查询串(it.value ?? it.label)', async () => {
+  const { suggestForQuery } = await import('../../web/assets/page-search.js')
+  const plugs = [
+    { slug: 'alpha-vision', name: 'alpha-vision', repo: 'Acme/alpha-vision', category: 'vision', tags: ['ocr'], stars: 100 },
+  ]
+  const items = [...suggestForQuery('al', plugs, []), ...suggestForQuery('cat:', plugs, [{ key: 'vision', label: '视觉' }])]
+  assert.ok(items.length > 0)
+  for (const it of items) {
+    const q = it.value ?? it.label
+    assert.ok(typeof q === 'string' && q.length > 0, `联想项缺 value/label: ${JSON.stringify(it)}`)
+  }
+})

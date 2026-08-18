@@ -1,0 +1,316 @@
+<h1>dsh-plugin-semantic-memory</h1>
+<p><strong>中文</strong>（<a href="https://github.com/chenkezhen480/dsh-semantic-memory/blob/HEAD/README.zh.md">README.zh.md</a>，推荐） | <a href="https://github.com/chenkezhen480/dsh-semantic-memory/blob/HEAD/README.md">English</a></p>
+<p>Semantic long-term memory for <a href="https://github.com/deepseek-ai/deepseek-harness">DeepSeek Harness</a>.</p>
+<p>A <code>dsh-plugin</code> (Cordis plugin) that gives the model a persistent, embedding-based
+memory across sessions — unlike the harness's built-in <code>session_query</code> (literal
+FTS5), this store retrieves by <em>meaning</em>.</p>
+<p><strong>Zero-config out of the box</strong>: install, restart, and start a new session. The
+local embedding model downloads itself on first use (~100 MB); the four tools,
+per-question recall, and 5-turn auto-summarization all work with defaults. You
+only configure when you want something different (see <a href="#configuration">Configuration</a>).</p>
+<h2>Features</h2>
+<ul>
+<li><strong>Cross-session semantic memory</strong> — facts, decisions, preferences, and notes
+persisted as JSONL under <code>$DSH_HOME/memories/memories.jsonl</code>.</li>
+<li><strong>Embedding retrieval</strong> — cosine similarity over normalized vectors; provider
+is pluggable:<ul>
+<li><code>local</code> (default): ONNX inference via <code>@huggingface/transformers</code> with
+<code>Xenova/bge-small-zh-v1.5</code> (offline, <del>100 MB model, cached in
+`</del>/.cache/huggingface`).</li>
+<li><code>api</code>: any OpenAI-compatible <code>/embeddings</code> endpoint (e.g. SiliconFlow,
+Zhipu, DashScope).</li>
+</ul>
+</li>
+<li><strong>Memory decay &amp; strengthening</strong> — each entry's effective strength halves
+over the configured half-life since its last access; searching an entry
+refreshes it. Importance (1–5) sets the base strength.</li>
+<li><strong>Model-facing tools</strong>:<ul>
+<li><code>memory_write</code> — persist a fact / decision / preference / note (content
+hash dedup, repeats update in place).</li>
+<li><code>memory_search</code> — semantic top-k recall with kind/tag/workspace filters.</li>
+<li><code>memory_forget</code> — delete by id.</li>
+<li><code>memory_stats</code> — store summary.</li>
+</ul>
+</li>
+<li><strong>Automatic injection</strong> — the plugin watches the session event stream: every
+new user message is embedded and searched asynchronously, and the freshest
+per-session recall is rendered into the system prompt <strong>before the turn's
+prompt assembly</strong> (question-aware). With no fresh recall yet, the strongest
+resident memories are injected as a fixed-size fallback.</li>
+<li><strong>Proactive writing guidance</strong> — the injected prompt tells the model to call
+<code>memory_write</code> on its own when the user states a durable preference, an
+established fact, or an explicit decision (no need to say "remember").</li>
+<li><strong>Auto-summarization</strong> — every N user messages (default 5), the plugin asks
+the harness LLM to distill the recent transcript into memory entries and
+writes them (tagged <code>auto</code>). One in-flight summary per session; silent on
+failure; only active when <code>llm</code> and <code>agentDefaultModel</code> services exist.</li>
+<li><strong>Workspace tagging</strong> — entries record the caller session's cwd; search
+scopes to that workspace by default and can opt into cross-workspace recall.</li>
+</ul>
+<h2>Install into a DSH profile</h2>
+<p>The package ships an in-package <code>cordis.patch.yml</code> declared via
+<code>dsh.bundle.patch</code>, so the plugin command mounts it automatically with no
+manual profile edits. DSH delegates plugin installation to <code>pnpm</code>, so <code>pnpm</code>
+must be available on <code>PATH</code> regardless of how DSH itself is launched.</p>
+<p>Use the command matching your DSH launcher:</p>
+<pre><code># DSH run through npx (no global `dsh` command)
+npx @deepseek-ai/dsh plugin --profile web add dsh-plugin-semantic-memory
+
+# DSH run from a deepseek-harness source checkout (run from that repo root)
+pnpm dsh plugin --profile web add dsh-plugin-semantic-memory
+
+# DSH installed with a global `dsh` command
+dsh plugin --profile web add dsh-plugin-semantic-memory
+</code></pre>
+<p>For a local checkout, build it first, then use the same launcher prefix:</p>
+<pre><code>cd C:/path/to/dsh-semantic-memory
+npm install
+npm run build
+npx @deepseek-ai/dsh plugin --profile web add file:C:/path/to/dsh-semantic-memory
+</code></pre>
+<p>Then restart the Web profile with the same launcher
+(<code>npx @deepseek-ai/dsh web</code>, <code>pnpm dsh web</code>, or <code>dsh web</code>) and start a new
+session. All knobs have schema defaults; the in-package <code>cordis.patch.yml</code> is
+the deployment config source — <strong>in-package config overrides outer layers</strong>
+(settings.yaml and user patch rows only fill keys the package does not declare,
+they do not override it).</p>
+<blockquote>
+<p><strong>Applying local configuration changes:</strong> the Web profile uses a copied
+snapshot for a <code>file:</code> dependency rather than reading the checkout live.
+After changing <code>cordis.patch.yml</code> or rebuilding the plugin, delete
+<code>&lt;DSH_HOME&gt;\profiles\web\node_modules\dsh-plugin-semantic-memory</code>, run
+<code>&lt;your DSH launcher&gt; plugin --profile web install</code>, and restart the Web
+profile.</p>
+</blockquote>
+<p>Manual equivalent (for older installs): add the dependency to the profile's
+<code>package.json</code>, insert a mount row — new entries must be <strong>inserted</strong> (a bare
+<code>- id:</code> row only overrides an existing bundle id and is silently ignored):</p>
+<pre><code>- insert:
+    - id: semantic-memory
+      name: 'dsh-plugin-semantic-memory'
+</code></pre>
+<p>Leave <code>mode</code>/<code>provider</code> unset unless you need an explicit switch: selection is
+automatic (see below).</p>
+<h2>Usage</h2>
+<h3>Provider selection</h3>
+<p>The embedding provider is chosen by <code>mode</code> (explicit deployment switch), falling
+back to the automatic selection:</p>
+<table>
+<thead>
+<tr>
+<th>Configuration</th>
+<th>Provider</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>mode: 'cloud'</code></td>
+<td><strong>API</strong> (OpenAI-compatible <code>/embeddings</code> endpoint); requires <code>apiKey</code></td>
+</tr>
+<tr>
+<td><code>mode: 'local'</code></td>
+<td><strong>local</strong> (ONNX via <code>@huggingface/transformers</code>, offline), even with an <code>apiKey</code> set</td>
+</tr>
+<tr>
+<td>no <code>mode</code>, <code>apiKey</code> present (non-empty)</td>
+<td><strong>API</strong></td>
+</tr>
+<tr>
+<td>no <code>mode</code>, no <code>apiKey</code></td>
+<td><strong>local</strong></td>
+</tr>
+<tr>
+<td><code>provider: 'local'</code> (explicit)</td>
+<td>local, even with an <code>apiKey</code> set</td>
+</tr>
+<tr>
+<td><code>provider: 'api'</code> (explicit)</td>
+<td>API; requires <code>apiKey</code></td>
+</tr>
+</tbody></table>
+<p>Switching deployment mode means editing <code>mode</code> in the in-package
+<code>cordis.patch.yml</code> and restarting the Web profile with the same DSH launcher —
+<strong>in-package config overrides outer layers</strong> (settings.yaml
+or user profile patch rows only fill keys the package does not declare; they do
+not override it). A restart is needed after patch-file changes; the settings
+document (<code>~/.dsh/settings.yaml</code>, <code>semantic-memory:</code> section) hot-reloads for
+the keys it is allowed to supply. The first local embed downloads the model
+(<del>100 MB, cached in `</del>/.cache/huggingface<code>; use </code>remoteHost` for a mirror).</p>
+<h3>Verify the plugin is live</h3>
+<p>Open a <strong>new session</strong> (existing sessions keep their original tool set) and ask
+the model: <em>"Do you have memory_</em> tools?"* — it should list <code>memory_write</code>,
+<code>memory_search</code>, <code>memory_forget</code>, and <code>memory_stats</code>. The system prompt also
+carries a <code>## Long-term memory</code> section once memories exist.</p>
+<h3>What the model can do</h3>
+<ul>
+<li><strong>Persist on its own</strong> — state a durable preference, fact, or decision; the
+injected guidance makes the model call <code>memory_write</code> without being asked.</li>
+<li><strong>Ask it to remember</strong> — <em>"记住：我在用硅基流动的 API"</em> → <code>memory_write</code>.</li>
+<li><strong>Recall</strong> — <em>"我之前对回答风格有什么偏好？"</em> → the per-turn semantic recall
+surfaces relevant memories automatically; <code>memory_search</code> digs deeper
+(supports <code>kind</code>, <code>tags</code>, <code>workspace</code>, <code>limit</code>, <code>min_score</code>).</li>
+<li><strong>Manage</strong> — <code>memory_forget &lt;id&gt;</code> deletes; <code>memory_stats</code> summarizes the store.</li>
+</ul>
+<h3>Automatic behaviors</h3>
+<table>
+<thead>
+<tr>
+<th>Trigger</th>
+<th>Behavior</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>Every user message</td>
+<td>Asynchronous embedding + search; the freshest per-session hits are injected into the next prompt assembly (<code>## Long-term memory (recalled for your current question)</code>)</td>
+</tr>
+<tr>
+<td>Every N user messages (default 5)</td>
+<td>The harness LLM distills <strong>only the messages since the last summary</strong> (per-session seq cursor — no re-digesting, nothing skipped) into memory entries, written with the <code>auto</code> tag; the cadence can be set with the <code>DSH_SEMANTIC_MEMORY_SUMMARIZE_EVERY</code> environment variable (<code>0</code> disables, overrides the config document)</td>
+</tr>
+<tr>
+<td>Prompt assembly, no fresh recall</td>
+<td>Strongest memories (importance × recency × access) injected as fallback</td>
+</tr>
+</tbody></table>
+<h3>Where the data lives</h3>
+<ul>
+<li>Store: <code>$DSH_HOME/memories/memories.jsonl</code> (one JSON line per entry, vectors
+included; edit/backup freely).</li>
+<li>Settings: in-package <code>cordis.patch.yml</code> (deployment source of truth — package
+config overrides outer layers); <code>~/.dsh/settings.yaml</code> under <code>semantic-memory:</code>
+only fills keys the package does not declare (hot-reloaded).</li>
+</ul>
+<h3>Troubleshooting</h3>
+<ul>
+<li><em><em>No memory_</em> tools in a session</em>* — the session predates the plugin; start a
+new one.</li>
+<li><strong>First local embed is slow / fails</strong> — the model downloads on first use; set
+<code>remoteHost: https://hf-mirror.com</code> in restricted networks.</li>
+<li><strong><code>api</code> provider errors</strong> — confirm <code>mode</code>/<code>apiKey</code> are set and <code>apiBase</code>
+points at an OpenAI-compatible endpoint (a <code>/v1</code> base gets <code>/embeddings</code>
+appended).</li>
+<li><strong>Auto-summary never fires</strong> — it needs the <code>llm</code> and <code>agentDefaultModel</code>
+services (present in the standard web profile) and <code>autoSummarizeEvery &gt; 0</code>.</li>
+</ul>
+<h2>Configuration</h2>
+<table>
+<thead>
+<tr>
+<th>Key</th>
+<th>Default</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>mode</code></td>
+<td><em>(unset)</em></td>
+<td>Deployment switch: <code>local</code> forces the local model, <code>cloud</code> forces the API (requires <code>apiKey</code>). Unset keeps the automatic selection.</td>
+</tr>
+<tr>
+<td><code>provider</code></td>
+<td><code>auto</code></td>
+<td><code>auto</code> selects by apiKey (non-empty → <code>api</code>, else <code>local</code>); explicit <code>local</code>/<code>api</code> overrides. An explicit <code>mode</code> overrides both.</td>
+</tr>
+<tr>
+<td><code>localModel</code></td>
+<td><code>Xenova/bge-small-zh-v1.5</code></td>
+<td>Local transformer model id.</td>
+</tr>
+<tr>
+<td><code>remoteHost</code></td>
+<td><code>https://huggingface.co</code></td>
+<td>Model download host; set <code>https://hf-mirror.com</code> in restricted networks.</td>
+</tr>
+<tr>
+<td><code>apiBase</code></td>
+<td><code>https://api.siliconflow.cn/v1</code></td>
+<td>API base URL (an <code>/embeddings</code> route is appended).</td>
+</tr>
+<tr>
+<td><code>apiKey</code></td>
+<td><code>''</code></td>
+<td>API key. When non-empty and provider is not explicitly <code>local</code>, the API provider is used.</td>
+</tr>
+<tr>
+<td><code>apiModel</code></td>
+<td><code>BAAI/bge-m3</code></td>
+<td>API embedding model name.</td>
+</tr>
+<tr>
+<td><code>memoryPath</code></td>
+<td><code>$DSH_HOME/memories/memories.jsonl</code></td>
+<td>Store file path.</td>
+</tr>
+<tr>
+<td><code>promptTopK</code></td>
+<td><code>3</code></td>
+<td>Memories injected per system-prompt assembly (0 disables).</td>
+</tr>
+<tr>
+<td><code>maxSearchResults</code></td>
+<td><code>10</code></td>
+<td>Default <code>memory_search</code> hit cap.</td>
+</tr>
+<tr>
+<td><code>minScore</code></td>
+<td><code>0.35</code></td>
+<td>Default minimum relevance for search hits.</td>
+</tr>
+<tr>
+<td><code>halfLifeMs</code></td>
+<td>30 days</td>
+<td>Memory strength half-life.</td>
+</tr>
+<tr>
+<td><code>autoSummarizeEvery</code></td>
+<td><code>5</code></td>
+<td>Auto-summarize every N user messages (0 disables; needs llm + agentDefaultModel). The <code>DSH_SEMANTIC_MEMORY_SUMMARIZE_EVERY</code> env var overrides this (0..100).</td>
+</tr>
+<tr>
+<td><code>summarizeWindow</code></td>
+<td><code>12</code></td>
+<td>Most recent messages included in one auto-summary.</td>
+</tr>
+<tr>
+<td><code>summarizeMaxTokens</code></td>
+<td><code>800</code></td>
+<td>Token budget for the summary call.</td>
+</tr>
+<tr>
+<td><code>summarizeTemperature</code></td>
+<td><code>0.2</code></td>
+<td>Sampling temperature for the summary call.</td>
+</tr>
+</tbody></table>
+<h2>Memory model</h2>
+<pre><code>interface MemoryEntry {
+  id: string            // sha1(kind + content), 16 hex chars — upsert key
+  kind: 'fact' | 'decision' | 'preference' | 'note'
+  content: string       // one-sentence, self-contained text
+  tags: string[]
+  workspace?: string    // caller session cwd at write time
+  source?: { sessionId: string; seq: number }
+  importance: number    // 1..5
+  embedding: number[]   // normalized vector
+  createdAt: number
+  updatedAt: number
+  accessCount: number
+  lastAccessAt: number
+}
+</code></pre>
+<p>Effective strength = <code>importance / 5 × 0.5^(age / halfLife)</code>;
+search rank = <code>cosine(query, entry) × strength</code>.</p>
+<h2>Known Limitations</h2>
+<ul>
+<li><strong>Recall is best-effort and async</strong> — the user-message listener embeds in the
+background; on a cold start (model still downloading) or with a slow API the
+first recall may arrive one step late, and the strength-ranked fallback
+covers that turn. Recall caches are per-session and stale after 60 s.</li>
+<li><strong>Sync prompt injection</strong> — the injected section renders from resident data
+only; the store is loaded lazily on first tool call, so a brand-new process
+may start with an empty injection for the first assembly.</li>
+<li><strong>No embedding persistence cache</strong> — vectors are stored inside each entry,
+so no separate index file is needed, but full re-embedding never happens
+either (entries keep their vectors forever).</li>
+<li><strong>Brute-force search</strong> — O(n) cosine over all entries per query; fine for
+personal-scale stores (thousands), not for millions of entries.</li>
+</ul>

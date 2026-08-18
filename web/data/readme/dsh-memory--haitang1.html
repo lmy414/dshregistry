@@ -1,0 +1,299 @@
+<h1>dsh-memory</h1>
+<p>Codex-like persistent memory for <a href="https://github.com/deepseek-ai/deepseek-harness">DeepSeek Harness</a>. The plugin gives every session a durable, auto-injected memory: a distilled global summary is injected into each prompt, agents can read/write/search memories with dedicated tools, and each finished turn is automatically distilled into per-session rollout summaries that periodically re-consolidate the global memory file.</p>
+<h2>How it works</h2>
+<pre><code>$DSH_HOME/memories/
+├── memory_summary.md           distilled, versioned, bounded memory — injected into every prompt
+├── raw_memories.md             append-only dated entries written by the memory tools
+├── rollout_summaries/&lt;sid&gt;.md  per-session turn summaries (auto)
+├── journal.jsonl               mutation journal consumed by consolidation
+├── summary_history/&lt;v&gt;.&lt;ts&gt;.md previous summary versions kept for rollback
+├── archive/raw-YYYY-MM.md      oldest raw entries archived past the byte budget
+├── scopes/ws-&lt;hash&gt;/...         per-workspace stores (when scopedMemory is enabled)
+├── scopes/project-&lt;hash&gt;/...    per-git-root project stores (when scopedMemory is enabled)
+└── state.json                  version + journal/rollout cursor bookkeeping
+</code></pre>
+<ul>
+<li><strong>Injection</strong> — <code>systemPrompt.context</code> re-reads <code>memory_summary.md</code> at every prompt assembly, so a <code>memory_add</code> call surfaces in the very next model step.</li>
+<li><strong>Tools</strong> — <code>memory_read</code>, <code>memory_add</code>, <code>memory_update</code>, <code>memory_delete</code>, <code>memory_search</code>, <code>memory_review</code>, <code>memory_merge</code>, <code>memory_export</code>, <code>memory_import</code>, <code>memory_stats</code>, <code>memory_browse</code>, <code>memory_history</code>, <code>memory_rollback</code>, <code>memory_sync</code> (see below).</li>
+<li><strong>Auto memory</strong> — on each finished turn of a root agent, the new conversation text is distilled with the default model into a rollout summary. Every <code>consolidateEvery</code> summaries, the scope's summary is re-merged (atomic write, version bump). With <code>scopedMemory</code>, rollouts and consolidation route to the session's workspace or project scope. All LLM work is queued, timed out, and never blocks a turn.</li>
+<li><strong>Seeding</strong> — on first run the plugin seeds the summary from <code>$DSH_HOME/AGENTS.md</code> (the Codex-synced global memory) without modifying it.</li>
+</ul>
+<p>Current release: <strong>0.2.5</strong> — see <a href="https://github.com/haitang1/dsh-memory/blob/HEAD/CHANGELOG.md">CHANGELOG.md</a> for the release history.</p>
+<h2>Install</h2>
+<p>The one-command path is <code>scripts/sync-install.ps1</code> (see <a href="#deploy--update">Deploy / update</a>); the manual path is below. Either way, restart DeepSeek Harness afterwards.</p>
+<ol>
+<li><p>Put the package under the profile's external plugins:</p>
+<pre><code>Copy-Item -Recurse E:\git\github\dsh-Plugin "$env:USERPROFILE\.dsh\profiles\web\node_modules\@dsh-external\dsh-memory"
+</code></pre>
+</li>
+<li><p>Add a loader row to <code>~/.dsh/profiles/web/cordis.patch.yml</code> (must be an <code>insert</code> entry — a standalone <code>- id:</code> row only overrides existing bundle entries and will not mount the plugin):</p>
+<pre><code>- insert:
+    - id: dsh-memory
+      name: '@dsh-external/dsh-memory'
+      config:
+        maxBytes: 8000
+        autoSummarize: true
+</code></pre>
+</li>
+<li><p>Restart DeepSeek Harness. The plugin mounts as <code>dsh-memory</code>; its settings namespace is <code>memory</code>.</p>
+</li>
+</ol>
+<h2>Configuration</h2>
+<table>
+<thead>
+<tr>
+<th>Key</th>
+<th>Default</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>memoryDir</code></td>
+<td><code>$DSH_HOME/memories</code></td>
+<td>Memory directory (empty = default).</td>
+</tr>
+<tr>
+<td><code>maxBytes</code></td>
+<td><code>8000</code></td>
+<td>Byte budget of the injected summary.</td>
+</tr>
+<tr>
+<td><code>consolidateMaxBytes</code></td>
+<td><code>40000</code></td>
+<td>Byte budget of the consolidation input sent to the merge model.</td>
+</tr>
+<tr>
+<td><code>keepSummaryVersions</code></td>
+<td><code>20</code></td>
+<td>Previous summary versions retained for <code>memory_rollback</code> (0 disables history).</td>
+</tr>
+<tr>
+<td><code>rawArchiveMaxBytes</code></td>
+<td><code>200000</code></td>
+<td>Active raw file byte budget; oldest entries move to <code>archive/</code> beyond it.</td>
+</tr>
+<tr>
+<td><code>autoSummarize</code></td>
+<td><code>true</code></td>
+<td>Distill finished turns into rollout summaries.</td>
+</tr>
+<tr>
+<td><code>summarizeProvider</code> / <code>summarizeModel</code></td>
+<td>selected agent model</td>
+<td>Model used for summarization.</td>
+</tr>
+<tr>
+<td><code>summarizeDebounceMs</code></td>
+<td><code>300000</code></td>
+<td>Minimum interval between summarizations of the same session (0 disables the debounce).</td>
+</tr>
+<tr>
+<td><code>consolidateEvery</code></td>
+<td><code>3</code></td>
+<td>Rollout summaries written before re-consolidating the global summary.</td>
+</tr>
+<tr>
+<td><code>summaryMaxTokens</code></td>
+<td><code>1500</code></td>
+<td>Max output tokens for turn summarization.</td>
+</tr>
+<tr>
+<td><code>consolidateMaxTokens</code></td>
+<td><code>3000</code></td>
+<td>Max output tokens for summary consolidation.</td>
+</tr>
+<tr>
+<td><code>llmRetries</code></td>
+<td><code>1</code></td>
+<td>Retries after a transient LLM failure.</td>
+</tr>
+<tr>
+<td><code>maxActiveSummaries</code></td>
+<td><code>4</code></td>
+<td>Maximum concurrent turn summarizations before new jobs are dropped.</td>
+</tr>
+<tr>
+<td><code>scopedMemory</code></td>
+<td><code>false</code></td>
+<td>Enable per-workspace memory scopes.</td>
+</tr>
+<tr>
+<td><code>redactSecrets</code></td>
+<td><code>true</code></td>
+<td>Redact credential-looking text from injected summaries.</td>
+</tr>
+<tr>
+<td><code>readOnlyScopes</code></td>
+<td><code>[]</code></td>
+<td>Scope keys whose write tools are blocked (<code>global</code>, exact <code>ws-*</code>/<code>project-*</code> keys, or <code>*</code> for all).</td>
+</tr>
+<tr>
+<td><code>embeddingBaseURL</code> / <code>embeddingApiKey</code> / <code>embeddingModel</code></td>
+<td>empty</td>
+<td>OpenAI-compatible <code>/embeddings</code> endpoint for <code>vector:true</code>; empty uses local hashed vectors.</td>
+</tr>
+<tr>
+<td><code>scopeMaxBytes</code></td>
+<td><code>2400</code></td>
+<td>Injected byte budget for the workspace summary when scopedMemory is enabled.</td>
+</tr>
+<tr>
+<td><code>seedFromAgentsMd</code></td>
+<td><code>true</code></td>
+<td>Seed the first summary from <code>$DSH_HOME/AGENTS.md</code>.</td>
+</tr>
+</tbody></table>
+<p>The Web settings card (see below) edits <code>maxBytes</code>, <code>consolidateEvery</code>, <code>autoSummarize</code>, and <code>seedFromAgentsMd</code> live; all other keys are configured through the loader row or the <code>memory:</code> section of <code>settings.yaml</code>.</p>
+<h2>Tools</h2>
+<table>
+<thead>
+<tr>
+<th>Tool</th>
+<th>Purpose</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>memory_read { scope? }</code></td>
+<td>Read the global, workspace, or project (nearest git root) memory summary.</td>
+</tr>
+<tr>
+<td><code>memory_add { content, tags?, scope?, importance?, allowDuplicate?, allowSecret? }</code></td>
+<td>Store one durable fact; obvious credentials are rejected unless <code>allowSecret:true</code>, <code>importance</code> 0-3 affects ranking, duplicates rejected by default.</td>
+</tr>
+<tr>
+<td><code>memory_update { id, content?, tags?, importance?, scope? }</code></td>
+<td>Replace an entry's content/tags/importance in the selected scope.</td>
+</tr>
+<tr>
+<td><code>memory_delete { id, scope? }</code></td>
+<td>Remove an entry from the selected scope.</td>
+</tr>
+<tr>
+<td><code>memory_search { query, tags?, mode?, fuzzy?, vector?, limit?, scope? }</code></td>
+<td>BM25-ranked search plus optional local hashed-embedding cosine retrieval (<code>vector:true</code>) for missing-term candidates.</td>
+</tr>
+<tr>
+<td><code>memory_stats {}</code></td>
+<td>Report store health: global + per-scope inventory, cursors, history, LLM counters, recent error telemetry.</td>
+</tr>
+<tr>
+<td><code>memory_history { scope? }</code></td>
+<td>List retained summary versions (newest first) for <code>memory_rollback</code>.</td>
+</tr>
+<tr>
+<td><code>memory_browse { targetDir, overwrite? }</code></td>
+<td>Write a self-contained interactive HTML browser over all scopes.</td>
+</tr>
+<tr>
+<td><code>memory_rollback { version }</code></td>
+<td>Restore a previously retained summary version.</td>
+</tr>
+<tr>
+<td><code>memory_sync {}</code></td>
+<td>Re-import AGENTS.md when it changed; reports a conflict instead of overwriting manual summary edits.</td>
+</tr>
+<tr>
+<td><code>memory_export { targetDir, scope?, overwrite? }</code></td>
+<td>Export a scope to Codex-compatible <code>memory_summary.md</code> + <code>raw_memories.md</code>.</td>
+</tr>
+<tr>
+<td><code>memory_import { sourceDir, scope?, merge? }</code></td>
+<td>Import Codex-compatible <code>raw_memories.md</code> into a scope (append or replace).</td>
+</tr>
+<tr>
+<td><code>memory_review { scope?, limit?, olderThanDays? }</code></td>
+<td>List oldest entries and near-duplicate groups for review; never deletes automatically.</td>
+</tr>
+<tr>
+<td><code>memory_merge { ids, keepId?, scope? }</code></td>
+<td>Merge active entries: longest content, union tags, max importance survive.</td>
+</tr>
+</tbody></table>
+<h2>Standalone MCP server</h2>
+<p><code>bin/dsh-memory-mcp.mjs</code> exposes the same Markdown memory store over stdio JSON-RPC (MCP) with no DeepSeek Harness runtime dependency. Environment: <code>DSH_MEMORY_DIR</code> (default <code>~/.dsh/memories</code>), <code>DSH_MEMORY_REDACT=1</code> (default). Scope arguments: <code>global</code> (default), <code>workspace</code>/<code>project</code> with a <code>cwd</code> argument.</p>
+<p>It serves 9 tools with the same store semantics as the DSH tools: <code>memory_read</code>, <code>memory_add</code>, <code>memory_update</code>, <code>memory_delete</code>, <code>memory_search</code>, <code>memory_stats</code>, <code>memory_history</code>, <code>memory_merge</code>, <code>memory_review</code>. An example client config lives in <a href="https://github.com/haitang1/dsh-memory/blob/HEAD/examples/mcp-config.json"><code>examples/mcp-config.json</code></a>.</p>
+<h2>Deploy / update</h2>
+<p><code>scripts/sync-install.ps1</code> copies runtime files into a DSH profile external-plugin directory and verifies SHA-256 hashes. It never touches memory data and does not restart DSH; restart is required after sync. Usage:</p>
+<pre><code>powershell -ExecutionPolicy Bypass -File scripts/sync-install.ps1 -DryRun
+powershell -ExecutionPolicy Bypass -File scripts/sync-install.ps1 -Backup
+</code></pre>
+<h3>Scripts</h3>
+<table>
+<thead>
+<tr>
+<th>Script</th>
+<th>Purpose</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>scripts/sync-install.ps1</code></td>
+<td>Copy runtime + metadata files into the profile external-plugin directory and verify SHA-256 (<code>-DryRun</code> preview, <code>-Backup</code> snapshot before writing).</td>
+</tr>
+<tr>
+<td><code>scripts/verify-after-restart.ps1</code></td>
+<td>Post-restart verification: file hashes, the Web settings allowlist (rc.7 auto-detected as removed), and an installed-copy MCP smoke test (<code>-SkipMcpSmoke</code>, <code>-SkipWebSettingsCheck</code>).</td>
+</tr>
+<tr>
+<td><code>scripts/restart-dsh.ps1</code></td>
+<td>Stop and relaunch the DSH web process, then run the verification (<code>-WhatIf</code> first; closes the running session).</td>
+</tr>
+<tr>
+<td><code>scripts/start-dsh-logged.ps1</code></td>
+<td>Diagnostic launch: restart the web process with stdout/stderr redirected to <code>$DSH_HOME/logs/</code> (captures startup errors).</td>
+</tr>
+<tr>
+<td><code>scripts/patch-web-settings.ps1</code></td>
+<td>Pre-rc.7 only: add <code>memory</code> to the <code>dsh-host-apiproxy</code> Web settings allowlist (obsolete since rc.7 removed the allowlist).</td>
+</tr>
+<tr>
+<td><code>scripts/mcp-smoke.mjs</code></td>
+<td>Standalone MCP server smoke test (version, tool count, add/search round-trip).</td>
+</tr>
+</tbody></table>
+<h2>Web settings page</h2>
+<p>The plugin ships a Web client bundle that registers a "Memory (dsh-memory)" card on the plugin configuration page (Settings → Plugins → Plugin config) automatically — no extra step is required beyond the deploy sync. The card edits <strong>every</strong> config field (grouped into General / Auto-summarization &amp; consolidation / Scopes / Security &amp; embeddings) through the plugin's own same-origin endpoint (<code>/_dsh/memory/settings</code>, registered by the host half). The card copy is localized (English/Chinese) and follows DSH's language setting; <code>embeddingApiKey</code> is shown masked, and <code>memoryDir</code> changes require a DSH restart.</p>
+<p>Since DSH <strong>0.1.0-rc.7</strong>, <code>settings.plugin.item</code> is a keyed slot and the plugin configuration tab dispatches cards by <strong>settings namespace</strong>: the card registers with <code>key: 'memory'</code> (the plugin's own settings namespace). rc.7 also removed the hard-coded <code>WEB_SETTINGS_NAMESPACES</code> allowlist from <code>dsh-host-apiproxy</code> — the generic Web settings API serves every registered namespace, so the legacy <code>patch-web-settings.ps1</code> no longer applies.</p>
+<h2>Automatic memory &amp; the auto-memory skill</h2>
+<p>Two complementary layers keep memory current without manual tool calls:</p>
+<ol>
+<li><strong>Host pipeline (automatic)</strong> — every finished turn of a root agent is
+distilled into a rollout summary (debounced via <code>summarizeDebounceMs</code>),
+and summaries are periodically re-consolidated into the injected global
+summary. The summarization model resolves through
+<code>summarizeProvider/summarizeModel</code>, then the selected agent model, then
+the <code>agent-default-model</code> settings namespace. <code>memory_stats</code> reports
+<code>summarizeSkipCounts</code> / <code>lastSummarizeSkip</code> so skipped distillations are
+observable. Since 0.2.3 the distillation reads both <code>user/message</code> and
+<code>assistant/message</code> text (assistant replies were previously dropped),
+user settings apply at boot (not only after the first live edit), and
+the internal distill/consolidate LLM calls run with reasoning off so
+they cannot hit the output-token cap. End-to-end verified 2026-08-16:
+turn → rollout file → consolidation bumped the global summary v1 → v2.</li>
+<li><strong>auto-memory skill (agent-driven)</strong> — the plugin registers a runtime
+skill that instructs agents to proactively recognize key facts
+(preferences, decisions, conventions, fixes, facts), write them with
+<code>memory_add</code> (tags + dedup), query memory with <code>memory_search</code> /
+<code>memory_read</code> when a task depends on history, and correct stale entries.
+The skill appears in every session's skill catalog after restart.</li>
+</ol>
+<h2>Scope</h2>
+<p>Memory is stored in three scopes:</p>
+<ul>
+<li><code>global</code> — shared by all sessions (the Codex-style default);</li>
+<li><code>workspace</code> — per working directory (<code>ws-&lt;hash&gt;</code>), active when <code>scopedMemory: true</code>;</li>
+<li><code>project</code> — per nearest git root (<code>project-&lt;hash&gt;</code>), active when <code>scopedMemory: true</code>.</li>
+</ul>
+<p>Tools accept a <code>scope</code> argument (<code>global</code> | <code>workspace</code> | <code>project</code>); the project scope resolves the session's <code>cwd</code>. Write access can be restricted per scope via <code>readOnlyScopes</code>.</p>
+<h2>Development &amp; testing</h2>
+<p><code>npm test</code> runs 59 tests (node:test):</p>
+<ul>
+<li><code>test/store.test.js</code> — store semantics, journal, history, archiving, scopes;</li>
+<li><code>test/automation.test.js</code> — the auto-memory skill definition, the model-route fallback chain, and <code>extractMessageText</code> (user/assistant event shapes);</li>
+<li><code>test/browser.test.js</code> — the interactive HTML browser snapshot rendering;</li>
+<li><code>test/web-settings.test.js</code> — the settings endpoint lifecycle (GET/POST, 403/409, body limits) plus a VM-sandbox load of the client bundle asserting the <code>settings.plugin.item</code> card registration;</li>
+<li><code>test/embedding.integration.test.js</code> — fake <code>/embeddings</code> server + local hashed vectors;</li>
+<li><code>test/mcp.integration.test.js</code> — real MCP child-process round-trips.</li>
+</ul>
+<p>The architecture and mechanism notes live in <a href="https://github.com/haitang1/dsh-memory/blob/HEAD/docs/DESIGN.md"><code>docs/DESIGN.md</code></a>; deployment status in <a href="https://github.com/haitang1/dsh-memory/blob/HEAD/docs/STATUS.md"><code>docs/STATUS.md</code></a>.</p>
+<h2>License</h2>
+<p>MIT</p>

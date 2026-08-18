@@ -1,0 +1,79 @@
+<h1>dsh-plugin-installer</h1>
+<p>DSH 插件自动安装重启助手：让 agent 通过一个模型工具完成「备份 → 安装 → 重启 → 自动继续对话」，安装或启动失败时自动回滚并报告问题。</p>
+<h2>功能</h2>
+<ul>
+<li><strong>模型工具 <code>install_plugin</code></strong>：安装持久化插件（bundle）到指定 profile。<ol>
+<li><strong>备份</strong>：安装前自动把 profile 的 <code>package.json</code>、<code>cordis.patch.yml</code>、<code>cordis.yml</code>、<code>settings.yaml</code> 备份到 <code>$DSH_HOME/backups/plugin-install-&lt;时间戳&gt;/</code>（含 manifest 清单）。</li>
+<li><strong>安装</strong>：调用官方 <code>dsh plugin --profile &lt;名&gt; add &lt;包&gt;</code>（pnpm add + bundles reconcile 同一路径）。</li>
+<li><strong>成功</strong> → 记录当前运行中的会话 → 自动重启 dsh → 重启完成后自动向会话注入「继续」提示词，对话无缝接续。</li>
+<li><strong>安装命令失败</strong> → 自动回滚备份 → 记录问题详情 → 重启 dsh → 把问题写入会话，让 agent 分析并解决。</li>
+<li><strong>重启后 dsh 起不来</strong>（新插件破坏启动）→ 独立的 detached helper 探测端口，起不来则自动回滚备份并再次重启，随后把回滚结果写入会话。</li>
+</ol>
+</li>
+</ul>
+<h2>安装</h2>
+<pre><code>dsh plugin --profile web add file:E:/GitHub/dsh-portal/dsh-plugin-installer
+</code></pre>
+<p>装完重启一次 dsh（bundle 补丁层在启动时加载）。</p>
+<h2>工具用法（agent / LLM）</h2>
+<pre><code>{
+  "package": "dsh-xxx",            // npm 包名 / file: 路径 / git URL
+  "profile": "web",                // 可选，默认 web
+  "version": "0.1.0",              // 可选版本号
+  "restart": true,                 // 可选，安装后是否重启，默认 true
+  "delayMs": 2000                  // 可选，重启前等待（结果回传时间），默认 2000
+}
+</code></pre>
+<h2>更新已安装的插件（含自更新）</h2>
+<p><code>install_plugin</code> 对<strong>任何已安装的包</strong>（不限于本插件自己）都会自动「先卸后装」强制刷新——包括正在开发的本地 file: 插件、版本号未变的情况。日常更新开发中插件：</p>
+<pre><code>{
+  "package": "file:E:/GitHub/dsh-plugins/xxx",   // 正在开发的插件，版本号没变也没关系
+  "profile": "web",
+  "restart": true
+}
+</code></pre>
+<p>更新本插件自己（self-upgrade）同理：</p>
+<pre><code>{
+  "package": "file:E:/GitHub/dsh-portal/dsh-plugin-installer",
+  "profile": "web",
+  "restart": true
+}
+</code></pre>
+<p>执行流程与普通安装一致，多一步「先卸后装」：</p>
+<ol>
+<li><strong>检测已安装</strong>：<code>packageNameOf()</code> 解析出包名（file: 读源目录的 package.json，npm 名直接解析），若发现已在 profile 依赖中，会先执行 <code>dsh plugin remove &lt;名&gt;</code> 再 <code>add</code>——保证从最新源码/包重新安装。pnpm 对 file: 依赖在版本号不变时会复用陈旧副本，直接 <code>add</code> 不会刷新，所以必须先 remove。</li>
+<li><strong>照常保护</strong>：备份 → 安装 → 重启 → 自动继续对话，失败同样自动回滚并报告。</li>
+</ol>
+<p>注意事项：</p>
+<ul>
+<li>file: 路径用<strong>正斜杠</strong>（<code>file:E:/...</code>），反斜杠会被 shell 当转义吃掉导致找不到包；file: 源自带版本号，<code>version</code> 参数只对 npm 包名生效。</li>
+<li>本地源码更新的完整流程：改 <code>src/</code> → <code>npm run build</code> → 调用上方工具 → 重启后新逻辑生效。</li>
+<li>更新操作同样受单次提权审批（非 danger-full-access 会话会请求主人批准）与 <code>allowProfiles</code> 白名单约束。</li>
+</ul>
+<h2>权限控制</h2>
+<ul>
+<li><strong>LLM 如何知道调用</strong>：插件会注入一段系统提示词（systemPrompt section），明确告诉模型「安装/升级/移除持久化插件必须调用 install_plugin 工具，不要直接跑 pnpm/dsh 命令」；工具的 description 也写明触发时机。</li>
+<li><strong>单次提权审批（默认开启）</strong>：<code>requireApproval: true</code> 时，若调用会话不是 <strong>danger-full-access</strong> 沙箱模式，工具不会硬拒，而是通过 approval seam（<code>ctx.approval.request</code>）向主人发起<strong>单次提权审批</strong>——主人批准（<code>allowed-once</code>）后本次调用放行，拒绝 / 取消 / 审批通道不可用则 fail closed（拒绝）。这与沙箱 bash 工具的 <code>sandbox_permissions</code> 升权是同一套机制。</li>
+<li><strong>配置</strong>（在 profile 的 <code>cordis.patch.yml</code> 本插件行上）：<ul>
+<li><code>requireApproval: false</code> — 关闭审批（任何模式都可直接调用）</li>
+<li><code>allowAuto: true</code> — 完全放行 LLM 自动调用（跳过审批）</li>
+<li><code>allowProfiles: ['web']</code> — 只允许安装到这些 profile；空数组 = 不限</li>
+</ul>
+</li>
+<li>即使放行，execute 内仍有 <code>allowProfiles</code> 白名单二次校验。</li>
+</ul>
+<h2>机制说明</h2>
+<ul>
+<li>重启采用 Node 原生方式：spawn 一个 detached helper，等待旧进程退出并释放端口后，以相同 argv/cwd 重新拉起 dsh（输出追加到 <code>%TEMP%/dsh-install-*.log</code>）。</li>
+<li>重启 helper 会轮询 web 端口（<code>DSH_WEB_URL</code> 或默认 3080）：若 120 秒内起不来，判定为新插件导致启动失败，自动回滚备份文件并再拉起一次。</li>
+<li>自动继续对话：重启前把运行中的会话 id 写入 <code>$DSH_HOME/dsh-install-resume.json</code>；重启后插件轮询 agent 注册表，对恢复的会话注入 <code>followup</code>（安装成功 → 继续提示；回滚 → 问题详情 + 解决指引）。</li>
+<li>所有操作写入 <code>$DSH_HOME/dsh-install.log</code> 便于排查。</li>
+</ul>
+<h2>注意</h2>
+<ul>
+<li>备份目录会累积在 <code>$DSH_HOME/backups/</code> 下，可定期清理。</li>
+<li>插件配置类文件（<code>settings.yaml</code> 等）在回滚时也会被恢复，因此安装失败不会留下半修改的配置。</li>
+<li>本插件自身是 host 半区插件，不需要浏览器 UI。</li>
+</ul>
+<h2>许可证</h2>
+<p>MIT</p>

@@ -1,0 +1,234 @@
+<h1>@zhourenke/dsh-agent-rate-limit</h1>
+<p>English | <a href="https://github.com/zhourenke/dsh-agent-rate-limit/blob/HEAD/README.zh.md">中文</a></p>
+<p><strong>Agent loop rate limiter</strong> — prevents TPM (Tokens Per Minute) and RPM (Requests Per Minute) limit violations by intercepting the LLM streaming pipeline and adding adaptive delays between requests.</p>
+<p>When model providers enforce rate limits (e.g., Alibaba Cloud Bailian's 15,000 RPM + 1,200,000 TPM for deepseek-v4-flash), the agent loop can trigger these limits every few steps, causing errors and interruptions. This plugin solves that by:</p>
+<ul>
+<li>Tracking token usage in a <strong>sliding 60-second window</strong></li>
+<li><strong>Estimating input tokens</strong> from messages before each request</li>
+<li><strong>Counting output tokens</strong> from stream chunks as they arrive</li>
+<li><strong>Adding adaptive delays</strong> when approaching TPM or RPM limits</li>
+<li><strong>Exponential backoff</strong> on rate-limit errors (auto-retry with <code>{ kind: 'retry' }</code>)</li>
+</ul>
+<h2>How it works</h2>
+<pre><code>User input → [agent/request] → [llm/stream*] → LLM API → [agent/request] → ...
+                                    ↑
+                          Rate limiter intercepts here
+
+  ┌─ Sliding window (60s FIFO) ──────────────────────┐
+  │  t0:  +5000 tokens (input)                       │
+  │  t5: +12000 tokens (input)                       │
+  │  t12: +8000 tokens (input)                       │
+  │  ...                                             │
+  │  Current window: 980,000 / 1,200,000 TPM         │
+  │  Remaining: 220,000 tokens → pass through        │
+  │  If approaching limit → delay before next request │
+  └───────────────────────────────────────────────────┘
+</code></pre>
+<p>The plugin intercepts two Waterfall events:</p>
+<table>
+<thead>
+<tr>
+<th>Event</th>
+<th>Purpose</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>llm/stream</code></td>
+<td>Check rate limits → delay if needed → stream tokens → count output tokens → update window</td>
+</tr>
+<tr>
+<td><code>agent/request-error</code></td>
+<td>Detect rate-limit errors (429) → return <code>{ kind: 'retry' }</code> with exponential backoff</td>
+</tr>
+</tbody></table>
+<h2>Installation</h2>
+<p>This plugin is a <strong>DSH profile bundle</strong>. The only supported installation method is to place the package folder directly into a DSH profile's <code>node_modules</code> and list it in that profile's <code>dsh.profile.bundles</code> array. No <code>npm link</code>, no pnpm, and no registry access is required.</p>
+<h3>Find your DSH profile</h3>
+<p>First, determine which profile you are using:</p>
+<pre><code># List available profiles
+Get-ChildItem "$env:USERPROFILE\.dsh\profiles" -Name
+</code></pre>
+<p>Common profiles: <code>web</code>, <code>tui</code>, <code>headless</code>. The profile directory is <code>$env:USERPROFILE\.dsh\profiles\&lt;name&gt;\</code>.</p>
+<h3>Step 1 — Copy the package folder into the profile</h3>
+<pre><code># Create the scoped directory if it does not exist
+$target = "$env:USERPROFILE\.dsh\profiles\&lt;name&gt;\node_modules\@zhourenke"
+New-Item -ItemType Directory -Force $target
+
+# Copy the whole plugin folder (package.json, cordis.patch.yml, lib/, ...)
+Copy-Item -Recurse C:\path\to\dsh-agent-rate-limit "$target\"
+</code></pre>
+<p>The copied tree must contain <code>package.json</code> (with <code>dsh.bundle.patch</code>), <code>cordis.patch.yml</code>, and <code>lib/</code>.</p>
+<h3>Step 2 — Register the bundle</h3>
+<p>Edit <code>$env:USERPROFILE\.dsh\profiles\&lt;name&gt;\package.json</code>:</p>
+<pre><code>  "dsh": {
+    "profile": {
+      "bundles": [
+        "@deepseek-ai/dsh-base",
+        "@deepseek-ai/dsh-web-app",
++       "@zhourenke/dsh-agent-rate-limit"
+      ]
+    }
+  }
+</code></pre>
+<p>No <code>dependencies</code> entry is needed — DSH resolves bundles purely by package name from the profile's <code>node_modules</code> at startup (a <code>dependencies</code> entry only matters to <code>pnpm install</code>, which is not used for this plugin).</p>
+<h3>Step 3 — Restart DSH</h3>
+<p>The plugin is loaded on the next DSH startup. When you update the plugin source, re-copy the folder (or use a junction if you prefer live updates) and restart DSH.</p>
+<h3>Verify the installation</h3>
+<p>After restarting DSH, check the startup logs for <code>[agent-rate-limit]</code> entries confirming that the rate limiter is active:</p>
+<pre><code>dsh web 2&gt;&amp;1 | Select-String "agent-rate-limit"
+</code></pre>
+<p>Expected output:</p>
+<pre><code>[agent-rate-limit] Plugin loaded. TPM: 1200000, RPM: 15000, factor: 0.8, window: 60000ms, retryOn429: true
+</code></pre>
+<h2>Configuration</h2>
+<table>
+<thead>
+<tr>
+<th>Key</th>
+<th>Default</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>windowMs</code></td>
+<td><code>60000</code></td>
+<td>Sliding window size in milliseconds (60s).</td>
+</tr>
+<tr>
+<td><code>tpmLimit</code></td>
+<td><code>1200000</code></td>
+<td>TPM (Tokens Per Minute) limit. Default matches Alibaba Cloud Bailian deepseek-v4-flash.</td>
+</tr>
+<tr>
+<td><code>rpmLimit</code></td>
+<td><code>15000</code></td>
+<td>RPM (Requests Per Minute) limit.</td>
+</tr>
+<tr>
+<td><code>safetyFactor</code></td>
+<td><code>0.8</code></td>
+<td>Safety factor (0.8 = use 80% of the limit, leaving 20% buffer).</td>
+</tr>
+<tr>
+<td><code>maxBackoffMs</code></td>
+<td><code>30000</code></td>
+<td>Maximum backoff delay in milliseconds (30s).</td>
+</tr>
+<tr>
+<td><code>retryOn429</code></td>
+<td><code>true</code></td>
+<td>When <code>true</code> (default), HTTP 429 responses are silently retried with adaptive backoff — the conversation continues smoothly. Set to <code>false</code> to surface 429 errors to the user.</td>
+</tr>
+</tbody></table>
+<h3>Example: Adjusting for different providers</h3>
+<pre><code># In your profile's cordis config or agent preset:
+- id: agent-rate-limit
+  name: '@zhourenke/dsh-agent-rate-limit'
+  config:
+    tpmLimit: 2000000     # 2M TPM for a different provider
+    rpmLimit: 5000        # 5K RPM
+    safetyFactor: 0.75    # 75% utilization, 25% buffer
+    retryOn429: true      # silently retry on 429 (recommended)
+</code></pre>
+<h2>How the rate limiting works</h2>
+<h3>Token estimation</h3>
+<p>The plugin uses a heuristic to estimate tokens from text:</p>
+<ul>
+<li><strong>CJK characters</strong> (Chinese, Japanese, Korean): ~1.5 chars per token</li>
+<li><strong>Other characters</strong> (Latin, numbers, etc.): ~3.5 chars per token</li>
+</ul>
+<p>This is intentionally conservative — it's better to delay slightly more than to hit the rate limit.</p>
+<h3>Error recovery</h3>
+<p>When a rate-limit error is detected (HTTP 429, the typical response from providers like Alibaba Cloud Bailian when TPM or RPM limits are hit), the plugin:</p>
+<ol>
+<li>Records the error timestamp for adaptive backoff calculation</li>
+<li>Returns <code>{ kind: 'retry' }</code> to tell the agent loop to retry <strong>transparently</strong> — the user never sees the error</li>
+<li>Applies <strong>time-based adaptive backoff</strong>: the delay is proportional to how recently the last error occurred (4s immediately after an error, decaying to 0 over 60s)</li>
+<li>If the error persists, the backoff keeps the retry rate low, avoiding further API hammering</li>
+<li>When a request finally succeeds, the backoff resets</li>
+</ol>
+<p>Set <code>retryOn429: false</code> in the config if you prefer 429 errors to surface to the user instead of being silently retried.</p>
+<h3>Sliding window algorithm</h3>
+<p>The sliding window maintains a FIFO queue of <code>{ timestamp, tokens }</code> entries. Before each request:</p>
+<ol>
+<li>Prune entries older than <code>windowMs</code> (60s)</li>
+<li>Sum remaining tokens = current TPM</li>
+<li>Count entries = current RPM</li>
+<li>If RPM ≥ limit → delay until oldest entry expires</li>
+<li>If TPM ≥ limit → delay until oldest entry expires</li>
+<li>If TPM + estimated input tokens ≥ limit → delay until enough tokens expire</li>
+<li>Apply backoff delay if there were consecutive errors</li>
+</ol>
+<h2>Rate limit detection</h2>
+<p>The plugin detects HTTP 429 responses by checking the following in the error:</p>
+<table>
+<thead>
+<tr>
+<th>Signal</th>
+<th>Example</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>HTTP status code</td>
+<td><code>statusCode: 429</code></td>
+</tr>
+<tr>
+<td>Error code</td>
+<td><code>429</code>, <code>RATE_LIMITED</code>, <code>QUOTA</code></td>
+</tr>
+<tr>
+<td>"rate limit" text</td>
+<td><code>rate limit exceeded</code>, <code>rate_limit</code></td>
+</tr>
+<tr>
+<td>"too many requests"</td>
+<td><code>too many requests, please try again later</code></td>
+</tr>
+<tr>
+<td>TPM/RPM tokens</td>
+<td><code>TPM limit reached</code>, <code>token limit exceeded</code></td>
+</tr>
+<tr>
+<td>"throttle"</td>
+<td><code>request throttled</code>, <code>throttling</code></td>
+</tr>
+<tr>
+<td>"quota"</td>
+<td><code>Allocated quota exceeded</code> (Bailian)</td>
+</tr>
+<tr>
+<td>"429" in message</td>
+<td><code>429: {...}</code></td>
+</tr>
+</tbody></table>
+<p>When any of these match, the plugin retries transparently with adaptive backoff by default (<code>retryOn429: true</code>).</p>
+<h2>Architecture</h2>
+<pre><code>┌─────────────────────────────────────────────────────────────────┐
+│                    dsh-agent-rate-limit                          │
+│                                                                  │
+│  ┌───────────────────────────────────────────────────────────┐  │
+│  │  SlidingWindow (module-level state)                        │  │
+│  │  ┌─────────────────────┐  ┌───────────────────────────┐   │  │
+│  │  │  windowEntries[]    │  │  consecutiveErrors        │   │  │
+│  │  │  {timestamp,tokens} │  │  (exponential backoff)    │   │  │
+│  │  └─────────────────────┘  └───────────────────────────┘   │  │
+│  └───────────────────────────────────────────────────────────┘  │
+│                                                                  │
+│  ctx.on('llm/stream', ...)          ctx.on('agent/request-error')│
+│  ┌─────────────────────────┐        ┌─────────────────────────┐  │
+│  │ 1. Check sliding window │        │ 1. Detect rate-limit    │  │
+│  │ 2. Delay if needed      │        │ 2. Return {kind:'retry'}│  │
+│  │ 3. Count output tokens  │        │ 3. Record error         │  │
+│  │ 4. Update window        │        └─────────────────────────┘  │
+│  └─────────────────────────┘                                     │
+└─────────────────────────────────────────────────────────────────┘
+</code></pre>
+<h2>Dependencies</h2>
+<ul>
+<li><code>@deepseek-ai/schemastery</code> — configuration schema validation</li>
+<li><code>@deepseek-ai/cordis</code> — plugin framework</li>
+<li><code>@deepseek-ai/dsh-invariants</code> — DSH invariants</li>
+<li><code>@deepseek-ai/dsh-llm</code> — LLM error types</li>
+</ul>
+<h2>License</h2>
+<p>MIT</p>

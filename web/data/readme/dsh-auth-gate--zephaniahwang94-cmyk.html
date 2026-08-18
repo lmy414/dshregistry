@@ -1,0 +1,659 @@
+<h1>dsh-auth-gate</h1>
+<p>English | <a href="#%E4%B8%AD%E6%96%87">中文</a></p>
+<p>Authentication and security hardening plugin for <a href="https://github.com/deepseek-ai/deepseek-harness">DeepSeek Harness</a>.</p>
+<h2>Security Risks in Public Network / Docker Deployment</h2>
+<p>DeepSeek Harness is designed as a <strong>local development tool</strong>. Its default security model relies on loopback binding (<code>127.0.0.1</code>) and request header validation (Host / Origin / Sec-Fetch-Site). This model breaks down in several common deployment scenarios:</p>
+<h3>Scenario 1: Docker container deployment</h3>
+<pre><code># Common Dockerfile pattern
+EXPOSE 3080
+CMD ["npx", "@deepseek-ai/dsh", "web"]
+</code></pre>
+<p><strong>Important correction</strong>: <code>EXPOSE</code> alone exposes nothing, and Docker port publishing cannot normally reach a process bound only to the container's loopback interface. The risk appears only when DSH is configured/patched to bind <code>0.0.0.0</code>, or when another process inside the container proxies a container-facing port to DSH. Publishing that port without host-IP restriction (for example <code>-p 3080:3080</code>) then exposes the full Agent control plane to reachable networks.</p>
+<p><strong>Root cause</strong>: No authentication layer. The trust fence only validates request headers, not caller identity.</p>
+<h3>Scenario 2: Reverse proxy (Nginx / Caddy)</h3>
+<pre><code>server {
+    listen 80;
+    server_name dsh.example.com;
+    location / {
+        proxy_pass http://127.0.0.1:3080;
+        proxy_set_header Host $host;
+        proxy_set_header Origin $http_origin;
+    }
+}
+</code></pre>
+<p><strong>Risk</strong>: The reverse proxy forwards <code>Host</code> and <code>Origin</code> headers from the client. The trust fence sees matching headers and allows the request. Anyone who can reach the reverse proxy has full access.</p>
+<p><strong>Root cause</strong>: Trust fence validates headers, not network origin. A proxy that passes through Host/Origin defeats the fence.</p>
+<h3>Scenario 3: Cloud VM / CI runner</h3>
+<pre><code># Running on a cloud VM with public IP
+dsh --profile headless "deploy the app"
+</code></pre>
+<p><strong>Risk</strong>: If the VM's firewall is misconfigured or the service binds to <code>0.0.0.0</code> (future feature), the agent is remotely accessible. A compromised agent can execute arbitrary code on the VM.</p>
+<p><strong>Root cause</strong>: No authentication, no network-level access control beyond binding.</p>
+<h3>Scenario 4: Team shared instance</h3>
+<pre><code># Running on an office server for the team
+DSH_AUTH_TOKEN="" dsh web --host 0.0.0.0  # future: when 0.0.0.0 is supported
+</code></pre>
+<p><strong>Risk</strong>: All team members share the same Agent instance. One user's malicious prompt can affect another user's session. No audit trail of who did what.</p>
+<p><strong>Root cause</strong>: No user identity, no session isolation, no audit logging.</p>
+<h3>What the trust fence actually protects</h3>
+<table>
+<thead>
+<tr>
+<th>Check</th>
+<th>What it does</th>
+<th>What it does NOT do</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>Host header</td>
+<td>Blocks DNS rebinding attacks</td>
+<td>Does not verify the caller is local</td>
+</tr>
+<tr>
+<td>Sec-Fetch-Site</td>
+<td>Blocks cross-site requests from browsers</td>
+<td>Does not block curl, scripts, or non-browser clients</td>
+</tr>
+<tr>
+<td>Origin header</td>
+<td>Blocks cross-origin browser requests</td>
+<td>Does not block requests without Origin header</td>
+</tr>
+</tbody></table>
+<p>The trust fence is a <strong>browser CSRF defense</strong>, not an authentication layer. It stops malicious websites from making requests to your local DSH instance. It does not stop anyone who can directly HTTP-connect to the port.</p>
+<h3>This plugin's mitigations</h3>
+<table>
+<thead>
+<tr>
+<th>Risk</th>
+<th>Mitigation</th>
+<th>Coverage</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>Unauthorized API access</td>
+<td>Bearer token + session login</td>
+<td>HTTP + WebSocket routes</td>
+</tr>
+<tr>
+<td>Excess approval prompts</td>
+<td>Prepended per-session waterfall limiter</td>
+<td>Approvals that reach this listener</td>
+</tr>
+<tr>
+<td>Exposed 0.0.0.0</td>
+<td>Fail-closed authentication gateway</td>
+<td>HTTP + WebSocket</td>
+</tr>
+<tr>
+<td>Windows partial sandbox</td>
+<td>Documented, not fixable at plugin level</td>
+<td>—</td>
+</tr>
+</tbody></table>
+<h3>What this plugin does NOT fix</h3>
+<ol>
+<li><p><strong>ACP / SDK channels</strong>: These run over stdio (stdin/stdout), not HTTP. Not reachable over the network, but also not protected if the process is shared.</p>
+</li>
+<li><p><strong>No user isolation</strong>: All authenticated users share the same Agent instance and session pool. There is no per-user sandboxing.</p>
+</li>
+<li><p><strong>No audit logging</strong>: This plugin does not log who authenticated or what they did. The DSH session log records agent actions but not the human identity behind them.</p>
+</li>
+<li><p><strong>Approval listener ordering</strong>: The limiter is prepended, but Cordis permits a later plugin to prepend another short-circuiting answerer ahead of it. Treat the limiter as defense in depth, not an unbypassable policy boundary.</p>
+</li>
+<li><p><strong>Reverse-proxy login buckets</strong>: Login attempts are keyed by the TCP peer address. Behind a reverse proxy, users share the proxy's bucket; configure edge rate limiting as well. The plugin intentionally does not trust spoofable forwarding headers.</p>
+</li>
+</ol>
+<p>The plugin wraps both existing and future DSH HTTP/upgrade routes. Because current DSH exposes registries rather than middleware, startup fails closed if that internal contract changes.</p>
+<h2>Install and choose protection</h2>
+<p>Install once and select a preset. Credentials stay in environment variables and are never written to a patch file.</p>
+<pre><code>$env:DSH_AUTH_USERNAME = 'admin'
+$env:DSH_AUTH_PASSWORD = Read-Host 'Enter a private password (12+ characters)'
+# Required when the public URL uses HTTPS:
+$env:DSH_AUTH_SECURE_COOKIE = 'true'
+
+.\install.ps1 -Protection Full
+.\install.ps1 -Protection NetworkAuth
+.\install.ps1 -Protection ApprovalLimit
+</code></pre>
+<p>If <code>dsh</code> is not on <code>PATH</code>, the script automatically uses a sibling <code>deepseek-harness</code> source checkout. For another location, pass <code>-HarnessPath C:\path\to\deepseek-harness</code>.</p>
+<p><code>Full</code> is the default. Add <code>-Start</code> to launch immediately. Otherwise the script prints the exact reusable launch command. Keep using its <code>--patch</code> argument on later launches:</p>
+<pre><code>dsh --profile web --patch C:\path\to\dsh-auth-gate\presets\full.yml
+</code></pre>
+<table>
+<thead>
+<tr>
+<th>Preset</th>
+<th align="right">HTTP + WebSocket auth</th>
+<th align="right">Approval limiter</th>
+<th>Important consequence</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>Full</code></td>
+<td align="right">Yes</td>
+<td align="right">Yes</td>
+<td>Recommended</td>
+</tr>
+<tr>
+<td><code>NetworkAuth</code></td>
+<td align="right">Yes</td>
+<td align="right">No</td>
+<td>Approval prompts are not rate-limited</td>
+</tr>
+<tr>
+<td><code>ApprovalLimit</code></td>
+<td align="right">No</td>
+<td align="right">Yes</td>
+<td>Network control surfaces remain unauthenticated</td>
+</tr>
+</tbody></table>
+<p>HTTP and WebSocket authentication cannot be split. This prevents an authenticated UI with an exposed RPC upgrade channel. Existing top-level configuration remains compatible and means full protection when <code>protections</code> is absent.</p>
+<h2>Initial password and collaborators</h2>
+<h3>Terminal users</h3>
+<p>Set credentials in the same process environment that starts Harness. Do not put a real password in YAML or command-line arguments.</p>
+<pre><code>cd C:\path\to\deepseek-harness
+$env:DSH_AUTH_USERNAME = 'admin'
+$env:DSH_AUTH_PASSWORD = Read-Host 'Enter a private password (12+ characters)'
+$env:DSH_AUTH_SECURE_COOKIE = 'false' # local HTTP only; use true with HTTPS
+pnpm dsh web
+</code></pre>
+<p>Environment changes do not affect an already-running process. Restart Harness after changing a password. Because session signing keys are generated per startup, every restart signs all browser sessions out.</p>
+<h3>WebUI-only users on Windows</h3>
+<p>The first password cannot safely be created inside the protected WebUI: authentication must exist before the page can open. Use <strong>Start → Edit environment variables for your account</strong>, create <code>DSH_AUTH_USERNAME</code>, <code>DSH_AUTH_PASSWORD</code>, and <code>DSH_AUTH_SECURE_COOKIE</code>, then fully quit and reopen the Harness WebUI launcher. User environment variables are stored by Windows and may be readable by other processes running as the same OS user; use this only for a trusted local account.</p>
+<h3>Collaborator accounts</h3>
+<p>Version 1.1 supports <strong>one shared login identity only</strong>. It cannot create a second independently named collaborator account or attribute actions to different people. Sharing the primary password gives access but is not an independent account and is not recommended for untrusted teams.</p>
+<p>For a temporary trusted collaborator, rotate the shared password, restart Harness, share it through a secure channel, then rotate and restart again when access should end. For durable collaborators, use separate Harness instances/OS identities or an authenticating reverse proxy with one identity per person. Do not claim per-user isolation: authenticated users still share the same Agent, sessions, workspace authority, and audit identity.</p>
+<h2>Configuration</h2>
+<h3>Bearer Token mode</h3>
+<p>For scripts and non-browser clients. HTTP and WebSocket requests must include <code>Authorization: Bearer &lt;token&gt;</code>, and the token must be at least 32 bytes. Browser WebSocket APIs cannot set this header, so use <code>session</code> or <code>both</code> for the Web UI.</p>
+<p><strong>Option A: Environment variable</strong></p>
+<pre><code>$env:DSH_AUTH_TOKEN = [Convert]::ToHexString(
+  [Security.Cryptography.RandomNumberGenerator]::GetBytes(32)
+).ToLowerInvariant()
+dsh web
+</code></pre>
+<p><strong>Option B: Config (not recommended because config diagnostics may expose it)</strong></p>
+<pre><code>config:
+  mode: bearer
+  # Deliberately empty: generate a private token; never copy a documented value.
+  token: ''
+</code></pre>
+<p><strong>Usage:</strong></p>
+<pre><code># Denied
+curl http://127.0.0.1:3080/api
+# → 401 Unauthorized
+
+# Allowed
+curl -H "Authorization: Bearer $env:DSH_AUTH_TOKEN" http://127.0.0.1:3080/api
+# → 200 OK
+</code></pre>
+<h3>Session mode</h3>
+<p>Login page with username/password, session cookie.</p>
+<pre><code>config:
+  mode: session
+  # Omit credentials here; set DSH_AUTH_USERNAME and DSH_AUTH_PASSWORD.
+  sessionTtl: 3600
+  loginPath: /auth/login
+</code></pre>
+<p>Visit <code>http://127.0.0.1:3080/auth/login</code> to sign in. The cookie is <code>HttpOnly; SameSite=Strict</code>. Set <code>secureCookie: true</code> for HTTPS/public deployments; leave it false only for direct local HTTP.</p>
+<h3>Both modes</h3>
+<pre><code>config:
+  mode: both
+  # Omit credentials here; set DSH_AUTH_TOKEN, DSH_AUTH_USERNAME,
+  # and DSH_AUTH_PASSWORD in the process environment.
+</code></pre>
+<p>Bearer token for API/script access, login page for browser access.</p>
+<h3>Sandbox escalation rate limiting</h3>
+<pre><code>config:
+  approvalRateLimit:
+    maxPerMinute: 3
+    maxPerSession: 10
+</code></pre>
+<p>Excess requests are denied with <code>'unavailable'</code> (fail-closed).</p>
+<h2>Config reference</h2>
+<table>
+<thead>
+<tr>
+<th>Field</th>
+<th>Type</th>
+<th>Default</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>mode</code></td>
+<td><code>'bearer' | 'session' | 'both'</code></td>
+<td><code>'bearer'</code></td>
+<td>Authentication mode</td>
+</tr>
+<tr>
+<td><code>protections.networkAuth</code></td>
+<td><code>boolean</code></td>
+<td><code>true</code></td>
+<td>Enable inseparable HTTP + WebSocket authentication</td>
+</tr>
+<tr>
+<td><code>protections.approvalRateLimit</code></td>
+<td><code>boolean</code></td>
+<td><code>true</code></td>
+<td>Enable approval waterfall rate limiting</td>
+</tr>
+<tr>
+<td><code>auth</code></td>
+<td><code>object</code></td>
+<td>—</td>
+<td>Optional nested form for all authentication fields below</td>
+</tr>
+<tr>
+<td><code>token</code></td>
+<td><code>string</code></td>
+<td>env <code>DSH_AUTH_TOKEN</code></td>
+<td>Bearer token</td>
+</tr>
+<tr>
+<td><code>sessionSecret</code></td>
+<td>unsupported</td>
+<td>random per startup</td>
+<td>Persistent secrets are rejected so logged-out cookies cannot revive after restart</td>
+</tr>
+<tr>
+<td><code>sessionTtl</code></td>
+<td><code>number</code></td>
+<td><code>3600</code></td>
+<td>Session lifetime in seconds</td>
+</tr>
+<tr>
+<td><code>loginPath</code></td>
+<td><code>string</code></td>
+<td><code>'/auth/login'</code></td>
+<td>Login page URL path</td>
+</tr>
+<tr>
+<td><code>username</code></td>
+<td><code>string</code></td>
+<td>—</td>
+<td>Session login username</td>
+</tr>
+<tr>
+<td><code>password</code></td>
+<td><code>string</code></td>
+<td>—</td>
+<td>Session login password</td>
+</tr>
+<tr>
+<td><code>secureCookie</code></td>
+<td><code>boolean</code></td>
+<td><code>false</code></td>
+<td>Add <code>Secure</code> to the cookie; enable with HTTPS</td>
+</tr>
+<tr>
+<td><code>approvalRateLimit.maxPerMinute</code></td>
+<td><code>number</code></td>
+<td><code>3</code></td>
+<td>Max escalation requests per minute</td>
+</tr>
+<tr>
+<td><code>approvalRateLimit.maxPerSession</code></td>
+<td><code>number</code></td>
+<td><code>10</code></td>
+<td>Max escalation requests per session</td>
+</tr>
+</tbody></table>
+<p>Bearer tokens must be at least 32 bytes. Login attempts are limited to five per source address per minute. Every startup generates a new session secret and invalidates old browser sessions; persistent secrets are rejected because logout revocations are intentionally process-local.</p>
+<h2>Architecture</h2>
+<pre><code>HTTP / WebSocket Request
+  ↓
+AuthGateway (exact, prefix, fallback, and upgrade routes)
+  ├─ /auth/login → login page handler
+  ├─ /auth/logout → logout handler
+  └─ /* → auth check
+       ├─ Authorization: Bearer &lt;token&gt; → validateBearer()
+       ├─ Cookie: dsh_session=&lt;token&gt; → validateSession()
+       └─ No valid auth → 401 / redirect to login
+
+Approval Request (approval/request waterfall)
+  ↓
+RateLimiter
+  ├─ Resolve session from req.agent.session.id
+  ├─ Under limits → delegate to next answerer
+  └─ Over limits → 'unavailable' (denied)
+</code></pre>
+<h2>Development</h2>
+<pre><code>npm install
+npm run typecheck
+npm run build
+npm test
+</code></pre>
+<h2>License</h2>
+<p><a href="https://github.com/zephaniahwang94-cmyk/dsh-auth-gate/blob/HEAD/LICENSE">MIT</a>. Please report security issues according to <a href="https://github.com/zephaniahwang94-cmyk/dsh-auth-gate/blob/HEAD/SECURITY.md">SECURITY.md</a>.</p>
+<hr>
+<hr>
+<h1>中文</h1>
+<p>DeepSeek Harness 的 <a href="https://github.com/deepseek-ai/deepseek-harness">认证与安全加固插件</a>。</p>
+<h2>公网部署 / Docker 部署的安全隐患</h2>
+<p>DeepSeek Harness 的定位是<strong>本地开发工具</strong>。它的默认安全模型依赖 loopback 绑定（<code>127.0.0.1</code>）和请求头校验（Host / Origin / Sec-Fetch-Site）。在以下常见部署场景中，这个模型会失效：</p>
+<h3>场景一：Docker 容器部署</h3>
+<pre><code># 常见的 Dockerfile 写法
+EXPOSE 3080
+CMD ["npx", "@deepseek-ai/dsh", "web"]
+</code></pre>
+<p><strong>重要更正</strong>：<code>EXPOSE</code> 本身不会暴露端口，Docker 端口发布通常也无法访问只绑定在容器 loopback 上的进程。只有当 DSH 被配置/修改为绑定 <code>0.0.0.0</code>，或容器内另有进程把对外端口代理到 DSH 时才出现风险。此时若使用未限制宿主 IP 的 <code>-p 3080:3080</code>，完整的 Agent 控制面会暴露给可达网络。</p>
+<p><strong>根因</strong>：没有认证层。信任围栏只校验请求头，不验证调用者身份。</p>
+<h3>场景二：反向代理（Nginx / Caddy）</h3>
+<pre><code>server {
+    listen 80;
+    server_name dsh.example.com;
+    location / {
+        proxy_pass http://127.0.0.1:3080;
+        proxy_set_header Host $host;
+        proxy_set_header Origin $http_origin;
+    }
+}
+</code></pre>
+<p><strong>隐患</strong>：反向代理会把客户端的 <code>Host</code> 和 <code>Origin</code> 头原样转发。信任围栏看到匹配的 header 就放行。任何能访问反向代理的人，都拥有完整权限。</p>
+<p><strong>根因</strong>：信任围栏校验的是 header，不是网络来源。透传 Host/Origin 的代理会让围栏失效。</p>
+<h3>场景三：云服务器 / CI 运行器</h3>
+<pre><code># 在有公网 IP 的云服务器上运行
+dsh --profile headless "deploy the app"
+</code></pre>
+<p><strong>隐患</strong>：如果服务器防火墙配置不当，或者未来 DSH 支持 <code>0.0.0.0</code> 绑定，Agent 会被远程访问。被攻破的 Agent 可以在服务器上执行任意代码。</p>
+<p><strong>根因</strong>：没有认证，绑定之外没有网络层访问控制。</p>
+<h3>场景四：团队共享实例</h3>
+<pre><code># 在办公室服务器上跑给团队用
+DSH_AUTH_TOKEN="" dsh web --host 0.0.0.0  # 未来支持时
+</code></pre>
+<p><strong>隐患</strong>：所有团队成员共享同一个 Agent 实例。一个用户的恶意 prompt 可以影响其他用户的 session。没有审计日志记录谁做了什么。</p>
+<p><strong>根因</strong>：没有用户身份，没有 session 隔离，没有审计日志。</p>
+<h3>信任围栏实际保护了什么</h3>
+<table>
+<thead>
+<tr>
+<th>检查项</th>
+<th>做了什么</th>
+<th>没做什么</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>Host header</td>
+<td>阻止 DNS rebinding 攻击</td>
+<td>不验证调用者是否在本地</td>
+</tr>
+<tr>
+<td>Sec-Fetch-Site</td>
+<td>阻止浏览器的跨站请求</td>
+<td>不阻止 curl、脚本、非浏览器客户端</td>
+</tr>
+<tr>
+<td>Origin header</td>
+<td>阻止浏览器的跨域请求</td>
+<td>不阻止没有 Origin header 的请求</td>
+</tr>
+</tbody></table>
+<p>信任围栏是一个<strong>浏览器 CSRF 防御</strong>，不是认证层。它能阻止恶意网站向你的本地 DSH 发请求，但无法阻止任何能直接 HTTP 连接到该端口的人。</p>
+<h3>本插件的缓解措施</h3>
+<table>
+<thead>
+<tr>
+<th>风险</th>
+<th>缓解措施</th>
+<th>覆盖范围</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>未授权 API 访问</td>
+<td>Bearer token + 登录页</td>
+<td>HTTP + WebSocket 路由</td>
+</tr>
+<tr>
+<td>过量审批提示</td>
+<td>前置的按会话 waterfall 限流</td>
+<td>能到达该监听器的审批请求</td>
+</tr>
+<tr>
+<td>暴露 0.0.0.0</td>
+<td>fail-closed 认证网关</td>
+<td>HTTP + WebSocket</td>
+</tr>
+<tr>
+<td>Windows 沙箱不完整</td>
+<td>已文档化，插件层无法修复</td>
+<td>—</td>
+</tr>
+</tbody></table>
+<h3>本插件无法修复的问题</h3>
+<ol>
+<li><p><strong>ACP / SDK 通道</strong>：走 stdio（stdin/stdout），不走 HTTP。网络上不可达，但如果进程被共享则无法保护。</p>
+</li>
+<li><p><strong>没有用户隔离</strong>：所有认证用户共享同一个 Agent 实例和 session 池，没有 per-user 沙箱。</p>
+</li>
+<li><p><strong>没有审计日志</strong>：本插件不记录谁认证了、做了什么。DSH session 日志记录 Agent 行为，但不记录背后的人类身份。</p>
+</li>
+<li><p><strong>审批监听器顺序</strong>：限流器会 prepend，但 Cordis 允许后加载的插件再次 prepend 并在其前方短路。该限流器属于纵深防御，不是不可绕过的策略边界。</p>
+</li>
+<li><p><strong>反向代理登录桶</strong>：登录尝试按 TCP 对端地址计数；反向代理后的用户会共享代理的桶，因此还应配置边缘限流。本插件刻意不信任可伪造的转发请求头。</p>
+</li>
+</ol>
+<p>插件会包装 DSH 已有和以后注册的 HTTP/upgrade 路由。由于当前 DSH 暴露的是注册表而非 middleware，一旦内部契约变化，插件会 fail closed 并拒绝启动。</p>
+<h2>安装并选择防护类型</h2>
+<p>插件只安装一次，通过预设选择防护模块。凭据只从环境变量读取，不会写入 patch 文件。</p>
+<pre><code>$env:DSH_AUTH_USERNAME = 'admin'
+$env:DSH_AUTH_PASSWORD = Read-Host '请输入私有密码（至少12个字符）'
+# 公网 URL 使用 HTTPS 时必须设置：
+$env:DSH_AUTH_SECURE_COOKIE = 'true'
+
+.\install.ps1 -Protection Full
+.\install.ps1 -Protection NetworkAuth
+.\install.ps1 -Protection ApprovalLimit
+</code></pre>
+<p>如果 <code>dsh</code> 不在 <code>PATH</code>，脚本会自动使用同级的 <code>deepseek-harness</code> 源码仓库；位于其他目录时传入 <code>-HarnessPath C:\path\to\deepseek-harness</code>。</p>
+<p>默认是 <code>Full</code>。添加 <code>-Start</code> 可立即启动；否则脚本会输出准确的启动命令，例如：</p>
+<pre><code>dsh --profile web --patch C:\path\to\dsh-auth-gate\presets\full.yml
+</code></pre>
+<table>
+<thead>
+<tr>
+<th>预设</th>
+<th align="right">HTTP + WebSocket 认证</th>
+<th align="right">审批限流</th>
+<th>重要后果</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>Full</code></td>
+<td align="right">是</td>
+<td align="right">是</td>
+<td>推荐</td>
+</tr>
+<tr>
+<td><code>NetworkAuth</code></td>
+<td align="right">是</td>
+<td align="right">否</td>
+<td>审批提示不受本插件限流</td>
+</tr>
+<tr>
+<td><code>ApprovalLimit</code></td>
+<td align="right">否</td>
+<td align="right">是</td>
+<td>网络控制面仍无认证</td>
+</tr>
+</tbody></table>
+<p>HTTP 和 WebSocket 认证不可拆分，避免 UI 已认证但 RPC upgrade 裸露。旧版顶层配置继续兼容；没有 <code>protections</code> 时等同完整防护。</p>
+<h2>初始密码与协作者</h2>
+<h3>终端用户</h3>
+<p>在启动 Harness 的同一个进程环境中设置凭据，不要把真实密码写进 YAML 或命令行参数。</p>
+<pre><code>cd C:\path\to\deepseek-harness
+$env:DSH_AUTH_USERNAME = 'admin'
+$env:DSH_AUTH_PASSWORD = Read-Host '请输入私有密码（至少12个字符）'
+$env:DSH_AUTH_SECURE_COOKIE = 'false' # 仅本机 HTTP；HTTPS 必须为 true
+pnpm dsh web
+</code></pre>
+<p>环境变量修改不会影响已经运行的进程；修改密码后必须重启 Harness。每次启动都会生成新的 session 签名密钥，因此重启也会让全部浏览器会话退出。</p>
+<h3>只使用 WebUI 的 Windows 用户</h3>
+<p>首次密码不能安全地在受保护的 WebUI 内创建，因为页面开放前认证就必须存在。打开 <strong>开始菜单 → 编辑账户的环境变量</strong>，新增 <code>DSH_AUTH_USERNAME</code>、<code>DSH_AUTH_PASSWORD</code> 和 <code>DSH_AUTH_SECURE_COOKIE</code>，然后彻底退出并重新打开 Harness WebUI 启动器。Windows 会保存用户环境变量，同一操作系统用户运行的其他进程可能读取它们，因此只适用于可信的本机账户。</p>
+<h3>协作者账户</h3>
+<p>1.1 版本目前只支持<strong>一个共享登录身份</strong>，不能创建第二个独立命名的协作者账户，也不能把操作归因到不同人员。共享主密码虽然可以访问，但不属于独立账户，不建议用于互不信任的团队。</p>
+<p>临时可信协作者可使用以下流程：轮换共享密码并重启 Harness，通过安全渠道发送密码；协作结束后再次轮换并重启。长期协作者应使用独立 Harness 实例/操作系统身份，或在前方部署支持每人独立身份的认证反向代理。即使认证通过，用户仍共享 Agent、session、workspace 权限和审计身份，不具备 per-user 隔离。</p>
+<h2>配置</h2>
+<h3>Bearer Token 模式</h3>
+<p>用于脚本及非浏览器客户端。HTTP 和 WebSocket 请求都必须带 <code>Authorization: Bearer &lt;token&gt;</code>，token 至少 32 字节。浏览器 WebSocket API 无法设置该请求头，因此 Web UI 请使用 <code>session</code> 或 <code>both</code>。</p>
+<p><strong>方式一：环境变量</strong></p>
+<pre><code>$env:DSH_AUTH_TOKEN = [Convert]::ToHexString(
+  [Security.Cryptography.RandomNumberGenerator]::GetBytes(32)
+).ToLowerInvariant()
+dsh web
+</code></pre>
+<p><strong>方式二：配置文件</strong></p>
+<pre><code>config:
+  mode: bearer
+  # 故意留空：请生成私有随机 token，不要复制文档中的固定值。
+  token: ''
+</code></pre>
+<p><strong>验证：</strong></p>
+<pre><code># 无 token → 拒绝
+curl http://127.0.0.1:3080/api
+# → 401 Unauthorized
+
+# 有 token → 放行
+curl -H "Authorization: Bearer $env:DSH_AUTH_TOKEN" http://127.0.0.1:3080/api
+# → 200 OK
+</code></pre>
+<h3>Session 模式</h3>
+<p>带登录页面，用户名密码验证后发 session cookie。</p>
+<pre><code>config:
+  mode: session
+  # 此处不写凭据；请设置 DSH_AUTH_USERNAME 和 DSH_AUTH_PASSWORD。
+  sessionTtl: 3600
+  loginPath: /auth/login
+</code></pre>
+<p>访问 <code>http://127.0.0.1:3080/auth/login</code> 登录。Cookie 设置为 <code>HttpOnly; SameSite=Strict</code>。HTTPS/公网部署必须设置 <code>secureCookie: true</code>；仅本机直接 HTTP 调试时保持 false。</p>
+<h3>两者同时启用</h3>
+<pre><code>config:
+  mode: both
+  # 此处不写凭据；请在进程环境中设置 DSH_AUTH_TOKEN、
+  # DSH_AUTH_USERNAME 和 DSH_AUTH_PASSWORD。
+</code></pre>
+<p>API/脚本用 token，浏览器用登录页。</p>
+<h3>沙箱升级速率限制</h3>
+<pre><code>config:
+  approvalRateLimit:
+    maxPerMinute: 3
+    maxPerSession: 10
+</code></pre>
+<p>超限请求直接拒绝，返回 <code>'unavailable'</code>（fail-closed）。</p>
+<h2>配置参考</h2>
+<table>
+<thead>
+<tr>
+<th>字段</th>
+<th>类型</th>
+<th>默认值</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>mode</code></td>
+<td><code>'bearer' | 'session' | 'both'</code></td>
+<td><code>'bearer'</code></td>
+<td>认证模式</td>
+</tr>
+<tr>
+<td><code>protections.networkAuth</code></td>
+<td><code>boolean</code></td>
+<td><code>true</code></td>
+<td>启用不可拆分的 HTTP + WebSocket 认证</td>
+</tr>
+<tr>
+<td><code>protections.approvalRateLimit</code></td>
+<td><code>boolean</code></td>
+<td><code>true</code></td>
+<td>启用审批 waterfall 限流</td>
+</tr>
+<tr>
+<td><code>auth</code></td>
+<td><code>object</code></td>
+<td>—</td>
+<td>下列认证字段也可统一写在此对象中</td>
+</tr>
+<tr>
+<td><code>token</code></td>
+<td><code>string</code></td>
+<td>环境变量 <code>DSH_AUTH_TOKEN</code></td>
+<td>Bearer token</td>
+</tr>
+<tr>
+<td><code>sessionSecret</code></td>
+<td>不支持</td>
+<td>每次启动随机生成</td>
+<td>拒绝持久密钥，避免已注销 Cookie 在重启后复活</td>
+</tr>
+<tr>
+<td><code>sessionTtl</code></td>
+<td><code>number</code></td>
+<td><code>3600</code></td>
+<td>Session 有效期（秒）</td>
+</tr>
+<tr>
+<td><code>loginPath</code></td>
+<td><code>string</code></td>
+<td><code>'/auth/login'</code></td>
+<td>登录页路径</td>
+</tr>
+<tr>
+<td><code>username</code></td>
+<td><code>string</code></td>
+<td>—</td>
+<td>登录用户名</td>
+</tr>
+<tr>
+<td><code>password</code></td>
+<td><code>string</code></td>
+<td>—</td>
+<td>登录密码</td>
+</tr>
+<tr>
+<td><code>secureCookie</code></td>
+<td><code>boolean</code></td>
+<td><code>false</code></td>
+<td>为 Cookie 添加 <code>Secure</code>；HTTPS 必须启用</td>
+</tr>
+<tr>
+<td><code>approvalRateLimit.maxPerMinute</code></td>
+<td><code>number</code></td>
+<td><code>3</code></td>
+<td>每分钟最大升级请求数</td>
+</tr>
+<tr>
+<td><code>approvalRateLimit.maxPerSession</code></td>
+<td><code>number</code></td>
+<td><code>10</code></td>
+<td>每 session 最大升级请求数</td>
+</tr>
+</tbody></table>
+<p>Bearer token 必须至少 32 字节。登录尝试按来源地址限制为每分钟 5 次。每次启动都会生成新 session secret 并使旧浏览器会话失效；由于注销状态只在进程内保存，持久密钥会被拒绝。</p>
+<h2>架构</h2>
+<pre><code>HTTP / WebSocket 请求
+  ↓
+认证网关（exact、prefix、fallback 和 upgrade 路由）
+  ├─ /auth/login → 登录页处理
+  ├─ /auth/logout → 登出处理
+  └─ /* → 认证检查
+       ├─ Authorization: Bearer &lt;token&gt; → validateBearer()
+       ├─ Cookie: dsh_session=&lt;token&gt; → validateSession()
+       └─ 无有效认证 → 401 / 重定向到登录页
+
+审批请求（approval/request waterfall）
+  ↓
+速率限制器
+  ├─ 从 req.agent.session.id 获取会话
+  ├─ 未超限 → 交给下一个审批处理器
+  └─ 超限 → 'unavailable'（拒绝）
+</code></pre>
+<h2>开发</h2>
+<pre><code>npm install
+npm run typecheck
+npm run build
+npm test
+</code></pre>
+<h2>许可证</h2>
+<p><a href="https://github.com/zephaniahwang94-cmyk/dsh-auth-gate/blob/HEAD/LICENSE">MIT</a>。安全漏洞请按照 <a href="https://github.com/zephaniahwang94-cmyk/dsh-auth-gate/blob/HEAD/SECURITY.md">SECURITY.md</a> 私下报告。</p>

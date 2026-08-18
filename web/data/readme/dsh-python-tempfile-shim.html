@@ -1,0 +1,79 @@
+<h1>dsh-python-tempfile-shim</h1>
+<p><a href="https://github.com/AngelosZou/dsh-python-tempfile-shim/blob/HEAD/README.zh.md">简体中文</a></p>
+<p>Temporary plugin that works around one Windows sandbox incompatibility until
+DeepSeek Harness ships an upstream fix. It is not published to npm; install it
+from a local clone. Read <a href="https://github.com/AngelosZou/dsh-python-tempfile-shim/blob/HEAD/SECURITY.md">SECURITY.md</a> before installing.</p>
+<p>The plugin lets Python (including pytest) use temporary directories inside the
+DSH Windows sandbox. Background: CPython on Windows builds a directory DACL
+from <code>os.mkdir</code>'s mode argument; <code>0o700</code> produces an owner-only directory.
+<code>tempfile.mkdtemp</code> and pytest's basetemp chain both use <code>0o700</code>. The DSH
+Windows sandbox runs commands under a <code>WRITE_RESTRICTED</code> token whose
+restricting-SID list excludes the user's own SID, so the confined process
+cannot read or write the directories it just created. pytest <code>tmp_path</code>/
+<code>tmpdir</code> tests fail with <code>[Errno 13]</code> / <code>WinError 5</code> and the
+<code>[sandbox: file access denied under workspace-write mode]</code> marker.</p>
+<h2>How it works — fully automatic, no extra tools</h2>
+<p>The plugin patches the mounted shell executor's <code>resolve()</code> — the single
+chokepoint every shell consumer passes through (the pwsh tool, background
+jobs, in-process plugin bridges) — so that <strong>every confined command</strong>
+(<code>workspace-write</code> / <code>read-only</code>) inherits <code>PYTHONPATH=&lt;plugin assets dir&gt;</code>.
+The bundled <code>assets/sitecustomize.py</code> then makes <code>os.mkdir</code> ignore the mode
+argument, so new directories inherit the parent ACL (which carries the
+sandbox's workspace/temp write ACEs) instead of CPython's owner-only DACL.</p>
+<p>Because the injection happens at the executor level:</p>
+<ul>
+<li><strong>No extra tools to remember</strong> — <code>python</code>, <code>pytest</code>, <code>pip</code>, <code>tox</code>, <code>nox</code>,
+venvs, and any child Python process all get the fix automatically.</li>
+<li><strong>No extra model context</strong> — the agent just runs Python normally through
+pwsh. A compact always-on system-prompt section tells it the fix is
+automatic so it never reaches for workarounds.</li>
+<li><strong>Zero escalation</strong> — the sandbox boundary is untouched: token, ACEs,
+policy, and escalation surface are all left alone.</li>
+</ul>
+<p><code>PYTHONPATH</code> is inert for non-Python commands, so adding it to every confined
+command is safe; a command that sets <code>$env:PYTHONPATH</code> itself still overrides
+it. The shim is deliberately <strong>not</strong> injected for unsandboxed compositions or
+<code>danger-full-access</code> runs (the bug does not exist there, and <code>0o700</code> is
+CPython's privacy hardening that unconfined runs should keep).</p>
+<p>A <code>python-tempfile-shim</code> skill is also registered for humans and for the rare
+case where a failure still appears (diagnose + report).</p>
+<h2>Scope</h2>
+<ul>
+<li>All <code>0o700</code> directory creation routes through <code>os.mkdir</code>: <code>tempfile.mkdtemp</code>,
+<code>tempfile.TemporaryDirectory</code>, <code>os.makedirs(mode=0o700)</code>,
+<code>pathlib.Path.mkdir(mode=0o700)</code>, pytest, tox/nox (the shim propagates to
+subprocesses via <code>PYTHONPATH</code>).</li>
+<li>Windows only; on other platforms <code>apply()</code> registers nothing.</li>
+<li>File creation (<code>os.open</code>/<code>mkstemp</code> modes) is not affected and needs no patch.</li>
+</ul>
+<h2>Install</h2>
+<pre><code>git clone https://github.com/AngelosZou/dsh-python-tempfile-shim.git
+dsh plugin --profile web add link:&lt;local repository path&gt;
+</code></pre>
+<p>Restart DSH afterwards.</p>
+<p>Uninstall: remove the plugin from the DSH settings page, then restart DSH.</p>
+<h2>Verification</h2>
+<ul>
+<li>Environment: Windows, DSH workspace-write sandbox, Python 3.11.15 / 3.13.14,
+pytest 9.1.1.<ul>
+<li>Without the plugin: <code>tmp_path</code> test fails with <code>PermissionError: [WinError 5]</code>.</li>
+<li>With the plugin: <code>1 passed</code>; <code>mkdtemp</code>, <code>TemporaryDirectory</code>, <code>mkstemp</code>,
+and basetemp cleanup work — run through the ordinary pwsh tool, no
+special arguments.</li>
+</ul>
+</li>
+<li>Subprocess propagation: parent Python process to child Python process
+(inherited <code>PYTHONPATH</code>) works.</li>
+<li>Smoke test: <code>npm test</code> covers the resolve-patch contract (confined modes
+injected, <code>danger-full-access</code>/unsandboxed left alone, idempotency,
+disposal, no spec mutation) plus prompt-section and skill registration.</li>
+</ul>
+<h2>Security</h2>
+<p>See <a href="https://github.com/AngelosZou/dsh-python-tempfile-shim/blob/HEAD/SECURITY.md">SECURITY.md</a>. Note: do not install
+<code>assets/sitecustomize.py</code> into global site-packages or a machine-wide
+PYTHONPATH; <code>0o700</code> is CPython's privacy hardening and unsandboxed runs should
+keep it.</p>
+<h2>Upstream status</h2>
+<p>Uninstall this plugin once an upstream fix ships.</p>
+<h2>License</h2>
+<p>MIT</p>

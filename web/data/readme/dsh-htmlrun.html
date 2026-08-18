@@ -1,0 +1,152 @@
+<h1>dsh-htmlrun</h1>
+<p>把 <a href="https://html.run">html.run</a> 的 HTML 发布能力从 <strong>agent skill</strong> 封装成 <strong>DeepSeek Harness（DSH）插件</strong>，让 DSH 会话内的模型可以直接把本地 HTML 发布成可分享链接。</p>
+<blockquote>
+<p>GitHub 仓库名与 npm 包名均为 <strong><code>dsh-htmlrun</code></strong>；harness 插件列表显示时会剥离 <code>dsh-</code> 前缀 → <strong>htmlrun</strong>；工具名、插件 <code>name</code> 均为 <code>htmlrun</code>。</p>
+</blockquote>
+<pre><code>用户："帮我把这个页面发布一下，发给我看看"
+   ↓
+DSH 模型调用动态工具 htmlrun (action=publish, file=...)
+   ↓
+插件通过 ctx.subprocess 调用 skill 自带 CLI（scripts/htmlrun.cjs）
+   ↓
+返回链接、版本、敏感词、指引等信息，由模型原样转达给用户
+</code></pre>
+<h2>目录结构</h2>
+<pre><code>dsh-htmlrun/
+├── README.md                        # 本文件
+├── package.json                     # 组合包（bundle）manifest：包名 dsh-htmlrun，声明 dsh.bundle
+├── cordis.patch.yml                 # 组合包 patch：条目 id=htmlrun，name=dsh-htmlrun
+├── lib/
+│   └── index.js                     # 插件真实模块入口（ESM，import defineTool + ctx.tools.register）
+├── plugin/
+│   └── htmlrun-publish/
+│       └── host.js                  # 动态插件形态（code.host，会话内 cordis_define 用，免安装）
+└── skill/                           # 原始 htmlrun skill（v2.0.1，MIT，原样拷贝，随项目分发）
+    ├── SKILL.md                     # skill 说明文档
+    ├── scripts/htmlrun.cjs          # 零依赖 CLI（Node &gt;= 16），插件的实际执行体
+    └── references/api.md            # html.run 服务端接口参考
+</code></pre>
+<p>两种形态共享同一套执行逻辑（子进程调 CLI、token 存 <code>~/.htmlrun/config</code>）：</p>
+<ul>
+<li><strong>动态插件</strong>（<code>plugin/htmlrun-publish/host.js</code>）：会话内 <code>cordis_define</code> 加载，免安装、进程内临时；</li>
+<li><strong>组合包</strong>（仓库根：<code>package.json</code> + <code>cordis.patch.yml</code> + <code>lib/index.js</code>）：可安装进 profile 的正式形态，用于发布到社区。</li>
+</ul>
+<h2>原理</h2>
+<ul>
+<li><strong>不重写 HTTP 层</strong>：插件的 <code>execute</code> 用 <code>ctx.subprocess</code> 把 <code>node scripts/htmlrun.cjs &lt;动作&gt;</code> 作为子进程跑起来，输出原样透传给模型转达——行为与 skill 里 CLI 逐字节一致，包括激活二维码、敏感词、<code>⚠ 已被限制访问</code>、<code>说明:</code>/<code>指引:</code> 等字段。</li>
+<li><strong>凭据互通</strong>：CLI 的 token 存在 <code>~/.htmlrun/config</code>，插件与终端里手工使用 CLI 是同一份凭据，无需重复激活。</li>
+<li><strong>为什么不直接用网络服务</strong>：DSH 动态插件沙箱禁用了 <code>fetch</code>/<code>require</code>，而 <code>ctx.web.fetch</code> 只支持无头 GET（无法发 POST + Authorization），调不了 html.run 的发布接口；<code>ctx.fs</code> 写 <code>~</code> 会被 workspace-write 沙箱拒绝。<code>ctx.subprocess</code> 是本地未加沙箱的子进程服务（<code>dsh-bash-local</code> 同样用它），是唯一能完整跑 CLI 的路径。</li>
+</ul>
+<h2>快速开始（动态插件，会话级）</h2>
+<ol>
+<li><p>确认本机有 Node（<code>node --version</code>，需 &gt;= 16），并保证 <code>skill/scripts/htmlrun.cjs</code> 可用（本仓库自带）。</p>
+</li>
+<li><p>在 DSH 会话中加载插件（把 <code>plugin/htmlrun-publish/host.js</code> 的内容作为 <code>code.host</code>）：</p>
+<ul>
+<li><strong>cordis_define</strong>（新插件）：<code>plugin.kind = "new"</code>、<code>idPrefix = "hpub"</code>、<code>code.host = host.js 全文</code>；</li>
+<li><strong>cordis_run</strong>：激活后即向当前会话注册模型工具 <code>htmlrun</code>。</li>
+</ul>
+</li>
+<li><p>之后直接对模型说"发布 xx.html / 更新一下链接"即可，模型会调用 <code>htmlrun</code> 工具。</p>
+</li>
+</ol>
+<h3>CLI 路径解析</h3>
+<p>插件按以下顺序确定 <code>htmlrun.cjs</code> 的位置：</p>
+<ol>
+<li>调用时显式传 <code>cliPath</code> 参数（绝对路径）；</li>
+<li>当前 workspace 下的 <code>skill/scripts/htmlrun.cjs</code>（把本仓库作为 DSH workspace 时自动命中）；</li>
+<li>两者都找不到时返回明确错误，提示用户传 <code>cliPath</code> 或把仓库作为 workspace。</li>
+</ol>
+<h2>工具参数</h2>
+<table>
+<thead>
+<tr>
+<th>参数</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>action</code></td>
+<td>必填。<code>check</code>（检查/发起激活）· <code>publish</code>（发布或更新）· <code>bind</code>（配对码换 token）· <code>login</code>（手工配置 token）· <code>logout</code>（清除 token）· <code>whoami</code>（查看状态）</td>
+</tr>
+<tr>
+<td><code>file</code></td>
+<td><code>publish</code> 用：HTML 文件绝对路径或相对 workspace 路径</td>
+</tr>
+<tr>
+<td><code>note</code></td>
+<td><code>publish</code> 用：本次发布/更新的简短说明（可选）</td>
+</tr>
+<tr>
+<td><code>forceNew</code></td>
+<td><code>publish</code> 用：强制新建工件拿全新链接（慎用；默认同路径自动更新原链接，版本 +1）</td>
+</tr>
+<tr>
+<td><code>noInline</code></td>
+<td><code>publish</code> 用：不内联本地资源（默认自动内联，只内联 HTML 所在目录内的文件）</td>
+</tr>
+<tr>
+<td><code>code</code></td>
+<td><code>bind</code> 用：管理端「绑定设备」给的 8 位配对码</td>
+</tr>
+<tr>
+<td><code>token</code></td>
+<td><code>login</code> 用：手工配置的 publish token（<code>h_</code> 开头）</td>
+</tr>
+<tr>
+<td><code>cliPath</code></td>
+<td>可选：覆盖 htmlrun.cjs 的位置</td>
+</tr>
+</tbody></table>
+<h2>常见流程</h2>
+<ul>
+<li><strong>首次使用</strong>：<code>action=check</code>——未激活时返回激活链接与二维码，转达用户，等用户确认后再 <code>check</code> 一次；已激活则静默通过。</li>
+<li><strong>发布</strong>：<code>action=publish, file=...</code>；成功后把输出里的 <code>链接:</code> 原样给用户，出现 <code>敏感词(N)</code>/<code>⚠ 已被限制访问</code>/<code>说明:</code>/<code>指引:</code> 时原样转达，不要说"发布成功"糊弄过去。</li>
+<li><strong>更新</strong>：改完内容后对<strong>同一文件路径</strong>再次 <code>publish</code>（不加 <code>forceNew</code>），链接不变、版本 +1。</li>
+<li><strong>token 纪律</strong>：token 明文不要出现在对话回复或日志里；<code>login</code> 只把 <code>h_</code> 开头的值传给工具，之后不要复述。</li>
+</ul>
+<h2>发布到插件社区</h2>
+<p>DeepSeek Harness 目前<strong>没有官方的中心化插件商店</strong>；官方推荐的插件分发方式是把插件打包成**组合包（bundle）**发布到 npm 或 GitHub，并在仓库打上 <code>dsh-plugin</code> 话题便于社区发现（官方 <a href="https://github.com/deepseek-ai/deepseek-harness/blob/HEAD/CONTRIBUTING.md">CONTRIBUTING</a> 明确推荐，官方仓库暂不接受外部 PR）。本仓库根目录已经是标准 bundle 结构。</p>
+<h3>分发渠道（三选一）</h3>
+<p><strong>1. GitHub（推荐，零构建门槛）</strong></p>
+<p>本插件是纯 JavaScript，无需构建，git 安装<strong>不需要</strong> <code>prepare</code> 脚本授权：</p>
+<pre><code># 推送到 GitHub 后，用户安装（仓库名 dsh-htmlrun）：
+dsh plugin --profile &lt;name&gt; add github:iwker/dsh-htmlrun#&lt;commit-sha&gt;
+</code></pre>
+<p>建议锁定 commit（<code>#&lt;sha&gt;</code>），防止仓库后续推送悄悄改变实际运行的代码。仓库创建后到 Settings → Topics 添加 <code>dsh-plugin</code> 话题。</p>
+<p><strong>2. npm 注册表</strong></p>
+<pre><code>pnpm publish        # 或 npm publish（需先登录；包名 dsh-htmlrun，npm 上尚无人占用）
+# 用户安装：
+dsh plugin --profile &lt;name&gt; add dsh-htmlrun
+</code></pre>
+<p>发布到 npm 的内容由 <code>package.json</code> 的 <code>files</code> 字段控制（<code>lib/</code>、<code>skill/scripts/</code>、<code>cordis.patch.yml</code>、<code>README.md</code>），用户拿到的是预构建代码。安装后 harness 插件列表显示的标题是 <strong>htmlrun</strong>（<code>dsh-</code> 前缀由界面自动剥离）。</p>
+<p><strong>3. tarball（自建分发）</strong></p>
+<pre><code>pnpm pack           # 生成 dsh-htmlrun-0.1.1.tgz
+# 用户安装：
+dsh plugin --profile &lt;name&gt; add ./dsh-htmlrun-0.1.1.tgz
+</code></pre>
+<h3>安装后验证</h3>
+<pre><code>dsh --profile &lt;name&gt; --dump-config    # 应出现 "# == dsh-htmlrun" 层
+dsh --profile &lt;name&gt;                  # 启动，然后在对话里让模型发布 HTML
+</code></pre>
+<h3>社区发现渠道</h3>
+<ul>
+<li>GitHub 话题 <a href="https://github.com/topics/dsh-plugin"><code>dsh-plugin</code></a>（官方推荐）</li>
+<li><a href="https://github.com/awesome-dsh-plugin/awesome-dsh-plugin">awesome-dsh-plugin</a>（社区清单，PR 收录）</li>
+<li><a href="https://github.com/Dominic789654/awesome-deepseek-harness">awesome-deepseek-harness</a>（社区清单，PR 收录）</li>
+<li><a href="https://github.com/hikariming/dshfind">dshfind</a>（社区插件市场）</li>
+</ul>
+<h3>与配置 key 的关系</h3>
+<p>本插件不需要为 DSH 配置任何 key：html.run 的 publish token 由 CLI 自行管理（<code>~/.htmlrun/config</code>）。若插件自身需要接入 DSH 的密钥体系（比如调用别的服务），官方做法是用 <code>ctx.credentials</code> 服务（见 host.js 里的说明），配置里只存环境变量名，值放 <code>$DSH_HOME/.credentials.yaml</code> 或启动环境变量。</p>
+<h2>已知边界</h2>
+<ul>
+<li>只支持单文件静态 HTML（CSS/JS 需内嵌或用本地相对引用；本地图片等资源由 CLI 自动内联）。</li>
+<li>不支持需要构建、需要后端的完整项目；不支持自定义域名等 html.run 未提供的能力。</li>
+<li>动态插件是进程内临时的，DSH 进程重启后需重新加载（<code>@hpub-1</code> 引用或重新 cordis_define）。</li>
+<li><code>token</code> 保存在 <code>~/.htmlrun/config</code>（0600），换机器/换路径发布会被视为新工件（<code>path</code> 参与工件匹配）。</li>
+</ul>
+<h2>许可与来源</h2>
+<ul>
+<li>仓库根 bundle（<code>package.json</code>、<code>cordis.patch.yml</code>、<code>lib/index.js</code>）与 <code>plugin/htmlrun-publish/host.js</code>：本仓库作者编写，MIT。</li>
+<li><code>skill/</code>：原样拷贝自 html.run 官方发布的 htmlrun skill v2.0.1（MIT），随项目分发；升级请替换整个 <code>skill/</code> 目录，不要单独改 <code>scripts/htmlrun.cjs</code>（其内部与服务端逐字节对齐，禁止私自分叉）。bundle 通过 <code>lib/index.js</code> 的 <code>import.meta.url</code> 相对引用 <code>skill/scripts/htmlrun.cjs</code>，保持单一来源。</li>
+</ul>

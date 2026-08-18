@@ -1,0 +1,450 @@
+<h1>dsh-goz</h1>
+<p><strong>Everything 级全盘文件定位插件：让 DeepSeek Harness 的 agent 毫秒级回答「某个文件在哪里」。</strong></p>
+<p><code>dsh-goz</code> 是一个 Cordis 插件，注册 <code>search_file</code> / <code>goz_status</code> 两个面向模型（model-facing）的工具，底层由 <a href="https://github.com/mustafaahci/goz">goz</a> 引擎支撑。goz 直接读取 NTFS 的 <strong>MFT（主文件表）</strong> 建立内存文件名索引，完全绕过目录树遍历——检索的是<strong>文件名 / 大小 / 时间</strong>索引，不含文件内容。</p>
+<blockquote>
+<p>goz 是 Everything 的开源替代品。本机实测：315 万文件（C/D/E 三卷）全盘查询单字符 <strong>毫秒级</strong> 返回；daemon 空闲工作集约 <strong>220-290 MB</strong>（进程 private ~520-580 MB，索引结构约 300 MB），索引常驻内存。</p>
+</blockquote>
+<h2>设计动机：为什么需要 goz</h2>
+<p>官方 <code>glob</code> / <code>grep</code>（<code>tool-fs-search</code>）基于 ripgrep 遍历目录树，是<strong>沙箱内、项目内</strong>检索的正确答案。但「这个文件在哪」的<strong>跨工作区</strong>问题——例如「我昨晚下载的 PDF 在哪」「D 盘所有 .env 文件」——需要全盘遍历，代价随磁盘规模线性增长：</p>
+<table>
+<thead>
+<tr>
+<th>任务</th>
+<th>goz</th>
+<th>常规手段</th>
+<th>差距</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>全盘按文件名找 <code>goz.exe</code></td>
+<td><strong>619 ms</strong></td>
+<td>PowerShell <code>Get-ChildItem -Recurse</code> 331,437 ms</td>
+<td><strong>~536x</strong></td>
+</tr>
+<tr>
+<td>全盘通配 <code>*.docx</code></td>
+<td><strong>756 ms</strong>（total 3451）</td>
+<td><code>find</code> 限深 6 耗时 66,383 ms，只找到 355 个</td>
+<td><strong>~88x，且漏检约 90%</strong></td>
+</tr>
+<tr>
+<td>子树（9,585 文件）<code>*.md</code></td>
+<td><strong>658 ms</strong>（total 3873）</td>
+<td><code>find</code> 完整遍历 4,053 ms</td>
+<td><strong>~6x</strong></td>
+</tr>
+</tbody></table>
+<p>结论：<strong>差距最大的是全盘 / 跨盘符、模糊文件名的定位</strong>——没有 goz 时这类任务基本做不成（遍历磁盘需要数分钟且易超时）；差距最小的是已知路径的小目录内搜索（此时 goz 只是锦上添花，官方 <code>glob</code> 更合适）。基准细节见<a href="#%E6%80%A7%E8%83%BD">性能</a>。</p>
+<h2>架构</h2>
+<pre><code>┌─────────────┐   spawn (ctx.subprocess seam)   ┌─────────────┐   命名管道    ┌─────────────┐
+│ dsh agent   │ ──▶  search_file / goz_status  ──▶ │  goz.exe    │ ──▶ \\.\pipe\goz-v1 ──▶ │  gozd.exe   │
+│ (模型)      │ ◀──  结构化 JSON 值              ◀── │  (CLI 客户端)│ ◀──  查询结果   ◀── │  (系统服务)  │
+└─────────────┘                                  └─────────────┘               └──────┬──────┘
+                                                                                      │ 读 MFT
+                                                                              ┌───────▼───────┐
+                                                                              │ NTFS 卷 (C/D/E) │
+                                                                              └───────────────┘
+</code></pre>
+<ul>
+<li><strong><code>gozd.exe</code>（daemon）</strong>：管理员权限启动的系统服务，读取 NTFS MFT 建立内存索引，通过 <code>\\.\pipe\goz-v1</code> 命名管道服务查询。索引常驻，因此每次查询都是毫秒级。</li>
+<li><strong><code>goz.exe</code>（CLI 客户端）</strong>：每次工具调用由插件 spawn 一次，通过命名管道向 daemon 发查询，以 <code>--json</code> 输出结构化结果后立即退出。客户端本身是<strong>无权限用户态</strong>进程。</li>
+<li><strong>插件（本包）</strong>：负责工具 schema、参数校验、argv 构造、JSON 解析、结果规范化、超时声明和 <code>tools/pre-execute</code> 审批门。<strong>从不暴露后台任务</strong>——只有在 <code>goz.exe</code> 退出、被协作式超时终止、被中止或失败后，工具调用才返回。</li>
+</ul>
+<h3>为什么 daemon 需要管理员权限（唯一的人工步骤）</h3>
+<p>读 MFT 需要管理员权限，而 dsh 是用户态进程弹不了 UAC，所以 daemon 的<strong>安装</strong>是插件使用前唯一需要人工执行的一步（在管理员终端运行 <code>gozd install</code>）。安装后 daemon 作为 Windows 系统服务常驻，agent 的每一次 <code>search_file</code> 都是毫秒级响应。</p>
+<h2>安装</h2>
+<h3>1. 安装插件</h3>
+<pre><code>dsh plugin add dsh-goz
+# 或本地目录
+dsh plugin add ./dsh-goz
+</code></pre>
+<p>插件包内自带 <code>goz.exe</code> + <code>gozd.exe</code> 二进制（Windows x86_64，位于 <code>vendor/</code>），<strong>无需单独下载或编译</strong>。daemon 版本可用 <code>.\vendor\gozd.exe --version</code> 验证（当前为 <code>gozd 0.1.1</code>）；<code>goz.exe</code> 是无状态 CLI 客户端，刻意不提供 <code>--version</code> 开关（会报 <code>unknown switch</code>），其行为版本跟随同目录的 <code>gozd.exe</code>。</p>
+<h3>2. 一次性安装 daemon（唯一的人工步骤）</h3>
+<pre><code># 开始菜单搜「PowerShell」或「终端」，右键 → 以管理员身份运行
+# gozd.exe 不在系统 PATH 里，先进入插件的 vendor 目录（路径按实际安装位置调整）
+cd C:\Users\Administrator\Desktop\dsh\dsh-goz\vendor
+.\gozd.exe install
+</code></pre>
+<blockquote>
+<p><strong>关于工作目录</strong>：<code>gozd install</code> 内部用自身可执行文件的<strong>绝对路径</strong>注册服务（安装后服务 PathName 为 <code>...\vendor\gozd.exe run --service</code>），与你在哪个目录执行无关，所以<strong>不需要</strong>特意 cd 到某个"工作目录"。上面的 <code>cd</code> 只是为了让系统能找到 <code>gozd.exe</code> 这个命令——它不在 PATH 里，直接敲 <code>gozd install</code> 会报「无法将 gozd 识别为 cmdlet」。你也可以不 cd，直接写完整路径：<code>&amp; "C:\...\dsh-goz\vendor\gozd.exe" install</code>。</p>
+</blockquote>
+<p>也可以手动前台运行：<code>.\gozd.exe run</code>（调试用，关窗即停）。查看安装后的状态：<code>.\goz.exe --status</code>。</p>
+<h3>3. 验证</h3>
+<p>先核对二进制版本（输出应为 <code>gozd 0.1.1</code>）：</p>
+<pre><code>.\vendor\gozd.exe --version
+</code></pre>
+<p>然后在 dsh 对话里问 agent「找一下 goz.exe 在哪」，或直接跑测试：</p>
+<pre><code>node tests/e2e.mjs           # 主集成测试：真实启动 web profile，13 项断言（需 daemon 在线）
+node tests/verify-syntax.mjs # README 查询语法表逐条核对（CLI 级）
+node tests/verify-readme.mjs # README 插件层声明核对（web profile + overlay）
+node tests/smoke.mjs         # CLI 冒烟测试：直接 spawn vendor/goz.exe 验证查询链路
+</code></pre>
+<h2>工具</h2>
+<table>
+<thead>
+<tr>
+<th>工具</th>
+<th>参数</th>
+<th>行为</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>search_file</code></td>
+<td><code>query</code>（必填）、<code>scope?</code>、<code>max?</code></td>
+<td>全盘/限定目录按文件名毫秒级定位，返回结构化匹配</td>
+</tr>
+<tr>
+<td><code>goz_status</code></td>
+<td>—</td>
+<td>检查 daemon 是否在线、索引健康状态；离线时返回安装指引</td>
+</tr>
+</tbody></table>
+<h3><code>search_file(query, scope?, max?)</code></h3>
+<table>
+<thead>
+<tr>
+<th>参数</th>
+<th>类型</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>query</code></td>
+<td>string，必填</td>
+<td>goz 查询语法（见<a href="#%E6%9F%A5%E8%AF%A2%E8%AF%AD%E6%B3%95">查询语法</a>），非空</td>
+</tr>
+<tr>
+<td><code>scope</code></td>
+<td>string，可选</td>
+<td>限定搜索目录（映射 <code>-path</code>）。缺省为全盘。<strong>超出白名单的 scope 会触发用户审批</strong></td>
+</tr>
+<tr>
+<td><code>max</code></td>
+<td>number，可选</td>
+<td>结果上限（映射 <code>-n</code>），默认取配置 <code>defaultMax</code>（50）</td>
+</tr>
+</tbody></table>
+<p>返回规范 JSON 值（<code>SearchValue</code>）：</p>
+<pre><code>{
+  "query": "goz",              // 回显原始查询
+  "scope": null,               // 本次搜索根，null 表示全盘
+  "total": 2,                  // 完整匹配数（诚实位）
+  "returned": 2,               // 实际返回条数（≤ max）
+  "more": false,               // 是否还有更多（诚实位；注意 goz 在 -n 截断时仍为 false，截断判断用 returned &lt; total）
+  "volumes_incomplete": false, // 结果可能不完整（诚实位）
+  "results": [
+    {
+      "path": "C:\\dsh\\dsh-goz\\vendor\\goz.exe",
+      "is_dir": false,
+      "size": 4617216,
+      "mtime_iso": "2026-08-17T03:12:44.000Z"
+    }
+  ]
+}
+</code></pre>
+<p>模型看到的是渲染后的文本（<code>output.render</code>），例如：</p>
+<pre><code>搜索 "goz" 于 全盘：共 2 个匹配，返回 2 条。
+[1.2 MB] C:\dsh\dsh-goz\vendor\goz.exe  修改于 2026-08-17T03:12:44.000Z
+[目录] C:\dsh\dsh-goz\vendor  修改于 2026-08-17T03:14:02.000Z
+</code></pre>
+<p><strong>诚实位设计</strong>：<code>total</code> / <code>more</code> / <code>volumes_incomplete</code> 三个字段原样透传 goz 的 <code>QueryResults</code> 帧，模型永远知道自己看到的结果是否完整——<code>volumes_incomplete</code> 为真时渲染会加 <code>⚠</code> 前缀提示；结果被 <code>max</code> 截断（<code>returned &lt; total</code>）时提示可缩小查询或增大 <code>max</code>。注意 goz 的 <code>more</code> 字段在 <code>-n</code> 截断时仍为 <code>false</code>，截断判断以 <code>returned &lt; total</code> 为准。</p>
+<h3><code>goz_status()</code></h3>
+<p>返回 <code>{ running: boolean, detail: string }</code>。在线时 <code>detail</code> 为 <code>gozd status</code> 输出（卷数、每卷条目数、phase、drift、内存占用）；离线时返回完整安装指引。建议模型在首次 <code>search_file</code> 前先确认引擎在线。</p>
+<h2>查询语法</h2>
+<p>goz 的查询语法与 Everything 兼容（es-compatible），作用于<strong>文件名</strong>（不含路径内容，但含路径的 token 按路径子串匹配）：</p>
+<table>
+<thead>
+<tr>
+<th>语法</th>
+<th>含义</th>
+<th>示例</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>report</code></td>
+<td>文件名子串（大小写不敏感）</td>
+<td><code>report</code> 匹配 <code>QuarterlyReport.xlsx</code></td>
+</tr>
+<tr>
+<td><code>*.pdf</code></td>
+<td>通配符（<code>*</code> / <code>?</code>）</td>
+<td><code>*.pdf</code></td>
+</tr>
+<tr>
+<td><code>ext:pdf;docx</code></td>
+<td>扩展名过滤（多值用<strong>分号</strong>；逗号在当前二进制中无效）</td>
+<td><code>ext:docx</code></td>
+</tr>
+<tr>
+<td><code>folder:</code> / <code>file:</code></td>
+<td>仅目录 / 仅文件</td>
+<td><code>folder: node_modules</code></td>
+</tr>
+<tr>
+<td><code>size:&gt;1mb</code></td>
+<td>大小过滤（<code>&lt;</code> <code>&gt;</code> <code>&lt;=</code> <code>&gt;=</code> <code>=</code>）</td>
+<td><code>size:&gt;1gb</code></td>
+</tr>
+<tr>
+<td><code>path:projects\src</code></td>
+<td>路径子串匹配</td>
+<td><code>path:C:\dsh</code></td>
+</tr>
+<tr>
+<td><code>"some dir"</code></td>
+<td>引号内整体匹配（含空格）</td>
+<td><code>"visual studio"</code></td>
+</tr>
+<tr>
+<td><code>case:</code></td>
+<td>大小写敏感开关（<strong>当前 v0.1.1 二进制不生效</strong>）</td>
+<td><code>case:goz.exe</code></td>
+</tr>
+<tr>
+<td>多个词</td>
+<td>空格分隔 = AND</td>
+<td><code>annual report</code></td>
+</tr>
+</tbody></table>
+<blockquote>
+<p><strong>注意</strong>：排除运算符（<code>!term</code>）在当前 vendor 的 goz 二进制中<strong>尚未实现</strong>——使用会得到 exit 4 与「operator '!' is not supported yet」错误。需要排除语义时，用多个正向过滤组合（如 <code>ext:pdf path:reports</code>）或增大 <code>max</code> 后在结果中自行筛选。</p>
+</blockquote>
+<blockquote>
+<p><strong>注意（实测于 v0.1.1）</strong>：<code>ext:</code> 多扩展名必须用<strong>分号</strong>分隔（<code>ext:md;png</code> 有效），<strong>逗号无效</strong>（<code>ext:md,png</code> 返回 0——逗号被当作扩展名的一部分）。<code>case:</code> 大小写开关<strong>不生效</strong>：任何 <code>case:</code> 前缀查询都会被当作字面子串解析而返回 0；普通查询本身大小写不敏感，需要精确大小写匹配时目前只能靠增大 <code>max</code> 后在结果中筛选。</p>
+</blockquote>
+<blockquote>
+<p>与 ripgrep 语法的区别：goz 查询是<strong>Everything 式搜索语言</strong>（子串 + 通配符 + 冒号过滤器），不是正则。项目内内容搜索仍用官方 <code>grep</code>。</p>
+</blockquote>
+<h2>配置</h2>
+<p>插件通过 Cordis patch 文件配置，所有字段可选：</p>
+<pre><code>- id: goz
+  name: dsh-goz
+  config:
+    defaultMax: 50            # 默认结果上限（模型未传 max 时）
+    timeoutMs: 15000          # 工具调用协作式超时（毫秒）
+    binDir: ""                # goz.exe 所在目录；留空用插件内 vendor/
+    allowedRoots:             # 白名单目录；超出需用户审批（见安全模型）
+      - "C:\\Users\\me\\Documents"
+      - "D:\\projects"
+</code></pre>
+<table>
+<thead>
+<tr>
+<th>配置键</th>
+<th>默认值</th>
+<th>含义</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>defaultMax</code></td>
+<td><code>50</code></td>
+<td>模型省略 <code>max</code> 时的结果上限；<code>z.number().step(1).min(1)</code></td>
+</tr>
+<tr>
+<td><code>timeoutMs</code></td>
+<td><code>15000</code></td>
+<td>附加到工具定义的协作式工具调用预算；<code>min(1000)</code>。subprocess seam 在预算之外另有 2s 终止升级宽限</td>
+</tr>
+<tr>
+<td><code>binDir</code></td>
+<td>插件 <code>vendor/</code></td>
+<td>自定义 <code>goz.exe</code> / <code>gozd.exe</code> 所在目录（绝对路径）；留空用打包二进制</td>
+</tr>
+<tr>
+<td><code>allowedRoots</code></td>
+<td>空（无审批）</td>
+<td>白名单目录数组；相对路径按会话工作目录解析</td>
+</tr>
+</tbody></table>
+<h3>启停</h3>
+<p>插件列表页是只读投影，<strong>启停的唯一事实源是 profile 的 <code>cordis.patch.yml</code></strong>，用同 id 条目覆盖：</p>
+<pre><code>- id: goz
+  disabled: true   # 停用；去掉该行或改为 false 重新启用
+</code></pre>
+<p>loader 支持热重载，改完保存即生效，无需重启 dsh。</p>
+<h2>安全模型</h2>
+<p>goz 的信任模型与 Everything 一致：<strong>任何认证的本地用户可查询文件名/大小/时间索引（不含内容）</strong>，已在 goz 上游 README 中文档化。索引本身<strong>永不触碰文件内容</strong>——内容搜索请用 <code>grep</code>。</p>
+<p><code>dsh-goz</code> 在此之上提供两层防护：</p>
+<ol>
+<li><strong>daemon 身份校验（强制）</strong>：<code>goz.exe</code> 连接命名管道时验证服务器 owner 为 SYSTEM/Administrators，拒绝 pipe squatter（冒充 daemon 的进程，exit code 9）。客户端绝不向不受信任的管道发送查询。</li>
+<li><strong>白名单审批（可选）</strong>：配置 <code>allowedRoots</code> 后，任何超出白名单的 <code>scope</code> 都会让插件在 <code>tools/pre-execute</code> 钩子里返回 <code>ask</code> 决策——dsh 向用户弹出审批面板，用户可<strong>拒绝</strong>。全盘可见性由此变成<strong>每次可审计、可拒绝</strong>的交互，而不是默认放开。</li>
+</ol>
+<h2>错误处理</h2>
+<p><code>goz.exe</code> 的退出码被规范化为模型可见的错误消息：</p>
+<table>
+<thead>
+<tr>
+<th>退出码</th>
+<th>含义</th>
+<th>模型看到的消息</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>8</code></td>
+<td>daemon 未运行（<code>\\.\pipe\goz-v1</code> 无服务器）</td>
+<td>完整安装指引（管理员终端 <code>gozd install</code>）</td>
+</tr>
+<tr>
+<td><code>9</code></td>
+<td>管道上有服务器但不是受信任的提权 daemon（owner 非 SYSTEM/Administrators）</td>
+<td>拒绝说明：已拒绝发送查询</td>
+</tr>
+<tr>
+<td>其他非零</td>
+<td>goz 启动失败 / 查询失败</td>
+<td><code>exit code N</code> + stderr 尾部摘录（上限 16KB）</td>
+</tr>
+</tbody></table>
+<p>参数错误（空 <code>query</code>、非法 <code>max</code> 等）是普通工具参数错误：<code>execute</code> 入口的 <code>parseSearchInput</code> 抛 <code>TypeError</code>，不进入 goz 调用，也不映射任何退出码。</p>
+<p><code>goz_status</code> 对任何 goz 失败都<strong>不抛错</strong>，统一返回 <code>{ running: false, detail: 说明 }</code> 让模型优雅降级：daemon 离线（exit 8）时 <code>detail</code> 为完整安装指引；管道不可信（exit 9）或其他非零退出时 <code>detail</code> 为拒绝说明/错误信息（与上表 search_file 抛出的消息文本一致）。</p>
+<h2>模型体验</h2>
+<h3>系统提示词</h3>
+<p>插件在 <code>ctx.systemPrompt</code> 注册一个 <code>tool:search_file</code> 段（order 110），内容大致为：</p>
+<blockquote>
+<p>search_file 是系统级全盘文件定位工具（Everything 级，毫秒响应），用于回答"某个文件在哪里"的跨工作区问题——例如"我昨晚下载的 pdf"、"D 盘所有 .env 文件"。它检索的是文件名/大小/时间索引，不含文件内容；内容搜索请用 grep 类工具。query 支持文件名子串、通配符（*.pdf）、ext:pdf、folder: 等语法；scope 限定目录（超出白名单会请求用户批准）。</p>
+</blockquote>
+<h3>工具 schema</h3>
+<ul>
+<li><code>search_file</code> 描述强调：整台 Windows 机器按文件名毫秒级定位、索引不含内容、适合跨工作区模糊检索、项目内优先用 <code>glob</code>；返回含 <code>total</code> / <code>more</code> / <code>volumes_incomplete</code> 诚实位。</li>
+<li><code>goz_status</code> 描述建议模型在 <code>search_file</code> 前先确认引擎在线。</li>
+</ul>
+<h3>结果与错误</h3>
+<ul>
+<li>结果：见<a href="#search_filequery-scope-max"><code>search_file</code> 返回</a>的渲染示例。实际返回条数小于完整匹配数（<code>returned &lt; total</code>，即结果被 <code>max</code> 截断）时，渲染附「还有更多结果」提示。</li>
+<li>错误：daemon 离线的 <code>exit 8</code> 错误会附带<strong>可执行的</strong>安装指引，模型可据此告知用户完成一次性安装。</li>
+</ul>
+<h3>Token / KV Cache 影响</h3>
+<p>提示词段和工具 schema 是注册期固定的：插件作用域、配置与文本不变时前缀稳定；激活/停用插件会使该段复用失效。结果与错误仅追加在可复用请求前缀之后，不使既有 KV Cache 条目失效。</p>
+<h2>性能</h2>
+<p>本机实测环境：Windows 11，NTFS 三卷（C: 1,914,045 + D: 1,202,415 + E: 38,137 ≈ <strong>315 万条目</strong>），daemon 索引常驻内存。每次查询是「spawn goz.exe + 管道往返 + JSON 解析」，不含冷启动（索引已在内存）。</p>
+<blockquote>
+<p><strong>复查（2026-08-17）</strong>：同一环境下全盘查询复测均值为 <strong>90-110 ms</strong>（此前另一次复测为 423-478 ms），均优于下表记录值——性能随系统负载与 daemon 状态波动，但量级一致（毫秒级），「与磁盘规模无关」的结论不变。</p>
+</blockquote>
+<table>
+<thead>
+<tr>
+<th>任务</th>
+<th>goz</th>
+<th>常规手段</th>
+<th>差距</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>全盘按文件名找 <code>goz.exe</code></td>
+<td><strong>619 ms</strong></td>
+<td>PowerShell <code>Get-ChildItem -Recurse</code> <strong>331,437 ms</strong>（约 5.5 分钟）</td>
+<td><strong>~536x</strong></td>
+</tr>
+<tr>
+<td>全盘通配 <code>*.docx</code></td>
+<td><strong>756 ms</strong>（total 3451，结果完整）</td>
+<td><code>find</code> 限深 6：66,383 ms，只找到 355 个</td>
+<td><strong>~88x，且漏检约 90%</strong></td>
+</tr>
+<tr>
+<td>子树（9,585 文件）<code>*.md</code></td>
+<td><strong>658 ms</strong>（total 3873）</td>
+<td><code>find</code> 完整遍历 4,053 ms</td>
+<td><strong>~6x</strong></td>
+</tr>
+<tr>
+<td>全盘 <code>*.tsx</code></td>
+<td><strong>682 ms</strong>（total 524）</td>
+<td>—</td>
+<td>常规手段基本不可行</td>
+</tr>
+</tbody></table>
+<p>要点：</p>
+<ul>
+<li><strong>全盘/跨盘符、模糊文件名定位</strong>是 goz 的质变场景（536x 且完整）。没有它，这类任务要么超时失败、要么深度受限漏检。</li>
+<li><strong>已知路径的小目录内搜索</strong>差距缩小到个位数倍——这种场景官方 <code>glob</code> 足够，无需动用 goz。</li>
+<li>goz 的时间开销几乎与磁盘规模无关（索引在内存）；常规遍历的时间与文件数线性相关。</li>
+</ul>
+<h2>已知限制</h2>
+<ul>
+<li><strong>仅 Windows</strong>：<code>os</code> 字段限制为 <code>win32</code>；NTFS MFT 读取、命名管道服务、<code>gozd</code> 服务模型均为 Windows 专属。</li>
+<li><strong>索引不含内容</strong>：只能按文件名/大小/时间检索。内容搜索用 <code>grep</code>，这是设计边界而非缺陷。</li>
+<li><strong>结果可能不完整</strong>：卷仍处于索引（<code>phase</code> 未 live）或不可用时，<code>volumes_incomplete</code> 为真，goz 会诚实上报而不是假装完整。</li>
+<li><strong>无 shell 层</strong>：查询词是普通 argv 元素，不存在 shell 引号问题，但也没有 shell 管道/组合能力；复杂过滤请多次调用或在应用侧组合。</li>
+<li><strong>权限模型放行同名文件</strong>：goz 索引的是文件名而非 ACL；检索结果可能包含用户无权读取的路径（读取时才由文件系统拒绝）。</li>
+<li><strong>没有 UI 卡片定制</strong>：工具沿用通用卡片渲染（<code>presentCall</code>/<code>presentResult</code> 未定制），模型可见文本由 <code>output.render</code> 提供。</li>
+<li><strong>搜索与文件访问没有共享工作区证明</strong>：返回的绝对路径能否继续 <code>read</code>，取决于后续工具对该路径的权限，本插件不做运行时校验。</li>
+</ul>
+<h2>与官方搜索工具的分工</h2>
+<table>
+<thead>
+<tr>
+<th>工具</th>
+<th>场景</th>
+<th>底层</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>glob</code> / <code>grep</code>（官方 <code>tool-fs-search</code>）</td>
+<td>沙箱内项目检索，高频</td>
+<td>ripgrep（遍历目录树）</td>
+</tr>
+<tr>
+<td><code>search_file</code>（本插件）</td>
+<td>全盘/跨工作区定位，低频，显式授权</td>
+<td>goz（MFT 内存索引，毫秒级）</td>
+</tr>
+</tbody></table>
+<h2>开发</h2>
+<pre><code>npm install          # 安装依赖（peer 由 dsh 宿主提供）
+npm run build        # tsc 编译到 lib/
+npm test             # 主集成测试 tests/e2e.mjs（需 daemon 在线）
+node tests/smoke.mjs # CLI 冒烟测试（需 vendor/goz.exe 且 daemon 在线）
+</code></pre>
+<p>本地调试用 overlay（不修改 profile）：</p>
+<pre><code>dsh --patch ./cordis.patch.yml
+</code></pre>
+<p>测试覆盖：</p>
+<ul>
+<li><code>tests/smoke.mjs</code>（CLI 冒烟）：<code>--json</code> 输出可解析且字段与 <code>GozQueryResults</code> 一致、<code>-path</code> scope 子树查询、daemon 离线时 exit 8、<code>-n</code> 上限生效。</li>
+<li><code>tests/e2e.mjs</code>（主集成）：真实启动 web profile，覆盖 loader 树、工具注册、<code>goz_status</code> / <code>search_file</code> 执行、scope 子树、渲染提示（含 <code>returned &lt; total</code> 的「还有更多结果」）、参数校验、max 钳制。</li>
+<li><code>tests/verify-syntax.mjs</code> / <code>tests/verify-readme.mjs</code>（README 对照）：前者逐条实测查询语法表，后者核对插件层声明（schema / timeoutMs / defaultMax / 白名单 / 参数校验矩阵），用于确认 README 与实际行为一致。</li>
+</ul>
+<p>调试本机非提权 daemon 时可设 <code>GOZ_INSECURE=1</code> 附加 <code>--insecure-no-server-check</code> 验证数据链路（生产提权 daemon 不需要）。</p>
+<h2>故障排查</h2>
+<table>
+<thead>
+<tr>
+<th>症状</th>
+<th>原因</th>
+<th>处理</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>search_file</code> 报「goz 引擎未运行」</td>
+<td>daemon 未安装或未启动（exit 8）</td>
+<td>管理员终端执行 <code>gozd install</code>（或 <code>gozd run</code> 前台调试），再重试</td>
+</tr>
+<tr>
+<td><code>search_file</code> 报「管道服务器不受信任」（exit 9）</td>
+<td>有进程冒用 <code>\\.\pipe\goz-v1</code>，或 daemon 以非提权方式运行</td>
+<td>确认 <code>gozd</code> 以管理员身份运行；排查是否有其他进程占用同名管道</td>
+</tr>
+<tr>
+<td>插件列表看不到 goz</td>
+<td>浏览器页面缓存 / 搜索框过滤</td>
+<td>刷新页面；清空搜索框或搜索「goz」</td>
+</tr>
+<tr>
+<td>结果提示「结果可能不完整」</td>
+<td>某卷仍在索引或不可用</td>
+<td>等待索引完成；<code>goz --status</code> 查看各卷 <code>phase</code></td>
+</tr>
+<tr>
+<td>改动 patch 不生效</td>
+<td>loader 未热重载</td>
+<td>保存后确认无 YAML 语法错误；必要时重启 dsh</td>
+</tr>
+</tbody></table>
+<h2>发布与发现</h2>
+<p>把本插件发布到 GitHub 时，建议给仓库添加 <a href="https://github.com/topics/dsh-plugin"><code>dsh-plugin</code></a> 话题（Topics），便于被归类进 dsh 插件聚合页、被其他用户搜索发现。添加方式：仓库页 → <strong>Settings → Topics</strong> → 输入 <code>dsh-plugin</code> 保存。</p>
+<blockquote>
+<p>注：<code>dsh-plugin</code> 仅是 GitHub 仓库的<strong>发现话题（topic）</strong>，不是插件内部的标签字段，也不影响 harness 加载——harness 靠 <code>cordis.patch.yml</code> 的 <code>id</code>/<code>name</code> 识别插件。Gitee 等平台有各自独立的话题机制，与 GitHub 不互通。</p>
+</blockquote>
+<h2>License</h2>
+<p>MIT。goz 二进制来自 <a href="https://github.com/mustafaahci/goz">mustafaahci/goz</a>（MIT）。</p>

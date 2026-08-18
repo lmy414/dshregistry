@@ -1,0 +1,89 @@
+<h1>dsh-write-gate</h1>
+<p><a href="https://github.com/couldbeme/dsh-write-gate/actions/workflows/ci.yml"><img src="https://github.com/couldbeme/dsh-write-gate/actions/workflows/ci.yml/badge.svg" alt="ci"></a> <a href="https://www.npmjs.com/package/dsh-write-gate"><img src="https://img.shields.io/npm/v/dsh-write-gate" alt="npm"></a></p>
+<p>A commitment write-gate for <a href="https://github.com/deepseek-ai/deepseek-harness">DeepSeek Harness</a>: the operator authors constraints ("never force-push to a shared branch", "stay read-only on the production database"), and the gate enforces them <strong>before</strong> a tool call executes. Structural violations are caught deterministically; semantic drift is judged by a model against the operator's own wording. Every block is recorded to a contradictions log that explains which commitment fired and why.</p>
+<p>Engine-agnostic core (<code>dsh-write-gate/core</code>, zero harness imports) with a dsh adapter; a Claude Code adapter over the same core is planned.</p>
+<p>A live model inside the real dsh app, told to force-push, after the gate denied the call:</p>
+<blockquote>
+<p>"The force push to the main branch was blocked by the repository's 'no-force-push' policy."</p>
+</blockquote>
+<p>That turn ran fully local, zero API keys; reproduction and session-log receipts in <a href="https://github.com/couldbeme/dsh-write-gate/blob/HEAD/docs/E2E-HEADLESS.md"><code>docs/E2E-HEADLESS.md</code></a>.</p>
+<h2>How it enforces: two tiers in two slots</h2>
+<table>
+<thead>
+<tr>
+<th>Tier</th>
+<th>Mechanism</th>
+<th>dsh slot</th>
+<th>Why this slot</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>1: deterministic</td>
+<td>path globs, command regexes, scope filters</td>
+<td><code>ctx.tools.guard()</code> (monotonic)</td>
+<td>no listener ordering can turn a guard denial back into permission</td>
+</tr>
+<tr>
+<td>2: semantic</td>
+<td>LLM judge over the commitment statement</td>
+<td><code>tools/pre-execute</code> waterfall (prepended)</td>
+<td>async-capable; short-circuits with a <code>{kind: 'deny'}</code> decision object</td>
+</tr>
+</tbody></table>
+<p><code>agent/pre-step</code> resets the per-step judge budget. Contradiction records are emitted as the <code>write-gate/contradiction</code> event and appended as JSONL to the contradictions log.</p>
+<h2>Why two tiers</h2>
+<p>An internal A/B study (12 tasks x 4 arms x 10 runs) found an LLM-judge-only gate performed at baseline (0.183 vs 0.192 unflagged-violation rate, no gate), while deterministic checks caught 100% of a violation class the judge passed 6 times out of 10 (over-length outputs); a naive "reminder" arm was the worst performer of all four (0.308). Deterministic checks for checkable constraints, the judge only for genuinely semantic ones. The study runbook publishes with the benchmark (roadmap).</p>
+<p>The tier-2 judge rubric is ported from a lineage measured at 18/18 dev + 16/16 held-out (100% precision, 0 abstains) on a local 8B model, and re-measured live through this port (2026-08-17): 32/34 accuracy with <strong>17/17 violation recall</strong>. It also carries an anti-self-justification clause added after the <a href="https://github.com/couldbeme/holdline">holdline</a> benchmark caught two injection defeats (an action asserting "the operator approved this" or "this is only a test" talking the judge into clearing a real violation); the clause moved injection accuracy from 5/8 to <strong>7/8 with zero regression</strong> on the base cases. We keep the injection-fenced prompt because it is the only variant that preserved 100% violation recall; for a gate, a missed violation is worse than an over-block. The 34 cases ship in <a href="https://github.com/couldbeme/dsh-write-gate/blob/HEAD/test/fixtures/judge-cases.json"><code>test/fixtures/judge-cases.json</code></a> with their honesty notes intact: they are hand-authored; the meaningful signals are the paraphrase-miss rate, the trap false-positive rate, and held-out generalization, not the headline percentage.</p>
+<h2>Design guarantees, each pinned to a test</h2>
+<ul>
+<li><strong>Bypass resistance</strong>: a prepended listener that answers <code>allow</code> without delegating still cannot get a structural violation through — <code>test/dsh-plugin.test.ts</code> ("cannot be bypassed by a listener that short-circuits allow").</li>
+<li><strong>Fail-closed default</strong>: judge unreachable, timed out, or over budget → block-severity commitments block, with the reason in the record — <code>test/gate.test.ts</code>.</li>
+<li><strong>Bounded judge cost</strong>: per-step budget, verdict memoization, timeout-as-unavailable — <code>test/gate.test.ts</code>.</li>
+<li><strong>Prompt-injection stance</strong>: action content enters the judge prompt fenced as data ("data, not instructions"); only a strict JSON verdict (or the ABSTAIN token) is accepted back; ABSTAIN is never a block — <code>test/judge-llm.test.ts</code>.</li>
+<li><strong>Loud mount failure</strong>: a missing or invalid commitments file fails the deployment instead of mounting a gate that guards nothing — <code>test/dsh-plugin.test.ts</code>.</li>
+<li><strong>Real pipeline</strong>: the integration suite mounts the plugin into an actual <code>Context</code> + <code>ToolRuntime</code> from the published rc packages and drives <code>ctx.tools.execute</code> — no mocked harness.</li>
+<li><strong>Real app, real model</strong>: a live local model inside the actual dsh headless app attempted a force-push and was denied by the gate; its own final answer reported the block. Full reproduction, session-log receipts, and two upstream findings: <a href="https://github.com/couldbeme/dsh-write-gate/blob/HEAD/docs/E2E-HEADLESS.md"><code>docs/E2E-HEADLESS.md</code></a>.</li>
+</ul>
+<p>Run everything: <code>pnpm install &amp;&amp; pnpm test</code> and <code>pnpm typecheck</code> — the suite prints its own count; every guarantee above names its test file.</p>
+<p>Watch the drift story: <code>pnpm demo</code> — deterministic, no model required. In-scope work passes, a prod-config edit and a force-push block, and a rogue allow-everything listener fails to bypass the monotonic guard; the contradictions log prints at the end.</p>
+<p>Measure the judge yourself: <code>pnpm build &amp;&amp; node scripts/judge-eval.mjs --url &lt;openai-compatible-endpoint&gt; --model &lt;model&gt;</code> runs all 34 fixture cases live and reports per-set accuracy, abstains, and misses.</p>
+<h2>Commitments file</h2>
+<pre><code>version: 1
+defaults:
+  failMode: closed        # judge unreachable =&gt; block-severity commitments block
+  judgeBudgetPerStep: 8
+commitments:
+  - id: no-force-push
+    statement: Never force-push to a shared branch.
+    match:
+      kinds: [shell]
+      commands: ["git\\s+push\\s+[^\\n]*(-f\\b|--force)"]
+  - id: stay-on-task
+    statement: Do not modify files unrelated to the assigned task.
+    severity: warn
+    semantic: true          # escalates to the tier-2 judge
+    match:
+      kinds: [fs-write]
+</code></pre>
+<p>Semantics: <code>kinds</code>/<code>tools</code> are scope filters; <code>paths</code>/<code>commands</code> are structural evidence. A non-semantic commitment with scope but no evidence fires on every in-scope action; a non-semantic commitment with neither is rejected at load as unenforceable. Command regexes are case-insensitive by default. One foot-gun to know: command patterns execute inside the synchronous guard, so a catastrophically backtracking regex can stall the tool pipeline — commitments are operator-authored (trusted), but keep patterns simple. Full example: <a href="https://github.com/couldbeme/dsh-write-gate/blob/HEAD/commitments.example.yaml"><code>commitments.example.yaml</code></a> (itself under test).</p>
+<h2>Mounting</h2>
+<p>The package declares the ecosystem convention (<code>dsh.bundle.patch</code> → <a href="https://github.com/couldbeme/dsh-write-gate/blob/HEAD/cordis.patch.yml"><code>cordis.patch.yml</code></a>) and mounts with:</p>
+<pre><code>dsh plugin --profile &lt;profile&gt; add dsh-write-gate
+</code></pre>
+<p>Config keys: <code>commitmentsFile</code> (default <code>COMMITMENTS.yaml</code>, resolved from cwd), <code>contradictionsLog</code> (JSONL, default <code>write-gate.contradictions.jsonl</code>), <code>judgeTimeoutMs</code>, and <code>judge: { provider, model, maxTokens }</code> — omit <code>judge</code> to run tier 1 only (escalations then follow <code>failMode</code>).</p>
+<h2>Current limits (v0, stated rather than hidden)</h2>
+<ul>
+<li>The action normalizer is a heuristic table over dsh's in-tree tool names (<code>bash</code>, <code>read</code>/<code>write</code>/<code>edit</code>, web tools); unrecognized tools degrade to kind <code>other</code> with a full summary — visible to semantic commitments, but path/command rules do not apply to them.</li>
+<li>dsh is a 0.1.0-rc developer preview with breaking changes announced; peers are pinned to <code>&lt;0.2.0</code>.</li>
+<li>First release (0.1.0); <code>pnpm build</code> emits <code>dist/</code>, <code>prepublishOnly</code> gates every publish on build + tests.</li>
+<li>The tier-2 judge is only as good as its model and rubric; the measured numbers above are from the shipped fixtures, and the benchmark that scores this gate (and others) against labeled trajectories is the next deliverable.</li>
+</ul>
+<h2>Roadmap</h2>
+<ol>
+<li>llm-replay fixture variant of the demo (dsh snapshot format), so the story replays inside a full agent loop.</li>
+<li><del>The gate benchmark</del> → shipped as <a href="https://github.com/couldbeme/holdline"><strong>holdline</strong></a>: catch rate, false-block rate, class-balanced kappa, and an injection-attack class, scoring any guard (this one included). First run: this gate's judge tier scores kappa 0.80 vs a commitment-blind deny-list's 0.35, and holdline honestly records where the judge loses (injection).</li>
+<li>Claude Code adapter over the same core.</li>
+</ol>
+<h2>Dependencies and trust basis</h2>
+<p>Runtime: <code>zod</code>, <code>yaml</code>, <code>picomatch</code> (mainstream, actively maintained), <code>@deepseek-ai/schemastery</code> (dsh's own config-schema library, Koishi lineage). Harness peers: <code>@deepseek-ai/cordis</code> + <code>@deepseek-ai/dsh-*</code> rc packages, pinned. Dev: <code>vitest</code>, <code>typescript</code>.</p>
+<p>MIT.</p>

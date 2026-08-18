@@ -1,0 +1,366 @@
+<h1>dsh-layered-memory</h1>
+<blockquote>
+<p>为 <a href="https://github.com/deepseek-ai/deepseek-harness">DeepSeek Harness (dsh)</a> 打造的分层长期记忆插件 —— 对标高端智能体个性化记忆体系，实现精细化跨会话记忆管理。</p>
+</blockquote>
+<p><a href="https://github.com/Olalaye/dsh-layered-memory/blob/HEAD/LICENSE"><img src="https://img.shields.io/badge/License-MIT-yellow.svg" alt="License: MIT"></a></p>
+<h2>简介</h2>
+<p>dsh-layered-memory 是 dsh 的<strong>静态 bundle 插件</strong>，为智能体增加一套分层长期记忆：把会话内容按三层沉淀——<strong>瞬时</strong>（当前会话要点）、<strong>情景</strong>（每次会话一条摘要）、<strong>语义</strong>（长期事实与偏好）。它自动捕获用户消息、由模型提炼成长期记忆，并在后续会话按相关度召回，实现「跨会话记住你」。</p>
+<p>与早期「动态插件」形式不同，本仓库是<strong>可全局安装的 bundle</strong>：通过 <code>dsh plugin add</code> 安装后随 Harness 启动自动加载、<strong>重启不丢失</strong>（记忆数据持久在磁盘）。安装后零配置，模型自动使用；也可通过 HTTP API 浏览、检索、编辑记忆。</p>
+<h2>特性</h2>
+<ul>
+<li><strong>三层记忆架构</strong>：瞬时（transient）/ 情景（episodic）/ 语义（semantic），各层独立存储、独立容量上限</li>
+<li><strong>自动捕获</strong>：<code>agent/pre-step</code> 实时捕获用户消息要点到瞬时层，零配置</li>
+<li><strong>AI 自动提炼</strong>：注册 4 个模型工具 + 系统提示词段落，模型自动保存用户<strong>使用习惯、写作风格、业务需求</strong>（按 <code>habit / style / business / preference / fact</code> 分类），任务收尾自动提交情景摘要</li>
+<li><strong>跨会话精准召回</strong>：CJK 感知分词（单字 + 双字 + 英文词）、重要性加权、45 天指数衰减、语义层权重、标签命中加成的排序评分</li>
+<li><strong>语义去重合并</strong>：相似度 ≥ 0.5 自动合并重复事实并累计 <code>hits</code>，防止语义层膨胀</li>
+<li><strong>持久化</strong>：JSON 文件存储于 <code>~/.dsh-memory/</code>，跨会话、跨工作区共享，可直接查看/备份；串行写队列防并发损坏</li>
+<li><strong>管理 HTTP API</strong>：<code>/api/memory/*</code> 提供浏览、检索、编辑、删除、清空、统计（见<a href="#http-%E7%AE%A1%E7%90%86-api">管理 API</a>）</li>
+</ul>
+<h2>安装</h2>
+<p>一个 bundle 就是「npm 包 + <code>dsh.bundle</code> 清单 + 补丁层」三件套，通过 <code>dsh plugin</code> 装入 profile。本项目是<strong>纯 JavaScript</strong>，无构建步骤，从本地目录、npm 或 Git 均可直接安装。</p>
+<h3>从本地目录安装</h3>
+<pre><code>dsh plugin --profile demo add ./dsh-layered-memory
+</code></pre>
+<h3>从 Git 安装</h3>
+<pre><code>dsh plugin --profile demo add github:Olalaye/dsh-layered-memory
+</code></pre>
+<blockquote>
+<p>本项目为纯 JS（无 <code>prepare</code> 构建脚本），因此 Git 安装<strong>无需</strong> <code>allowBuilds</code> 白名单即可直接运行。</p>
+</blockquote>
+<h3>从 npm 安装（发布后）</h3>
+<pre><code>dsh plugin --profile demo add dsh-layered-memory
+</code></pre>
+<h3>验证并启动</h3>
+<pre><code>dsh --profile demo --dump-config   # 应看到 "# == dsh-layered-memory" 配置层
+dsh --profile demo                 # 启动（Web GUI 默认 http://127.0.0.1:3080）
+</code></pre>
+<p>安装后：</p>
+<ul>
+<li>模型获得 <code>memory_recall</code> / <code>memory_remember</code> / <code>memory_commit</code> / <code>memory_stats</code> 四个工具</li>
+<li>系统提示词自动注入「分层长期记忆系统」使用规则（<code>memory-system</code>，order 150）</li>
+<li>启动后记忆数据写入 <code>~/.dsh-memory/</code></li>
+</ul>
+<p>卸载：</p>
+<pre><code>dsh plugin --profile demo remove dsh-layered-memory
+</code></pre>
+<h2>配置</h2>
+<p>所有可调参数通过 <code>Config</code> schema 暴露，可在 profile 的 <code>cordis.patch.yml</code> 中覆盖：</p>
+<pre><code>- override:
+    - id: dsh-layered-memory
+      config:
+        storageDir: ~/.dsh-memory   # 记忆存储目录（默认 ~/.dsh-memory）
+        maxTransient: 300           # 瞬时层容量上限
+        maxEpisodic: 500            # 情景层容量上限
+        maxSemantic: 800            # 语义层容量上限
+        minScore: 0.08              # 召回最低分数阈值
+</code></pre>
+<table>
+<thead>
+<tr>
+<th>字段</th>
+<th>默认</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>storageDir</code></td>
+<td><code>~/.dsh-memory</code></td>
+<td>记忆 JSON 存储目录（支持 <code>~</code> 与相对路径）</td>
+</tr>
+<tr>
+<td><code>maxTransient</code></td>
+<td>300</td>
+<td>瞬时层容量上限（超出按 <code>ts</code> 裁剪最旧）</td>
+</tr>
+<tr>
+<td><code>maxEpisodic</code></td>
+<td>500</td>
+<td>情景层容量上限</td>
+</tr>
+<tr>
+<td><code>maxSemantic</code></td>
+<td>800</td>
+<td>语义层容量上限</td>
+</tr>
+<tr>
+<td><code>minScore</code></td>
+<td>0.08</td>
+<td>召回最低分数</td>
+</tr>
+</tbody></table>
+<h2>使用方法</h2>
+<h3>1. 日常使用（全自动，零操作）</h3>
+<p>安装后无需任何配置，模型会按提示词规则自动使用记忆系统：</p>
+<table>
+<thead>
+<tr>
+<th>场景</th>
+<th>模型自动行为</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>会话开始，或你说"之前/上次/记得吗/照旧/按老规矩"</td>
+<td>自动调用 <code>memory_recall</code> 检索相关历史后再回答</td>
+</tr>
+<tr>
+<td>你明确说出可长期复用的偏好（习惯、写作风格、业务要求等）</td>
+<td>自动调用 <code>memory_remember</code> 保存并分类</td>
+</tr>
+<tr>
+<td>一段工作完成、任务收尾、或你说"今天先到这/再见"</td>
+<td>自动调用 <code>memory_commit</code> 提交会话摘要并沉淀要点</td>
+</tr>
+<tr>
+<td>任何会话中的用户消息</td>
+<td>插件自动捕获到瞬时层（无需模型参与）</td>
+</tr>
+</tbody></table>
+<h3>2. 手动指令（给模型发消息即可）</h3>
+<p>不需要记忆相关术语，用自然语言即可：</p>
+<pre><code>记住：我汇报时喜欢用表格
+以后写文档都用中文，标题用 ## 两级
+上次我们讨论的 X 项目结论是什么？
+把这个会话记下来
+查一下我上次说的关于 Y 的要求
+忘记我之前说的那件事吧
+</code></pre>
+<p>模型会对应调用 <code>memory_remember</code> / <code>memory_recall</code> / <code>memory_commit</code> 完成操作。（注：删除/清空请使用 HTTP API，模型工具暂不提供删除入口。）</p>
+<h3>3. 数据文件管理</h3>
+<p>记忆以纯 JSON 存储于 <code>~/.dsh-memory/</code>（跨会话、跨工作区共享）：</p>
+<pre><code>.dsh-memory/
+├── transient.json   # 瞬时记忆（上限 300 条）
+├── episodic.json    # 情景记忆（上限 500 条）
+└── semantic.json    # 语义记忆（上限 800 条）
+</code></pre>
+<ul>
+<li><strong>备份</strong>：直接复制这三个文件即可；恢复时放回原目录</li>
+<li><strong>迁移</strong>：把目录复制到另一台机器的用户目录下，重新安装插件即可读取</li>
+<li><strong>隐私</strong>：记忆包含个人数据，位于用户目录、不在仓库内</li>
+</ul>
+<h2>HTTP 管理 API</h2>
+<p>Web GUI 运行时，插件注册一组 <code>/api/memory/*</code> 路由（需自行鉴权，dsh Web 服务默认仅监听 <code>127.0.0.1</code>）：</p>
+<table>
+<thead>
+<tr>
+<th>方法</th>
+<th>路径</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>GET</td>
+<td><code>/api/memory/stats</code></td>
+<td>各层条数与存储位置</td>
+</tr>
+<tr>
+<td>GET</td>
+<td><code>/api/memory/list?layer=&amp;category=&amp;limit=</code></td>
+<td>列出记忆条目</td>
+</tr>
+<tr>
+<td>GET</td>
+<td><code>/api/memory/search?query=&amp;layer=&amp;limit=</code></td>
+<td>带匹配度的全文检索</td>
+</tr>
+<tr>
+<td>POST</td>
+<td><code>/api/memory/add</code></td>
+<td>手动新增 <code>{layer, text, category?, importance?, tags?}</code></td>
+</tr>
+<tr>
+<td>POST</td>
+<td><code>/api/memory/update</code></td>
+<td>编辑 <code>{id, patch:{text?, category?, importance?, tags?}}</code></td>
+</tr>
+<tr>
+<td>POST</td>
+<td><code>/api/memory/remove</code></td>
+<td>删除单条 <code>{id}</code></td>
+</tr>
+<tr>
+<td>POST</td>
+<td><code>/api/memory/clear</code></td>
+<td>清空一层或全部 <code>{layer}</code>（<code>all</code>）</td>
+</tr>
+</tbody></table>
+<blockquote>
+<p>早期动态插件形式的 React 设置页「记忆管理」依赖客户端 UI 槽位，属于独立的 client 插件包、无法由 <code>dsh plugin add</code> 注入；本 bundle 以 HTTP API 提供等价的管理能力（见<a href="#%E5%B7%B2%E7%9F%A5%E8%BE%B9%E7%95%8C">已知边界</a>）。</p>
+</blockquote>
+<h2>架构</h2>
+<h3>记忆分层</h3>
+<table>
+<thead>
+<tr>
+<th>层</th>
+<th>存储文件</th>
+<th>内容</th>
+<th>来源</th>
+<th>容量</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>瞬时 <code>transient</code></td>
+<td><code>transient.json</code></td>
+<td>当前会话要点（用户消息）</td>
+<td><code>agent/pre-step</code> 自动捕获（2s 冷却、300 字符截断）+ <code>memory_remember(layer=transient)</code></td>
+<td>300</td>
+</tr>
+<tr>
+<td>情景 <code>episodic</code></td>
+<td><code>episodic.json</code></td>
+<td>每会话一条记录（标题、时间、要点、交互数）</td>
+<td><code>memory_commit</code> 提交；<code>agent/disposed</code> 自动沉淀兜底</td>
+<td>500</td>
+</tr>
+<tr>
+<td>语义 <code>semantic</code></td>
+<td><code>semantic.json</code></td>
+<td>长期事实（习惯/风格/业务/偏好/事实/其他）</td>
+<td><code>memory_remember</code> / <code>memory_commit(facts)</code>；相似度 ≥ 0.5 自动合并</td>
+<td>800</td>
+</tr>
+</tbody></table>
+<p>存储目录：<code>~/.dsh-memory/</code>（默认，由 <code>config.storageDir</code> 覆盖，跨会话、跨工作区共享）。</p>
+<h3>数据模型</h3>
+<p>每条记忆条目：</p>
+<pre><code>{
+  "id": "s_mstyq3l9-asx1jy",
+  "layer": "semantic",
+  "text": "用户偏好用 Markdown 表格汇报数据",
+  "category": "preference",
+  "source": "agent",
+  "importance": 4,
+  "tags": ["汇报", "markdown"],
+  "ts": 1786773359277,
+  "updatedAt": 1786773359277,
+  "sessionId": "session-xxx",
+  "hits": 2
+}
+</code></pre>
+<blockquote>
+<p>字段按层略有差异：情景条目另含 <code>sessionTitle</code> / <code>messageCount</code>，瞬时条目不含 <code>hits</code>。</p>
+</blockquote>
+<h3>召回算法</h3>
+<pre><code>score = (0.15 × min(命中词数, 3)          # 命中基础分
+       + 0.40 × 查询覆盖率                # matched / queryTokens
+       + 0.10 × 条目密度                  # matched / entryTokens
+       + 0.15 × 标签命中)                 # 可选
+       × (0.75 + 0.25 × importance/5)    # 重要度加权
+       × (0.40 + 0.60 × e^(-ageDays/45))  # 45 天指数衰减
+       × 层级权重                          # semantic 1.15 / episodic 1.0 / transient 0.55
+</code></pre>
+<p>阈值 <code>MIN_SCORE = 0.08</code>（可配），结果按分数降序、同时按更新时间次排序。</p>
+<h2>模型工具 API</h2>
+<h3><code>memory_recall(query, layer?, category?, limit?)</code></h3>
+<p>跨层检索相关历史。<strong>会话开始或用户提到"之前/上次/照旧"时优先调用</strong>。</p>
+<table>
+<thead>
+<tr>
+<th>参数</th>
+<th>类型</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>query</code></td>
+<td>string (必填)</td>
+<td>检索关键词：主题、人名、项目、术语等</td>
+</tr>
+<tr>
+<td><code>layer</code></td>
+<td>enum</td>
+<td><code>all</code>（默认）/ <code>transient</code> / <code>episodic</code> / <code>semantic</code></td>
+</tr>
+<tr>
+<td><code>category</code></td>
+<td>enum</td>
+<td>语义层分类筛选：<code>habit</code> / <code>style</code> / <code>business</code> / <code>preference</code> / <code>fact</code> / <code>other</code></td>
+</tr>
+<tr>
+<td><code>limit</code></td>
+<td>integer</td>
+<td>返回条数，默认 8，最大 20</td>
+</tr>
+</tbody></table>
+<p>返回 <code>{ query, count, results[], context }</code>——<code>context</code> 是可直接注入系统上下文的紧凑文本块。</p>
+<h3><code>memory_remember(text, category?, importance?, tags?, layer?)</code></h3>
+<p>写入语义事实（自动去重合并并累计 <code>hits</code>）或瞬时笔记。适用于用户明确表达的长期偏好、习惯、风格、业务需求。</p>
+<h3><code>memory_commit(summary, facts?, title?)</code></h3>
+<p>提交当前会话：写入情景记忆（摘要），并把 <code>facts</code> 数组 <code>[{text, category?, importance?}]</code> 沉淀到语义层。适用于工作完成、任务收尾、用户告别时。</p>
+<h3><code>memory_stats()</code></h3>
+<p>各层条数与存储位置。</p>
+<h2>事件钩子</h2>
+<table>
+<thead>
+<tr>
+<th>事件</th>
+<th>模式</th>
+<th>用途</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>agent/session-start</code></td>
+<td>emit</td>
+<td>初始化会话跟踪器</td>
+</tr>
+<tr>
+<td><code>agent/pre-step</code></td>
+<td><strong>waterfall</strong>（必须 <code>return next()</code>）</td>
+<td>捕获标准 <code>UserMessage[]</code> → 瞬时层</td>
+</tr>
+<tr>
+<td><code>agent/disposed</code></td>
+<td>emit</td>
+<td>自动沉淀情景记录（兜底）</td>
+</tr>
+</tbody></table>
+<h2>系统提示词段落</h2>
+<p><code>memory-system</code>（order 150）注入使用规则：</p>
+<ol>
+<li>会话开始或用户提到"之前/上次/记得吗/照旧"时，先 <code>memory_recall</code> 再作答；</li>
+<li>用户表达可长期复用的习惯、风格、业务要求、偏好时，<code>memory_remember</code> 并选对 <code>category</code>；</li>
+<li>工作完成、任务收尾或告别时，<code>memory_commit</code> 提交情景摘要 + facts 沉淀；</li>
+<li>检索结果只用于辅助回答，不原样复述。</li>
+</ol>
+<h2>目录结构</h2>
+<pre><code>dsh-layered-memory/
+├── index.js          # 插件入口：name / inject / Config / apply
+├── lib/
+│   ├── store.js      # 记忆存储引擎：分词、召回、去重、CRUD、持久化
+│   ├── tools.js      # 四个模型工具定义（defineTool）
+│   ├── prompt.js     # 系统提示词段落文本
+│   └── http.js       # 管理 HTTP API（可选，ctx.webServer 存在时注册）
+├── package.json      # dsh.bundle 清单 + 依赖
+├── cordis.patch.yml  # 配置层：插入本插件行
+├── README.md
+├── LICENSE           # MIT
+└── .gitignore
+</code></pre>
+<h2>开发</h2>
+<pre><code>npm install                 # 安装依赖（@deepseek-ai/dsh-tools / schemastery）
+node --check index.js       # 语法校验（各 lib/*.js 同理）
+</code></pre>
+<p>本插件是<strong>纯 ESM JavaScript</strong>，无构建步骤；<code>apply(ctx, config)</code> 内的一切注册（工具、事件、提示词段落）都经 <code>ctx</code> 完成，插件卸载时由 Cordis 自动清理。</p>
+<h2>已知边界</h2>
+<ul>
+<li><strong>管理 UI 为 HTTP API</strong>：早期动态插件形式的 React 设置页依赖客户端 UI 槽位，属于独立 client 插件包（浏览器端模块图），无法由 <code>dsh plugin add</code>（宿主 bundle）注入；本仓库以 <code>/api/memory/*</code> HTTP API 提供等价能力，如需图形化界面可另行开发 client 插件（Roadmap）</li>
+<li><strong>Web 服务仅回环</strong>：dsh Web 默认只监听 <code>127.0.0.1</code>，HTTP API 不对外暴露</li>
+<li>插件重启后会话计数器（messageCount/notes）重置，不影响已落盘数据；情景记录以 <code>memory_commit</code> 为主路径、<code>agent/disposed</code> 为兜底</li>
+<li>删除/清空操作通过 HTTP API 完成；词面去重阈值保守（0.5），语义级去重由模型在提交时判断</li>
+<li>记忆数据（<code>~/.dsh-memory/</code>）为个人隐私数据，位于用户目录、不在仓库内</li>
+</ul>
+<h2>Roadmap</h2>
+<ul>
+<li> 客户端 UI 插件：把「记忆管理」设置页迁到 dsh client 插件包，复用 HTTP API</li>
+<li> 记忆导入/导出（JSON/Markdown）</li>
+<li> 语义层自动晋升（hits ≥ 阈值时从情景层自动提炼）</li>
+<li> 多语言召回（CJK 双字分词已在中文/英文下工作，计划扩展日韩）</li>
+<li> 可选向量检索后端（当前为确定性词面评分，零依赖）</li>
+</ul>
+<h2>版本历史</h2>
+<ul>
+<li><strong>v1.0.0 (bundle)</strong> — 从「动态插件」彻底迁移为 dsh 静态 bundle：ESM 入口（<code>name</code>/<code>inject</code>/<code>Config</code>/<code>apply</code>）、<code>defineTool</code> 工具注册、<code>ctx.systemPrompt.section</code> 提示词、<code>agent/*</code> 事件、<code>node:fs</code> 持久化、可配置 <code>Config</code> schema、HTTP 管理 API。可 <code>dsh plugin add</code> 全局安装、重启持久。</li>
+<li><strong>v0.x（动态插件，历史）</strong> — 早期以 <code>cordis_define</code>/<code>cordis_run</code> 动态定义插件运行，依赖进程内 harness 沙箱，重启即失效；本仓库从 bundle 版（v1.0.0）起重新维护。</li>
+</ul>
+<h2>License</h2>
+<p><a href="https://github.com/Olalaye/dsh-layered-memory/blob/HEAD/LICENSE">MIT</a></p>

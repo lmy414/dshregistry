@@ -1,0 +1,259 @@
+<h1>@dsh-external/dsh-ocr1-memory</h1>
+<p>基于 <strong>DeepSeek-OCR: Contexts Optical Compression</strong>（arXiv:2510.18234）思想实现的 DSH 光学记忆系统。</p>
+<p>记忆不再只存文本——它被<strong>渲染成图像（SoM 编号分段）并保留下来</strong>；按年龄把旧记忆<strong>降分辨率（越久远越模糊）</strong>；检索命中低清记忆后通过 <strong>active recall 恢复高清</strong>；最终返回<strong>原始 verbatim 片段</strong>（Locate-and-Transcribe），避免生成式幻觉。</p>
+<h2>能力</h2>
+<table>
+<thead>
+<tr>
+<th>工具</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>ocr1_mem_status</code></td>
+<td>状态：存储目录 / OCR 后端 / 条目数 / 渲染依赖 / 层级</td>
+</tr>
+<tr>
+<td><code>ocr1_mem_store</code></td>
+<td>文本 → 自动分段 → 渲染 SoM 图像 → 存入记忆库</td>
+</tr>
+<tr>
+<td><code>ocr1_mem_update</code></td>
+<td>更新已有记忆，替换为新内容并重置为 vivid（冲突消解）</td>
+</tr>
+<tr>
+<td><code>ocr1_mem_retrieve</code></td>
+<td>按查询检索，OCR 读回图像 + 分段召回；命中低清记忆自动 active recall</td>
+</tr>
+<tr>
+<td><code>ocr1_mem_list</code></td>
+<td>列出记忆条目（id / 来源 / 段数 / 层级 / 命中数）</td>
+</tr>
+<tr>
+<td><code>ocr1_mem_metrics</code></td>
+<td>查看压缩比指标：文本 token 数 / 视觉 token 数 / 实测 prompt_tokens</td>
+</tr>
+<tr>
+<td><code>ocr1_mem_calibrate</code></td>
+<td>校准 OCR 文本基线 prompt_tokens，用于更准确的视觉 token 估算</td>
+</tr>
+<tr>
+<td><code>ocr1_mem_forget</code></td>
+<td>按 id 删除记忆</td>
+</tr>
+<tr>
+<td><code>ocr1_mem_render_test</code></td>
+<td>渲染管线自测</td>
+</tr>
+<tr>
+<td><code>ocr1_mem_embed_test</code></td>
+<td>视觉 embedding 自测：返回真实 1280 维 DeepSeek-OCR embedding 与直接视觉 token 数</td>
+</tr>
+</tbody></table>
+<h2>设计（对应 OCR1 论文）</h2>
+<table>
+<thead>
+<tr>
+<th>OCR1 概念</th>
+<th>本插件实现</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>长文本 → 光学 2D 映射</td>
+<td>文本按段落自动分段，渲染为图像</td>
+</tr>
+<tr>
+<td>visual tokens 承载信息</td>
+<td>分辨率模式对应 OCR1 官方设计：<code>vivid 1280(≈400) → normal 1024(≈256) → fuzzy 640(≈100)</code>；会记录接口级视觉 token 数</td>
+</tr>
+<tr>
+<td>记忆随时间模糊</td>
+<td>按 <code>createdAt</code> 年龄衰减，旧记忆降到低分辨率</td>
+</tr>
+<tr>
+<td>人类记忆的 vivid-to-fuzzy</td>
+<td>越旧越低清，但保留语义 gist</td>
+</tr>
+<tr>
+<td>记忆刷新</td>
+<td>命中低清记忆 → active recall 恢复高清，并在一段时间内豁免再衰减</td>
+</tr>
+<tr>
+<td>避免幻觉</td>
+<td>Locate-and-Transcribe 风格：返回原始 verbatim 片段；当前定位由文本打分 + OCR 证据完成，不是模型直接输出 SoM 编号</td>
+</tr>
+<tr>
+<td>OCR 驱动召回</td>
+<td>原始 token 未命中但 DeepSeek-OCR 从图像读到关键词 → 仍按 OCR 证据召回并取回原文</td>
+</tr>
+<tr>
+<td>视觉 embedding</td>
+<td>存储真实 DeepSeek-OCR 1280 维视觉向量（<code>visualMemory.embedding</code>）；检索时用 query embedding 与记忆 embedding 的相似度作为主信号，再结合文本分段定位</td>
+</tr>
+<tr>
+<td>渲染缓存</td>
+<td>AgentOCR 式分段哈希缓存，相同分段集合+分辨率直接复用图像</td>
+</tr>
+</tbody></table>
+<h2>配置</h2>
+<p>在 profile 的 cordis.patch.yml 中覆盖（裸条目）：</p>
+<pre><code>- id: dsh-ocr1-memory
+  config:
+    storeDir: ''                 # 默认 &lt;home&gt;/.dsh/ocr1-memory
+    ocrBaseUrl: ''               # DeepSeek-OCR vLLM/OpenAI 兼容端点；留空则跳过 OCR 读回
+    ocrApiKey: ''
+    ocrModel: 'deepseek-ai/DeepSeek-OCR'
+    pythonPath: 'python'
+    renderScript: '&lt;插件目录&gt;/scripts/render_memory.py'
+    requireOcr: false            # true 时 OCR 不可用会直接报错
+    useMockRenderer: false       # true 时跳过 Python 渲染（仅测试）
+    autoStartOcrServer: false    # true 时插件加载后自动确保 llama-server 在线
+    ocrServerPath: ''            # llama-server.exe 路径；留空用默认值
+    ocrModelDir: ''              # DeepSeek-OCR GGUF 目录；留空用默认值
+    ocrServerPort: 18080         # OCR 服务端口
+    ocrEmbeddingBaseUrl: ''      # 通常与 ocrBaseUrl 相同（combined 模式）；留空自动回退到 ocrBaseUrl
+    ocrEmbeddingApiKey: ''
+    ocrEmbeddingModel: ''        # 留空则使用 ocrModel
+    ocrEmbeddingTimeoutMs: 120000
+    ocrEmbeddingEmptyPromptTokens: 1  # 空文本 embedding 的 prompt_tokens 基线
+    ocrEmbeddingAutoStart: false       # 仅当 embedding 使用独立服务时才需要 true
+    ocrEmbeddingPort: 18084            # 独立 embedding 服务端口（combined 模式不使用）
+    ocrEmbeddingUbatchSize: 2048       # 必须 &gt;= 单图视觉 token 数（默认 512 会拒大图）
+    ocrEmbeddingServerPath: ''         # embeddings 用的 llama-server.exe 路径
+    ocrEmbeddingModelDir: ''           # embeddings 用的 GGUF 目录
+    ocrEmbeddingOnDemand: true         # 仅当 embedding 使用独立服务时生效；combined 模式下直接复用 18080
+    ocrEmbeddingIdleTimeoutMs: 300000  # embedding 服务空闲多少毫秒后自动关闭
+    ocrEmbeddingContextSize: 2048      # embedding 服务上下文（不需要长生成，2048 够用）
+    sharedStore: false                 # true 时每次操作前重读 memories.json，支持多 Agent 共享同一 store
+    embeddingRetrieval: true           # true 时使用 1280 维视觉 embedding 相似度作为检索主信号（配合 ocrEmbeddingBaseUrl）
+    ocrMaxEntriesPerRetrieve: 5        # 文本检索不足 topK 时，最多对多少条记忆做 OCR 读回（防止大库检索卡死）
+</code></pre>
+<h2>安装</h2>
+<pre><code># 从 GitHub 安装（推荐）
+dsh plugin --profile web add github:DDDFXYqiming/dsh-ocr1-memory
+
+# headless（自测）
+dsh plugin --profile headless add github:DDDFXYqiming/dsh-ocr1-memory
+</code></pre>
+<p>本地开发时也可直接使用仓库目录：</p>
+<pre><code>dsh plugin --profile web add &lt;本目录&gt;
+</code></pre>
+<p>运行时注入（免重启，开发用）：</p>
+<pre><code>dev_inject_plugin &lt;本目录&gt;
+</code></pre>
+<h2>接上真正的 DeepSeek-OCR</h2>
+<p>本插件把 OCR 后端抽象成 OpenAI 兼容的 <code>/v1/chat/completions</code>（vLLM 已支持 DeepSeek-OCR）。</p>
+<pre><code># 例：用 vLLM 起 DeepSeek-OCR 服务
+python -m vllm.entrypoints.openai.api_server \
+  --model deepseek-ai/DeepSeek-OCR \
+  --max-model-len 16384
+</code></pre>
+<p>然后把 <code>ocrBaseUrl</code> 配成 <code>http://127.0.0.1:8000/v1</code> 即可让检索真正走光学读回路径。</p>
+<p>本机 AMD 路线（llama.cpp）：</p>
+<pre><code># 一键启动/确保 DeepSeek-OCR llama-server 在线
+node scripts/ensure-ocr-server.mjs 18080
+# 或手动
+powershell -File scripts/start-ocr-server.ps1
+</code></pre>
+<p>默认后端地址：<code>http://127.0.0.1:18080/v1</code>，模型默认为 <code>deepseek-ocr-Q4_K_M.gguf</code>（<code>DeepSeek-OCR-Q8_0.gguf</code> 也可通过 <code>ocrModelDir</code>/脚本参数覆盖）。</p>
+<h3>真实视觉 embedding（DeepSeek-OCR embeddings 端点）</h3>
+<p>llama.cpp 的 <code>/v1/embeddings</code> 支持多模态输入（<code>prompt_string</code> + <code>multimodal_data</code>）。当前构建的 <code>llama-server</code> 在 <code>--embeddings --pooling mean</code> 下<strong>同时提供 <code>/v1/chat/completions</code> 和 <code>/v1/embeddings</code></strong>，所以只需要一个服务即可同时做 OCR 和视觉 embedding：</p>
+<pre><code># 方式一：使用 start-ocr-server.ps1（已默认启用 combined 模式）
+powershell -File scripts/start-ocr-server.ps1 -Port 18080
+
+# 方式二：手动启动（需 -ub 大于单图视觉 token 数，默认 512 会拒绝大图）
+llama-server.exe --host 127.0.0.1 --port 18080 --embeddings --pooling mean \
+  -m &lt;model_dir&gt;\deepseek-ocr-Q4_K_M.gguf \
+  --mmproj &lt;model_dir&gt;\mmproj-deepseek-ocr-q8_0.gguf \
+  --alias deepseek-ocr -c 8192 -np 1 -n 1024 -b 2048 -ub 2048
+</code></pre>
+<p>然后把 <code>ocrEmbeddingBaseUrl</code> 配成与 <code>ocrBaseUrl</code> 相同的 <code>http://127.0.0.1:18080/v1</code>（不配置时也会自动回退到 <code>ocrBaseUrl</code>）。插件会为每条记忆存储 <strong>1280 维真实视觉 embedding</strong>，并报告“直接视觉 token 数”（仅用 media marker 请求，<code>prompt_tokens - 空文本基线</code>）。</p>
+<h2>与 DeepSeek OCR1 论文的差距</h2>
+<p>当前实现是 <strong>OCR1 思想的工程近似</strong>，不是论文内部机制的完整复刻：</p>
+<ol>
+<li><p><strong>DeepEncoder 内部压缩未复刻</strong></p>
+<ul>
+<li>论文：DeepEncoder 把文档图像真正压缩成少量 visual tokens，再交给 DeepSeek-3B 解码。</li>
+<li>当前：使用 llama.cpp 的 OCR/embeddings 接口做光学读回和视觉向量存储；视觉 token 数来自接口统计，不是 DeepEncoder 内部张量输出。</li>
+</ul>
+</li>
+<li><p><strong>Locate-and-Transcribe 是工程近似</strong></p>
+<ul>
+<li>论文/OCR-Memory：模型直接输出 SoM 编号（Locate），再取回原文（Transcribe）。</li>
+<li>当前：定位靠文本 token 重叠打分 + OCR 证据；返回原始 verbatim 片段，避免生成幻觉，但不是“模型输出编号”。</li>
+<li>LoRA 微调让模型输出 SoM 编号这部分按目标要求<strong>不做</strong>。</li>
+</ul>
+</li>
+<li><p><strong>视觉 embedding 已作为主检索信号（工程实现）</strong></p>
+<ul>
+<li>当前 <code>visualMemory.embedding</code> 已存储 1280 维真实视觉向量；</li>
+<li>检索时先用 query embedding 与记忆 embedding 的余弦相似度排序记忆，再在命中的记忆内做文本分段定位；</li>
+<li>这比纯文本打分更接近论文“用视觉表示检索”的方向，但仍不是 DeepEncoder 内部压缩。</li>
+</ul>
+</li>
+<li><p><strong>视觉 token 数是接口级直接测量</strong></p>
+<ul>
+<li>通过 embeddings 端点 marker-only 请求得到 <code>visualTokensDirect</code>；</li>
+<li>不是 DeepEncoder 内部逐层显式输出。</li>
+</ul>
+</li>
+</ol>
+<h2>当前运行服务与后续推进条件</h2>
+<ul>
+<li>当前实际需要的服务：<ul>
+<li><code>18080</code>：DeepSeek-OCR combined 服务，同时提供 <code>/v1/chat/completions</code>（OCR 读回）和 <code>/v1/embeddings</code>（1280 维视觉 embedding / embedding 检索）。</li>
+</ul>
+</li>
+<li>不再需要独立的 <code>18084</code>；探索残留的 <code>18081/18082/18083</code> 已全部关闭。</li>
+<li>已验证的推进边界：<ul>
+<li>无微调让 DeepSeek-OCR 直接输出 SoM 编号：当前 llama.cpp 后端不可靠（输出无关文本），因此论文原版 Locate 需要 LoRA 才能推进。</li>
+<li>DeepEncoder 内部压缩管线 / 内部逐层 visual token 数：当前 llama.cpp 公开接口无法获取。</li>
+<li>多模态 embedding 依赖 llama.cpp 扩展；在 AMD 无 NVIDIA/vLLM 环境下无法切换到官方 DeepEncoder 输出。</li>
+</ul>
+</li>
+<li>后续可推进条件：<ul>
+<li>若允许 LoRA 微调：可补上“模型输出 SoM 编号”的 Locate 能力。</li>
+<li>若具备 NVIDIA/vLLM 环境：可进一步对齐 DeepEncoder 内部压缩、内部 visual token 输出和官方多模态 embedding。</li>
+</ul>
+</li>
+</ul>
+<h2>开发与测试</h2>
+<pre><code>npm run build        # node --check
+npm test             # 47 项测试（含复杂隔离测试 + 真实 OCR/embedding + robustness，若后端在线）
+npm run test:smoke   # 本地端到端冒烟（真实 Python 渲染 + mock OCR）
+node scripts/compare-memory.mjs  # 对比 dsh-ocr1-memory vs dsh-memory（隔离临时环境）
+dsh --profile headless --dump-config   # 检查插件层已装配
+</code></pre>
+<h2>测试与对比结果</h2>
+<ul>
+<li><code>npm test</code>：<strong>47/47 通过</strong>。</li>
+<li>Robustness：多 Agent 共享 store、图像缺失/缓存损坏恢复、超长输入边界均通过。</li>
+<li>对比基准（<code>scripts/compare-memory.mjs</code>，隔离 headless + 官方原装 DSH）：<ul>
+<li>dsh-ocr1-memory：R1–R6 全部 PASS。</li>
+<li>dsh-memory：本次 R1–R6 全部 PASS；但 R5 此前手动验证曾 FAIL（<code>memory_archive</code> 后仍可被 <code>memory_read</code> 读到），行为不稳定。</li>
+<li>结论：dsh-ocr1-memory 未出现落后于 dsh-memory 的情况。</li>
+</ul>
+</li>
+</ul>
+<h2>Roadmap</h2>
+<ul>
+<li> LoRA 微调 DeepSeek-OCR decoder 做 SoM 检索（OCR-Memory 方案），把检索真正变成“模型输出编号”而非文本打分</li>
+<li> AgentOCR 式 segment optical caching（哈希分段缓存，降低渲染成本；已实现 <code>.render-cache</code> 复用）</li>
+<li> 压缩比指标与 OCR 文本基线校准（<code>ocr1_mem_metrics</code> / <code>ocr1_mem_calibrate</code>）</li>
+<li> 显式记忆更新（<code>ocr1_mem_update</code>，冲突消解）</li>
+<li> 自动确保 OCR 服务在线（<code>autoStartOcrServer</code>）</li>
+<li> 对比 dsh-memory 的隔离基准（R1–R6 已用修正后脚本完整重跑；dsh-ocr1-memory 全部 PASS）</li>
+<li> 真实 DeepSeek-OCR 视觉 embedding 存储（1280 维，<code>visualMemory.embedding</code>）</li>
+<li> 直接视觉 token 测量（embeddings 端点 marker-only 请求，<code>visualMemory.visualTokensDirect</code>）</li>
+<li> 多 Agent 共享 store（<code>sharedStore</code> + reload + 原子保存）</li>
+<li> 图像缺失 / 渲染缓存损坏自动恢复</li>
+<li> 超长输入边界测试</li>
+<li> 记忆命中热度驱动的动态衰减策略</li>
+<li> 自动注入 <code>/context</code> 让 Agent 每轮看到记忆摘要</li>
+</ul>
+<h2>相关参考</h2>
+<ul>
+<li>DeepSeek-OCR（OCR1）：<a href="https://arxiv.org/abs/2510.18234">https://arxiv.org/abs/2510.18234</a> · <a href="https://github.com/deepseek-ai/DeepSeek-OCR">https://github.com/deepseek-ai/DeepSeek-OCR</a></li>
+<li>OCR-Memory（方法蓝本，未开源）：<a href="https://arxiv.org/abs/2604.26622">https://arxiv.org/abs/2604.26622</a></li>
+<li>AgentOCR（工程参考，已开源）：<a href="https://github.com/langfengQ/AgentOCR">https://github.com/langfengQ/AgentOCR</a></li>
+</ul>

@@ -1,0 +1,267 @@
+<h1>dsh-auto-approval-llm</h1>
+<blockquote>
+<p>为 DeepSeek Harness 的 <strong>Auto 权限档</strong>提供 LLM 辅助自动审批 + 超时自动兜底。</p>
+</blockquote>
+<blockquote>
+<p>English: <a href="https://github.com/cuddly-guacamole/dsh-auto-approval-llm/blob/HEAD/README.en.md">README.en.md</a></p>
+</blockquote>
+<p><code>Auto 档</code> = <code>sandbox: danger-full-access</code> + <code>approval: ask</code>。本插件在 Auto 会话里充当 <code>approval/request</code> 的<strong>唯一终结裁决者</strong>：常规操作放行、危险/模糊操作交给「静态规则 → LLM 分类 → LLM/人工裁决 → 倒计时兜底 → 熔断」的自动管线，把「自动但安全」的吞吐做高，同时保证有人工与审计兜底。</p>
+<hr>
+<h2>特性</h2>
+<ul>
+<li><strong>静态规则 + LLM 分类器</strong>：只读/会话/工作区常规操作直接放行；危险、外部写、凭据外泄、受保护路径直接拒绝；模糊操作交给 LLM 预分类（<code>tools/guard</code> + <code>tools/pre-execute</code>）。</li>
+<li><strong>在线评审模型（可选）</strong>：填写 API 协议、地址、模型、密钥后，审批复审直接打到你的 OpenAI / Anthropic 兼容端点；密钥存在 DSH 凭据存储里，前端只显示「已配置」，永不回显。</li>
+<li><strong>人工倒计时 + 超时兜底</strong>：低/中/高三档倒计时（默认 3/5/10 秒）；超时按 <code>timeoutAction</code> 处理（<code>拒绝</code> / <code>通过</code> / <code>低风险自动同意</code>）。关浏览器也不悬挂（host 计时器独裁）。</li>
+<li><strong>LLM 接管</strong>：中风险且 LLM 在倒计时内给出明确结论时，客户端立即按 LLM 结论裁决，无需你点。</li>
+<li><strong>熔断</strong>：连续 <code>maxConsecutiveDenials</code> 次或累计 <code>maxTotalDenials</code> 次被 LLM 拒绝 → 转人工、不再自动倒计时；<code>/approval reset</code> 可重置。</li>
+<li><strong>可靠的历史与审计</strong>：内存 200 条 + <code>history.jsonl</code>，append-only <code>audit.jsonl</code>（清空留 tombstone）。</li>
+<li><strong>每会话评审模式</strong>：<code>/approval-mode manual|smart|unattended</code> 持久化；<code>manual</code> 全转人、<code>unattended</code> 自动应答（高风险仍转人）。</li>
+<li><strong>声明式规则</strong>：<code>rulesText</code> 用 Claude 风格 <code>工具(正则) | allow|deny|human [| 字段]</code> 一眼看懂、实时校验。</li>
+<li><strong>DSH 原生观感的设置卡</strong>：4 张可折叠子卡（计时器与熔断 / 在线评审模型 / 安全规则列表 / 最近审批记录），顶层开关即时保存、每卡独立 保存/放弃/恢复默认；非法配置值有红色横幅 +「尝试修复」。</li>
+</ul>
+<hr>
+<h2>工作方式</h2>
+<pre><code>工具调用
+  → tools.guard        静态硬拒闸门（命中即拒，不弹窗）
+  → tools/pre-execute  静态评估：allow 放行 / deny 拒绝 / ask 交给 LLM 分类器
+  → approval/request   唯一终结裁决：
+       声明规则 rulesText → denyList/allowlist → humanOnlyList → 评审模式 →
+       熔断检查 → 风险分档（LOW/MEDIUM/HIGH）→ LLM 复审 + 人工倒计时
+  → tools/post-execute 把「超时/规则/模型拒绝」标记喂回模型
+</code></pre>
+<ul>
+<li><strong>LOW</strong>：不送评审则静默放行；送评审时按 LLM 结论（ALLOW/DENY）直接裁决；LLM 无法决定（ESCALATE）转人工。</li>
+<li><strong>MEDIUM</strong>：弹面板 + 倒计时，同时并行跑 LLM；<code>llmTakeoverScope</code> 覆盖且 LLM 给出明确结论 → 立即跟随；否则只显示建议。</li>
+<li><strong>HIGH</strong>：弹面板 + 倒计时，LLM 只给建议不接管；超时严格按 <code>timeoutAction</code>。</li>
+<li>所有「需要人」的场景都委托官方面板显示倒计时；<strong>超时标记唯一作者是 host 计时器</strong>，客户端只上报 outcome，伪造不了。</li>
+</ul>
+<hr>
+<h2>安装</h2>
+<p>当前以本地注入 / 开发装配为主（尚未发布 npm）：</p>
+<pre><code># 本地开发构建
+DSH_CHECKOUT=&lt;dsh 源码 checkout&gt; bash scripts/build.sh   # 编译 host → lib/
+npx tsdown                                               # 构建 client bundle → lib/client.js
+
+# 注入器环境（dsh-super-injector）
+dev_inject_plugin &lt;本目录&gt;
+</code></pre>
+<p>发布（待做）：</p>
+<pre><code>dsh plugin --profile web add dsh-auto-approval-llm
+</code></pre>
+<blockquote>
+<p>提示：本插件依赖 DSH 的 <code>auto</code> 权限预设（<code>danger-full-access</code> + <code>approval: ask</code>），并作为 <code>approval/request</code> 的唯一终结者——<strong>不要与其他审批类插件（如 dsh-approval-llm / dsh-auto-review）同时启用</strong>。</p>
+</blockquote>
+<hr>
+<h2>快速开始</h2>
+<ol>
+<li>确保会话/预设处于 <strong>Auto 档</strong>（<code>auto</code> 预设）。</li>
+<li>到 设置 → 插件 → 自动审批，按需配置；默认即可工作（空配置 = 静态规则 + 会话模型评审 + 拒绝式超时兜底）。</li>
+<li>想让审批走你自己的模型：在「在线评审模型」卡填 协议 / API 地址 / 模型名称 / API 密钥 → 保存 → 测试连接。</li>
+<li>嫌中风险弹窗频繁或超时漏拦：调大「中风险倒计时」，或把「超时动作」改为 <code>拒绝</code> / <code>低风险自动同意</code>。</li>
+</ol>
+<hr>
+<h2>界面预览</h2>
+<p>在 Auto 权限预设下使用（<code>设置 → 通用设置 → 权限 → Auto</code>；Read Only / Workspace Write / Auto / Full access）：</p>
+<p><img src="https://raw.githubusercontent.com/cuddly-guacamole/dsh-auto-approval-llm/HEAD/assets/permission-auto-preset.png" alt="Auto 权限预设"></p>
+<p>设置卡总览——顶层开关即时保存，右侧为可折叠子卡：</p>
+<p><img src="https://raw.githubusercontent.com/cuddly-guacamole/dsh-auto-approval-llm/HEAD/assets/settings-overview.png" alt="设置卡总览"></p>
+<p>计时器与熔断——三档倒计时、熔断防劫持与双熔断阈值：</p>
+<p><img src="https://raw.githubusercontent.com/cuddly-guacamole/dsh-auto-approval-llm/HEAD/assets/settings-timers-breaker.png" alt="计时器与熔断"></p>
+<p>在线评审模型——API 协议 / 地址 / 模型 / 密钥（密钥前端不可见）：</p>
+<p><img src="https://raw.githubusercontent.com/cuddly-guacamole/dsh-auto-approval-llm/HEAD/assets/settings-online-reviewer.png" alt="在线评审模型"></p>
+<p>安全规则列表——安全 Prompt / 白黑名单 / 声明规则 / 规则干跑：</p>
+<p><img src="https://raw.githubusercontent.com/cuddly-guacamole/dsh-auto-approval-llm/HEAD/assets/settings-safety-rules.png" alt="安全规则列表"></p>
+<p>审批面板——倒计时贴在超时自动执行的动作上（此处 <code>超时动作=低风险自动同意</code> → 中风险超时自动<strong>拒绝</strong>，「拒绝」按钮带倒计时、「允许一次」保持干净）：</p>
+<p><img src="https://raw.githubusercontent.com/cuddly-guacamole/dsh-auto-approval-llm/HEAD/assets/approval-panel-countdown-reject.png" alt="审批面板 · 拒绝倒计时"></p>
+<p>会话审批统计——会话标题栏「自动审批」按钮弹层：总计/通过/拒绝/超时/熔断 + 最近记录：</p>
+<p><img src="https://raw.githubusercontent.com/cuddly-guacamole/dsh-auto-approval-llm/HEAD/assets/session-stats.png" alt="会话审批统计"></p>
+<hr>
+<h2>配置项</h2>
+<table>
+<thead>
+<tr>
+<th>键</th>
+<th>默认</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>enabled</code></td>
+<td>true</td>
+<td>总开关</td>
+</tr>
+<tr>
+<td><code>autoSwitchPolicyToAsk</code></td>
+<td>false</td>
+<td>仅 Auto 预设且 override=never 时自动切 ask</td>
+</tr>
+<tr>
+<td><code>timeoutAction</code></td>
+<td><code>reject</code></td>
+<td>倒计时超时动作：<code>reject</code> 拒绝 / <code>allow</code> 全部通过 / <code>low-risk-allow</code> 仅低风险放行</td>
+</tr>
+<tr>
+<td><code>llmReviewScope</code></td>
+<td><code>medium-or-above</code></td>
+<td>LOW/MEDIUM/HIGH 哪些档送 LLM 复审</td>
+</tr>
+<tr>
+<td><code>llmTakeoverScope</code></td>
+<td><code>medium-or-below</code></td>
+<td>哪些档允许 LLM 结论直接接管</td>
+</tr>
+<tr>
+<td><code>defaultReviewMode</code></td>
+<td><code>smart</code></td>
+<td>每会话评审模式默认：人工 / 智能 / 无人值守</td>
+</tr>
+<tr>
+<td><code>lowRiskSeconds</code> / <code>mediumRiskSeconds</code> / <code>highRiskSeconds</code></td>
+<td>3 / 5 / 10</td>
+<td>三档倒计时（秒）</td>
+</tr>
+<tr>
+<td><code>breakerAntiHijackMs</code></td>
+<td>0</td>
+<td>熔断弹窗按钮防误点禁用时长，0 不启用</td>
+</tr>
+<tr>
+<td><code>maxConsecutiveDenials</code></td>
+<td>3</td>
+<td>连续 LLM 拒绝熔断阈值，0 关闭</td>
+</tr>
+<tr>
+<td><code>maxTotalDenials</code></td>
+<td>20</td>
+<td>累计拒绝熔断阈值，0 关闭</td>
+</tr>
+<tr>
+<td><code>reviewerProtocol</code></td>
+<td><code>openai</code></td>
+<td>在线评审协议：<code>openai</code>(chat/completions) / <code>anthropic</code>(messages)</td>
+</tr>
+<tr>
+<td><code>reviewerBaseUrl</code></td>
+<td>''</td>
+<td>在线评审 API 地址；非空才走在线评审，空则跟随会话模型</td>
+</tr>
+<tr>
+<td><code>reviewerModel</code>（＋旧 <code>reviewerProvider</code>）</td>
+<td>''</td>
+<td>在线评审模型名（旧 Provider 路由保留兼容，不再 UI 暴露）</td>
+</tr>
+<tr>
+<td><code>safetyPrompt</code></td>
+<td>''</td>
+<td>附加给评审模型的额外策略（保存即热生效）</td>
+</tr>
+<tr>
+<td><code>allowlist</code> / <code>denyList</code> / <code>humanOnlyList</code></td>
+<td>[]</td>
+<td>工具名精确匹配</td>
+</tr>
+<tr>
+<td><code>rulesText</code></td>
+<td>''</td>
+<td>声明式规则（优先于内置列表执行）</td>
+</tr>
+<tr>
+<td><code>rulesDryRun</code></td>
+<td>false</td>
+<td>规则干跑：只记命中不执法</td>
+</tr>
+<tr>
+<td><code>maxArgsChars</code></td>
+<td>4000</td>
+<td>取回工具参数的最大长度</td>
+</tr>
+<tr>
+<td><code>notifyUser</code></td>
+<td>true</td>
+<td>「模型通过」通知进会话</td>
+</tr>
+<tr>
+<td><code>showSessionPanel</code></td>
+<td><code>off</code></td>
+<td>会话标题栏按钮：关 / 仅Auto / 开</td>
+</tr>
+<tr>
+<td><code>aiButtonPosition</code></td>
+<td><code>header</code></td>
+<td>按钮位置：标题栏 / 悬浮</td>
+</tr>
+<tr>
+<td><code>workspaceRoot</code> / <code>dshHome</code> / <code>tempRoots</code></td>
+<td>''/''/[]</td>
+<td>路径根（DSH_HOME 默认保护）</td>
+</tr>
+<tr>
+<td><code>classifierTimeoutMs</code> / <code>classifierMaxOutputTokens</code></td>
+<td>8000 / 1024</td>
+<td>分类器超时与输出上限</td>
+</tr>
+<tr>
+<td><code>debug</code></td>
+<td>false</td>
+<td>调试模式：写 <code>approval-debug.jsonl</code> 与 <code>[debug]</code> 日志</td>
+</tr>
+</tbody></table>
+<blockquote>
+<p>顶层开关（启用/切换策略/超时动作/评审·接管范围/默认模式/按钮显示与位置）改动即保存；每张子卡有独立的 保存/放弃修改 按钮（安全规则列表另有 恢复默认）。host-only 键（workspaceRoot 等）用 patch/YAML 配置，设置卡保存不会抹掉它们。</p>
+</blockquote>
+<hr>
+<h2>评审模式与命令</h2>
+<ul>
+<li><code>/approval-mode</code>　查看当前会话评审模式</li>
+<li><code>/approval-mode manual|smart|unattended</code>　设置（持久化）</li>
+<li><code>/approval reset</code>　重置熔断计数与在途审批状态</li>
+</ul>
+<hr>
+<h2>数据文件（均在插件根目录）</h2>
+<table>
+<thead>
+<tr>
+<th>文件</th>
+<th>语义</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>history.jsonl</code></td>
+<td>审批历史（内存窗口 200 条 + 落盘；&gt;1MB 轮转）。删除文件不触发重载、不清内存窗口，下一条裁决会自动重建</td>
+</tr>
+<tr>
+<td><code>audit.jsonl</code></td>
+<td>append-only 审计（清空留 <code>clear</code> tombstone）</td>
+</tr>
+<tr>
+<td><code>review-mode.json</code></td>
+<td>每会话评审模式快照</td>
+</tr>
+<tr>
+<td><code>approval-debug.jsonl</code></td>
+<td>仅调试模式开启时写入：评审/审批时序（decision/risk/tookMs/outcome/source），&gt;1MB 轮转</td>
+</tr>
+</tbody></table>
+<p>数据查询：<code>node scripts/audit-query.mjs [--last N|--tool X|--session S|--source S|--since ISO|--json]</code></p>
+<hr>
+<h2>安全设计要点</h2>
+<ul>
+<li><strong>唯一终结者</strong>：同一 approval 只有一个裁决者（prepend + global），避免双弹窗/双写/审计断裂。</li>
+<li><strong>fail-closed</strong>：评审器超时/垃圾/失败 → 拒绝或转人；ESCALATE 一律转人，不被 <code>timeoutAction=allow</code> 自动放行；reviewer 失败不计入熔断。</li>
+<li><strong>reasoning-blind</strong>：评审只看 工具名 + 结构化脱敏参数 + 有界直接用户消息（唯一授权证据）+ 工作区事实，剥离评审者的自述与工具输出。</li>
+<li><strong>密钥不出 host</strong>：在线评审密钥存 DSH 凭据，每操作解析、前端仅显「已配置」。</li>
+<li><strong>倒计时按钮规则</strong>：倒计时只贴在「会超时自动执行」的那个按钮上——<code>timeoutAction=通过</code> → 超时自动通过，「允许一次」倒计时、拒绝按钮干净；<code>timeoutAction=拒绝</code> / <code>低风险自动同意</code> → 中/高风险超时自动拒绝，「拒绝」按钮倒计时（低风险自动同意时仅低风险超时通过）。中风险默认 5 秒偏紧，建议按需调大。</li>
+</ul>
+<hr>
+<h2>致谢</h2>
+<p>本项目在设计与实现中参考/移植了以下开源项目，谨此致谢它们的作者与社区：</p>
+<ul>
+<li><strong><a href="https://github.com/NanmiCoder/dsh-auto-mode">@nanmicoder/dsh-auto-mode</a></strong> —— Auto 档 + 静态规则 → LLM 分类器 → 人工 的核心审批管线：受保护路径、静态评估、shell 安全解析、LLM 预分类等策略移植自该项目，并在 <code>src/auto/</code> 中重写为独立实现（移除该项目也可正常工作）。</li>
+<li><strong><a href="https://github.com/Anionex/dsh-vision-toolkit">@anionex/dsh-vision-toolkit</a></strong> —— 设置界面范式：在线模型（API 协议 / 地址 / 模型 / 密钥，密钥存 DSH 凭据、前端不可见）、红色报错横幅与修复按钮、「复用 DSH 原生 CSS 与 UI primitives」的做法。</li>
+</ul>
+<hr>
+<h2>版本 / 发布</h2>
+<ul>
+<li>当前：<code>0.0.1</code>（未发布 npm）。</li>
+<li>语义：BSD-3-Clause。</li>
+</ul>

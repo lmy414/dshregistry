@@ -1,0 +1,122 @@
+<h1>dsh-dlp</h1>
+<p>Data-loss prevention for <a href="https://github.com/deepseek-ai/deepseek-harness">DeepSeek Harness</a>,
+built as an out-of-repo plugin.</p>
+<p>📖 <strong><a href="https://charlotten7.github.io/dsh-dlp/">Full documentation</a></strong></p>
+<h2>What it does</h2>
+<ol>
+<li><strong>Denies credential-file access and secrets bound for the network</strong> — unconditionally, from
+<code>ctx.tools.guard()</code>, testing path-typed arguments against a table of credential stores and
+following symlinks first.</li>
+<li><strong>Redacts secrets out of tool results</strong> before the model reads them and before the session log
+records them, withholding a result it cannot clean.</li>
+<li><strong>Redacts secrets out of exported telemetry</strong>, closing a hole where <code>DSH_TELEMETRY_MODE=FULL</code>
+ships message text, tool arguments, results and workspace paths in the clear.</li>
+<li><strong>Strips invisible characters that carry hidden instructions</strong> — the Tags block, bidi
+overrides, runs of variation selectors — and strips terminal control sequences from the audit
+lane so a tool result cannot forge its own audit record.</li>
+<li><strong>Neutralises remote markdown images in assistant output</strong> and detects a tool call another
+plugin rewrote after the session log recorded it.</li>
+<li><strong>Asks before the agent writes a file that changes future behaviour</strong> — agent settings and
+hooks, <code>CLAUDE.md</code>, <code>.claude/rules/**</code> and the other agent rules directories, prompt
+templates, <code>.vscode/tasks.json</code>, <code>.mcp.json</code>, git hooks, CI workflows, shell startup files,
+<code>pnpm-workspace.yaml</code> — and before it writes a <code>*_BASE_URL</code> that would redirect a provider
+credential.</li>
+<li><strong>Asks before a call switches off its own confirmation</strong> — <code>non_interactive: true</code>,
+<code>approval_mode: auto</code>, an <code>apply</code> whose approval is still pending. Both <code>ask</code> tiers are
+prompts rather than controls: they live at <code>tools/pre-execute</code> and can be neutralised.</li>
+<li><strong>Writes an audit record for every decision.</strong> A redaction or denial names the rule, its
+version, the offsets and a keyed hash; the three kinds with no matched region to describe —
+an ask, a rewritten call, a neutralised image — carry a rule id, the changed field names or
+the destination hostname instead. Never the secret, never the path or command that matched.
+<code>dsh-dlp report</code> reads it back.</li>
+</ol>
+<h2>What this is not</h2>
+<p><strong>This is not a containment boundary.</strong> The plugin runs in-process, at the agent's own uid.
+Anything the agent can execute — a <code>bash</code> command, a <code>run_code</code> program, a mounted MCP server —
+can read every file the guard denies and open its own sockets without the plugin seeing anything.
+It closes the path where <em>the model</em> asks for credential material through a tool. It does not stop
+code that is already running. If you need containment, that is the sandbox, <code>landlock-run</code>,
+filesystem permissions and egress firewalling.</p>
+<p>Three limits worth knowing before you rely on it:</p>
+<ul>
+<li><strong>Only the guard floor is unconditional.</strong> Every other seam can be neutralised by a listener
+registered ahead of ours. <code>ctx.tools.guard()</code> is order-independent only because it has no allow
+arm.</li>
+<li><strong>The shell-command arm is advisory pattern-matching.</strong> It tests the whole command line and
+each of its tokens, so a credential path left <em>spelled</em> in the command is caught whatever
+program would open it: <code>python3 -c "open('~/.ssh/id_rsa')"</code> is denied. Changing the spelling
+defeats it — one glob character, quote-splitting, <code>find -exec</code>, a substitution that assembles
+the path from pieces, a base64 round-trip, each verified. <strong>Do not count this arm as a
+control.</strong></li>
+<li><strong>Detection is pattern-based.</strong> No entropy rule (measured, not assumed: at a false-positive-free
+threshold the miss rate is 100% below 22 characters). Encoded forms pass. A homoglyph defeats
+every rule in this package.</li>
+</ul>
+<p><a href="https://charlotten7.github.io/dsh-dlp/">The full list of limits →</a></p>
+<h2>Install</h2>
+<p>A profile carrying only <code>@deepseek-ai/dsh-base</code> has no agent loop, so add a runnable bundle
+alongside it or there is nothing for this plugin to guard:</p>
+<pre><code>dsh plugin --profile &lt;name&gt; add @deepseek-ai/dsh-headless@0.1.0-rc.6
+dsh plugin --profile &lt;name&gt; add dsh-dlp
+dsh --profile &lt;name&gt; --dump-config      # the dsh-dlp row should appear
+</code></pre>
+<p>Any harness from <code>0.1.0-rc.6</code> onwards in the <code>0.1.x</code> line works: the peer ranges accept it and CI
+runs the end-to-end suite against every published rc in that range.</p>
+<p>Pin <code>@deepseek-ai/dsh-headless</code> explicitly — its npm <code>latest</code> tag still points at <code>0.0.1-rc.1</code>.
+The package ships a <code>cordis.patch.yml</code> bundle layer, so listing it in <code>dsh.profile.bundles</code> mounts
+it with working defaults.</p>
+<p><strong>Install from the registry or a packed tarball, not from a git spec:</strong> <code>lib/</code> is a build output
+git does not carry and no <code>prepare</code> script rebuilds it, so a git-spec row mounts and then fails to
+load.</p>
+<h2>Configure</h2>
+<pre><code>- id: dsh-dlp
+  config:
+    auditLog: /var/log/dsh-dlp.audit.jsonl
+    redactionKeyFile: /var/lib/dsh/dsh-dlp.redaction-key
+    policyFile: ./.dsh-dlp.yml        # optional, lowest trust
+    breadthTier: true
+    resultRedaction: true
+    telemetryRedaction: true
+    configWriteAsk: true
+    approvalSuppressionAsk: true
+</code></pre>
+<p><code>redactionKeyFile</code> is created on first mount with 32 random bytes at mode <code>0600</code>. Keep it out of
+version control — it is what makes a placeholder's hash keyed rather than a bare digest anyone
+holding a candidate secret could confirm.</p>
+<p><strong>The guard floor has no configuration.</strong> Credential-path denial and secret-argument denial are
+security invariants, not deployment-varying tunables. A repo-local <code>policyFile</code> is the lowest
+trust rank and may only <em>tighten</em>: add deny patterns, add egress tool names, raise a severity,
+switch a pass on. Any downgrade makes the whole file invalid.</p>
+<p><a href="https://charlotten7.github.io/dsh-dlp/configuration.html">Configuration reference →</a> ·
+<a href="https://charlotten7.github.io/dsh-dlp/denials.html">What gets denied →</a> ·
+<a href="https://charlotten7.github.io/dsh-dlp/redaction.html">Redaction and detection →</a></p>
+<h2>Reading the audit log</h2>
+<pre><code>dsh-dlp report                       # everything in the audit sink
+dsh-dlp report --since 24h
+dsh-dlp report --session &lt;id&gt;
+dsh-dlp report --would-have          # everything except the denials
+</code></pre>
+<p>A redaction or denial record carries a rule id, rule version, span offsets and a keyed hash —
+never the matched value. An ask carries its rule id, a rewritten call the names of the fields
+that changed, and a neutralised remote image the destination hostname in the clear; none of
+those has a matched region to hash.</p>
+<p><a href="https://charlotten7.github.io/dsh-dlp/audit.html">Audit record format →</a></p>
+<h2>Mitigations for defects in the harness itself</h2>
+<p>Three registrations work around defects in DeepSeek Harness rather than in your configuration:
+remote markdown images in assistant output, a tool call rewritten between <code>tools/pre-execute</code> and
+the guard, and a telemetry redactor that cannot run under the shipped default. <strong>None of them
+closes its channel</strong> and an upstream fix is better in all three cases.</p>
+<p><a href="https://charlotten7.github.io/dsh-dlp/harness-mitigations.html">What each one does and does not close →</a></p>
+<h2>Development</h2>
+<pre><code>nvm use 22           # Node ^22.19.0 || &gt;=24, and pnpm 11
+pnpm install
+pnpm run typecheck
+pnpm run test:coverage
+pnpm run test:e2e    # boots a real dsh against a mock model; no API key
+</code></pre>
+<p>Coverage is gated at 100% per file: this is a security control, so an untested branch in a deny
+path is an unproven deny path.</p>
+<p>Design decisions and their rationale live in <a href="https://github.com/CharlotteN7/dsh-dlp/blob/HEAD/ADR.md">ADR.md</a>. Security policy is in
+<a href="https://github.com/CharlotteN7/dsh-dlp/blob/HEAD/SECURITY.md">SECURITY.md</a>.</p>
+<h2>License</h2>
+<p>MIT</p>

@@ -1,0 +1,157 @@
+<h1>dsh-turn-fork</h1>
+<p>Turn-atomic message editing, retry, reroll, and version-tree navigation for
+<a href="https://github.com/deepseek-ai/deepseek-harness">DeepSeek Harness</a> conversations.</p>
+<p><a href="https://github.com/ruby1304/dsh-turn-fork/blob/HEAD/README.zh-CN.md">简体中文</a></p>
+<ul>
+<li>Edit any settled user message and re-run the conversation from that turn
+(<code>truncate</code> or <code>preserve</code> downstream turns).</li>
+<li>Retry any historical turn; regenerate the latest reply.</li>
+<li>Version tree Timeline with undo/redo navigation across branches.</li>
+<li>Branch logs <strong>survive a dsh process restart</strong> — the P0 durability guarantee
+the community plugin <code>dsh-message-edit</code> fails (see below).</li>
+<li>Official slots only: Timeline tab, session-header actions, and per-message
+assistant actions. No DOM injection, no text guessing.</li>
+<li>Bilingual UI (zh / en) through the <code>dsh-client-locale</code> service.</li>
+</ul>
+<h2>Install</h2>
+<pre><code>dsh plugin add dsh-turn-fork
+</code></pre>
+<p>Then restart dsh. The plugin registers a <strong>Turn Fork</strong> tab (between Trajectory
+and Prompt Studio), compact undo/redo/regenerate buttons in the session
+header, and retry/regenerate buttons on each finalized assistant message.</p>
+<h2>Why this plugin exists</h2>
+<p><code>dsh-message-edit</code> (v0.2.3) has a P0 defect: its durable provenance event
+<code>message-edit/version</code> is written <strong>without</strong> the <code>ignorable</code> marker. The live
+write path accepts it, but after a dsh restart the persistence layer's
+cold-read vocabulary guard (<code>assertEventsSupported</code>) rejects the whole log
+with <code>SessionFormatUnsupportedError</code> — every branch session becomes
+unreadable. See <code>tests/p0-persistence.test.mjs</code> for a reproduction (live
+write OK → restart → cold read REJECTED) and this plugin's regression test
+(ignorable marker → restart → cold read PASSES), run against the real
+<code>dsh-session</code> + <code>dsh-session-persistence-jsonl</code> packages in a fresh child
+process.</p>
+<p><code>dsh-turn-fork</code> also fixes the design gaps the review found in the community
+plugin:</p>
+<table>
+<thead>
+<tr>
+<th>Gap</th>
+<th>This plugin</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>Custom events must be <code>ignorable: true</code></td>
+<td><code>turn-fork/version</code> is always ignorable; schema-versioned for future migration</td>
+</tr>
+<tr>
+<td>HTTP route without trust fence (CSRF / DNS rebinding, quota burning)</td>
+<td>Origin/Host loopback fence + content-type check + 64 KiB body cap</td>
+</tr>
+<tr>
+<td>Message targeting by DOM text guessing</td>
+<td>Official slots only (<code>conversation.view</code>, <code>conversation.session.header.actions</code>, <code>conversation.chat.assistant-actions</code>)</td>
+</tr>
+<tr>
+<td><code>reasoningEffort</code> / config lost on fork</td>
+<td><code>provider</code>/<code>model</code>/<code>maxTokens</code> derive from the last <code>request/header</code>; <code>reasoningEffort</code> and <code>adapterDefaults</code> ride the inherited header inside the seed</td>
+</tr>
+<tr>
+<td>Steering messages dropped on replay</td>
+<td>Every user input of a turn is preserved and replayed in order</td>
+</tr>
+<tr>
+<td>Assistant edits forge <code>source: {kind:'model'}</code> and drop tool calls</td>
+<td>Not supported (honest limitation, see below)</td>
+</tr>
+<tr>
+<td>Undo navigation leaves branches running silently</td>
+<td>Running branches are reported; each has an explicit Stop control</td>
+</tr>
+<tr>
+<td><code>preserve</code> replays N turns with no confirmation</td>
+<td>Cost hint and explicit cascade choice before saving</td>
+</tr>
+<tr>
+<td>No tests, no i18n</td>
+<td>node:test suite + P0 regression + dsh-testkit lifecycle gate; zh/en dictionaries</td>
+</tr>
+</tbody></table>
+<h2>Usage</h2>
+<ul>
+<li><strong>Edit a user message</strong> — open the <em>Turn Fork</em> tab, pick a message, correct
+the text, choose the downstream policy and save. A new branch session is
+created from the completed prefix and the corrected turn re-runs.</li>
+<li><strong>Retry / regenerate</strong> — per-turn buttons in the tab, per-message buttons on
+assistant replies, or the header regenerate button for the latest reply.</li>
+<li><strong>Version tree</strong> — the tab lists every branch with its operation summary
+(<code>from "…" to "…"</code>), marks the current version, and offers Undo/Redo
+navigation plus Open for any branch. Branches with a running agent show a
+warning and a Stop control.</li>
+<li><strong>Cascade policy</strong> — <code>truncate</code> drops everything after the edited turn;
+<code>preserve</code> replays the edited turn and every later turn (each replayed input
+becomes its own turn, with inputs of the same original turn kept in order).
+The editor shows how many turns <code>preserve</code> will replay before you confirm.</li>
+</ul>
+<h2>Design notes</h2>
+<ul>
+<li><strong>Fork semantics.</strong> The official <code>session.fork(atSeq)</code> RPC cuts <em>including</em>
+the anchored turn, which cannot express "edit turn N and re-run it". This
+plugin therefore uses the same underlying transaction seam the official
+fork uses internally — <code>ctx.agents.create</code> — with the seed cut <em>before</em> the
+target turn, official lineage meta (<code>parentSession</code>, <code>seedLength</code>, <code>cwd</code>,
+<code>agentPreset</code>), the source's preset re-mounted, and durability flushed
+before the branch is announced.</li>
+<li><strong>Workspace.</strong> The fork inherits the source's workspace attachment exactly
+like the official fork does (re-attach, no filesystem snapshot). Re-running
+a task that rewrites files can therefore leave the working tree at the new
+branch's state. Pair with a checkpointing plugin
+(e.g. <code>dsh-checkpoint-rewind</code>) when you need workspace state rewind.</li>
+<li><strong>Branch deletion / GC.</strong> The platform currently exposes no session-delete
+API, so branches cannot be garbage-collected yet; the version tree is a
+plain disclosure of this lineage.</li>
+<li><strong>Migration from <code>dsh-message-edit</code>.</strong> Logs written by the broken event
+format are refused by the persistence layer itself, so no reader — this
+plugin included — can repair them in place. The Timeline detects the
+refusal and reports it explicitly. To recover old transcripts, use the
+official export flow before upgrading, or wait for the upstream fix.</li>
+</ul>
+<h2>HTTP trust fence</h2>
+<p>The host route <code>/turn-fork</code> is served by the dsh web server, which performs no
+origin checks of its own. Every request must pass the plugin's fence: a
+browser <code>Origin</code> must be <code>http(s)://localhost|127.0.0.1|[::1]</code> with the
+server's exact port (relaxed only when the server listens on <code>0.0.0.0</code>, the
+operator's explicit remote-exposure opt-in); requests without an <code>Origin</code>
+must carry a loopback <code>Host</code>. POST bodies must be <code>application/json</code> and at
+most 64 KiB.</p>
+<h2>Development</h2>
+<pre><code>npm install
+npm run build      # tsc typecheck + tsdown host/client bundles
+npm test           # build + node:test (core, lineage, P0 persistence regression)
+</code></pre>
+<h3>Tests</h3>
+<ul>
+<li><code>tests/p0-persistence.test.mjs</code> — the P0 regression: the plugin's real fork
+seed is written through a real <code>dsh-session</code> store and
+<code>dsh-session-persistence-jsonl</code> backend, flushed to disk, then cold-read in
+a fresh child process ("restart"). A negative control proves the guard
+rejects the same log with the marker stripped.</li>
+<li><code>tests/core.test.mjs</code> — steering fidelity, plan boundaries, seed
+construction, model-config derivation, trust-fence matrix, body cap,
+operation decoding.</li>
+<li><code>tests/lineage.test.mjs</code> — version projection, undo/redo stacks, running
+flags.</li>
+<li><code>dsh-testkit.yaml</code> — real-host lifecycle gate (install → boot → register →
+uninstall → reboot → residue) via the community
+<a href="https://github.com/iiwish/dsh-testkit">dsh-testkit</a>, plus the generated
+<code>.github/workflows/dsh-lifecycle.yml</code> CI workflow.</li>
+</ul>
+<h3>Testkit notes</h3>
+<p><code>dsh-test --suite full</code> reports <code>flaky</code> under <code>--runner local</code>: every attempt
+passes every stage with identical assertions, but the repeatability digest
+includes attempt-scoped absolute paths and timestamps, which necessarily
+differ between attempts (the Docker default runner keeps the run-root path
+stable). The quick suite is the authoritative lifecycle gate here; the CI
+workflow runs it under Docker.</p>
+<h2>License</h2>
+<p>MIT. The client bundle preset under <code>scripts/dsh-client-preset.ts</code> is vendored
+from the DeepSeek Harness repository (MIT, © DeepSeek).</p>

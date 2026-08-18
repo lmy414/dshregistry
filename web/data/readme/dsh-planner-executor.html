@@ -1,0 +1,92 @@
+<h1>dsh-planner-executor</h1>
+<p>DeepSeek Harness 插件：<strong>规划/执行分离</strong>。</p>
+<ul>
+<li>主模型（会话所选模型）负责分析问题、制定计划、汇总结果；</li>
+<li>执行工作通过工具 <code>delegate_execution</code> 委派给<strong>独立的执行子代理</strong>；</li>
+<li>执行子代理的模型 / LLM 提供方 / 人格 / 工具范围在 Web 设置面板「<strong>规划与执行</strong>」分节配置（留空 = 继承主模型）；</li>
+<li>子代理在独立会话中执行，<strong>中间步骤永不进入主会话</strong>，只有最终汇报回到主模型 —— 最大化节约主模型 token，且让不同角色各用最合适的模型。</li>
+</ul>
+<p>零构建依赖、纯 JS（ESM 宿主 + 手写浏览器 bundle），即装即用。</p>
+<h2>安装</h2>
+<pre><code># 1. 安装进 web profile
+dsh plugin --profile web add "github:mikuuuuuue/dsh-planner-executor"
+
+# 2. 把插件加入 bundle 层
+#    编辑 ~/.dsh/profiles/web/package.json 的 dsh.profile.bundles，追加：
+#    "dsh-planner-executor"
+
+# 3. 重启 dsh web 进程
+</code></pre>
+<blockquote>
+<p>本地开发提示：以 <code>file:</code> 方式安装本地源码目录时，pnpm 会<strong>拷贝</strong>目录而非
+符号链接，改动源码后需重新执行 install 再重启；发布新版本后重新 add 升级。</p>
+</blockquote>
+<h2>测试</h2>
+<pre><code>npm install   # 拉取 devDependencies
+npm test      # host-boot（24 项）+ client-smoke（1 项）
+</code></pre>
+<h2>配置</h2>
+<p>Web 设置 → 「规划与执行」：</p>
+<table>
+<thead>
+<tr>
+<th>字段</th>
+<th>含义</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>子代理后端</td>
+<td><code>spawn</code>（全新上下文，省 token，默认）/ <code>fork</code>（继承主代理已完成轮次）</td>
+</tr>
+<tr>
+<td>LLM 提供方</td>
+<td>执行子代理的 provider 路由；留空 = 继承主模型提供方</td>
+</tr>
+<tr>
+<td>执行模型</td>
+<td>执行子代理的模型 ID；留空 = 继承主模型</td>
+</tr>
+<tr>
+<td>单次执行最大 Token</td>
+<td>子代理 token 预算；0 = 继承</td>
+</tr>
+<tr>
+<td>最大委派深度</td>
+<td>递归上限；0 = 禁止委派（默认 3）</td>
+</tr>
+<tr>
+<td>执行者人格</td>
+<td>子代理 persona（覆盖部署默认人格）</td>
+</tr>
+<tr>
+<td>允许工具 / 禁止工具</td>
+<td>子代理工具过滤（逗号分隔）；<code>delegate_execution</code> 自身<strong>永远</strong>被禁止</td>
+</tr>
+<tr>
+<td>规划者指引</td>
+<td>只对顶层主代理显示的系统提示词段（引导「规划 → 委派 → 汇总」）</td>
+</tr>
+</tbody></table>
+<p>保存后对<strong>下一次</strong> <code>delegate_execution</code> 调用即时生效（每次调用实时读取设置）。</p>
+<h2>工作原理</h2>
+<ul>
+<li>主代理调用 <code>delegate_execution(task, context)</code> → 插件读取设置 → <code>ctx.subagents.start(backend, { agentOptions: { provider?, model?, maxTokens? }, persona, toolFilter, maxDepth, ... })</code>。</li>
+<li>子代理通过 <code>agentOptions</code> 显式指定模型/提供方（<code>resolveChildAgentOptions</code> 覆盖继承值），在其独立会话中执行并返回最终汇报；<code>run.result</code> 的 <code>stopReason</code> 非 <code>completed</code> 时（超限/取消/拒绝/失败）映射为带原因的错误并附保留的部分输出。</li>
+<li>安全边界（由 dsh-subagent 接缝保证 + 插件自加）：<ul>
+<li>子代理权限固定在继承的沙箱范围内，审批策略固定为 <code>never</code>，无法自拓宽；</li>
+<li>子代理的工具目录不含 <code>delegate_execution</code>（toolFilter 强制 deny），且即使被构造调用，深度守卫（<code>delegationDepth &gt; 0</code>）也会拒绝；</li>
+<li><code>maxDepth</code> 限制递归委派。</li>
+</ul>
+</li>
+<li>规划指引段按深度动态渲染：只有顶层代理（delegation depth 0）看得到；子代理与冷组装看到空串。</li>
+</ul>
+<h2>已知限制</h2>
+<ul>
+<li>工具从宿主平面注册（对个人单 profile 部署无影响）：所有会话的主代理都可见 <code>delegate_execution</code>；执行子代理因 toolFilter 不可见。</li>
+<li>不支持按次调用的动态模型参数（模型选择是部署级配置，保证 schema 与 KV cache 前缀稳定）。</li>
+<li>未引入 <code>outputSchema</code> 结构化汇报（可作后续增强）。</li>
+</ul>
+<h2>测试</h2>
+<p><code>test/host-boot.test.mjs</code> 用真实 cordis Context + 内存 settings 提供方 + 假 subagents/llm/webServer 驱动工具与设置路由；<code>test/client-smoke.test.mjs</code> 在 Node 中加载浏览器 bundle 校验契约。</p>
+<h2>License</h2>
+<p>MIT</p>

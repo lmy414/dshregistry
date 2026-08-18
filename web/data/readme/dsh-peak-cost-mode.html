@@ -1,0 +1,88 @@
+<h1>dsh-peak-cost-mode</h1>
+<p>DeepSeek peak-pricing cost guard for <a href="https://github.com/deepseek-ai/dsh">DeepSeek Harness</a> (DSH): during DeepSeek peak-pricing hours (Beijing time 09:00–12:00 and 14:00–18:00, price ×2) the agent automatically switches to ultra-compressed <strong>caveman-style output</strong> to cut output tokens, and a header badge + toast keep you posted on every peak/valley transition.</p>
+<h2>Features</h2>
+<ul>
+<li><strong>Automatic peak detection</strong> — Beijing time (UTC+8, no DST) is checked every 30 s against the DeepSeek V4 peak-pricing schedule:<table>
+<thead>
+<tr>
+<th>Window (Beijing)</th>
+<th>Tier</th>
+<th>Price</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>09:00–12:00</td>
+<td>Peak</td>
+<td>×2</td>
+</tr>
+<tr>
+<td>12:00–14:00</td>
+<td>Valley</td>
+<td>×1</td>
+</tr>
+<tr>
+<td>14:00–18:00</td>
+<td>Peak</td>
+<td>×2</td>
+</tr>
+<tr>
+<td>18:00–next 09:00</td>
+<td>Valley</td>
+<td>×1</td>
+</tr>
+</tbody></table>
+</li>
+<li><strong>Peak-hour cost saving</strong> — while in a peak window, a "Peak Cost Mode" prompt section is injected, instructing the model to reply in ultra-compressed caveman style (drop filler/pleasantries/hedging, keep all technical content verbatim: code, commands, API names, file paths, exact error strings, numbers; safety warnings and irreversible-action confirmations are never compressed).</li>
+<li><strong>Transition reminders</strong> — toasts on every tier switch:<ul>
+<li>valley → peak: 「梁文锋来了，少说话多做事。」(Liang Wenfeng is here — talk less, do more.)</li>
+<li>peak → valley: 「梁文谷来了，一切正常。」(back to normal)</li>
+</ul>
+</li>
+<li><strong>Persistent status badge</strong> — right side of the session header (left of the session-log button): red <code>高峰 ×2 · 省流中</code> during peak, green <code>低谷 ×1</code> otherwise, with full details (windows / multiplier / Beijing time / next switch) on hover. Clicking the badge opens the savings report.</li>
+<li><strong>Savings metering (0.2.0)</strong> — during peak hours the plugin intercepts every streaming model call (<code>llm/stream</code>) and records real token usage per model (input miss / cache hit / output, disjoint counts from the DeepSeek adapter). It then estimates how much the cave-man compression saved you and converts it to RMB at DeepSeek peak prices:<ul>
+<li><code>saved tokens ≈ peak output tokens × r/(1−r)</code> where <strong>r = compression ratio, default 0.6</strong> (conservative; configurable 0–0.9).</li>
+<li><code>saved RMB = saved tokens × model peak output price / 1M</code> (peak price = valley ×2; e.g. V4-Flash output ¥9.0/M, V4-Pro output ¥27.0/M).</li>
+<li><strong>Cache-hit awareness</strong> — input is invoiced separately by cache hit vs. miss (hit ¥0.05 vs miss ¥1.5 per M for Flash → 30×; ±for Pro), a <code>cache hit rate</code> health metric is shown, and a <code>cache delta</code> line reports whether a different hit rate helped (+¥) or cost (−¥) extra; net saved = output saved + cache delta.</li>
+<li>Totals are saved per peak window to <code>${DSH_HOME:-~/.dsh}/dsh-peak-cost-mode/stats.json</code> and survive restarts (falls back to in-memory if the file cannot be written).</li>
+<li>Good to know: the “saved” figure is an <strong>estimate</strong> (a counterfactual — the exact uncompressed output is unknowable). It is clearly labelled as such in the UI.</li>
+</ul>
+</li>
+<li><strong>Where savings are shown</strong> — the header badge (peak live counter), an ambient readout above the composer (<code>conversation.composer.dock</code>), the peak→valley toast (this peak's summary), and a <strong>savings report panel</strong> (click the badge): this peak / today / total in tokens + RMB, per-model breakdown, cache hit rate vs. baseline, invoice vs. counterfactual, and a “reset” button (<code>POST /api/peak-cost/reset</code>).</li>
+</ul>
+<h2>Install</h2>
+<pre><code>dsh plugin --profile web add dsh-peak-cost-mode
+# or from GitHub
+dsh plugin --profile web add github:moon09300731/dsh-peak-cost-mode
+</code></pre>
+<p>Then restart <code>dsh web</code> and hard-refresh the browser page.</p>
+<h2>Configuration</h2>
+<p>Optional JSON file at <code>${DSH_HOME:-~/.dsh}/dsh-peak-cost-mode/config.json</code>:</p>
+<pre><code>{
+  "saveRatio": 0.6,
+  "baseCacheHitRate": 0.5,
+  "multiplier": 2,
+  "prices": {
+    "deepseek-v4-flash": { "hit": 0.05, "miss": 1.5, "output": 4.5 },
+    "deepseek-v4-pro": { "hit": 0.15, "miss": 4.5, "output": 13.5 }
+  }
+}
+</code></pre>
+<ul>
+<li><code>saveRatio</code> — assumed output-compression ratio of the cave-man mode (default 0.6; bounds 0–0.9).</li>
+<li><code>baseCacheHitRate</code> — assumed input cache-hit rate for the “without plugin” counterfactual input invoice when no valley-time measurement exists (default 0.5).</li>
+<li><code>multiplier</code> — peak multiplier used for the RMB conversion (default 2).</li>
+<li><code>prices</code> — per-model valley prices in ¥ per million tokens; exact model keys override the built-in flash/pro defaults. <strong>Prices go stale — verify against the official DeepSeek pricing page; displayed savings are estimates, not an invoice.</strong></li>
+</ul>
+<h2>How it works</h2>
+<ul>
+<li>Host (<code>src/index.mjs</code>): a 30 s timer computes the Beijing wall-clock time; on entering a peak window it registers a <code>systemPrompt</code> section (<code>peak-cost-mode</code>, order 60) that makes the next and subsequent model steps reply compressed; on leaving it disposes the section. Since 0.2.0 it also subscribes to the <code>llm/stream</code> waterfall, wrapping each call to capture <code>usage</code> (input/cacheRead/output tokens) + model id at completion time when the Beijing clock is inside a peak window, accumulates a per-window ledger, and exposes <code>GET /api/peak-cost/state</code>, <code>GET /api/peak-cost/stats</code> and <code>POST /api/peak-cost/reset</code>.</li>
+<li>Client (<code>client.js</code>): polls <code>/api/peak-cost/state</code> every 30 s (mirroring a snapshot to <code>localStorage</code> key <code>dsh.peakCost.v1</code>) and renders the badge, toasts, the composer readout and the report panel.</li>
+</ul>
+<blockquote>
+<p>Note: the prompt section is registered in the host scope, so during peak hours it applies to <strong>all sessions</strong> of the deployment (that is the cost-saving point). If you want peak compression for one session only, use the dynamic-plugin variant instead.</p>
+</blockquote>
+<h2>Development</h2>
+<pre><code>npm test   # node --check src/index.mjs &amp;&amp; node --check client.js
+</code></pre>
+<h2>License</h2>
+<p>MIT © moon09300731</p>

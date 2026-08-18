@@ -1,0 +1,228 @@
+<h1>dsh-cli-interactive</h1>
+<p>在无头服务器上把 DeepSeek Harness 变成 <strong>Claude Code 风格的交互式终端 CLI</strong>。</p>
+<p>这是一个 out-of-tree 的 dsh <strong>profile bundle</strong>：叠加在官方 <code>dsh-base</code> 之上，
+复用 dsh 的全部核心能力（agent 循环、会话持久化、工具、凭据、settings、沙箱审批），
+只把官方 <code>dsh-headless</code> 的"提交一次任务就退出"换成<strong>持久 REPL 循环</strong>——
+同一个 agent 反复对话、回复流式输出、审批在终端应答、每轮结束后会话落盘、
+随时 <code>--resume</code> 找回旧会话。不挂载任何 Host / HTTP / 浏览器插件。</p>
+<h2>特性</h2>
+<ul>
+<li>交互式 REPL：输入即消息，agent 回复流式打印（增量轮询 session 事件日志）</li>
+<li>会话持久化：每轮结束后 flush 到 <code>$DSH_HOME/sessions/*.jsonl</code>（默认 <code>~/.dsh/sessions</code>）</li>
+<li><code>--resume &lt;sessionId&gt;</code>：恢复旧会话继续聊（复用官方 <code>agents.resume()</code>）</li>
+<li>审批应答：默认 <code>workspace-write + ask</code> 策略下的权限询问直接在终端 y/n 应答</li>
+<li>slash 命令：<code>/help /sessions /model /permission /cancel /session /workspace /exit</code></li>
+<li>忙时输入不丢：agent 执行期间键入的内容排队，下一轮自动发出</li>
+<li>Ctrl-C 中断当前轮（<code>agent.cancel({kind:'user'})</code>），再按一次退出</li>
+<li>启动参数：<code>--model --provider --preset --once</code>，任务位置参数可选（先跑一轮再进 REPL）</li>
+<li>输入历史持久化：<code>$DSH_HOME/cli.history</code>，上下键翻查，重进保留</li>
+<li>Tab 补全：<code>/he</code>+Tab → <code>/help</code>；<code>/model dee</code>+Tab → 模型名</li>
+<li><code>--once</code>：跑完任务（或一轮）即退出，脚本友好（<code>dsh --profile cli --once "task"</code>）</li>
+</ul>
+<h3>界面</h3>
+<ul>
+<li>紧凑 banner 盒：session id / 会话标题 / workspace·模型(provider)·策略 / 快捷提示（长路径自动掐头去尾）</li>
+<li>会话标题：首轮 prompt 截断生成（<code>--task</code> 或 resume 旧会话自动恢复），横幅 + 状态行显示</li>
+<li>每轮状态行：<code>dsh-cli · session-… · "标题" · 模型 · 策略 · cwd</code></li>
+<li>提示符带模型名：<code>you (deepseek-v4-flash)&gt; </code>，<code>/model</code> 切换后立即反映</li>
+<li>流式输出：<code>assistant [step N]&gt;</code>，step 推进处插入 <code>[step N]</code> 分隔（仅行首，不切断单词）</li>
+<li>内联工具行：工具调用在文本流中安全插入 <code>⚙ bash …</code> 行（仅行边界，绝不切断单词；行中则走活动行）</li>
+<li>工具活动：<code>⚙ step N · bash …</code>（内容变化时才原位重绘：新 step / 工具开始 / 工具完成，绝不逐帧刷屏），完成 <code>✓</code>；轮末摘要 <code>⚙ N tool call · S steps · ↑in ↓out tok</code></li>
+<li>错误轮次提示：turn 出错后提示重试 / 退出，不静默继续</li>
+<li><code>/help</code> 分组排版：session / info / control 三组</li>
+<li>审批提示友好化：<code>⚠ approval required</code> 框内分层显示工具名（亮黄粗体）/模式/原因</li>
+<li>自适应终端：TTY 下彩色 + Unicode 圆角框；管道/<code>NO_COLOR</code> 下自动降级纯文本（<code>FORCE_COLOR=1</code> 可强制着色）</li>
+</ul>
+<h2>目录结构</h2>
+<pre><code>dsh-cli-interactive/
+├── package.json          # 声明 dsh.bundle.patch → 安装时自动加入 profile 层栈
+├── cordis.patch.yml      # 组合层（不要动插件行，只可改 persona 等配置值）
+├── lib/
+│   ├── ui.js             # ANSI 样式/布局助手（零依赖）：色板、可见宽度、box、表格、spinner、工具摘要
+│   ├── startup.js        # 命令行参数（--resume/--model/--provider/--preset/[task]/--once）
+│   └── runner.js         # REPL 主循环——banner、you&gt; 提示符、流式输出、slash 命令、审批提示、会话横幅
+├── bin/dsh-cli.js        # 便捷入口：dsh-cli ≡ dsh --profile cli
+├── scripts/build.mjs     # 构建脚本（node --check 语法校验 + 组装 dist/，零依赖）
+├── tests/unit.mjs        # 单元冒烟测试（node tests/unit.mjs）
+└── README.md
+</code></pre>
+<h2>构建</h2>
+<p>零工具链、零网络依赖（Node ≥ 22 自带）：</p>
+<pre><code>node scripts/build.mjs          # 语法校验 + 生成 dist/
+npm run check                   # 只做语法校验
+</code></pre>
+<p>产物在 <code>dist/</code>：<code>lib/ + bin/ + cordis.patch.yml + package.json + README + LICENSE</code>。</p>
+<h2>安装到 dsh（服务器 / 本机）</h2>
+<p>前置：Node 22 + 全局 <code>@deepseek-ai/dsh</code>（<code>npm i -g @deepseek-ai/dsh</code>）+
+pnpm（<code>npm i -g pnpm</code>，<code>dsh plugin</code> 转发给 pnpm），
+密钥放 <code>~/.dsh/.env</code>（<code>DEEPSEEK_API_KEY=sk-...</code>）。</p>
+<p><code>dsh plugin</code> 首次使用会初始化 profile（bundles 起始为 <code>[dsh-base]</code>），
+然后转发 pnpm 安装你的包；因为包声明了 <code>dsh.bundle</code>，<strong>会自动加入
+<code>dsh.profile.bundles</code> 层栈</strong>（无需手改 manifest）。</p>
+<h3>方案 A：从 GitHub 拉取（通用）</h3>
+<p>任意一台装有 dsh 的机器（服务器 / 本机），clone 本仓库后构建出 <code>dist/</code>
+再安装：</p>
+<pre><code># 1. 拉取源码
+git clone https://github.com/studyinglx/dsh-cli.git
+cd dsh-cli
+
+# 2. 构建出 dist/（零工具链，Node ≥ 22 自带即可）
+node scripts/build.mjs
+
+# 3. 安装到 dsh profile（本地路径指向 dist/）
+dsh plugin --profile cli add file:$PWD/dist
+
+# 4. 验证组合层（不启动）
+dsh --profile cli --dump-config
+
+# 5. 使用
+dsh --profile cli                                    # 进入 REPL
+dsh --profile cli "先 review 一下代码库"              # 先跑一轮，然后进入 REPL
+</code></pre>
+<blockquote>
+<ul>
+<li><code>dsh plugin</code> 首次运行会自动初始化 <code>cli</code> profile（bundles 起始为 <code>[dsh-base]</code>）。</li>
+<li>已安装过旧版本时，先 <code>dsh plugin --profile cli remove dsh-cli-interactive</code> 再 add，
+或重新 add 覆盖（pnpm 会按路径重装）。</li>
+<li>拉取到的源码可直接改（lib/、cordis.patch.yml），改完 <code>node scripts/build.mjs</code>
+重建再 add 即生效。</li>
+</ul>
+</blockquote>
+<h3>方案 B：本地路径 / 发布到 npm</h3>
+<pre><code># 从 dist 目录安装（本地路径）
+dsh plugin --profile cli add file:/path/to/dsh-cli-interactive/dist
+
+# 或发布到 npm 后按包名安装
+npm publish
+dsh plugin --profile cli add dsh-cli-interactive
+
+# 验证组合层（不启动）
+dsh --profile cli --dump-config
+</code></pre>
+<h2>使用</h2>
+<pre><code>cd /srv/workspace            # 启动目录 = workspace 根
+
+dsh --profile cli                                    # 进入 REPL
+dsh --profile cli "先 review 一下代码库"              # 先跑一轮，然后进入 REPL
+dsh --profile cli --once "先 review 一下代码库"        # 跑一轮即退出（脚本友好）
+dsh --profile cli --resume session-xxxx              # 恢复旧会话
+dsh --profile cli --model deepseek-v4-pro            # 指定模型
+dsh-cli --resume session-xxxx                        # 或用包装命令
+</code></pre>
+<h3>slash 命令</h3>
+<table>
+<thead>
+<tr>
+<th>命令</th>
+<th>作用</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>/help</code></td>
+<td>命令列表（分组排版）</td>
+</tr>
+<tr>
+<td><code>/sessions</code></td>
+<td>列出 <code>$DSH_HOME/sessions</code> 下最近的 20 个会话（递归嵌套布局，id/大小/时间）</td>
+</tr>
+<tr>
+<td><code>/session</code></td>
+<td>显示当前会话 id</td>
+</tr>
+<tr>
+<td><code>/workspace</code></td>
+<td>显示 workspace 根目录</td>
+</tr>
+<tr>
+<td><code>/model [id]</code></td>
+<td>查看 / 切换模型（下一轮生效；如 <code>deepseek-v4-flash</code>、<code>deepseek-v4-pro</code>）</td>
+</tr>
+<tr>
+<td><code>/permission [ask|never]</code></td>
+<td>查看 / 切换审批策略（写会话日志，模型会看到通知）</td>
+</tr>
+<tr>
+<td><code>/cancel</code></td>
+<td>取消正在运行的轮次</td>
+</tr>
+<tr>
+<td><code>/exit</code> <code>/quit</code></td>
+<td>退出（会话已持久化）</td>
+</tr>
+</tbody></table>
+<h3>长任务 / 值守</h3>
+<p>agent 一轮内部会自主多轮调用工具直到停稳（<code>whenIdle()</code>），所以单条消息可以持续
+几分钟到几小时；进程被杀则中断（会话日志保留，<code>--resume</code> 可续）。用 tmux 保活：</p>
+<pre><code>tmux new -s dsh 'cd /srv/workspace &amp;&amp; dsh --profile cli'
+# Ctrl-b d 分离，随时 tmux attach -t dsh 回来
+</code></pre>
+<blockquote>
+<p><strong>管道模式（脚本友好）</strong>：<code>echo "任务" | dsh --profile cli --once</code> 也可以正常
+工作——readline 监听器在任何异步初始化之前注册，管道数据/EOF 不会丢失。
+空输入（立即 EOF）同样干净退出。</p>
+</blockquote>
+<h2>架构说明（改动点对照）</h2>
+<table>
+<thead>
+<tr>
+<th>官方 dsh-headless</th>
+<th>本包</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>headless-startup</code> 只解析任务位置参数</td>
+<td><code>cli-startup</code> 增加 <code>--resume/--model/--provider/--preset/--once</code></td>
+</tr>
+<tr>
+<td><code>headless-runner</code>：提交 1 次 → 打印 → 退出</td>
+<td><code>cli-runner</code>：REPL 循环 + 流式 + 审批应答 + slash 命令</td>
+</tr>
+<tr>
+<td>无审批应答（无人应答 → <code>unavailable</code> → 拒绝）</td>
+<td>在 <code>setup</code> 中注册 <code>approval/request</code> waterfall 监听器，终端 y/n 应答</td>
+</tr>
+<tr>
+<td><code>agents.create()</code> 一次</td>
+<td><code>agents.create()</code> / <code>agents.resume()</code>（<code>resumeSessionId</code> 字段）</td>
+</tr>
+<tr>
+<td>退出码 = 本轮结果</td>
+<td>交互退出码 0；轮次 error 提示但不退出</td>
+</tr>
+</tbody></table>
+<h2>硬性约束</h2>
+<ol>
+<li><strong>apply(ctx, config) 同步契约</strong>：apply 内绝不能 await loader（会死锁导致启动无输出）；
+<code>ctx.config</code> 在 apply 返回后不可读，config 必须从 apply 第二参数取。</li>
+<li><strong>改完必须运行 <code>node scripts/build.mjs</code></strong> 做语法校验（<code>npm run check</code> 只校验不打包）。</li>
+<li><strong>不要改 cordis.patch.yml 中的插件 id/name/inject 结构</strong>，只可改 persona 等配置值。</li>
+<li>不挂载 Host / HTTP / 浏览器插件，保持 headless 终端形态。</li>
+<li>零工具链、零网络依赖构建（Node ≥ 22）。</li>
+<li>会话落盘到 <code>$DSH_HOME/sessions/&lt;project&gt;/&lt;id&gt;/session.jsonl[.zstd]</code>（嵌套布局，
+<code>/sessions</code> 按此递归遍历）。</li>
+<li>非 TTY / 管道下输出必须可 grep、无转义垃圾（颜色/spinner/Unicode 框全部按 TTY 判定降级）。</li>
+</ol>
+<h2>已知限制</h2>
+<ul>
+<li><strong>单 agent 单进程</strong>：一个 CLI 进程一个会话；多会话 = 多开 tmux/systemd 实例。</li>
+<li><strong>进程内会话</strong>：会话仅存在于运行中的进程（与 web/headless 一致），重启后靠
+<code>$DSH_HOME/sessions/*.jsonl</code> + <code>--resume</code> 恢复。</li>
+<li><strong>无 web 功能</strong>：没有浏览器 UI、/api、多客户端并发。</li>
+<li><strong>审批在终端</strong>：无人值守（如 cron 里跑）时审批请求会卡住等待输入——
+请用 <code>/permission never</code> 或 <code>DSH_PERMISSION_MODE=danger-full-access</code> 预置策略。</li>
+<li>非 TTY（管道）模式下不绘制 spinner/活动行，仅输出文本与轮末摘要。</li>
+<li>默认模型/凭据解析与官方一致（<code>~/.dsh/settings.yaml</code> 的 <code>llm-deepseek</code> 段热加载；
+<code>DEEPSEEK_API_KEY</code> 环境层优先）。</li>
+</ul>
+<h2>开发提示</h2>
+<ul>
+<li>依赖解析：bundle 的插件名 = 包名（<code>dsh-cli-interactive</code>）+ <code>/startup</code> 子路径，
+与官方 <code>@deepseek-ai/dsh-headless/startup</code> 同款约定。</li>
+<li><strong>apply 必须同步</strong>（官方 headless 契约）：runner 的 <code>apply(ctx, config)</code> 只做
+<code>run(ctx, config).catch(...)</code> 就返回，<code>run</code> 内部才 <code>await loader</code>。
+async apply 会与 loader settle 互相等待而死锁（启动无任何输出）；
+<code>ctx.config</code> 在 apply 返回后不可读，config 必须从 apply 第二参数取。</li>
+<li>想加工具/技能：直接改 <code>cordis.patch.yml</code> 插入行，或在 profile 的
+<code>cordis.patch.yml</code>（<code>$DSH_HOME/profiles/cli/cordis.patch.yml</code>）覆盖。</li>
+<li>类型检查（可选）：<code>npm i -D typescript @types/node</code> 后 <code>npx tsc -p tsconfig.json</code>。</li>
+</ul>

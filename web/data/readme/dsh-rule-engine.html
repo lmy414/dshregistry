@@ -1,0 +1,146 @@
+<h1>dsh-rule-engine</h1>
+<p>DSH 规则执行引擎 v3 的插件实现。它把 <code>~/.dsh/AGENTS.md</code> 当作唯一真相源，自动解析规则四要素与执行等级，再通过「工具守卫 + 文本检测 + 时序检查 + 审计台账」执行用户规则，而不是内置一套与用户无关的安全清单。</p>
+<h2>项目背景</h2>
+<p>这个项目来自一个非常具体的个人需求：</p>
+<ul>
+<li>作者是<strong>零编程基础</strong>用户，但极其重视规则的制定、执行、遵守与复盘。</li>
+<li>作者发现：规则如果只写在文本里、靠模型“自觉”执行，会反复失效（例如时间词写错、内联命令违规、交付前漏验证等）。</li>
+<li>因此核心思路是：<strong>规则的执行不能只靠自觉，要尽量靠插件在机制层强制</strong>。</li>
+<li>本插件所有规则均从 <code>AGENTS.md</code> 动态解析，规则增删改后无需重写插件。</li>
+</ul>
+<p>当前实现基于已有的 <code>AGENTS.md</code> 规则体系拓展，社区暂无类似插件供参考（大概率为该等约束可能限制开发自由性，不适用于专业编程人员），<strong>可能存在大量不完备、误判或边界问题</strong>。欢迎任何使用者提出调整建议、提交 issue 或 PR。项目仍处于“可运行但需要持续打磨”的阶段。</p>
+<h2>功能分层</h2>
+<ul>
+<li>阶段 1 容器：解析 AGENTS.md 全部规则 → 理解产物（<code>rule-understanding.json</code> 可生成）</li>
+<li>阶段 2 匹配机 + 工具守卫 + 文本检测</li>
+<li>阶段 3 时序检查 + 授权询问集成</li>
+<li>阶段 4 D 级自证调度 + <code>/guard</code> 命令完善</li>
+</ul>
+<p>当前实现以「模式库兜底」为主，LLM 理解器预留扩展点；所有规则均从 AGENTS.md 实时解析。</p>
+<h2>命令</h2>
+<table>
+<thead>
+<tr>
+<th>命令</th>
+<th>作用</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>/guard status</code></td>
+<td>引擎状态（规则数/置信度/放行/解锁）</td>
+</tr>
+<tr>
+<td><code>/guard rules</code></td>
+<td>规则清单 + 理解产物</td>
+</tr>
+<tr>
+<td><code>/guard active</code></td>
+<td>最近激活了哪些规则、为什么</td>
+</tr>
+<tr>
+<td><code>/guard log [N]</code></td>
+<td>最近 N 条审计</td>
+</tr>
+<tr>
+<td><code>/guard unlock [N]</code></td>
+<td>解锁配置写保护 N 分钟（仅用户）</td>
+</tr>
+<tr>
+<td><code>/guard bypass [N]</code></td>
+<td>临时整体放行 N 分钟（仅用户）</td>
+</tr>
+<tr>
+<td><code>/guard lock</code></td>
+<td>立即恢复全部守卫（取消解锁/放行）</td>
+</tr>
+<tr>
+<td><code>/guard revoke</code></td>
+<td>撤销全部授权记录</td>
+</tr>
+<tr>
+<td><code>/guard reload</code></td>
+<td>强制重解析 AGENTS.md</td>
+</tr>
+</tbody></table>
+<h2>装配方式</h2>
+<p>本插件已按官方 <strong>bundle</strong> 规范打包，包内自带 <code>cordis.patch.yml</code>。</p>
+<p>推荐安装方式：</p>
+<pre><code>dsh plugin --profile web add dsh-rule-engine
+</code></pre>
+<p>或手动将 <code>dsh-rule-engine</code> 加入 profile 的 <code>dsh.profile.bundles</code> 数组。包内的 <code>cordis.patch.yml</code> 会自动挂载插件行：</p>
+<pre><code>- insert:
+    - id: dsh-rule-engine
+      name: 'dsh-rule-engine'
+</code></pre>
+<p>如果你是从源码手动调试，也可以沿用 insert 方式挂载，但正式安装建议走 bundle。</p>
+<h2>安全设计</h2>
+<ul>
+<li>只读操作（read/grep/glob/read_image/str_replace_editor view）无条件放行，拦截只针对变更类操作</li>
+<li>插件自身配置/理解产物对模型只读：直接 <code>edit/write</code> 会被守卫拒绝，需 <code>/guard unlock</code></li>
+<li>AGENTS.md mtime 变化后自动重解析（<code>fs.watch</code> + stat 兜底），规则增删改无需重启</li>
+<li>低置信规则不参与硬拦，避免误伤；在 <code>/guard rules</code> 中标记人工复核</li>
+<li>授权证据按“操作类型 + 目标路径前缀”结构化匹配，区分“询问”与“授权”</li>
+<li>备份证据按“目标路径 → 备份路径”记录，删除/覆盖前必须存在对应路径且备份文件真实存在</li>
+<li>版本/手册类文件写后自检：版本号连续、append 不覆盖上一行，失败自动回滚并审计</li>
+<li>跨工具一致性：同一敏感操作经 <code>edit</code> / <code>write</code> / <code>str_replace_editor</code> / <code>pwsh</code> 必须得到相同拦截/放行结论</li>
+<li>命令输出静默错误检测：全 false/0/null 或与上一条完全一致时审计 + 注入提醒，不阻断</li>
+<li>技能目录实时联动：<code>ctx.skills</code> 目录变化后自动刷新，已禁用/不存在的技能不触发 12B</li>
+<li>LLM 增量理解：对非 high 置信规则调用 <code>ctx.llm</code> 补全结构化理解，失败自动回退模式库</li>
+<li>D 级自证泛化：按规则特征触发自证提示，每规则每会话限 3 次</li>
+<li>授权记录默认 10 分钟 TTL，无路径的全局授权 TTL 缩短为 2 分钟；可用 <code>/guard revoke</code> 撤销</li>
+<li>用户直接命令式指令（如“删除这个文件”）也视为授权</li>
+<li>规则 1 支持“用户明确要求重试”豁免</li>
+<li>会话状态有容量上限并自动清理，防止长跑内存膨胀</li>
+<li>LLM 理解按“规则 + AGENTS.md mtime”去重，避免重复烧 token</li>
+<li>审计日志：<code>~/.dsh/rule-engine.log.jsonl</code></li>
+<li>守卫使用 <code>ctx.tools.guard()</code> 单调拒绝，模型无法自行绕过</li>
+</ul>
+<h2>当前局限与后续优化路线</h2>
+<p>当前版本已经具备完整四层骨架，但距离“成熟”仍有距离。以下是一些<strong>难度较高、尚未完全实现</strong>的优化方向，欢迎社区共同推进：</p>
+<ol>
+<li><p><strong>LLM 理解器深化</strong>
+当前只对非 high 置信规则做一次 LLM 增量理解；未来应支持“规则变更窗口期”、增量重理解、低置信人工复核队列。</p>
+</li>
+<li><p><strong>授权语义精确化</strong>
+当前 ask 授权记录为宽泛 <code>any</code> + 路径前缀；未来可要求 ask 面板显式声明操作类型，或支持“一次授权仅针对单个 callId”。</p>
+</li>
+<li><p><strong>备份证据完整化</strong>
+当前校验备份文件存在；未来可增加哈希/大小一致性校验、备份链管理与自动清理。</p>
+</li>
+<li><p><strong>规则 12C / 13B / 10 / 15 / 19 等流程类规则深度执行</strong>
+这些规则需要更多业务语义（下载校验、会话三层验证、版本判断、知识沉淀），目前偏“自证提示”，尚未做到机器可判定。</p>
+</li>
+<li><p><strong>跨会话持久化</strong>
+授权/备份目前为内存态，重启失效。持久化涉及写入保护、并发与恢复，风险较高，暂未实现。</p>
+</li>
+<li><p><strong>输出文本实时拦截</strong>
+受 DSH 官方架构限制，<code>assistant/message</code> 无法“拦下不发”，只能事后审计 + 纠正注入；这是平台边界，不是插件能单独突破的。</p>
+</li>
+</ol>
+<h2>致谢</h2>
+<p>感谢以下项目与作者的无私开源付出，本项目在开发过程中直接受益：</p>
+<ul>
+<li><strong>DeepSeek Harness 官方团队（@deepseek-ai）</strong>：提供了 DSH 平台、插件机制与官方文档。</li>
+<li><strong>本机已安装插件的作者们</strong>：<ul>
+<li>dsh-guardian（lonelymoon87）</li>
+<li>dsh-visualize（Nagi-ovo）</li>
+<li>dsh-usage（kestiny18）</li>
+<li>dsh-rules-manager（jilian-dsh）</li>
+<li>dsh-vision-router、dsh-super-injector 等未列出的作者</li>
+</ul>
+</li>
+<li><strong>学习参考的社区文档/库作者</strong>：<ul>
+<li>dsh-handbook（Electricitysheep）</li>
+<li>SandBase deepseek-harness-handbook（sandbaseai）</li>
+<li>以及 DSH 官方文档镜像与源码维护者</li>
+</ul>
+</li>
+</ul>
+<h2>免责声明</h2>
+<p>本项目是<strong>个人/社区项目</strong>，<strong>不属于 DeepSeek Harness 官方项目</strong>，与官方无隶属关系。使用风险自负，请在生产环境前充分测试。</p>
+<h2>开发与测试</h2>
+<pre><code>npm test
+bash scripts/build.sh
+</code></pre>
+<h2>License</h2>
+<p>MIT</p>

@@ -1,0 +1,269 @@
+<h1>dsh-edit-approval</h1>
+<p><a href="https://github.com/SiriLee/dsh-edit-approval/blob/HEAD/README.zh.md">简体中文</a></p>
+<p>Per-edit approval for <a href="https://github.com/deepseek-ai/deepseek-harness">DeepSeek Harness</a>: intercepts <code>write</code> / <code>edit</code> / <code>str_replace_editor</code> and shows a red/green line-level diff <strong>before</strong> the file is touched — <strong>approve once or reject</strong>, with a master switch in Settings → General.</p>
+<blockquote>
+<p><strong>Status:</strong> published to npm (<code>v0.1.8</code>) via GitHub Actions Trusted Publishing + Sigstore provenance. Targets the web profile (<code>dsh --profile web</code>).</p>
+</blockquote>
+<p><a href="https://www.npmjs.com/package/dsh-edit-approval"><img src="https://img.shields.io/npm/v/dsh-edit-approval.svg" alt="npm version"></a>
+<a href="https://github.com/SiriLee/dsh-edit-approval/blob/main/LICENSE"><img src="https://img.shields.io/npm/l/dsh-edit-approval.svg" alt="npm license"></a></p>
+<h2>Table of contents</h2>
+<ul>
+<li><a href="#-features">✨ Features</a></li>
+<li><a href="#-screenshots">📸 Screenshots</a></li>
+<li><a href="#how-it-works">How it works</a></li>
+<li><a href="#approval-policy-interaction">Approval policy interaction</a></li>
+<li><a href="#-install">Install</a></li>
+<li><a href="#configure">Configure</a></li>
+<li><a href="#behavior-details--limitations">Behavior details &amp; limitations</a></li>
+<li><a href="#not-included">Not included</a></li>
+<li><a href="#compatibility">Compatibility</a></li>
+<li><a href="#development">Development</a></li>
+<li><a href="#publishing">Publishing</a></li>
+<li><a href="#license">License</a></li>
+</ul>
+<h2>✨ Features</h2>
+<table>
+<thead>
+<tr>
+<th>Feature</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>Pre-write approval</td>
+<td>Intercepts <code>write</code> / <code>edit</code> / <code>str_replace_editor</code> on the <code>tools/pre-execute</code> seam and asks before any file is modified</td>
+</tr>
+<tr>
+<td>Red/green line diff</td>
+<td>Line-level diff (added / removed / context) computed per tool semantics; rendered per-line in the approval panel, with unchanged runs collapsed to <code>…</code></td>
+</tr>
+<tr>
+<td>Approve once / reject</td>
+<td>Two actions, mirroring the Claude Code edit-approval flow; rejection reports back to the model</td>
+</tr>
+<tr>
+<td>Master switch</td>
+<td>Settings → General "Edit approval" row, backed by the <code>/approval-edit on|off|status</code> host command (same source)</td>
+</tr>
+<tr>
+<td>Policy-aware</td>
+<td>Respects the session approval policy: <code>ask</code> intercepts, <code>never</code> (full access) runs edits through untouched</td>
+</tr>
+<tr>
+<td>Thresholds</td>
+<td><code>minDiffLines</code>, <code>includeCreate</code>, <code>includeDelete</code> for fine-grained control</td>
+</tr>
+</tbody></table>
+<h2>📸 Screenshots</h2>
+<table>
+<thead>
+<tr>
+<th align="center">Master switch in Settings → General</th>
+<th align="center">The <code>/approval-edit</code> command and its arguments</th>
+</tr>
+</thead>
+<tbody><tr>
+<td align="center"><img src="https://raw.githubusercontent.com/SiriLee/dsh-edit-approval/HEAD/assets/screenshots/settings-switch.png" alt="Settings → General with the Edit approval toggle row"></td>
+<td align="center"><img src="https://raw.githubusercontent.com/SiriLee/dsh-edit-approval/HEAD/assets/screenshots/status-command.png" alt="The /approval-edit command showing its on|off|status arguments"></td>
+</tr>
+</tbody></table>
+<table>
+<thead>
+<tr>
+<th align="center">Approval panel — red/green line diff</th>
+</tr>
+</thead>
+<tbody><tr>
+<td align="center"><img src="https://raw.githubusercontent.com/SiriLee/dsh-edit-approval/HEAD/assets/screenshots/approval-panel.png" alt="Approval panel showing the tool/file header and red/green line diff"></td>
+</tr>
+</tbody></table>
+<h2>How it works</h2>
+<p>The plugin listens on the <code>tools/pre-execute</code> waterfall (the seam the harness
+runs before a tool executes) and matches a whitelist of registered tool names:
+<code>write</code>, <code>edit</code>, <code>str_replace_editor</code>. For each intercepted call it:</p>
+<ol>
+<li><strong>Resolves the target</strong> through <code>ctx.fs</code>, applying the same session-cwd rule
+the fs tools use (a relative <code>..</code> path canonicalizes the cwd).</li>
+<li><strong>Reads the current content</strong> and reconstructs the proposed content from the
+tool's arguments, mirroring each tool's semantics:<ul>
+<li><code>write</code> — full text; <code>edit</code> — single unique replace (or <code>replace_all</code>);</li>
+<li><code>str_replace_editor</code> — <code>str_replace</code> unique replace, <code>insert</code> line
+insertion, <code>create</code> uses <code>file_text</code>.</li>
+</ul>
+</li>
+<li><strong>Computes a line-level LCS diff</strong> between current and proposed content.
+Equal head/tail runs are trimmed first so a one-line edit in a large file
+stays a one-line diff; pathological files fall back to a coarse whole-file
+diff.</li>
+<li><strong>Returns <code>{ kind: 'ask', reason }</code></strong> with a header line (<code>tool · file (op): N insertions, M deletions</code>) plus the diff text. The harness's own
+<code>serviceAsk</code> routes that through <code>ctx.approval</code> into the web approval panel
+— the host needs <strong>zero UI changes</strong>. <code>allowed-once</code> proceeds, <code>rejected</code>
+denies the call; every other case delegates via <code>next()</code>.</li>
+</ol>
+<p>The browser half (<code>dsh.client</code>) rebuilds the panel's plain-text headline into
+red/green per-line blocks, adds a <code>white-space: pre-wrap</code> compensation for the
+headline's CSS, and registers the Settings → General master-switch row. All side
+effects live in a single <code>ctx.effect</code> (torn down on plugin unload / HMR), and a
+per-animation-frame <code>MutationObserver</code> enhances approval panels as they appear.</p>
+<h2>Approval policy interaction</h2>
+<p>The harness's session approval policy (<code>ask</code> / <code>never</code>) keeps applying:</p>
+<table>
+<thead>
+<tr>
+<th>Session policy</th>
+<th>Plugin behavior</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>ask</code> (e.g. <code>workspace-write</code> preset)</td>
+<td>Intercepts and shows the approval panel</td>
+</tr>
+<tr>
+<td><code>never</code> (e.g. <code>danger-full-access</code> preset)</td>
+<td>Delegates — edits run without prompting, the sandbox keeps enforcing</td>
+</tr>
+</tbody></table>
+<p>Under <code>never</code>, every <code>ask</code> this plugin emitted would be deterministically
+rejected by the approval service, silently breaking every edit in a full-access
+session. The plugin therefore stops asking and lets the sandbox enforce. It
+never expands access or changes the sandbox mode.</p>
+<h2>📦 Install</h2>
+<p>Published to npm — the registry path is the recommended one. <strong>Restart dsh web
+(<code>--profile web</code>) after installing.</strong></p>
+<h3>Option A: registry (recommended)</h3>
+<pre><code>dsh plugin --profile web add dsh-edit-approval
+</code></pre>
+<h3>Option B: local checkout (authors / contributors)</h3>
+<pre><code>cd dsh-edit-approval
+npm install      # devDeps come from the npm registry; no harness checkout needed
+npm run build    # full tsc build, including .d.ts
+dsh plugin --profile web add /path/to/dsh-edit-approval   # link install
+</code></pre>
+<h3>Option C: GitHub (pin a commit for reproducibility)</h3>
+<pre><code>dsh plugin --profile web add github:SiriLee/dsh-edit-approval#&lt;commit-sha&gt;
+</code></pre>
+<p>First run fails: pnpm blocks git dependencies from running build scripts. Follow
+the CLI hint to add an <code>allowBuilds</code> key to the profile's <code>pnpm-workspace.yaml</code>
+(e.g. <code>$DSH_HOME/profiles/web/pnpm-workspace.yaml</code>), then retry. pnpm then runs
+the plugin's <code>prepare</code> (full build) and installs it into the profile.</p>
+<h3>Option D: tarball (offline / self-hosted registry)</h3>
+<pre><code>npm pack                                   # produces dsh-edit-approval-&lt;version&gt;.tgz
+dsh plugin --profile web add ./dsh-edit-approval-&lt;version&gt;.tgz
+</code></pre>
+<p><code>npm pack</code> runs <code>prepare</code>, so the tarball always carries a prebuilt <code>lib/</code>
+(including <code>.d.ts</code>) and the <code>LICENSE</code>; <code>dsh plugin add</code> runs no build scripts.</p>
+<h2>Configure</h2>
+<p>Runtime configuration lives in the <code>edit-approval</code> settings namespace, layered
+as <strong>schema defaults &lt; cordis row config &lt; user settings page (persisted)</strong>.
+The cordis row ships without config on purpose; a profile patch overrides
+deployment defaults by restating only the keys it changes:</p>
+<pre><code># profile's cordis.patch.yml
+- id: dsh-edit-approval
+  name: dsh-edit-approval
+  config:
+    minDiffLines: 2
+    includeCreate: false
+</code></pre>
+<table>
+<thead>
+<tr>
+<th>Key</th>
+<th>Default</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>enabled</code></td>
+<td><code>true</code></td>
+<td>Master switch (users can turn it off)</td>
+</tr>
+<tr>
+<td><code>tools</code></td>
+<td><code>['write','edit','str_replace_editor']</code></td>
+<td>Whitelist of intercepted registered tool names</td>
+</tr>
+<tr>
+<td><code>minDiffLines</code></td>
+<td><code>0</code></td>
+<td>Ask only when the change touches <strong>at least</strong> this many lines; smaller changes pass silently</td>
+</tr>
+<tr>
+<td><code>includeCreate</code></td>
+<td><code>true</code></td>
+<td>Whether creating a new file asks for approval</td>
+</tr>
+<tr>
+<td><code>includeDelete</code></td>
+<td><code>true</code></td>
+<td>Whether clearing/emptying a file asks for approval</td>
+</tr>
+</tbody></table>
+<h2>Behavior details &amp; limitations</h2>
+<ul>
+<li>Only write-family <strong>tools</strong> are intercepted; edits inside <code>bash</code>/<code>pwsh</code>
+commands are out of scope.</li>
+<li>The diff is presented as <code>+</code> / <code>-</code> line markers — a read-only preview, not
+interactive per-line selection; "apply partially" is not supported.</li>
+<li>Cases the tool itself would fail on are <strong>not</strong> asked about and pass through
+for the tool to report: <code>str_replace_editor create</code> against an existing file,
+a non-unique or missing <code>old_str</code> / <code>old_string</code>. An empty <code>old_string</code> <code>edit</code>
+preview deviates from the tool (treated as not-found) — the deviation is safe,
+it never falsely blocks.</li>
+<li>The button text follows <code>navigator.language</code>, not <code>ctx.locale</code> — a deliberate
+simplification for a self-contained bundle.</li>
+<li>Note the registered tool name is <code>str_replace_editor</code> (underscores), distinct
+from the npm package name <code>@deepseek-ai/dsh-tool-str-replace-editor</code>.</li>
+</ul>
+<h2>Not included</h2>
+<ul>
+<li>Post-edit review / rollback — covered by the community
+<a href="https://github.com/cirelir/dsh-change-review">dsh-change-review</a>.</li>
+<li>Keyboard shortcuts (Enter to approve / Esc to reject) — split into a
+dedicated plugin.</li>
+<li>Permission-tier extensions — covered by the community
+<a href="https://github.com/StyxNether/dsh-auto-approval-plugin">dsh-auto-approval-plugin</a>.</li>
+</ul>
+<h2>Compatibility</h2>
+<ul>
+<li>Node.js <code>^22.19.0 || &gt;=24.0.0</code>.</li>
+<li>DeepSeek Harness web profile (<code>dsh --profile web</code>); peer <code>@deepseek-ai/*</code>
+packages are resolved by the harness at runtime.</li>
+</ul>
+<blockquote>
+<p>[!WARNING]
+This project and DSH are both in developer preview. Pin exact versions in
+reproducible environments and review the behavior notes above.</p>
+</blockquote>
+<h2>Development</h2>
+<pre><code>npm install            # devDeps from the npm registry
+npm run typecheck      # tsc on both compilation surfaces (host + client)
+npm test               # vitest: diff / guard unit tests + real-cordis integration (46 cases)
+npm run build          # full build: tsc → lib/ (with .d.ts) + lib/client.js bundle
+npm run build:portable # optional lightweight esbuild build, no typecheck
+node scripts/verify-host.mjs   # verify the BUILT host artifact end-to-end
+</code></pre>
+<p><code>prepare</code> runs the full build, so git installs and <code>npm pack</code>/<code>npm publish</code>
+always produce a complete <code>lib/</code> (with <code>.d.ts</code>) and the <code>LICENSE</code>.</p>
+<h2>Publishing</h2>
+<p>Releases go out through GitHub Actions Trusted Publishing (OIDC, no stored
+<code>NPM_TOKEN</code>). See <a href="https://github.com/SiriLee/dsh-edit-approval/blob/HEAD/docs/npm-trusted-publishing-guide.md">docs/npm-trusted-publishing-guide.md</a>.</p>
+<pre><code>npm version patch &amp;&amp; git push origin main --tags   # triggers .github/workflows/publish.yml
+</code></pre>
+<p>The workflow verifies the tag matches <code>package.json</code>, runs typecheck + tests +
+a full build + artifact verification, publishes with Sigstore provenance, and
+creates a GitHub Release. CI (<code>.github/workflows/ci.yml</code>) runs the same checks
+on every push / PR. The publish step is idempotent — a version already on npm
+is skipped.</p>
+<h2>Directory layout</h2>
+<pre><code>src/index.ts            host plugin: tools/pre-execute interception + /approval-edit command + settings
+src/diff.ts             line-level diff (pure functions: LCS, head/tail trim, render, counts)
+src/guard.ts            decision logic (pure functions: tool matching, thresholds, create/delete, ask/pass)
+src/client/index.ts     client plugin: red/green diff rendering + master switch + lifecycle
+src/client/settings-row.tsx   Settings → General toggle row
+tests/                  vitest suites (diff / guard / integration)
+scripts/                build + artifact verification
+cordis.patch.yml        bundle patch (mounts the host plugin row)
+package.json            dsh.bundle + dsh.client manifests, peerDependencies
+</code></pre>
+<h2>License</h2>
+<p><a href="https://github.com/SiriLee/dsh-edit-approval/blob/HEAD/LICENSE">MIT</a></p>

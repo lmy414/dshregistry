@@ -1,0 +1,141 @@
+<h1>@ya8d/dsh-directive-compact</h1>
+<p>A natural-language compaction plugin for <a href="https://github.com/deepseek-ai/deepseek-harness">DeepSeek Harness</a>: tell the agent — in plain language — what to keep, what to drop, and how to compress an existing conversation. Designed for large-context models (1M-token window, e.g. <code>deepseek-v4-flash</code>).</p>
+<h2>Commands</h2>
+<table>
+<thead>
+<tr>
+<th>Command</th>
+<th>What it does</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>/compact-directive &lt;requirement&gt;</code></td>
+<td>Compresses the <strong>middle</strong> of the conversation. Keeps the session's fixed head (first user message + injected <code>agent-instructions</code> / <code>system-prompt</code> / <code>skill-catalog</code>) and the recent turns verbatim; summarizes everything between them per your requirement. The requirement is mandatory — an empty one returns a usage error.</td>
+</tr>
+<tr>
+<td><code>/trim-directive &lt;requirement&gt;</code></td>
+<td>Trims the <strong>whole conversation</strong> per your requirement, with <strong>no region protection and no system-node protection</strong> — any content can be deleted by natural-language instruction, including the head, the injected skeleton, and anything <code>/compact-directive</code> cannot reach.</td>
+</tr>
+</tbody></table>
+<blockquote>
+<p><strong>⚠️ Destructive — fork first.</strong> A trim/compaction permanently removes content from the model-visible conversation. There is no undo and no minimum retention. The original text is <em>not</em> lost (the session log is append-only and records every removed node), but restoring it needs tooling. <strong>Fork the session before destructive experiments.</strong></p>
+</blockquote>
+<h2>Install</h2>
+<p>The <code>dsh</code> CLI is the entry point. How you invoke it depends on your setup:</p>
+<ul>
+<li>If <code>dsh</code> is on your <code>PATH</code> (a global install), call it directly: <code>dsh plugin ...</code>.</li>
+<li>In a DeepSeek Harness checkout, use the workspace wrapper: <code>pnpm dsh ...</code> (or <code>npx dsh ...</code>).</li>
+</ul>
+<p>Install into a profile (replace <code>&lt;name&gt;</code> with <code>web</code>, <code>headless</code>, or your own):</p>
+<pre><code>dsh plugin --profile &lt;name&gt; add @ya8d/dsh-directive-compact        # npm registry (latest)
+dsh plugin --profile &lt;name&gt; add @ya8d/dsh-directive-compact@rc     # npm registry (release candidate)
+dsh plugin --profile &lt;name&gt; add ./dsh-directive-compact            # local checkout
+</code></pre>
+<p>The package declares <code>dsh.bundle</code>, so the plugin row is activated automatically and nothing from the upstream composition is disabled — the plugin is a pure increment (it never touches the upstream <code>ctx.compaction</code> slot or <code>/compact</code>). Remove with <code>dsh plugin --profile &lt;name&gt; remove @ya8d/dsh-directive-compact</code> (or the matching <code>pnpm dsh ...</code> / <code>npx dsh ...</code> form).</p>
+<h2>Usage</h2>
+<p>Both requirements are plain free text <strong>in any natural language</strong>. Examples:</p>
+<pre><code>/compact-directive keep the login-related errors, compress the rest of the middle process
+/trim-directive delete all git-operation records, keep the user's original instructions and the plugin-development goal
+</code></pre>
+<h3>How the two differ</h3>
+<table>
+<thead>
+<tr>
+<th></th>
+<th><code>/compact-directive</code></th>
+<th><code>/trim-directive</code></th>
+</tr>
+</thead>
+<tbody><tr>
+<td>Region</td>
+<td>Middle only; head + recent turns protected</td>
+<td><strong>The whole surface; nothing protected</strong></td>
+</tr>
+<tr>
+<td>Baseline</td>
+<td>Requirement layered over a four-point summary baseline</td>
+<td>Requirement is the sole instruction (no baseline)</td>
+</tr>
+<tr>
+<td>Result</td>
+<td>One checkpoint replacing the middle</td>
+<td>One checkpoint replacing the whole surface</td>
+</tr>
+<tr>
+<td>Use case</td>
+<td>Routine context compression with a focus</td>
+<td>Aggressive / surgical deletion the head-protected command cannot reach</td>
+</tr>
+</tbody></table>
+<h3>Operation mode (how a trim actually cuts)</h3>
+<p><code>/trim-directive</code> runs every chunk in <strong>operation mode</strong>: the model sees each node numbered with its global event seq (<code>[seq 28039] [user] …</code>) and replies with a small <strong>operation manifest</strong>:</p>
+<pre><code>delete: 28039, 28045          remove whole nodes
+delete-text: 28039, "..."     delete an exact fragment inside one node
+rewrite: 28039                replace one node (partial edits) → its full new text
+summarize: 28040-28045        replace a range with a short summary
+---content--- … ---end---     (the replacement text for rewrite/summarize)
+&lt;&lt;NO_CHANGE&gt;&gt;                 nothing to change in this chunk
+</code></pre>
+<p>The plugin then <strong>executes the manifest programmatically</strong>: untouched nodes keep their original text, deleted nodes drop, <code>delete-text</code> fragments are removed by exact string match, rewritten nodes take the model's content, summarized ranges take the summary. Any malformed or uncertain manifest (prose, unknown ops, out-of-range seqs, overlaps, a split tool call/result pair, missing content) <strong>falls back to a plain rewrite</strong> of the chunk — the plugin never half-executes.</p>
+<h3>When there is nothing to remove</h3>
+<p>A trim/compaction that finds nothing worth changing is a <strong>normal outcome, not a failure</strong>:</p>
+<ul>
+<li><strong>Per-chunk declaration (trim).</strong> If the requirement changes nothing in a chunk, the model replies with exactly <code>&lt;&lt;NO_CHANGE&gt;&gt;</code> (or an empty manifest); the command layer keeps that chunk's <strong>original rendering verbatim</strong> in the checkpoint. A marker buried in other output is treated as content, not a declaration — a model that misuses the marker can only fail to shrink, never silently drop content.</li>
+<li><strong>Shrink validation.</strong> If the assembled checkpoint is still not smaller than the span it replaces (e.g. every chunk declared no change), the command reports a no-change success — <code>Nothing to trim: …</code> / <code>Nothing to compact: …</code> — and leaves the conversation exactly as it was. It never loops, retries, or hangs. (This is why a directive like "delete all telemetry mentions" on a session with no telemetry returns with a message instead of churning for many minutes.)</li>
+</ul>
+<h3>Where the command and its effect appear</h3>
+<ul>
+<li><strong>Commands are log-only, not dialogue.</strong> Like every dsh slash command (including upstream <code>/compact</code>), these commands do not appear as messages in the conversation UI. The invocation, result, and compaction lifecycle are visible in the <strong>session trace/log</strong>.</li>
+<li><strong>The original dialogue stays visible in the UI after a trim/compaction.</strong> The conversation transcript never erases what you already saw (dsh's design; upstream <code>/compact</code> behaves the same). The <strong>model</strong> uses the checkpointed context on its next request — to verify the effect, read the session trace, not the chat transcript.</li>
+</ul>
+<h2>Configuration</h2>
+<p>All fields are validated through the Cordis <code>Config</code> schema and settable from <code>cordis.yml</code>:</p>
+<table>
+<thead>
+<tr>
+<th>Field</th>
+<th>Default</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>keepHeadUsers</code></td>
+<td><code>3</code></td>
+<td>User turns kept verbatim at the head (after the fixed skeleton) when planning the compact middle.</td>
+</tr>
+<tr>
+<td><code>keepTailUsers</code></td>
+<td><code>3</code></td>
+<td>User turns kept verbatim at the tail; the last user utterance is always kept regardless.</td>
+</tr>
+<tr>
+<td><code>summarizationProvider</code></td>
+<td><code>''</code></td>
+<td>Provider for the summarization call; falls back to the routed provider when empty.</td>
+</tr>
+<tr>
+<td><code>summarizationModel</code></td>
+<td><code>''</code></td>
+<td>Model for the summarization call; falls back to the routed model when empty.</td>
+</tr>
+<tr>
+<td><code>maxTokens</code></td>
+<td><code>8192</code></td>
+<td>Generation cap for the <code>/compact-directive</code> summarization call.</td>
+</tr>
+</tbody></table>
+<h2>Known Limitations</h2>
+<ul>
+<li><strong>A trim can take minutes.</strong> The model reasons about your requirement before cutting (deliberately — disabling reasoning would hurt the cut decisions). A small conversation trims in about three minutes; a large one (~180K+ tokens, several parallel 50K chunks) can take 5–10+ minutes.</li>
+<li><strong>Model judgment is the trim's engine — and its limit.</strong> The model decides what survives from the rendered dialogue. It generally follows the requirement, but it is <em>not</em> a deterministic per-node delete: a surgical instruction ("delete exactly this one message") can be interpreted as a broader compression, and an ambiguous requirement may yield an unexpected result. Check the session trace after a trim.</li>
+<li><strong>The injected skeleton is trim-able, and regenerates.</strong> <code>/trim-directive</code> can remove the injected <code>agent-instructions</code> / <code>system-prompt</code> / <code>skill-catalog</code> nodes. They are re-created on the next request by the agent loop, so the model keeps its environment; nothing needs manual re-injection.</li>
+<li><strong>A trim whose total input exceeds 20 × 50K heuristic tokens fails loud</strong> with "compact the session first" — before any model call opens. Compact the session first, then trim again.</li>
+</ul>
+<h2>Further reading</h2>
+<ul>
+<li><a href="https://github.com/ya8D/dsh-directive-compact/blob/HEAD/docs/observability.md">docs/observability.md</a> — what each log line means, enabling debug output, diagnosing a slow or stalled run.</li>
+<li><a href="https://github.com/ya8D/dsh-directive-compact/blob/HEAD/docs/model-experience.md">docs/model-experience.md</a> — what the model sees and the token / KV-cache effects of each command.</li>
+<li><a href="https://github.com/ya8D/dsh-directive-compact/blob/HEAD/docs/testing.md">docs/testing.md</a> — running the test suites.</li>
+</ul>
+<h2>License</h2>
+<p>MIT</p>

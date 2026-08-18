@@ -1,0 +1,94 @@
+<h1>DSH Lifeboat</h1>
+<p>English | <a href="https://github.com/IoveCelestina/dsh-lifeboat/blob/HEAD/README.zh.md">简体中文</a></p>
+<p>DSH Lifeboat is an out-of-process recovery console for DeepSeek Harness profiles. It can still start when a profile cannot: every probe runs against a temporary <code>DSH_HOME</code>, and the original profile manifest and patch files stay read-only until the user explicitly applies a recovery.</p>
+<p><img src="https://raw.githubusercontent.com/IoveCelestina/dsh-lifeboat/HEAD/screenshot.png" alt="DSH Lifeboat rescue console"></p>
+<h2>What is included</h2>
+<ul>
+<li>A loopback-only Web UI at <code>127.0.0.1</code> with live probe progress, evidence, verified recovery-plan selection, report download, and one-step undo.</li>
+<li>A CLI mode that emits the same <code>dsh-lifeboat/v1</code> JSON report without the UI.</li>
+<li>Config probes using <code>dsh --profile &lt;name&gt; --dump-config</code>.</li>
+<li>Optional runtime probes that treat a clean exit or survival through a configurable startup window as a successful boot.</li>
+<li>Fresh temporary homes for every probe attempt; runtime results are confirmed twice by default and mixed evidence never enables recovery.</li>
+<li>Bounded removal-set search over the complete Profile: exact minimum-cardinality plans at shallow depths, followed by a verified 1-minimal fallback.</li>
+<li>Separate checks for profile-level and Harness-home <code>cordis.patch.yml</code> failures.</li>
+<li>Optimistic manifest hashing, timestamped backups, and atomic recovery writes.</li>
+<li>A bounded diagnosis queue, graceful process shutdown, <code>GET /api/health</code>, browser-session reconnect, and atomically persisted reports.</li>
+<li>A small Harness plugin that writes <code>~/.dsh/lifeboat/last-healthy.json</code> only after the Loader settles. The rescue server itself never runs inside the failing Harness process.</li>
+</ul>
+<h2>Run from this checkout</h2>
+<p>Node.js <code>^22.19.0 || &gt;=24.0.0</code> is required. There are no runtime dependencies.</p>
+<pre><code>node ./src/cli.js serve
+</code></pre>
+<p>Open the printed <code>http://127.0.0.1:&lt;port&gt;/</code> address. The default port is <code>4317</code>; use <code>--port 0</code> for a random free port.</p>
+<p>Terminal reports are stored under <code>$DSH_HOME/lifeboat/reports</code>. See <a href="https://github.com/IoveCelestina/dsh-lifeboat/blob/HEAD/docs/service.md">service operation</a> for systemd and Windows Task Scheduler guidance.</p>
+<p>Run without the UI:</p>
+<pre><code>node ./src/cli.js diagnose --profile web
+node ./src/cli.js diagnose --profile web --json
+node ./src/cli.js diagnose --profile web --mode boot --allow-runtime-code-execution
+node ./src/cli.js diagnose --profile web --mode boot --boot-confirmations 3 --allow-runtime-code-execution
+node ./src/cli.js diagnose --profile web --max-exact-removals 2 --max-recovery-probes 256
+</code></pre>
+<p>When <code>dsh</code> is run from a Harness source checkout, use safe executable-plus-argument fields instead of a shell command string:</p>
+<pre><code>node ./src/cli.js diagnose \
+  --command pnpm \
+  --command-arg --dir \
+  --command-arg /path/to/deepseek-harness \
+  --command-arg dsh \
+  --profile web
+</code></pre>
+<p>On PowerShell, quote any argument beginning with <code>--</code> when necessary.</p>
+<h2>Install as a Harness bundle</h2>
+<p>Install the pinned v0.1.1 release directly through Harness:</p>
+<pre><code>dsh plugin --profile web add https://github.com/IoveCelestina/dsh-lifeboat/releases/download/v0.1.1/dsh-lifeboat-0.1.1.tgz
+</code></pre>
+<p>For a local checkout, run this from its parent directory instead:</p>
+<pre><code>dsh plugin --profile web add ./dsh-lifeboat
+</code></pre>
+<p>The package declares <code>dsh.bundle</code> through <code>cordis.patch.yml</code>. Installation adds the health marker to the selected profile. The rescue UI remains a standalone binary so a broken Loader cannot take it down:</p>
+<pre><code>pnpm --dir "$DSH_HOME/profiles/web" exec dsh-lifeboat serve
+</code></pre>
+<p>Release packages are distributed as GitHub Release assets, not through the npm registry. Validate the tarball installation command above against the current Harness CLI before relying on it for an incident.</p>
+<h2>How isolation works</h2>
+<ol>
+<li>Lifeboat reads <code>$DSH_HOME/profiles/&lt;name&gt;/package.json</code> and records its SHA-256 hash.</li>
+<li>Installation-owned bundles stay fixed. Bundles also present in the profile's <code>dependencies</code> become candidates.</li>
+<li>Every probe attempt receives a new direct child named <code>dsh-lifeboat-*</code> under the operating-system temp directory.</li>
+<li>Bounded regular profile assets are copied. Credential-bearing files and symlinked assets are skipped. Installed packages are exposed through absolute package-resolution links so pnpm's relative links remain valid in the temporary profile.</li>
+<li>The full composition is probed. If it fails, Lifeboat distinguishes clean bundle failures from user-patch failures.</li>
+<li>For a community-bundle failure, Lifeboat tests removal sets while keeping every nonremoved Bundle active. It enumerates cardinalities from one through the configured exact depth. When one succeeds, every smaller cardinality has already been exhausted, so the plan has globally minimum removal cardinality.</li>
+<li>If the exact phase finds no plan, delta debugging shrinks the known-recovering "remove all candidates" set. The result is 1-minimal: re-adding any one removed Bundle loses the observed recovery, but a smaller nonlocal plan may exist.</li>
+<li>Every candidate plan is independently re-run in another fresh Home with the complete remaining Profile. Failed verification, unstable runtime evidence, or an exhausted search budget suppresses automatic recovery.</li>
+<li>In runtime mode, inconsistent repeated attempts stop the diagnosis as <code>unstable-probe</code> without offering recovery.</li>
+<li>Each temporary directory is removed after all owned links are unlinked, unless <code>--keep-artifacts</code> was selected.</li>
+</ol>
+<p>The search never performs an unbounded <code>2^n</code> powerset walk. Exact depth <code>k</code> has up to <code>C(n,1) + ... + C(n,k)</code> candidates, but a hard logical-probe budget stops both exact and fallback phases. Defaults are depth 2 and 256 recovery probes in config mode or 64 in boot mode; the advanced UI and <code>--max-exact-removals</code> / <code>--max-recovery-probes</code> expose these limits.</p>
+<p>These are recovery plans, not moral blame. If A and B fail only when active together, Lifeboat can offer "disable A" and "disable B" as equal one-removal alternatives. If A and B fail independently, a verified plan must remove both. Reports distinguish <code>exact</code> from <code>one-minimal</code> and record whether all equal-size alternatives were enumerated.</p>
+<h2>Recovery behavior</h2>
+<p>“Apply recovery” is deliberately unavailable until the report contains an independently verified Bundle-removal plan. When confirmed, Lifeboat:</p>
+<ol>
+<li>lets the operator choose among verified alternatives;</li>
+<li>resolves that <code>planId</code> from the server-owned diagnosis report and rejects arbitrary Bundle lists;</li>
+<li>re-reads the original manifest and rejects the write if its hash changed;</li>
+<li>saves the exact original file under <code>.lifeboat-backups/</code>;</li>
+<li>atomically replaces <code>package.json</code>, removing only the selected plan's Bundles from <code>dsh.profile.bundles</code> while keeping dependencies installed;</li>
+<li>exposes “Undo this recovery” for the same local server session.</li>
+</ol>
+<p>Running a later <code>dsh plugin</code> package-manager command may reconcile an installed bundle back into the active list. Remove or update the actual faulty dependency after recovery.</p>
+<h2>Safety and current limitations</h2>
+<ul>
+<li>The server binds only to <code>127.0.0.1</code>, rejects non-loopback Host headers, sends a restrictive CSP, and requires a random per-process token for writes.</li>
+<li>Config mode does not mount plugin rows. Runtime mode does execute installed plugin code with the current operating-system user permissions and therefore requires an explicit acknowledgement. The temporary Home isolates configuration and runtime data; it is not an operating-system sandbox for plugin source code.</li>
+<li>Probe processes receive a credential-scrubbed environment. A plugin that requires an API key may therefore fail for an environmental reason; the report preserves this distinction as far as the process result allows.</li>
+<li>Runtime survival is a health heuristic, not proof of full application correctness. Prefer config mode for deterministic loader/configuration failures.</li>
+<li>Relative profile assets are copied up to 32 MiB. Links are skipped and reported, so a profile built around linked local sources may require <code>--keep-artifacts</code> and manual inspection.</li>
+<li>The current candidate classifier follows the Harness profile contract: out-of-tree bundle names are active bundles also listed in <code>dependencies</code>. Installation-owned bundles are never automatically disabled.</li>
+<li>The current release targets the <code>dsh.profile.bundles</code> format used by current pre-release Harness builds. It has not been validated against every historical release.</li>
+</ul>
+<h2>Relationship to dsh-guard</h2>
+<p>Lifeboat was implemented independently. The closest listed community project, <a href="https://github.com/x2802490130-prog/dsh-guard"><code>dsh-guard</code></a>, focuses on rolling snapshots and in-process rollback; its README explicitly notes that an in-process plugin cannot rescue a startup crash without an external launcher. Lifeboat focuses on an independent diagnostic service, fresh-home reproduction, verified bounded removal plans, and evidence-gated recovery. See the <a href="https://github.com/IoveCelestina/dsh-lifeboat/blob/HEAD/docs/community-overlap.md">non-ranking comparison</a>.</p>
+<h2>Development</h2>
+<pre><code>npm test
+npm run check
+npm pack --dry-run --ignore-scripts
+</code></pre>
+<p>The project intentionally uses only Node.js built-ins so the rescue path does not acquire another dependency graph that can fail during an incident.</p>

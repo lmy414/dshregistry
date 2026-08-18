@@ -1,0 +1,128 @@
+<h1>yolo-mode</h1>
+<p>English | <a href="https://github.com/CanGeng/yolo-mode/blob/HEAD/README.zh.md">中文</a></p>
+<p>An <strong>unattended full-access window</strong> plugin for the <a href="https://github.com/deepseek-ai/deepseek-harness">DeepSeek Harness</a> (<code>dsh</code>): when you walk away and want the agent to grind through a long task, one human-only command — <code>/yolo on</code> — arms <code>danger-full-access</code> sandbox + <code>never</code> approval for that session, with an automatic way back, a tripwire against catastrophic commands, and notifications when the work is done or something needs attention.</p>
+<blockquote>
+<p><strong>Read this first.</strong> In yolo mode the model executes with <em>your</em> uid and full filesystem reach — every operation is equivalent to your own. The bundled guard is a <strong>best-effort tripwire against accidents, not a security boundary</strong> (a regex blocklist is trivially bypassed by deliberate obfuscation). Arm it only for sessions whose task you would be comfortable running yourself. See <a href="#residual-risks">Residual risks</a>.</p>
+</blockquote>
+<h2>Why</h2>
+<p>Per-call approvals and the workspace sandbox turn every wall into a stall when nobody is at the keyboard. dsh already ships a <code>danger-full-access</code> permission preset; what the unattended case additionally needs is:</p>
+<ul>
+<li>a fast, unambiguous, <strong>human-only</strong> switch (the model never gets a tool to grant itself access),</li>
+<li>an <strong>automatic way back</strong> (time-boxed expiry, circuit breaker),</li>
+<li>a guard for the operations <strong>no dsh sandbox mode stops</strong> — the file sandbox governs file effects only, so fork bombs, shutdowns, and raw-device writes sail through <code>workspace-write</code> too,</li>
+<li>a signal back to you (idle / denial / disarm notifications).</li>
+</ul>
+<h2>Usage</h2>
+<table>
+<thead>
+<tr>
+<th>Command</th>
+<th>Effect</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>/yolo on</code></td>
+<td>Arm (no expiry by default, until <code>/yolo off</code>)</td>
+</tr>
+<tr>
+<td><code>/yolo on 4h</code> · <code>/yolo on 90m</code> · <code>/yolo on 1h30m</code> · <code>/yolo on 2d</code> · <code>/yolo on 45</code> (bare number = minutes)</td>
+<td>Arm with an expiry; auto-reverts when it passes</td>
+</tr>
+<tr>
+<td><code>/yolo off</code></td>
+<td>Disarm now; reverts to the pre-arm permission snapshot</td>
+</tr>
+<tr>
+<td><code>/yolo status</code></td>
+<td>Armed state, remaining time, revert target, guard strike count, notify channels</td>
+</tr>
+</tbody></table>
+<p>Arming writes the canonical <code>sandbox/mode</code> and <code>approval/policy</code> session events through their canonical setters, so the model-visible runtime context updates immediately, the state survives restarts via log replay, and the Web UI's permission selector shows <code>danger-full-access</code>.</p>
+<h2>How it works</h2>
+<ol>
+<li><strong>The only permission truth is the canonical knob events.</strong> <code>yolo/armed</code> / <code>yolo/disarmed</code> are derived annotations (expiry, revert snapshot, audit) that never override the knobs — consistent with dsh's log-only + replay philosophy.</li>
+<li><strong>Only a human can arm.</strong> <code>/yolo</code> runs on the UI command plane; the model has no tool to arm yolo, and the guard's circuit breaker only ever <em>disarms</em>.</li>
+<li><strong>Expiry is lazy and restart-safe.</strong> <code>expiresAt</code> is checked at every tool call, on a 30-second sweep, and at plugin start; a revived session with a stale window reverts immediately. Already-running background processes are <em>not</em> killed (long tasks are the point) — the residual risk is notified instead.</li>
+<li><strong>The guard is honest about what it is.</strong> It labels itself a tripwire everywhere, including the model-facing text (no risk compensation), and its denials are final per command: no rephrasing, encoding, or retrying.</li>
+<li><strong>Notifications never touch the tool pipeline.</strong> Desktop command / webhook / SMTP email run via direct <code>child_process</code> / <code>fetch</code> / socket, so the plugin's own guard can never block or loop them.</li>
+</ol>
+<h2>Guard</h2>
+<ul>
+<li><code>tools/pre-execute</code> listener; <code>mode: always | yolo-only | off</code> (default <code>always</code> — see <em>Why</em>).</li>
+<li><strong>Catastrophic core list</strong> (deliberately tiny and beyond argument): fork bombs; <code>dd</code> / redirects onto raw devices; <code>mkfs</code> / <code>wipefs</code> / <code>blkdiscard</code>; <code>rm -rf</code> on bare <code>/</code>, <code>/*</code>, <code>~</code>, <code>$HOME</code> (split flags, quotes, globs, <code>--no-preserve-root</code> variants covered; subpaths pass); shutdown / poweroff / halt / reboot / <code>init 0|6</code> / <code>systemctl poweroff</code> (anchored to command position so prose like <code>echo reboot</code> is untouched); <code>chmod -R 777 /</code>.</li>
+<li><strong>Protected paths:</strong> the <code>write</code>/<code>edit</code> tools may not touch <code>~/.ssh</code>, <code>~/.gnupg</code>, <code>~/.aws</code>, <code>~/.config/gcloud</code>, <code>~/.kube</code> (lexical prefix match, configurable).</li>
+<li><strong>Circuit breaker:</strong> while armed, accumulated guard denials reaching <code>maxStrikes</code> (default 3, <code>0</code> disables) disarm yolo automatically and notify.</li>
+<li>Custom regexes append to <code>guard.patterns</code>; a pattern that fails to compile is skipped, never fatal.</li>
+</ul>
+<h2>Model experience</h2>
+<p>While armed, a cache-stable runtime-context section (<code>yolo:policy</code>) tells the model: full-access window active; the user is away — work autonomously, make and record reasonable default choices, batch genuinely blocking questions into one ask at the end; the expiry instant; the tripwire's existence and finality; the background-process residual risk; and that the full session log will be reviewed afterwards. When not armed the section is empty — zero tokens.</p>
+<h2>Notifications (all off by default)</h2>
+<table>
+<thead>
+<tr>
+<th>Event</th>
+<th>Fires when</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>armed</code> / <code>disarmed:manual</code> / <code>disarmed:expired</code> / <code>disarmed:strikes</code></td>
+<td>Switch and revert</td>
+</tr>
+<tr>
+<td><code>guard-denied</code></td>
+<td>A guard denial (pattern name + strike count)</td>
+</tr>
+<tr>
+<td><code>idle</code></td>
+<td>The agent goes idle while armed (work finished / needs a human); rate-limited to once per 5 minutes per session</td>
+</tr>
+</tbody></table>
+<p>Three channels, usable together — see <a href="https://github.com/CanGeng/yolo-mode/blob/HEAD/cordis.patch.yml">cordis.patch.yml</a> for every field:</p>
+<pre><code>notify:
+  desktop:
+    command: 'notify-send "dsh yolo" "{event}: {detail}"'   # {event} {detail} {sessionId} {time}
+  webhook:
+    url: https://example.com/hook    # POSTs {event, detail, sessionId, at} as JSON
+  email:                             # built-in minimal SMTP client (PLAIN auth; implicit TLS 465 or STARTTLS)
+    host: smtp.example.com
+    port: 465
+    secure: true
+    user: bot@example.com
+    pass: app-password
+    from: bot@example.com
+    to: me@example.com
+</code></pre>
+<h2>Residual risks</h2>
+<p>Accepted knowingly, in exchange for autonomy:</p>
+<ul>
+<li>The regex tripwire is bypassable by deliberate obfuscation (base64, variable splicing, writing a script first); it protects against <strong>accidents</strong>, not adversaries.</li>
+<li>Subagents and background processes started while armed keep the permissions they were born with, past expiry.</li>
+<li>Expiry can lag up to ~30 seconds plus one tool-call interval; a long in-flight generation is not interrupted.</li>
+<li>Under <code>danger-full-access</code> the <code>write</code>/<code>edit</code> tools reach the whole disk — the protected-path list covers only what is configured.</li>
+<li>If your dsh Web endpoint has no authentication, any local process or page that can reach it can already operate the UI (a dsh deployment fact, not introduced by this plugin).</li>
+<li>Everything — every tool call and guard decision — lands in the session log for later review in the GUI.</li>
+</ul>
+<h2>Session readability drift (uninstalling this plugin)</h2>
+<p>dsh's persistence layer refuses to load a session log containing event types outside its built-in <code>KNOWN_SESSION_EVENT_TYPES</code> set (unless an event carries <code>ignorable:true</code> — which <code>Session.append()</code> cannot set as of 0.1.0-rc.6). <code>/yolo on|off</code> writes <code>yolo/armed</code> / <code>yolo/disarmed</code> annotation events into the log, so this plugin registers both types into that set at load time. Consequence:</p>
+<ul>
+<li><strong>While this plugin is loaded</strong>, yolo sessions load normally.</li>
+<li><strong>If you uninstall it</strong> (or disable its loading), any session that ever ran <code>/yolo</code> will fail to open with <code>SessionFormatUnsupportedError</code> until the plugin is restored, or the <code>yolo/*</code> lines in the log are given <code>"ignorable": true</code> (one-line JSON edit per event; <code>decodeStorageRecord</code> passes them through untouched).</li>
+</ul>
+<p>In short: session readability depends on the plugin's presence. This is a harness-side API gap (write path accepts anything, read path vets a closed vocabulary, and no writer for <code>ignorable</code> exists) — not a choice this plugin can opt out of on stock dsh. Before uninstalling, patch the logs as described above; a repair script is straightforward (decompress <code>session.jsonl.zstd</code>, add <code>"ignorable": true</code> to <code>yolo/*</code> lines, recompress).</p>
+<h2>Install</h2>
+<pre><code># 1. Clone anywhere and link it into your profile's node_modules
+git clone https://github.com/CanGeng/yolo-mode.git
+ln -sfn "$(pwd)/yolo-mode" ~/.dsh/profiles/node_modules/yolo-mode
+
+# 2. Append the insert row from this repo's cordis.patch.yml
+#    to ~/.dsh/profiles/web/cordis.patch.yml
+
+# 3. Restart dsh web, then verify with /yolo status in a session
+</code></pre>
+<h2>Configuration</h2>
+<p>Every knob lives in the <code>yolo-mode</code> row of your profile's <code>cordis.patch.yml</code> — see <a href="https://github.com/CanGeng/yolo-mode/blob/HEAD/cordis.patch.yml">cordis.patch.yml</a> for the annotated default configuration (<code>guard.*</code>, <code>notify.*</code>, <code>context.*</code>).</p>
+<h2>Testing</h2>
+<pre><code>node test.mjs   # 22 cases: duration parsing / event fold / guard positive+negative / path protection / email message / fake-SMTP dialogue
+</code></pre>
+<h2>License</h2>
+<p><a href="https://github.com/CanGeng/yolo-mode/blob/HEAD/LICENSE">MIT</a></p>

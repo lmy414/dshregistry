@@ -1,0 +1,126 @@
+<h1>dsh-custom-provider-reasoning</h1>
+<p>dsh host 插件：让<strong>自定义提供方</strong>（GUI「添加自定义提供方」创建的、pi-ai 目录之外的手写路由）的所有模型，都能在 composer 的模型选择器里选择<strong>思考强度（推理等级）</strong>，并且选择会真正发往线上。</p>
+<h2>问题背景</h2>
+<ul>
+<li>composer 的模型选择器只在适配器为<strong>该确切模型</strong>公布了 <code>reasoning</code> 元数据时才显示推理等级行；</li>
+<li><code>dsh-llm-pi-ai</code> 只会从 <code>llm-pi-ai</code> 设置分节里模型条目的 <code>reasoningEfforts</code> 声明物化这份元数据；</li>
+<li>而设置 UI 刻意不写这个字段（推理强度是按模型的能力，提供方级控件无法表达）。</li>
+</ul>
+<p>结果就是：内置提供方（如 DeepSeek）可选思考强度，自定义提供方的模型一律「当前模型未提供推理等级」。</p>
+<h2>插件做什么</h2>
+<p>在支持的原厂配置缝上补齐缺口：每当 <code>llm-pi-ai</code> 设置变化或适配器目录发布时，插件自动为每个<strong>合格模型条目</strong>写入 <code>reasoningEfforts</code>（默认 <code>off / low / medium / high</code>，wire 拼写与等级同名——OpenAI 兼容端点标准词汇），并<strong>补齐缺失的 <code>maxTokens</code>（默认 384000）与 <code>contextWindow</code>（默认 1000000）</strong>——因为手写路由在 pi-ai 目录里没有对应条目，不补的话 dsh 会回落到 32768 的保守输出上限，DeepSeek V4 这类思考模型光推理输出就会顶满截断。</p>
+<p>插件还<strong>感知协议类型</strong>，自动管理路由级 <code>compat</code>：</p>
+<ul>
+<li><code>openai-completions</code>：模型 id 含 <code>deepseek</code> 的路由自动补 <code>compat.thinkingFormat: deepseek</code>（用 DeepSeek 的 <code>thinking</code> 参数方言，而不是 OpenAI 的 <code>reasoning_effort</code>）。</li>
+<li>所有 <code>declared</code> 自定义路由在 <code>openai-completions</code> 下自动补 <code>compat.supportsDeveloperRole: false</code>——因为 pi-ai 对未知端点默认判定支持 <code>developer</code> 角色，会把系统提示发成 <code>role: "developer"</code>，而 new-api/one-api 系网关不认这个角色，直接返回 400。</li>
+<li><code>openai-responses</code> / <code>anthropic-messages</code>：自动剥离 completions 专属的 <code>thinkingFormat</code> / <code>supportsReasoningEffort</code>，避免切换协议时残留无效开关导致校验报错。</li>
+</ul>
+<p>于是你可以在三种接口（<code>openai-completions</code> / <code>openai-responses</code> / <code>anthropic-messages</code>）之间自由切换，不用手动增删 <code>compat</code>。<code>reasoningEfforts</code> 是协议无关的：三种协议都把它物化成 <code>reasoning</code> + <code>thinkingLevelMap</code>，只是线上拼写不同（completions 发 <code>thinking</code>/<code>reasoning_effort</code>，responses 发 <code>reasoning: {effort}</code>，anthropic 发 <code>thinking: {type, effort/budget}</code>）。</p>
+<p>下游一切照旧走原厂链路：<code>session.models</code> / <code>llm.models</code> 目录 RPC、请求期校验（<code>resolveCallConfig</code>）、以及线上翻译（pi-ai 对 OpenAI 兼容端点发送 <code>reasoning_effort: low|medium|high</code>）。</p>
+<h3>合格规则</h3>
+<table>
+<thead>
+<tr>
+<th>场景</th>
+<th>是否注入</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>自定义路由（<code>declared</code>）上的模型，无 <code>reasoningEfforts</code></td>
+<td>✅ 注入</td>
+</tr>
+<tr>
+<td>目录路由上、pi-ai 目录未收录的模型（<code>scope: all</code>）</td>
+<td>✅ 注入</td>
+</tr>
+<tr>
+<td>已有 <code>reasoningEfforts</code> 的模型（手调字典或显式 <code>false</code>）</td>
+<td>❌ 不覆盖 reasoningEfforts，但仍补缺失的 maxTokens/contextWindow</td>
+</tr>
+<tr>
+<td>缺 <code>maxTokens</code> 的模型</td>
+<td>✅ 补 <code>maxTokens</code>（默认 384000，可配）</td>
+</tr>
+<tr>
+<td>缺 <code>contextWindow</code> 的模型</td>
+<td>✅ 补 <code>contextWindow</code>（默认 1000000，可配）</td>
+</tr>
+<tr>
+<td>pi-ai 目录已收录的模型（目录自带推理元数据）</td>
+<td>❌ 交给目录</td>
+</tr>
+</tbody></table>
+<p>* 三个字段<strong>独立判断</strong>：<code>reasoningEfforts</code> 手写值始终权威，<code>maxTokens</code>/<code>contextWindow</code> 只在字段缺失时才补，已有值永不被覆盖。</p>
+<p>* 唯一例外：恰好等于<strong>内置默认字典</strong>（<code>off/low/medium/high</code>）的 <code>reasoningEfforts</code> 只可能是插件自己写的，因此会在配置的 <code>levels</code> 变化时被自动刷新为新配置——这样在 patch 里调高 <code>levels</code> 能覆盖到插件已经处理过的提供方，而用户手写的配置始终权威。</p>
+<p>注入是<strong>幂等</strong>的：模型一旦被覆盖就不再写入，不会与设置 UI 打架，也不会循环。</p>
+<h2>安装</h2>
+<p>把本目录加入 web profile（<code>~/.dsh/profiles/web</code>）：</p>
+<pre><code>// package.json
+{
+  "dependencies": {
+    "dsh-custom-provider-reasoning": "github:534119219/dsh-custom-provider-reasoning"
+  },
+  "dsh": {
+    "profile": {
+      "bundles": [
+        "@deepseek-ai/dsh-base",
+        "@deepseek-ai/dsh-web-app",
+        "dsh-custom-provider-reasoning"   // 追加到列表末尾
+      ]
+    }
+  }
+}
+</code></pre>
+<p>然后在 profile 目录执行：</p>
+<pre><code>pnpm install
+</code></pre>
+<p>重启 <code>dsh web</code>。启动后插件会自动把 <code>reasoningEfforts</code> 写入 <code>~/.dsh/settings.yaml</code> 的自定义路由模型条目（例如）：</p>
+<pre><code>llm-pi-ai:
+  providers:
+    scnet:
+      models:
+        - id: DeepSeek-V4-Pro
+          reasoningEfforts:
+            off:
+            low: low
+            medium: medium
+            high: high
+</code></pre>
+<p>之后打开 composer 模型选择器，选择该模型即可看到推理等级（Default / Off / Low / Medium / High）。</p>
+<h2>配置</h2>
+<p>插件支持配置（放在 profile 的 <code>cordis.patch.yml</code> 对应行或插件设置页）：</p>
+<pre><code>- id: dsh-custom-provider-reasoning
+  name: 'dsh-custom-provider-reasoning'
+  config:
+    enabled: true          # 总开关，默认 true
+    scope: declared        # declared（默认，只处理自定义路由）| all（额外覆盖目录路由上目录未收录的模型）
+    verify: false          # 发布后逐个 resolveModelInfo 并记录推理元数据（诊断用）
+    maxTokens: 384000      # 缺 maxTokens 的模型补这个值；设 false 则不补
+    contextWindow: 1000000 # 缺 contextWindow 的模型补这个值；设 false 则不补
+    thinkingFormat: false    # 默认 false 不写 thinkingFormat；确需 DeepSeek 方言时改成 deepseek
+    defaultEffort: medium    # 路由级默认推理等级（profile.reasoning）：路由未声明时写入，已有值不覆盖；设 false 则不管
+    supportsDeveloperRole: false  # 自动为 declared 路由补 compat.supportsDeveloperRole；false=补 false（new-api 网关安全），true=补 true
+    levels:
+      off:                 # 留空 = 支持但不发送任何内容（端点用自己的默认）
+      low: low
+      medium: medium
+      high: high
+      max: max
+</code></pre>
+<p><code>levels</code> 的键必须是 pi-ai 的思考等级（<code>off / minimal / low / medium / high / xhigh / max</code>），值是对应线上拼写；除 <code>off</code> 外都必须是非空字符串。至少要有 <code>off</code> 之外的等级，否则插件拒绝启动（避免把路由配置弄成不可服务）。</p>
+<p><code>maxTokens</code> / <code>contextWindow</code> 只在对应字段<strong>缺失</strong>时回填，已手写的值永不被覆盖；默认值 384000 / 1000000 对齐 DeepSeek V4 官方规格。若你的自定义提供方是其他模型（上限更低），可在此调低；设 <code>false</code> 则完全不碰该字段。</p>
+<p><code>thinkingFormat</code> 控制路由级 <code>compat.thinkingFormat</code> 的管理：默认 <code>false</code>（<strong>不写</strong> thinkingFormat，因为 dsh 对每次写入都做可用性校验，残留的 thinkingFormat 会让「切协议」这一写入本身先被拒绝，插件来不及清理）；非 <code>openai-completions</code> 协议下始终自动剥离 completions 专属的 <code>thinkingFormat</code> / <code>supportsReasoningEffort</code>。只有端点确实需要 DeepSeek 的 <code>thinking</code> 参数时，才把它设成 <code>deepseek</code>（或 <code>qwen</code>/<code>together</code> 等）。</p>
+<p><code>defaultEffort</code> 管理路由级默认推理等级（<code>profile.reasoning</code> → 模型的 <code>defaultEffort</code>）：默认 <code>medium</code>，即新自定义提供方的模型在未显式选等级时使用 Medium、选择器预选 Medium（且不再显示「Default」选项）。只在路由<strong>未声明</strong>时写入，已有值永不被覆盖；设 <code>false</code> 关闭该管理。</p>
+<p><code>supportsDeveloperRole</code> 控制 <code>compat.supportsDeveloperRole</code> 的自动回填：默认 <code>false</code>，即对 <code>declared</code> 路由在 <code>openai-completions</code> 下自动补 <code>supportsDeveloperRole: false</code>（让系统提示走 <code>system</code> 角色，new-api/one-api 网关安全）；设 <code>true</code> 则补 <code>true</code>（适用于真正支持 OpenAI <code>developer</code> 角色的端点）。只在字段<strong>缺失</strong>时写入，已手写的值永不被覆盖。</p>
+<h2>注意事项</h2>
+<ul>
+<li><strong>端点兼容性</strong>：默认按 OpenAI 兼容 <code>reasoning_effort</code> 词汇注入。若端点不认 <code>reasoning_effort</code>，请求可能报错——这时可以在 <code>settings.yaml</code> 里把该模型的 <code>reasoningEfforts</code> 改成端点支持的拼写，或直接设 <code>reasoningEfforts: false</code> 关闭（插件不会覆盖显式声明）。</li>
+<li><strong>方言端点</strong>：DeepSeek 系端点（模型 id 含 <code>deepseek</code>）在 <code>openai-completions</code> 下会自动补 <code>compat.thinkingFormat: deepseek</code>；其他方言（如 qwen / together）可用 <code>thinkingFormat</code> 配置改成对应值，或设 <code>false</code> 关闭自动管理后自行在 <code>settings.yaml</code> 配置。</li>
+<li><strong>new-api / one-api 系网关会拒绝 <code>developer</code> 角色</strong>：pi-ai 对未知端点默认判定 <code>supportsDeveloperRole: true</code>，会把系统提示转换成 OpenAI o 系列专用的 <code>role: "developer"</code>，而 new-api 系网关（国内常见）不认这个角色，直接返回 <code>400 Format Error</code>。插件现已自动为 <code>declared</code> 路由补 <code>compat.supportsDeveloperRole: false</code>（配置里可改成 <code>true</code>），无需手动处理。</li>
+<li><strong>运行时</strong>：插件启动即生效（写入设置后下一次请求边界生效）；新增/编辑自定义提供方无需重启。已存在的自定义提供方（如 scnet）在插件写入 <code>reasoningEfforts</code> 后<strong>无需重启 GUI</strong> 即可看到推理等级——设置文件被 host 热加载。重启 GUI 只用于加载插件本身（保证未来新增的自定义提供方也被自动覆盖）。</li>
+</ul>
+<h2>工作原理（代码地图）</h2>
+<ul>
+<li><code>lib/index.js</code> — <code>apply()</code>：监听 <code>llm/adapters-updated</code>、<code>settings/updated</code>、<code>settings/document-updated</code>，串行执行 <code>refresh()</code>；<code>planOps()</code> 纯函数计算最小 <code>settings.mutate</code> 路径操作。</li>
+<li>路由「自定义」判定来自 <code>ctx.llm.listConfigurableProviders()</code> 的 <code>declared</code> 标志（与设置 UI 的「自定义」标签同一来源），不依赖 pi-ai 内部实现。</li>
+</ul>

@@ -1,0 +1,149 @@
+<h1>dsh-omni-vision</h1>
+<blockquote>
+<p><strong>本插件全由 DeepSeek v4 Flash（<code>deepseek-v4-flash</code>）编写。</strong></p>
+</blockquote>
+<p>让 Agent 自己"看见"文字与图形的 DSH 插件，全程本地、不依赖视觉模型：</p>
+<ul>
+<li><strong><code>eyes_render</code></strong> — 在 Web GUI 对话流里渲染画布（文字、线条、矩形、圆形、椭圆），PNG 落盘到工作区 <code>renders/</code>（读完即焚），并<strong>一式两份</strong>另存永久副本到 <code>pics/</code>。</li>
+<li><strong><code>eyes_paste</code></strong> — 让用户把剪贴板图片（截图/照片）直接 Ctrl+V 粘贴或拖进页面：浏览器捕获图片、归一化为 PNG 存到工作区，供本地 OCR/像素分析读取。只写 <code>renders/</code>（读完即焚，<strong>不留</strong> <code>pics/</code> 永久副本）。<strong>全本地读图路径</strong>（不限流、离线），独立于 DSH 原生发图链路（DSH 输入框本身支持图片粘贴/拖放，但发图需要选择支持图片的模型，见"限制"）。</li>
+<li><strong><code>eyes_ocr</code></strong> — 用 Windows 自带 OCR（<code>Windows.Media.Ocr</code>，完全离线）把 PNG 里的文字读回成文本。<strong>这是 Agent "看见文字"的途径</strong>：DeepSeek 是纯文本模型，但识别出的文本可以原样喂回给模型引用。</li>
+<li><strong><code>eyes_analyze</code></strong> — 把 PNG 解码成像素数据（N×N 颜色网格、主色占比、内容包围盒）。<strong>这是 Agent "看见图形/颜色"的途径</strong>：无需视觉模型，图形以结构化数据呈现。</li>
+</ul>
+<p>全程本地闭环：浏览器 canvas → 本机 HTTP → 本机磁盘 → Windows OCR / 像素分析。<strong>所有下载均按需、不盲目下载</strong>（详见"下载策略"）；出网环节仅限：模型推理本身，以及（可选）首次渲染 Mermaid 图且本地无副本时按需获取一次 Mermaid 库。</p>
+<h2>平台要求</h2>
+<p><strong>仅支持 Windows。</strong> <code>eyes_ocr</code> 通过 PowerShell 调用 Windows 自带 OCR 引擎（<code>Windows.Media.Ocr</code>，完全离线）；<code>eyes_render</code> / <code>eyes_paste</code> / <code>eyes_analyze</code> 本身不依赖 Windows 特性，但整个插件在非 Windows 上无法提供"读字"能力，按 Windows 平台维护。</p>
+<h2>下载策略：全部按需，不盲目下载</h2>
+<p><strong>安装与启动阶段零下载；所有获取均按需发生：</strong></p>
+<ul>
+<li><strong>插件本体</strong>：本地 <code>link:</code> / <code>file:</code> 安装，无任何下载。</li>
+<li><strong>Mermaid 库</strong>：唯一可能发生的运行时下载——仅在<strong>首次实际渲染 Mermaid 图</strong>且本地无副本时，浏览器按需从 CDN 获取一次（成功后缓存）；不渲染 Mermaid 就完全不会下载。</li>
+<li><strong>其余全部本地</strong>：渲染、OCR、像素分析、图片接收，均不产生任何网络下载。</li>
+</ul>
+<h2>工作原理</h2>
+<pre><code>模型 ──eyes_render──▶ 服务端工具 execute
+  │                      │ 按 callId 注册"待渲染"承诺（15s 超时）
+  │                      ▼
+  │          会话事件流（tool/call 事件实时推送浏览器）
+  │                      ▼
+  │          浏览器 keyed tool.call.toolview 卡片
+  │                      │ 解析命令 → canvas 绘制 → toBlob → PNG base64
+  │                      ▼
+  │          POST /eyes/render（同源校验，按 callId 匹配）
+  │                      ▼
+  │          工具恢复：写 &lt;workspace&gt;/renders/eyes-&lt;callId&gt;.png（读完即焚）
+  │                    + 永久副本 &lt;workspace&gt;/pics/eyes-&lt;callId&gt;.png
+  │                    + attachments.saveImage（内容寻址存储）
+  │                      ▼
+  │          工具结果 = 文本信封（路径/尺寸/命令数/OCR 文本）
+  └──────────────────────（模型声明支持图片时，结果额外带 image 图片块）
+
+模型 "看见"文字：eyes_render（或任意 PNG）→ eyes_ocr ──▶ 行文本
+模型 "看见"图形：PNG → eyes_analyze ──▶ 颜色网格 / 主色 / 内容包围盒
+
+用户图片进来：模型 ──eyes_paste──▶ 粘贴卡片（Ctrl+V 提示）
+  │                      │ 浏览器捕获剪贴板图片 → canvas → PNG base64
+  │                      ▼
+  │          POST /eyes/paste（同源校验，按 callId 匹配）
+  │                      ▼
+  │          写 &lt;workspace&gt;/renders/paste-&lt;callId&gt;.png（读完即焚，无永久副本）
+  └────────── 之后 eyes_ocr / eyes_analyze 读取
+</code></pre>
+<ul>
+<li><strong>图片能力探测 + 降级</strong>：执行时探测当前模型路由是否声明 <code>image</code> 输入（<code>llm.resolveModelInfo().inputModalities</code>）。支持 → 结果带 <code>{type:'image', attachment}</code> 图片块，模型下一轮起能看见；不支持（如 DeepSeek API，适配器声明 <code>["text"]</code> 且遇图片块抛 <code>UNSUPPORTED_CONTENT</code>）→ 只返回文本信封，会话绝不报错。画布仍渲染在 GUI 里，用户可见。</li>
+<li><strong>本地感知（文字）</strong>：<code>eyes_ocr</code> 通过 PowerShell 5.1 调用 Windows 自带 OCR 引擎，离线识别，支持已安装的语言包（如 <code>zh-Hans-CN</code> 中文简体）。识别结果按行返回文本。</li>
+<li><strong>本地感知（图形）</strong>：<code>eyes_analyze</code> 自带纯 Node PNG 解码器（zlib + 反滤波，支持 8-bit RGB/RGBA 非交错 PNG），输出网格平均色、主色直方图、内容包围盒。</li>
+<li><strong>渲染匹配</strong>：客户端把工具调用的 <code>callId</code> 随 PNG 一起 POST 回来，服务端按 <code>exec.callId</code> 匹配待渲染条目，天然支持并行调用与多标签页（先到先得，其余 404 被客户端静默忽略）。</li>
+<li><strong>重放</strong>：刷新页面后，历史会话里的卡片从工具参数（<code>block.call.argsRaw</code>）重放绘制，不再上传。</li>
+<li><strong>读完即焚 + 一式两份</strong>：<code>eyes_render</code> 每次产出都写两份——<code>renders/</code> 下的临时副本在 <code>eyes_ocr</code> / <code>eyes_analyze</code> 读取成功后自动删除（返回结果带 <code>fileDeleted</code> 标记，<code>renders/</code> 不会越积越多）；<code>pics/</code> 下的永久副本（返回结果带 <code>keptPath</code>）<strong>不会被删除</strong>，用户随时可以打开查看。<code>eyes_paste</code> 只写 <code>renders/</code>（读完即焚），<strong>不保留</strong> <code>pics/</code> 永久副本。用户放在其他目录的图片（截图、照片等）<strong>绝不会</strong>被删除。</li>
+</ul>
+<h2>安装</h2>
+<pre><code>cd &lt;你的工作区&gt;
+dsh plugin --profile web add link:&lt;你的工作区&gt;\dsh-omni-vision
+# 若链接失败：dsh plugin --profile web add file:&lt;你的工作区&gt;\dsh-omni-vision
+</code></pre>
+<p>安装后校验 <code>%USERPROFILE%\.dsh\profiles\web\package.json</code>：dependencies 与 <code>dsh.profile.bundles</code> 都应包含 <code>dsh-omni-vision</code>。</p>
+<p><strong>可选</strong>：<code>npm i mermaid@11</code> 仅在需要<strong>全离线</strong>渲染 Mermaid 图时安装；不装也能用——首次实际渲染时浏览器会<strong>按需</strong>从 CDN 加载（成功后缓存）。<strong>安装/启动阶段不会盲目下载任何东西。</strong></p>
+<p><strong>必须重启 web 服务</strong>（生产启动时插件列表与客户端 bundle 在启动时固化）：</p>
+<ol>
+<li>在运行 <code>dsh web</code> 的窗口按 Ctrl+C（或结束监听 3080 端口的进程）。</li>
+<li>重新运行 <code>start-dsh.ps1</code>（或 <code>npx --yes @deepseek-ai/dsh web</code>）。</li>
+<li>浏览器硬刷新（Ctrl+Shift+R）。</li>
+</ol>
+<h2>使用</h2>
+<h3>eyes_render —— 画</h3>
+<p>参数：<code>width</code>/<code>height</code>（64–2048）、<code>background</code>（CSS 颜色）、<code>title</code>、<code>description</code>、<code>commands</code>（数组）、<code>mermaid</code>（字符串，可选）、<code>ocr</code>（布尔，渲染后顺带本地 OCR，默认 false）。</p>
+<p><strong>Mermaid 连线图</strong>：传 <code>mermaid</code> 参数（Mermaid 源码字符串，如 <code>graph LR\n  A[start] --&gt; B[process] --&gt; C[end]</code>）即可让浏览器渲染出流程图/时序图等，<strong>无需手工计算坐标</strong>；<code>mermaid</code> 存在时优先于 <code>commands</code>。支持 flowchart / sequenceDiagram / classDiagram / stateDiagram 等 Mermaid 语法。渲染结果走同一套 PNG 存档（一式两份）+ 可选 OCR（可把节点文字读回给模型）。<strong>按需加载</strong>（本插件所有下载均按需，见"下载策略"）：只有实际传 <code>mermaid</code> 参数渲染时才加载，优先用本地副本（在插件目录 <code>npm i mermaid@11</code> 后全离线可用），缺失时才回退 CDN（首次需浏览器联网，成功后浏览器缓存）。加载或语法失败时工具返回明确错误。</p>
+<p>落盘 PNG 的像素尺寸与 <code>width</code>/<code>height</code> <strong>完全一致</strong>（不做设备像素比缩放），命令坐标与 PNG 像素一一对应——<code>eyes_analyze</code> 看到的网格坐标、<code>contentBox</code> 都与命令里的 x/y 直接可比。</p>
+<p><code>text</code> 的 <code>y</code> 是<strong>首行字形顶部</strong>的坐标：绘制时用 <code>measureText</code> 量出字形顶部相对字母基线的距离（<code>actualBoundingBoxAscent</code>），在 <code>y + ascent</code> 处画基线，字形顶精确落在 y 上（跨引擎一致，不随字体/字号/浏览器解释差异偏下），中文、拉丁文混排时顶部对齐一致。</p>
+<p>PNG <strong>一式两份</strong>：<code>renders/eyes-&lt;callId&gt;.png</code>（<code>ocr:true</code> 且读回成功后自动删除，读完即焚）+ <code>pics/eyes-&lt;callId&gt;.png</code>（永久保留，结果里的 <code>keptPath</code>）。</p>
+<table>
+<thead>
+<tr>
+<th>op</th>
+<th>字段</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>text</code></td>
+<td><code>x</code>,<code>y</code>,<code>text</code>,<code>size</code>,<code>font</code>,<code>weight</code>,<code>color</code>,<code>align</code>,<code>maxWidth</code></td>
+</tr>
+<tr>
+<td><code>line</code></td>
+<td><code>x1</code>,<code>y1</code>,<code>x2</code>,<code>y2</code>,<code>color</code>,<code>width</code></td>
+</tr>
+<tr>
+<td><code>rect</code></td>
+<td><code>x</code>,<code>y</code>,<code>w</code>,<code>h</code>,<code>radius</code>,<code>fill</code>,<code>stroke</code>,<code>strokeWidth</code></td>
+</tr>
+<tr>
+<td><code>circle</code></td>
+<td><code>cx</code>,<code>cy</code>,<code>r</code>,<code>fill</code>,<code>stroke</code>,<code>strokeWidth</code></td>
+</tr>
+<tr>
+<td><code>ellipse</code></td>
+<td><code>cx</code>,<code>cy</code>,<code>rx</code>,<code>ry</code>,<code>fill</code>,<code>stroke</code>,<code>strokeWidth</code></td>
+</tr>
+<tr>
+<td><code>clear</code></td>
+<td><code>color</code>（清屏底色）</td>
+</tr>
+</tbody></table>
+<h3>eyes_ocr —— 读文字</h3>
+<p>参数：<code>path</code>（PNG 绝对路径，如 <code>eyes_render</code> 返回的 path）。返回 <code>ok</code>、<code>text</code>（全文）、<code>lines</code>（逐行）、<code>language</code>，以及 <code>fileDeleted</code>（<code>renders/</code> 下的源文件读取后自动删除）。</p>
+<h3>eyes_analyze —— 看图形</h3>
+<p>参数：<code>path</code>（PNG 绝对路径）、<code>grid</code>（采样网格 N×N，2–32，默认 8）、<code>maxColors</code>（主色数量，1–16，默认 6）。返回 <code>gridCells</code>（网格平均色）、<code>dominantColors</code>（主色及占比）、<code>contentBox</code>（内容包围盒），以及 <code>fileDeleted</code>（同上，读完即焚）。</p>
+<h3>eyes_paste —— 收图</h3>
+<p>参数：<code>hint</code>（可选，显示在粘贴卡片上的说明）。调用后 GUI 出现粘贴卡片，用户选择一张图片复制后ctrl+v或直接拖到浏览器界面（批量读取时，可把多张图片副本直接放入 renders/ 文件夹并告诉所用AI），浏览器捕获并保存为 <code>&lt;workspace&gt;/renders/paste-&lt;callId&gt;.png</code>（读完即焚，<strong>无</strong> <code>pics/</code> 永久副本读完即焚；未读取的文件会留在 renders/ 中，可手动清理）。返回 <code>path</code>、<code>width</code>、<code>height</code>、<code>bytes</code>、<code>fileSaved</code>、<code>fileError</code>。</p>
+<h3>示例</h3>
+<blockquote>
+<p>用 eyes_paste 让用户粘贴一张截图，然后用 eyes_ocr 读出里面的文字并复述给我</p>
+</blockquote>
+<blockquote>
+<p>用 eyes_render 画一张 800x400 的画布，写上文字"Hello 世界 123"，设 ocr:true，然后告诉我你看到了什么</p>
+</blockquote>
+<blockquote>
+<p>用 eyes_render 画一张 900x500 的 Mermaid 流程图：<code>graph TD\n  A[登录] --&gt; B{校验}\n  B --&gt;|成功| C[进入主页]\n  B --&gt;|失败| D[提示错误]</code>，设 ocr:true 读回节点文字</p>
+</blockquote>
+<blockquote>
+<p>eyes_ocr 读取 \renders\eyes-xxx.png，把识别出的文字逐行复述给我</p>
+</blockquote>
+<blockquote>
+<p>eyes_analyze 分析 \renders\eyes-xxx.png，网格 12，然后描述画面布局和主要颜色</p>
+</blockquote>
+<h2>限制</h2>
+<ul>
+<li><strong>仅支持 Windows</strong>：<code>eyes_ocr</code> 依赖 Windows 自带 OCR（<code>Windows.Media.Ocr</code> + PowerShell 5.1），其他平台无法读字；渲染/粘贴/像素分析不依赖 Windows，但插件整体按 Windows 平台维护。</li>
+<li><strong>需要浏览器 GUI 打开</strong>：<code>eyes_render</code> / <code>eyes_paste</code> 会等浏览器回传——普通渲染 15 秒、Mermaid 首次加载放宽到 45 秒、<code>eyes_paste</code> 等人粘贴放宽到 60 秒；GUI 未开时返回明确错误。无服务端渲染兜底。</li>
+<li><strong>Mermaid 依赖（按需）</strong>：本插件所有下载均按需（见"下载策略"）——Mermaid 仅在实际渲染时才加载，优先取宿主 <code>/eyes/mermaid.min.js</code>（在插件目录 <code>npm i mermaid@11</code> 后提供，全离线），否则回退 jsDelivr CDN（仅首次需浏览器联网，成功后浏览器缓存）；不渲染就完全不会下载。渲染与语法错误会作为工具报错返回。</li>
+<li><strong>OCR 效果</strong>：依赖 Windows 自带语言包（需已安装对应语言包，如 <code>zh-Hans-CN</code>）；<code>Windows.Media.Ocr</code> 对中英混排会在中文字符间插入空格，效果一般但可读；纯图形内容识别为空属正常。</li>
+<li><strong>OCR 路径</strong>：WinRT <code>StorageFile</code> 要求反斜杠路径，脚本已自动把 <code>/</code> 规范化为 <code>\</code>。</li>
+<li><strong><code>eyes_analyze</code> 仅支持 8-bit RGB/RGBA 非交错 PNG</strong>（覆盖本插件的渲染输出与常见截图）；其他变体返回明确错误。</li>
+<li>无 <code>attachments</code> 服务时不注册工具（与 <code>read_image</code> 相同门槛）。</li>
+<li><strong>DSH 输入框原生支持图片</strong>（粘贴/拖放，"图片拖动到此处即可添加，最多 20 张/20MB"，UI 在 <code>dsh-client-ui-conversation</code>）；发图被拒是因为当前 DeepSeek 路由是纯文本（错误码 <code>MODEL_DOES_NOT_SUPPORT_IMAGES</code>，提示"当前模型不支持图片"）——切换到 dsh-vision-router 的「自动识图」模型即可原生发图。<code>eyes_paste</code> 是<strong>全本地</strong>读图路径（不依赖云/不限流），适合 OCR/像素细看用户图。</li>
+</ul>
+<h2>开发</h2>
+<ul>
+<li>服务端半区：<code>lib/index.js</code>（纯 ESM，无构建）、<code>lib/png.js</code>（PNG 解码+分析）、<code>lib/ocr.ps1</code>（Windows OCR 封装）。</li>
+<li>客户端半区：<code>client/client.js</code>（手写 <code>window.__ModuleLoader__.load</code> factory bundle，无构建；loader 表提供 <code>react</code>）。</li>
+<li>改动后需重启 <code>dsh web</code> 才生效（生产启动无 HMR watcher）。</li>
+</ul>

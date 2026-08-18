@@ -1,0 +1,163 @@
+<p><a href="https://github.com/AntaresCorn/dsh-auto-reviewer/blob/HEAD/README.en.md">English</a> | <a href="https://github.com/AntaresCorn/dsh-auto-reviewer/blob/HEAD/README.md">中文</a></p>
+<h1>dsh-auto-reviewer — Codex-style "approve for me" permission mode</h1>
+<p>为 DeepSeek Harness 提供类似 Codex Auto Reviewer / "approve for me" 的权限模式：</p>
+<ul>
+<li>在现有 <strong>Permissions</strong> 列表中新增 <strong>auto-review</strong> 选项；</li>
+<li>模型在沙箱中请求提权时，插件自动判断这次操作是否危险、是否已被用户明确确认；</li>
+<li>安全操作自动同意（<code>allowed-once</code>），危险/模糊操作转交用户确认，明显恶意/破坏性操作直接拒绝；</li>
+<li>模糊场景可选调用 LLM 进行自动审查，LLM 不可用或拿不准时安全地退回人工确认。</li>
+</ul>
+<blockquote>
+<p>这是一个社区项目，与 DeepSeek 官方无关。</p>
+</blockquote>
+<h2>特性</h2>
+<ul>
+<li><strong>新增权限预设</strong>：通过 <code>cordis.patch.yml</code> 扩展官方 <code>permission-presets</code> 表，UI 的权限下拉框会多出 <code>auto-review</code> 选项，选择后写入 <code>workspace-write + ask</code>，并记录为 <code>auto-review</code> 预设。</li>
+<li><strong>自动授权提示</strong>：自动放行/拒绝时都会向对话流注入一条 Codex 风格的提示（放行：<code>Automatic approval review approved (risk: low, authorization: unknown): Auto-review returned a low-risk allow decision.</code>；拒绝：<code>Automatic approval review denied (risk: high, authorization: unknown): Auto-review returned a high-risk deny decision.</code>），方便追踪哪些提权被自动裁决。</li>
+<li><strong>自动补齐权限图标</strong>：安装插件后会自动为已安装的 DSH 权限选择弹框补上 <code>auto-review</code> 图标（盾牌+星芒），与内置预设风格一致；升级或重装 dsh 后重启服务即自动重新补齐，浏览器强制刷新后生效。</li>
+<li><strong>审批瀑布前置</strong>：使用 <code>ctx.on('approval/request', handler, true)</code> 把自动审查器放在交互式 UI 应答者之前；返回 <code>allowed-once</code>/<code>rejected</code> 即直接裁决，调用 <code>next()</code> 则正常弹出人工确认。</li>
+<li><strong>多级安全策略</strong>：<ul>
+<li>快速放行：<code>workspace-write</code> 且非高风险；</li>
+<li>用户确认放行：最近用户消息中有明确“请执行/我确认/允许”等信号，且非致命破坏操作；</li>
+<li>模糊转人工：LLM 返回 <code>ask</code>、LLM 不可用或超时；</li>
+<li>直接拒绝：命中 <code>blocklist</code>，或未获用户确认的致命破坏操作（<code>rm -rf /</code>、<code>mkfs</code>、<code>curl | sh</code> 等）。</li>
+</ul>
+</li>
+<li><strong>可选 LLM 审查</strong>：默认使用当前会话的 provider/model 对模糊请求做一次短输出 JSON 审查；可配置独立 <code>llmProvider</code>/<code>llmModel</code>。</li>
+</ul>
+<h2>安装</h2>
+<h3>作为 GitHub 仓库装配（推荐）</h3>
+<pre><code>dsh plugin --profile web add github:AntaresCorn/dsh-auto-reviewer
+</code></pre>
+<p>或手动 clone 后装配（仓库已提交编译好的 <code>lib/</code>；本地目录装配前需先装好开发依赖并链接宿主包）：</p>
+<pre><code>git clone https://github.com/AntaresCorn/dsh-auto-reviewer.git
+cd dsh-auto-reviewer
+npm install
+npm run link-host
+cd ..
+dsh plugin --profile web add /path/to/dsh-auto-reviewer
+</code></pre>
+<p>说明：<code>dsh plugin add /path/to/dir</code> 会以 <code>link:</code> 方式指向该目录，所以装配前必须在仓库目录执行 <code>npm install</code> 和 <code>npm run link-host</code>。</p>
+<h3>本地构建</h3>
+<pre><code>npm install          # 安装 typescript / @types/node 等开发依赖
+npm run link-host    # 把 node_modules/@deepseek-ai 软链到已安装的 dsh 宿主包（避免重复副本）
+npm run build        # src/ → lib/（仓库已提交编译产物，普通用户无需构建）
+</code></pre>
+<p>安装/注入后<strong>必须完全重启 DeepSeek Harness</strong>，新建会话，在权限选择器中选择 <strong>auto-review</strong>。</p>
+<blockquote>
+<p>⚠️ 经验教训（2026-08-16 实测）：不要在运行中的对话里用 <code>dev_install_package</code> / <code>dev_inject_plugin</code> 热装载后继续对话。
+热装载路径与正式 bundle 装配路径不一致，可能导致 loader/agent 上下文损坏（<code>Cannot read properties of undefined (reading 'enabled')</code>）。
+正式安装请走官方 <code>dsh plugin --profile web add &lt;目录&gt;</code>，然后 <code>systemctl --user restart dsh-web</code>（或对应重启方式）。
+开发目录的 <code>node_modules</code> 只用于本地编译/类型检查，不要让它成为 profile link 指向的运行时依赖来源。</p>
+</blockquote>
+<h2>使用方法</h2>
+<ol>
+<li>打开一个新会话（或已有会话）。</li>
+<li>在权限弹窗/设置中选择 <strong>auto-review</strong>。</li>
+<li>正常让模型工作。当模型因为沙箱拒绝而请求 <code>sandbox_permissions</code> 提权时，本插件自动裁决：<ul>
+<li>安全 → 自动放行；</li>
+<li>有风险 → 弹出人工确认；</li>
+<li>明确恶意/未确认的破坏性操作 → 拒绝。</li>
+</ul>
+</li>
+</ol>
+<h2>配置</h2>
+<p>插件默认配置已在 <code>cordis.patch.yml</code> 中给出。你可以通过 profile 的 <code>cordis.patch.yml</code> 覆盖：</p>
+<table>
+<thead>
+<tr>
+<th>配置项</th>
+<th>默认值</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>presetName</code></td>
+<td><code>auto-review</code></td>
+<td>本插件响应的权限预设名</td>
+</tr>
+<tr>
+<td><code>llmProvider</code></td>
+<td><code>''</code></td>
+<td>审查 LLM provider，留空使用当前会话</td>
+</tr>
+<tr>
+<td><code>llmModel</code></td>
+<td><code>''</code></td>
+<td>审查 LLM model，留空使用当前会话</td>
+</tr>
+<tr>
+<td><code>maxContextMessages</code></td>
+<td><code>12</code></td>
+<td>参与判断的最近用户消息数</td>
+</tr>
+<tr>
+<td><code>autoApproveWorkspaceWrite</code></td>
+<td><code>true</code></td>
+<td>自动放行非高风险 workspace-write 提权</td>
+</tr>
+<tr>
+<td><code>autoApproveDangerFullAccess</code></td>
+<td><code>true</code></td>
+<td>自动放行非高风险 danger-full-access 提权</td>
+</tr>
+<tr>
+<td><code>autoApproveUserConfirmed</code></td>
+<td><code>true</code></td>
+<td>用户明确确认且非致命破坏时放行</td>
+</tr>
+<tr>
+<td><code>askOnAmbiguous</code></td>
+<td><code>true</code></td>
+<td>模糊时转人工；<code>false</code> 则拒绝</td>
+</tr>
+<tr>
+<td><code>rejectCritical</code></td>
+<td><code>true</code></td>
+<td>未确认的致命破坏操作直接拒绝</td>
+</tr>
+<tr>
+<td><code>useLlm</code></td>
+<td><code>true</code></td>
+<td>对模糊请求使用 LLM 审查</td>
+</tr>
+<tr>
+<td><code>timeoutMs</code></td>
+<td><code>10000</code></td>
+<td>LLM 审查超时</td>
+</tr>
+<tr>
+<td><code>blocklist</code></td>
+<td><code>[]</code></td>
+<td>自定义正则黑名单</td>
+</tr>
+<tr>
+<td><code>blocklistMode</code></td>
+<td><code>reject</code></td>
+<td>命中黑名单时 <code>reject</code> 或 <code>ask</code></td>
+</tr>
+<tr>
+<td><code>extraInstructions</code></td>
+<td><code>''</code></td>
+<td>追加给审查 LLM 的指令</td>
+</tr>
+</tbody></table>
+<h2>安全说明</h2>
+<ul>
+<li>任何内部异常都会<strong>失败关闭</strong>：调用 <code>next()</code> 转人工确认，不会自动放行。</li>
+<li>自动放行只针对单次操作（<code>allowed-once</code>），不会记住“永远允许”。</li>
+<li>本插件不会绕过 <code>never</code> 策略：如果会话被切到 <code>danger-full-access</code>（<code>approval: never</code>），审批服务会在到达本插件前直接拒绝。</li>
+<li>请先阅读源码再安装；本插件只做权限决策，不执行任何网络请求以外的 LLM 审查调用。</li>
+</ul>
+<h2>仓库结构</h2>
+<pre><code>dsh-auto-reviewer/
+├── cordis.patch.yml      # 扩展权限表 + 装配插件
+├── package.json          # 插件包元数据（dsh.bundle.patch）
+├── scripts/build.sh      # tsc 构建脚本（无需 DSH checkout）
+├── scripts/link-host-deps.sh # 软链宿主 @deepseek-ai 依赖（避免重复副本）
+├── src/index.ts          # 自动审查实现
+├── README.md             # 中文说明
+└── README.en.md          # English README
+</code></pre>
+<h2>License</h2>
+<p>BSD-3-Clause</p>

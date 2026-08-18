@@ -1,0 +1,82 @@
+<h1>dsh-review</h1>
+<p><strong>Packaged multi-agent adversarial code review for DeepSeek Harness.</strong></p>
+<p>English | <a href="https://github.com/Viger1/dsh-review/blob/HEAD/README.zh.md">中文</a></p>
+<p>Status: <strong>M0</strong> — the <code>review</code> tool works end to end.</p>
+<h2>The problem</h2>
+<p>dsh ships the primitives for multi-agent work — subagents, workflows, ralph loops — but nothing that packages them into a review you can trust. Run naive parallel reviewers over a diff and you get a wall of plausible-sounding findings, most of them wrong; triaging them costs more than the review saved. "AI code review produces too many false positives" is the reason people stop using it.</p>
+<h2>The method</h2>
+<p>Two stages, and the second is the one that matters:</p>
+<ol>
+<li><strong>Find</strong> — several reviewers in parallel, each with a distinct lens (correctness, lifecycle/concurrency, API-contract conformance, security), each reporting findings with a concrete failure scenario rather than a style opinion.</li>
+<li><strong>Verify adversarially</strong> — every finding gets its own verifier whose job is to <em>refute</em> it: read the real code, reproduce if possible, and default to "not real" when the evidence is ambiguous. Only survivors are reported.</li>
+</ol>
+<p>Measured on this repo's two sibling plugins (<a href="https://github.com/Viger1/dsh-preview">dsh-preview</a>, <a href="https://github.com/Viger1/dsh-pilot">dsh-pilot</a>): <strong>73 agents, 49 confirmed findings, 14 refuted.</strong> Two of the confirmed ones were only established because a verifier wrote a script and reproduced the failure — including a defect where the agent silently clicked the wrong same-named button on shadow-DOM pages.</p>
+<h2>Install</h2>
+<pre><code>dsh plugin --profile web add dsh-review
+</code></pre>
+<p>Requires a composed subagent provider (the stock <code>spawn</code> provider in <code>dsh-base</code> is the default) and Node <code>^22.19 || &gt;=24</code>.</p>
+<h2>Use</h2>
+<p>One tool, <code>review</code>. It is the most expensive thing in a session — every lens is an agent and every finding costs another — so it is a <strong>pre-release audit, not a per-commit check</strong>. A full run on a real change took minutes and a double-digit number of agents in our own use; budget for that, and use <code>depth: quick</code> when you want a cheap look at a small change.</p>
+<p>Describe the target the way you would brief a colleague who has the repository but not the context:</p>
+<pre><code>Review the uncommitted changes in src/policy.ts and src/index.ts (run git diff).
+They add an origin gate that must follow the session's approval stance: a session
+with approval policy 'never' passes silently, an 'ask' session is prompted once
+per origin, and a grant must never leak to another session.
+</code></pre>
+<p>The tool returns confirmed findings — file, line, what is wrong, the failure scenario, and a suggested fix — plus the titles of findings that were <strong>refuted</strong>, so you can see what the verification stage filtered out rather than wondering what it missed.</p>
+<pre><code>review { target: "...", depth: "quick" }
+</code></pre>
+<p><code>quick</code> caps the run at two lenses, four verified findings, and one verifier — roughly a third of the cost. <strong>Verification runs at both depths</strong>: a cheaper review looks at less rather than trusting more, because reporting an unverified claim is the failure this plugin exists to avoid.</p>
+<p>The bundled <code>adversarial-review</code> skill teaches the agent when a review is worth its cost and how to act on the two categories differently.</p>
+<h3>What this has not been measured against</h3>
+<p>The evidence here is that the method finds real defects — 49 confirmed across the sibling plugins, several reproduced by a verifier writing a script. What has <strong>not</strong> been measured is whether it beats simply asking the model to review the same diff: no A/B, no false-positive rate against a baseline. Treat the refutation stage as a design argument backed by observed refusals (14 findings dropped), not as a proven improvement over the obvious alternative.</p>
+<h2>Configuration</h2>
+<pre><code>- id: review
+  name: dsh-review
+  config:
+    subagentProvider: spawn   # which composed provider runs the children
+    lenses: []                # [] runs every built-in lens
+    verifiersPerFinding: 1    # raise for a stricter panel; all must confirm
+    maxFindings: 12           # verification budget, worst severities first
+    maxConcurrentChildren: 8  # cap on children running at once
+    maxDepth: 2               # delegation-depth cap for review children
+    registerSkill: true
+</code></pre>
+<p>Lenses: <code>correctness</code>, <code>lifecycle</code>, <code>contract</code>, <code>security</code>. Each is one child agent, and each finding costs <code>verifiersPerFinding</code> more — a review is the most expensive tool in a session, which is why the skill tells the model to use it deliberately.</p>
+<h2>Design notes</h2>
+<ul>
+<li><strong>Silence is reported, not implied.</strong> A lens that ran and found nothing is listed as such, separately from one that failed — otherwise a caller cannot tell coverage from absence, which the plugin's own first quick run made obvious.</li>
+<li><strong>Failures are contained per child.</strong> A finder that dies costs its lens and is reported as a coverage gap; a verifier that dies refutes its finding, because a claim nobody verified is exactly what this plugin exists not to print.</li>
+<li><strong>Verification is unanimous.</strong> With <code>verifiersPerFinding &gt; 1</code>, one refutation is enough to drop a finding — the asymmetry is deliberate.</li>
+<li><strong>The budget cuts the least severe.</strong> Findings are verified worst-first, and anything cut is reported as dropped rather than silently omitted.</li>
+<li><strong>Fan-out is bounded.</strong> Every child start passes through one limiter, so a large budget queues instead of firing hundreds of agents at once — an overload would otherwise arrive disguised as a review that refuted everything.</li>
+</ul>
+<h3>Dogfooding</h3>
+<p><code>dsh-review</code> reviewed its own source and found three defects, which are fixed and pinned by tests: a zero <code>dedupeThreshold</code> merged every finding in a file (distinct defects silently discarded as duplicates), the verifier fan-out had no concurrency bound, and <code>maxDepth</code> was the one numeric config never validated at load. It also refuted two findings, one of which was a genuine false positive about a value the entry point already validates.</p>
+<h2>Family</h2>
+<table>
+<thead>
+<tr>
+<th>Plugin</th>
+<th>What it gives your agent</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><a href="https://github.com/Viger1/dsh-preview">dsh-preview</a></td>
+<td>👁 Eyes — verify what it builds: open, read, screenshot, self-check</td>
+</tr>
+<tr>
+<td><a href="https://github.com/Viger1/dsh-pilot">dsh-pilot</a></td>
+<td>✋ Hands — operate any page by accessibility refs, with a native permission model</td>
+</tr>
+<tr>
+<td><strong>dsh-review</strong> (this repo)</td>
+<td>🔍 Judgement — find defects, then try to refute each one before reporting it</td>
+</tr>
+<tr>
+<td><a href="https://github.com/Viger1/dsh-design">dsh-design</a></td>
+<td>🎨 Taste — constrain the choices, then measure whether the result kept them</td>
+</tr>
+</tbody></table>
+<h2>License</h2>
+<p>MIT © Viger1</p>

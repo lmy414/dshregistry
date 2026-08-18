@@ -1,0 +1,80 @@
+<h1>dsh-plugin-desktop</h1>
+<p>DSH-desktop-for-Linux 的<strong>官方伴生插件</strong>（独立发布，<code>dsh-plugin</code> 话题）。</p>
+<p><strong>定位：大部分桌面端功能 + 小部分插件功能。</strong> 原版桌面端保持极简；安装此插件才解锁增强功能。运行在 dsh 服务进程内，一方面把桌面端需要的内部状态以稳定 HTTP 端点暴露出来（替代桌面端过去的 hack），另一方面往 Web UI 注入增强的页内右键菜单与「置顶会话」扩展。</p>
+<table>
+<thead>
+<tr>
+<th>桌面端旧做法</th>
+<th>插件做法</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>嗅探 <code>webRequest</code> 的 <code>/api/session.*</code> POST body 判断当前会话</td>
+<td><code>GET /api/state</code> 直接给出</td>
+</tr>
+<tr>
+<td>解压 <code>~/.dsh/sessions/**/session.jsonl.zstd</code> 估算用量</td>
+<td><code>GET /api/usage</code> 给出事件流实时聚合</td>
+</tr>
+<tr>
+<td>（无）</td>
+<td>页内完整右键菜单（会话/工作区/正文/链接/输入框）+「置顶会话」扩展（client 注入）</td>
+</tr>
+</tbody></table>
+<h2>端点</h2>
+<ul>
+<li><code>GET /api/state</code> → <code>{ plugin, since, currentSessionId, turn: 'working'|'idle', lastTurnEndSeq, lastSummary }</code></li>
+<li><code>GET /api/usage</code> → <code>{ plugin, since, complete: false, byModel, sessions: [{ id, byModel, userMsgByModel, lastTurnEndSeq, lastSummary, updatedAt }] }</code><ul>
+<li><code>complete: false</code>：仅覆盖插件加载后的事件（dsh 重启后归零）。桌面端用它做当前会话的实时数据，历史总量仍走本地文件扫描（有 mtime+size 缓存，增量代价很小）。</li>
+</ul>
+</li>
+<li><code>POST /api/prompt</code> <code>{ sessionId?, text }</code> → 全局快捷输入的发送通道；<code>sessionId</code> 缺省用当前会话。</li>
+<li><code>POST /api/set-session</code> <code>{ sessionId }</code> → 桌面壳在用户在 Web UI 中切换会话时调用，让 <code>/api/state</code> 的 <code>currentSessionId</code> 始终跟随用户实际查看的会话（DS-pet 依赖此接口）。</li>
+</ul>
+<h2>实机验证（2026-08-17）</h2>
+<p>在真实 dsh + 桌面 Electron 环境中验证了 <code>POST /api/set-session</code> 的端到端链路：</p>
+<ol>
+<li>创建两个会话，<code>/api/state</code> 因 <code>session/created</code> 事件暂时指向新会话；</li>
+<li>在主页面（webContents 内）发起 <code>fetch('/api/session.history', { method: 'POST', body: JSON.stringify({ payload: { sessionId } }) })</code>，模拟用户在 Web UI 中打开某个会话；</li>
+<li>桌面壳的 <code>webRequest</code> 嗅探捕获该请求并调用 <code>POST /api/set-session</code>；</li>
+<li>随后 <code>GET /api/state</code> 的 <code>currentSessionId</code> 双向切换正确（<code>session-f30a986a-…</code> ↔ <code>session-611cc60e-…</code>）。</li>
+</ol>
+<p>该链路证明：即使插件可用（<code>pluginAvailable=true</code>），桌面端也会持续嗅探 <code>/api/session.*</code> 并同步 UI 导航导致的当前会话变化，DS-pet 轮询到的 <code>currentSessionId</code> 与实际查看的会话一致。</p>
+<p>事件语义与桌面端 <code>src/usage-parse.js</code> 完全一致（<code>request/header</code> 记模型、<code>user/message</code> 开新一轮、<code>turn/end</code> 收尾、用量只取 <code>assistant/chunk</code>），保证两条路径数字一致。</p>
+<h2>安装</h2>
+<p><strong>方式一（推荐，独立发布）</strong>：</p>
+<pre><code>dsh plugin add github:Quan-Robin/dsh-plugin-desktop
+</code></pre>
+<p><strong>方式二（桌面端内置）</strong>：DSH-desktop-for-Linux 托盘/设置页「安装伴生插件」一键安装（从应用内拷贝 + patch 注册）。</p>
+<p>手动亦可：把本目录拷贝到 <code>$DSH_HOME/profiles/web/node_modules/dsh-plugin-desktop/</code>，并在 <code>$DSH_HOME/profiles/web/cordis.patch.yml</code> 追加：</p>
+<pre><code>- insert:
+    - id: dsh-plugin-desktop
+      name: dsh-plugin-desktop
+      inject:
+        - webServer
+        - apiProxy
+</code></pre>
+<p>然后重启 dsh 服务。手动验证：<code>curl http://127.0.0.1:3080/api/state</code>。</p>
+<h2>页内增强（client 注入，随插件加载）</h2>
+<p>安装后 dsh Web UI 自动获得：</p>
+<ul>
+<li><strong>完整右键菜单</strong>：会话 / 工作区 / 正文编辑 / 链接 / 输入框，各场景对应操作；检测到社区 @baihejiangnan/dsh-session-context-menu 已装时自动让位，仅注册「置顶会话」为其扩展</li>
+<li><strong>置顶会话</strong>：会话行右键「置顶会话」→ 侧边栏独立「📌 置顶」分区（状态由桌面端保管）；右键会话菜单显示「置顶/取消置顶」随状态切换</li>
+</ul>
+<h2>适配真实 dsh（重要）</h2>
+<p>dsh 的插件 API 尚未文档化，本插件的宿主交互集中在 <code>lib/index.js</code> 的三个
+ADAPTER 函数里，全部是"尝试多种可能形态、逐个降级"的写法：</p>
+<ol>
+<li><strong><code>EVENT_BUS_SHAPES</code></strong> — 事件挂接：<code>ctx.on('dsh/event')</code> / <code>ctx.on('session/event')</code> / <code>ctx.events.on(...)</code></li>
+<li><strong><code>ROUTER_SHAPES</code></strong> — HTTP 注册：<code>ctx.server.get/post</code> / <code>ctx.router.get/post</code></li>
+<li><strong><code>PROMPT_SHAPES</code></strong> — 发消息 RPC：<code>ctx.server.call('session.prompt')</code> 等</li>
+</ol>
+<p>接真实 dsh 时只需要改这三个列表；聚合逻辑（<code>Tracker</code>）不依赖任何宿主 API。
+<code>GET /api/state</code> 不暴露适配诊断（保持响应精简），可用插件 apply 返回的
+<code>report()</code> 在进程内查询哪个形态挂接成功。</p>
+<p>零 npm 依赖是有意为之：桌面端直接拷贝目录安装，无需 npm/网络。</p>
+<h2>测试</h2>
+<pre><code>node test/run.mjs
+</code></pre>
+<p>用 mock ctx（假事件总线 + 路由表）验证事件聚合、三个端点的响应与降级行为，
+不依赖真实 dsh。</p>

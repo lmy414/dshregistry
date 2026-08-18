@@ -1,0 +1,111 @@
+<h1>dsh-web-restart</h1>
+<p>DSH web 插件：从界面重启 dsh web 服务，不再需要人工重启；并可选地在重启后<strong>自动继续</strong>被中断的会话。</p>
+<h2>名字</h2>
+<ul>
+<li>插件包：<code>dsh-web-restart</code>（host 行 id：<code>web-restart</code>）</li>
+<li>配套监督进程（launchd）：<code>com.dsh.web-supervisor</code>，脚本 <code>~/.dsh/scripts/dsh-web-supervisor.sh</code></li>
+</ul>
+<h2>功能</h2>
+<ul>
+<li><strong>Host 端</strong>（<code>lib/index.js</code>，注入 <code>webServer</code> / <code>agents</code> / <code>goals</code> / <code>sessionQuery</code> / <code>sessionPersistence</code>）：<ul>
+<li><code>GET /plugin/dsh-web-restart</code> → 返回当前进程 pid、监督进程是否存活、是否有待执行的重启请求、自动继续开关与上次扫描结果</li>
+<li><code>POST /plugin/dsh-web-restart</code>（body <code>{ "delay": 10 }</code>）→ 写入重启请求文件 <code>~/.dsh/dsh-web.restart-request</code></li>
+<li><code>GET|POST /plugin/dsh-web-restart/config</code> → 读写自动继续开关（持久化到 <code>~/.dsh/dsh-web-restart.json</code>）</li>
+</ul>
+</li>
+<li><strong>Client 端</strong>（<code>lib/client.js</code>，注入 <code>slots</code>、<code>locale</code>、<code>settingsScope</code>）：<ul>
+<li>在<strong>侧边栏（左 rail）最底部</strong>（<code>sidebar.rail.footer</code> 插槽，与余额等底部项并列；首页 / 会话 / 日历模式等任何布局都固定可见）放重启按钮：环形箭头 icon（rail 展开为宽栏时带文字标签），带状态圆点（绿=运行中 / 黄=重启排队中 / 红=监督进程未运行）；<ul>
+<li>绿 = 服务运行中、监督进程在线；黄 = 已有重启请求排队；红 = 监督进程未运行 / 状态获取失败</li>
+</ul>
+</li>
+<li><strong>点击按钮弹出居中确认弹窗</strong>：描述操作效果（服务将停止并重启、运行中的会话会被中断、自动继续开关状态）与"确认重启 / 取消"按钮；<strong>只有点击"确认重启"才会发出请求</strong>，杜绝误触；确认后图标旋转表达"重启中"，页面在延迟后自动刷新（Esc / 点击遮罩 / 取消可关闭弹窗，监督进程未运行时确认按钮禁用）</li>
+</ul>
+</li>
+<li><strong>设置卡片</strong>（client 半）：在 <strong>设置 → 插件 → 插件配置</strong> 注册一张卡片（id <code>web-restart</code>），就地展开后是"重启后自动继续中断的会话"开关，按 settings 领域惯例：暂存 → 保存 / 放弃修改 / 恢复默认，并标注是否"已覆盖"</li>
+</ul>
+<h2>自动继续（autoContinueAfterRestart）</h2>
+<ul>
+<li><strong>开（默认关）</strong>：服务重启完成后（插件启动约 2 秒后）执行一次扫描：<ol>
+<li>枚举所有持久化的顶层会话（<code>delegationDepth === 0</code>，子代理随父会话一起恢复）；</li>
+<li>读取每个会话日志尾部，识别"被上次停机中断"的会话：<strong>开放的 turn</strong>（进程被强杀）或 <strong>turn/end 因非用户原因中止</strong>（SIGTERM 优雅停机时 agent 以 <code>{kind:'disposed'}</code> / goal 驱动器以 <code>{kind:'parent'}</code> 中止；用户主动点"停止"是 <code>{kind:'user'}</code>，<strong>绝不会</strong>被自动继续）；</li>
+<li>只处理<strong>上次启动标记之后</strong>被中断的会话（配置文件的 <code>lastBootAt</code>），更早的崩溃残留不会突然被拉起；</li>
+<li>对每个会话：<code>ctx.agents.resume</code> 恢复 agent（日志尾部的损坏由持久化后端的崩溃修复自动补齐，中断的工具调用会获得 <code>TOOL_OUTCOME_UNKNOWN</code> / <code>TOOL_NOT_STARTED</code> 结果）；</li>
+<li><strong>有 active goal</strong> → <code>ctx.goals.resume</code> 重新武装续行，goal-round-driver 自动排下一轮 <code>&lt;goal_round&gt;</code> 继续跑（暂停/阻塞的 goal 不动，尊重用户意图）；
+<strong>无 goal</strong> → 注入一条合成的用户消息"（服务已重启）请继续之前中断的工作…"触发新回合；</li>
+<li>结果写入 <code>~/.dsh/dsh-web-restart.json</code> 的 <code>lastSweep</code>，并输出到服务日志（<code>~/.dsh/dsh-web.log</code>）。</li>
+</ol>
+</li>
+<li><strong>关</strong>：一切照旧——重启后需要人工打开会话继续（说"继续"即可，goal 会话也可 <code>/goal resume</code>）。</li>
+</ul>
+<h3>配置方式（二选一）</h3>
+<ol>
+<li><strong>设置界面（推荐）</strong>：<strong>设置 → 插件 → 插件配置</strong> → 展开"重启服务设置"卡片 → 切换开关 → 保存。</li>
+<li><strong>设置文档 / 补丁</strong>：用户覆盖写入 <code>~/.dsh/settings.yaml</code> 的 <code>web-restart</code> 分节（直接编辑该文件也会被 watcher 热发布）：<pre><code>web-restart:
+  autoContinueAfterRestart: true
+</code></pre>
+组装默认值在插件的 <code>cordis.patch.yml</code>（<code>config.autoContinueAfterRestart: false</code>），机器级补丁（<code>~/.dsh/cordis.patch.yml</code> 整行替换该行）可改默认值。
+优先级（settings 领域标准）：用户设置分节 &gt; 注册方 base（entry 配置）&gt; schema 默认 false。
+旧版本写在 <code>~/.dsh/dsh-web-restart.json</code> 里的开关会在首次启动时自动迁移进设置文档（该文件此后只存运行状态）。</li>
+</ol>
+<h3>设计取舍</h3>
+<ul>
+<li><strong>只继续"被上次重启中断"的会话</strong>，不自动拉起空闲会话，也不复活用户主动停止的工作；</li>
+<li>恢复的 agent 与 GUI 打开会话是同一机制（<code>ctx.agents.resume</code>，模型选择从会话日志的最近请求头继承），因此行为与手动打开一致；</li>
+<li>若重启后你已先打开了某个会话并开始新回合（agent 正在运行），扫描会跳过它，不会重复注入。</li>
+</ul>
+<h2>为什么重启动作不在插件里做</h2>
+<p>插件运行在 dsh web 进程内部，杀掉宿主进程等于自杀（脚本会随宿主一起死）。
+因此插件只负责"请求"，真正的 kill + 启动由 launchd 托管的监督进程（进程树之外）执行：
+supervisor 每 5 秒轮询请求文件，发现到期请求就执行 停止 → 等端口释放 → 启动 → 健康检查；
+服务意外掉线时 supervisor 也会直接拉起（崩溃自愈）。</p>
+<h2>安装</h2>
+<pre><code>dsh plugin --profile web add dsh-web-restart
+# 或使用 GitHub Release tarball：
+# dsh plugin --profile web add https://github.com/qschen86/dsh-web-restart/releases/download/v0.2.0/dsh-web-restart-0.2.0.tgz
+dsh --profile web --dump-config   # 验证条目已加入 bundles
+# 重启 dsh web（host 半生效），刷新页面（client 半生效）
+</code></pre>
+<h2>初始化（首次安装必做）</h2>
+<p>重启按钮本身是"请求方"——真正的 kill + 启动由 <strong>launchd 监督进程</strong>执行
+（按钮显示<strong>红色状态点 = 监督进程未运行</strong>）。监督脚本与 plist 模板已随包发布
+（tarball 内 <code>scripts/</code>，或仓库 <code>scripts/</code> 目录）：</p>
+<ol>
+<li><p><strong>部署监督脚本</strong>：</p>
+<pre><code>mkdir -p ~/.dsh/scripts
+cp scripts/dsh-web-supervisor.sh ~/.dsh/scripts/ &amp;&amp; chmod +x ~/.dsh/scripts/dsh-web-supervisor.sh
+~/.dsh/scripts/dsh-web-supervisor.sh status   # 此时应显示 stopped
+</code></pre>
+</li>
+<li><p><strong>部署 launchd 配置</strong>（按本机调整脚本路径；dsh 不在 PATH 时在
+<code>EnvironmentVariables</code> 里设 <code>DSH_BIN</code>，例如 npx 缓存路径）：</p>
+<pre><code>cp scripts/com.dsh.web-supervisor.plist.example ~/Library/LaunchAgents/com.dsh.web-supervisor.plist
+# 编辑 plist：把 /Users/YOUR_USER 换成你的用户名
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.dsh.web-supervisor.plist
+</code></pre>
+</li>
+<li><p><strong>验证</strong>：约 5 秒后 <code>~/.dsh/scripts/dsh-web-supervisor.sh status</code> 应输出
+<code>running</code>；再刷新页面，重启按钮应变为绿色状态点。</p>
+</li>
+<li><p><strong>卸载插件时一并移除监督进程</strong>（可选）：</p>
+<pre><code>launchctl bootout gui/$(id -u)/com.dsh.web-supervisor
+rm ~/Library/LaunchAgents/com.dsh.web-supervisor.plist
+dsh plugin --profile web remove dsh-web-restart
+</code></pre>
+</li>
+</ol>
+<blockquote>
+<p>只装插件不装监督进程 = 按钮永远红色、重启请求不会被执行（插件与脚本设计上
+分离，监督进程缺位不会影响 dsh web 本身）。</p>
+</blockquote>
+<h2>依赖说明</h2>
+<p>host 半静态导入 <code>@deepseek-ai/schemastery</code>（构造 settings 命名空间的 schema），
+已在 package.json 声明为正式依赖（<code>dependencies</code>），<code>dsh plugin add</code> 时会随包安装。
+本地开发环境下该依赖由 <code>$DSH_HOME/profiles/node_modules</code>（flat fallback，指向当前
+dsh 安装闭包）提供，无需在插件目录内放任何 node_modules。</p>
+<h2>相关文件</h2>
+<ul>
+<li>重启请求文件：<code>~/.dsh/dsh-web.restart-request</code>（内容为到期 unix 秒时间戳）</li>
+<li>运行时状态（启动标记 / 上次扫描结果，非用户配置）：<code>~/.dsh/dsh-web-restart.json</code>；用户配置：<code>~/.dsh/settings.yaml</code>（<code>web-restart</code> 分节）</li>
+<li>监督进程日志：<code>~/.dsh/dsh-web-restart.log</code>、<code>~/.dsh/dsh-web.log</code></li>
+<li>launchd：<code>~/Library/LaunchAgents/com.dsh.web-supervisor.plist</code></li>
+</ul>

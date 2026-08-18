@@ -1,0 +1,95 @@
+<h1>dsh-selfup</h1>
+<p>Self-update and deployment tools for <a href="https://github.com/deepseek-ai/deepseek-harness">DeepSeek Harness</a>, shipped as an installable profile bundle.</p>
+<p><code>dsh-selfup</code> gives the agent (and you) four maintenance tools over the harness checkout:</p>
+<table>
+<thead>
+<tr>
+<th>Tool</th>
+<th>What it does</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><a href="#dsh_update_status"><code>dsh_update_status</code></a></td>
+<td>Read-only: repo, branch, HEAD, ahead/behind, dirty files, CLI version, built-bin freshness, launcher and systemd-unit state</td>
+</tr>
+<tr>
+<td><a href="#dsh_update"><code>dsh_update</code></a></td>
+<td><code>git fetch</code> → fast-forward pull → <code>pnpm install</code> → <code>pnpm run build</code> (optional <code>pnpm run test</code>), each as its own reported step</td>
+</tr>
+<tr>
+<td><a href="#dsh_install"><code>dsh_install</code></a></td>
+<td>Install <code>dsh</code> to <code>~/.local/bin</code> (<code>mode=local</code>, from the repo) or build an Arch package from the published npm tarball (<code>mode=arch</code>)</td>
+</tr>
+<tr>
+<td><a href="#dsh_systemd"><code>dsh_systemd</code></a></td>
+<td>Manage a systemd <strong>user</strong> service running <code>dsh web</code> (<code>~/.config/systemd/user/dsh-web.service</code>)</td>
+</tr>
+</tbody></table>
+<p>Zero runtime dependencies: the plugin talks to the checkout through the harness's own <code>shell</code> service, and <code>ctx.tools.register()</code> accepts the raw definitions directly.</p>
+<h2>Requirements</h2>
+<ul>
+<li>A DeepSeek Harness <strong>repo checkout</strong> (the tools operate on <code>git rev-parse --show-toplevel</code> from the working directory, falling back to <code>$DSH_SELFUP_REPO</code>)</li>
+<li><code>git</code>, <code>node</code>, <code>pnpm</code> on <code>PATH</code></li>
+<li><code>mode=arch</code> additionally needs <code>makepkg</code> (Arch <code>base-devel</code>); the systemd actions need a running user systemd instance</li>
+</ul>
+<h2>Install</h2>
+<p>Install the bundle into a profile and restart the web server:</p>
+<pre><code>dsh plugin --profile web add dsh-selfup          # once published to npm
+dsh plugin --profile web add github:geokkjer/dsh-selfup   # or straight from this repo
+</code></pre>
+<p>Or, for a local checkout of this plugin:</p>
+<pre><code>cd /path/to/dsh-selfup
+dsh plugin --profile web add .
+</code></pre>
+<p><code>dsh plugin</code> runs <code>pnpm add</code> in the profile directory and registers the package as a bundle layer (<code>dsh.bundle.patch</code> → <code>cordis.patch.yml</code>). After the next <code>dsh web</code> start, the four tools appear in every session.</p>
+<p>To develop against this repo without a build step, the package entry is plain ESM (<code>index.js</code>) with a hand-written <code>index.d.ts</code>; there is nothing to compile.</p>
+<h2>Tools</h2>
+<h3><code>dsh_update_status</code></h3>
+<p>Read-only snapshot of the checkout and its deployment:</p>
+<ul>
+<li>repo path, branch, HEAD</li>
+<li>commits behind / ahead of <code>origin/master</code></li>
+<li>dirty working-tree file count (first 20 names)</li>
+<li>CLI version from <code>apps/cli/package.json</code></li>
+<li>built-bin presence (<code>apps/cli/lib/bin.js</code>)</li>
+<li><code>~/.local/bin/dsh</code> launcher presence</li>
+<li><code>dsh-web</code> systemd unit: active, enabled, file present</li>
+</ul>
+<h3><code>dsh_update</code></h3>
+<p>Update the checkout in four independently skippable steps:</p>
+<ol>
+<li><code>git fetch origin</code></li>
+<li><code>git merge --ff-only origin/master</code> (never rebases or creates merge commits)</li>
+<li><code>pnpm install</code></li>
+<li><code>pnpm run build</code> (and optionally <code>pnpm run test</code>)</li>
+</ol>
+<p>Parameters (all optional booleans, default <code>true</code>): <code>pull</code>, <code>install</code>, <code>build</code>, <code>test</code>, <code>force</code>.</p>
+<ul>
+<li>A dirty working tree refuses the pull <strong>unless</strong> <code>force=true</code>, which auto-stashes before the pull and pops after (a pop conflict is reported, not hidden).</li>
+<li>When the tree is already at <code>origin/master</code> and nothing else is requested, the tool says so and stops.</li>
+<li>Each step returns its exit code and an output tail; long <code>pnpm</code> steps run as background processes with the call's abort signal forwarded, so a cancelled call kills the step.</li>
+<li>The running web session keeps its loaded code — restart the service to apply: <code>dsh_systemd action=restart</code>.</li>
+</ul>
+<h3><code>dsh_install</code></h3>
+<ul>
+<li><code>mode=local</code> (default): writes a launcher to <code>~/.local/bin/dsh</code> that execs the repo's built CLI (<code>apps/cli/lib/bin.js</code>) and falls back to the tsx source launcher when the build is absent. <code>dsh --version</code> then works from anywhere and stays in sync with the repo.</li>
+<li><code>mode=arch</code>: writes a <code>PKGBUILD</code> to <code>~/.cache/dsh-arch</code> sourcing the published npm tarball at the checkout's version, builds it with <code>makepkg -f</code>, and returns the package path for <code>sudo pacman -U</code>.</li>
+</ul>
+<h3><code>dsh_systemd</code></h3>
+<p>Manage the <code>dsh-web</code> user service that runs <code>dsh web --host &lt;host&gt; --port &lt;port&gt;</code> (defaults <code>127.0.0.1:3080</code>):</p>
+<ul>
+<li><code>action=install</code> writes the unit file, <code>daemon-reload</code>s and <code>enable</code>s it — it does <strong>not</strong> start it.</li>
+<li><code>status</code> / <code>start</code> / <code>restart</code> / <code>stop</code> / <code>disable</code> act on the unit directly.</li>
+</ul>
+<blockquote>
+<p>⚠️ <code>start</code> / <code>restart</code> terminate the currently running <code>dsh web</code> instance — including the session calling the tool — so the new code only takes effect then. The port must be free (stop any terminal <code>pnpm run dsh web</code> first).</p>
+</blockquote>
+<p>The unit sets <code>WorkingDirectory</code> to the repo, <code>DSH_HOME</code> to <code>$HOME/.dsh</code>, and <code>PATH</code> to include the node bin directory, so it behaves like a hand-started <code>dsh web</code>.</p>
+<h2>Sandbox policy</h2>
+<p>The plugin resolves the session's sandbox policy (<code>sandboxPolicy.resolve({ session })</code>) and passes it to every shell call, so writes outside the workspace — the launcher, the unit file, the Arch build dir — inherit the session's approved mode instead of the executor's confining default.</p>
+<h2>Tests</h2>
+<pre><code>npm test
+</code></pre>
+<p>Applies the plugin against a stub context and asserts the four tools register with the expected names and well-formed JSON schemas (no harness needed).</p>
+<h2>License</h2>
+<p><a href="https://github.com/geokkjer/dsh-selfup/blob/HEAD/LICENSE">MIT</a></p>

@@ -1,0 +1,95 @@
+<h1>@deepseek-ai/dsh-vision-bridge</h1>
+<p>English | <a href="https://github.com/Zh-U-hB/dsh-vision-bridge/blob/HEAD/README.zh.md">中文</a></p>
+<p>Host plugin and Web settings page for routing image-bearing messages to a user-configured vision model when the active text model cannot accept image input.</p>
+<h2>Install</h2>
+<pre><code>./install.sh            # installs into the default `web` profile
+DSH_PROFILE=myprofile ./install.sh
+</code></pre>
+<p>The installer registers this repository as a profile bundle with <code>dsh plugin</code>, then
+applies the small <code>dsh-host-apiproxy</code> compatibility patch this plugin needs on
+dsh <code>0.1.0-rc.x</code>: exposing the <code>vision-bridge</code> settings namespace and admitting
+new image prompts while the bridge is enabled. Restart <code>dsh web</code> after
+installing.</p>
+<h2>How it works</h2>
+<p>The bridge listens on the <code>agent/pre-step</code> waterfall. Before the loop appends claimed messages to the session log, it inspects each message for <code>image</code> content blocks:</p>
+<ol>
+<li>If the active provider/model reports <code>image</code> input modality, the message passes through unchanged.</li>
+<li>If the model explicitly reports text-only input and the settings namespace names a configured endpoint, the bridge:<ul>
+<li>asks the active text model to write one precise vision prompt from the accompanying message text;</li>
+<li>assembles the same scoped system prompt the loop would use;</li>
+<li>POSTs <code>system prompt + written prompt + image data</code> to the configured OpenAI-compatible endpoint;</li>
+<li>replaces the image blocks with the returned text in a fresh user message.</li>
+</ul>
+</li>
+<li>The loop logs that text-only message, so the transcript remains reconstructable and the text model never receives raw image bytes.</li>
+</ol>
+<h2>Settings</h2>
+<p>The Web Settings page adds a <strong>Vision</strong> section under the <code>vision-bridge</code> settings namespace:</p>
+<table>
+<thead>
+<tr>
+<th>Field</th>
+<th>Default</th>
+<th>Purpose</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>enabled</code></td>
+<td><code>false</code></td>
+<td>Whether image bridging runs at all</td>
+</tr>
+<tr>
+<td><code>url</code></td>
+<td><code>''</code></td>
+<td>OpenAI-compatible API base URL, or a full URL ending in <code>/chat/completions</code></td>
+</tr>
+<tr>
+<td><code>apiKey</code></td>
+<td><code>''</code></td>
+<td>Bearer API key; <code>role('secret')</code>, redacted on the wire</td>
+</tr>
+<tr>
+<td><code>model</code></td>
+<td><code>''</code></td>
+<td>Vision model id for the configured endpoint</td>
+</tr>
+<tr>
+<td><code>timeoutMs</code></td>
+<td><code>60000</code></td>
+<td>Per-request timeout</td>
+</tr>
+</tbody></table>
+<p>The plugin's cordis.yml <code>config</code> supplies the settings composition <code>base</code>, so a deployment can set defaults without writing the user document. Bridging requires all of <code>enabled</code>, <code>url</code>, <code>apiKey</code>, and <code>model</code>.</p>
+<h2>Endpoint protocol</h2>
+<p><code>POST &lt;url&gt;/chat/completions</code> with <code>Authorization: Bearer &lt;apiKey&gt;</code> and an OpenAI chat-completions body:</p>
+<pre><code>{
+  "model": "&lt;settings.model&gt;",
+  "messages": [
+    { "role": "system", "content": "&lt;assembled harness system prompt&gt;" },
+    {
+      "role": "user",
+      "content": [
+        { "type": "text", "text": "&lt;text-model-written prompt&gt;" },
+        { "type": "image_url", "image_url": { "url": "data:&lt;mediaType&gt;;base64,&lt;bytes&gt;" } }
+      ]
+    }
+  ]
+}
+</code></pre>
+<p>The response must be a chat completion whose first choice carries a string or text-part-array <code>message.content</code>.</p>
+<h2>Model Experience</h2>
+<h3>Bridged conversation</h3>
+<h4>What the model sees</h4>
+<p>When bridging activates, the text model sees the original message text plus one appended text block: <code>[image analysis from vision model &lt;model&gt;]</code> followed by the vision model's answer. The image block itself is removed. The text model's prompt-writing auxiliary call uses a fixed instruction and <code>temperature: 0</code>; it carries no session id.</p>
+<h4>Token effect</h4>
+<p>The original image blocks contribute no tokens to the text model. The appended vision answer contributes its full text token count, plus the fixed marker line and the prompt-writing call's input/output tokens.</p>
+<h4>KV Cache effect</h4>
+<p>System and tool sections are unchanged. The text-model prompt-writing call is a separate request with a fixed system prompt and does not reuse the conversation prefix. A changed vision endpoint, model, or enable state changes future conversation content and therefore future prefix caches.</p>
+<h2>Known Limitations and Deferred Work</h2>
+<ul>
+<li>Bridging triggers only when the active adapter's <code>resolveModel()</code> explicitly omits <code>image</code> from <code>inputModalities</code>. Models with unknown modality metadata pass through untouched.</li>
+<li>The <code>agent/request</code> waterfall may replace the provider/model after pre-step; this plugin reads the agent's declared options and therefore does not follow such a late model switch.</li>
+<li>Images that already reached the session log through another path (for example a custom tool result) are not rewritten; only claimed pre-step inbox messages are bridged.</li>
+<li>Only OpenAI-compatible <code>/chat/completions</code> endpoints are supported.</li>
+<li>The settings page keeps the saved API key hidden and treats a blank key field as "keep the saved key"; clearing a stored key requires the raw settings document.</li>
+</ul>

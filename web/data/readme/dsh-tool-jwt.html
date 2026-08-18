@@ -1,0 +1,225 @@
+<h1>dsh-tool-jwt</h1>
+<p><a href="https://github.com/chenxuhl/dsh-tool-jwt/blob/HEAD/README.en.md">English</a></p>
+<p>DSH JWT 工具插件 —— HS256 JWT 的<strong>解析（不验签）</strong>、<strong>签发</strong>与<strong>完整验签</strong>。纯函数、零运行时依赖（仅 Node 内置 <code>crypto</code>）。</p>
+<p><a href="https://github.com/chenxuhl/dsh-tool-jwt/blob/HEAD/LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License"></a></p>
+<h2>动机</h2>
+<p>后端开发日常：拿到一个 token 想看里面是什么、过期没有，但手算 base64url 解码 + JSON 解析 + 时间戳换算太慢；联调时需要造测试 token（网关/下游鉴权），手拼 header/payload/signature 容易错；验证 token 签名和有效期时，心算 HMAC 不可靠。</p>
+<p>本插件提供确定性 JWT 工具，其中 <code>decode</code> 是差异化能力：<strong>不验签</strong>，只做结构解析 + 过期状态计算（当前时钟对比），用于快速排查 token 内容。<code>verify</code> 走完整校验链：算法检查（<code>alg=HS256</code>）、常数时间签名比较（<code>crypto.timingSafeEqual</code>，抗时序攻击）、过期判定（可选 <code>leewaySeconds</code> 时钟偏差容忍）。</p>
+<h2>安全模型</h2>
+<p>JWT 的签名伪造和算法混淆是真实威胁。防线：</p>
+<ol>
+<li><strong>算法强制</strong>：<code>verify</code> 仅接受 <code>alg=HS256</code>；<code>alg=none</code> 或任何非 HS256 直接拒绝，杜绝算法降级攻击</li>
+<li><strong>常数时间签名比较</strong>：<code>crypto.timingSafeEqual</code>，签名字节逐位比较不泄露时序信息</li>
+<li><strong>输入长度上限</strong>：token ≤ 16KB、secret ≤ 4KB、payload 序列化后 ≤ 8KB——超限在入口直接拒绝，不进入处理</li>
+<li><strong>decode 不验签</strong>：只做结构解析 + 过期状态计算，明确告知调用方"decode does not verify the signature"</li>
+</ol>
+<blockquote>
+<p>⚠️ 本工具面向<strong>开发/联调场景</strong>（解码排查、造测试 token、验签）。不要把生产环境密钥粘贴到不可信会话。</p>
+</blockquote>
+<p>其余边界：无效 base64url 直接报错（含输入截断）；非 JSON header/payload 报错（含定位）；非对象 JSON 报错；<code>exp</code> 非数字报错；secret 互斥检测（<code>secret</code> 与 <code>secretBase64url</code> 同时给即报错）。</p>
+<h2>工具声明</h2>
+<p>注册 <code>jwt</code> 工具（<code>dsh-tool-jwt</code>，row id <code>tool-jwt</code>），统一输出文本报告。</p>
+<table>
+<thead>
+<tr>
+<th>参数</th>
+<th>类型</th>
+<th>必填</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>action</code></td>
+<td>string</td>
+<td>✅</td>
+<td><code>decode</code> / <code>sign</code> / <code>verify</code></td>
+</tr>
+<tr>
+<td><code>token</code></td>
+<td>string</td>
+<td></td>
+<td>JWT 紧凑序列化（<code>header.payload.signature</code>）。decode/verify 必需</td>
+</tr>
+<tr>
+<td><code>payload</code></td>
+<td>object</td>
+<td></td>
+<td>声明对象（sign 必需），如 <code>{"sub":"u1","role":"admin"}</code>。<code>exp</code>/<code>iat</code> 由 <code>expiresInSeconds</code> 管理</td>
+</tr>
+<tr>
+<td><code>secret</code></td>
+<td>string</td>
+<td></td>
+<td>HMAC 密钥（UTF-8 字节）。sign/verify 必需。与 <code>secretBase64url</code> 互斥</td>
+</tr>
+<tr>
+<td><code>secretBase64url</code></td>
+<td>string</td>
+<td></td>
+<td>HMAC 密钥（base64url 编码的原始字节，用于二进制密钥如 RFC 7515 向量、JWK <code>k</code> 值）。与 <code>secret</code> 互斥</td>
+</tr>
+<tr>
+<td><code>expiresInSeconds</code></td>
+<td>integer</td>
+<td></td>
+<td>sign only：有效期秒数，设置 <code>exp = now + N</code>（<code>payload.exp</code> 已给时跳过）</td>
+</tr>
+<tr>
+<td><code>leewaySeconds</code></td>
+<td>integer</td>
+<td></td>
+<td>verify only：允许的时钟偏差秒数（默认 0）</td>
+</tr>
+</tbody></table>
+<h2>Actions</h2>
+<table>
+<thead>
+<tr>
+<th>action</th>
+<th>功能</th>
+<th>输出示例</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>decode</code></td>
+<td>解析 header/payload 为 JSON，按当前时钟计算过期状态（<code>valid</code> / <code>expired</code> / <code>no-exp-claim</code>，含 ISO 时间与剩余/已过期秒数）。<strong>不验签</strong></td>
+<td><code>header: {"alg":"HS256","typ":"JWT"}</code><br><code>payload: {"sub":"u1","exp":1767231600}</code><br><code>expiry.status: valid</code><br><code>expiry.expiresInSeconds: 3600</code></td>
+</tr>
+<tr>
+<td><code>sign</code></td>
+<td>用 HS256 签发 token。可选 <code>expiresInSeconds</code> 自动填 <code>exp</code>，<code>iat</code> 自动填充；<code>payload.exp</code> 已给时跳过</td>
+<td><code>token: eyJ...</code><br><code>claims: {"sub":"u1","iat":1767225600,"exp":1767231600}</code></td>
+</tr>
+<tr>
+<td><code>verify</code></td>
+<td>完整校验：<code>alg=HS256</code>、常数时间签名比较、过期判定（可选 <code>leewaySeconds</code>）</td>
+<td><code>valid: true</code><br><code>payload: {"sub":"u1","exp":1767231600}</code><br><code>expiry.expiresAt: 2026-01-01T01:00:00.000Z</code></td>
+</tr>
+</tbody></table>
+<h2>示例</h2>
+<pre><code>jwt { action: "decode", token: "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ1MSJ9.sig" }
+  → header: {"alg":"HS256","typ":"JWT"}
+    payload: {"sub":"u1"}
+    expiry.status: no-exp-claim
+    note: decode does not verify the signature
+
+jwt { action: "sign", payload: {"sub":"u1","role":"admin"}, secret: "topsecret", expiresInSeconds: 3600 }
+  → token: eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ1MSIsInJvbGUiOiJhZG1pbiIsImlhdCI6MTc2NzIyNTYwMCwiZXhwIjoxNzY3MjI5MjAwfQ.&lt;sig&gt;
+    claims: {"sub":"u1","role":"admin","iat":1767225600,"exp":1767229200}
+
+jwt { action: "verify", token: "eyJ...", secret: "topsecret", leewaySeconds: 30 }
+  → valid: true
+    payload: {"sub":"u1","role":"admin","iat":1767225600,"exp":1767229200}
+    expiry.expiresAt: 2026-01-01T01:00:00.000Z
+</code></pre>
+<h2>边界行为</h2>
+<table>
+<thead>
+<tr>
+<th>情况</th>
+<th>处理</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>非三段的 token</td>
+<td><code>jwt: token must have exactly three segments</code></td>
+</tr>
+<tr>
+<td>非 JSON header/payload</td>
+<td><code>jwt: header/payload is not valid JSON</code></td>
+</tr>
+<tr>
+<td>非对象的 header/payload</td>
+<td><code>jwt: header/payload JSON must be an object</code></td>
+</tr>
+<tr>
+<td>无效 base64url</td>
+<td><code>jwt: invalid base64url input: "..."</code></td>
+</tr>
+<tr>
+<td><code>exp</code> 非数字</td>
+<td><code>jwt: exp claim must be a number</code></td>
+</tr>
+<tr>
+<td><code>exp</code> 正好等于当前时间</td>
+<td><code>expired</code>（RFC 7519：<code>exp</code> 必须<strong>严格大于</strong>当前时间）</td>
+</tr>
+<tr>
+<td>无 <code>exp</code> 声明</td>
+<td><code>no-exp-claim</code></td>
+</tr>
+<tr>
+<td>token 超 16KB / secret 超 4KB / payload 超 8KB</td>
+<td>入口拒绝（不截断）</td>
+</tr>
+<tr>
+<td><code>secret</code> 与 <code>secretBase64url</code> 同时给</td>
+<td>入口拒绝</td>
+</tr>
+<tr>
+<td>签名不匹配</td>
+<td><code>valid: false</code> + <code>reason: bad-signature</code></td>
+</tr>
+<tr>
+<td><code>alg</code> 非 HS256</td>
+<td><code>valid: false</code> + <code>reason: wrong-alg</code></td>
+</tr>
+<tr>
+<td>过期 token</td>
+<td><code>valid: false</code> + <code>reason: expired</code>（<code>leewaySeconds</code> 内可容错）</td>
+</tr>
+<tr>
+<td>空 secret</td>
+<td><code>jwt: secret must be a non-empty string</code></td>
+</tr>
+<tr>
+<td>RFC 7515 二进制密钥</td>
+<td>通过 <code>secretBase64url</code> 传入原始字节（<code>Buffer.from(key, 'base64url')</code>）</td>
+</tr>
+</tbody></table>
+<h2>正确性</h2>
+<p>签名逻辑由 <a href="https://www.rfc-editor.org/rfc/rfc7515">RFC 7515</a> Appendix A.1 官方 HS256 测试向量验证——<code>tests/jwt-sign.spec.ts</code> 中 <code>verifyJwt: RFC vector</code> 测试组确认本实现与 RFC 标准输出逐字节一致。</p>
+<h2>安装</h2>
+<h3>Profile Bundle（推荐）</h3>
+<p>将本插件作为独立 bundle 安装到 profile：</p>
+<pre><code># 交互式（web）profile —— 从 GitHub 仓库安装
+dsh plugin --profile web add github:chenxuhl/dsh-tool-jwt
+# 一次性任务（headless）profile —— dsh run 默认使用 headless
+dsh plugin --profile headless add github:chenxuhl/dsh-tool-jwt
+</code></pre>
+<p>或从 <code>npm pack</code> 生成的 tarball 安装：</p>
+<pre><code>npm pack     # 生成 dsh-tool-jwt-&lt;version&gt;.tgz
+# 交互式（web）profile
+dsh plugin --profile web add ./dsh-tool-jwt-&lt;version&gt;.tgz
+# 一次性任务（headless）profile
+dsh plugin --profile headless add ./dsh-tool-jwt-&lt;version&gt;.tgz
+</code></pre>
+<p>包内 <code>dsh.bundle.patch</code> 会在安装后自动把插件加入 profile 的 layer stack（row id：<code>tool-jwt</code>）。插件缺失的 peer 依赖（<code>@deepseek-ai/cordis</code>、<code>@deepseek-ai/dsh-tools</code>）由 profile 的 healed <code>profiles/node_modules</code> 回退安装提供。</p>
+<blockquote>
+<p>⚠️ web 与 headless 是<strong>不同 profile</strong>：web 安装不会自动覆盖 headless；<code>dsh run</code> 默认使用 headless profile。Windows 路径使用正斜杠（<code>C:/...</code>）。</p>
+</blockquote>
+<h3>本地开发（link 安装）</h3>
+<pre><code>git clone https://github.com/chenxuhl/dsh-tool-jwt.git
+cd dsh-tool-jwt &amp;&amp; npm install &amp;&amp; npm run build
+dsh plugin --profile web add link:&lt;repo-path&gt;
+</code></pre>
+<blockquote>
+<p>Windows + pnpm <code>link:</code> 协议注意：部分 pnpm 版本会把 <code>link:D:\...</code> 反斜杠路径错误拼接。使用正斜杠 <code>link:D:/...</code>；若 junction 仍指向错误路径，手动 <code>New-Item -ItemType Junction</code> 修复 <code>node_modules</code> 内的链接即可。</p>
+</blockquote>
+<h3>验证安装</h3>
+<pre><code>dsh --profile web --dump-config | grep tool-jwt
+</code></pre>
+<h3>运行验证</h3>
+<pre><code>dsh run "用 jwt 工具 decode 一下 eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ1MSJ9.sig"
+</code></pre>
+<h2>测试</h2>
+<pre><code>npm test
+</code></pre>
+<ul>
+<li><code>base64url.spec.ts</code>：编解码全分支 + 非法字符 + 非字符串输入 + 大小写/填充变体</li>
+<li><code>jwt-decode.spec.ts</code>：三段拆分 + JSON 解析 + 过期状态（valid/expired/no-exp-claim/边界） + 大小守卫</li>
+<li><code>jwt-sign.spec.ts</code>：RFC 7515 A.1 官方 HS256 向量 + 自签 round-trip + 错密钥 + 过期 + leeway 容错 + 篡改检测 + 非 HS256 算法拒绝</li>
+<li><code>register.spec.ts</code>：注册契约（AUDIT-CROSS-02 风格）</li>
+</ul>
+<h2>许可</h2>
+<p>MIT</p>

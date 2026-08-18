@@ -1,0 +1,308 @@
+<h1>dsh-smart-restart</h1>
+<p>A <strong>DeepSeek Harness (DSH) host plugin</strong> that keeps the main agent aware of service restarts — <strong>without the user having to prompt it</strong>. On every boot it detects that a new process has taken over, wakes the target agent with a short "Smart-restart" notice (boot time, previous boot, downtime). New in <strong>v0.2.0</strong> it added the <code>smart_restart</code> tool to <strong>restart DSH itself</strong> and return the notice to the exact session that asked; new in <strong>v0.3.0</strong> it <strong>auto-detects</strong> when the service was stopped while an agent session was active, so even a <em>plain</em> <code>systemctl restart</code> the agent ran notifies that session at boot.</p>
+<p><a href="https://www.npmjs.com/package/dsh-smart-restart"><img src="https://img.shields.io/npm/v/dsh-smart-restart?style=flat-square&amp;logo=npm" alt="npm"></a>
+<a href="https://github.com/edusrez/dsh-smart-restart/blob/HEAD/LICENSE"><img src="https://img.shields.io/npm/l/dsh-smart-restart?style=flat-square" alt="license"></a>
+<a href="https://github.com/edusrez/dsh-smart-restart"><img src="https://img.shields.io/github/stars/edusrez/dsh-smart-restart?style=flat-square" alt="stars"></a>
+<a href="https://github.com/edusrez/dsh-smart-restart"><img src="https://img.shields.io/github/last-commit/edusrez/dsh-smart-restart?style=flat-square" alt="last commit"></a></p>
+<h2>Table of contents</h2>
+<ul>
+<li><a href="#overview">Overview</a></li>
+<li><a href="#how-it-works">How it works</a></li>
+<li><a href="#the-smart_restart-tool">The <code>smart_restart</code> tool</a></li>
+<li><a href="#requirements">Requirements</a></li>
+<li><a href="#install">Install</a></li>
+<li><a href="#configuration">Configuration</a></li>
+<li><a href="#behavior--lifecycle">Behavior &amp; lifecycle</a></li>
+<li><a href="#limitations">Limitations</a></li>
+<li><a href="#development">Development</a></li>
+<li><a href="#license">License</a></li>
+</ul>
+<h2>Overview</h2>
+<p>A long-lived DSH instance restarts for many reasons: the agent installs or reconfigures a plugin and triggers a reboot, the host machine reboots, or the service is restarted under <strong>systemd</strong>. After any such restart the agent is up and running again, but it has <strong>no idea that anything happened</strong> — the previous session is gone. Today, the only way to get the agent to pick back up is for the user to tell it, usually with something like <em>"you restarted"</em>.</p>
+<p><code>dsh-smart-restart</code> closes that gap. It detects the restart itself and wakes the main agent at boot with a short, self-contained notice describing what happened, so the agent decides whether to resume interrupted work, note the downtime, or simply acknowledge — no user prompt needed.</p>
+<p><strong>New in v0.3.0</strong>, the plugin also covers the <em>unplanned</em> restart of an <strong>active agent</strong>. It tracks the last active session and, on shutdown (<code>SIGTERM</code>/<code>SIGINT</code>), persists a <code>shutdown-notice.json</code>; on boot it pins the notice back to that session (when it was active within <code>shutdownGraceMs</code>). So a plain <code>systemctl restart</code> the agent ran — or a restart that happened while an agent was mid-task — is auto-notified without the user prompting. v0.2.0 let the main agent <em>cause</em> restarts: the <code>smart_restart</code> tool records the calling session and restarts DSH through systemd, returning the notice to that exact session.</p>
+<ul>
+<li><strong>Zero prompting</strong> — the user never has to tell the agent "you restarted".</li>
+<li><strong>Self-restart</strong> — the main agent can restart DSH itself and resume its task automatically afterwards.</li>
+<li><strong>Automatic wake</strong> — an idle main agent is woken and handed the notice on its own.</li>
+<li><strong>Targeted delivery</strong> — the post-restart notice returns to the session that requested it; otherwise the <code>target</code> config decides where it lands.</li>
+<li><strong>Precise context</strong> — the notice carries the boot time, the previous boot time, the downtime, and an optional reason.</li>
+<li><strong>Self-contained</strong> — a single host bundle; nothing to run, no external service.</li>
+</ul>
+<h2>How it works</h2>
+<p>On every boot the plugin:</p>
+<ol>
+<li><strong>Reads the previous marker</strong> — a durable <code>marker.json</code> (<code>{lastBootAt, pid, dshVersion?}</code>) stored under <code>&lt;DSH_HOME&gt;/&lt;stateDir&gt;/</code>.</li>
+<li><strong>Detects a restart</strong> — a previous marker with a <strong>different <code>pid</code></strong> than the current <code>process.pid</code> means a <em>new process</em> has started, i.e. the service restarted; downtime is <code>now − previous lastBootAt</code>, clamped to <code>≥ 0</code>.</li>
+<li><strong>Writes a new marker</strong> immediately, so the next boot can be compared against this one.</li>
+<li><strong>Checks for a pending notice</strong> — if the <code>smart_restart</code> tool left a <code>pending-notice.json</code> before the previous restart, this boot <strong>pins</strong> delivery to that exact session (<strong>highest priority</strong>; the file is consumed once read).</li>
+<li><strong>Checks for a shutdown notice</strong> — if there was <strong>no</strong> pending notice, the plugin reads <code>shutdown-notice.json</code> (written by the previous process on <code>SIGTERM</code>/<code>SIGINT</code>, recording the last active session). If that session was active within <code>shutdownGraceMs</code>, this boot <strong>pins</strong> delivery to it (<strong>second priority</strong>); otherwise the pin is skipped and delivery falls back to <code>target</code>. The file is consumed once read.</li>
+<li><strong>Delivers the notice</strong> — once per boot via the source-agnostic <code>agent/session-start</code> hook (a pinned session is matched regardless of publication source, so a session that <strong>resumes</strong> with <code>source: 'resume'</code> is caught too), backed by a <strong>bounded poll</strong> (750ms tick, ~15s cap) that picks up a pinned session which resumes lazily late.</li>
+</ol>
+<p>There are <strong>three delivery paths</strong>, depending on how the restart happened:</p>
+<h3>(a) Agent-initiated restart (<code>smart_restart</code> tool)</h3>
+<p>The main agent calls <code>smart_restart(reason?)</code>. The tool:</p>
+<ul>
+<li>validates the configured <code>restartUnit</code> token,</li>
+<li><strong>persists the pending notice synchronously</strong> (calling session + optional reason) to <code>pending-notice.json</code> under the state dir, <em>before</em> any spawn so it survives the imminent service kill,</li>
+<li>spawns a <strong>detached</strong> <code>setsid bash</code> process (a ~1s delay lets the tool's response be written) that runs <code>systemctl restart &lt;unit&gt;</code> and survives this process being killed by systemd,</li>
+<li>returns <code>{ok: true, restarting: true, ...}</code>.</li>
+</ul>
+<p>On the next boot, step 4 above reads the pending notice, <strong>pins</strong> it to the calling session (<strong>highest priority</strong>), and the notice returns there — <strong>regardless of source</strong> — so the agent that asked resumes its interrupted task.</p>
+<h3>(b) Smart shutdown auto-detection (plain restart while an agent was active)</h3>
+<p>If there is <strong>no</strong> pending notice, the plugin looks for a <code>shutdown-notice.json</code>. This file is written synchronously by the previous process on <code>SIGTERM</code>/<code>SIGINT</code>, recording the <strong>last active session</strong> (tracked on <code>agent/session-start</code> and <code>agent/pre-step</code>) and its timestamp. On boot the plugin <strong>pins</strong> the notice to that session <em>only if</em> it was active within <code>shutdownGraceMs</code> of shutdown (recent activity ⇒ the user restarted while the agent was mid-task, so auto-notify). If the session was idle well before shutdown (the user probably restarted while idle), the pin is skipped and delivery falls back to <code>target</code>.</p>
+<p>This is what makes a <strong>plain <code>systemctl restart</code></strong> that the agent ran — or a restart that happened while an agent was active — auto-notify that session at boot, with no user prompt and no need to have called <code>smart_restart</code>.</p>
+<h3>(c) External restart (systemd, host reboot, dev tools) — no active session</h3>
+<p>There is <strong>no pending notice</strong> and <strong>no usable shutdown notice</strong> (either none was written, or the last activity predates <code>shutdownGraceMs</code>). The boot falls back to the <code>target</code> config (<code>primary</code> | <code>all</code> | <code>&lt;session-id&gt;</code>) to decide which agent(s) get the notice. The <code>source === 'startup'</code> gate applies only to this non-pinned path.</p>
+<h3>Restart vs. HMR semantics</h3>
+<p>The detection is intentionally precise:</p>
+<table>
+<thead>
+<tr>
+<th>Situation</th>
+<th>Detected as a restart?</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>New OS process, previous marker exists</td>
+<td><strong>Yes</strong> — service (re)started.</td>
+</tr>
+<tr>
+<td>Same OS process (in-process HMR / hot-reload)</td>
+<td><strong>No</strong> — ignored.</td>
+</tr>
+<tr>
+<td>First-ever boot (no marker)</td>
+<td><strong>No</strong> — nothing to compare against.</td>
+</tr>
+<tr>
+<td>Marker present but stale/corrupt <code>lastBootAt</code></td>
+<td><strong>Yes</strong> — downtime reported as 0.</td>
+</tr>
+</tbody></table>
+<p>Only a genuinely <strong>new process</strong> counts as a restart. An in-process hot-reload keeps the same <code>pid</code>, so it is not treated as a service restart. Delivery happens <strong>once per boot</strong>: a <code>deliveredIds</code> set plus a <code>primary</code> guard (for the <code>primary</code> target) prevent the startup event and the fallback poll from double-sending.</p>
+<h3>Notice</h3>
+<p>The default notice (English) reads:</p>
+<blockquote>
+<p>Smart-restart: the DSH service restarted at <code>&lt;iso&gt;</code>. Previous boot: <code>&lt;iso&gt;</code> (downtime ~2m 9s). If a task was in progress, resume it; otherwise reply with a one-line acknowledgment.</p>
+</blockquote>
+<p>When a <code>reason</code> was recorded by <code>smart_restart</code>, it is appended (<code>… reason: &lt;reason&gt;.</code>) before the resume instruction. The previous-boot/downtime segment is omitted when no previous boot time is known, and the whole text is fully customizable via the <code>notice</code> config (see below).</p>
+<h2>The <code>smart_restart</code> tool</h2>
+<p>Registered via <code>ctx.tools.register</code> in <code>apply</code> (so it is available to agent sessions) when <code>toolEnabled</code> is true (the default). It lets the main agent restart DSH itself through systemd.</p>
+<p><strong>Parameters</strong></p>
+<table>
+<thead>
+<tr>
+<th>Param</th>
+<th>Type</th>
+<th>Required</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>reason</code></td>
+<td>string</td>
+<td>no</td>
+<td>Optional human-readable note, e.g. <code>"installed dshmarket in stable+dev"</code>. Included in the post-restart notice.</td>
+</tr>
+</tbody></table>
+<p><strong>Behavior</strong></p>
+<ul>
+<li>Validates the configured <code>restartUnit</code> — a single systemd unit token (<code>/^[A-Za-z0-9_.@-]+$/</code>, no spaces/slashes) to prevent shell injection into the detached command.</li>
+<li><strong>Fails fast</strong> when <code>restartUnit</code> is not configured (<code>ok: false</code>, error <code>restartUnit not configured</code>) rather than guessing a unit.</li>
+<li>Persists <code>pending-notice.json</code> <strong>synchronously</strong> (before any spawn) so it survives the service kill and targets the restarting session.</li>
+<li>Restarts via a <strong>detached</strong> <code>setsid bash</code> process (<code>sleep 1 &amp;&amp; systemctl restart &lt;unit&gt;</code>) that outlives this process, then unrefs it.</li>
+<li>Returns <code>{ok: true, restarting: true, sessionId, reason}</code> on success, or <code>{ok: false, restarting: false, error}</code> when it fails.</li>
+</ul>
+<p><strong>Intended agent flow</strong></p>
+<pre><code>install/change a plugin
+  → call smart_restart(reason)   # e.g. "installed dshmarket in stable+dev"
+  → DSH restarts (detached, ~1s)
+  → after boot, the notice returns to THIS session (pinned)
+  → the task continues automatically — no user prompt needed
+</code></pre>
+<p><strong>Safety notes</strong></p>
+<ul>
+<li>The unit token is validated against a strict regex to block shell injection through <code>restartUnit</code> into the detached shell command.</li>
+<li>The tool targets a <strong>systemd-managed</strong> DSH install (<code>setsid</code> / <code>systemctl</code>); it does not apply to a bare process without a systemd unit.</li>
+</ul>
+<h2>Requirements</h2>
+<ul>
+<li><strong>DSH <code>&gt;= 0.1.0-rc.7</code></strong> — a <strong>long-lived instance with a live main-agent session</strong> (the web / GUI profile). This plugin is designed for a continuously-running service whose main agent stays resident; it is <strong>not</strong> aimed at the one-shot headless CLI.</li>
+<li><strong>systemd-managed DSH install</strong> for the <code>smart_restart</code> tool — it restarts the service through <code>setsid</code>/<code>systemctl</code>, so the unit named in <code>restartUnit</code> must be a real systemd unit (e.g. <code>dsh.service</code>).</li>
+<li><strong>Node.js / pnpm</strong> — the usual DSH toolchain for building and installing host bundles.</li>
+</ul>
+<h2>Install</h2>
+<p><code>dsh-smart-restart</code> is a <strong>DSH host bundle</strong>: <code>package.json</code> carries <code>dsh.bundle.patch = ./cordis.patch.yml</code>, so installing the package lets the plugin layer auto-join the profile's <code>dsh.profile.bundles</code>.</p>
+<pre><code># From a registry (npm)
+dsh plugin --profile &lt;name&gt; add dsh-smart-restart
+
+# Or link a local checkout while developing
+dsh plugin --profile &lt;name&gt; add /path/to/dsh-smart-restart
+</code></pre>
+<p><strong>A restart is required after <code>add</code></strong> — which is exactly the scenario this plugin exists to surface. The bundled patch inserts the layer into the profile's layer stack:</p>
+<pre><code># cordis.patch.yml (bundled with this package)
+- insert:
+    - id: smart-restart
+      name: dsh-smart-restart
+      config:
+        enabled: true
+        stateDir: .smart-restart
+        target: primary
+        wakeup: true
+        notice: ''
+        restartUnit: ''   # REQUIRED per profile for smart_restart to work
+        toolEnabled: true
+</code></pre>
+<blockquote>
+<p><strong>You MUST set <code>restartUnit</code> per profile.</strong> The <code>smart_restart</code> tool only
+works when <code>restartUnit</code> names the systemd unit for that DSH instance. Add a
+<code>cordis.patch.yml</code> override on the <code>smart-restart</code> row — <strong>restating the full
+config</strong> (a partial override would drop the other keys) — with the unit for
+that profile. For example, for the stable instance and the dev instance
+respectively:</p>
+</blockquote>
+<pre><code># Override on the smart-restart row — profile "stable" (dsh.service)
+- insert:
+    - id: smart-restart
+      name: dsh-smart-restart
+      config:
+        enabled: true
+        stateDir: .smart-restart
+        target: primary
+        wakeup: true
+        notice: ''
+        restartUnit: dsh.service
+        toolEnabled: true
+
+# Override on the smart-restart row — profile "deepartments-dev" (dsh-deepartments-dev.service)
+- insert:
+    - id: smart-restart
+      name: dsh-smart-restart
+      config:
+        enabled: true
+        stateDir: .smart-restart
+        target: primary
+        wakeup: true
+        notice: ''
+        restartUnit: dsh-deepartments-dev.service
+        toolEnabled: true
+</code></pre>
+<p>Because the bundle declares <code>dsh.bundle</code>, the layer auto-joins <code>dsh.profile.bundles</code> on install — no manual profile edit required beyond the per-profile <code>restartUnit</code> override.</p>
+<h2>Configuration</h2>
+<p>All behavior is controlled through the plugin row's <code>config</code>:</p>
+<table>
+<thead>
+<tr>
+<th>Key</th>
+<th>Type</th>
+<th>Default</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>enabled</code></td>
+<td>boolean</td>
+<td><code>true</code></td>
+<td>Master switch; <code>false</code> skips all processing.</td>
+</tr>
+<tr>
+<td><code>stateDir</code></td>
+<td>string</td>
+<td><code>.smart-restart</code></td>
+<td>Sub-directory under <code>&lt;DSH_HOME&gt;</code> where <code>marker.json</code>, <code>pending-notice.json</code> and <code>shutdown-notice.json</code> are written.</td>
+</tr>
+<tr>
+<td><code>target</code></td>
+<td>string</td>
+<td><code>primary</code></td>
+<td>Which agent(s) to notify when there is <strong>no</strong> pending/shutdown notice: <code>primary</code> | <code>all</code> | <code>&lt;session-id&gt;</code>.</td>
+</tr>
+<tr>
+<td><code>wakeup</code></td>
+<td>boolean</td>
+<td><code>true</code></td>
+<td><code>true</code> → <code>agent.followup()</code> wakes the agent and delivers; <code>false</code> → <code>agent.inject()</code> queues model-facing context only (no wake).</td>
+</tr>
+<tr>
+<td><code>notice</code></td>
+<td>string</td>
+<td><code>''</code></td>
+<td>Optional custom notice text; returned verbatim when non-empty, else the default.</td>
+</tr>
+<tr>
+<td><code>restartUnit</code></td>
+<td>string</td>
+<td><code>''</code></td>
+<td>Systemd unit to restart when <code>smart_restart</code> is invoked (e.g. <code>dsh.service</code> or <code>dsh-deepartments-dev.service</code>). Must be set per profile; empty → the tool fails safe with a clear error.</td>
+</tr>
+<tr>
+<td><code>toolEnabled</code></td>
+<td>boolean</td>
+<td><code>true</code></td>
+<td>Whether the <code>smart_restart</code> tool is registered (available to agent sessions).</td>
+</tr>
+<tr>
+<td><code>shutdownGraceMs</code></td>
+<td>number</td>
+<td><code>600000</code></td>
+<td>Grace window (ms, default 10 minutes) before shutdown within which last agent activity counts as "agent-involved" for the smart shutdown auto-notification. If the last-active session was idle beyond this window on shutdown, the pin is skipped and delivery falls back to <code>target</code>.</td>
+</tr>
+</tbody></table>
+<p><code>target</code> semantics (fallback path only — a pending notice or a usable shutdown notice overrides <code>target</code> for that boot):</p>
+<ul>
+<li><code>primary</code> — the first root agent to start (the main agent). Delivery is guarded so exactly one primary is notified.</li>
+<li><code>all</code> — every root agent.</li>
+<li><code>&lt;session-id&gt;</code> — an exact session id, pinned to one specific agent.</li>
+</ul>
+<p>Full example patch row, restating every key with a custom notice and an explicit <code>restartUnit</code>:</p>
+<pre><code>- insert:
+    - id: smart-restart
+      name: dsh-smart-restart
+      config:
+        enabled: true
+        stateDir: .smart-restart
+        target: primary
+        wakeup: true
+        notice: "The DSH service restarted. Please check for interrupted work and report your status in one line."
+        restartUnit: dsh.service
+        toolEnabled: true
+        shutdownGraceMs: 600000
+</code></pre>
+<blockquote>
+<p><strong>Single delivery channel.</strong> When <code>wakeup</code> is enabled the notice is delivered via <code>agent.followup()</code>; when disabled, via <code>agent.inject()</code>. It is <strong>never</strong> both with the same message — a followup that queues into the inbox and a parallel inject of the same message would collide with Inbox's "already pending" validation.</p>
+</blockquote>
+<h2>Behavior &amp; lifecycle</h2>
+<ul>
+<li><strong>When woken</strong>, the main agent receives a plugin-source user message (<code>source.kind: 'plugin'</code>, <code>form: 'notice'</code>) and typically acknowledges with a one-liner or resumes any interrupted task.</li>
+<li><strong>On success</strong>, the plugin logs <code>[smart-restart] notice delivered to &lt;id&gt;</code>; when a pending notice is pinned on boot it logs <code>[smart-restart] pinned restart notice to session &lt;id&gt;</code>, and when a smart shutdown notice is pinned it logs <code>[smart-restart] pinned restart notice to last-active session &lt;id&gt;</code> — all observable boot evidence in the journal.</li>
+<li><strong>Once per boot</strong> — the startup-event delivery and the bounded poll cannot both fire, so a restart produces exactly one notice.</li>
+<li><strong>Pinning priority</strong> — (1) a tool-caller <code>pending-notice.json</code> wins; (2) a smart shutdown <code>shutdown-notice.json</code> pins to the last-active session when it was active within <code>shutdownGraceMs</code>; (3) otherwise <code>target</code> decides.</li>
+<li><strong>Reversible lifecycle</strong> — the event listeners, poll timer, tool registration, and <code>SIGTERM</code>/<code>SIGINT</code> handlers are reversible via <code>ctx.effect</code> (dropped on plugin unload / HMR). The only intentional exceptions are the marker and the <code>pending-notice.json</code>/<code>shutdown-notice.json</code> files, which must survive the restart they document.</li>
+</ul>
+<h2>Limitations</h2>
+<p>Be honest about what this plugin does not do:</p>
+<ul>
+<li><strong>Agent-side awareness only.</strong> There is no desktop or browser toast — DSH currently has no notification service, so the notice surfaces only in the agent's own context (visible in the GUI session, not as an OS/browser notification).</li>
+<li><strong>Not for the one-shot headless CLI.</strong> A boot-time wake may not exit cleanly in a single-shot headless run; this plugin targets long-lived GUI instances. The notice is still delivered and committed, but for headless one-shots it is of little use.</li>
+<li><strong>Per-DSH-home marker.</strong> The marker lives under a single <code>&lt;DSH_HOME&gt;</code>, so separate homes (e.g. your stable vs. dev instance) are tracked independently — a restart of one does not notify agents in the other.</li>
+<li><strong>Tool requires restartUnit.</strong> The <code>smart_restart</code> tool needs a configured <code>restartUnit</code>; without it the tool fails safe. Non-tool restarts are still auto-detected when an agent was active within <code>shutdownGraceMs</code>, otherwise they fall back to <code>target</code>.</li>
+<li><strong>Existing sessions may lack the tool.</strong> A session whose toolset was created <strong>before</strong> the plugin was installed won't have <code>smart_restart</code> — start a new chat after installing to pick it up.</li>
+<li><strong>rc-era API.</strong> The plugin targets DSH <code>&gt;= 0.1.0-rc.7</code>; pre-1.0 APIs (events, session ids, message forms) may change in later releases.</li>
+</ul>
+<h2>Development</h2>
+<pre><code>src/
+  index.ts   — apply() wiring: marker + pending/shutdown-notice I/O, restart detection, activity tracking + SIGTERM/SIGINT hook, smart_restart tool, delivery (followup/inject)
+  boot.ts    — pure, deterministic restart + notice logic (I/O-free, unit-testable), incl. parseShutdownNotice / shutdownTarget
+test/
+  marker.test.js  — detectRestart / parsePendingNotice / parseShutdownNotice / shutdownTarget / selectsAgent / targetsAgent / compiled exports
+  notice.test.js  — buildNotice / humanizeDowntime
+</code></pre>
+<ul>
+<li><code>pnpm install</code> — install dependencies.</li>
+<li><code>pnpm build</code> — compile <code>src/</code> to <code>lib/</code> with <code>tsc</code>.</li>
+<li><code>pnpm test</code> — run the unit tests in <code>test/</code> (<code>node:test</code>) against the built <code>lib/</code>.</li>
+</ul>
+<p>The unit tests cover <strong>pure logic only</strong> (restart detection, pending-notice parsing, targeting, humanized downtime, notice building) plus a small check of the compiled plugin exports. A real reboot smoke — install into an isolated development profile, trigger a service restart, and confirm the notice is delivered — is performed against a dev profile, since a true process restart cannot be exercised inside a unit-test process.</p>
+<h2>License</h2>
+<p>MIT</p>

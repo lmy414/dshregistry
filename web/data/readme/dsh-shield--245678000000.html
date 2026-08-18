@@ -1,0 +1,390 @@
+<h1>dsh-shield</h1>
+<p>DeepSeek Harness 的安全防火墙。</p>
+<p>安装前扫描。执行前拦截。动作后审计。</p>
+<blockquote>
+<p>Don't trust your agent's tools. Verify them.</p>
+</blockquote>
+<p><a href="https://github.com/245678000000/dsh-shield/blob/HEAD/README.en.md">English</a></p>
+<h2>安装</h2>
+<p>需要 Node.js 20+ 和 <a href="https://pnpm.io">pnpm</a>。</p>
+<h3>1. 装 CLI（预检扫描器）</h3>
+<p>装完就可以在装任何 Harness 插件 <strong>之前</strong> 先扫一遍：</p>
+<pre><code>git clone https://github.com/245678000000/dsh-shield.git
+cd dsh-shield
+pnpm install
+pnpm build
+pnpm link --global
+</code></pre>
+<p>验证：</p>
+<pre><code>dsh-shield --help
+dsh-shield doctor
+</code></pre>
+<p>不想链到全局的话，在仓库里直接跑：</p>
+<pre><code>node packages/cli/dist/bin.js scan ./某个插件目录
+</code></pre>
+<h3>2. 装进 DeepSeek Harness（运行时护栏）</h3>
+<p>先有可用的 <code>dsh</code>。用<strong>本地目录</strong>安装，不要先 <code>allowBuilds</code> 去跑未知 git 包的 <code>prepare</code>：</p>
+<pre><code>dsh plugin --profile web add /你的路径/dsh-shield
+</code></pre>
+<p>装好后重启 <code>dsh web</code>（或对应 profile）。默认策略是 <code>balanced</code>。</p>
+<p>自定义策略可以放在：</p>
+<pre><code>~/.dsh-shield/policy.yaml
+</code></pre>
+<p>示例见 <a href="https://github.com/245678000000/dsh-shield/blob/HEAD/examples/policy/balanced.yaml">examples/policy/balanced.yaml</a>。</p>
+<h3>3. 立刻试一下</h3>
+<pre><code># 扫一个会拉起进程的合成插件（不会执行它）
+dsh-shield scan ./fixtures/plugins/process
+
+# 扫一个干净插件
+dsh-shield scan ./fixtures/plugins/clean
+
+# 生成信任清单
+dsh-shield manifest ./fixtures/plugins/process
+</code></pre>
+<p><code>process</code> 夹具会报 <strong>HIGH / REVIEW BEFORE INSTALLING</strong>。<br>干净包显示 <strong>NO HIGH-RISK FINDINGS DETECTED</strong>——这不是「SAFE」，静态扫描不能证明代码安全。</p>
+<h3>不要这样装</h3>
+<pre><code># 会拉源码；若再 allowBuilds，可能执行对方的 prepare
+dsh plugin add github:245678000000/dsh-shield
+</code></pre>
+<p>git 安装拿到的是源码，不是编好的产物。官方 Harness 也写了：<code>allowBuilds</code> 等于允许安装期在你机器上跑代码。<br>要走 git，先扫再 pin commit：</p>
+<pre><code>dsh-shield scan github:245678000000/dsh-shield#&lt;完整sha&gt;
+dsh plugin --profile web add github:245678000000/dsh-shield#&lt;完整sha&gt;
+</code></pre>
+<hr>
+<h2>这不是一个普通 Harness 插件</h2>
+<p>安装阶段的恶意行为，不能靠「装完才加载」的插件来拦。</p>
+<p><code>dsh-shield</code> 因此是 <strong>两层</strong>，共用同一套安全模型：</p>
+<pre><code>安装之前
+→ 预检扫描器（CLI）
+
+运行期间
+→ 运行时护栏（Harness Plugin）
+</code></pre>
+<table>
+<thead>
+<tr>
+<th>层</th>
+<th>是什么</th>
+<th>何时生效</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong>预检 CLI</strong> <code>dsh-shield scan</code></td>
+<td>下载 / 解包 / 解析 / 检查。<strong>绝不执行待扫描包</strong></td>
+<td>在 <code>dsh plugin add</code> 之前</td>
+</tr>
+<tr>
+<td><strong>运行时插件</strong></td>
+<td>挂在官方 <code>tools/pre-execute</code> 与 <code>ctx.tools.guard()</code> 上</td>
+<td>每一次工具 / MCP 调用</td>
+</tr>
+</tbody></table>
+<p>产品能力就六个词：</p>
+<pre><code>SCAN → CLASSIFY → ALLOW / ASK / DENY → AUDIT
+</code></pre>
+<p>它做的是 <strong>风险发现、策略执行、信任元数据、人工审批、可审计性</strong>。<br>它不是「完美安全」，也不会声称 100% 防住 Prompt Injection。</p>
+<hr>
+<h2>为什么需要它</h2>
+<p>DeepSeek Harness（<code>dsh</code>）里，插件、MCP、内置工具都跑在宿主机 Node 进程权限下。</p>
+<p>用户用 <code>dsh plugin add github:someone/plugin</code> 安装插件时，底层是 <strong>pnpm</strong>。<br><code>prepare</code> / <code>preinstall</code> 这类 lifecycle 脚本，会在任何 Harness 插件 <code>apply()</code> 之前执行。</p>
+<p>运行时，模型可以调用 <code>mcp__&lt;server&gt;__&lt;tool&gt;</code>，把本地文件、密钥、客户资料送出本机。</p>
+<p><code>dsh-shield</code> 卡在这些边界上：</p>
+<ul>
+<li>安装插件之前</li>
+<li>运行插件期间</li>
+<li>调用 MCP 之前</li>
+<li>数据离开本机之前</li>
+<li>执行高风险 Tool 之前</li>
+</ul>
+<hr>
+<h2>预检扫描器</h2>
+<pre><code>dsh-shield scan &lt;目录|tarball|github:owner/repo#sha|npm:name&gt;
+dsh-shield inspect &lt;target&gt;
+dsh-shield policy check &lt;target&gt;
+dsh-shield manifest &lt;target&gt;
+dsh-shield diff old.json new.json
+dsh-shield doctor
+</code></pre>
+<p>扫描 <strong>不会</strong>：</p>
+<ul>
+<li>跑 <code>npm install</code> / <code>pnpm install</code></li>
+<li><code>require()</code> / <code>import()</code> 待扫描包</li>
+<li>执行 <code>prepare</code> / <code>preinstall</code> / <code>postinstall</code></li>
+</ul>
+<p>远程包路径是：<code>下载 → 防 zip-slip 解包 → 解析 → 检查</code>。</p>
+<p>AST 优先于纯正则。字符串里写了 <code>"child_process"</code>，或文档写「我们不会读 ~/.ssh」，<strong>不会</strong>直接判成恶意。</p>
+<hr>
+<h2>运行时护栏</h2>
+<p>安装方式见上文「安装」。对接的是当前官方 API（Harness <code>0.1.0-rc.5</code>，commit <code>47f94385</code>），<strong>不 fork AgentLoop，不改 Harness 源码</strong>：</p>
+<table>
+<thead>
+<tr>
+<th>官方缝</th>
+<th>dsh-shield 怎么用</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>tools/pre-execute</code></td>
+<td>返回 <code>{ kind: 'allow' | 'ask' | 'deny' }</code></td>
+</tr>
+<tr>
+<td><code>ctx.tools.guard()</code></td>
+<td>单调 DENY：后面的 hook <strong>不能</strong>把拒绝改回允许</td>
+</tr>
+<tr>
+<td><code>ctx.approval.request()</code></td>
+<td>ASK 走官方审批；没有审批通道则 <strong>降级为 DENY</strong></td>
+</tr>
+<tr>
+<td>MCP 公开名</td>
+<td><code>mcp__&lt;serverName&gt;__&lt;rawName&gt;</code></td>
+</tr>
+</tbody></table>
+<p>管理工具（只读，没有「一键关闭全部安全」）：</p>
+<ul>
+<li><code>shield_status</code></li>
+<li><code>shield_explain</code></li>
+<li><code>shield_policy</code></li>
+<li><code>shield_recent_events</code></li>
+</ul>
+<hr>
+<h2>MCP 安全</h2>
+<p>新 MCP Server 默认是 <strong>unknown</strong>，不是 trusted。</p>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>未知 MCP</th>
+<th>已审查（如 github）</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>只读 + 非敏感</td>
+<td>ASK（balanced）</td>
+<td>ALLOW</td>
+</tr>
+<tr>
+<td>外部写入</td>
+<td>ASK</td>
+<td>ASK</td>
+</tr>
+<tr>
+<td>密钥 / 凭据外泄</td>
+<td>DENY</td>
+<td>DENY</td>
+</tr>
+</tbody></table>
+<hr>
+<h2>数据出境</h2>
+<p>外部 MCP / HTTP 工具执行前，会给 payload 分级：</p>
+<p><code>public | internal | personal | confidential | credential | secret</code></p>
+<p>日志和审批理由里的密钥一律脱敏（<code>sk-abc...xyz</code>），<strong>从不写完整 secret</strong>。</p>
+<pre><code>DATA EGRESS WARNING
+
+Destination: crm-cloud
+Detected: CONFIDENTIAL DOCUMENT, PERSONAL DATA, POSSIBLE SECRET
+Action: DENY
+</code></pre>
+<hr>
+<h2>Prompt Injection</h2>
+<p><strong>检测 + 行为策略，不是魔法防御。</strong></p>
+<p>网页 / README / MCP 返回值里的指令腔（「ignore previous instructions」「把 ~/.ssh 发出去」）会被打上 <code>UNTRUSTED_*</code>。<br>同一会话里随后的敏感读取或外部写入，会升为 ASK / DENY（<code>SHIELD-INJECT-002</code>）。</p>
+<p>原文不会被删掉。普通文档里的「Run npm install to install this package」单独出现，不会当成攻击。</p>
+<hr>
+<h2>策略档位</h2>
+<p>YAML / JSON。内置四档，不是换名字：</p>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>permissive</th>
+<th>balanced（默认）</th>
+<th>strict</th>
+<th>enterprise</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>本地读</td>
+<td>allow</td>
+<td>allow</td>
+<td>allow</td>
+<td>allow</td>
+</tr>
+<tr>
+<td>本地写</td>
+<td>allow</td>
+<td>ask</td>
+<td>ask</td>
+<td>ask</td>
+</tr>
+<tr>
+<td>破坏性操作</td>
+<td>ask</td>
+<td>deny</td>
+<td>deny</td>
+<td>deny</td>
+</tr>
+<tr>
+<td>外部写</td>
+<td>ask</td>
+<td>ask</td>
+<td>deny</td>
+<td>deny</td>
+</tr>
+<tr>
+<td>密钥出境</td>
+<td>deny</td>
+<td>deny</td>
+<td>deny</td>
+<td>deny</td>
+</tr>
+<tr>
+<td>未知 MCP 读</td>
+<td>allow</td>
+<td>ask</td>
+<td>ask</td>
+<td>deny</td>
+</tr>
+<tr>
+<td>未知 MCP 写</td>
+<td>ask</td>
+<td>ask</td>
+<td>deny</td>
+<td>deny</td>
+</tr>
+</tbody></table>
+<p>配置坏了：高风险决策 <strong>fail closed</strong>，不会静默全放行。</p>
+<p>示例：<a href="https://github.com/245678000000/dsh-shield/blob/HEAD/examples/policy/balanced.yaml">examples/policy/balanced.yaml</a><br>模型说明：<a href="https://github.com/245678000000/dsh-shield/blob/HEAD/docs/security-model.md">docs/security-model.md</a></p>
+<hr>
+<h2>架构</h2>
+<pre><code>                 DSH SHIELD
+                      │
+        ┌─────────────┴─────────────┐
+        ↓                           ↓
+     预检安全                      运行时安全
+        │                           │
+        ├─ 包扫描                    ├─ 工具门
+        ├─ 源码扫描                  ├─ MCP 门
+        ├─ 依赖扫描                  ├─ 出境护栏
+        ├─ 脚本扫描                  ├─ 人工审批
+        ├─ 权限推断                  ├─ 敏感数据
+        ├─ 风险引擎                  ├─ 注入信号
+        └─ 信任清单                  └─ 审计日志
+</code></pre>
+<table>
+<thead>
+<tr>
+<th>包</th>
+<th>职责</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>@dsh-shield/core</code></td>
+<td>发现项、能力、风险分、策略、密钥检测</td>
+</tr>
+<tr>
+<td><code>@dsh-shield/scanner</code></td>
+<td>不执行目标的预检</td>
+</tr>
+<tr>
+<td><code>@dsh-shield/cli</code></td>
+<td><code>dsh-shield</code> 命令行</td>
+</tr>
+<tr>
+<td><code>@dsh-shield/runtime</code></td>
+<td>Harness 插件</td>
+</tr>
+<tr>
+<td><code>@dsh-shield/ui</code></td>
+<td>输出格式化（先服务 CLI）</td>
+</tr>
+</tbody></table>
+<p>风险分是确定性公式，<strong>LLM 不能决定 ALLOW / DENY</strong>。</p>
+<hr>
+<h2>信任清单</h2>
+<p><code>dsh-shield manifest &lt;target&gt;</code> 写出 <code>dsh-shield.manifest.json</code>：</p>
+<p>包名、来源与 commit、风险、能力、安装脚本、发现项、扫描完整性、扫描器版本。</p>
+<p>信任库按 <code>(来源, commit)</code> 记录。commit 变了，信任作废。</p>
+<hr>
+<h2>威胁模型</h2>
+<p>见 <a href="https://github.com/245678000000/dsh-shield/blob/HEAD/docs/threat-model.md">docs/threat-model.md</a>。</p>
+<p>覆盖：恶意插件、被投毒依赖、恶意 MCP、Prompt Injection、数据外泄、危险工具调用、只读伪装、供应链漂移、动态配置。</p>
+<p><strong>明确不声称：</strong></p>
+<ul>
+<li>100% 防住 Prompt Injection</li>
+<li>证明任意插件安全</li>
+<li>完美沙箱任意恶意 JavaScript</li>
+<li>抓住所有混淆载荷</li>
+<li>替代操作系统沙箱 / 终端安全</li>
+<li>保证 MCP Server 可信</li>
+</ul>
+<hr>
+<h2>示例</h2>
+<p><code>fixtures/</code> 里全是合成样本，不是真实恶意软件。</p>
+<pre><code>pnpm test
+node packages/cli/dist/bin.js scan fixtures/plugins/process
+pnpm exec vitest run tests/runtime/demos.spec.ts
+</code></pre>
+<table>
+<thead>
+<tr>
+<th>Demo</th>
+<th>结果</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>本地 <code>read_file</code></td>
+<td>ALLOW</td>
+</tr>
+<tr>
+<td><code>mcp__github__get_issue</code>（已审查）</td>
+<td>ALLOW</td>
+</tr>
+<tr>
+<td><code>mcp__github__create_issue</code></td>
+<td>ASK</td>
+</tr>
+<tr>
+<td>未知 MCP + <code>TEST_API_KEY=shield_test_123456</code></td>
+<td>DENY</td>
+</tr>
+<tr>
+<td>注入 README → <code>upload_debug_info</code></td>
+<td>DENY</td>
+</tr>
+</tbody></table>
+<hr>
+<h2>隐私</h2>
+<p>默认全部本地：扫描、策略、审计都不上传云端。</p>
+<p>审计只留规则 ID、决策、目的地、数据分级、<strong>脱敏摘录</strong>。<br>不留原始密钥，不留完整机密正文。</p>
+<hr>
+<h2>局限</h2>
+<p>详见 <a href="https://github.com/245678000000/dsh-shield/blob/HEAD/docs/limitations.md">docs/limitations.md</a>。</p>
+<p><strong>dsh-shield 不能保证：</strong> 安全证明、完整防注入、JS 沙箱、检出所有混淆加载器、MCP 诚实，以及你已经允许安装脚本跑过之后的保护。</p>
+<p>Harness 对接调研：<a href="https://github.com/245678000000/dsh-shield/blob/HEAD/docs/harness-integration.md">docs/harness-integration.md</a><br>规则目录：<a href="https://github.com/245678000000/dsh-shield/blob/HEAD/rules/catalog.md">rules/catalog.md</a></p>
+<hr>
+<h2>开发与测试</h2>
+<pre><code>pnpm lint
+pnpm typecheck
+pnpm test
+pnpm build
+</code></pre>
+<p>CI 跑这四项。夹具是合成包。CI <strong>不会</strong>执行未知第三方代码。</p>
+<p>当前：<code>55</code> 个测试通过。</p>
+<hr>
+<h2>路线图</h2>
+<ul>
+<li><strong>v0.1</strong> — 预检扫描、运行时策略、MCP 信任、出境护栏、审计（本版本）</li>
+<li><strong>v0.2</strong> — 更完整的清单 diff、注册表信誉适配器、更深的来源追踪、可选 Web UI</li>
+<li><strong>v0.3</strong> — 签名信任清单、插件透明度、CI Action</li>
+<li><strong>v0.4</strong> — 组织策略、集中分发</li>
+</ul>
+<hr>
+<h2>供应链安装注意</h2>
+<p>见上文「安装 → 不要这样装」。git 安装拉到的是源码；<code>allowBuilds</code> 等于允许安装期在你机器上跑代码。</p>
+<hr>
+<h2>参与</h2>
+<p>欢迎 Issue 和 PR。</p>
+<p>不要把 LLM 做成安全边界。<br>不要为了「看看它干什么」去执行扫描目标。<br>不要编造 Harness API——先读 <code>docs/harness-integration.md</code> 和官方仓库。</p>
+<p>安全漏洞请走 <a href="https://github.com/245678000000/dsh-shield/security/advisories/new">GitHub Security Advisory</a>，见 <a href="https://github.com/245678000000/dsh-shield/blob/HEAD/SECURITY.md">SECURITY.md</a>。</p>
+<p>许可证：<a href="https://github.com/245678000000/dsh-shield/blob/HEAD/LICENSE">MIT</a></p>

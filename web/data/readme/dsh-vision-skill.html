@@ -1,0 +1,225 @@
+<h1>dsh-plugins / dsh-vision-skill</h1>
+<p><strong>DeepSeek Harness（DSH）标准插件版识图技能</strong> —— 把本仓库 <code>General_skills/vision-skill</code>（源自 Qwen 官方动态分辨率方法）包装成 DSH 原生插件。</p>
+<blockquote>
+<p>零框架补丁：插件本身只使用官方扩展接缝（<code>ctx.skills.register</code> / <code>ctx.tools.register</code> / <code>ctx.credentials</code> / <code>ctx.sessions</code> / <code>ctx.webServer</code> / client 注入），可随 DSH 版本升级。<strong>v0.4 起直接贴图走 paste-to-path，不再需要 pi-ai 补丁</strong>；旧补丁只作为兼容保留，并附带还原脚本。</p>
+</blockquote>
+<h2>能力一览（8 工具 + 1 运行时 skill）</h2>
+<table>
+<thead>
+<tr>
+<th>名称</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>vision</code>（运行时 skill）</td>
+<td>模型按需加载的识图指令；加载后自动激活下列工具（渐进式暴露）</td>
+</tr>
+<tr>
+<td><code>vision_analyze</code></td>
+<td>识别本地图片（6 模式：general/ocr/table/code/error/<strong>evidence 结构化证据</strong> + <code>budget</code> 含 <code>mega</code> 超高清 16M 像素）</td>
+</tr>
+<tr>
+<td><code>vision_ocr</code></td>
+<td>独立 OCR：提取全部可见文字，保持原始排版</td>
+</tr>
+<tr>
+<td><code>vision_ground</code></td>
+<td>定位目标（如「微信图标」），返回像素坐标框 + 归一化坐标</td>
+</tr>
+<tr>
+<td><code>vision_detect</code></td>
+<td>枚举一类元素（默认所有 UI 元素），编号 + 像素坐标框</td>
+</tr>
+<tr>
+<td><code>vision_dominant_colors</code></td>
+<td>主色分析（本地像素算法，无需视觉 API）</td>
+</tr>
+<tr>
+<td><code>vision_long_screenshot_ocr</code></td>
+<td>超长截图分块 OCR：切块（带重叠）→ <strong>本地 tesseract 优先</strong> → VLM 兜底 → 合并全文</td>
+</tr>
+<tr>
+<td><code>vision_clipboard</code></td>
+<td>剪贴板图片兜底识别（paste-to-path 失败/特殊场景的手动通道）</td>
+</tr>
+<tr>
+<td><code>vision_activate</code></td>
+<td>渐进式暴露兜底：skill 加载后工具未自动出现时调用一次</td>
+</tr>
+</tbody></table>
+<h2>工程化特性</h2>
+<ul>
+<li><strong>渐进式工具暴露</strong>：全局只挂 1 个轻量激活工具，完整工具集在 skill 加载成功后按 Agent 挂载（省上下文）；<code>progressive: false</code> 可回退为全局注册。</li>
+<li><strong>paste-to-path 直贴（v0.4.2 起输入框显示 📎 chip）</strong>：client 插件在 capture 阶段截获粘贴图片，用 <code>input.insertReference</code> 插入图片 chip；发送时 <code>codec.serialize</code> 才同源 POST 到 <code>/dsh-vision-skill/paste</code>、落盘工作区 <code>.dsh-vision/pasted/</code>，并把路径文本交给模型。消息里没有 image 块，因此 DSH 不再报 <code>MODEL_DOES_NOT_SUPPORT_IMAGES</code>；旧版无 reference 能力时自动回退为直接插路径文本。</li>
+<li><strong>多 provider failover + 429 退避</strong>：<code>visionProviders</code> 数组按顺序 failover；每个 provider 可配 <code>apiUrl/model/apiKey/credential</code>；429 按 <code>Retry-After</code> 退避重试一次。</li>
+<li><strong>结构化证据</strong>：<code>vision_analyze</code> 的 <code>mode=evidence</code> 返回 <code>summary / ocr_full_text / layout（阅读顺序）/ semantics（entities/relations）/ uncertainty / visual</code> JSON。</li>
+<li><strong>本地 OCR 快路径</strong>：长截图 OCR 每块先跑 tesseract（<code>tesseract</code> / <code>tesseractLangs</code> 可配置），不可用才调 VLM，省 token 更快。</li>
+<li><strong>图像记忆缓存</strong>：<code>vision_analyze</code> 结果按图片内容 SHA-256 + mode/budget/crop/prompt 缓存（<code>cache</code> / <code>cacheTtlSeconds</code> / <code>cacheMaxEntries</code>），TTL 内命中直接返回 <code>cached:true</code>，不重复烧视觉 API。</li>
+<li><strong>密钥 Credential 化</strong>：config 支持 <code>credential: VISION_API_KEY</code>（DSH Credential 引用，每操作解析，推荐）或 <code>apiKey</code>（兼容旧配置，不推荐明文）。</li>
+<li><strong>路径围栏</strong>：图片路径必须位于会话工作区 / DSH 附件目录 / <code>allowedDirs</code> 之一（realpath 校验，防穿越）。</li>
+<li><strong>超时与并发门控</strong>：<code>timeoutMs</code>（默认 180s）与 <code>concurrency</code>（默认 2）可配置。</li>
+<li><strong>结构化输出</strong>：全部工具返回严格 JSON Schema 定义的结构化结果。</li>
+<li><strong>测试与自检</strong>：<code>python -m unittest discover -s tests</code>（16 项纯函数/回退链测试）；<code>python scripts/vision.py --check --no-api</code> 检查 provider 链路、PIL、tesseract。</li>
+</ul>
+<h2>识图核心方法</h2>
+<p>Qwen 官方动态分辨率预处理（<code>smart_resize</code>：预算像素 + patch 网格吸附）→ <strong>任意 OpenAI 兼容多模态模型</strong>（默认 MiniMax-M3，<code>thinking: disabled</code> 关闭思考，可替换）。Grounding 采用 Qwen 官方方法：VLM 输出 0-1000 归一化 bbox → 解析 JSON / <code>&lt;ref&gt;&lt;box&gt;</code> 双格式 → 映射像素坐标。</p>
+<h2>目录结构</h2>
+<pre><code>dsh-vision-skill/
+├── lib/index.js          # 插件主体（skill 注册 + 8 工具 + 渐进暴露 + 围栏）
+├── scripts/vision.py     # 识图脚本（动态分辨率 / OCR / grounding / 主色 / 长图分块）
+├── scripts/reapply-pi-ai-vision-patch.ps1  # pi-ai 适配器「图片→路径」幂等补丁脚本（dsh 升级后重跑）
+├── SKILL.md              # 运行时 skill 内容（模型按需加载）
+├── package.json          # 插件包声明（peerDependencies: dsh-tools / dsh-credentials / schemastery）
+└── templates/.env.example # 脚本独立运行时的配置模板
+</code></pre>
+<h2>安装</h2>
+<h3>方式一：本地 link（开发/直装，推荐）</h3>
+<pre><code># 1. 克隆仓库（或已有）
+git clone https://github.com/DDDFXYqiming/dsh-vision-skill.git
+cd dsh-vision-skill
+
+# 2. （可选）本地开发依赖：peer 包由 DSH 自带（dsh-base 提供 @deepseek-ai/dsh-tools 等），
+#    无需在插件目录单独安装；若脚本独立运行需要类型/工具，可临时加：
+#    pnpm add -D "@deepseek-ai/dsh-tools@rc" "@deepseek-ai/dsh-credentials@rc"
+
+# 3. 注册到 web profile（link 方式，改源码即时生效）
+#    在 C:\Users\&lt;user&gt;\.dsh\profiles\web\package.json 的 dependencies 加：
+#    "dsh-vision-skill": "link:&lt;绝对路径&gt;\dsh-plugins\dsh-vision-skill"
+#    然后在该目录执行 pnpm install
+</code></pre>
+<h3>方式二：插件命令（推荐，bundle 标准安装）</h3>
+<pre><code>dsh plugin --profile web add github:DDDFXYqiming/dsh-vision-skill
+</code></pre>
+<p>安装后插件包自带的 <code>cordis.patch.yml</code> 会自动贡献 <code>id: vision-skill</code> 条目（进 profile 的 bundles 列表），<strong>无需手动 insert</strong>。配置默认值由插件内置的 Schemastery Config schema 提供（<code>apiUrl</code>=MiniMax / <code>model</code>=MiniMax-M3 / <code>credential</code>=VISION_API_KEY）。</p>
+<h3>配置（覆盖 bundle 默认值）</h3>
+<p>⚠️ <strong>重要</strong>：bundle 方式安装后，<strong>不要</strong>在 profile 的 <code>cordis.patch.yml</code> 里再 <code>insert</code> 一个 <code>id: vision-skill</code>——重复 id 会导致 <code>duplicate loader entry id</code> 启动崩溃。需要自定义配置时，用<strong>裸条目按 id 覆盖</strong>（不带 <code>insert:</code> 包装）：</p>
+<pre><code># profile cordis.patch.yml —— 裸条目覆盖 bundle 行（后写者胜，config 整行替换）
+- id: vision-skill
+  config:
+    apiUrl: '&lt;你的多模态模型 OpenAI 兼容接口地址&gt;'  # 如 https://api.minimaxi.com/v1/chat/completions
+    model: '&lt;模型名&gt;'                                # 如 MiniMax-M3 / qwen-vl-plus / gemini-2.5-flash
+    credential: 'VISION_API_KEY'   # 推荐：DSH Credential 引用
+    # apiKey: '&lt;明文 key&gt;'         # 兼容旧方式（不推荐）
+</code></pre>
+<p>覆盖时只写要改的字段即可？——<strong>不行</strong>：patch 会替换目标行的<strong>整个</strong> config（不深合并），所以覆盖时要把需要保留的默认字段也一起写上（如上面的 apiUrl/model/credential 全量）。也可以不覆盖——直接用内置默认值（MiniMax-M3 + VISION_API_KEY 凭证引用），此时 profile 无需任何 vision-skill 行。</p>
+<p>fallback 链路示例（顺序=优先级，429/5xx/网络错误自动切下一个）：</p>
+<pre><code>- id: vision-skill
+  config:
+    apiUrl: '&lt;主 provider&gt;'
+    model: '&lt;主模型&gt;'
+    credential: VISION_API_KEY
+    visionProviders:
+      - apiUrl: 'https://api.minimaxi.com/v1/chat/completions'
+        model: MiniMax-M3
+        credential: VISION_API_KEY
+      - apiUrl: '&lt;第三个 OpenAI 兼容端点&gt;'
+        model: '&lt;模型&gt;'
+        apiKey: '&lt;或明文 key&gt;'
+    tesseract: tesseract
+    tesseractLangs: chi_sim+eng
+    pasteMaxBytes: 10485760
+    cache: true
+    cacheTtlSeconds: 3600
+    cacheMaxEntries: 200
+</code></pre>
+<p>Credential 值存到 <code>$DSH_HOME/.credentials.yaml</code>：</p>
+<pre><code>VISION_API_KEY: sk-xxxx
+</code></pre>
+<p>补丁层支持热重载（无需重启）；<strong>修改插件源码（lib/index.js）后需重启宿主</strong>。</p>
+<h2>测试与验证</h2>
+<pre><code># 纯函数/回退链测试（16 项）
+python -m unittest discover -s tests -v
+
+# 语法与自检（不请求 API）
+npm run check
+python scripts/vision.py --check --no-api
+</code></pre>
+<p>改动后按 AGENTS.md 红线优先用 headless 自测；直接贴图属于 client/Web 行为，需重启 web 宿主后强刷浏览器验证。</p>
+<h2>依赖</h2>
+<ul>
+<li>Node.js + DSH（<code>@deepseek-ai/dsh-tools</code>、<code>@deepseek-ai/dsh-credentials</code>、<code>@deepseek-ai/schemastery</code>）</li>
+<li>Python 3 + Pillow（<code>pip install pillow</code>；<code>vision.py --check</code> 自检）</li>
+<li>视觉模型 API Key（<strong>任意 OpenAI 兼容的多模态模型</strong>：Qwen-VL / MiniMax-M3 / Gemini / GPT-4o 等，默认 MiniMax-M3）</li>
+</ul>
+<h2>图片怎么喂给插件（三种方式）</h2>
+<p>插件的所有工具只接收<strong>图片的本地路径（文本）</strong>，不接收图片本体。三种喂图方式：</p>
+<table>
+<thead>
+<tr>
+<th>方式</th>
+<th>操作</th>
+<th>适用环境</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>① 路径直发</td>
+<td>图片已在本地（或放一份到工作区），对话框发路径文本："识别这张图 <code>E:\...\xxx.png</code>"</td>
+<td><strong>所有环境</strong></td>
+</tr>
+<tr>
+<td>② 剪贴板</td>
+<td>Win+Shift+S 截屏（图片自动进剪贴板）→ 对话框说"看图"，<code>vision_clipboard</code> 自动保存到工作区 <code>.dsh-vision/</code> 再识别</td>
+<td><strong>所有环境</strong></td>
+</tr>
+<tr>
+<td>③ 直接贴图</td>
+<td>v0.4 起内置：输入框粘贴 → 同源上传到 <code>.dsh-vision/pasted/</code> → 路径文本进入消息 → 模型调 <code>vision_analyze</code>；<strong>不需要 pi-ai 补丁</strong></td>
+<td>✅ 所有环境</td>
+</tr>
+</tbody></table>
+<h2>图片投递机制与适配器支持矩阵</h2>
+<p><strong>原理（v0.4 paste-to-path）</strong>：粘贴图片时 client 插件在 capture 阶段截获字节，POST 到 <code>/dsh-vision-skill/paste</code>，图片落盘到会话工作区 <code>.dsh-vision/pasted/</code>，输入框只插入 <code>[pasted image available at absolute path: "..."]</code> 文本。消息里没有 image 块，因此不会触发 DSH 的 <code>MODEL_DOES_NOT_SUPPORT_IMAGES</code> 准入检查。模型拿到路径后调用 <code>vision_analyze</code>。看图能力来自本插件（独立多模态 API），主模型只需能读路径文本 + 调工具。</p>
+<table>
+<thead>
+<tr>
+<th>适配器 / 场景</th>
+<th>直接贴图（方式③）</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>dsh-llm-deepseek</code>（deepseek-official）</td>
+<td>✅ 开箱即用</td>
+<td>DSH 新版<strong>原生内置</strong>图片→路径转换（源自 vision-skill patch v2，官方已采纳）</td>
+</tr>
+<tr>
+<td><code>dsh-llm-pi-ai</code>（opencode-go / 自定义 OpenAI 兼容 provider）</td>
+<td>✅ v0.4 无需补丁</td>
+<td>paste-to-path 在图片进入适配器前已改为路径文本；旧 image→path 补丁仅兼容保留</td>
+</tr>
+<tr>
+<td>多模态模型（<code>input</code> 含 image）</td>
+<td>✅ 图片直达</td>
+<td>无需转换（模型原生看图）</td>
+</tr>
+</tbody></table>
+<p><strong>零补丁环境说明（v0.4）</strong>：paste-to-path 让消息里不再出现 image 块，pi-ai 适配器不会触发 <code>UNSUPPORTED_CONTENT</code>。本次升级已执行还原，zen-ua 补丁保留。若 DSH 升级后旧补丁被重新打上，可运行 <code>python scripts\restore_pi_ai_vision_patch.py</code>（或 <code>powershell -File scripts\restore-pi-ai-vision-patch.ps1</code>）还原。</p>
+<h3>pi-ai 适配器补丁（opencode-go 等，v0.4 起仅兼容保留）</h3>
+<p>v0.4 的 paste-to-path 已让直接贴图不再需要 pi-ai 补丁。旧补丁只在你希望保留“图片先进入官方附件管线、由适配器转路径”的旧行为时使用：</p>
+<pre><code># 在 dsh npm 升级/重装后执行一次（幂等：已打补丁自动跳过）
+powershell -File scripts\reapply-pi-ai-vision-patch.ps1
+# 然后重启 DSH 宿主生效
+</code></pre>
+<ul>
+<li>补丁内容：给 <code>dsh-llm-pi-ai/lib/index.js</code> 打两处补丁——<code>zen-ua</code>（OpenCode Zen 免费层只认 <code>opencode/&lt;ver&gt;</code> User-Agent）+ <code>image→path</code>（图片转路径占位符，格式与官方 <code>dsh-llm-deepseek</code> 完全一致，保证 vision 工作流格式统一）</li>
+<li>⚠️ <strong>该脚本是作者机器级维护工具</strong>（硬编码本机 <code>.dsh/profiles</code> 路径，改的是 node_modules 里的 vendor 包），<strong>随包分发时已从 files 白名单排除</strong>；他机使用需先修改脚本顶部的 <code>$piAi</code> 路径</li>
+<li><strong>dsh 升级后需重跑脚本</strong>（node_modules 被覆盖）；改 <code>lib/index.js</code> 后需重启宿主</li>
+<li>补丁只影响 pi-ai 适配器的纯文本模型（<code>input</code> 不含 image）；真正多模态的模型不受影响</li>
+</ul>
+<h2>使用示例</h2>
+<pre><code>识别这张图 &lt;路径&gt;          → vision_analyze
+OCR 这张图 &lt;路径&gt;          → vision_ocr
+在这张图里找到 &lt;目标&gt;      → vision_ground（返回像素坐标框）
+清点这张图的所有按钮       → vision_detect
+这张图的主色是什么         → vision_dominant_colors（本地算法，不耗 API）
+提取这段长聊天记录的文字   → vision_long_screenshot_ocr
+看图（剪贴板截图）         → vision_clipboard
+</code></pre>
+<h2>相关</h2>
+<ul>
+<li>脚本独立运行：见 <code>templates/.env.example</code>，<code>python scripts/vision.py &lt;图&gt; --check</code></li>
+<li>通用技能源：<a href="https://github.com/DDDFXYqiming/dsh-vision-skill/blob/HEAD/General_skills/vision-skill">General_skills/vision-skill</a></li>
+<li>⚠️ <strong>同名技能冲突</strong>：本插件以 <code>runtime</code> 层注册技能名 <code>vision</code>；若同时在 <code>$DSH_HOME/skills</code>（user 层）或项目 <code>.dsh/skills</code>（project 层）安装了同名技能，按官方优先级 project &gt; runtime &gt; user，可能互相遮蔽——建议二选一安装</li>
+<li>授权：MIT</li>
+</ul>

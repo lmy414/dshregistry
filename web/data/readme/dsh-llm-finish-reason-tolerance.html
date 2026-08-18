@@ -1,0 +1,122 @@
+<h1>dsh-llm-finish-reason-tolerance</h1>
+<p>A <a href="https://github.com/deepseek-ai/deepseek-harness">DeepSeek Harness</a> host plugin that makes the agent tolerate OpenAI-compatible providers whose streaming responses end without a <code>finish_reason</code>.</p>
+<p>The canonical case is the <strong>Snowflake Cortex</strong> gateway (<code>*.snowflakecomputing.com/api/v2/cortex/v1</code>): its Chat Completions SSE streams content deltas and a terminal <code>data: [DONE]</code> but never sends a <code>finish_reason</code> — not for plain text, not for tool calls (non-streaming responses return <code>finish_reason: ""</code>). The harness's model client (pi-ai) treats that as a truncated stream (<code>Stream ended without finish_reason</code>), and the harness maps it to a <code>TRANSPORT</code> error finish. Every request delivers content and then <strong>fails the turn</strong>.</p>
+<p>This plugin rewrites only that specific terminal error into the successful finish the content already deserves.</p>
+<h2>How it works</h2>
+<p>The plugin listens on the harness's <code>llm/stream</code> waterfall (registered globally and prepended, so its returned iterable is the one consumers iterate) and wraps every model stream:</p>
+<ul>
+<li>a <strong>tool-call</strong> block was delivered → the terminal finish becomes <code>{ kind: 'tool-calls' }</code></li>
+<li><strong>text</strong> content was delivered → the terminal finish becomes <code>{ kind: 'stop' }</code></li>
+<li>nothing was delivered, or the error is anything else → passed through untouched</li>
+</ul>
+<p>The rewrite is gated on both the exact pi-ai message (<code>Stream ended without finish_reason</code>) and on delivered content, so genuine mid-stream truncations (which surface as different pi-ai errors) are never masked.</p>
+<p>No changes to pi-ai, <code>dsh-llm</code>, or <code>dsh-llm-pi-ai</code> are required.</p>
+<h2>Requirements</h2>
+<ul>
+<li>DeepSeek Harness (any recent deployment; <code>@deepseek-ai/cordis</code> ≥ 4 and <code>@deepseek-ai/schemastery</code> ≥ 3 are already present)</li>
+<li>Node ≥ 20</li>
+<li>The plugin must be installed into a <strong>profile</strong> (e.g. <code>web</code>) and mounted in the <strong>host composition</strong> — it is host-level and single-instance. Do not mount it inside an agent preset.</li>
+</ul>
+<h2>Install</h2>
+<p>The package is shipped as a <strong>profile bundle</strong>: it carries its own <code>cordis.patch.yml</code> layer (declared via <code>dsh.bundle.patch</code> in <code>package.json</code>), so installing it mounts the plugin with no manual composition editing.</p>
+<h3>Bundle install (recommended)</h3>
+<pre><code>dsh plugin --profile web add /path/to/dsh-llm-finish-reason-tolerance-0.2.0.tgz
+</code></pre>
+<p>What this does:</p>
+<ol>
+<li><p><code>pnpm</code> installs the package into the profile's dependency tree.</p>
+</li>
+<li><p>The <code>dsh plugin</code> CLI detects <code>dsh.bundle.patch</code> and automatically appends the package to the profile's <code>dsh.profile.bundles</code> in <code>package.json</code>:</p>
+<pre><code>"dsh": { "profile": { "bundles": ["@deepseek-ai/dsh-base", "@deepseek-ai/dsh-web-app", "dsh-llm-finish-reason-tolerance"] } }
+</code></pre>
+</li>
+<li><p>At the next boot, the bundle's own patch layer (<code>cordis.patch.yml</code> inside the package) inserts the <code>llm-finish-reason-tolerance</code> row into the host composition.</p>
+</li>
+</ol>
+<p>That's the whole install. Use <code>&lt;profile&gt;</code> instead of <code>web</code> for any other profile (e.g. <code>dsh plugin --profile tui add …</code>).</p>
+<h3>Plain install (alternative)</h3>
+<p>If you prefer a plain dependency (e.g. the package is only published to a registry without bundle semantics), install it and add the row yourself. The profile patch layer (<code>~/.dsh/profiles/&lt;profile&gt;/cordis.patch.yml</code>) is a list of <strong>patch operations</strong>, so a new row must be wrapped in <code>insert:</code> — a bare <code>id:</code> row is an id-targeted override of an <em>existing</em> entry and is silently skipped when none matches:</p>
+<pre><code># from the profile directory (e.g. ~/.dsh/profiles/web)
+pnpm add /path/to/dsh-llm-finish-reason-tolerance-0.2.0.tgz
+</code></pre>
+<pre><code># ~/.dsh/profiles/&lt;profile&gt;/cordis.patch.yml
+- insert:
+    - id: llm-finish-reason-tolerance
+      name: dsh-llm-finish-reason-tolerance
+      config:
+        # Provider route keys from the `llm-pi-ai` settings section.
+        # Empty (or omitted) applies to every provider.
+        providers:
+          - snowflake-cortex
+</code></pre>
+<h3>Restart</h3>
+<p>A <strong>restart of the harness is required</strong> after install — the plugin is a new module and is only mounted at boot. After restart, <code>llm-finish-reason-tolerance</code> appears in the plugins list.</p>
+<p>Do not combine both install methods (that would insert the row twice), and do not also mount the row inside an agent preset.</p>
+<h2>Configuration</h2>
+<table>
+<thead>
+<tr>
+<th>Field</th>
+<th>Type</th>
+<th>Default</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>providers</code></td>
+<td><code>string[]</code></td>
+<td><code>[]</code></td>
+<td>Provider route keys (as named in the <code>llm-pi-ai</code> settings section) this tolerance applies to. <code>[]</code> = all providers.</td>
+</tr>
+</tbody></table>
+<h3>Scoping the tolerance to specific routes</h3>
+<p>The bundle ships with <code>providers: []</code> — the tolerance applies to <strong>every</strong> provider route. To restrict it to specific routes, override the row's config in your <strong>own</strong> profile patch layer. This works because bundle layers apply first and their inserted rows can be targeted by later layers (the <code>config</code> value replaces the bundle's wholesale, so state the full config):</p>
+<pre><code># ~/.dsh/profiles/&lt;profile&gt;/cordis.patch.yml
+- id: llm-finish-reason-tolerance
+  config:
+    providers:
+      - snowflake-cortex
+</code></pre>
+<p>With the plain install, scoping is simply the <code>providers</code> value inside the <code>insert:</code> row above.</p>
+<h2>Using it with Snowflake Cortex</h2>
+<p>The Snowflake provider must be configured in the <code>llm-pi-ai</code> settings section with a route key that matches the plugin's <code>providers</code> list. With the default (empty) <code>providers</code> list the plugin applies to every route, so no matching is required; if you scope the plugin, the route key must match exactly (e.g. <code>snowflake-cortex</code>).</p>
+<pre><code># ~/.dsh/settings.yaml
+llm-pi-ai:
+  providers:
+    snowflake-cortex:
+      displayName: Snowflake Cortex (SG)
+      apiKeyEnv: SNOWFLAKE_CORTEX_API_KEY
+      api: openai-completions
+      baseURL: https://&lt;account&gt;.snowflakecomputing.com/api/v2/cortex/v1
+      models:
+        - id: claude-sonnet-5
+          name: Claude Sonnet 5
+        # e.g. a DeepSeek model your account serves (deepseek-r1 is deprecated)
+        # - id: deepseek-r1
+        #   name: DeepSeek R1
+</code></pre>
+<p>Notes:</p>
+<ul>
+<li>Use <code>api: openai-completions</code> with the full <code>…/api/v2/cortex/v1</code> base URL. The OpenAI SDK authenticates with <code>Authorization: Bearer</code> from <code>apiKeyEnv</code> automatically — no headers needed.</li>
+<li>The plugin fixes the missing <code>finish_reason</code>; <code>deepseek-r1</code> is deprecated at the endpoint and cannot be used regardless of the plugin.</li>
+</ul>
+<h2>Safety</h2>
+<ul>
+<li>The rewrite fires <strong>only</strong> for pi-ai's <code>Stream ended without finish_reason</code> terminal error and <strong>only</strong> when content was delivered. All other errors — auth, rate limit, quota, genuine mid-stream truncation, empty responses — pass through unchanged.</li>
+<li>A response that ends without <code>finish_reason</code> and without content keeps its original error finish.</li>
+<li>Scope with <code>providers</code> to keep the behavior local to the routes that need it.</li>
+</ul>
+<h2>Development</h2>
+<pre><code>npm test        # node --test — exercises the wrapper with synthetic chunk streams
+npm pack        # build the distributable tarball
+</code></pre>
+<p>Layout:</p>
+<ul>
+<li><code>lib/index.js</code> — the plugin (plain ESM, no build step; the harness loads it directly)</li>
+<li><code>lib/index.d.ts</code> — TypeScript declarations</li>
+<li><code>test/finish-reason.test.mjs</code> — self-contained wrapper tests</li>
+<li><code>cordis.patch.yml</code> — the bundle's own patch layer (auto-applied on bundle install)</li>
+<li><code>cordis.example.yml</code> — the mount row for the plain-install path</li>
+</ul>
+<h2>License</h2>
+<p>MIT</p>

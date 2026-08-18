@@ -1,0 +1,206 @@
+<h1>dsh-shadow-mind</h1>
+<p>Parallel cognitive runtime for <a href="https://github.com/deepseek-ai/dsh">DeepSeek Harness</a> (DSH / Cordis).</p>
+<p>This project is a DSH plugin implementation of <a href="https://github.com/liuzhengdongfortest/pi-shadow-mind">pi-shadow-mind</a>. The plugin runs multiple "Shadow Mind" agents beside the main agent to provide independent reviews, fact-checking, and parallel cognitive work: after each main-agent turn, a heartbeat scheduler randomly activates configured shadows, each with its own responsibility, tool allowlist, and run timeout.</p>
+<blockquote>
+<p><strong>Status</strong>: functional prototype. Core heartbeat scheduling, restricted-tool shadow agents, per-run timeouts, lifecycle cleanup, and management tools work end-to-end. See <a href="#known-limitations">Known Limitations</a> below.</p>
+</blockquote>
+<h2>Relation to pi-shadow-mind</h2>
+<ul>
+<li>Original project: <a href="https://github.com/liuzhengdongfortest/pi-shadow-mind">https://github.com/liuzhengdongfortest/pi-shadow-mind</a></li>
+<li>This repository is a DSH plugin (dsh-plugin) implementation of pi-shadow-mind: the shadow-mind concepts are reimplemented on the DSH/Cordis runtime as an independent package — not a fork, and not a line-by-line translation.</li>
+<li>DSH uses different primitives (continuable subagents, native background notices, and the Cordis plugin model), so the implementation adapts the original design to them.</li>
+</ul>
+<h2>Features</h2>
+<ul>
+<li><strong>Heartbeat scheduling</strong>: After each main-agent turn, randomly activates configured Shadow Minds.</li>
+<li><strong>Restricted-tool shadows</strong>: Each shadow receives a sanitized main-session trajectory and an explicit tool allowlist. The default allowlist is read-only; configuring other tools can broaden that access.</li>
+<li><strong>Per-run timeout</strong>: <code>timeout_seconds</code> (or the config default) bounds each shadow run; an expired run is interrupted and its slot is released.</li>
+<li><strong>Lifecycle cleanup</strong>: <code>subagent/end</code> removes finished shadow runs, so slots and <code>active</code> counts stay accurate within an epoch.</li>
+<li><strong>Management tools</strong>: Create, update, delete, list, enable, and disable shadow definitions via model tools. Persistent writes are gated behind the DSH approval service when one is mounted.</li>
+<li><strong>Config tools</strong>: Read and write the global <code>config.json</code> via model tools (writes validate the merged result before persisting).</li>
+<li><strong>Pause/resume/epoch</strong>: <code>/shadow pause</code> and <code>/shadow resume</code>; pausing also aborts running shadows. New user input increments the epoch and cancels running shadows from the previous epoch.</li>
+<li><strong>Auto toggle</strong>: <code>/shadow auto on|off</code> actually enables/disables heartbeat activation.</li>
+<li><strong>Tool-call argument redaction</strong>: Tool-call arguments are redacted before being forwarded to shadows (credentials are not leaked). Tool results are summarized.</li>
+</ul>
+<h2>Installation</h2>
+<p>DSH plugins are loaded through a Cordis composition (profile or agent preset).</p>
+<h3>1. Install the package into a DSH profile</h3>
+<pre><code>dsh plugin --profile web add @winterchenhuan/dsh-shadow-mind
+</code></pre>
+<p>For local development, build the package before adding the directory so <code>dist/index.js</code> exists:</p>
+<pre><code>cd /path/to/dsh-shadow-mind
+npm install
+npm run build
+dsh plugin --profile web add /path/to/dsh-shadow-mind
+</code></pre>
+<p>The profile stores the local package as a path dependency; rerun <code>npm run build</code> after source changes, then restart DSH.</p>
+<p>The current repository version is <code>0.1.6</code>. Installing by package name resolves the latest published npm version; to test an unpublished checkout, use the local-directory procedure above.</p>
+<p>The package ships a <code>cordis.patch.yml</code>. The profile loader reads the package's <code>dsh.bundle.patch</code> manifest and applies it automatically; no manual profile <code>cordis.patch.yml</code> editing is needed.</p>
+<h3>2. Restart DSH</h3>
+<p>Restart DSH and the plugin will be loaded. The package exports a default Cordis plugin factory from <code>dist/index.js</code>.</p>
+<h2>Configuration</h2>
+<p>Shadow definitions and global config live in:</p>
+<pre><code>$DSH_HOME/agent/shadow-minds/
+├── config.json
+├── grounded-reviewer.md
+├── requirement-keeper.md
+└── ...
+</code></pre>
+<p><code>$DSH_HOME</code> defaults to <code>~/.dsh</code> (honoring the <code>DSH_HOME</code> environment variable), so the default location is <code>~/.dsh/agent/shadow-minds/</code>.</p>
+<p>Example <code>config.json</code>:</p>
+<pre><code>{
+  "heartbeat_probability": 0.33,
+  "max_parallel_shadows": 2,
+  "default_shadow_timeout_seconds": 120,
+  "headless_drain_timeout_seconds": 30,
+  "result_batch_window_ms": 5000,
+  "default_shadow_model": null,
+  "default_thinking_level": "low",
+  "random_seed": null
+}
+</code></pre>
+<p>The timeout and heartbeat fields are active. <code>headless_drain_timeout_seconds</code>, <code>result_batch_window_ms</code>, and <code>default_thinking_level</code> are accepted for configuration compatibility but are not active yet; see <a href="#known-limitations">Known Limitations</a>.</p>
+<p>Example shadow definition <code>grounded-reviewer.md</code>:</p>
+<pre><code>---
+id: grounded-reviewer
+name: Project Grounding Checker
+enabled: true
+activation_probability: 0.6
+run_with_model: openai/gpt-5-mini
+thinking_level: low
+tools:
+  - read
+  - grep
+  - glob
+---
+
+Check whether the main agent's claims are supported by the current workspace. If nothing is worth reporting, reply exactly: NOT_RELEVANT.
+</code></pre>
+<h2>Usage</h2>
+<p>After installation, restart the target profile and start DSH Web normally:</p>
+<pre><code>dsh web
+</code></pre>
+<p>(<code>dsh --profile web</code> is equivalent.)</p>
+<p>In the Web UI, continue using the main agent. Shadow activations happen after main-agent turns according to the configured probability. Use <code>/shadow status</code> first to confirm the plugin loaded and to see registry/config diagnostics.</p>
+<p>Typical flow:</p>
+<ol>
+<li><code>/shadow status</code> — confirm the plugin loaded and see the current state.</li>
+<li><code>/shadow list</code> — see which shadows are defined and enabled.</li>
+<li><code>/shadow probe grounded-reviewer</code> — manually run one shadow once to check it works.</li>
+<li>Shadows then activate automatically after main-agent turns (heartbeat), as long as auto mode is ON.</li>
+</ol>
+<h2>Commands</h2>
+<p>Use the single <code>/shadow</code> umbrella command:</p>
+<pre><code>/shadow status
+/shadow probe &lt;id&gt; [tools]
+/shadow list
+/shadow clean
+/shadow auto &lt;on|off&gt;
+/shadow pause
+/shadow resume
+</code></pre>
+<table>
+<thead>
+<tr>
+<th>Command</th>
+<th>Purpose</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>/shadow status</code></td>
+<td>Show the current state: active/paused, auto mode, epoch, running shadow count, event count, plus config/registry diagnostics.</td>
+</tr>
+<tr>
+<td><code>/shadow probe &lt;id&gt; [tools]</code></td>
+<td>Manually run one shadow once without waiting for a heartbeat. <code>&lt;id&gt;</code> selects the shadow (omit it to pick a random enabled one). Optional comma-separated <code>tools</code> overrides that shadow's tool allowlist.</td>
+</tr>
+<tr>
+<td><code>/shadow list</code></td>
+<td>List all shadow definitions: enabled/disabled, activation probability, and tool allowlist.</td>
+</tr>
+<tr>
+<td><code>/shadow clean</code></td>
+<td>Abort all currently running shadows and release their slots.</td>
+</tr>
+<tr>
+<td><code>/shadow auto &lt;on|off&gt;</code></td>
+<td>Enable/disable heartbeat activation. <code>off</code> stops random activations; already-running shadows are not affected.</td>
+</tr>
+<tr>
+<td><code>/shadow pause</code> / <code>/shadow resume</code></td>
+<td>Pause/resume the whole shadow system for the current session. Pausing also aborts running shadows. A new user message (new epoch) also stops shadows left over from the previous epoch.</td>
+</tr>
+</tbody></table>
+<h2>Management Tools</h2>
+<p>These are registered as model-callable tools:</p>
+<ul>
+<li><code>list_shadows</code></li>
+<li><code>create_shadow</code></li>
+<li><code>update_shadow</code></li>
+<li><code>delete_shadow</code></li>
+<li><code>enable_shadow</code></li>
+<li><code>disable_shadow</code></li>
+<li><code>trigger_shadow</code></li>
+<li><code>read_shadow_config</code></li>
+<li><code>write_shadow_config</code></li>
+</ul>
+<h2>Known Limitations</h2>
+<p>The following areas are not fully implemented yet:</p>
+<table>
+<thead>
+<tr>
+<th>Area</th>
+<th>Status</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>Independent Shadow AgentSession</td>
+<td><strong>Partial</strong>: DSH continuable subagents are used instead of a separate agent session.</td>
+</tr>
+<tr>
+<td><code>report_to_main</code> tool</td>
+<td><strong>Missing</strong>: DSH native background notices are used instead. Report batching and <code>steer</code>/<code>followUp</code> are not yet replicated.</td>
+</tr>
+<tr>
+<td>Tool allowlist resolution</td>
+<td><strong>Simplified</strong>: missing-tool reporting and <code>report_to_main</code> injection are not implemented.</td>
+</tr>
+<tr>
+<td>Per-shadow model auth check</td>
+<td><strong>Missing</strong>: <code>run_with_model</code> is passed as <code>agentOptions</code>, but auth validation is not performed.</td>
+</tr>
+<tr>
+<td>Per-shadow <code>timeout_seconds</code></td>
+<td><strong>Enforced</strong>: each run is bounded by <code>timeout_seconds</code> or <code>default_shadow_timeout_seconds</code>; expired runs are interrupted and their slots released.</td>
+</tr>
+<tr>
+<td>Per-shadow <code>thinking_level</code></td>
+<td><strong>Not applied</strong>: DSH uses reasoning effort, which is not yet mapped.</td>
+</tr>
+<tr>
+<td>Shutdown drain / headless mode</td>
+<td><strong>Missing</strong>: no headless drain on process shutdown.</td>
+</tr>
+<tr>
+<td>UI status panel / message renderer</td>
+<td><strong>Partial</strong>: a Client indicator exists in the dynamic prototype; the real package currently only exposes <code>/shadow</code>.</td>
+</tr>
+<tr>
+<td>Debug session logs</td>
+<td><strong>Not needed</strong>: shadow runs are DSH continuable subagents, and DSH Web already shows their execution (trajectory, tool calls, results) live. The <code>debug</code> frontmatter field was removed accordingly.</td>
+</tr>
+<tr>
+<td>Test suite</td>
+<td><strong>Minimal</strong>: vitest suite covers the pure scheduling, parsing, serialization, config, and drain logic; no harness integration tests yet.</td>
+</tr>
+</tbody></table>
+<p>See <a href="https://github.com/winterhuan/dsh-shadow-mind/blob/HEAD/DESIGN.md">DESIGN.md</a> for the project's design goals; some of them are not fully implemented yet.</p>
+<h2>Development</h2>
+<pre><code>npm install
+npm run typecheck
+npm run verify   # typecheck + unit tests
+npm run build
+</code></pre>
+<p><code>npm pack</code> runs <code>prepack</code> (i.e. <code>npm run build</code>) automatically, so a release tarball always contains <code>dist/index.js</code>.</p>
+<h2>License</h2>
+<p>MIT</p>

@@ -1,0 +1,348 @@
+<h1>dsh-safety</h1>
+<p>English | <a href="https://github.com/sugarxl/dsh-safety/blob/HEAD/README.zh.md">中文</a></p>
+<p align="center">
+  <img src="https://img.shields.io/badge/license-MIT-blue?style=flat-square" alt="License">
+  &nbsp;
+  <img src="https://img.shields.io/badge/dependencies-0-brightgreen?style=flat-square" alt="Dependencies">
+  &nbsp;
+  <img src="https://img.shields.io/badge/node-%3E%3D22-339933?style=flat-square" alt="Node">
+  &nbsp;
+  <img src="https://img.shields.io/badge/version-0.1.0-blue?style=flat-square" alt="v0.1.0">
+  &nbsp;
+  <img src="https://img.shields.io/github/actions/workflow/status/sugarxl/dsh-safety/test.yml?style=flat-square&amp;label=CI" alt="CI">
+</p>
+
+<p align="center">
+  <strong>DSH 安全兜底：拦截无脑删文件 · 删除可撤销 · 组合可回滚 · 重启前体检</strong><br>
+  <em>plugin guard · safe_delete · snapshots · pre-restart check · standalone CLI</em>
+</p>
+
+
+
+<p><a href="#what">What</a> · <a href="#features">Features</a> · <a href="#install">Install</a> · <a href="#quick-start">Quick start</a> · <a href="#cli-reference">CLI</a> · <a href="#configuration">Config</a> · <a href="https://github.com/sugarxl/dsh-safety/blob/HEAD/docs/DESIGN.md">Design</a> · <a href="https://github.com/sugarxl/dsh-safety/blob/HEAD/docs/FAQ.md">FAQ</a> · <a href="https://github.com/sugarxl/dsh-safety/blob/HEAD/docs/KNOWN-LIMITATIONS.md">Known limitations</a></p>
+
+
+<h2>What</h2>
+<p><strong>A safety harness for DeepSeek Harness (DSH).</strong> Stops the AI agent from
+deleting or rewriting the files that make DSH unbootable, makes every delete
+recoverable, snapshots the whole plugin composition for one-command rollback,
+and checks the composition before you restart.</p>
+<p>Zero third-party dependencies. Works as a DSH profile bundle plugin <strong>and</strong> as
+a standalone CLI — so the safety net is usable even when DSH is down.</p>
+<blockquote>
+<p>Why this exists: a real incident — a script silently resolved the wrong
+path (PowerShell's <code>$HOME</code> is read-only) and <code>Remove-Item -Recurse -Force</code>
+deleted an entire engine runtime root. The only reason it was recoverable is
+that the deleted directory was <em>generated</em> content. Anything hand-authored
+would have been gone forever. dsh-safety encodes the lessons of that
+incident as enforced mechanisms, not advice.</p>
+</blockquote>
+<h2>Features</h2>
+<ul>
+<li><strong>Execution-time guard</strong> (<code>ctx.tools.guard</code>): denies destructive tool calls
+<em>before</em> they run.<ul>
+<li><strong>Recursive directory deletes are blocked everywhere</strong> (<code>rm -r/-rf</code>,
+<code>Remove-Item -Recurse</code>, <code>rd /s</code>, <code>rmdir</code>, <code>shutil.rmtree</code>,
+<code>fs.rm recursive</code>, <code>require('fs').rmSync</code>…) — no matter which path,
+routed to <code>safe_delete</code>.</li>
+<li><code>write</code>/<code>edit</code>/<code>str_replace_editor</code> on <strong>protected</strong> paths (profile
+<code>package.json</code>, <code>cordis.patch.yml</code>, <code>cordis.yml</code>, lockfiles,
+<code>node_modules</code>, the deployment install dir, home patch/settings) are
+denied.</li>
+<li>Deletes on <strong>confirm</strong> zones (the whole OS home dir, plugin sources,
+agent presets) are denied and routed to <code>safe_delete</code>.</li>
+<li><strong><code>run_code</code> bodies are scanned too</strong> — arbitrary code execution cannot
+hide an <code>fs.rmSync</code>/<code>shutil.rmtree</code> on a protected zone behind a tool
+call boundary.</li>
+<li><strong>Variable-reference deletes are caught</strong> — <code>Remove-Item "$env:USERPROFILE\.dsh\…"</code> whose literal path only exists after expansion
+is denied (the reference + tail fragment is matched against protected
+markers).</li>
+</ul>
+</li>
+<li><strong><code>safe_delete</code></strong> — the only sanctioned delete channel. Moves to a trash
+directory (recoverable via <code>safety_undo</code>), <code>preview:true</code> shows what would
+be removed first, refuses filesystem roots and its own state dir, and
+journals every delete.</li>
+<li><strong>Composition snapshots</strong> — <code>safety_snapshot</code> saves the whole plugin
+composition (per-profile manifests, patches, lockfiles, plugin
+<code>package.json</code> + <code>cordis.patch.yml</code>, agent presets) with SHA-256 hashes;
+<code>safety_restore</code> rolls back to a last-known-good state (current files are
+backed up first). Credential-bearing files are excluded by default.</li>
+<li><strong>Pre-restart check</strong> — <code>safety_check</code> validates UTF-8, detects mojibake
+(wrong-encoding round-trips, the classic "DSH won't open" cause), JSON
+parse errors, and <strong>duplicate plugin row ids across patch layers</strong> (the
+"one row, one layer" rule).</li>
+<li><strong>Audit journal + web panel</strong> — every block/delete/snapshot/restore is
+journaled; a "Safety Center" settings section shows trash, snapshots,
+journal, and one-click restore/rollback.</li>
+<li><strong>Standalone CLI</strong> — <code>dsh-safety</code> works without DSH: delete/undo/snapshot/
+restore/check from your own terminal, even when DSH won't boot.</li>
+</ul>
+<h2>Install</h2>
+<p>System requirements: a working DeepSeek Harness (<code>dsh web</code> boots). npm
+install has no extra requirements; installing from the repository needs
+Node.js &gt;= 22 and pnpm.</p>
+<h3>From npm (recommended)</h3>
+<pre><code>dsh plugin --profile web add @suagr_xl/dsh-safety
+</code></pre>
+<p><code>dsh plugin</code> runs pnpm and reconciles <code>dsh.profile.bundles</code> automatically
+because this package declares <code>dsh.bundle</code>. Restart <code>dsh web</code> — the guard is
+then active and the <code>safety_*</code> tools appear.</p>
+<blockquote>
+<p>Not published to npm yet — until then use the repository install below.</p>
+</blockquote>
+<h3>From the repository (development)</h3>
+<pre><code>git clone https://github.com/sugarxl/dsh-safety.git
+cd dsh-safety
+dsh plugin --profile web add link:$(pwd)     # symlink the repo into the profile
+</code></pre>
+<p>The <code>link:</code> protocol symlinks the repo (changes to <code>lib/</code> apply after a
+restart), unlike <code>file:</code> which copies a snapshot. <code>dsh plugin</code> reconciles the
+bundle automatically. Note: the profile directory is not a pnpm workspace, so
+any <code>workspace:*</code> deps would fall back to the npm registry — this plugin has
+<strong>zero runtime dependencies at all</strong> (its imports are only Node builtins +
+its own <code>safety-core.mjs</code>), so a bare <code>link:</code> install works with no
+<code>node_modules</code> of its own and no fallback is needed.</p>
+<h3>Where it lands (official layout)</h3>
+<p>Both installs go through the official <code>dsh plugin</code> mechanism — nothing else to
+configure:</p>
+<pre><code>$DSH_HOME/profiles/&lt;name&gt;/package.json                # + dependency + dsh.profile.bundles
+$DSH_HOME/profiles/&lt;name&gt;/node_modules/dsh-safety/    # the installed package
+</code></pre>
+<p>The bundle layer is read at boot from the package's own <code>cordis.patch.yml</code>.
+The <code>dsh-safety</code> row id appears in exactly one layer (that file); never add it
+to the profile or home <code>cordis.patch.yml</code>.</p>
+<h3>Verify &amp; uninstall</h3>
+<pre><code>dsh --profile web --dump-config | grep -i dsh-safety   # row present
+dsh-safety check                                        # pre-restart gate
+# restart dsh web
+
+# uninstall:
+dsh plugin --profile web remove @suagr_xl/dsh-safety
+# restart dsh web
+</code></pre>
+<h3>Install troubleshooting</h3>
+<ul>
+<li><strong>Installed, restarted, but nothing changed</strong>: restart the whole <code>dsh web</code>
+process — a page refresh is not enough. Confirm the row is mounted with
+<code>dsh --profile web --dump-config</code>.</li>
+<li><strong><code>ERR_PNPM_IGNORED_BUILDS</code></strong>: pnpm blocks dependency build scripts; add
+the listed packages to <code>pnpm-workspace.yaml</code> <code>allowBuilds</code> and re-run.</li>
+<li><strong>pnpm release-age gate installs an old version</strong>: pnpm 11's
+<code>minimumReleaseAge</code> can silently pick an older publish within ~10 days; add
+<code>minimumReleaseAgeExclude: ['@suagr_xl/dsh-safety']</code> to the profile's
+<code>pnpm-workspace.yaml</code> and run <code>dsh plugin --profile web update @suagr_xl/dsh-safety</code>.</li>
+</ul>
+<h3>Standalone CLI (no plugin install needed)</h3>
+<pre><code>npm link   # or: node bin/dsh-safety.mjs ...
+dsh-safety status
+</code></pre>
+<p>The CLI reads the same <code>$DSH_HOME/.dsh-safety</code> state the plugin uses, so you
+can undo/restore from your terminal even if DSH is down.</p>
+<h2>Quick start</h2>
+<pre><code># 1. See what's protected
+dsh-safety policy
+
+# 2. Before touching any composition file, snapshot
+dsh-safety snapshot before-edit
+
+# 3. Delete the safe way (preview first!)
+dsh-safety delete path/to/file --preview
+dsh-safety delete path/to/file
+
+# 4. Oops — undo it
+dsh-safety trash
+dsh-safety undo &lt;trash-id&gt;
+
+# 5. DSH won't boot? Check then roll back
+dsh-safety check
+dsh-safety status          # list snapshots
+dsh-safety restore &lt;snapshot-id&gt; --confirm
+</code></pre>
+<h2>CLI reference</h2>
+<pre><code>dsh-safety status                  state: trash, snapshots, journal
+dsh-safety delete &lt;path&gt; [--force] [--preview]
+dsh-safety trash [--limit N]
+dsh-safety undo &lt;id&gt;
+dsh-safety snapshot [label] [--exclude a,b]
+dsh-safety restore &lt;id&gt; --confirm
+dsh-safety check                   exit 1 on failure (CI-friendly)
+dsh-safety journal [n]
+dsh-safety policy                  effective policy zones
+dsh-safety help
+</code></pre>
+<p><code>--home &lt;path&gt;</code> overrides the state root (<code>$DSH_HOME</code> or <code>~/.dsh</code> by default).</p>
+<h2>Model-facing tools (when installed as a plugin)</h2>
+<table>
+<thead>
+<tr>
+<th>Tool</th>
+<th>Purpose</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>safe_delete</code></td>
+<td>trash-based delete (preview / force / undoable)</td>
+</tr>
+<tr>
+<td><code>safety_trash</code> / <code>safety_undo</code></td>
+<td>list trash / restore an item</td>
+</tr>
+<tr>
+<td><code>safety_snapshot</code> / <code>safety_restore</code></td>
+<td>snapshot composition / rollback (<code>confirm:true</code>)</td>
+</tr>
+<tr>
+<td><code>safety_check</code></td>
+<td>pre-restart validation (UTF-8 / mojibake / JSON / duplicate ids)</td>
+</tr>
+<tr>
+<td><code>safety_journal</code> / <code>safety_status</code></td>
+<td>audit log / state</td>
+</tr>
+</tbody></table>
+<h2>Configuration</h2>
+<p>Configure via the bundle row in a patch layer (e.g. the profile's
+<code>cordis.patch.yml</code>):</p>
+<pre><code>- id: dsh-safety
+  config:
+    blockWriteRoots: ["C:\\extra\\protected"]
+    confirmDeleteRoots: ["D:\\data"]
+    snapshotExclude: ["settings.yaml", ".credentials.yaml"]
+    blockWrites: true
+    blockShellDestructive: true
+    audit: true
+    keepTrash: 200
+    keepSnapshots: 10
+</code></pre>
+<table>
+<thead>
+<tr>
+<th>Field</th>
+<th>Default</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>blockWriteRoots</code></td>
+<td>profile manifests/patches/lockfiles/node_modules, install dir, home patch/settings</td>
+<td>no write/edit/delete</td>
+</tr>
+<tr>
+<td><code>confirmDeleteRoots</code></td>
+<td><code>$HOME</code>, <code>profiles/*</code>, <code>.agent-presets</code></td>
+<td>no delete without <code>force</code> (still trash-only)</td>
+</tr>
+<tr>
+<td><code>snapshotExclude</code></td>
+<td><code>["settings.yaml", ".credentials.yaml"]</code></td>
+<td>files never copied into snapshots</td>
+</tr>
+<tr>
+<td><code>blockWrites</code></td>
+<td><code>true</code></td>
+<td>enable the write/edit guard</td>
+</tr>
+<tr>
+<td><code>blockShellDestructive</code></td>
+<td><code>true</code></td>
+<td>enable the shell-delete guard</td>
+</tr>
+<tr>
+<td><code>audit</code></td>
+<td><code>true</code></td>
+<td>journal destructive tool calls</td>
+</tr>
+<tr>
+<td><code>keepTrash</code> / <code>keepSnapshots</code></td>
+<td><code>200</code> / <code>10</code></td>
+<td>retention limits</td>
+</tr>
+</tbody></table>
+<h2>How it works</h2>
+<p>Three-tier policy:</p>
+<table>
+<thead>
+<tr>
+<th>Tier</th>
+<th>Allowed</th>
+<th>Denied</th>
+<th>Default coverage</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>protected</code></td>
+<td>read</td>
+<td>write / edit / delete</td>
+<td>profile <code>package.json</code>/<code>cordis.patch.yml</code>/<code>cordis.yml</code>/lockfiles/<code>node_modules</code>, install dir, home patch &amp; settings</td>
+</tr>
+<tr>
+<td><code>confirm</code></td>
+<td>read, edit</td>
+<td>delete (needs <code>safe_delete --force</code>, still trash-only)</td>
+<td>entire <code>$HOME</code>, plugin sources, agent presets</td>
+</tr>
+<tr>
+<td><code>free</code></td>
+<td>read/write/delete</td>
+<td>recursive delete</td>
+<td>regular workspace files</td>
+</tr>
+</tbody></table>
+<p>The guard decision chain, per tool call: destructive verb? → is it a
+recursive delete? → does an explicit path hit a protected/confirm zone? → does
+a variable-reference fragment (<code>$env:X\…</code>, <code>%X%\…</code>, <code>${X}/…</code>) expand into a
+protected zone? → does the command text hit a protected marker (<code>~</code>/relative
+forms)? → <code>run_code</code> code bodies go through the same chain → recursive deletes
+are denied <strong>everywhere</strong> as a final rule. Denials are journaled and returned
+to the model as errors (never a crash).</p>
+<p>A second layer hooks the <code>fs/write-intent</code> / <code>fs/edit-intent</code> waterfalls and
+throws <code>FS_DENIED</code> on protected paths regardless of which tool writes.</p>
+<p><code>buildPolicy</code> lives in <code>safety-core.mjs</code> and is shared by the plugin guard and
+the standalone CLI, so the two surfaces can never drift apart.
+<code>restoreSnapshot</code> is transactional: it backs up live files first, then copies
+snapshot files back, and rolls the whole thing back if either phase fails — a
+failed rollback never leaves the composition half-restored.</p>
+<h2>Structure</h2>
+<pre><code>dsh-safety/
+├── bin/
+│   └── dsh-safety.mjs        # standalone CLI (zero deps)
+├── lib/
+│   ├── safety-core.mjs       # pure logic: policy/guard/trash/snapshot/check
+│   ├── index.js              # host half: tools, guard, fs hooks, web route
+│   └── client.js             # browser half: "Safety Center" settings panel
+├── test/
+│   ├── safety.test.mjs       # 19 unit tests (zero deps)
+│   └── harness.mjs           # 38 integration checks (loads @deepseek-ai)
+├── cordis.patch.yml          # bundle patch (inserts the dsh-safety row)
+├── package.json              # dsh.bundle + dsh.client + bin
+├── install.ps1 / recover.ps1 # local convenience scripts (snapshot→install→verify→rollback)
+├── README.md / README.zh.md  # docs (bilingual, officially paired)
+└── LICENSE / NOTICE / SECURITY.md
+</code></pre>
+<h2>Testing</h2>
+<pre><code>node --test test/safety.test.mjs   # 19 unit tests, zero dependencies
+node test/harness.mjs              # 38 integration checks against real @deepseek-ai packages
+npm run check                      # syntax checks
+</code></pre>
+<h2>Troubleshooting</h2>
+<ul>
+<li><strong>DSH won't boot after a plugin change</strong>: run <code>dsh-safety check</code> to find
+mojibake / JSON / duplicate-id problems; <code>dsh --profile web --dump-default-config</code> to see the bundle layer without the user layer;
+<code>dsh-safety restore &lt;id&gt; --confirm</code> to roll back a snapshot.</li>
+<li><strong>The guard blocks something legitimate</strong>: the guard never blocks reads or
+edits of plugin sources; it blocks deletes on <code>$HOME</code>/plugin/config zones —
+use <code>safe_delete</code> (undoable) instead of raw <code>rm</code>.</li>
+<li><strong>I want to delete something on a protected path</strong>: <code>safe_delete</code> with
+<code>force:true</code> (or <code>dsh-safety delete --force</code>) — it still goes to trash,
+never permanent.</li>
+</ul>
+<h2>Security</h2>
+<p>See <a href="https://github.com/sugarxl/dsh-safety/blob/HEAD/SECURITY.md">SECURITY.md</a>. In short: the guard intercepts <strong>model tool
+calls</strong>, not commands you run in your own terminal; <code>safety_check</code> is a
+line-level scanner, not a full YAML parser. It is a safety net, not a sandbox
+— configure DSH's own sandbox/approval for real containment, and use this
+plugin for the recovery layer DSH lacks.</p>
+<h2>License</h2>
+<p>MIT. Integration patterns modeled after DeepSeek Harness (MIT); see
+<a href="https://github.com/sugarxl/dsh-safety/blob/HEAD/NOTICE">NOTICE</a>.</p>

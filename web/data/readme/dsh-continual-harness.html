@@ -1,0 +1,185 @@
+<h1>dsh-continual-harness</h1>
+<p>English | <a href="https://github.com/jasen215/dsh-continual-harness/blob/HEAD/docs/readme/README.zh.md">中文</a></p>
+<p>A <strong>continual self-refinement plugin</strong> for DeepSeek Harness: one plugin gives the agent a closed loop of <em>persistent memory + periodic review-and-refine + cross-session shared knowledge + automatic rollback on failure</em> (plan → validate → apply → rollback), implemented through dsh's plugin mechanisms (session events, agent-scoped events, pre-step waterfall, tools service).</p>
+<p>The design is inspired by the open-source <a href="https://github.com/PrimeIntellect-ai/prime-agent">prime-agent</a> from Prime Intellect, a self-improving coding harness.</p>
+<h2>One plugin is enough</h2>
+<p>There is no need to split into multiple packages: this plugin is a single npm package (<code>dsh-continual-harness</code>) that takes effect through the following extension points once mounted:</p>
+<table>
+<thead>
+<tr>
+<th>Capability</th>
+<th>Mechanism</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>State projection (inject harness context each step)</td>
+<td><code>agent/pre-step</code> waterfall listener; incremental injection when the content digest changes</td>
+</tr>
+<tr>
+<td>Review and automatic refinement</td>
+<td><code>session/event</code> listener on turn interval / compaction end; runs LLM review → plan → apply automatically</td>
+</tr>
+<tr>
+<td>Manual refinement tool</td>
+<td>Registers the <code>harness_refine</code> tool (directly callable by the LLM, supports rollback)</td>
+</tr>
+<tr>
+<td>In-session review trajectory</td>
+<td>Rebuilt from session logs (tail-biased truncation)</td>
+</tr>
+<tr>
+<td>Invariant guard</td>
+<td><code>harness/refinement</code> event validation + batched failure reporting</td>
+</tr>
+</tbody></table>
+<h2>Architecture</h2>
+<pre><code>src/
+  domain.ts      event declaration merging (SessionEventMap / MessageSourceMap / cordis Events)
+  types.ts       HarnessState / RefinementProposal / RefinementResult and other types
+  storage.ts     disk read/write of state and history (atomic writes, corruption degradation, local/global merge, jsonl history)
+  refine.ts      validation, application, rollback (baseline conflict detection, version increments, content-shrink guard)
+  skills.ts      SKILL.md rendering + file reconciliation (generated skills are real dsh skills)
+  render.ts      model-facing overview / summary / history rendering
+  planner.ts     LLM planning prompts and JSON parsing (plan / auto-refine review prompts)
+  store.ts       HarnessStore: combined storage + event publishing (session events + agent-scoped events)
+  complete.ts    completeViaAgent: completion through ctx.get('llm')
+  tool.ts        harness_refine tool
+  projection.ts  pre-step projection (digest dedup, &lt;harness_state&gt; injection)
+  driver.ts      automatic refinement driver (turn-interval gate / compaction gate / cooldown / re-entry guard)
+  invariant.ts   runtime invariant plugin
+  index.ts       plugin entry and Config
+tests/           7 specs, 46 cases (storage / refine / planner / store / driver / invariant / plugin integration)
+</code></pre>
+<h3>Data layout</h3>
+<pre><code>&lt;harnessRoot&gt;/                      harness/ under the default dsh data dir (overridable via Config.harnessRoot)
+  harness_state.json                cross-session global state
+  refinements.jsonl                 global refinement history (append-only)
+  sessions/&lt;sessionKey&gt;/harness/
+    harness_state.json              session-local state (shadows same-id global entries)
+    refinements.jsonl               session refinement history
+</code></pre>
+<ul>
+<li>Entries are stored in four kinds — <code>prompt / memory / skill / subagent</code> — each with a <code>version</code> (incremented on every update).</li>
+<li>Merged view: local entries win; a shadowed global entry remains visible under the <code>local:&lt;id&gt;</code> prefix.</li>
+<li>Baseline validation on apply: an edit is rejected if the entry changed concurrently during planning (<code>entry changed during refinement planning</code>).</li>
+<li><code>base_system_prompt</code> is a protected id; any edit to it is rejected.</li>
+<li><strong>Skills are real dsh skills.</strong> Every applied skill edit materializes the effective merged entry as a <code>&lt;name&gt;/SKILL.md</code> bundle (YAML <code>name</code> + <code>description</code> frontmatter, kebab-case id) under <code>Config.skillsDir</code> (default <code>$DSH_HOME/skills</code>), where dsh's filesystem skill provider (<code>dsh-skill-filesystem</code>) discovers it live and <code>dsh-tool-skill</code> exposes it to the model. Deletes remove the bundle; rollbacks restore it. Only ids touched by a commit are written or removed, so user-owned skills in the same directory are never touched. Each bundle stamps a <code>metadata</code> provenance block (<code>author: dsh-continual-harness</code>, <code>source: esp</code>) so generated skills are distinguishable from hand-written ones.</li>
+</ul>
+<h3>Experience Solidification Protocol (ESP)</h3>
+<p>The Experience Solidification Protocol (ESP) is the <strong>protocol surface</strong> of this capability set, decoupled from this package's implementation:</p>
+<table>
+<thead>
+<tr>
+<th>Protocol element</th>
+<th>Carrier</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>Experience state schema</td>
+<td><code>harness_state.json</code> (<code>schemaVersion: 1</code>)</td>
+<td>Four kinds of entries — <code>prompt / memory / skill / subagent</code> — each with <code>id / kind / version / content / updatedAt</code></td>
+</tr>
+<tr>
+<td>Experience history</td>
+<td><code>refinements.jsonl</code> (append-only)</td>
+<td>One <code>RefinementResult</code> record per apply/rollback; rollback by id</td>
+</tr>
+<tr>
+<td>Refinement event</td>
+<td>session event <code>harness/refinement</code></td>
+<td>Written to the session log on apply/rollback (model-visible ⟺ logged)</td>
+</tr>
+<tr>
+<td>Refinement notification</td>
+<td>agent event <code>harness/refined</code></td>
+<td>Payload <code>{agent, result}</code>; subscribable by invariant and other plugins</td>
+</tr>
+<tr>
+<td>Experience injection</td>
+<td>message source <code>harness-state</code> (carries <code>digest</code>)</td>
+<td>Pre-injected into the model context; deduplicated by digest change</td>
+</tr>
+</tbody></table>
+<p>Any dsh plugin can read and write experience through this protocol (write state files, append history, publish events, inject messages); this package is the protocol's <strong>reference implementation and primary consumer</strong> (planning / refinement / projection / automatic gate). If the experience read/write layer is ever extracted into a standalone reusable protocol package, <code>dsh-esp</code> can be split out along these lines, with the harness degrading to a consumer of ESP.</p>
+<h3>Events and message sources</h3>
+<ul>
+<li>Session event <code>harness/refinement</code> (RefinementResult) — written to the session log on every apply/rollback (model-visible ⟺ logged).</li>
+<li>Agent-scoped event <code>harness/refined</code> (payload <code>{agent, result}</code>) — subscribable by invariant and other plugins.</li>
+<li>Pre-injected message <code>source.kind === 'harness-state'</code>, carrying a <code>digest</code> for deduplication.</li>
+</ul>
+<h2>Mounting (dsh profile)</h2>
+<p>Install into a profile in one line (published to npm):</p>
+<pre><code>dsh plugin --profile &lt;name&gt; add dsh-continual-harness
+</code></pre>
+<p>The package declares <code>dsh.bundle</code>, so <code>dsh plugin</code> installs it as a profile
+layer: the dependency is added and its <code>cordis.patch.yml</code> is applied as that
+bundle's patch. The plugin's runtime imports of <code>@deepseek-ai/*</code> resolve
+through the profile's flat fallback <code>node_modules</code> directory. Update with
+<code>dsh plugin --profile &lt;name&gt; update dsh-continual-harness@latest</code>.</p>
+<p>Manual overlay (before publish, or to pin a local checkout): apply
+<a href="https://github.com/jasen215/dsh-continual-harness/blob/HEAD/cordis.patch.yml">cordis.patch.yml</a> onto the profile, e.g.
+<code>~/.dsh/profiles/&lt;name&gt;/cordis.patch.yml</code>; a patch layer must be a
+<strong>top-level YAML array</strong> (<code>insert</code> rows append plugin entries; id-targeted rows override an existing row):</p>
+<pre><code>- insert:
+    - id: continual-harness
+      name: dsh-continual-harness
+      config:
+        defaultGlobal: true
+</code></pre>
+<p>Prerequisites: the <code>tools</code>, <code>agents</code>, <code>session</code>, <code>llm</code>, <code>systemPrompt</code> capability plugins must load before this plugin (its <code>inject</code> declaration enforces that; mounting is deferred until they load).</p>
+<h2>Config</h2>
+<table>
+<thead>
+<tr>
+<th>Field</th>
+<th>Default</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>harnessRoot</code></td>
+<td>dsh data dir <code>harness/</code></td>
+<td>State root directory (temporary dir in tests)</td>
+</tr>
+<tr>
+<td><code>skillsDir</code></td>
+<td><code>$DSH_HOME/skills</code></td>
+<td>Directory where skill entries materialize as dsh SKILL.md bundles (dsh's user skill root)</td>
+</tr>
+<tr>
+<td><code>defaultGlobal</code></td>
+<td>required</td>
+<td>Target scope when the tool call omits <code>global</code></td>
+</tr>
+<tr>
+<td><code>maxTrajectoryChars</code></td>
+<td>80000</td>
+<td>Max characters of the review trajectory (tail-biased truncation)</td>
+</tr>
+<tr>
+<td><code>plannerMaxTokens</code></td>
+<td>32000</td>
+<td>Max tokens for the planner LLM call</td>
+</tr>
+<tr>
+<td><code>autoRefine</code></td>
+<td><code>{turnInterval: 25, compact: true, cooldownMs: 1200000}</code></td>
+<td>Auto-refine: turn-interval gate, compaction-end gate, cooldown, disable switch</td>
+</tr>
+</tbody></table>
+<h2>Development</h2>
+<p>The plugin is self-contained: <code>devDependencies</code> pin the published
+<code>@deepseek-ai/*</code> packages (rc versions), so <code>pnpm install</code>, <code>pnpm run typecheck</code>, <code>pnpm test</code> (47 cases), and <code>pnpm run build</code> (tsc emits
+<code>lib/types/*.js + *.d.ts</code>; the <code>"."</code> and <code>"./invariant"</code> exports point at the
+artifacts) all work in a clean checkout — CI and the OIDC release workflow
+run the same steps. <code>peerDependencies</code> declare the semver ranges consumers
+(host dsh installations) must satisfy.</p>
+<h2>Known Limitations and Deferred Work</h2>
+<ul>
+<li>No end-to-end tests with a real LLM: <code>completeViaAgent</code> depends on the loaded <code>llm</code> capability and provider/model configuration; tests cover the planning/review paths with a stub <code>Complete</code>. Real e2e requires <code>DEEPSEEK_API_KEY</code>.</li>
+<li><code>compaction/end</code> is not part of the plugin's type union; the driver triggers it via string comparison after type narrowing, and the gate is silently skipped when the compaction capability is not loaded.</li>
+<li>Projection dedup is an in-process <code>WeakMap&lt;Agent, digest&gt;</code>: the first step after a session restart re-injects (stateless and idempotent, but one extra injection).</li>
+<li>Concurrent writes are last-writer-wins: multiple processes refining the same directory concurrently may overwrite each other; baseline conflict detection during planning can only catch read-after-write races, not serialize them.</li>
+<li>A failed automatic refinement degrades silently (only logged) and never interrupts the session.</li>
+</ul>

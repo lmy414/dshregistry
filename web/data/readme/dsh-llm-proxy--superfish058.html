@@ -1,0 +1,121 @@
+<h1>@superfish058/dsh-llm-proxy</h1>
+<p>Model-level proxy routing <strong>+ retry</strong> for DSH LLM requests, with a Web settings page (模型代理) in the DSH 设置 UI.</p>
+<h2>Problem</h2>
+<ul>
+<li>DSH's LLM adapter (<code>pi-ai</code> → OpenAI SDK → undici fetch) exposes <strong>no per-provider proxy knob</strong>.</li>
+<li><code>NODE_USE_ENV_PROXY</code> is only honored at <strong>process start</strong> — a plugin cannot set it at runtime.</li>
+<li>Result: overseas model endpoints (e.g. <code>api.b.ai</code>) time out from a mainland network.</li>
+<li>Bonus problem: free-tier quotas get exhausted by transient 429s and 5xx — there is no built-in throttle, but a retry policy keeps requests alive through rate-limit windows.</li>
+</ul>
+<h2>Solution</h2>
+<p>On apply, the plugin installs a <strong>custom undici <code>RoutingDispatcher</code></strong> (wrapped in undici's official <code>RetryAgent</code>) as the <em>global dispatcher</em>. Every LLM request is routed by <strong>target hostname</strong>:</p>
+<ol>
+<li>Loopback hosts (<code>localhost</code>, <code>127.0.0.1</code>, <code>::1</code>) → <strong>direct</strong> (always).</li>
+<li>Hosts whose models are selected in <strong>走代理的模型</strong> → the configured <strong>proxy</strong> (<code>proxyHost:proxyPort</code>).</li>
+<li>Everything else → <strong>direct</strong> (domestic APIs: DeepSeek, Xiaomi, Qwen, Zhipu, …).</li>
+</ol>
+<p>The default is DIRECT — the model is the unit of intent: pick the models that need the proxy, everything else stays on the direct path.</p>
+<p><strong>Retry</strong> (<code>retries</code> / <code>retryIntervalMs</code>, default 3 / 1000ms): the undici <code>RetryAgent</code> replays the request on transport errors (ECONNRESET, ECONNREFUSED, …), HTTP 429 and 5xx (500/502/503/504). LLM calls are POST, so the method list is overridden to include POST.</p>
+<p>Because each provider has a distinct baseURL host, this gives per-provider routing with a single mechanism — below the LLM adapter. <code>ctx.llm</code> providers and <code>settings.yaml</code> stay untouched, and <strong>no process restart is needed</strong>: the dispatcher swap is live from the first request.</p>
+<blockquote>
+<p><strong>Connection-pool pitfall (undici 8.x, fixed in v1.0.0)</strong>: the <code>ProxyAgent</code>'s
+internal proxy-side pool defaults to keep-alive. When the proxy (e.g.
+Clash) silently closes an idle CONNECT tunnel, undici keeps reusing the
+dead socket and the request hangs until timeout — surfaced as
+<code>Request timed out</code> / <code>HeadersTimeoutError</code>, intermittently (reproduced:
+2/10 requests fail with 2.5s idle gaps while a raw tunnel succeeds 10/10).
+The dispatcher now constructs the proxy agent with
+<code>clientFactory + pipelining: 0</code> so every tunnel is a fresh connection
+(verified 10/10 on the full RetryAgent(RoutingDispatcher) path).</p>
+</blockquote>
+<h2>Web settings page（模型代理）</h2>
+<p>The DSH 设置 page shows a <strong>模型代理</strong> plugin card inside <strong>插件 → 可配置插件</strong> (the official <code>settings.plugin.item</code> slot, declared by <code>@deepseek-ai/dsh-client-ui-settings-plugins</code>). Opening the card reveals the configurable items:</p>
+<ul>
+<li><strong>代理地址 / 代理端口</strong> (<code>proxyHost</code> / <code>proxyPort</code>, default <code>127.0.0.1:7897</code>) — the proxy does not have to live on this machine.</li>
+<li><strong>走代理的模型</strong> (<code>proxiedModels</code>) — a dropdown populated from the configured model list (llm-pi-ai + llm-deepseek namespaces via a host bridge); add multiple models, each routes its baseURL host through the proxy.</li>
+<li><strong>重试次数 / 重试间隔</strong> (<code>retries</code> / <code>retryIntervalMs</code>) — retry policy for failed requests.</li>
+</ul>
+<p>Saving writes the settings namespace <code>llm-proxy</code> and <strong>re-applies the dispatcher live</strong> (no restart).</p>
+<ul>
+<li>Host half (<code>lib/settings.js</code>): registers the <code>llm-proxy</code> settings namespace (same <code>Config</code> schema; the cordis.patch.yml config is the composition <code>base</code>) and watches it for committed changes. Because rc.6 host-apiproxy only exposes a hard-coded namespace allowlist, the namespace is also re-served to the browser over a <strong>loopback-only bridge</strong> (<code>/api/dsh-llm-proxy/settings/{describe,mutate,models}</code>) — the same pattern the official dsh-web-ui settings plugin uses.</li>
+<li>Browser half (<code>src/client/</code>): registers the <code>settings.plugin.item</code> card and binds a compat settings scope (official transport first, bridge fallback), so the card works on any host. The card draws its own form; the section stacks cards and reports their count.</li>
+<li>When no settings seam exists (tests, bare config), the plugin falls back to applying the patch config directly.</li>
+</ul>
+<blockquote>
+<p><strong>Bridge status (rc.6 temporary)</strong>: the settings bridge is a *temporary rc.6 compatibility
+seam — <code>settings.register()</code>/namespace exposure is not yet public on the host side
+(<code>api-proxy</code> serves a hard-coded allowlist), so the <code>llm-proxy</code> namespace is re-served
+loopback-only. Once the official host exposes <code>settings.register()</code> for third-party
+namespaces, the bridge routes (<code>lib/settings.js</code>) and the bridge fallback half of
+<code>src/client/settings-scope.ts</code> can be removed; the card itself stays, riding the
+official transport only.</p>
+</blockquote>
+<p>Rebuild the browser half after editing <code>src/client/</code>:</p>
+<pre><code>npm run build        # tsdown → lib/client.js (window.__ModuleLoader__ closure)
+npm run typecheck    # tsc --noEmit
+</code></pre>
+<p>Then restart <code>dsh web</code> (tray exit → start) to load the new host half and re-serve the client bundle.</p>
+<h2>Install</h2>
+<pre><code># GitHub (source, builds on install — grant the allowBuilds prompt once)
+dsh plugin --profile web add github:superfish058/dsh-llm-proxy
+
+# or from a local checkout
+dsh plugin --profile web add C:/path/to/dsh-llm-proxy
+</code></pre>
+<p>Git-hosted installs run the package's <code>prepare</code> script (tsdown); pnpm ≥10 asks you to authorize builds once — copy the printed key into the profile's <code>pnpm-workspace.yaml</code> and re-run <code>add</code>. To skip the build allowance entirely, use a tarball instead:</p>
+<pre><code>pnpm pack        # → dsh-llm-proxy-1.0.0.tgz
+dsh plugin --profile web add ./dsh-llm-proxy-1.0.0.tgz
+</code></pre>
+<p>Then restart <code>dsh web</code> (tray exit → start). No other change needed.</p>
+<h2>Config</h2>
+<table>
+<thead>
+<tr>
+<th>Field</th>
+<th>Default</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>proxyHost</code></td>
+<td><code>127.0.0.1</code></td>
+<td>Proxy hostname/IP; does not have to be this machine.</td>
+</tr>
+<tr>
+<td><code>proxyPort</code></td>
+<td><code>7897</code></td>
+<td>Proxy port (1–65535).</td>
+</tr>
+<tr>
+<td><code>proxiedModels</code></td>
+<td><code>[]</code></td>
+<td>Model keys that route through the proxy, <code>&lt;providerId&gt;/&lt;modelId&gt;</code> (resolved against the llm-pi-ai / llm-deepseek model list); everything else stays direct.</td>
+</tr>
+<tr>
+<td><code>retries</code></td>
+<td><code>3</code></td>
+<td>Max retry attempts on failure (transport error / 429 / 5xx), 0–10.</td>
+</tr>
+<tr>
+<td><code>retryIntervalMs</code></td>
+<td><code>1000</code></td>
+<td>Delay between retry attempts, ms (0–60000).</td>
+</tr>
+</tbody></table>
+<blockquote>
+<p>The plugin shipped its model-level design as v1.0.0 (previous internal iterations
+used <code>proxyUrl</code>/<code>routes</code>/<code>rateLimits</code>; if you carried a user layer from those,
+delete the old <code>llm-proxy:</code> section from <code>settings.yaml</code> and configure the new fields).</p>
+</blockquote>
+<h2>Verify</h2>
+<p>After restart, <code>dsh web</code> logs show:</p>
+<pre><code>dsh-llm-proxy: global dispatcher → RetryAgent(RoutingDispatcher) (proxy=127.0.0.1:7897, proxiedHosts=[api.b.ai], retries=3×1000ms)
+</code></pre>
+<p>Then select the b.ai model in the model picker — streaming should work, and only its host (<code>api.b.ai</code>) goes through the proxy.</p>
+<h2>Test</h2>
+<pre><code>npm test            # unit tests (routing + RetryAgent retry, no network)
+npm run test:client # client-bundle build check (run npm run build first)
+npm run test:smoke  # end-to-end against real undici + local servers (routing + 503 retry)
+npm run test:global # proves the dispatcher also intercepts Node's GLOBAL fetch
+npm run test:load   # plugin entry load with a fake cordis ctx
+</code></pre>

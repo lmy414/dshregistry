@@ -1,0 +1,234 @@
+<h1>dsh-recap</h1>
+<p><a href="https://github.com/deepseek-ai/DeepSeek-Harness">DeepSeek Harness</a>（DSH）的会话回顾总结插件：把<strong>每一次模型请求（turn:step）新增的数据</strong>总结成一句话，按时间顺序追加成一条「回顾链」——一眼看清这个会话做了什么，而不必重放整个对话。</p>
+<p>技术路线要点：</p>
+<ul>
+<li><strong>缓存友好的增量生成</strong>。第 k 次总结请求 = 固定 system + 已有句子 1..k-1（逐字作为前缀）+ 本次新增数据 Δk。provider 前缀缓存的分叉点就在最新一句之后——<strong>除 Δk 外的输入几乎全额缓存命中</strong>，且历史以句子形态回灌（斜率 ~40 tok/步，而非原文 ~640 tok/步），长会话不会撑爆上下文。</li>
+<li><strong>对 agent loop 零侵入</strong>。捕获是 <code>session/event</code> 的只读监听；生成是与主循环并行的辅助 <code>ctx.llm.stream</code> 调用（<code>purpose: 'recap'</code>，可被任何观察者过滤）；<strong>不向会话日志写入任何事件、不注入消息</strong>——持久化走插件自有文件（<code>~/.dsh/recap/sessions/&lt;sessionId&gt;.jsonl</code>）。</li>
+<li><strong>无思考生成</strong>。总结调用默认 <code>reasoningEffort: 'off'</code>（DeepSeek 适配器映射为 <code>thinking: disabled</code>）；不支持 <code>off</code> 的路由自动降级 <code>low</code> 并按路由记忆。</li>
+<li><strong>模型路由用户可指定</strong>。设置页的 <code>recap</code> 分区（或侧边栏下拉）可单独指定 provider+model——总结不需要强模型，指个便宜的即可；未指定时跟随会话当前路由，再退到宿主默认模型。</li>
+</ul>
+<h2>界面</h2>
+<ul>
+<li><strong>对话内联回顾行（独立，不依赖任何其他插件）</strong>：每句总结<strong>穿插在模型正式回复之间</strong>——直接插在产生它的那次模型请求（assistant 消息行）之后，而不是全列在轮末。锚点来自对话引擎给每个聊天行盖的稳定属性（assistant 行 <code>data-chat-anchor-key="14:assistant-step&lt;turn&gt;:&lt;step&gt;"</code>、轮尾 <code>data-turn-tail</code>），MutationObserver 对位注入/回收；某 step 行未渲染（被打断等）时回退到同 turn 更早的 step 行。默认 <code>step-end</code> 触发：请求一结束（~1.5s debounce）即总结，下一轮轮询（2.5s）内出现在原位。页面隐藏时轮询暂停。</li>
+<li><strong>设置页</strong>：客户端在 DSH 设置外壳注册 <code>settings.section</code> 分区（「会话回顾」），渲染启用开关 / 总结间隔 / provider / model / 思考等级，经插件自有的 <code>/recap/api/settings*</code> 路由读写（DSH 的 settings RPC 不向配置客户端放行第三方命名空间），实时生效。provider/model 为级联下拉（<code>/recap/api/providers</code> → <code>ctx.llm.listProviders/listModels</code>，按 provider 缓存；清单加载失败时降级为手动输入）。</li>
+</ul>
+<h2>安装（从源码）</h2>
+<p>前置：DSH 已安装（<code>dsh web</code> 可运行），Node.js ≥ 22.13，pnpm ≥ 10。</p>
+<pre><code># 1. 克隆并构建
+git clone https://github.com/Howardzhangdqs/dsh-recap.git ~/Code/dsh-recap
+cd ~/Code/dsh-recap &amp;&amp; pnpm install &amp;&amp; pnpm build
+
+# 2. 依赖指向本地克隆（~/.dsh/profiles/web/package.json 的 dependencies）
+#    "dsh-recap": "link:/home/you/Code/dsh-recap"
+
+# 3. 追加挂载行（~/.dsh/profiles/web/cordis.patch.yml）
+#    - insert:
+#        - id: recap
+#          name: 'dsh-recap'
+
+# 4. 安装并重启
+cd ~/.dsh/profiles/web &amp;&amp; pnpm install
+</code></pre>
+<p>完成后重启 DSH 并硬刷新（Cmd/Ctrl+Shift+R）。</p>
+<h3>GitHub 通道（<code>dsh plugin</code> 一键安装）</h3>
+<p><code>dsh plugin add</code> 接受任何 pnpm 依赖形式；本插件<strong>不发布 npm</strong>，用 GitHub Release 的预构建 tarball 安装。包内 <code>dsh.bundle</code> 声明（cordis.patch.yml）使 <code>dsh plugin</code> 自动完成挂载；若 profile 已有手动挂载行（上面的源码方式），先删除避免双挂载。</p>
+<p>每个版本随 <a href="https://github.com/Howardzhangdqs/dsh-recap/releases">GitHub Release</a> 附带 <code>pnpm pack</code> 产出的预构建 tarball（含 <code>lib/</code> 产物与 <code>dsh.plugin.json</code>，无 sourcemap），pnpm 对远程 tarball 不执行构建脚本，装的就是附件里的产物：</p>
+<pre><code>dsh plugin --profile web add https://github.com/Howardzhangdqs/dsh-recap/releases/download/v0.1.0/dsh-recap-0.1.0.tgz
+</code></pre>
+<p>升级时改 URL 中的版本号重跑即可。</p>
+<h2>配置</h2>
+<h3>挂载行配置（cordis.yml，部署级）</h3>
+<table>
+<thead>
+<tr>
+<th>键</th>
+<th>默认</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>trigger</code></td>
+<td><code>step-end</code></td>
+<td>触发时机：<code>step-end</code>（每个请求结束即触发，句随请求落位）/ <code>turn-end</code>（turn 结束后 debounce 攒批）/ <code>manual</code>（仅手动）</td>
+</tr>
+<tr>
+<td><code>debounceMs</code></td>
+<td><code>1500</code></td>
+<td>触发防抖窗口</td>
+</tr>
+<tr>
+<td><code>textBlockLimit</code></td>
+<td><code>4096</code></td>
+<td>Δ 内单消息文本截断（字节，UTF-8 安全）</td>
+</tr>
+<tr>
+<td><code>toolResultLimit</code></td>
+<td><code>2048</code></td>
+<td>工具结果截断</td>
+</tr>
+<tr>
+<td><code>toolArgsLimit</code></td>
+<td><code>1024</code></td>
+<td>工具调用参数截断</td>
+</tr>
+<tr>
+<td><code>historyMaxSentences</code></td>
+<td><code>400</code></td>
+<td>提示词携带的最大历史句数（超限折叠最旧）</td>
+</tr>
+<tr>
+<td><code>storeMaxEntries</code></td>
+<td><code>500</code></td>
+<td>每会话落盘条数上限（超限压缩文件）</td>
+</tr>
+<tr>
+<td><code>maxPending</code></td>
+<td><code>200</code></td>
+<td>待总结 Δ 上限（超限合并最旧，背压）</td>
+</tr>
+<tr>
+<td><code>requestTimeoutMs</code></td>
+<td><code>60000</code></td>
+<td>单次总结调用超时</td>
+</tr>
+<tr>
+<td><code>retryBackoffMs</code></td>
+<td><code>30000</code></td>
+<td>限流退避基数：生成遇 <code>RATE_LIMIT</code>（如 zai 的 429/1305「访问量过大」）时，该 Δ <strong>原样回到队首</strong>等待重试——不记失败条目、不占覆盖，链条不留永久空洞。等待<strong>指数加宽</strong>（连续限流 ×2，封顶 32× 基数），等待期间该位置的内联芯片显示「限流等待中，Ns 后重试…」</td>
+</tr>
+<tr>
+<td><code>maxTokens</code></td>
+<td><code>120</code></td>
+<td>单句输出上限</td>
+</tr>
+<tr>
+<td><code>toolsEnabled</code></td>
+<td><code>false</code></td>
+<td>是否注册模型工具（默认关：工具 schema 会进入会话请求）</td>
+</tr>
+<tr>
+<td><code>storeDir</code></td>
+<td><code>~/.dsh/recap/sessions</code></td>
+<td>存储目录覆盖</td>
+</tr>
+</tbody></table>
+<blockquote>
+<p>⚠️ 截断/框架类参数构成缓存前缀的一部分——链条中途修改会重热前缀缓存（一次性代价）。</p>
+</blockquote>
+<h3>用户设置（设置页 <code>recap</code> 分区，实时生效）</h3>
+<table>
+<thead>
+<tr>
+<th>键</th>
+<th>默认</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>enabled</code></td>
+<td><code>true</code></td>
+<td>总开关（false 时暂停生成，Δ 继续积累）</td>
+</tr>
+<tr>
+<td><code>interval</code></td>
+<td><code>1</code></td>
+<td>总结粒度：每 N 个请求的新增数据合并总结成<strong>一句</strong>（1 = 每请求一句）。加宽后每句的坐标为 <code>[T&lt;turn&gt;]</code>（覆盖请求区间）；改小后下一个请求立即恢复细粒度</td>
+</tr>
+<tr>
+<td><code>provider</code> + <code>model</code></td>
+<td>未设置</td>
+<td>总结专用路由（两者须成对设置）；未设置时跟随会话路由 → 宿主默认模型</td>
+</tr>
+<tr>
+<td><code>effort</code></td>
+<td><code>off</code></td>
+<td><code>off</code>（关思考）→ <code>low</code>（低思考）→ <code>follow</code>（跟随适配器默认）三级阶梯：路由拒绝当前档时自动降档并按路由记忆；模型无 effort 词表时最终省略该字段</td>
+</tr>
+</tbody></table>
+<h4>「关闭思考」（off）真正生效的条件</h4>
+<p><code>effort: off</code> 是否显式发送「禁用思考」由<strong>路由的适配器与模型声明</strong>决定，不在本插件：</p>
+<ul>
+<li><strong>DeepSeek 官方路由</strong>：适配器内置映射，<code>off</code> → <code>thinking: {type: "disabled"}</code>，开箱即用。</li>
+<li><strong>pi-ai 路由（zai 等）</strong>：模型的 effort 档位表来自 settings 文档（<code>llm-pi-ai.providers.&lt;route&gt;.models[].reasoningEfforts</code>），且<strong>未声明的档位一律视为不支持</strong>：<ul>
+<li><p>条目完全没写 <code>reasoningEfforts</code>、又不在 pi-ai 内置目录里的模型，会被当成<strong>非思考模型</strong>——请求里连 <code>thinking</code> 字段都不写（是否思考取决于服务端默认）；</p>
+</li>
+<li><p>要显式关闭，需在模型条目里声明 <code>off</code> 档，YAML <strong>空值</strong>写法（<code>off:</code> 留 null）表示「支持关闭：发送时省略参数」，zai 格式会序列化为 <code>thinking: {type: "disabled"}</code>；注意只声明 <code>off</code> 一个档会被校验拒绝，须同时声明至少一个思考档：</p>
+<pre><code>reasoningEfforts:
+  off:        # null = 支持关闭：发送时省略参数（zai 格式 → thinking: {type: disabled}）
+  low: low
+  high: high
+</code></pre>
+</li>
+<li><p>路由不支持 <code>off</code> 时（档位表未声明），本插件的降档阶梯会<strong>静默</strong>退到 <code>low</code> 或省略字段——「关闭」名不副实但不会报错，排查时先看该模型的 <code>reasoningEfforts</code> 声明。</p>
+</li>
+</ul>
+</li>
+</ul>
+<h2>模型工具（默认关闭）</h2>
+<p>开启 <code>toolsEnabled</code> 后注册两个工具（按调用 agent 的会话绑定作用域）：</p>
+<ul>
+<li><code>recap_read(limit?)</code> — 读取回顾链（新句在前）</li>
+<li><code>recap_refresh()</code> — 立即排空待总结队列</li>
+</ul>
+<h2>HTTP API</h2>
+<p><code>POST /recap/api/&lt;method&gt;</code>（JSON body；与 <code>/api</code> 相同的浏览器信任围栏）：</p>
+<table>
+<thead>
+<tr>
+<th>方法</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>list</code></td>
+<td><code>{sessionId, limit?}</code> → 条目（新在前）+ 汇总（句数/缓存命中率/用量）+ 队列状态</td>
+</tr>
+<tr>
+<td><code>generate</code></td>
+<td><code>{sessionId}</code> 手动排空</td>
+</tr>
+<tr>
+<td><code>stats</code></td>
+<td><code>{sessionId}</code> 队列/存储/设置快照</td>
+</tr>
+<tr>
+<td><code>clear</code></td>
+<td><code>{sessionId}</code> 清空回顾链</td>
+</tr>
+<tr>
+<td><code>settings</code> / <code>settings.update</code></td>
+<td>读写用户设置（带 revision 守卫）</td>
+</tr>
+<tr>
+<td><code>providers</code></td>
+<td>列出 provider（或某 provider 的模型）供选择器使用</td>
+</tr>
+</tbody></table>
+<h2>架构</h2>
+<pre><code>session/event ──▶ capture（seed 回放 + live 镜像，按消息 id 幂等去重）
+                      │ 每 step 的 Δ（新增数据，确定性截断+JSON 框架）
+                      ▼
+                 queue（每会话串行、跨会话并行、背压合并、失败韧性）
+                      │ history = store 句子（逐字节复用为前缀）
+                      ▼
+                 generator（ctx.llm.stream 辅助调用，purpose:'recap'，
+                           reasoningEffort off→low，超时控制）
+                      ▼
+                 store（~/.dsh/recap/sessions/&lt;sid&gt;.jsonl，追加写+压缩）
+</code></pre>
+<p>单包双半结构（host + client），完全遵循 <a href="https://github.com/Howardzhangdqs/dsh-dashboard">dsh-dashboard</a> 的工程组织：<code>src/</code> 为 host 半（捕获/队列/生成/存储/路由/工具），<code>src/client/</code> 为浏览器半（dashboard tab + i18n）；<code>tsdown</code> 产出双通道 client bundle（profile 名 <code>dsh-recap</code> 与注册表 id <code>dsh-external/dsh-recap</code>）。</p>
+<h2>缓存命中账（为什么这样设计）</h2>
+<p>第 k 次调用的输入 = <code>system(固定) + 句子行 1..k-1 + Δk + 框架尾</code>。相邻调用共享 <code>system + 句子行 1..k-1</code> 逐字节前缀 → 除 Δk（本来就必须喂的新数据）与一行新句外，<strong>全部命中缓存</strong>。对比两种替代方案：</p>
+<ul>
+<li>全链多轮（历史 Δ 原文重放）：input 随步数线性爆炸（~640 tok/步），长会话超窗；</li>
+<li>Δ 前置：每次调用在开头即分叉，前缀缓存几乎全灭。</li>
+</ul>
+<p>设计细节见 <a href="https://github.com/Howardzhangdqs/dsh-recap/blob/HEAD/docs/plans/2026-08-15-dsh-recap-design.md">docs/plans/2026-08-15-dsh-recap-design.md</a>。</p>
+<h2>开发</h2>
+<pre><code>pnpm install
+pnpm typecheck   # tsc --noEmit
+pnpm test        # vitest（capture/store/generator/queue 四接缝单测）
+pnpm build       # tsc 声明 + tsdown bundle
+</code></pre>
+<h2>License</h2>
+<p>MIT</p>

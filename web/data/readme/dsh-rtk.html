@@ -1,0 +1,118 @@
+<h1>dsh-rtk — RTK (Rust Token Killer) 原生 DSH 插件</h1>
+<p>把本机 <a href="https://github.com/rtk-ai/rtk">RTK</a>（Rust Token Killer）以 DSH 原生插件
+方式接入 DeepSeek Harness：模型通过 <code>pwsh</code> 工具执行的命令会被<strong>自动改写</strong>为
+RTK 过滤版本（<code>git status</code> → <code>rtk git status</code>），压缩后的输出再返回给模型，
+与 Claude Code / Codex 的 PreToolUse 钩子等价，<strong>模型无需显式写 <code>rtk</code> 命令</strong>。</p>
+<h2>原理</h2>
+<ul>
+<li>拦截点：DSH 官方 <code>tools/execute</code> around-dispatch waterfall。该瀑布允许监听器
+不调用 <code>next()</code> 而自行执行并返回结果（<code>tools/pre-execute</code> 刻意禁止改写参数，
+因此这里是受支持的钩子位）。</li>
+<li>判定：<code>rtk rewrite &lt;command&gt;</code> 退出码 0/3 且输出非空 → 有 RTK 等价命令；
+1（passthrough）或 2（deny）→ 原样执行，交还 DSH 自身的权限流程。</li>
+<li>执行：插件只调用 <code>rtk rewrite</code> 获取改写文本；随后将改写后的命令作为嵌套的
+原生 <code>pwsh</code> 分发交回 DSH。cwd、sandbox、审批、超时、取消与终端卡片渲染均由
+pwsh 工具自身负责。</li>
+<li>安全边界：<code>run_in_background</code> 调用、带 <code>sandbox_permissions</code> 的调用、命中
+<code>excludeCommands</code> 前缀的命令一律原样放行；RTK 二进制缺失/崩溃时回退原始命令。</li>
+</ul>
+<h2>上游项目署名</h2>
+<p><code>dsh-rtk</code> 是独立的 DSH 集成层，不包含、复制或再分发 RTK 的源码或二进制；它仅调用
+用户本机已安装的 <code>rtk</code> CLI。RTK（Rust Token Killer）上游项目由
+<a href="https://github.com/rtk-ai/rtk">rtk-ai/rtk</a> 提供，并采用
+<a href="https://www.apache.org/licenses/LICENSE-2.0">Apache-2.0</a> 许可证。</p>
+<h2>安装</h2>
+<p>插件未发布到 npm。开发时可使用本地 <code>link:</code> 依赖；公开 GitHub 安装会从源码
+执行本包的 <code>prepare</code> 构建脚本，因此只应安装可信、固定 commit 的版本。</p>
+<pre><code># 1. 在插件目录构建
+cd D:\AI\DeepSeek\plugins-split\dsh-rtk
+pnpm install &amp;&amp; pnpm build
+
+# 2. 挂载到目标 profile（以 devtools-test 为例）
+#    在 &lt;profile&gt;/package.json 的 dependencies 添加：
+#      "dsh-rtk": "link:D:/AI/DeepSeek/plugins-split/dsh-rtk"
+#    在 &lt;profile&gt;/package.json 的 dsh.profile.bundles 添加 "dsh-rtk"
+#    在 &lt;profile&gt;/cordis.patch.yml 添加：
+#      - id: rtk
+#        name: dsh-rtk
+#        config:
+#          enabled: true
+#          announceToAgent: true
+</code></pre>
+<p>挂载后<strong>重启 <code>dsh web</code></strong>：模型后续的 pwsh 命令自动被 RTK 压缩。</p>
+<h3>从 GitHub 安装</h3>
+<pre><code># 使用发布后的不可变 commit；首次安装会提示 pnpm 允许执行 prepare。
+dsh plugin --profile demo add github:dd2673/dsh-rtk#&lt;commit-sha&gt;
+
+# 在 $DSH_HOME/profiles/demo/pnpm-workspace.yaml 中复制 pnpm 报错里打印的精确键，再重试 add。
+allowBuilds:
+  "dsh-rtk@https://codeload.github.com/dd2673/dsh-rtk/tar.gz/&lt;commit-sha&gt;": true
+</code></pre>
+<p>随后用 <code>dsh --profile demo --dump-config</code> 确认存在 <code>dsh-rtk</code> bundle 层，再启动或
+重启该 profile。<code>allowBuilds</code> 允许安装时在本机执行本包源码，务必固定 commit 并先审查源码。</p>
+<h2>配置</h2>
+<table>
+<thead>
+<tr>
+<th>键</th>
+<th>类型</th>
+<th>默认</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>enabled</code></td>
+<td>boolean</td>
+<td><code>true</code></td>
+<td>插件总开关</td>
+</tr>
+<tr>
+<td><code>announceToAgent</code></td>
+<td>boolean</td>
+<td><code>true</code></td>
+<td>是否向 Agent 宣告插件</td>
+</tr>
+<tr>
+<td><code>rtkBin</code></td>
+<td>string</td>
+<td><code>rtk</code></td>
+<td>RTK 二进制路径（可用绝对路径）</td>
+</tr>
+<tr>
+<td><code>askMode</code></td>
+<td><code>'rewrite' | 'passthrough'</code></td>
+<td><code>rewrite</code></td>
+<td><code>rtk rewrite</code> 退出码 3（ask）时的处理</td>
+</tr>
+<tr>
+<td><code>excludeCommands</code></td>
+<td>string[]</td>
+<td><code>[]</code></td>
+<td>前缀匹配、永不重写的命令</td>
+</tr>
+<tr>
+<td><code>interceptedTools</code></td>
+<td>string[]</td>
+<td><code>['pwsh']</code></td>
+<td>被拦截改写的工具名</td>
+</tr>
+<tr>
+<td><code>defaultTimeoutMs</code></td>
+<td>number</td>
+<td><code>120000</code></td>
+<td>模型未指定 timeoutMs 时的超时</td>
+</tr>
+</tbody></table>
+<h2>开发</h2>
+<pre><code>pnpm install --filter dsh-rtk...
+pnpm --filter dsh-rtk test
+pnpm --filter dsh-rtk build
+</code></pre>
+<h2>已知限制</h2>
+<ul>
+<li>带 <code>sandbox_permissions</code> 的调用、后台调用及排除前缀的命令保持原样，不会改写。</li>
+<li><code>tools/execute</code> 钩子作用于顶层工具调用；插件自身发起的嵌套 pwsh 分发不会再次
+改写，因此不会递归。<code>run_code</code> 等其他嵌套子调度不重写。</li>
+<li>会话日志记录原始工具参数（hook 语义与 Claude Code 一致，输出为压缩版）。</li>
+<li>RTK 只覆盖其内置命令族；不支持的命令原样执行。</li>
+</ul>

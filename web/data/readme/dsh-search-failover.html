@@ -1,0 +1,233 @@
+<h1>dsh-search-failover</h1>
+<p>DSH 的 <strong>provider 级搜索池</strong>: 原生 <code>web_search</code> 工具不变, 内部自动在多个
+免费/付费搜索后端间 failover / rotate, 带<strong>额度感知熔断</strong>。</p>
+<blockquote>
+<p>状态: v0.2 (8 个后端适配器) · 设计文档见 dsh-config/docs/search-failover-design.md</p>
+</blockquote>
+<h2>为什么</h2>
+<ul>
+<li><code>dsh-search-mcp</code> 能配多个服务器但没有自动 failover</li>
+<li><code>dsh-web-search-pro</code> 有自动回退但是重依赖的工具套件, 不是 provider 级</li>
+<li>本插件: 轻量(纯 HTTP) + provider 级(保留原生工具) + 额度感知熔断</li>
+</ul>
+<h2>架构</h2>
+<pre><code>web_search (原生工具)
+  └── ctx.web → searchProvider: "search-pool"
+        └── SearchPoolProvider.search(query)
+              ├─ failover: 按 priority 依次尝试, 首个成功返回
+              ├─ rotate:   健康后端轮询 (分散免费额度)
+              ├─ 熔断: QUOTA→长冷却(1h) / TRANSIENT→阈值3次/5min→短冷却(60s)
+              └─ 冷却到期半开探活, 成功即恢复
+</code></pre>
+<h2>开发安装 (link:)</h2>
+<pre><code># 1. 装进 web profile (link: 改代码即时生效)
+#    package.json 声明 dsh.bundle.patch → 自动加入 profile bundle 层
+dsh plugin --profile web add link:/Users/walve/Documents/Codex/dsh-search-failover
+
+# 2. 用户 patch (cordis.patch.yml) 提供后端链配置:
+#    - id: web  → searchProvider: search-pool
+#    - id: search-pool → config.backends (见下)
+#    (bundle 只插入行; key 经 apiKeyEnv 从 ~/.dsh/.env 读取)
+
+# 3. 验证组合树 (无需重启): dsh --profile web --dump-config | grep -A30 "id: search-pool"
+
+# 4. 重启 dsh web 生效
+</code></pre>
+<h2>后端适配器 (免费额度, 2026-08 核实)</h2>
+<table>
+<thead>
+<tr>
+<th>kind</th>
+<th>后端</th>
+<th>免费额度</th>
+<th>key</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>exa</code></td>
+<td>Exa</td>
+<td>注册 $20 + $10/月; 教育 $1000</td>
+<td>必须</td>
+<td><code>apiKeyEnv: EXA_API_KEY</code> ✅ 实测可用</td>
+</tr>
+<tr>
+<td><code>tavily</code></td>
+<td>Tavily</td>
+<td>1000 积分/月</td>
+<td>可选</td>
+<td>无 key 自动走 keyless 匿名档 ✅ 实测可用</td>
+</tr>
+<tr>
+<td><code>serper</code></td>
+<td>Serper.dev</td>
+<td>2500 次一次性</td>
+<td>必须</td>
+<td>Google SERP</td>
+</tr>
+<tr>
+<td><code>serpapi</code></td>
+<td>SerpApi</td>
+<td>250 次/月</td>
+<td>必须</td>
+<td>Google SERP</td>
+</tr>
+<tr>
+<td><code>brave</code></td>
+<td>Brave</td>
+<td>⚠️ 免费档已撤 (2026-08 实测注册需订阅)</td>
+<td>必须</td>
+<td>不推荐</td>
+</tr>
+<tr>
+<td><code>jina</code></td>
+<td>Jina s.jina.ai</td>
+<td>免费注册得 key</td>
+<td>必须</td>
+<td>⚠️ 实测 2026-08 无 key 已 401, markdown 解析</td>
+</tr>
+<tr>
+<td><code>ddg</code></td>
+<td>DuckDuckGo</td>
+<td>完全免费</td>
+<td>无</td>
+<td>⚠️ 实测 2026-08 被反爬拦截 (202 anomaly), 视网络/IP 而定</td>
+</tr>
+<tr>
+<td><code>searxng</code></td>
+<td>SearXNG 自托管</td>
+<td>完全免费</td>
+<td>无</td>
+<td><code>baseURL</code> 或 env <code>SEARXNG_BASE_URL</code>; 实例需开 <code>format: json</code></td>
+</tr>
+</tbody></table>
+<p>每个后端通用字段: <code>id</code>(熔断/日志标识)、<code>kind</code>、<code>priority</code>(failover 顺序, 小者优先)、
+<code>apiKey</code> / <code>apiKeyEnv</code>(从环境读 key)、<code>baseURL</code>(searxng 用)。</p>
+<h2>配置 (cordis.patch.yml)</h2>
+<pre><code>- id: search-pool
+  name: dsh-search-failover
+  config:
+    strategy: failover          # failover | rotate
+    maxResults: 8
+    timeoutMs: 15000
+    backends:
+      - id: exa                 # 主力 (需 key)
+        kind: exa
+        apiKeyEnv: EXA_API_KEY
+        priority: 1
+      - id: serper              # 2500 次试用 (需 key)
+        kind: serper
+        apiKeyEnv: SERPER_API_KEY
+        priority: 2
+      - id: tavily-anon         # 无 key → Tavily keyless 匿名档
+        kind: tavily
+        priority: 3
+      - id: jina                # 免费注册 key 后可用
+        kind: jina
+        apiKeyEnv: JINA_API_KEY
+        priority: 4
+      - id: ddg                 # DuckDuckGo HTML, 完全免费 (可能被反爬拦截)
+        kind: ddg
+        priority: 5
+      - id: serpapi             # 250 次/月 (需 key)
+        kind: serpapi
+        apiKeyEnv: SERPAPI_API_KEY
+        priority: 6
+      - id: brave               # 2000 次/月 (需 key)
+        kind: brave
+        apiKeyEnv: BRAVE_API_KEY
+        priority: 7
+      - id: searxng             # 自托管 (可选)
+        kind: searxng
+        baseURL: http://localhost:8080
+        priority: 8
+    circuit:
+      threshold: 3
+      burstWindowMs: 300000
+      cooldownMs: 60000
+      quotaCooldownMs: 3600000
+</code></pre>
+<h2>设置页 (v0.3+)</h2>
+<p>GUI 内管理所有后端的 API Key: <strong>设置 → 搜索池</strong>, 每个后端一行,
+填 key 点保存即写入 <code>settings.yaml</code> user 层并<strong>立即生效 (无需重启)</strong> —
+provider 每次搜索实时读取配置。页面还实时显示每个后端的熔断/冷却状态
+(正常 / 冷却中 / 额度冷却 + 倒计时), 以及 key 是否已配置。</p>
+<ul>
+<li>保存路径: <code>POST /search-pool/keys</code> (same-origin 校验) → <code>settings.update</code></li>
+<li>恢复默认: <code>POST /search-pool/reset</code> → <code>settings.replace({})</code>, 回退到行内配置</li>
+<li>状态查询: <code>GET /search-pool/state</code> (no-store)</li>
+<li>优先级: 设置页保存的 <code>apiKey</code> &gt; 行内 <code>apiKey</code> &gt; <code>apiKeyEnv</code> 环境变量</li>
+<li><strong>自定义后端</strong>: 「添加后端」可选择任意已支持类型（含自托管 SearXNG），保存即热生效；
+所有后端都可一键删除（内置项删除后可用「恢复默认配置」找回）。</li>
+<li><strong>策略切换</strong>: 「使用方式」一键切换 failover(按优先级) / rotate(轮询分摊)。<ul>
+<li>failover 顺序 = 列表顺序：每行 ↑↓ 按钮直接排序。</li>
+<li>rotate 可设每后端权重 1-10（默认 1），搜索按权重分配。</li>
+</ul>
+</li>
+<li><strong>额度查询</strong>: 每个后端行内实时显示剩余额度（SerpApi 支持，其余无公开接口则标注）。</li>
+<li><strong>测试连接</strong>: 每行 ▶ 按钮对该后端发一次真实轻量搜索 (1 条), 显示可用性与耗时。</li>
+<li>密钥只存在本机 <code>~/.dsh/settings.yaml</code>, 绝不进 git / 不上报</li>
+</ul>
+<h2>测试</h2>
+<pre><code>npm test     # node:test, 纯逻辑无网络
+</code></pre>
+<h2>路线</h2>
+<ul>
+<li>v0.1: failover + exa/tavily/ddg + 熔断 ✅</li>
+<li>v0.2: 适配器扩展 — serper/serpapi/brave/jina/searxng ✅; 故障演练+console 日志 ✅</li>
+<li>v0.3: 设置页 UI (GUI 填 key 热生效) ✅; 发布 npm/GitHub ✅; 收录 awesome-dsh-plugin ✅</li>
+<li>v0.4: multi/RRF 融合 🔜 | rotate 分散额度 🔜</li>
+</ul>
+<h2>真实网络验证 (2026-08-16 实测)</h2>
+<pre><code>EXA_API_KEY=xxx node scripts/smoke.mjs [kind...]   # 逐个真实调用并打印结果
+</code></pre>
+<table>
+<thead>
+<tr>
+<th>kind</th>
+<th>实测结果</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>exa</code> (真实 key)</td>
+<td>✅ 5 条结果 ~2s</td>
+</tr>
+<tr>
+<td><code>tavily</code> (真实 key)</td>
+<td>✅ 5 条结果 ~1.3s</td>
+</tr>
+<tr>
+<td><code>tavily</code> (keyless 匿名)</td>
+<td>✅ 5 条结果 ~2.8s</td>
+</tr>
+<tr>
+<td><code>serper</code> (真实 key)</td>
+<td>✅ 5 条结果 ~2.3s</td>
+</tr>
+<tr>
+<td><code>serpapi</code> (真实 key)</td>
+<td>✅ 6 条结果 ~14s (最慢)</td>
+</tr>
+<tr>
+<td><code>jina</code> (真实 key)</td>
+<td>✅ 6 条结果 ~8.3s</td>
+</tr>
+<tr>
+<td><code>ddg</code></td>
+<td>❌ html/lite 双端点均 202 anomaly (反爬), 浏览器 UA 无效</td>
+</tr>
+<tr>
+<td><code>brave</code></td>
+<td>❌ 免费档已撤, 未注册</td>
+</tr>
+</tbody></table>
+<h2>合规提示</h2>
+<ul>
+<li>DDG 走非官方 HTML 端点, 有 ToS 风险, 实测已被反爬拦截, 仅作兜底</li>
+<li>Tavily keyless / Exa 均为官方免费档, 有限速</li>
+</ul>
+<h2>致谢</h2>
+<ul>
+<li>熔断模式借鉴 <a href="https://github.com/dsh-model-failover">dsh-model-failover</a></li>
+<li>适配器/归一化参考 <a href="https://github.com/gxpppp/dsh-search-mcp">dsh-search-mcp</a> (MIT)</li>
+</ul>

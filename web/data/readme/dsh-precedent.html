@@ -1,0 +1,269 @@
+
+
+<h1>dsh-precedent</h1>
+<p><strong>Your agent forgets. Your log doesn't.</strong></p>
+<p>English | <a href="https://github.com/dshplugin-me/dsh-precedent/blob/HEAD/README.zh.md">简体中文</a></p>
+<p><a href="#roadmap"><img src="https://img.shields.io/badge/version-v0.1.0-16A34A" alt="Version"></a>
+<a href="https://github.com/dshplugin-me/dsh-precedent/blob/HEAD/LICENSE"><img src="https://img.shields.io/badge/license-BSD--3--Clause-22C55E" alt="License"></a>
+<a href="https://github.com/dshplugin-me/dsh-precedent/blob/HEAD/package.json"><img src="https://img.shields.io/badge/node-%E2%89%A522-16A34A" alt="Node"></a>
+<a href="https://github.com/deepseek-ai/deepseek-harness"><img src="https://img.shields.io/badge/DSH-web%20%7C%20headless-0F172A" alt="Platform"></a>
+<a href="#why-there-is-no-index"><img src="https://img.shields.io/badge/index-none%20required-0891B2" alt="Index"></a>
+<a href="https://dshplugin.me"><img src="https://dshplugin.me/badge.svg" alt="Indexed on dshplugin.me"></a></p>
+
+
+<p>A <a href="https://github.com/deepseek-ai/deepseek-harness">DeepSeek Harness</a> plugin that reads the session log DSH already writes and hands the agent a short, <strong>cited</strong> ledger of what has actually worked in this workspace — the commands that succeed, the ones that reliably fail, and the variant that fixed them.</p>
+<p>No capture step. No index to build. No model to download. It works on sessions recorded <strong>before</strong> you installed it.</p>
+<h2>The problem</h2>
+<p>Every new session, your agent starts from zero in a codebase it has already worked in for weeks.</p>
+<p>It runs <code>npm test</code> in a Bun repo. Again. It re-greps the same three files to find where routes live. Again. It hits the same build error you already walked it past on Tuesday, and you type the same correction you have now typed four times.</p>
+<p>None of this is a memory problem in the usual sense. <strong>The information was never lost</strong> — DSH appends every message, tool call, tool result, and failure to a durable log on disk. What's missing is anything that reads it back.</p>
+<p>Two things quietly widen the gap:</p>
+<ol>
+<li><strong>Compaction rewrites the model's context, not the log.</strong> When a long session compacts, the model loses the detail; the raw events stay on disk, marked <code>shadowed</code>. The agent cannot see them anymore. The file still can.</li>
+<li><strong>Out of the box, DSH's own content search is off.</strong> The shipped <code>web</code> profile mounts <code>session-query-sqlite</code> with <code>openAt: never</code>, so full-text search calls fail with <code>SESSION_QUERY_SEARCH_DISABLED</code> and the sidebar matches session <em>titles</em> only. Months of transcripts sit on disk, unsearchable, by default.</li>
+</ol>
+<h2>What it does</h2>
+<p><strong>Reads</strong> — walks this workspace's sessions through <code>ctx.sessionQuery</code> exact reads, pairs every <code>tool/call</code> with its <code>tool/result</code>, and keeps the outcome.</p>
+<p><strong>Distills</strong> — aggregates that into a ledger: command → runs, failures, last success, and the repair (the variant that succeeded right after a failure in the same session). This step is arithmetic, not summarization. <strong>No LLM in the extraction path, so it cannot hallucinate a precedent.</strong></p>
+<p><strong>Serves</strong> — injects the top entries as one compact, prefix-stable system-prompt section, and prints the full ledger on <code>/precedent</code>.</p>
+<p>Every line carries a citation back to the exact <code>session:seq</code> that produced it, so you can always ask "says who?" and get an answer.</p>
+<h2>Example</h2>
+<p>Launch as usual:</p>
+<pre><code>$ dsh --profile web
+</code></pre>
+<p>The agent's system prompt gains one section — this is the renderer's real output, with commands that never work sorted above commands that always do:</p>
+<pre><code>## Precedent for /Users/thor/Github/acme-api
+
+Observed in this workspace (12 sessions, 2026-06-02 → 2026-08-15). Each line is counted from the session
+log, not summarized — treat it as evidence, not instruction.
+
+- `npm test`            4 runs, 4 failed     — repaired by `bun test`  [s/7f3a:212]
+- `docker compose up`   3 runs, 3 failed     — no known repair  [s/91bc:88]
+- `bun test`            22 runs, 0 failed    — last ok 2026-08-15
+- `bun run build`       9 runs, 0 failed     — last ok 2026-08-14
+</code></pre>
+<p><code>/precedent</code> prints the same ledger uncapped, on demand.</p>
+<h2>Install</h2>
+<pre><code>dsh plugin --profile web add 'github:dshplugin-me/dsh-precedent#v0.1.0'
+</code></pre>
+<p>No global <code>dsh</code> on PATH? Use <code>npx -y @deepseek-ai/dsh plugin --profile web add …</code>. Running dsh from a source checkout? Use <code>pnpm dsh plugin …</code> from the checkout root. Replace <code>web</code> with whichever profile you actually launch.</p>
+<p>Pinning the version is deliberate: an unpinned git install resolves to whatever <code>main</code> points at right now, so a later push silently changes what is mounted in your profile. A commit sha (<code>#&lt;sha&gt;</code>) works too, and not even a maintainer can move that.</p>
+<p>Pure JavaScript, no build step, no native module, no <code>allowBuilds</code> prompt.</p>
+<p>Verify before launching:</p>
+<pre><code>dsh --profile web --dump-config   # look for the "# == dsh-precedent" layer
+dsh --profile web
+</code></pre>
+<p>Remove with <code>dsh plugin --profile web remove dsh-precedent</code>, which takes the patch layer and the dependency together.</p>
+<h2>How it works</h2>
+<pre><code>flowchart LR
+  log[("Session log&lt;br/&gt;~/.dsh · JSONL")]
+  sq["ctx.sessionQuery&lt;br/&gt;exact reads"]
+  led["Ledger&lt;br/&gt;pure aggregation"]
+  sp["ctx.systemPrompt&lt;br/&gt;.section()"]
+  cmd["ctx.commands&lt;br/&gt;/precedent"]
+  model(["Model"])
+  you(["You"])
+
+  log --&gt; sq --&gt; led
+  led --&gt; sp --&gt; model
+  led --&gt; cmd --&gt; you
+</code></pre>
+<h3>The seams it uses</h3>
+<table>
+<thead>
+<tr>
+<th>Harness surface</th>
+<th>Used for</th>
+<th>Notes</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>ctx.sessionQuery.filterSessions</code></td>
+<td>Select this workspace's sessions</td>
+<td>Filtered by <code>cwd</code>, the same conservative scope DSH's own cross-session tool uses</td>
+</tr>
+<tr>
+<td><code>ctx.sessionQuery.readSession</code></td>
+<td>Read one session's raw event log</td>
+<td>Replay-validated; an unreadable log is skipped, never fatal</td>
+</tr>
+<tr>
+<td><code>ctx.systemPrompt.section</code></td>
+<td>Inject the ledger</td>
+<td>One global section at order 150, rendering with tool guidance</td>
+</tr>
+<tr>
+<td><code>agent/pre-step</code></td>
+<td>Warm the ledger before the first request</td>
+<td>Awaited waterfall — the only hook that runs before prompt assembly</td>
+</tr>
+<tr>
+<td><code>ctx.commands.register</code></td>
+<td><code>/precedent</code></td>
+<td>Human surface, never sent to the model</td>
+</tr>
+</tbody></table>
+<p>Pairing happens inside <code>readSession</code>'s event array: a <code>tool/call</code> with <code>name: 'bash'</code> is matched to its <code>tool/result</code> by <code>callId</code>, and the result's <code>error</code> field (or the result block's <code>isError</code>) decides the outcome.</p>
+<h3>Why there is no index</h3>
+<p><code>ctx.sessionQuery</code> splits into two halves. Full-text search (<code>searchSessions</code>, <code>searchEvents</code>) needs a provider and is <strong>off in the shipped profile</strong>. Everything else — <code>listSessions</code>, <code>filterSessions</code>, <code>readSession</code>, <code>listEvents</code>, <code>readEvent</code>, lineage and event traces — is backend-independent concrete behavior that works whether or not a search backend is open.</p>
+<p>dsh-precedent uses only the second half. That is the whole reason it needs no index, no embedding model, and no warm-up: it reads the log the way the harness itself reads it for resume and export.</p>
+<p>The cost is honest and bounded: a ledger build is a linear pass over this workspace's logs, done once per workspace per process, capped at <code>maxSessions</code>, and it stops blocking the first step after <code>buildTimeoutMs</code> whether or not it has finished.</p>
+<h3>Why the extraction has no LLM in it</h3>
+<p>A command either exited non-zero or it didn't. <code>tool/result.error</code> records which. Pairing it to its <code>tool/call</code> by <code>callId</code> and counting is arithmetic — deterministic, reproducible, and impossible to hallucinate.</p>
+<p>The one place judgment is genuinely required is deciding whether a user correction is a durable convention ("use bun, never npm") or one-off steering ("no, the other file"). That is why <code>v0.1.0</code> ships no correction mining at all: the command ledger stands on arithmetic alone.</p>
+<h2>Configuration</h2>
+<pre><code>- id: precedent
+  name: dsh-precedent
+  config:
+    maxEntries: 40        # ledger lines injected per session
+    minRuns: 2            # ignore commands seen only once
+    lookbackDays: 90      # ignore sessions older than this
+    maxSessions: 200      # upper bound on logs read in one build
+    buildTimeoutMs: 5000  # stop blocking the first step after this
+</code></pre>
+<table>
+<thead>
+<tr>
+<th>Key</th>
+<th>Default</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>maxEntries</code></td>
+<td><code>40</code></td>
+<td>Hard cap on injected ledger lines, so the section stays a fixed, small token cost. <code>/precedent</code> is never capped</td>
+</tr>
+<tr>
+<td><code>minRuns</code></td>
+<td><code>2</code></td>
+<td>A command seen once is an anecdote, not a precedent</td>
+</tr>
+<tr>
+<td><code>lookbackDays</code></td>
+<td><code>90</code></td>
+<td>A convention from six months ago may no longer be true</td>
+</tr>
+<tr>
+<td><code>maxSessions</code></td>
+<td><code>200</code></td>
+<td>Newest sessions first; a workspace with years of history stays cheap to read</td>
+</tr>
+<tr>
+<td><code>buildTimeoutMs</code></td>
+<td><code>5000</code></td>
+<td>A slow build releases the first step and lands on a later one instead</td>
+</tr>
+</tbody></table>
+<p>Scope is not configurable: sessions are matched on exact <code>cwd</code> string equality, the same conservative rule DSH's own cross-session authorization uses — a symlinked path is a different workspace.</p>
+<h2>Commands</h2>
+<table>
+<thead>
+<tr>
+<th>Command</th>
+<th>What it does</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>/precedent</code></td>
+<td>Print the full ledger with citations, uncapped</td>
+</tr>
+<tr>
+<td><code>/precedent rebuild</code></td>
+<td>Discard the cached ledger and re-scan</td>
+</tr>
+</tbody></table>
+<p>Everything the plugin injects is visible on demand before you trust it. A memory you cannot audit is a memory you cannot trust.</p>
+<h2>What it is not</h2>
+<ul>
+<li><strong>Not a search tool.</strong> It does not answer "what did we discuss in June". It answers "what already works here", before you ask. If you want verbatim transcript retrieval, use a recall plugin — they compose fine.</li>
+<li><strong>Not a note-taker.</strong> Nothing asks you to write memories. There is no capture step to forget to run.</li>
+<li><strong>Not context stuffing.</strong> The injected section is capped and prefix-stable, so it costs a fixed small number of tokens and does not invalidate the KV cache between turns.</li>
+<li><strong>Not a replacement for <code>AGENTS.md</code>.</strong> Hand-written intent still wins. Precedent covers the part nobody keeps up to date: what actually happened.</li>
+<li><strong>Not cross-workspace.</strong> By design. See below.</li>
+</ul>
+<h2>Privacy and safety</h2>
+<ul>
+<li><strong>Everything stays local.</strong> The plugin reads the session log through <code>ctx.sessionQuery</code> and holds the ledger in memory. No files written, no network calls, no telemetry, no upload path in the code.</li>
+<li><strong>Workspace-scoped.</strong> Sessions are selected by exact <code>cwd</code> equality, mirroring the boundary DSH's own <code>tool-session-query</code> enforces. Another project's log is not read, even on the same machine.</li>
+<li><strong>Secrets are dropped, not stored.</strong> Command strings routinely contain tokens (<code>curl -H "Authorization: …"</code>, <code>DEPLOY_KEY=… ./ship</code>). Every command is matched against secret-shaped patterns and the whole entry is discarded — not masked, discarded — before it reaches the ledger.</li>
+<li><strong>Auditable by construction.</strong> <code>/precedent</code> prints exactly what gets injected, with a <code>session:seq</code> citation on every line that came from a failure.</li>
+</ul>
+<h2>How it compares</h2>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>Verbatim search plugins</th>
+<th>Note-taking memory plugins</th>
+<th><code>AGENTS.md</code> editors</th>
+<th><strong>dsh-precedent</strong></th>
+</tr>
+</thead>
+<tbody><tr>
+<td>Works on pre-install history</td>
+<td>Yes, after indexing</td>
+<td>No — starts empty</td>
+<td>No</td>
+<td><strong>Yes, immediately</strong></td>
+</tr>
+<tr>
+<td>Needs an index or model</td>
+<td>Usually</td>
+<td>No</td>
+<td>No</td>
+<td><strong>No</strong></td>
+</tr>
+<tr>
+<td>Acts before you ask</td>
+<td>No</td>
+<td>Sometimes</td>
+<td>Yes</td>
+<td><strong>Yes</strong></td>
+</tr>
+<tr>
+<td>Sources are citable</td>
+<td>Yes</td>
+<td>Rarely</td>
+<td>N/A</td>
+<td><strong>Always</strong></td>
+</tr>
+<tr>
+<td>Can hallucinate an entry</td>
+<td>No</td>
+<td>Yes</td>
+<td>N/A</td>
+<td><strong>Not in the ledger path</strong></td>
+</tr>
+<tr>
+<td>Answers "what did we discuss"</td>
+<td><strong>Yes</strong></td>
+<td>Partly</td>
+<td>No</td>
+<td>No</td>
+</tr>
+</tbody></table>
+<p>Different jobs. A recall plugin is a search box; precedent is a track record. Running both is reasonable.</p>
+<h2>Roadmap</h2>
+<ul>
+<li> <code>v0.1.0</code> — command ledger, system-prompt injection, <code>/precedent</code></li>
+<li> <code>v0.2.0</code> — <code>tools/pre-execute</code> advisory on a known-bad call, <code>intercept: warn | ask | deny</code> via <code>ctx.tools.guard</code></li>
+<li> <code>v0.3.0</code> — correction mining with citations, <code>/precedent why</code>, <code>/precedent pin</code>, <code>/precedent forget</code></li>
+<li> <code>v0.4.0</code> — incremental rebuild as the current session appends, instead of once per process</li>
+<li> Later — export the ledger as an <code>AGENTS.md</code> draft for human review</li>
+</ul>
+<p>Interfaces above are frozen against <code>deepseek-ai/deepseek-harness@47f943859bef</code> (read 2026-08-16). Anything that changes upstream will be noted here rather than silently adjusted.</p>
+<h2>Contributing</h2>
+<p>Issues and PRs welcome. Useful contributions, roughly in order of value:</p>
+<ol>
+<li><strong>A precedent your agent should have caught and didn't.</strong> Paste the situation (no logs needed). Missed patterns are the roadmap.</li>
+<li><strong>Extraction rules for a toolchain we get wrong.</strong> Command normalization is heuristic; every ecosystem has its own shape.</li>
+<li><strong>Secret-shaped patterns we fail to drop.</strong> Treat these as security reports — open an issue and we will fix before discussing.</li>
+</ol>
+<h2>License</h2>
+<p><a href="https://github.com/dshplugin-me/dsh-precedent/blob/HEAD/LICENSE">BSD-3-Clause</a>.</p>
+<hr>
+
+
+<p>Part of <a href="https://dshplugin.me">dshplugin.me</a> · sibling project: <a href="https://github.com/dshplugin-me/dsh-plugin-radar">dsh-plugin-radar</a></p>
+

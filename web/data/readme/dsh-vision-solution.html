@@ -1,0 +1,254 @@
+<h1>dsh-vision-solution</h1>
+<p><strong>让 DeepSeek Harness (DSH) 里的纯文本模型（如 DeepSeek）也能发送并识别图片。</strong></p>
+<p>本项目把两个东西整合成一个自包含方案：</p>
+<ol>
+<li><strong>识图技能</strong> — <a href="https://github.com/Sorwcyra/ds-vision-skill">ds-vision-skill</a>（v0.5.1，MIT）：图片/截图/PDF/OCR 的统一路由与识别，输出标准 JSON 交给主模型继续推理。</li>
+<li><strong>宿主补丁</strong> — <a href="https://github.com/Gingerate/dsh-vision-skill">vision-patch</a>（幂等补丁引擎）：移除 DSH 对"纯文本模型 + 图片"的拦截，让图片消息能送达到模型侧。</li>
+</ol>
+<p>装上即用：<strong>纯文本模型发图不再被拒，图片自动交给视觉 API 识别。</strong></p>
+<hr>
+<h2>为什么需要它</h2>
+<p>很多编码/推理 Agent 是纯文本模型（例如通过火山方舟托管的 DeepSeek 系列）。它们本身没有视觉能力，而且 DSH 会在两处直接拒绝图片消息：</p>
+<ul>
+<li>发送图片时：<code>Model "xxx" does not support image input.</code></li>
+<li>切换到纯文本模型但会话已含图片时：<code>does not accept image input...</code></li>
+</ul>
+<p>本项目通过<strong>宿主补丁</strong>移除这两处拒绝，并把图片以"带本地路径的占位文本"（<code>[图片附件：xxx，本地路径：...]</code>）送给模型；模型据此调用识图技能里的 <code>vision-router.ps1</code>，把图片交给<strong>火山方舟 doubao-seed-2.0-lite</strong>（或任意 OpenAI 兼容视觉 API）识别，拿回结构化结果继续推理。</p>
+<h2>工作原理</h2>
+<pre><code>用户发图/拖入图片/粘贴图片
+        │
+        ▼
+DSH host (打补丁后不再拒绝)
+        │  图片 → "[图片附件：xxx，本地路径：&lt;path&gt;]" 占位文本
+        ▼
+主模型（纯文本）收到路径占位
+        │  调用 ds-vision-skill → scripts/vision-router.ps1
+        ▼
+vision-router 自动路由
+  ├─ 图片理解：竞速池(agnes/glm) → custom-1/2/3 → local
+  ├─ OCR：百度OCR → Windows OCR → 视觉推理
+  └─ 文档解析：MinerU
+        │
+        ▼
+视觉 API（本项目默认：火山方舟 doubao-seed-2.0-lite）
+        │
+        ▼
+标准 JSON 信封 → 主模型阅读 result 并继续推理
+</code></pre>
+<h3>降级链</h3>
+<pre><code>image reasoning: race(agnes-2.5-flash, agnes-2.0-flash, glm, glm-thinking) -&gt; custom-1 -&gt; custom-2 -&gt; custom-3 -&gt; local
+ocr:             baidu-ocr -&gt; windows-ocr -&gt; vision reasoning
+document:        mineru flash -&gt; mineru extract
+</code></pre>
+<h2>特性</h2>
+<ul>
+<li>✅ 纯文本模型（DeepSeek 等）发送图片不再被"当前模型不支持图片"拦截</li>
+<li>✅ 图片自动降级为本地路径占位文本，配合识图技能完成视觉理解</li>
+<li>✅ 多模态模型行为完全不变，图片照常直传</li>
+<li>✅ 支持火山方舟 / 任意 OpenAI 兼容视觉 API</li>
+<li>✅ 宿主补丁<strong>幂等</strong>：可安全重复执行，每次自动 <code>node --check</code> 自校验</li>
+<li>✅ 无密钥入库：API Key 通过环境变量提供</li>
+</ul>
+<h2>目录结构</h2>
+<pre><code>dsh-vision-solution/
+├── README.md                  # 本文档
+├── LICENSE                    # MIT
+├── install.ps1                # 一键安装脚本
+├── package.json               # DSH 插件 manifest（dsh.bundle，可 `dsh plugin add` 安装）
+├── cordis.patch.yml           # bundle 挂载补丁（注册两个技能）
+├── lib/index.js               # 插件 host 半边（ctx.skills.register 注册技能）
+├── skills/
+│   ├── ds-vision-skill/       # 识图技能（来自 Sorwcyra/ds-vision-skill）
+│   │   ├── SKILL.md           #   技能定义
+│   │   ├── scripts/           #   vision-router / setup / 各通道脚本
+│   │   └── references/        #   通道与基准文档
+│   └── vision-patch/          # 宿主补丁技能
+│       ├── SKILL.md           #   补丁检修说明
+│       └── patch-vision.js    #   幂等补丁引擎
+</code></pre>
+<h2>前置要求</h2>
+<table>
+<thead>
+<tr>
+<th>项</th>
+<th>要求</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>DeepSeek Harness (DSH)</td>
+<td><code>0.1.0-rc.6</code>（补丁锚点针对该版本）</td>
+</tr>
+<tr>
+<td>Node.js</td>
+<td>≥ 20</td>
+</tr>
+<tr>
+<td>操作系统</td>
+<td>Windows / macOS（脚本跨平台）</td>
+</tr>
+<tr>
+<td>视觉 API Key</td>
+<td>火山方舟（或任意 OpenAI 兼容视觉 API）</td>
+</tr>
+</tbody></table>
+<h2>快速安装</h2>
+<h3>方式一：作为 DSH 插件安装（dsh.bundle）</h3>
+<p>本仓库声明了 <code>dsh.bundle</code> manifest，可用 <code>dsh plugin add</code> 从 GitHub 安装：</p>
+<pre><code>dsh plugin add https://github.com/br1nosense/dsh-vision-solution
+</code></pre>
+<p>安装后重启 <code>dsh web</code>，<code>ds-vision-skill</code> 与 <code>vision-patch</code> 两个技能即注册到技能系统；
+宿主补丁仍需在「图片被拒」时执行一次 <code>vision-patch</code>（或手动跑 <code>patch-vision.js</code>）。</p>
+<h3>方式二：一键脚本（推荐）</h3>
+<pre><code># 在本仓库根目录执行
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\install.ps1
+</code></pre>
+<p>脚本会：</p>
+<ol>
+<li>把 <code>skills/ds-vision-skill</code>、<code>skills/vision-patch</code> 复制到 <code>~/.dsh/skills/</code>；</li>
+<li>自动执行 <code>patch-vision.js</code> 修补 DSH 宿主；</li>
+<li>打印后续配置指引。</li>
+</ol>
+<h3>方式三：手动</h3>
+<pre><code># 1. 复制技能目录
+Copy-Item -Recurse .\skills\ds-vision-skill $HOME\.dsh\skills\
+Copy-Item -Recurse .\skills\vision-patch  $HOME\.dsh\skills\
+
+# 2. 执行宿主补丁（幂等，可重复）
+node "$HOME\.dsh\skills\vision-patch\patch-vision.js"
+</code></pre>
+<h3>重启生效</h3>
+<p>补丁需<strong>重启 <code>dsh web</code></strong> 才生效：</p>
+<pre><code># 在启动 dsh web 的终端按 Ctrl+C 停止，再运行：
+dsh web --port 3080
+</code></pre>
+<p>重启后刷新页面，从会话列表恢复会话即可。</p>
+<blockquote>
+<p>提示：如果以后 dsh 升级/重装导致图片拦截复现，直接对模型说 <strong>"执行 vision-patch"</strong>，即可重打补丁。</p>
+</blockquote>
+<h2>配置：火山方舟（doubao-seed-2.0-lite）</h2>
+<p>本方案默认把视觉识别交给火山方舟。按以下步骤配置 <code>custom-1</code> 通道：</p>
+<pre><code># 进入技能目录
+cd $HOME\.dsh\skills\ds-vision-skill
+
+# 配置 custom-1 通道（BaseUrl 末尾会自动补 /chat/completions）
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts\setup.ps1 -SetCustom `
+  -Slot 1 `
+  -BaseUrl "https://ark.cn-beijing.volces.com/api/coding/v3" `
+  -Key "ark-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx" `
+  -Model "doubao-seed-2.0-lite"
+</code></pre>
+<p>写入的用户级环境变量：</p>
+<table>
+<thead>
+<tr>
+<th>变量</th>
+<th>值</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>VISION_CUSTOM_1_BASE_URL</code></td>
+<td><code>https://ark.cn-beijing.volces.com/api/coding/v3</code></td>
+</tr>
+<tr>
+<td><code>VISION_CUSTOM_1_API_KEY</code></td>
+<td>你的火山 ark key</td>
+</tr>
+<tr>
+<td><code>VISION_CUSTOM_1_MODEL</code></td>
+<td><code>doubao-seed-2.0-lite</code></td>
+</tr>
+</tbody></table>
+<p>检查状态：</p>
+<pre><code>powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts\setup.ps1 -Status
+# 期望看到 custom-1 [third-party slot]: configured
+</code></pre>
+<p>验证通道（生成测试图片并调用 doubao 识别）：</p>
+<pre><code>powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts\setup.ps1 -Verify -Channel custom-1
+</code></pre>
+<h3>其他视觉 API（可选）</h3>
+<p><code>custom-1</code> 是 OpenAI 兼容插槽，可指向任意视觉端点：</p>
+<pre><code>scripts\setup.ps1 -SetCustom -Slot 1 -BaseUrl "https://你的服务/v1/chat/completions" -Key "KEY" -Model "视觉模型名"
+</code></pre>
+<h2>使用</h2>
+<h3>在 DSH 对话中发图</h3>
+<ul>
+<li>直接<strong>拖入图片</strong> / <strong>粘贴截图</strong> / <strong>发送图片 URL</strong> 均可。</li>
+<li>纯文本模型会收到图片的本地路径占位，自动调用识图技能分析。</li>
+</ul>
+<h3>命令行（供技能内部使用）</h3>
+<pre><code># 统一路由（推荐）
+scripts\vision-router.ps1 -Path "path\to\image.png" -Prompt "分析这张图" -Intent auto -Json
+
+# 显式 OCR
+scripts\vision-router.ps1 -Path "path\to\scan.png" -Intent ocr -Json
+
+# 文档/PDF 解析
+scripts\vision-router.ps1 -Path "path\to\report.pdf" -Intent document -Json
+</code></pre>
+<h3>JSON 输出契约</h3>
+<p>所有脚本在 <code>-Json</code> 模式下输出同一结构：</p>
+<pre><code>{
+  "task_type": "image_reasoning | document_parsing | ocr",
+  "tool_used": "custom-1:doubao-seed-2.0-lite",
+  "confidence": "high | medium | low",
+  "result": "识别/解析/理解的内容",
+  "metadata": {}
+}
+</code></pre>
+<h2>验证</h2>
+<pre><code># 端到端：生成测试图片并识别
+$img = "$env:TEMP\test.png"
+Add-Type -AssemblyName System.Drawing
+$bmp = New-Object System.Drawing.Bitmap 900, 300
+$g = [System.Drawing.Graphics]::FromImage($bmp)
+$g.Clear([System.Drawing.Color]::White)
+$g.DrawString("DS Vision 测试 12345", (New-Object System.Drawing.Font("Microsoft YaHei", 48)), [System.Drawing.Brushes]::Black, 30, 90)
+$g.Dispose(); $bmp.Save($img); $bmp.Dispose()
+
+scripts\vision-router.ps1 -Path $img -Prompt "这张图里写了什么？" -Intent reason -Json
+</code></pre>
+<h2>故障排查</h2>
+<table>
+<thead>
+<tr>
+<th>现象</th>
+<th>处理</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>发送图片仍被拒</td>
+<td>运行 <code>vision-patch</code> 技能重打补丁，检查日志；确认已重启 <code>dsh web</code></td>
+</tr>
+<tr>
+<td>补丁输出 <code>MISS</code> / <code>AMBIGUOUS</code> / <code>SYNTAX FAIL</code></td>
+<td>当前 DSH 版本与补丁锚点（rc.6）不一致，把完整输出贴到 Issue，不要手动改文件</td>
+</tr>
+<tr>
+<td>识图报"模型不存在 / 401"</td>
+<td>检查 <code>VISION_CUSTOM_1_API_KEY</code>、模型名是否正确，或换用其他视觉 API</td>
+</tr>
+<tr>
+<td>本地没网络无法调云端</td>
+<td>配置 local 通道（Ollama/LM Studio/llama.cpp）或 Windows OCR</td>
+</tr>
+</tbody></table>
+<h2>兼容性 / 已知限制</h2>
+<ul>
+<li>实测环境：DSH <code>0.1.0-rc.6</code>、Node ≥ 20、Windows。</li>
+<li>补丁锚点针对 rc.6 源码形态，其他版本可能出现 <code>MISS</code>（脚本只告警、绝不硬改）。</li>
+<li>子智能体会话暂不支持图片（DSH 原有设计，本项目不改变）。</li>
+<li>纯文本模型收到的历史图片显示为 <code>[image attachment ...]</code> 占位文本。</li>
+<li>云端通道会把图片内容发送给对应服务商，敏感内容请优先用本地通道。</li>
+</ul>
+<h2>隐私与安全</h2>
+<ul>
+<li>本仓库<strong>不含任何 API Key</strong>；密钥一律通过环境变量提供。</li>
+<li>请勿把 <code>.env</code> 或真实 key 提交到任何仓库。</li>
+<li>若怀疑 Key 泄露，请立即到对应平台吊销并更换。</li>
+</ul>
+<h2>许可与致谢</h2>
+<ul>
+<li>识图技能 <a href="https://github.com/Sorwcyra/ds-vision-skill">Sorwcyra/ds-vision-skill</a>（MIT）</li>
+<li>宿主补丁灵感与引擎 <a href="https://github.com/Gingerate/dsh-vision-skill">Gingerate/dsh-vision-skill</a>（MIT）</li>
+<li>本项目整体以 <strong>MIT</strong> 许可发布，见 <a href="https://github.com/br1nosense/dsh-vision-solution/blob/HEAD/LICENSE">LICENSE</a>。</li>
+</ul>

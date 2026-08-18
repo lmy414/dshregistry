@@ -1,0 +1,255 @@
+<p><a href="https://github.com/JohnXu22786/command-scout/blob/HEAD/README.zh.md">简体中文</a></p>
+<h1>command-scout</h1>
+<p>Discover the build commands a project already declares — Makefile targets,
+package.json scripts (npm / yarn / pnpm / bun), just recipes, deno tasks —
+and expose them to the agent as ready-to-run tools. Instead of guessing how
+to build, test or lint a project, the agent reads exactly what the project
+itself defines.</p>
+<ul>
+<li><strong>Scans at startup</strong>: on plugin activation the workspace root is inspected
+once and every command found becomes a registered tool.</li>
+<li><strong>Multiple build systems</strong>: Makefile, package.json scripts with automatic
+runner detection, justfile, deno.json / deno.jsonc tasks.</li>
+<li><strong>Rich metadata</strong>: descriptions (<code>##</code> comments in Makefiles, trailing
+text in justfiles), prerequisite lists, referenced variables, argument
+hints.</li>
+<li><strong>Safe naming</strong>: tool names are deterministic (<code>make_build</code>, <code>pnpm_dev</code>,
+<code>just_lint</code>) and collisions are resolved with numeric suffixes.</li>
+<li><strong>Self-contained</strong>: zero runtime dependencies, plain Node.js ESM, works
+with or without a harness — a CLI (<code>scan</code> / <code>docs</code>) ships in the box.</li>
+</ul>
+<h2>How it works</h2>
+<pre><code>project root
+   │  Makefile  package.json  justfile  deno.json(c)
+   ▼
+collectors ──► RecipeBook (dedupe, order, resolve names)
+   │
+   ├─► dsh adapter: registers one tool per recipe (ctx.tools.register)
+   └─► CLI:        table / JSON / generated COMMANDS.md
+</code></pre>
+<p>Each collector parses one file format into <strong>recipes</strong>. A recipe carries the
+command line to run, a description, its source file, prerequisites, and the
+variables it accepts. The adapter turns recipes into agent tools whose
+<code>execute</code> runs the command through the platform shell and returns stdout,
+stderr and the exit code.</p>
+<h2>Requirements</h2>
+<ul>
+<li>Node.js &gt;= 18.17</li>
+<li>For the dsh integration: a working DeepSeek Harness install with
+<code>@deepseek-ai/dsh-base</code> (provides the <code>tools</code> service), and pnpm for
+<code>dsh plugin</code> management.</li>
+</ul>
+<h2>Installation</h2>
+<h3>Installing in DSH</h3>
+<pre><code>dsh plugin --profile demo add github:JohnXu22786/command-scout
+</code></pre>
+<h3>As a dsh bundle (recommended)</h3>
+<p>A bundle is an npm package that contributes a configuration layer. From the
+directory containing this checkout:</p>
+<pre><code>dsh plugin --profile demo add ./path/to/command-scout
+</code></pre>
+<p>This initializes the <code>demo</code> profile (with <code>@deepseek-ai/dsh-base</code> as its
+first bundle), links the checkout, and appends <code>dsh-command-scout</code> to the
+profile's bundle list because <code>package.json</code> declares <code>dsh.bundle</code>. Verify
+and boot:</p>
+<pre><code>dsh --profile demo --dump-config   # shows the "# == dsh-command-scout" layer
+dsh --profile demo
+</code></pre>
+<p>The contributed patch layer (<code>cordis.patch.yml</code>) inserts one plugin row
+mounting the adapter entry (a package subpath, resolved through the
+package's <code>exports</code> map):</p>
+<pre><code>- insert:
+    - id: command-scout
+      name: dsh-command-scout/adapter
+</code></pre>
+<h3>As a patch overlay (no packaging)</h3>
+<p>Point the plugin row directly at the adapter source. Create an overlay file
+<code>command-scout-patch.yml</code>:</p>
+<pre><code>- insert:
+    - id: command-scout
+      name: '&lt;abs-path&gt;/src/dsh-adapter.js'
+</code></pre>
+<p>and pass it to the harness:</p>
+<pre><code>dsh --patch ./command-scout-patch.yml
+</code></pre>
+<h3>Standalone (no harness)</h3>
+<pre><code>node bin/command-scout.mjs scan --root /path/to/project
+npm install -g .     # provides the `command-scout` command
+</code></pre>
+<h2>Plugin contract</h2>
+<p>The adapter (<code>dsh-command-scout/adapter</code>) is a Cordis plugin. The harness
+loader validates and defaults the config through the exported Schemastery
+schema, waits for the declared services, calls <code>apply(ctx, config)</code>, and
+calls the returned disposer on unload or config hot-reload. The package
+main (<code>dsh-command-scout</code>) deliberately stays free of harness imports and
+exposes only the embedding API.</p>
+<table>
+<thead>
+<tr>
+<th>Export</th>
+<th>Kind</th>
+<th>Purpose</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>name</code></td>
+<td>string</td>
+<td><code>command-scout</code></td>
+</tr>
+<tr>
+<td><code>inject</code></td>
+<td>string[]</td>
+<td><code>['tools']</code> — activation waits for the service</td>
+</tr>
+<tr>
+<td><code>Config</code></td>
+<td>schema</td>
+<td>validated configuration (below)</td>
+</tr>
+<tr>
+<td><code>apply</code></td>
+<td>function</td>
+<td>scans the root, registers tools, returns a disposer</td>
+</tr>
+</tbody></table>
+<h3>Events</h3>
+<ul>
+<li><code>tools/change</code> is emitted by the harness registry for every register and
+unregister, so UIs observing the registry refresh automatically.</li>
+<li>The plugin itself emits no events; it only registers tools on activation.</li>
+</ul>
+<h3>Re-scanning</h3>
+<p>Discovery happens once per activation. Editing a Makefile or package.json
+does not re-trigger a scan; reload the plugin (config hot-reload or a new
+session) to refresh the tool set.</p>
+<h2>Configuration</h2>
+<p>Configuration is supplied through the plugin row's <code>config</code> (in
+<code>cordis.patch.yml</code> or the profile patch). All fields have defaults; the
+example below shows every option:</p>
+<pre><code>- insert:
+    - id: command-scout
+      name: dsh-command-scout/adapter
+      config:
+        root: '.'                    # directory scanned, relative to process cwd
+        collectors:
+          makefile:
+            enabled: true
+          scripts:
+            enabled: true
+            runner: auto             # auto | npm | yarn | pnpm | bun
+            lockfilePriority:        # probed in order by runner: auto
+              - pnpm-lock.yaml
+              - yarn.lock
+              - bun.lockb
+              - bun.lock
+              - package-lock.json
+          justfile:
+            enabled: true
+          deno:
+            enabled: true
+        naming:
+          style: scoped              # scoped | flat
+        execution:
+          timeoutMs: 120000          # per-command hard budget
+</code></pre>
+<h3>Runner detection (<code>scripts</code>)</h3>
+<p><code>runner: auto</code> resolves in this order:</p>
+<ol>
+<li>the <code>packageManager</code> field of package.json (<code>"pnpm@9.1.0"</code> → pnpm),</li>
+<li>the first lockfile present, in <code>lockfilePriority</code> order,</li>
+<li>npm as fallback.</li>
+</ol>
+<p>The resolved runner also names the tools (<code>pnpm_dev</code> vs <code>npm_dev</code>), so two
+projects using different runners never collide.</p>
+<h3>Naming</h3>
+<ul>
+<li><code>scoped</code> (default): <code>make_build</code>, <code>pnpm_dev</code>, <code>just_lint</code>, <code>deno_serve</code>.</li>
+<li><code>flat</code>: bare names (<code>build</code>, <code>dev</code>); on collision the first recipe keeps
+the bare name and later ones get numeric suffixes (<code>dev_2</code>).</li>
+</ul>
+<p>Tool names only ever contain lowercase letters, digits and underscores
+(names with no such characters at all, e.g. CJK-only script names, get a
+deterministic <code>task_&lt;hash&gt;</code> form), and the reserved harness name <code>run_code</code>
+is never produced.</p>
+<h2>Tools the agent gets</h2>
+<p>One tool per command, named as above. Example for a Makefile target:</p>
+<pre><code>make_build — Project makefile command "build" (from Makefile).
+Compile the release bundle
+Run: make build
+Acceptable variables: VERSION, CC (pass as VAR=value via "args")
+Prerequisites: clean
+Additional shell arguments can be appended through the "args" parameter.
+</code></pre>
+<p>Every tool accepts one optional parameter, <code>args</code>: a string appended to the
+command line verbatim. It is the single extension point for flags and
+overrides (<code>--port 8080</code>, <code>VERSION=2.0.0</code>).</p>
+<p>Execution semantics:</p>
+<ul>
+<li>runs through the platform shell with the scan root as working directory,</li>
+<li>hard timeout per <code>execution.timeoutMs</code>; timeouts and harness cancellation
+kill the whole process tree (not just the shell wrapper), so build tools
+cannot leak as orphan processes,</li>
+<li>stdout/stderr captured and truncated at 1 MiB per stream,</li>
+<li>returns <code>{ command, ok, exitCode, stdout, stderr, killed, durationMs }</code>.</li>
+</ul>
+<blockquote>
+<p><strong>Security note</strong>: commands run as the harness user with the project's own
+definitions, and <code>args</code> is appended verbatim — both are shell code by
+design. The harness approval policy (<code>tools/pre-execute</code>) still applies to
+every call; run under a workspace-write sandbox as usual.</p>
+</blockquote>
+<h2>CLI</h2>
+<p>The standalone CLI needs no harness:</p>
+<pre><code># Inspect a project's commands as a table
+command-scout scan --root path/to/project
+
+# Machine-readable output
+command-scout scan --root path/to/project --format json
+
+# Generate a COMMANDS.md reference document
+command-scout docs --root path/to/project [--output COMMANDS.md]
+</code></pre>
+<p>Example table output:</p>
+<pre><code>source    name              command           description
+makefile  build             make build        Compile the release bundle
+makefile  clean             make clean        Remove build artifacts
+scripts   dev               pnpm run dev      vite
+scripts   test              pnpm run test     vitest run
+</code></pre>
+<h2>Programming interface</h2>
+<pre><code>import { discover, runCommand } from 'dsh-command-scout'
+
+const { book, diagnostics, detectedFiles } = discover('.')
+const toolNames = book.assignToolNames('scoped')
+for (const recipe of book.entries()) {
+  console.log(toolNames.get(recipe.id), recipe.command)
+}
+
+const result = await runCommand('make build', { cwd: '.', timeoutMs: 30_000 })
+console.log(result.stdout)
+</code></pre>
+<p>Exports: <code>discover</code>, <code>RecipeBook</code>, <code>createRecipe</code>, <code>runCommand</code>,
+<code>renderTable</code> / <code>renderJson</code> / <code>renderMarkdown</code>, <code>normalizeConfig</code>,
+<code>DEFAULT_CONFIG</code>. (The plugin contract <code>name</code> / <code>Config</code> / <code>apply</code> /
+<code>inject</code> is exported from the <code>dsh-command-scout/adapter</code> subpath.)</p>
+<h2>Development</h2>
+<pre><code>node --test          # run the test suite (built-in node:test, no deps)
+node bin/command-scout.mjs scan --root test/fixtures/mixed   # smoke test
+</code></pre>
+<p>Test fixtures live in <code>test/fixtures/</code> (mixed project, per-runner lockfile
+projects, empty project).</p>
+<h2>Project layout</h2>
+<pre><code>bin/command-scout.mjs      CLI launcher
+src/config.js              defaults and config normalization
+src/recipe.js              the Recipe domain object
+src/recipe-book.js         aggregation, dedupe, naming, ordering
+src/discover.js            scan orchestration (the Scout)
+src/execute.js             shell execution with capture and timeouts
+src/render.js              table / JSON / Markdown rendering
+src/cli.js                 CLI implementation
+src/dsh-adapter.js         the Cordis plugin surface
+src/collectors/            one module per build system
+test/                      node:test suite + fixtures
+</code></pre>
+<h2>License</h2>
+<p><a href="https://github.com/JohnXu22786/command-scout/blob/HEAD/LICENSE">MIT</a></p>

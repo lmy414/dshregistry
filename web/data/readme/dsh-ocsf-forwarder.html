@@ -1,0 +1,107 @@
+<h1>dsh-ocsf-forwarder</h1>
+<p>A read-side SIEM forwarder for <a href="https://github.com/deepseek-ai">DeepSeek Harness</a>. It observes the
+session event firehose, normalises every event to <strong>OCSF 1.9.0</strong> with the native <code>ai_operation</code>
+profile, and writes newline-delimited OCSF JSON to a local append-only spool — optionally shipping
+it to <strong>Splunk HTTP Event Collector</strong> or an <strong>OTLP/HTTP</strong> collector.</p>
+<p>📖 <strong><a href="https://charlotten7.github.io/dsh-ocsf-forwarder/">Full documentation</a></strong> — including the
+complete event → OCSF mapping table for all 44 session event types.</p>
+<h2>What it does</h2>
+<ul>
+<li>Subscribes to <code>session/event</code>, <code>session/created</code> and <code>session/disposed</code>, and sweeps
+<code>ctx.sessions.list()</code> at mount.</li>
+<li>Correlates <code>tool/call</code> ↔ <code>tool/result</code> and <code>approval/asked</code> ↔ <code>approval/decided</code>, emitting
+<strong>approval decision latency</strong> — the approval-fatigue signal.</li>
+<li>Classifies tool calls by what they do: shell and code execution → Process Activity (1007),
+file tools → File System Activity (1001), web tools → HTTP Activity (4002), approvals and
+sandbox changes → Authorize Session (3003), everything else → API Activity (6003).</li>
+<li>Names the MCP server behind every <code>mcp__&lt;server&gt;__&lt;tool&gt;</code> call.</li>
+<li>Emits a <strong>high-severity record when a tool hands the task to an external harness</strong>, stating in
+the record that telemetry coverage ends at that boundary.</li>
+<li>Emits a periodic <strong>heartbeat</strong> carrying counters, live session count and delivery cursor, so a
+host that goes quiet is distinguishable from one that is idle. A spool that has stopped writing
+reports itself there at <code>severity_id: 5</code>, with the count of what it dropped.</li>
+<li>Chains every spooled record with the OCSF <strong><code>record_integrity</code></strong> profile, and ships
+<code>dsh-ocsf-verify</code> to check the chain.</li>
+<li>Replays a resumed or forked session's constructor seed, which never reaches the live firehose.</li>
+<li>Keeps raw values out of the SOC lane: keyed digests, value classifications and lengths instead.</li>
+</ul>
+<h2>What it does not do</h2>
+<ul>
+<li><strong>It never writes to the session log.</strong> <code>Session.append()</code> cannot set the envelope's <code>ignorable</code>
+flag, so a plugin-owned event type makes the next resume throw <code>SessionFormatUnsupportedError</code>
+and refuse the entire session. All durable output goes to our own sink, and the plugin registers
+no waterfall listener, so it cannot change a tool call, an approval decision or a model request.</li>
+<li><strong>It is not a containment boundary.</strong> It runs in the agent's process at the agent's uid; an agent
+that can run <code>bash</code> can delete or rewrite the spool — and can recompute the hash chain over what
+it wrote, because the algorithm is published. What it buys you is that records leave the host
+promptly and that a gap is <em>visible</em> — the chain's entry numbering, <code>metadata.sequence</code> holes per
+session, and a shipper cursor that stopped advancing.</li>
+<li>It ships no detection content, no alerting and no secret detectors.</li>
+</ul>
+<p><a href="https://charlotten7.github.io/dsh-ocsf-forwarder/">The full scope statement →</a></p>
+<h2>Install</h2>
+<p>The profile must already compose a runnable agent — a profile carrying only
+<code>@deepseek-ai/dsh-base</code> has no agent loop and this plugin would observe nothing:</p>
+<pre><code>dsh plugin --profile &lt;name&gt; add @deepseek-ai/dsh-headless@0.1.0-rc.6
+dsh plugin --profile &lt;name&gt; add dsh-ocsf-forwarder
+dsh --profile &lt;name&gt; --dump-config      # verify the row is mounted
+</code></pre>
+<p>Pin <code>@deepseek-ai/dsh-headless</code> explicitly — its npm <code>latest</code> tag still points at <code>0.0.1-rc.1</code>.
+Install from the registry or a packed tarball, <strong>not</strong> from a git spec: <code>lib/</code> is a build output
+git does not carry.</p>
+<p><a href="https://charlotten7.github.io/dsh-ocsf-forwarder/install.html">Install in full →</a></p>
+<h2>Configure</h2>
+<pre><code>- id: dsh-ocsf-forwarder
+  config:
+    spoolPath: /var/log/dsh/ocsf.jsonl      # absolute; created 0640
+    splunk:
+      endpoint: https://splunk.example:8088
+      token: { source: env, variable: SPLUNK_HEC_TOKEN }
+    privacy:
+      hmacKey: { source: env, variable: DSH_OCSF_KEY }
+</code></pre>
+<p>Every numeric key that is resolved must be a positive finite number, and those counting records or
+files must be whole numbers — <code>statsIntervalMs</code> is the one exception, where <code>0</code> means "only at
+unload". A value outside those ranges fails at load, because the alternative is worse than a
+refused mount: <code>batchSize: 0</code> makes the shipper loop without ever advancing its cursor. A shipper
+block with no <code>endpoint</code> configures no shipper and is not resolved, so nothing in it is checked.</p>
+<p>The default privacy posture keeps raw values out of the SOC lane — argument values and command
+lines are digested, URLs reduced to their host. A second <strong>restricted lane</strong> carries verbatim
+payloads and must be explicitly acknowledged before it will open.</p>
+<p><a href="https://charlotten7.github.io/dsh-ocsf-forwarder/configuration.html">Every configuration key →</a> ·
+<a href="https://charlotten7.github.io/dsh-ocsf-forwarder/mapping.html">Record format and the mapping table →</a></p>
+<h2>Shipping to a SIEM</h2>
+<p>Splunk HEC and OTLP/HTTP are both supported; configure exactly one per spool. Delivery is
+cursor-based off the spool, so a collector outage costs nothing but disk, and the spool refuses to
+delete an un-drained generation rather than silently discarding unacknowledged evidence.</p>
+<p><a href="https://charlotten7.github.io/dsh-ocsf-forwarder/shipping.html">Splunk and OTLP setup →</a> ·
+<a href="https://charlotten7.github.io/dsh-ocsf-forwarder/operations.html">Delivery and failure modes →</a></p>
+<h2>Tamper-evidence</h2>
+<p>Every record carries an OCSF 1.9.0 <code>record_integrity</code> attestation: the SHA-256 fingerprint of the
+record, plus the uid and fingerprint of the record before it. Editing, deleting, or reordering a
+spooled record breaks the chain at that record and at the one after it.</p>
+<pre><code>dsh-ocsf-verify /var/log/dsh/ocsf.jsonl   # exits 0 intact, 1 broken, 2 unreadable
+</code></pre>
+<p>The fingerprints are <strong>unkeyed</strong>, so anyone can recompute them — which is the point, and which also
+means the chain does not resist the agent it observes. What it detects is a later edit by anything
+that does not recompute the chain, and it makes every record already shipped to a SIEM an anchor
+the spool can be checked against.</p>
+<p><a href="https://charlotten7.github.io/dsh-ocsf-forwarder/integrity.html">The canonicalisation, the threat model, and the cost →</a></p>
+<h2>Running it with <code>dsh-netguard</code></h2>
+<p>Both packages emit OCSF into one index and share the <code>correlation_uid</code> scheme
+<code>&lt;session&gt;:&lt;callId&gt;</code>, so a Network Activity record from netguard joins to this package's Process
+Activity record for the same tool call — answering <em>which tool call opened this connection</em>.</p>
+<p><code>metadata.uid</code> is deliberately <strong>not</strong> shared: this package's key is <code>&lt;session&gt;:&lt;seq&gt;</code> over the
+session log's event sequence, and netguard namespaces its own as <code>&lt;session&gt;:netguard:&lt;seq&gt;</code> so a
+SIEM deduplicating on that field cannot mistake one package's records for the other's.</p>
+<h2>Development</h2>
+<pre><code>nvm use 22           # Node ^22.19.0 || &gt;=24, and pnpm 11
+pnpm install
+pnpm run typecheck
+pnpm run test:coverage
+pnpm run test:e2e    # boots a real dsh against a mock model; no API key
+</code></pre>
+<p>Design decisions and their rationale live in <a href="https://github.com/CharlotteN7/dsh-ocsf-forwarder/blob/HEAD/ADR.md">ADR.md</a>. Security policy is in
+<a href="https://github.com/CharlotteN7/dsh-ocsf-forwarder/blob/HEAD/SECURITY.md">SECURITY.md</a>.</p>
+<h2>License</h2>
+<p>MIT</p>

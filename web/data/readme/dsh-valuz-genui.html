@@ -1,0 +1,67 @@
+<h1>dsh-valuz-genui</h1>
+<p>A <a href="https://github.com/deepseek-ai/deepseek-harness">DeepSeek Harness</a> plugin that gives the model a <code>generate_ui</code> tool: the <strong>model itself authors</strong> an <a href="https://a2ui.org">A2UI</a> v0.9.1 document and passes it to <code>generate_ui</code>, and the browser renders it as an <strong>interactive surface inline in the chat</strong> — charts, KPI cards, tables, forms, dashboards — <strong>streaming as the model writes the call</strong>, and whose interactions come back to the model.</p>
+<p>There is <strong>no nested model call</strong>: the UI is the model's own streamed output, so it appears live (like a fenced block), costs one model turn, and can't fail with a mid-stream error from a second request. It builds on the provider-agnostic <a href="https://github.com/valuz-ai/valuz-genui">valuz-genui</a> core (76-component A2UI catalog, streaming sanitizer, React renderer).</p>
+<h2>How it works</h2>
+<ul>
+<li><strong>Authoring guide (system prompt + skill).</strong> The plugin teaches the model to author A2UI and deliver it by calling <code>generate_ui</code> with <code>messages</code> (the array of A2UI message objects). When the host supports skills, a compact guide (component names + purposes + message contract) is always on and the full field-signature catalog loads on demand via the <code>genui</code> skill; otherwise the full guide stays in the system prompt.</li>
+<li><strong>Streaming render.</strong> As the model writes the <code>generate_ui</code> arguments, each <code>tool-call-delta</code> reaches the browser as an <code>assistant/chunk</code> <em>before the tool runs</em>. A conversation node folds those deltas, extracts the complete A2UI messages authored so far, and renders them with the valuz <code>&lt;A2UIRenderer&gt;</code> — which keeps the last good surface while the tail is still being written. So the surface builds up component by component, live.</li>
+<li><strong>Settle + replay.</strong> When <code>generate_ui</code> executes (milliseconds — it only validates and never calls a model), it persists the canonical document to <code>tool/result.meta</code>. The node adopts that authoritative document, and the same meta re-renders the surface on reload/replay.</li>
+<li><strong>Interactions.</strong> A click/submit on a rendered surface is sent back to the model as an ordinary user message: <code>&lt;ui_action surface="…" component="…" name="…"&gt;{context}&lt;/ui_action&gt;</code> (model-visible ⟺ logged). The model answers in text or calls <code>generate_ui</code> again with the updated document.</li>
+</ul>
+<h2>Install</h2>
+<p>Into an existing profile that already has a model configured:</p>
+<pre><code>dsh plugin --profile web add @valuz/dsh-valuz-genui
+</code></pre>
+<p>The npm package ships a prebuilt <code>lib/</code>, so no build step or <code>allowBuilds</code> entry is needed. To pin an unreleased commit instead, install from git — pnpm ≥ 10 then blocks the git dependency's <code>prepare</code> build until you allow it; the first <code>add</code> fails and prints the exact key to copy into the profile's <code>pnpm-workspace.yaml</code>:</p>
+<pre><code>dsh plugin --profile web add github:valuz-ai/dsh-valuz-genui#&lt;commit-sha&gt;
+</code></pre>
+<pre><code>allowBuilds:
+  '@valuz/dsh-valuz-genui@https://codeload.github.com/valuz-ai/dsh-valuz-genui/tar.gz/&lt;commit-sha&gt;': true
+</code></pre>
+<p>Then restart <code>dsh web</code> and hard-refresh. Ask the model for a chart or dashboard to verify. <strong>No extra configuration is needed</strong> — the model authors the UI through whatever model the session is using.</p>
+<h3>Local development</h3>
+<p>The generation core and renderer come from npm (<code>@valuz/genui-core</code>, <code>@valuz/a2ui</code>, from <a href="https://github.com/valuz-ai/valuz-genui">valuz-ai/valuz-genui</a>); the client bundle inlines them at build time:</p>
+<pre><code>git clone https://github.com/valuz-ai/dsh-valuz-genui.git
+cd dsh-valuz-genui &amp;&amp; pnpm install &amp;&amp; pnpm run check
+# install into a profile (rebuild lib/ first with pnpm run build)
+dsh plugin --profile web add /absolute/path/to/dsh-valuz-genui
+</code></pre>
+<p>Restart <code>dsh web</code> and hard-refresh after each rebuild.</p>
+<h2>The tool</h2>
+<p><code>generate_ui(messages, title?)</code></p>
+<ul>
+<li><code>messages</code> — the array of A2UI v0.9.1 message objects the model authored: <code>createSurface</code> first, then <code>updateComponents</code> / <code>updateDataModel</code>; exactly one component has id <code>"root"</code>. Written as native JSON (not a stringified blob), so it streams and validates cleanly.</li>
+<li><code>title</code> — optional short surface title.</li>
+</ul>
+<p>The tool validates the document, pins the catalog id, drops schema-invalid components (siblings survive), and persists everything to <code>tool/result.meta</code>. The model receives a one-line receipt.</p>
+<h2>Configuration</h2>
+<p>Override the <code>valuz-genui</code> row by id in your profile's <code>cordis.patch.yml</code>:</p>
+<table>
+<thead>
+<tr>
+<th>Key</th>
+<th>Default</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>maxDocumentBytes</code></td>
+<td>262144</td>
+<td>Inclusive byte cap on the serialized A2UI document.</td>
+</tr>
+<tr>
+<td><code>alwaysOnFullGuide</code></td>
+<td>false</td>
+<td>Keep the full field-signature catalog in the system prompt instead of the on-demand <code>genui</code> skill.</td>
+</tr>
+</tbody></table>
+<h2>Known Limitations and Deferred Work</h2>
+<ul>
+<li><strong>Always-on prompt cost.</strong> Where the host supports skills (<code>ctx.skills</code>, e.g. the web profile), only a compact guide (<del>3.1k tokens: component names + one-line purposes + the message contract) stays always on, and the full field-signature catalog (</del>9k tokens) loads on demand through the <code>genui</code> skill. Where no skill capability exists (or <code>alwaysOnFullGuide: true</code>), the full guide stays in the system prompt. Both are stable prefixes (KV-cache-friendly). The model is told to load the <code>genui</code> skill before authoring; guessing fields drops components.</li>
+<li><strong>Authoring quality depends on the model.</strong> A2UI's 76-component graph is richer — and harder to author inline — than a compact DSL. Complex dashboards may need prompt tuning; the sanitizer tolerates and drops malformed components rather than failing the whole surface.</li>
+<li><strong>Client bundle is large (~3.5 MB).</strong> recharts, the A2UI renderer, and markdown-it are inlined. Phase 2 splits the chart engine into a lazily loaded plugin-served asset.</li>
+<li><strong>Theme bridge is coarse.</strong> The renderer follows light/dark but does not yet map A2UI <code>--va2-*</code> tokens onto the host <code>--dsw-alias-*</code> scale.</li>
+<li><strong>Interactions round-trip through the model.</strong> Every <code>&lt;ui_action&gt;</code> becomes a user message; there is no local-only handling yet.</li>
+</ul>
+<h2>License</h2>
+<p>MIT</p>

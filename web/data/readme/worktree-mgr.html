@@ -1,0 +1,329 @@
+<h1>worktree-mgr</h1>
+<p><a href="https://github.com/JohnXu22786/worktree-mgr/blob/HEAD/README.zh.md">简体中文</a></p>
+<p>A plugin that provides <strong>task-isolated workspaces</strong> for <strong>dsh</strong> (DeepSeek Harness, a plugin-based harness running on the Cordis plugin framework).</p>
+<p>When a model processes multiple tasks in parallel, each task is completed in its own <strong>git workspace</strong> (git worktree) on its own branch, without polluting the main workspace; when the task ends, the plugin commits, merges, and cleans up automatically. The full lifecycle — <strong>create / sync / overview / finish / batch cleanup</strong> — is covered by 5 tools + 1 CLI, with zero manual git operations throughout.</p>
+<h2>Core Concepts</h2>
+<table>
+<thead>
+<tr>
+<th>Concept</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>Task</td>
+<td>A single unit of work, e.g. <code>add-search-box</code>. Tools take the task name as entry point</td>
+</tr>
+<tr>
+<td>Branch</td>
+<td>Derived automatically from the task name: <code>&lt;prefix&gt;/&lt;task-slug&gt;</code>, default <code>wtm/add-search-box</code>, or explicitly specified</td>
+</tr>
+<tr>
+<td>Workspace</td>
+<td>Located under the vault directory (default platform data dir <code>wtm/vaults/&lt;repo-slug&gt;/</code>), isolated from the main repository</td>
+</tr>
+<tr>
+<td>Ledger</td>
+<td><code>index.json</code> under the vault, persisting the "task ↔ branch ↔ path" mapping (JSON format, atomic writes + mutex lock)</td>
+</tr>
+<tr>
+<td>Base branch</td>
+<td>The branch a task merges into; defaults to the main workspace's current branch</td>
+</tr>
+</tbody></table>
+<h2>Features</h2>
+<ul>
+<li><strong>Task-driven</strong>: give the model a task name and the branch name, path, and ledger record are all generated automatically — no need to specify a branch</li>
+<li><strong>Branch name safety</strong>: task name → slug normalization (illegal forms such as <code>..</code> within a segment, <code>.lock</code> suffix, leading dots in a segment are fixed at the source), with dual ref-validity checks; creation is rejected when different tasks derive the same slug</li>
+<li><strong>Uncommitted change detection</strong>: merge is refused when the base branch is dirty (prevents mixing in unfinished work); uncommitted changes in the task workspace trigger an automatic snapshot commit by default</li>
+<li><strong>Merge target consistency</strong>: before merging, the plugin validates "main workspace current branch == ledger base branch" and "task workspace current branch == ledger task branch"; any mismatch is refused — eliminating the silent error of reporting success while changes land on the wrong branch</li>
+<li><strong>Sync and finish separated</strong>: <code>wtm_merge</code> only merges without cleanup, while <code>wtm_finish</code> commits → merges → deletes workspace → deletes branch → clears the record; retry scenarios automatically skip already-completed merges (no duplicate empty merge commits)</li>
+<li><strong>Batch cleanup</strong>: <code>wtm_purge</code> finishes multiple tasks at once; a single task failure does not interrupt the rest, and any failure yields a non-zero exit code</li>
+<li><strong>Repository-level configuration</strong>: <code>&lt;repo-root&gt;/.wtm.json</code> supports branch prefixes, message templates, seed files (with path-escape protection), and lifecycle triggers (fixed working directory)</li>
+<li><strong>Concurrency safety</strong>: ledger writes hold a mutex — the lock contains a unique token with heartbeat refresh, stale locks are reclaimed only after a process crash, and release never mistakenly deletes a successor's lock</li>
+<li><strong>Failure recovery</strong>: a failed create rolls back the created worktree and branch automatically; merge conflicts provide a <code>git merge --abort</code> recovery guide</li>
+<li><strong>Cross-platform</strong>: triggers execute on Windows (cmd) and POSIX (sh); path comparison normalizes case and separators</li>
+<li><strong>Zero dependencies, no build</strong>: pure Node ESM, <code>node &gt;= 21</code> is enough — install and use</li>
+</ul>
+<h2>Installing in DSH</h2>
+<p>Install the latest version into a profile from GitHub:</p>
+<pre><code>dsh plugin --profile demo add github:JohnXu22786/worktree-mgr
+</code></pre>
+<p>Remove it:</p>
+<pre><code>dsh plugin --profile demo remove worktree-mgr
+</code></pre>
+<h3>Option 1: install as a dsh bundle (recommended)</h3>
+<p>From a directory containing this package:</p>
+<pre><code>dsh plugin --profile demo add ./worktree-mgr
+</code></pre>
+<ul>
+<li><code>package.json</code> declares <code>dsh.bundle.patch → cordis.patch.yml</code>, so dsh automatically inserts the plugin line into the profile's configuration layer;</li>
+<li>That layer defaults to <code>root: !!js process.cwd()</code> (the dsh startup directory as the main repository), overridable as needed;</li>
+<li>This package is pure JavaScript with no build step, so installing from git never misses build artifacts.</li>
+</ul>
+<h3>Option 2: overlay loading (without installing into a profile)</h3>
+<pre><code>dsh --profile demo --patch ./examples/overlay.yml
+</code></pre>
+<p><code>overlay.yml</code> shares the same structure as the plugin line configuration, suitable for temporary mounting or configuration tweaks.</p>
+<h3>Option 3: standalone CLI</h3>
+<pre><code>npm link            # or node bin/wtm.js ...
+wtm begin "Add Search Box"
+</code></pre>
+<h2>Quick Start</h2>
+<pre><code># 1. Create an isolated workspace for the task (auto-derives branch wtm/add-search-box)
+wtm begin "Add Search Box"
+
+# 2. Edit code freely inside &lt;vault&gt;/add-search-box
+#    (or let the model work inside the task workspace directory)
+
+# 3. View the status of all tasks (dirty/ahead/behind)
+wtm status
+
+# 4. Sync only, without finishing: merge task changes back to the base branch, keeping the workspace
+wtm merge "Add Search Box"
+
+# 5. Finish: snapshot commit → merge → remove workspace → delete branch → clear ledger
+wtm finish "Add Search Box"
+
+# 6. Batch finish
+wtm purge "Task A" "Task B"      # specified tasks
+wtm purge --all                  # all tasks
+</code></pre>
+<p>All commands support <code>--json</code> for structured output, making them easy to consume from scripts and the harness.</p>
+<h2>CLI Reference</h2>
+<p><code>bin/wtm.js</code> runs standalone (<code>wtm</code> after <code>npm link</code>, or <code>node bin/wtm.js</code>); every subcommand accepts <code>--json</code> for structured output on stdout.</p>
+<table>
+<thead>
+<tr>
+<th>Command</th>
+<th>Description</th>
+<th>Exit code</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>wtm begin &lt;task&gt;</code></td>
+<td>Create an isolated workspace (<code>--base</code>, <code>--branch</code>, <code>--note</code>, <code>--root</code>)</td>
+<td>0 success / 1 failure</td>
+</tr>
+<tr>
+<td><code>wtm merge &lt;task&gt;</code></td>
+<td>Merge the task branch back to the base, keep the workspace (<code>--mode</code>, <code>--message</code>)</td>
+<td>0 / 1</td>
+</tr>
+<tr>
+<td><code>wtm finish &lt;task&gt;</code></td>
+<td>Finish and clean up (<code>--mode</code>, <code>--message</code>)</td>
+<td>0 / 1</td>
+</tr>
+<tr>
+<td><code>wtm status</code></td>
+<td>Overview of all tasks</td>
+<td>0 / 1</td>
+</tr>
+<tr>
+<td><code>wtm purge [task...]</code></td>
+<td>Batch finish; <code>--all</code> for everything</td>
+<td>0, or 1 when any task fails</td>
+</tr>
+<tr>
+<td><code>wtm help</code></td>
+<td>Print usage</td>
+<td>0 (2 for a bare <code>wtm</code>)</td>
+</tr>
+</tbody></table>
+<p>Exit codes: <code>0</code> success; <code>1</code> operation failure (with <code>--json</code> the failure lives in the JSON payload, and any failed sub-result of <code>purge</code> also yields 1); <code>2</code> usage errors (unknown or missing command). The <code>WTM_*</code> environment variables apply to the CLI as well.</p>
+<h2>Tool Interface (Model-Facing)</h2>
+<table>
+<thead>
+<tr>
+<th>Tool</th>
+<th>Purpose</th>
+<th>Key parameters</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>wtm_begin</code></td>
+<td>Create an isolated workspace for a task</td>
+<td><code>task</code>(required), <code>base</code>, <code>branch</code>, <code>note</code>, <code>root</code></td>
+</tr>
+<tr>
+<td><code>wtm_merge</code></td>
+<td>Sync: merge task branch back to base branch (workspace kept)</td>
+<td><code>task</code>(required), <code>mode</code>(commit/refuse), <code>message</code>, <code>root</code></td>
+</tr>
+<tr>
+<td><code>wtm_finish</code></td>
+<td>Finish: commit→merge→clean up workspace and branch</td>
+<td><code>task</code>(required), <code>mode</code>(commit/abandon/keep), <code>message</code>, <code>root</code></td>
+</tr>
+<tr>
+<td><code>wtm_status</code></td>
+<td>Task overview (existence/dirty state/ahead-behind)</td>
+<td><code>root</code></td>
+</tr>
+<tr>
+<td><code>wtm_purge</code></td>
+<td>Batch finish</td>
+<td><code>tasks</code>, <code>all</code>, <code>mode</code>, <code>message</code>, <code>root</code></td>
+</tr>
+</tbody></table>
+<p><strong><code>mode</code> semantics</strong></p>
+<ul>
+<li><code>commit</code> (default): first snapshot-commit the uncommitted changes in the task workspace, then merge back to the base branch, then clean up</li>
+<li><code>refuse</code>: refuse directly when the task workspace has uncommitted changes (only <code>wtm_merge</code>)</li>
+<li><code>abandon</code>: discard all task changes, force-clean the workspace and delete the branch (irrecoverable, use with care)</li>
+<li><code>keep</code>: only release management; workspace and branch remain untouched (only <code>wtm_finish</code>)</li>
+</ul>
+<p><strong>Safety boundaries</strong> (identical for tools and CLI):</p>
+<ul>
+<li>Base branch workspace has uncommitted changes → merge refused (<code>wtm_merge</code> / <code>wtm_finish</code> in commit mode)</li>
+<li>Main workspace current branch ≠ ledger base branch, or task workspace current branch ≠ ledger record → operation refused (prevents changes landing on the wrong branch)</li>
+<li>Task branch already exists, task already registered, workspace directory already exists, or different tasks deriving the same workspace path → creation refused</li>
+<li>Illegal task or branch name (git ref rules) → refused before any git operation</li>
+<li>Seed file path escapes (<code>../x</code> escaping the repo/workspace) → intercepted with a warning</li>
+<li>Call cancelled (<code>exec.signal</code> abort) → clean return; a failed create rolls back created worktrees and branches automatically</li>
+</ul>
+<h2>Plugin Integration Notes (how the harness loads it)</h2>
+<p>This plugin follows dsh's standard plugin protocol, consisting of three pieces:</p>
+<pre><code>worktree-mgr/
+├── package.json        # ① dsh.bundle manifest: declares this package as a configuration layer
+├── cordis.patch.yml    # ② Configuration layer content: inserts the plugin line into the profile
+├── index.js            # ③ Entry module: exports name / inject / apply
+└── src/                # Implementation: naming/config/vault/git/triggers/ops/tools
+</code></pre>
+<p><strong>① Bundle manifest</strong> (<code>package.json</code>):</p>
+<pre><code>{
+  "name": "worktree-mgr",
+  "type": "module",
+  "main": "index.js",
+  "dsh": { "bundle": { "patch": "./cordis.patch.yml" } }
+}
+</code></pre>
+<p><strong>② Configuration layer</strong> (<code>cordis.patch.yml</code>):</p>
+<pre><code>- insert:
+    - id: worktree-mgr
+      name: worktree-mgr        # resolved by package name; Node module resolution finds index.js
+      config:
+        root: !!js process.cwd()
+</code></pre>
+<p><strong>③ Entry module</strong> (<code>index.js</code>) exports:</p>
+<pre><code>export const name = 'worktree-mgr'
+export const inject = ['tools']              // declares dependency on the tools registry
+export function apply(ctx, config = {}) {
+  ctx.tools.register(...)                    // registers the 5 tools
+}
+</code></pre>
+<p>Loading order: profile assembly → this bundle's patch layer inserts the plugin line → the loader waits for the <code>tools</code> service → calls <code>apply(ctx, config)</code> → tool schemas flow into the system prompt automatically, and the model can invoke them.</p>
+<p><strong>Tool definition shape</strong> (consistent with dsh tool conventions):</p>
+<pre><code>{
+  name: 'wtm_status',
+  description: '...',                        // model-visible description
+  parameters: {                              // flat property table; required: true means mandatory
+    root: { type: 'string', description: 'repository path' }
+  },
+  output: {
+    schema: { type: 'object', properties: { ok: { type: 'boolean', required: true }, ... } },
+    render: (args, value) =&gt; [{ type: 'text', text: '...' }]   // model-visible content
+  },
+  async execute(args, exec) { ... }          // returns canonical JSON; exec.signal supports cancellation
+}
+</code></pre>
+<p><strong>Events/hooks interface</strong>: the plugin itself does not subscribe to harness events; lifecycle extensions go through <strong>triggers</strong> in the repository-level configuration — at the <code>on_begin</code> / <code>on_merge</code> / <code>on_finish</code> nodes, repo-configured shell commands run with <code>WTM_TASK</code> / <code>WTM_BRANCH</code> / <code>WTM_BASE</code> / <code>WTM_PATH</code> / <code>WTM_ROOT</code> environment variables injected. Triggers have fixed working directories: <code>on_begin</code> runs inside the new workspace, <code>on_merge</code> / <code>on_finish</code> run at the main repository root. Trigger failures only log warnings and never interrupt the main flow.</p>
+<h2>Configuration</h2>
+<p>Precedence (low → high): <strong>built-in defaults &lt; plugin line config &lt; repo <code>.wtm.json</code> &lt; environment variables <code>WTM_*</code></strong></p>
+<table>
+<thead>
+<tr>
+<th>Key</th>
+<th>Default</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>root</code></td>
+<td><code>process.cwd()</code></td>
+<td>Main repository path (plugin line / tool parameter only)</td>
+</tr>
+<tr>
+<td><code>vault</code></td>
+<td>platform data dir <code>wtm/vaults/&lt;repo-slug&gt;/</code></td>
+<td>Directory for task workspaces and the ledger; relative paths resolve against the repo path</td>
+</tr>
+<tr>
+<td><code>prefix</code></td>
+<td><code>wtm</code></td>
+<td>Branch prefix; derived branches are <code>&lt;prefix&gt;/&lt;slug&gt;</code></td>
+</tr>
+<tr>
+<td><code>commitMessage</code></td>
+<td><code>chore(wtm): snapshot {task}</code></td>
+<td>Snapshot commit template, placeholders <code>{task}</code> <code>{branch}</code> <code>{base}</code></td>
+</tr>
+<tr>
+<td><code>mergeMessage</code></td>
+<td><code>merge(wtm): fold {task} into {base}</code></td>
+<td>Merge commit template</td>
+</tr>
+</tbody></table>
+<p>Environment variables: <code>WTM_ROOT</code> (effective for both tools and CLI), <code>WTM_VAULT</code>, <code>WTM_PREFIX</code>, <code>WTM_COMMIT_MESSAGE</code>, <code>WTM_MERGE_MESSAGE</code> (<code>WTM_ROOT</code> has lower precedence than tool parameters and plugin config).</p>
+<h3>Repository-level config <code>&lt;repo-root&gt;/.wtm.json</code></h3>
+<pre><code>{
+  "prefix": "wtm",
+  "vault": "D:/wtm-vaults",
+  "commitMessage": "chore(wtm): snapshot {task}",
+  "mergeMessage": "merge(wtm): fold {task} into {base}",
+  "seed": { "files": ["docs/AGENTS.md"] },
+  "triggers": {
+    "on_begin": ["pnpm install"],
+    "on_merge": ["pnpm lint"],
+    "on_finish": []
+  }
+}
+</code></pre>
+<ul>
+<li><code>vault</code> <strong>must be outside the repository working tree</strong> (otherwise the vault directory would keep dirtying the main workspace, and the plugin refuses outright);</li>
+<li><code>seed.files</code>: files copied from the main repository into the workspace when the task workspace is created (e.g. team convention docs); paths must stay within the repo/workspace — out-of-bounds entries are intercepted with a warning;</li>
+<li><code>triggers.*</code>: lifecycle hook command arrays, see "Events/hooks interface" above.</li>
+</ul>
+<p>Unknown keys produce a warning and are ignored; a corrupted <code>.wtm.json</code> never blocks operations, only warns.</p>
+<h2>Security Notes (Important)</h2>
+<ul>
+<li><strong>Repository config is code</strong>: <code>.wtm.json</code>'s <code>seed.files</code> copies files from the repo into workspaces, and <code>triggers.*</code> runs arbitrary shell commands with your user's privileges. <strong>Only enable this plugin in trusted repositories</strong> — when cloning and operating on untrusted repositories, a repo-supplied <code>.wtm.json</code> is equivalent to granting it your execution permissions. Leave <code>seed</code>/<code>triggers</code> empty when you don't need this capability.</li>
+<li><strong>Snapshot commits include untracked files</strong>: when the task workspace is dirty, the default snapshot <code>git add -A</code> commits everything (including untracked files such as build artifacts). To keep large directories out of history, maintain a <code>.gitignore</code> in the task workspace, or handle it manually with <code>refuse</code> mode.</li>
+<li><strong>abandon is irrecoverable</strong>: <code>wtm_finish --mode abandon</code> and batch <code>wtm_purge</code> force-delete workspaces and delete task branches (<code>-D</code>); changes there cannot be recovered, so only use them when you have confirmed the discard.</li>
+</ul>
+<h2>Ledger and Concurrency</h2>
+<ul>
+<li>Ledger: <code>&lt;vault&gt;/index.json</code>, <code>{version: 1, records: [{task, branch, base, path, createdAt, updatedAt, note?}]}</code></li>
+<li>Writes are atomic (temp file + rename) and hold a <code>.lock</code> mutex for the entire operation;</li>
+<li>The lock contains a unique holder token with a 30s heartbeat refresh: after a process crash, a lock older than 5 minutes is deemed stale and reclaimed; release validates the token so a successor's lock is never mistakenly deleted; the wait timeout defaults to 5 seconds.</li>
+</ul>
+<h2>Development and Testing</h2>
+<pre><code>npm test          # node --test, zero third-party dependencies
+npm run typecheck # optional: requires dev-installed typescript + @types/node
+</code></pre>
+<p>Test coverage: naming rules, config merging, ledger (atomic writes/lock/stale reclamation/corruption recovery), git output parsing, triggers, lifecycle orchestration (fake git injection), tool schemas, plus integration tests against real git (full begin → modify files → status → finish chain).</p>
+<h2>Directory Structure</h2>
+<pre><code>worktree-mgr/
+├── package.json          # bundle manifest + metadata
+├── cordis.patch.yml      # plugin configuration layer
+├── index.js              # dsh plugin entry (name/inject/apply)
+├── bin/wtm.js            # standalone CLI
+├── README.md             # documentation (EN)
+├── README.zh.md          # documentation (ZH)
+├── LICENSE               # MIT license
+├── src/
+│   ├── naming.js         # task name → branch mapping and ref validation
+│   ├── config.js         # config merging and template rendering
+│   ├── vault.js          # ledger persistence (atomic writes/lock)
+│   ├── git.js            # git execution layer and output parsing
+│   ├── triggers.js       # lifecycle triggers
+│   ├── ops.js            # lifecycle orchestration (begin/merge/finish/status/purge)
+│   └── tools.js          # dsh tool definitions
+├── examples/
+│   ├── .wtm.json.example # repository config example
+│   └── overlay.yml       # dsh overlay example
+└── tests/                # node:test unit + integration tests
+</code></pre>
+<h2>License</h2>
+<p>MIT — see <a href="https://github.com/JohnXu22786/worktree-mgr/blob/HEAD/LICENSE">LICENSE</a>.</p>

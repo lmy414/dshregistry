@@ -1,0 +1,116 @@
+<h1>dsh-model-parameters</h1>
+<p><strong>中文</strong> | <a href="https://github.com/fonlan/dsh-model-parameters/blob/HEAD/README.en.md">English</a></p>
+<p>DSH 插件：当 provider 的模型同步（或任何设置写入）留下缺失能力字段的模型条目时，自动从 <a href="https://models.dev">models.dev</a> 目录补全——显示名称（display name）、上下文窗口（context window）、最大输出 token、推理档位（reasoning efforts）和输入模态（input modalities）。</p>
+<p>大多数 provider 的 <code>/v1/models</code> 列表只披露一个 id，别无其他。本插件用本地缓存的目录补全这些同步模型的元数据，让它们立即可用，并报告补全了什么、哪些无法匹配。</p>
+<h2>工作原理</h2>
+<ol>
+<li>插件监听 <code>llm-pi-ai</code> 设置命名空间（<code>settings/updated</code>）。任何已提交的变更——新同步的 provider、编辑过的 provider 卡片、手动编辑的 <code>settings.yaml</code>——都会触发一次 reconcile。</li>
+<li>插件启动时还会对现有配置执行一次全量回填。</li>
+<li>对每个缺少 <code>name</code> / <code>contextWindow</code> / <code>maxTokens</code> / <code>reasoningEfforts</code> / <code>input</code> 任一字段的模型条目，解析出最佳目录条目，只补全缺失字段（fill-only：已有值绝不覆盖）。</li>
+<li>写入走设置接缝（<code>ctx.settings.mutate</code>），即落到 <code>~/.dsh/settings.yaml</code>——与你手动编辑的是同一个文件。</li>
+</ol>
+<p>reconcile 天然是 fill-only 的，因此它自己的写入不会造成循环：下一次 <code>settings/updated</code> 看到字段已存在，不会产生任何操作。</p>
+<h2>匹配逻辑</h2>
+<p>models.dev 把同一模型挂在许多 provider 名下（<code>deepseek-v4-flash</code> 出现在 57 个 provider 下）。解析是确定性的、且 provider 感知：</p>
+<ol>
+<li><strong>Provider 匹配</strong> —— 为 dsh provider 映射的 models.dev provider（显式 <code>providerMap</code> 覆盖，其次同 id）。你的 <code>opencode-go</code> 路由本身也是 models.dev provider，所以它的条目优先。</li>
+<li><strong>完整 id 精确匹配</strong> —— 已带 <code>vendor/</code> 前缀的 dsh 模型 id 与完全相同的 models.dev key 匹配。</li>
+<li><strong>官方 vendor 优先</strong> —— <code>officialProviders</code>（deepseek、openai、anthropic、google、xai……）在冲突时偏向厂商自己的条目。</li>
+<li><strong>完整性</strong> —— 两个 limit 都已知的条目优于部分已知的。</li>
+<li><strong>provider id 字母序</strong> —— 稳定的兜底。</li>
+</ol>
+<p>裸 id 对最后一段路径段做大小写不敏感匹配，所以 <code>qwen3.7-max</code> 解析到 <code>Qwen/Qwen3.7-Max</code>，<code>kimi-k2.7-code</code> 解析到 <code>Kimi-K2.7-Code</code>。</p>
+<h2>补全字段</h2>
+<table>
+<thead>
+<tr>
+<th>dsh 字段</th>
+<th>models.dev 来源</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>name</code></td>
+<td><code>name</code></td>
+<td>显示名称</td>
+</tr>
+<tr>
+<td><code>contextWindow</code></td>
+<td><code>limit.context</code></td>
+<td>token 数</td>
+</tr>
+<tr>
+<td><code>maxTokens</code></td>
+<td><code>limit.output</code></td>
+<td>token 数</td>
+</tr>
+<tr>
+<td><code>reasoningEfforts</code></td>
+<td><code>reasoning_options[type=effort].values</code></td>
+<td>恒等字典 <code>{high:"high", max:"max"}</code>；pi-ai 档位之外的取值（<code>default</code>/<code>none</code>/……）被过滤；<code>toggle</code>/<code>budget_tokens</code> 选项忽略</td>
+</tr>
+<tr>
+<td><code>input</code></td>
+<td><code>modalities.input</code></td>
+<td>过滤到 <code>text</code>/<code>image</code>（pi-ai 仅接受这两种模态；<code>pdf</code>/<code>audio</code>/<code>video</code> 丢弃）</td>
+</tr>
+</tbody></table>
+<p>目录中无匹配的模型（例如本地网关模型 <code>hy3-paid</code>）保持原样，并在补全报告中列为 unmatched。</p>
+<h2>目录缓存与更新</h2>
+<ul>
+<li>目录从 <code>https://models.dev/api.json</code> 拉取，缓存在 <code>~/.dsh/model-parameters/catalog.json</code>（约 4 MB）。</li>
+<li>缓存超过 <code>ttlDays</code>（默认 <strong>7 天</strong>）后，在下一次 reconcile 时惰性刷新。</li>
+<li>拉取失败则保留上次成功的缓存；完全没有缓存时插件什么都不补，直到刷新成功。</li>
+<li>设置卡片有 <strong>立即更新目录并补全</strong> 按钮可强制刷新，并显示上次更新时间与新鲜度。</li>
+</ul>
+<h2>设置卡片</h2>
+<p>在 DSH 设置 → <strong>插件 → 插件配置</strong> 中会出现一张 "模型参数补全 / Model Parameters" 可展开卡片（样式与内置插件卡片一致，默认折叠）：</p>
+<ul>
+<li>总开关 + 逐字段开关（<code>fillName</code>、<code>fillContext</code>、<code>fillMaxTokens</code>、<code>fillReasoning</code>、<code>fillInput</code>）；</li>
+<li>目录 TTL（天）；</li>
+<li>可选的 <code>provider → models.dev provider</code> 映射覆盖；</li>
+<li>目录新鲜度（条目数、provider 数、上次更新）；</li>
+<li>上次补全报告：补全的字段、涉及的 provider、未匹配的模型 id 列表。</li>
+</ul>
+<p>插件配置保存在 <code>model-parameters</code> 设置命名空间（<code>~/.dsh/settings.yaml</code>），例如：</p>
+<pre><code>model-parameters:
+  enabled: true
+  ttlDays: 7
+  fillName: true
+  fillContext: true
+  fillMaxTokens: true
+  fillReasoning: true
+  fillInput: true
+  providerMap: {}
+  officialProviders:
+    - deepseek
+    - openai
+    - anthropic
+    - google
+    - xai
+</code></pre>
+<h2>安装</h2>
+<p>通过 <code>dsh plugin</code> 命令安装（<code>web</code> 换成你的 profile 名）：</p>
+<p><strong>从 npm 安装</strong>：</p>
+<pre><code>dsh plugin --profile web add @fonlan/dsh-model-parameters
+</code></pre>
+<p><strong>直接从 GitHub 安装</strong>：</p>
+<pre><code>dsh plugin --profile web add github:fonlan/dsh-model-parameters
+</code></pre>
+<p><strong>卸载</strong>：</p>
+<pre><code>dsh plugin --profile web remove @fonlan/dsh-model-parameters
+</code></pre>
+<h2>开发</h2>
+<pre><code>pnpm install
+pnpm build        # tsc 类型 + tsdown host 与 client bundle
+pnpm typecheck
+node scripts/verify-catalog.mjs   # 用 models.dev dump 校验匹配逻辑
+</code></pre>
+<h2>发布</h2>
+<p>打 tag 自动发布到 npm（GitHub Actions <code>Publish to npm</code>，校验 tag 与 package.json 版本一致后执行 <code>npm publish</code>，需仓库配置 <code>NPM_TOKEN</code> secret）：</p>
+<pre><code>npm run release:patch   # npm version patch &amp;&amp; git push &amp;&amp; git push --tags
+npm run release:minor
+npm run release:major
+</code></pre>
+<h2>License</h2>
+<p>MIT</p>

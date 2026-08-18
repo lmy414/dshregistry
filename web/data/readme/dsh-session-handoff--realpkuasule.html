@@ -1,0 +1,93 @@
+<h1>dsh-session-handoff</h1>
+<p>DSH <strong>宿主插件（薄适配层）</strong>：观测 → 阈值触发 → append-only 建议注入 → approval 门 → 调用 harness-automation CLI。</p>
+<p>设计依据：<code>docs/designs/session-handoff.md</code>（v0.3，§5/§8/§9-P2）；宿主能力查证：<code>docs/spike-findings.md</code>。
+P1 实况校准：<code>docs/designs/p1-delivered.md</code>。验收记录：<code>docs/acceptance-p2.md</code>。</p>
+<p><a href="https://github.com/realpkuasule/dsh-session-handoff/blob/HEAD/README.md">English</a> | <a href="https://github.com/realpkuasule/dsh-session-handoff/blob/HEAD/README.zh.md">中文</a></p>
+<p>仓库：<code>github.com/realpkuasule/dsh-session-handoff</code>（镜像：<code>github.com/xiaozhiaixue/dsh-session-handoff</code>）。
+本仓库带 <a href="https://github.com/topics/dsh-plugin"><code>dsh-plugin</code></a> topic，供 <a href="https://github.com/deepseek-ai/deepseek-harness">DeepSeek Harness</a> 插件生态发现。</p>
+<h2>边界（违反即返工）</h2>
+<ul>
+<li>只做<strong>观测、判定、触发</strong>。交接执行一律 spawn 全局 <code>harness-automation session handoff</code>，解析其 JSON 输出（<code>ok</code> 字段），<strong>绝不复制任何交接逻辑</strong>。</li>
+<li>注入只允许 <strong>append-only</strong>（<code>agent.inject()</code> → next-step inbox → 历史尾部追加，前缀不变）、<strong>确定性模板渲染</strong>（无时间戳/随机数）、<strong>状态不变时零追加</strong>（指纹去重，见下文）。</li>
+<li>approval 只在 <strong>open turn 内</strong>请求；无后台定时器；不单方面终止会话。</li>
+<li>阈值<strong>只读</strong>策略文件（项目 <code>.harness/session-workflow.yaml</code> → 包内默认），插件绝不改写；CLI 缺口只记录、不兜底。</li>
+</ul>
+<h2>装配（web profile）</h2>
+<p><strong>标准方式（dsh plugin / bundle 机制）</strong>：本包声明了 <code>dsh.bundle.patch</code>（<code>cordis.patch.yml</code>，按包名挂载
+<code>dsh-session-handoff</code> 行）与插件清单 <code>dsh.plugin.json</code>。安装即挂载：</p>
+<pre><code>dsh plugin --profile web add dsh-session-handoff
+# 或：dsh --profile web plugin add github:realpkuasule/dsh-session-handoff
+</code></pre>
+<p>本机当前即此形态：<code>~/.dsh/profiles/web/package.json</code> 的 <code>link:</code> 依赖 + <code>dsh.profile.bundles</code> 条目
+（<code>pnpm install</code> 后由本包 <code>cordis.patch.yml</code> 提供挂载行）。</p>
+<p>校验：<code>dsh --profile web --dump-config</code>（确认 <code>dsh-session-handoff</code> 行出现在组成树中）；重启 web 生效
+（<code>python3 ~/DSH/dsh-sidechat/restart-dsh-web.py &lt;当前pid&gt; [delay-s]</code>，detached 安全重启）。
+装配证据：<code>pluginInventory/list</code> 远程查询出现 <code>dsh-session-handoff</code> 且 phase=active。</p>
+<p><strong>开发快捷方式（可选）</strong>：在 <code>~/.dsh/profiles/web/cordis.patch.yml</code> 的 insert 列表加一行直接指向源码
+（免安装、免 pnpm，但非标准分发形态）：</p>
+<pre><code>- insert:
+    - id: dsh-session-handoff
+      name: 'file:///Users/zhichao/DSH/dsh-session-handoff/lib/index.js'
+</code></pre>
+<h2>观测 → 判定 → 触发</h2>
+<table>
+<thead>
+<tr>
+<th>阶段</th>
+<th>实现</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>观测</td>
+<td>投影单元 <code>sessionHandoff</code>（key，stateVersion 1，log-scoped 纯 fold：<code>turns</code>/<code>steps</code>/<code>llmMs</code>/<code>titles</code>/<code>retries</code>/<code>splices</code>/<code>injected</code>/<code>cacheObs</code>），注册于 <code>ctx.sessionProjections</code>；订阅 change feed <code>(session, key, view, seq)</code></td>
+</tr>
+<tr>
+<td>判定</td>
+<td><code>computeCrossed(view, thresholds)</code>：turns ≥ 12、steps ≥ 150、llmMs ≥ 30min → <strong>切换建议</strong>；titles ≥ 2 → 阶段漂移提示；retries ≥ 3 → 返工提示；splices ≥ 8 → 前缀缓存健康提示（默认值镜像 CLI 包内策略，项目策略文件可覆盖）</td>
+</tr>
+<tr>
+<td>触发</td>
+<td>命中且未注入过的指纹 → 挂入 pending；该会话<strong>下一个 open turn</strong>（<code>turn/start</code>）注入一条确定性建议（微任务推迟，规避 <code>session append cannot reenter</code>）</td>
+</tr>
+<tr>
+<td>approval 门</td>
+<td>仅切换建议 + 工作项可得时，同 turn 内 <code>ctx.approval.request()</code>；<code>allowed-once</code> → spawn CLI；<code>rejected/cancelled/unavailable</code> → 不动</td>
+</tr>
+<tr>
+<td>执行</td>
+<td><code>harness-automation session handoff --project &lt;cwd&gt; --work-item &lt;id&gt; --session &lt;id&gt; [--dry-run]</code>；成功注入 seed 输出，失败只报告错误（CLI 缺口由负责人决策）</td>
+</tr>
+</tbody></table>
+<p>工作项解析：工具参数 → <code>session status</code> 扫描（<code>docs/HANDOFF-*.md</code> → <code>github:&lt;owner&gt;/&lt;repo&gt;#&lt;issue&gt;</code>）。触发工具另可传 <code>project</code> 覆盖会话 cwd（跨项目触发）。<code>--dry-run</code> <strong>默认 true</strong>（零写入）。</p>
+<h2>注入纪律与缓存观测（§5.4）</h2>
+<ul>
+<li><strong>确定性渲染</strong>：消息内容只由 <code>{signal, threshold, actual, projectPath, workItem, sessionId, dryRun}</code> 渲染，无时间戳/随机数；<code>test/template.test.mjs</code> 断言两次渲染逐字节一致。</li>
+<li><strong>零重复追加</strong>：建议消息 id = <code>dsh-session-handoff-suggestion-&lt;fp1&gt;+&lt;fp2&gt;…</code>（fp=<code>signal:threshold</code>）。注入前查 <code>agent.inbox.nextStep</code> 是否已有同 id；fold 从 <code>user/message</code> 事件读回指纹 → <code>injected[]</code>，重启后 refold 依然去重（重启安全）。</li>
+<li><strong>前缀核对观测方法</strong>：fold 在注入建议后的<strong>第一个</strong> <code>assistant/message</code> 上记录 <code>cacheObs[] = {fingerprint, before, after}</code>，<code>before</code>=注入前最后一次请求的 <code>usage.cacheReadTokens</code>，<code>after</code>=注入后第一次请求的 <code>usage.cacheReadTokens</code>。前缀未受损 ⇔ <code>after ≥ before</code>（新注入内容追加在保留历史之后，前缀逐字节不变）。日志侧证据：注入的 <code>user/message</code> 事件 <code>surfaceOp:"append"</code>（见 spike-findings §3.1）。投影快照可直接读取：<code>sessionProjections.snapshot(session).values.sessionHandoff.cacheObs</code>。</li>
+<li><strong>自反馈防护</strong>：<code>splices</code> 计数排除 <code>source.plugin === 'dsh-session-handoff'</code> 的消息。</li>
+</ul>
+<h2>测试与验收（设计 §9 P2 对照）</h2>
+<ul>
+<li><code>test/replay.mjs</code>：离线回放真实会话日志（session-3299f5d5、本会话），断言 fold 计数与日志事件逐项一致、两次回放逐字节一致。已验：session-3299f5d5 在默认阈值下 turns/steps/llmMs/titles/splices 五信号全部命中。</li>
+<li><code>test/template.test.mjs</code>：阈值命中 → 模板确定性 → 指纹去重往返 → cacheObs before/after。10/10。</li>
+<li>装配验收：web profile 加载成功（pluginInventory phase=active）；信号命中 → 下一 open turn 注入建议（live 观察）；批准 → CLI 完成一次 handoff（dry-run 可接受；<code>allowed-once</code> 需会话 approval policy=ask）；注入前后请求前缀对比（cacheObs + surfaceOp 证据）。</li>
+<li>遗留与已知限制：<ul>
+<li><code>allowed-once</code> 路径在 policy=never 会话被确定性拒绝（seam 语义）；验收时临时切 ask。</li>
+<li>approval 答案若在 turn 结束后才落（用户长时间不点），<code>approval/decided</code> 审计事件可能非 turn-enclosed——宿主 seam 的已知行为（README "Only one-shot grants / requests valid only inside an open turn"），P3 可换用工具路径触发规避。</li>
+<li><code>session/event</code> 是进程级投递：插件按 session id 过滤，每会话独立 fold/去重。</li>
+<li>项目策略文件的插件侧解析只认 <code>thresholds:</code> 块标量数字键（无 YAML 依赖；CLI 权威解析 workflow.path 经 <code>session status</code> 复用）。</li>
+</ul>
+</li>
+</ul>
+<h2>目录</h2>
+<pre><code>lib/index.js       插件装配（feed/去重/注入/approval/CLI spawn/触发工具）
+lib/projection.js  投影单元纯 fold（可离线回放）
+lib/config.js      阈值策略读取（内置默认镜像 CLI 包内策略）
+lib/template.js    确定性模板 + 指纹 + 命中判定
+lib/cli.js         harness-automation spawn 与 JSON 解析
+test/replay.mjs    真实日志离线回放测试
+test/template.test.mjs  合成事件测试
+scripts/spike-analyze-log.mjs  spike 离线分析工具
+docs/spike-findings.md  spike 结论
+docs/designs/…      权威设计文档（只读）
+</code></pre>

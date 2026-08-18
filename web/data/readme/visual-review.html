@@ -1,0 +1,313 @@
+中文 | <a href="https://github.com/wang-bool/visual-review/blob/HEAD/README.en.md">English</a>
+
+<h1>visual-review</h1>
+<p><a href="https://github.com/wang-bool/visual-review/blob/HEAD/LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License: MIT"></a>
+<a href="https://www.npmjs.com/package/visual-review"><img src="https://img.shields.io/npm/v/visual-review.svg" alt="npm version"></a>
+<a href="https://github.com/awesome-dsh-plugin/awesome-dsh-plugin"><img src="https://awesome-dsh-plugin.com/badge.svg" alt="Awesome DSH Plugin"></a></p>
+<p>为 <a href="https://github.com/deepseek-ai/deepseek-harness">DeepSeek Harness</a>（DSH）Web 界面打造的<strong>双面插件</strong>：让聊天界面直接<strong>显示图片</strong>，并让模型<strong>解读图片</strong>。</p>
+<ul>
+<li><strong>图片显示</strong>：用户粘贴 / 上传的图片（PNG / JPEG / WebP / GIF）会直接渲染在对话气泡里。</li>
+<li><strong>视觉解读</strong>：<code>visual_review</code> 工具调用视觉多模态模型，返回图片的中文文字描述（文字、物体、人物、场景、图表等）。</li>
+<li><strong>双引擎</strong>：云端优先（任意 OpenAI 兼容的多模态 <code>chat/completions</code> API，零本地依赖）；未配置时自动回退本机 Qwen3-VL-8B（数据不出本机）。</li>
+<li><strong>无需更换模型</strong>：插件在发送路径上把「图片块」转换成「带附件 ID 的文本注解」，任何本身看不到图片的文本模型都能配合工作。</li>
+</ul>
+<hr>
+<h2>目录</h2>
+<ul>
+<li><a href="#%E5%8A%9F%E8%83%BD%E7%89%B9%E6%80%A7">功能特性</a></li>
+<li><a href="#%E6%9E%B6%E6%9E%84%E4%B8%8E%E5%B7%A5%E4%BD%9C%E5%8E%9F%E7%90%86">架构与工作原理</a></li>
+<li><a href="#%E7%9B%AE%E5%BD%95%E7%BB%93%E6%9E%84">目录结构</a></li>
+<li><a href="#%E7%8E%AF%E5%A2%83%E8%A6%81%E6%B1%82">环境要求</a></li>
+<li><a href="#%E5%AE%89%E8%A3%85">安装</a></li>
+<li><a href="#%E9%85%8D%E7%BD%AE">配置</a></li>
+<li><a href="#%E4%BD%BF%E7%94%A8">使用</a></li>
+<li><a href="#%E5%AE%89%E5%85%A8%E8%AF%B4%E6%98%8E">安全说明</a></li>
+<li><a href="#%E5%BC%80%E5%8F%91%E4%B8%8E%E6%B5%8B%E8%AF%95">开发与测试</a></li>
+<li><a href="#%E5%B8%B8%E8%A7%81%E9%97%AE%E9%A2%98faq">常见问题（FAQ）</a></li>
+<li><a href="#license">License</a></li>
+</ul>
+<h2>功能特性</h2>
+<table>
+<thead>
+<tr>
+<th>能力</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>聊天界面渲染图片</td>
+<td>客户端插件注入 <code>conversation.chat.node</code> 渲染槽，把图片块渲染为 <code>&lt;img&gt;</code>（经 <code>/vr-image</code> 路由取字节）</td>
+</tr>
+<tr>
+<td>模型“看见”图片</td>
+<td><code>/api/session.prompt</code> 拦截 + <code>agent/pre-step</code> 兜底：图片块 → 注解文本，附带附件 ID，提示模型调用工具</td>
+</tr>
+<tr>
+<td>图片解读工具</td>
+<td><code>visual_review</code>：传 <code>attachment_id</code>（会话图片）或 <code>image_path</code>（本地文件）即可分析</td>
+</tr>
+<tr>
+<td>云端引擎</td>
+<td>OpenAI 兼容 <code>chat/completions</code>，图片以 <code>data:</code> URL 内联发送，支持 <code>content</code> / <code>reasoning_content</code> 返回</td>
+</tr>
+<tr>
+<td>本机引擎</td>
+<td>内置 JSON-lines worker，加载本地 Qwen3-VL-8B 推理，图片与结果均不出本机</td>
+</tr>
+<tr>
+<td>配置工具</td>
+<td><code>visual_review_config</code>：查看 / 更新云端 <code>url</code> / <code>api_key</code> / <code>model</code>，一键切换引擎</td>
+</tr>
+</tbody></table>
+<h2>架构与工作原理</h2>
+<pre><code>┌──────────────────────────── DSH Web 前端 ────────────────────────────┐
+│  聊天界面（React）                                                    │
+│    └─ visual-review 客户端插件（lib/client.js）                        │
+│         注入 conversation.chat.node 渲染槽                             │
+│         └─ 图片块 → &lt;img src="https://raw.githubusercontent.com/wang-bool/visual-review/HEAD//vr-image/sha256:xxx"&gt;                  │
+└───────────────┬─────────────────────────────────────────┬────────────┘
+                │ ① /api/session.prompt（图片块→注解）      │ ② /vr-image 取图片字节
+┌───────────────▼─────────────────────────────────────────▼────────────┐
+│                        DSH Host（插件 Host 端 lib/index.js）          │
+│  • /api/session.prompt 拦截路由：把 image 块存为附件，替换为注解文本    │
+│  • agent/pre-step 兜底（幂等）：模型侧消息里的 image 块 → 注解          │
+│  • /vr-image 路由：仅回环地址可访问，从附件存储读取图片字节             │
+│  • visual_review 工具：云端优先 → 本机回退                             │
+│        ├─ 云端：node 内联脚本 → OpenAI 兼容 chat/completions           │
+│        └─ 本机：spawn Python worker（server/visual_review_server.py）  │
+└───────────────────────────────────────────────────────────────────────┘
+</code></pre>
+<p>三个关键机制：</p>
+<ol>
+<li><p><strong>发送拦截（图片 → 注解）</strong>。客户端发送 <code>session.prompt</code> 时，插件拦截请求，把内容中的 <code>image</code> 块交给附件服务保存，得到附件 ID（形如 <code>sha256:xxx</code>），再替换成一段文本注解：</p>
+<pre><code>[用户上传了图片附件（image/png，640x360px）。你无法直接查看图片，
+请调用 visual_review 工具并传入 attachment_id="sha256:xxx" 获取图片的视觉解析。]
+</code></pre>
+<p><code>agent/pre-step</code> 钩子对模型侧消息做同样的转换，作为兜底且幂等。于是<strong>文本模型也能“看见”图片</strong>——它只需按注解调用工具。</p>
+</li>
+<li><p><strong><code>/vr-image</code> 路由（字节 → 渲染）</strong>。客户端渲染槽把注解里的附件 ID 提取出来，渲染为 <code>&lt;img src="https://raw.githubusercontent.com/wang-bool/visual-review/HEAD//vr-image/&lt;id&gt;"&gt;</code>；Host 端从附件存储读回图片字节返回。该路由<strong>仅接受回环地址</strong>（127.0.0.1 / ::1）的请求。</p>
+</li>
+<li><p><strong><code>visual_review</code> 工具（图片 → 描述）</strong>。模型拿到附件 ID 后调用工具：优先读取 <code>$DSH_HOME/visual_review.config.json</code> 走云端；未配置云端则启动/复用本机 Python worker，把图片以 base64 经 stdin 发送，worker 返回生成文本。</p>
+</li>
+</ol>
+<p>本机 worker 通信协议（JSON-lines，每行一个 JSON 对象）：</p>
+<pre><code>请求  → {"id":1, "kind":"describe", "image_b64":"...", "prompt":"...", "max_new_tokens":256}
+响应  → {"id":1, "ok":true, "text":"图片中有一只橘猫……"}
+就绪  → {"event":"ready"}   （模型在后台线程加载，describe 请求会等待该事件）
+</code></pre>
+<h2>目录结构</h2>
+<pre><code>visual-review/
+├── lib/
+│   ├── index.js                  # Host 端插件：工具、路由、发送拦截、worker 管理
+│   └── client.js                 # 客户端插件：聊天界面图片渲染
+├── server/
+│   └── visual_review_server.py   # 本机推理 worker（Qwen3-VL-8B，JSON-lines 协议）
+├── config/
+│   └── visual_review.config.example.json  # 云端配置模板（含 API Key 占位符）
+├── install/
+│   ├── install.sh                # 一键安装到 DSH profile
+│   └── cordis.patch.yml.example  # 手动安装时追加到 cordis.patch.yml 的片段
+├── examples/
+│   └── test_image.png            # 测试图片
+├── assets/
+│   ├── qr-official-account.jpg   # 公众号二维码
+│   └── qr-group.png              # 交流群二维码
+├── cordis.patch.yml              # dsh.bundle 安装补丁层（`dsh plugin add` 用）
+├── package.json                  # 插件清单（exports host/client 双入口 + dsh.bundle manifest）
+├── README.md / README.en.md      # 中文 / English 文档
+├── LICENSE                       # MIT
+└── .gitignore
+</code></pre>
+<h2>环境要求</h2>
+<ul>
+<li><strong>DSH</strong>（DeepSeek Harness）Web profile（<code>~/.dsh/profiles/web</code>），Node.js ≥ 18（需要全局 <code>fetch</code>）。</li>
+<li>视觉引擎<strong>二选一</strong>：<ul>
+<li><strong>云端模式</strong>（推荐，最简单）：任意 OpenAI 兼容的多模态 <code>chat/completions</code> API（如 SiliconFlow、OpenAI、DeepSeek、本地 vLLM 等）。</li>
+<li><strong>本机模式</strong>：Python 3.10+，<code>torch</code>、<code>transformers</code>（≥ 4.57，支持 Qwen3-VL）、<code>Pillow</code>，以及本地模型文件 <code>Qwen3-VL-8B-Instruct</code>（可换为任意兼容的 Qwen3-VL 权重）。</li>
+</ul>
+</li>
+</ul>
+<h2>安装</h2>
+<blockquote>
+<p><strong>方式 A / B 无需依赖外部发布渠道</strong>；插件已声明 <code>dsh.bundle</code> manifest（<code>cordis.patch.yml</code>），因此也支持官方 <code>dsh plugin add</code> 安装（<strong>方式 C</strong>，推荐，最简单）。</p>
+</blockquote>
+<h3>方式 C：官方 <code>dsh plugin add</code>（推荐）</h3>
+<p>npm 发布后：</p>
+<pre><code>dsh plugin --profile web add visual-review
+</code></pre>
+<p>npm 尚未发布或想装最新版时，可直接从 GitHub 安装：</p>
+<pre><code>dsh plugin --profile web add github:wang-bool/visual-review
+</code></pre>
+<p>安装后<strong>重启 dsh web</strong> 并刷新浏览器。</p>
+<h3>方式 A：一键脚本</h3>
+<pre><code>git clone &lt;本仓库&gt; visual-review
+cd visual-review
+bash install/install.sh
+</code></pre>
+<p>脚本会把插件复制到 <code>$DSH_HOME/profiles/web/node_modules/visual-review/</code>，并在 <code>cordis.patch.yml</code> 中注册（幂等，重复执行安全）。可用 <code>DSH_HOME</code> / <code>DSH_PROFILE</code> 环境变量指定其它数据目录或 profile。</p>
+<h3>方式 B：手动安装</h3>
+<ol>
+<li><p>将插件包放入 profile 的 <code>node_modules</code>：</p>
+<pre><code>DSH_HOME="${DSH_HOME:-$HOME/.dsh}"
+PROFILE_DIR="$DSH_HOME/profiles/web"
+mkdir -p "$PROFILE_DIR/node_modules/visual-review"
+cp -r package.json lib server "$PROFILE_DIR/node_modules/visual-review/"
+</code></pre>
+</li>
+<li><p>在 <code>$PROFILE_DIR/cordis.patch.yml</code> 末尾追加（参考 <code>install/cordis.patch.yml.example</code>）：</p>
+<pre><code>- insert:
+    - id: visual-review
+      name: 'visual-review'
+</code></pre>
+</li>
+<li><p><strong>重启 DSH web 服务并刷新浏览器</strong>。宿主日志出现以下输出即加载成功：</p>
+<pre><code>visual_review: 全局插件已加载 (config=.../visual_review.config.json)
+visual_review: /vr-image 图片路由已注册
+visual_review: /api/session.prompt 拦截路由已注册
+</code></pre>
+</li>
+</ol>
+<h2>配置</h2>
+<h3>云端引擎（推荐）</h3>
+<p>在 <code>$DSH_HOME/visual_review.config.json</code>（默认 <code>~/.dsh/visual_review.config.json</code>）写入：</p>
+<pre><code>{
+  "url": "https://api.siliconflow.cn/v1/chat/completions",
+  "apiKey": "sk-xxxx",
+  "model": "Qwen/Qwen3.5-35B-A3B"
+}
+</code></pre>
+<p>也可以在会话中让模型调用 <strong><code>visual_review_config</code></strong> 工具填写 <code>url</code> / <code>api_key</code> / <code>model</code>（只传需要修改的字段；三项都留空表示清除云端配置、回退本机引擎）。</p>
+<blockquote>
+<p>该文件包含明文 API Key，务必加入 <code>.gitignore</code> 并注意文件权限（本仓库的 <code>.gitignore</code> 已包含）。</p>
+</blockquote>
+<h3>本机引擎</h3>
+<p>未配置云端时自动回退。需要本地模型：</p>
+<pre><code>huggingface-cli download Qwen/Qwen3-VL-8B-Instruct
+</code></pre>
+<p>模型目录解析顺序：命令行参数 → 环境变量 <code>VISUAL_REVIEW_MODEL_DIR</code> → 默认 <code>~/.cache/huggingface/hub/models--Qwen--Qwen3-VL-8B-Instruct</code>。</p>
+<h3>环境变量</h3>
+<table>
+<thead>
+<tr>
+<th>变量</th>
+<th>默认值</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>DSH_HOME</code></td>
+<td><code>$HOME/.dsh</code></td>
+<td>DSH 数据目录，<code>visual_review.config.json</code> 存放处</td>
+</tr>
+<tr>
+<td><code>VISUAL_REVIEW_SERVER</code></td>
+<td>插件自带 <code>server/visual_review_server.py</code></td>
+<td>本机推理脚本路径</td>
+</tr>
+<tr>
+<td><code>VISUAL_REVIEW_PYTHON</code></td>
+<td><code>python3</code></td>
+<td>本机推理脚本的解释器</td>
+</tr>
+<tr>
+<td><code>VISUAL_REVIEW_WORKSPACE</code></td>
+<td>sandbox 工作区根 → 进程 cwd</td>
+<td>工作区根目录（<code>.visual_review_tmp</code> 所在处）</td>
+</tr>
+<tr>
+<td><code>VISUAL_REVIEW_ATTACH_ROOT</code></td>
+<td><code>$HOME/.dsh/attachments/v1/objects</code></td>
+<td>附件对象存储根目录（<code>/vr-image</code> 兜底读取用）</td>
+</tr>
+<tr>
+<td><code>VISUAL_REVIEW_MODEL_DIR</code></td>
+<td>HF 缓存默认路径</td>
+<td>本机 Qwen3-VL 模型目录（worker 内读取）</td>
+</tr>
+</tbody></table>
+<h2>使用</h2>
+<ol>
+<li><strong>直接体验</strong>：在聊天框<strong>粘贴</strong>或<strong>上传</strong>一张图片 → 图片立即渲染在气泡里；模型侧自动出现附件注解，模型会自动调用 <code>visual_review</code> 并给出图片描述。</li>
+<li><strong>分析本地文件</strong>：让模型分析磁盘上的图片，例如“请用 <code>visual_review</code> 分析 <code>/path/to/photo.png</code>”，模型会以 <code>image_path</code> 参数调用工具。</li>
+<li><strong>定制提问</strong>：给模型指令时说明诉求，如“读出这张图片里的所有文字”“描述这个图表的趋势”。工具支持 <code>prompt</code> 参数，由模型按需传递。</li>
+<li><strong>切换引擎</strong>：调用 <code>visual_review_config</code> 修改云端配置即可；把三项都置空则回到本机引擎。</li>
+</ol>
+<h2>安全说明</h2>
+<ul>
+<li><code>/vr-image</code> 与 <code>/api/session.prompt</code> 路由<strong>只接受回环地址</strong>（127.0.0.1 / ::1）的请求，其他来源一律 403。</li>
+<li>云端 API Key 以<strong>明文</strong>存储在 <code>$DSH_HOME/visual_review.config.json</code>，请勿提交到仓库、注意权限控制。</li>
+<li>本机模式：图片仅在本机处理，不产生任何外部网络请求。</li>
+</ul>
+<h2>开发与测试</h2>
+<h3>单独测试本机 worker（不经过 DSH）</h3>
+<pre><code># 方式一：环境变量指定模型目录
+VISUAL_REVIEW_MODEL_DIR=/path/to/Qwen3-VL-8B-Instruct python3 -u server/visual_review_server.py
+
+# 方式二：命令行参数指定模型目录
+python3 -u server/visual_review_server.py /path/to/Qwen3-VL-8B-Instruct
+</code></pre>
+<p>另开一个终端发送请求（图片先 base64 编码）：</p>
+<pre><code>B64=$(base64 -w0 examples/test_image.png)
+printf '{"id":1,"kind":"describe","image_b64":"%s","prompt":"请描述这张图片","max_new_tokens":256}\n' "$B64" | \
+  VISUAL_REVIEW_MODEL_DIR=/path/to/model python3 -u server/visual_review_server.py
+</code></pre>
+<p>预期依次收到 <code>{"event":"ready"}</code> 与 <code>{"id":1,"ok":true,"text":"..."}</code>。<code>kind:"decode_image"</code> 可用于把 base64 文件还原为二进制文件（无需模型）。</p>
+<h3>协议速查</h3>
+<table>
+<thead>
+<tr>
+<th>方向</th>
+<th>消息</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>Host → worker</td>
+<td><code>{"id":&lt;n&gt;,"kind":"describe","image_b64":"...","prompt":"...","max_new_tokens":&lt;int&gt;}</code></td>
+</tr>
+<tr>
+<td>Host → worker</td>
+<td><code>{"id":&lt;n&gt;,"kind":"decode_image","b64_path":"...","out_path":"..."}</code></td>
+</tr>
+<tr>
+<td>worker → Host</td>
+<td><code>{"id":&lt;n&gt;,"ok":true,"text":"..."}</code> 或 <code>{"id":&lt;n&gt;,"ok":false,"error":"..."}</code></td>
+</tr>
+<tr>
+<td>worker → Host</td>
+<td><code>{"event":"ready"}</code>（模型就绪）/ <code>{"event":"load-failed","error":"..."}</code></td>
+</tr>
+</tbody></table>
+<h2>常见问题（FAQ）</h2>
+<p><strong>Q：模型加载很慢 / 报“模型加载超时（20 分钟）”。</strong>
+本机模式首次要加载 Qwen3-VL-8B 权重，视磁盘与显存可能需数分钟。可先确认 <code>VISUAL_REVIEW_MODEL_DIR</code> 指向正确，或用云端模式。</p>
+<p><strong>Q：报“找不到附件 ID”。</strong>
+附件引用只在本会话内有效：请直接重新上传图片，或改用 <code>image_path</code> 传入本地文件路径。</p>
+<p><strong>Q：云端调用失败，提示 url 似乎缺少 <code>/chat/completions</code>。</strong>
+<code>url</code> 必须是完整的 OpenAI 兼容端点，如 <code>https://xxx/v1/chat/completions</code>。</p>
+<p><strong>Q：图片在界面上显示为“（图片加载失败）”。</strong>
+<code>/vr-image</code> 仅允许回环请求；若通过远程访问 DSH Web，图片渲染可能被拒绝。另外开发模式下修改客户端插件需要重建前端 bundle 并刷新。</p>
+<p><strong>Q：粘贴图片后模型说看不到图片。</strong>
+确认宿主日志中有 <code>/api/session.prompt 拦截路由已注册</code>。若该行缺失（webServer/apiProxy 不可用），发送拦截被跳过，此时依赖 <code>agent/pre-step</code> 兜底；仍不行请重新上传图片。</p>
+<h2>License</h2>
+<p><a href="https://github.com/wang-bool/visual-review/blob/HEAD/LICENSE">MIT</a> © visual-review authors</p>
+<hr>
+<h2>联系我们</h2>
+<p>欢迎关注公众号、加入交流群，获取最新动态、使用反馈与开源讨论：</p>
+
+
+<table>
+<thead>
+<tr>
+<th align="center">公众号 · 关注获取最新动态</th>
+<th align="center">交流群 · 入群交流反馈</th>
+</tr>
+</thead>
+<tbody><tr>
+<td align="center"><img src="https://raw.githubusercontent.com/wang-bool/visual-review/HEAD/assets/qr-official-account.jpg" alt="公众号二维码"></td>
+<td align="center"><img src="https://raw.githubusercontent.com/wang-bool/visual-review/HEAD/assets/qr-group.png" alt="交流群二维码"></td>
+</tr>
+</tbody></table>
+<blockquote>
+<p>💡 群二维码有时效（7 天），过期后请关注公众号获取最新入群方式。</p>
+</blockquote>
+

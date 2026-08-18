@@ -1,0 +1,269 @@
+<h1>dsh-hooks-plugin</h1>
+<p><a href="https://github.com/KYinCode/dsh-hooks-plugin/blob/HEAD/README.md">中文</a> | <a href="https://github.com/KYinCode/dsh-hooks-plugin/blob/HEAD/README.en.md">English</a></p>
+<p>为 <a href="https://github.com/deepseek-ai/deepseek-harness">DeepSeek Harness</a> 提供 Claude Code 风格的 hooks：在智能体 / 工具生命周期事件上运行 shell 命令，配置来自 <code>.dsh/hooks.json</code>（与 Claude Code hooks 兼容的 JSON 结构）。</p>
+<blockquote>
+<p>产品名是 <strong>dsh-hooks</strong>；npm / GitHub 包名是 <strong><code>dsh-hooks-plugin</code></strong>（<code>dsh-hooks</code> 已被占用）。运行时 API 与日志路径沿用 <code>dsh-hooks</code> 名：<code>~/.dsh/logs/dsh-hooks/dsh-hooks.log</code> 与 <code>GET /dsh-hooks/recent</code>（见下）。</p>
+</blockquote>
+<h2>目录</h2>
+<ul>
+<li><a href="#%E7%89%B9%E6%80%A7v1">特性（v1）</a></li>
+<li><a href="#%E5%AE%89%E8%A3%85">安装</a></li>
+<li><a href="#%E9%85%8D%E7%BD%AE%E7%A4%BA%E4%BE%8B">配置示例</a><ul>
+<li><a href="#hook-%E5%AD%97%E6%AE%B5-schema">hook 字段 schema</a></li>
+</ul>
+</li>
+<li><a href="#cc-%E5%85%BC%E5%AE%B9%E8%BE%B9%E7%95%8C">CC 兼容边界</a></li>
+<li><a href="#stdin--stdout-%E5%8D%8F%E8%AE%AEcc-%E5%85%BC%E5%AE%B9">stdin / stdout 协议（CC 兼容）</a></li>
+<li><a href="#%E5%BC%80%E5%8F%91--%E9%AA%8C%E8%AF%81">开发 / 验证</a></li>
+<li><a href="#%E6%98%8E%E7%A1%AE%E4%B8%8D%E5%81%9A%E8%BE%B9%E7%95%8C">明确不做（边界）</a></li>
+<li><a href="#license">License</a></li>
+</ul>
+<h2>特性（v1）</h2>
+<ul>
+<li><strong>四层配置</strong>：全局 <code>~/.dsh/hooks.json</code> → 预设 <code>&lt;preset-dir&gt;/hooks.json</code> → 项目 <code>&lt;项目根&gt;/.dsh/hooks.json</code> → 项目本地 <code>.dsh/hooks.local.json</code>。</li>
+<li><strong>CC 兼容 schema 与协议</strong>：<code>matcher[] + hooks[]</code> 结构、stdin JSON 输入 / stdout JSON 决策输出，可复用现有 Claude Code hook 脚本。</li>
+<li><strong>去重规则对齐 CC 2.1.88 <code>hookDedupKey</code></strong>：<code>command</code> = <code>shell+command+if</code>、<code>http</code> = <code>url+if</code>、<code>prompt/agent</code> = <code>prompt+if</code>；同一 key 跨层只执行一次，最后合并层胜出；<code>callback/function</code> 不去重。</li>
+<li><strong>matcher 语义对齐 CC <code>matchesPattern</code></strong>：<code>*</code> 全匹配、<code>A|B</code> 管道精确匹配、其余按正则；<code>if</code> 条件支持权限规则语法（<code>Bash(git *)</code>、<code>Read(*.ts)</code>）。</li>
+<li><strong>事件</strong>：<code>PreToolUse</code> / <code>PostToolUse</code> / <code>PostToolUseFailure</code> / <code>UserPromptSubmit</code> / <code>SessionStart</code> / <code>SessionEnd</code> / <code>Stop</code> / <code>SubagentEnd</code>。<ul>
+<li><code>PreToolUse</code> 决策 <code>deny</code> → 官方工具失败卡片（模型看到 <code>Error: &lt;reason&gt;</code>）。</li>
+</ul>
+</li>
+<li><strong>子代理</strong>：默认触发，输入载荷携带 <code>agent_id</code> / <code>agent_type</code> / <code>delegation_depth</code>；可用 <code>subagents: false</code> 关闭；命令在触发者自己的沙箱上下文执行。</li>
+<li><strong>热重载</strong>：项目配置改动自动重新加载（<code>fs.watchFile</code>），无需重启。</li>
+<li><strong>免重启热升级</strong>：安装 <a href="https://github.com/KYinCode/dsh-hot-installer"><code>dsh-hot-installer</code></a> 后，<code>dsh plugin --profile web add &lt;包&gt;@&lt;新版本&gt;</code> 当场生效，无需重启。</li>
+<li><strong>交付形态</strong>：profile bundle（<code>cordis.patch.yml</code> 自动插行），用 <code>dsh plugin --profile &lt;p&gt; add</code> 安装。</li>
+</ul>
+<h2>安装</h2>
+<pre><code># 从 npm 安装（发布后）
+dsh plugin --profile web add dsh-hooks-plugin
+
+# 或本地打包
+npm pack
+dsh plugin --profile web add ./dsh-hooks-plugin-0.2.3.tgz
+</code></pre>
+<p>安装后新会话自动生效；已有会话需要新建（<code>agent/created</code> 时按会话接线）。</p>
+<h2>配置示例</h2>
+<p><code>&lt;项目根&gt;/.dsh/hooks.json</code>：</p>
+<pre><code>{
+  "PreToolUse": [
+    {
+      "matcher": "Read|Write|Edit",
+      "hooks": [
+        {
+          "type": "command",
+          "command": "echo hook triggered",
+          "timeout": 5
+        }
+      ]
+    },
+    {
+      "matcher": "Read",
+      "hooks": [
+        {
+          "type": "command",
+          "command": "node -e \"process.stdout.write(JSON.stringify({hookSpecificOutput:{hookEventName:'PreToolUse',permissionDecision:'deny',permissionDecisionReason:'blocked'}}))\"",
+          "if": "Read(*private*)",
+          "timeout": 5
+        }
+      ]
+    }
+  ]
+}
+</code></pre>
+<h3>hook 字段 schema</h3>
+<p>每条 hook 是一个对象，<code>type</code> 决定判别联合（对齐 CC 2.1.88 <code>schemas/hooks.ts</code>）。</p>
+<p><strong>command / prompt / agent / http 公共字段</strong></p>
+<table>
+<thead>
+<tr>
+<th>字段</th>
+<th>类型</th>
+<th>默认</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>type</code></td>
+<td><code>"command" | "http" | "prompt" | "agent"</code></td>
+<td>—</td>
+<td>hook 类型。v1 实现 <code>command</code> 与 <code>http</code>；<code>prompt</code>/<code>agent</code> 依赖外部 LLM/子代理，v1 不做（<code>parseHookConfig</code> 会拒绝未知类型）</td>
+</tr>
+<tr>
+<td><code>if</code></td>
+<td><code>string</code></td>
+<td>无</td>
+<td>权限规则语法过滤器（如 <code>Bash(git *)</code>、<code>Read(*.ts)</code>），仅工具类事件生效；在 spawn 之前匹配 <code>tool_name</code> + <code>tool_input</code>，不匹配则不启动进程</td>
+</tr>
+<tr>
+<td><code>timeout</code></td>
+<td><code>number</code>（&gt;0）</td>
+<td>60</td>
+<td>本命令/请求的超时秒数</td>
+</tr>
+<tr>
+<td><code>statusMessage</code></td>
+<td><code>string</code></td>
+<td>无</td>
+<td><strong>纯展示文案</strong>：hook 运行时在 spinner/列表里显示的自定义状态消息；有则取代 command/url/prompt 作为 hook 显示名，<strong>不参与去重键、不改变执行与决策</strong></td>
+</tr>
+<tr>
+<td><code>once</code></td>
+<td><code>boolean</code></td>
+<td><code>false</code></td>
+<td>为 <code>true</code> 时执行一次后从运行期集合移除</td>
+</tr>
+</tbody></table>
+<p><strong><code>type: "command"</code> 专用</strong></p>
+<table>
+<thead>
+<tr>
+<th>字段</th>
+<th>类型</th>
+<th>默认</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>command</code></td>
+<td><code>string</code>（必填）</td>
+<td>—</td>
+<td>要执行的 shell 命令</td>
+</tr>
+<tr>
+<td><code>shell</code></td>
+<td><code>"bash" | "powershell"</code></td>
+<td><code>bash</code></td>
+<td>shell 解释器；<code>bash</code> 用 <code>$SHELL</code>（bash/zsh/sh），<code>powershell</code> 用 pwsh。<strong>是去重键的一部分</strong></td>
+</tr>
+<tr>
+<td><code>async</code></td>
+<td><code>boolean</code></td>
+<td><code>false</code></td>
+<td>为 <code>true</code> 时后台运行、不阻塞主流程</td>
+</tr>
+<tr>
+<td><code>asyncRewake</code></td>
+<td><code>boolean</code></td>
+<td><code>false</code></td>
+<td>后台运行，且退出码为 2 时唤醒模型并注入阻塞错误；隐含 <code>async</code></td>
+</tr>
+</tbody></table>
+<p><strong><code>type: "http"</code> 专用</strong></p>
+<table>
+<thead>
+<tr>
+<th>字段</th>
+<th>类型</th>
+<th>默认</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>url</code></td>
+<td><code>string</code>（必填，URL）</td>
+<td>—</td>
+<td>向其 POST hook 输入 JSON 的地址</td>
+</tr>
+<tr>
+<td><code>headers</code></td>
+<td><code>object&lt;string,string&gt;</code></td>
+<td>无</td>
+<td>附加请求头；值可用 <code>$VAR_NAME</code> / <code>${VAR_NAME}</code> 引用环境变量</td>
+</tr>
+<tr>
+<td><code>allowedEnvVars</code></td>
+<td><code>string[]</code></td>
+<td>无</td>
+<td>允许在 header 值里插值的环境变量名白名单；只列出的变量会被解析，其余 <code>$VAR</code> 引用留空</td>
+</tr>
+</tbody></table>
+<p><strong><code>type: "prompt"</code> / <code>type: "agent"</code> 专用（v1 不做，schema 对齐 CC）</strong></p>
+<table>
+<thead>
+<tr>
+<th>字段</th>
+<th>类型</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>prompt</code></td>
+<td><code>string</code>（必填）</td>
+<td>用 LLM 评估的 prompt / 要验证的内容；<code>$ARGUMENTS</code> 占位 = hook 输入 JSON</td>
+</tr>
+<tr>
+<td><code>model</code></td>
+<td><code>string</code></td>
+<td>指定模型（如 <code>claude-sonnet-4-6</code>）；缺省用小模型 / Haiku</td>
+</tr>
+</tbody></table>
+<p><strong>matcher 结构</strong></p>
+<pre><code>{
+  "&lt;Event&gt;": [
+    { "matcher": "&lt;模式&gt;", "hooks": [ &lt;hook&gt;, ... ] },
+    ...
+  ]
+}
+</code></pre>
+<table>
+<thead>
+<tr>
+<th>字段</th>
+<th>类型</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>matcher</code></td>
+<td><code>string</code></td>
+<td>事件匹配模式：<code>*</code>（或空）全匹配；<code>A|B</code> 管道精确匹配；其余按正则。DSH 工具名小写，精确匹配大小写不敏感</td>
+</tr>
+<tr>
+<td><code>hooks</code></td>
+<td><code>hook[]</code></td>
+<td>该 matcher 命中时串行执行的 hook 列表</td>
+</tr>
+</tbody></table>
+<p>事件 key 限 CC 27 事件名；v1 实际接线：<code>PreToolUse</code> / <code>PostToolUse</code> / <code>PostToolUseFailure</code> / <code>UserPromptSubmit</code> / <code>SessionStart</code> / <code>SessionEnd</code> / <code>Stop</code> / <code>SubagentEnd</code>。</p>
+<h2>CC 兼容边界</h2>
+<p>与 Claude Code 的兼容<strong>只停留在"配置结构延续 CC 形状 + 协议能自洽表达决策"</strong>；不搬运 CC 专属协议面：</p>
+<ul>
+<li>✅ 配置结构（<code>matcher[] + hooks[]</code>、<code>if</code>、<code>shell</code>、<code>timeout</code>、<code>statusMessage</code>、<code>once</code>）、stdin JSON 输入 / stdout JSON 决策输出、去重键语义 —— 延用，方便理解与迁移。</li>
+<li>❌ 不注入 CC 专属环境变量（<code>CLAUDE_PROJECT_DIR</code>、<code>CLAUDE_PLUGIN_ROOT</code> 等）——项目根已在输入 JSON 的 <code>cwd</code> 字段，且 DSH 没有插件/技能目录可指向。</li>
+<li>❌ 不做 <code>${CLAUDE_PLUGIN_ROOT}</code> 字符串替换、<code>CLAUDE_PLUGIN_OPTION_*</code>、<code>CLAUDE_ENV_FILE</code> 等插件体系机制。</li>
+<li>DSH 内部决策直接消费 waterfall 返回值，stdout JSON 只是让命令 hook 自己表达决策（如 deny）的协议手段，不是"按 CC 输出解析"。</li>
+</ul>
+<h2>stdin / stdout 协议（CC 兼容）</h2>
+<p><strong>输入</strong>（命令 stdin 单行 JSON）：</p>
+<pre><code>{
+  "session_id": "...",
+  "cwd": "F:\\project",
+  "hook_event_name": "PreToolUse",
+  "tool_name": "read",
+  "tool_input": { "path": "..." },
+  "tool_use_id": "...",
+  "agent_id": "&lt;仅子代理&gt;",
+  "agent_type": "&lt;仅子代理&gt;",
+  "delegation_depth": 0
+}
+</code></pre>
+<p><strong>输出</strong>（stdout JSON 决策）：</p>
+<pre><code>{
+  "hookSpecificOutput": {
+    "hookEventName": "PreToolUse",
+    "permissionDecision": "allow | deny | ask",
+    "permissionDecisionReason": "denied by ...",
+    "additionalContext": "..."
+  }
+}
+</code></pre>
+<h2>开发 / 验证</h2>
+<ul>
+<li>纯函数单测：<code>node --test test/</code></li>
+<li>热装验证（免重启）：<a href="https://github.com/KYinCode/dsh-hot-installer"><code>dsh-hot-installer</code></a> 已安装时，<code>dsh plugin --profile web add &lt;包&gt;@&lt;新版本&gt;</code> 当场生效。</li>
+<li>文件日志：<code>~/.dsh/logs/dsh-hooks/dsh-hooks.log</code>；最近记录：<code>GET /dsh-hooks/recent</code>。</li>
+</ul>
+<h2>明确不做（边界）</h2>
+<p>不实现卸载生命周期、悬空行提醒、会话级配置档、PreCompact/PostCompact、prompt/agent 型 hook、设置页。配置的生命周期 = 它所在目录的生命周期；若某预设报 <code>Cannot find package</code>，通常是该插件包已卸载而预设行仍在，请手动移除对应行或删除预设目录。</p>
+<h2>License</h2>
+<p>MIT</p>

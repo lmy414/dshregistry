@@ -1,0 +1,135 @@
+<h1>dsh-gitmemo</h1>
+<p><strong>English</strong> | <a href="https://github.com/fonlan/dsh-gitmemo/blob/HEAD/README.zh.md"><strong>简体中文</strong></a></p>
+<p><strong>Git-backed long-term memory for DeepSeek Harness (dsh)</strong> — a Cordis plugin mirroring
+<a href="https://github.com/fonlan/gitmemo">GitMemo</a>. The agent stores completed task outcomes as
+markdown entries in a local <strong><code>.mem</code></strong> Git repository and searches them before starting new
+work. Git is the only dependency, and no manual memory commands are ever needed.</p>
+<h2>Key Characteristics</h2>
+<ul>
+<li><strong>Extremely simple</strong> — once installed, no manual memory commands in day-to-day tasks</li>
+<li><strong>Fully automated</strong> — the agent runs <code>init</code>, <code>search</code>, <code>read</code>, <code>write</code>, <code>delete</code> as part of its normal task flow</li>
+<li><strong>Local-only &amp; offline</strong> — memory lives in a local <code>.mem</code> Git repository; no cloud dependency</li>
+<li><strong>Git-only</strong> — no runtime dependency beyond the <code>git</code> CLI</li>
+<li><strong>Token-efficient</strong> — reuses prior conclusions via <code>mem_search</code> instead of re-injecting context</li>
+<li><strong>Prevents context bloat</strong> — search-first workflow; the skill caps reads at 5 relevant memories</li>
+<li><strong>Auditable</strong> — every memory action is a commit in <code>.mem</code>'s Git history</li>
+<li><strong>Traceable</strong> — each memory can be traced and replayed from commit history</li>
+<li><strong>Branch-aligned</strong> — the <code>.mem</code> branch follows the project's current branch on writes</li>
+</ul>
+<h2>What the Plugin Provides</h2>
+<table>
+<thead>
+<tr>
+<th>Piece</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>mem_init</code></td>
+<td>Initialize the <code>.mem</code> repository (all other tools auto-initialize)</td>
+</tr>
+<tr>
+<td><code>mem_search</code></td>
+<td>Search memories: <code>keywords</code> (comma-separated), <code>skip</code> (pagination), <code>mode</code> (<code>and</code> / <code>or</code> / <code>auto</code> — AND first, OR fallback). Returns up to 20 hits as <code>hash|title|date</code></td>
+</tr>
+<tr>
+<td><code>mem_read</code></td>
+<td>Read one memory entry by commit hash (full markdown)</td>
+</tr>
+<tr>
+<td><code>mem_write</code></td>
+<td>Store a task outcome: <code>title</code> + <code>content</code> (or <code>content_file</code> / <code>file</code>), optional inline <code>body</code> (commit body; engine API still supports <code>body_file</code>). Commits <code>.mem/entries/&lt;timestamp&gt;-&lt;slug&gt;.md</code> and aligns the <code>.mem</code> branch</td>
+</tr>
+<tr>
+<td><code>mem_delete</code></td>
+<td>Delete a memory entry by commit hash (then redo and rewrite)</td>
+</tr>
+<tr>
+<td>Always-on rules section</td>
+<td>The complete workflow rules (gitmemo's <code>agents-template.md</code> equivalent) are injected into <strong>every</strong> session's system prompt — no skill load needed</td>
+</tr>
+<tr>
+<td>Session-start injection</td>
+<td>On every new <strong>root</strong> agent session, the N most recent memory titles (<code>hash|title|date</code>) are automatically injected into that session's system prompt, so prior-session context is visible before any tool call; subagents are skipped and the lookup never creates <code>.mem</code></td>
+</tr>
+</tbody></table>
+<h2>Installation</h2>
+<p>Requires dsh ≥ 0.1.0-rc.6 and the <code>git</code> CLI.</p>
+<p>From the npm registry (once published):</p>
+<pre><code>dsh plugin --profile web add @fonlan/dsh-gitmemo
+</code></pre>
+<p>From a local checkout (development / unpublished):</p>
+<pre><code>dsh plugin --profile web add /path/to/dsh-gitmemo
+</code></pre>
+<p>Then restart the dsh profile (e.g. restart the <code>dsh web</code> process). The plugin registers on the
+host plane, so every agent session in that profile sees the tools and the skill.</p>
+<h3>Configuration</h3>
+<p>The bundle patch ships with sensible defaults; override them in the profile's
+<code>cordis.patch.yml</code>:</p>
+<pre><code>- id: dsh-gitmemo
+  config:
+    memDirName: .mem       # memory repo directory name at the project root
+    searchLimit: 20        # max hits per mem_search call
+    branchAlign: true      # .mem branch follows the project branch on write
+    recentContextLimit: 5  # recent memory titles injected into each new session's system prompt (0 disables)
+    projectRoot: null      # optional explicit project root (defaults to the session cwd)
+</code></pre>
+<h2>Memory Location</h2>
+<p>The <code>.mem</code> repository lives at the <strong>project root</strong> of the calling session's workspace
+(<code>git rev-parse --show-toplevel</code>, falling back to the working directory). Entries are
+markdown files under <code>.mem/entries/</code>; every operation is a commit, so the whole memory is
+readable with plain <code>git</code>:</p>
+<pre><code>git -C .mem log --oneline
+git -C .mem show &lt;commit-hash&gt;
+</code></pre>
+<blockquote>
+<p>Tip: add <code>.mem/</code> to your project's <code>.gitignore</code> so the memory repository never mixes into project commits.</p>
+</blockquote>
+<h2>Agent Workflow (always-on rules)</h2>
+<ol>
+<li><strong>Before work — search.</strong> Extract 3-5 keywords from the request → <code>mem_search</code>. If more
+than 5 hits are relevant, read only the 5 most likely (<code>mem_read</code>). Paginate with <code>skip</code>
+20, 40, … when nothing relevant appears.</li>
+<li><strong>User unsatisfied — delete and rewrite.</strong> <code>mem_delete &lt;hash&gt;</code> → redo from feedback →
+<code>mem_write</code> a corrected entry.</li>
+<li><strong>End-of-session checkpoint — the only write path.</strong> When the conversation is ending, review
+the whole session and <code>mem_write</code> every completed repo-related task that still lacks a memory
+and whose outcome is <strong>valuable/reusable</strong> (or was explicitly asked to be remembered). Never
+duplicate an already-written entry; if a stored outcome is outdated, <code>mem_delete</code> it first,
+then write the corrected entry. Never write for pure Q&amp;A, incomplete tasks, non-repo work, or
+purely operational git actions. Write all pending memories before closing the conversation.</li>
+</ol>
+<h2>Entry Format</h2>
+<pre><code>---
+date: 2026-02-19T15:10:10Z
+status: done
+repo_branch: main
+repo_commit: 9f3e1a2
+mem_branch: main
+related_paths: [src/auth/login.ts]
+tags: [auth, security]
+---
+### Original User Request
+(verbatim)
+### AI Understanding
+- Goal: / Constraints: / Out of scope:
+### Final Outcome
+- Changes/outputs summary
+</code></pre>
+<h2>Development</h2>
+<pre><code>npm install
+npm run build    # tsc → lib/
+npm test         # build + engine/plugin unit tests (node:test)
+</code></pre>
+<h2>Layout</h2>
+<pre><code>dsh-gitmemo/
+├── package.json          # npm package; dsh.bundle.patch wires the profile layer
+├── cordis.patch.yml      # composition layer: the dsh-gitmemo row
+├── src/
+│   ├── index.ts          # Cordis plugin: mem_* tools + gitmemo skill + prompt section
+│   └── mem.ts            # core engine (port of gitmemo scripts/mem.sh)
+├── lib/                  # built output (committed; used by file:/git installs)
+└── test/mem.test.mjs     # engine + plugin unit tests
+</code></pre>
+<h2>License</h2>
+<p>MIT</p>

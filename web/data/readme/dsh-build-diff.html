@@ -1,0 +1,97 @@
+<h1>dsh-build-diff</h1>
+<p>DeepSeek Harness Web GUI（DSH）的 Agent 循环变更审查插件。<strong>每次 agent 结束一轮 loop</strong>（一次 <code>running → idle</code> 驱动周期，与 dsh-agent-loop 的 kick() 语义一致）后，自动快照会话工作区、检测文件/代码变更，并支持：</p>
+<ul>
+<li><strong>审查</strong>：右侧边栏按轮次列出所有变更文件，内联展示行级 diff（双栏行号、+/− 着色、长上下文折叠为「N 行未改动」）。</li>
+<li><strong>撤销</strong>：一键撤销整轮变更，或逐文件撤销——恢复为 loop 开始前的精确内容；删除 agent 新建的文件、还原 agent 删除的文件。</li>
+<li><strong>审查气泡</strong>：每轮结束后，气泡（「已编辑 N 个文件 · +X -Y · 撤销 / 审核」）渲染在助手消息「复制 / 好的回答 / 有问题的回答」按钮行正上方。宽度与消息列一致；文件预览默认 3 个，「再显示 N 个文件」在气泡内展开其余项。点击文件可在右侧栏打开该文件的 diff。</li>
+<li><strong>轮次切换</strong>：通过「轮次」下拉回顾该工作区之前的各轮变更。</li>
+<li><strong>复制 Diff / 标记已处理</strong>：复制统一 diff 文本、标记已审阅。</li>
+</ul>
+<p><a href="https://github.com/KeLearns/dsh-build-diff/blob/HEAD/README.en.md">English</a></p>
+<p>官方双面 dsh 插件（host 半端 + browser 半端），零运行时依赖，不改 dsh 源码。</p>
+<h2>前置插件</h2>
+<p><strong>必须安装 <code>dsh-better-sidebar</code>（^0.12.1）</strong>——审阅界面以标签页形式存在于它的 VS Code 式右侧栏工作台中。客户端半端通过 cordis <code>inject</code> 声明该服务，未安装时 UI 不加载（host 半端照常检测与记录变更）。先安装：</p>
+<pre><code>dsh plugin --profile web add dsh-better-sidebar
+</code></pre>
+<h2>安装</h2>
+<pre><code># 从 npm（发布后），或本地目录：
+dsh plugin --profile web add @kelearns/dsh-build-diff
+# 本地开发：
+dsh plugin --profile web add link:/path/to/dsh-build-diff
+</code></pre>
+<p>手动安装（与桌面版内置插件同机制）：</p>
+<ol>
+<li><p>把本目录复制到 <code>~/.dsh/profiles/node_modules/@kelearns/dsh-build-diff/</code>（保留 <code>index.js</code>、<code>lib/</code>、<code>package.json</code>、<code>cordis.patch.yml</code>）。</p>
+</li>
+<li><p>在 <code>~/.dsh/profiles/web/cordis.patch.yml</code> 追加：</p>
+<pre><code>- insert:
+    - id: dsh-build-diff
+      name: '@kelearns/dsh-build-diff'
+</code></pre>
+</li>
+<li><p>重启 DSH（重启桌面应用或 <code>dsh web</code>）。设置页（设置 → 变更审阅）可开关检测与内容捕获上限。</p>
+</li>
+</ol>
+<h2>工作原理</h2>
+<pre><code>agent/status running  →  快照工作区（全量指纹 + 小文本文件内容）
+   … agent 修改文件 …
+agent/status idle      →  重扫、对比、持久化 loop 记录（Myers 行级 diff）
+   GET  /dsh-build-diff/loops?cwd=…         loop 元数据
+   GET  /dsh-build-diff/loop/&lt;id&gt;           完整记录（diff；旧内容仅存服务端）
+   POST /dsh-build-diff/loop/&lt;id&gt;/revert    撤销全部或指定文件
+   POST /dsh-build-diff/loop/&lt;id&gt;/dismiss   标记已处理
+</code></pre>
+<ul>
+<li>存储：<code>$DSH_HOME/build-diff/{config.json,index.json,loops/&lt;id&gt;.json}</code>；超过 <code>retentionDays</code>（默认 7 天，保留最近 200 条）自动清理。</li>
+<li>快照成本：全文件指纹 + 文本文件（≤ <code>contentCapBytes</code>，默认 1 MB，单轮总预算 256 MB）内容捕获；内存缓存按（路径, size, mtime）命中，未变工作区后续轮次近似零 IO。</li>
+<li>默认排除：<code>.git</code>、<code>node_modules</code>、<code>dist</code>、<code>build</code>、<code>target</code>、<code>out</code>、<code>coverage</code>、<code>.next</code>、<code>.venv</code>、<code>__pycache__</code>、<code>.idea</code>、<code>.vscode</code> 等（见 <code>lib/engine.js</code>）。</li>
+</ul>
+<h2>限制</h2>
+<ul>
+<li>只跟踪插件激活<strong>之后</strong>开始的 loop；激活时已在运行的 loop 会漏掉开头。</li>
+<li>超过 <code>contentCapBytes</code> 的文件（或二进制）：仍检测并计数，但无 diff、不可撤销；可在设置中调高上限。</li>
+<li>撤销 = 原样回写 loop 开始前的内容；若之后有更新的 loop 改过同一文件，撤销旧 loop 会覆盖新变更。</li>
+<li>撤销按记录幂等执行，无重做。</li>
+<li>同一工作区内的子 agent / 后台任务 agent 也会产生记录（共享工作区根），便于一并审查。</li>
+<li>快照扫描有文件数上限（默认 50,000）。</li>
+</ul>
+<h2>集成面</h2>
+<p>客户端半端依赖 <strong><code>dsh-better-sidebar</code></strong>（cordis <code>inject: ['betterSidebar', …]</code>——前置声明，服务出现前 UI 挂起），注册：</p>
+<table>
+<thead>
+<tr>
+<th>表面</th>
+<th>条目</th>
+<th>用途</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>conversation.chat.turnTail</code></td>
+<td>chain 条目</td>
+<td>助手消息按钮行正上方的审查气泡（按 <code>loop-by-turn</code> 查询；该轮无变更则不渲染）</td>
+</tr>
+<tr>
+<td><code>betterSidebar.registerTab</code></td>
+<td>标签页 <code>build-diff</code></td>
+<td>右侧栏「变更审阅」标签页（单实例、待处理角标、轮次选择、逐文件内联 diff、撤销）</td>
+</tr>
+<tr>
+<td><code>conversation.session.header.actions</code></td>
+<td><code>build-diff</code></td>
+<td>会话头按钮，点击在侧边栏打开审阅标签页</td>
+</tr>
+<tr>
+<td><code>settings.section</code></td>
+<td><code>dsh-build-diff</code></td>
+<td>设置页（检测开关 / 上限 / 历史）</td>
+</tr>
+</tbody></table>
+<p>从气泡的「审核」、会话头按钮或「+」菜单均可打开侧边栏标签页（带内容的打开会自动展开右侧面板）。</p>
+<h2>测试</h2>
+<pre><code>node test/diff.test.mjs             # Myers diff + hunks + 统一 diff 文本
+node test/snapshot.test.mjs         # 扫描 / 捕获 / 对比 / 撤销（临时目录）
+node test/host-integration.test.mjs # mock ctx 应用插件 + 完整 loop → 路由 → 撤销
+node test/client-smoke.test.mjs     # 浏览器半端模块契约 + 槽位注册
+</code></pre>
+<h2>License</h2>
+<p>MIT</p>

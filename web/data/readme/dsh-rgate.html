@@ -1,0 +1,113 @@
+<h1>dsh-rgate</h1>
+<p><a href="https://github.com/raomaiping-hash/dsh-rgate/actions/workflows/ci.yml"><img src="https://github.com/raomaiping-hash/dsh-rgate/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+<a href="https://github.com/raomaiping-hash/dsh-rgate/tags"><img src="https://img.shields.io/github/v/tag/raomaiping-hash/dsh-rgate" alt="version"></a>
+<a href="https://github.com/raomaiping-hash/dsh-rgate/blob/HEAD/LICENSE"><img src="https://img.shields.io/github/license/raomaiping-hash/dsh-rgate" alt="license"></a></p>
+<p><a href="https://github.com/raomaiping-hash/dsh-rgate/blob/HEAD/README.zh.md">中文</a> | English</p>
+<p>A remote access login gate for the <a href="https://github.com/deepseek-ai/deepseek-harness">DeepSeek Harness</a> Web UI. Put a password wall in front of the whole browser surface: anonymous visitors on a public (non-loopback) address see only a login page, and every <code>/api</code> RPC is refused until they authenticate.</p>
+<h2>Why</h2>
+<p>The Harness's built-in browser-trust fence (<code>trustedHosts</code>) is a DNS-rebinding defense, explicitly <em>not</em> authentication. Anyone whose <code>Host</code> header passes the fence can use the Web UI. This plugin adds the missing authentication layer for self-hosted deployments: IP scanners hit a login page instead of your agent.</p>
+<h2>What it does</h2>
+<ul>
+<li><strong>Full-page login wall</strong> — a gate script is injected into every <code>index.html</code> (via <code>webServer.tapIndex</code>); unauthenticated non-loopback visitors are redirected to <code>/rgate-login</code>, a self-contained login page.</li>
+<li><strong>Complete <code>/api</code> gating</strong> — exact routes shadow the shipped <code>/api</code> prefix for all 52 unary RPCs plus <code>/api/respond</code> and <code>/api/session.export</code>. Loopback requests pass through; everything else needs a session cookie or gets <code>401</code> before the body is even parsed.</li>
+<li><strong>Cookie sessions</strong> — <code>rgate_session</code>, HttpOnly + SameSite=Strict, 7-day in-memory sessions; logout and password change invalidate all sessions.</li>
+<li><strong>Login throttling</strong> — 5 failed attempts per client → exponential backoff (30s doubling, capped at 16 min). Behind Cloudflare Tunnel the client key is <code>Cf-Connecting-Ip</code> (fallback <code>X-Forwarded-For</code>, then socket address), so one attacker cannot lock everyone out.</li>
+<li><strong>Audit logging</strong> — login success/failure/lockout and password changes go to the harness log (journald) without passwords.</li>
+<li><strong>Hashed password storage</strong> — scrypt (N=16384, r=8, p=1) with a random salt and constant-time comparison in <code>~/.dsh/remote-auth.json</code> (mode 0600). Legacy plaintext files are migrated automatically. A forgotten password is recovered by deleting the file and restarting: the fresh password is printed once in the service log.</li>
+<li><strong>Remote Access settings section</strong> — a <code>settings.section</code> entry showing gate status, login/logout, and password change. Password display is hashed-only by design.</li>
+<li><strong>Origin validation</strong> on login/logout/password endpoints (cross-site form posts are refused).</li>
+</ul>
+<h2>Install</h2>
+<p>From GitHub (plain ESM, <strong>no build step and no install scripts</strong> — nothing runs at install time):</p>
+<pre><code>dsh plugin --profile web add github:raomaiping-hash/dsh-rgate
+</code></pre>
+<p>Pin a commit sha for reproducibility: later pushes cannot silently change what runs on your machine (<code>dsh plugin --profile web add github:raomaiping-hash/dsh-rgate#&lt;commit-sha&gt;</code>).</p>
+<p>From npm or a tarball:</p>
+<pre><code>dsh plugin --profile web add dsh-rgate          # npm
+dsh plugin --profile web add ./dsh-rgate-0.1.0.tgz   # tarball
+</code></pre>
+<p>Then restart the web profile. The plugin prints <code>[rgate] 门禁已启用 …</code> (or <code>[rgate] gate enabled …</code>) when it activates, and creates <code>~/.dsh/remote-auth.json</code> with a random password on first boot:</p>
+<pre><code>journalctl -u deepseek-harness | grep rgate
+</code></pre>
+<h2>Configuration</h2>
+<p>There is no config file for the gate itself. Two behaviors are worth knowing:</p>
+<ul>
+<li><strong>Loopback is always trusted.</strong> <code>127.0.0.1</code> / <code>localhost</code> / <code>::1</code> never see the wall — that is the admin path.</li>
+<li><strong>All other Hosts require login</strong> (LAN, Tailscale, public domain alike). If you want a friction-free host, protect it upstream instead (see below).</li>
+</ul>
+<p>The password file lives at <code>$DSH_HOME/remote-auth.json</code> (default <code>~/.dsh/remote-auth.json</code> — the harness convention, beside <code>settings.yaml</code>):</p>
+<table>
+<thead>
+<tr>
+<th>field</th>
+<th>meaning</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>version: 2</code></td>
+<td>scrypt-hashed storage</td>
+</tr>
+<tr>
+<td><code>salt</code>, <code>N</code>, <code>r</code>, <code>p</code>, <code>hash</code></td>
+<td>scrypt parameters and derived key</td>
+</tr>
+<tr>
+<td><code>createdAt</code>, <code>updatedAt</code></td>
+<td>bookkeeping</td>
+</tr>
+</tbody></table>
+<h2>HTTP endpoints added</h2>
+<table>
+<thead>
+<tr>
+<th>Endpoint</th>
+<th>Method</th>
+<th>Purpose</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>/rgate-login</code></td>
+<td>GET</td>
+<td>Self-contained login page (redirects to <code>/</code> when already allowed)</td>
+</tr>
+<tr>
+<td><code>/api/remote-auth.login</code></td>
+<td>POST <code>{password}</code></td>
+<td>Verify password, set session cookie</td>
+</tr>
+<tr>
+<td><code>/api/remote-auth.logout</code></td>
+<td>POST</td>
+<td>Drop session + clear cookie</td>
+</tr>
+<tr>
+<td><code>/api/remote-auth.status</code></td>
+<td>GET</td>
+<td><code>{configured, authenticated, loopback}</code></td>
+</tr>
+<tr>
+<td><code>/api/remote-auth.secret</code></td>
+<td>GET</td>
+<td>Loopback only: <code>{mode, path, createdAt, updatedAt}</code> — never the password</td>
+</tr>
+<tr>
+<td><code>/api/remote-auth.password</code></td>
+<td>POST <code>{current?, next}</code></td>
+<td>Change password (authenticated session, or loopback + current password)</td>
+</tr>
+</tbody></table>
+<h2>Known limitations</h2>
+<ul>
+<li><strong>WebSocket event streams are not gated.</strong> <code>/api/events.mux</code> and <code>/api/events.host</code> upgrades are owned by the shipped <code>dsh-client-connection</code> plugin; registering the same upgrade path throws, and pre-registering breaks boot. A fence-passing client can still open them and receive live session event frames. The robust fix is <strong>upstream</strong>: enable Cloudflare Access (Zero Trust) on your public domain, or put an authenticating reverse proxy (e.g. nginx <code>auth_request</code>) in front. That closes UI, API and WebSockets before traffic reaches the Harness.</li>
+<li><strong>RPC surface is pinned to a snapshot.</strong> The gate shadows the unary method table of the Harness version it was tested against; a Harness upgrade that adds RPCs needs those paths added to the <code>UNARY</code> table.</li>
+<li><strong>Sessions are in-memory.</strong> A Harness restart signs everyone out (7-day cookie otherwise).</li>
+<li>Static assets are still served to unauthenticated visitors (they are public code); all data lives behind the API gate.</li>
+</ul>
+<h2>Threat model</h2>
+<p>The gate is an <em>authentication</em> layer for a single-password, personal/small-team deployment. It assumes the Harness process and its host filesystem are trusted; anyone who can read <code>remote-auth.json</code> or the process memory already owns the host. It is not a substitute for OS/network hygiene, HTTPS termination, or upstream access control on the public entry point.</p>
+<h2>Test</h2>
+<p><code>tests/smoke.mjs</code> runs the plugin's real route handlers against a stubbed context in an isolated <code>HOME</code> (no real credentials touched):</p>
+<pre><code>node tests/smoke.mjs
+</code></pre>
+<h2>License</h2>
+<p>MIT</p>

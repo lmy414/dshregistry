@@ -1,0 +1,552 @@
+<h1>dsh-lark-all — DeepSeek Harness 飞书 / Lark 一体化插件</h1>
+<p>基于飞书官方 <code>@larksuiteoapi/node-sdk</code> 的 <a href="https://github.com/deepseek-ai">DeepSeek Harness</a> 长连接通道 + 进程重启恢复通知合并插件。使用官方 WebSocket 长连接接收事件，<strong>无需公网 IP、无需回调服务器</strong>，同时支持飞书中国版与国际版 Lark。</p>
+<p>一个包、一次安装，同时提供两个插件入口：</p>
+<table>
+<thead>
+<tr>
+<th>入口</th>
+<th>插件 ID</th>
+<th>作用</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>dsh-lark-all</code></td>
+<td><code>lark-channel</code></td>
+<td>飞书/Lark 消息通道桥：收发消息、并行任务会话、流式卡片、媒体与云文档</td>
+</tr>
+<tr>
+<td><code>dsh-lark-all/ops</code></td>
+<td><code>dsh-ops</code></td>
+<td>重启恢复通知：进程重启完成后向发起重启的聊天发送恢复提示</td>
+</tr>
+</tbody></table>
+<hr>
+<h2>功能特性</h2>
+<h3>通道与消息</h3>
+<ul>
+<li>官方 WebSocket 长连接 + 自动重连，无公网服务器</li>
+<li>单聊 / 群聊访问策略（<code>open</code> / <code>allowlist</code> / <code>disabled</code>），群聊默认要求 <code>@机器人</code></li>
+<li>文字、富文本、图片消息输入；图片按模型能力启用多模态输入，超大「原图」自动降级为工作区文件并告知模型路径</li>
+<li>文件 / 语音 / 视频入站：自动下载到 <code>.lark-inbox/</code>，文本类文件附带内容预览，模型读路径即可处理</li>
+<li>飞书云文档（docx）分享入站：自动读取正文内容供模型回答</li>
+<li>模型文字回复、生成图片上传发送</li>
+<li>收到消息立即添加「进行中」表情（默认 <code>Typing</code>），完成后移除，可选添加完成表情</li>
+<li>每个聊天独立、可恢复的 Harness 会话；消息路由决策写入 <code>&lt;cwd&gt;/.lark-routing.log</code> 便于排查</li>
+</ul>
+<h3>并行任务会话（核心特性）</h3>
+<ul>
+<li>消息以 <code>任务：</code> 开头（或 <code>ptc任务：</code> / <code>标准任务：</code> / <code>极简任务：</code> / <code>创造任务：</code> 指定 agent preset）创建<strong>独立、可持久化的 Harness 会话</strong>——相当于 Web 端新建对话</li>
+<li>每个任务在各自的话题中运行，带<strong>实时流式交互卡片</strong>：蓝色「🧠 任务执行中」→ 完成绿色「✅ 任务完成」/ 失败红色「⚠️ 任务失败」，正文展示任务标题、模式与会话、状态、耗时、轮次步骤、最近工具、思考摘要（240 字）与任务清单（最多 3 项）</li>
+<li>卡片更新按 1200ms 最小间隔节流，终态立即推送并冻结；同一聊天内<strong>多个任务并行执行</strong>（<code>chatQueue: false</code> 默认）</li>
+<li>话题内继续发消息即继续该任务会话（自动归属，无需依赖 <code>root_id</code>/<code>thread_id</code>）；每轮生成一张新的「第 N 轮」卡片</li>
+<li>超长报告按每页 3500 字符分页，避开代码块、尽量在标题处断页，每页以回复形式投递到任务话题内</li>
+<li>恢复旧的严格串行行为：设置 <code>chatQueue: true</code></li>
+</ul>
+<h3>出站媒体</h3>
+<table>
+<thead>
+<tr>
+<th>方式</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>斜杠命令</td>
+<td><code>/bot-send-file</code>（文件 ≤30MB）、<code>/bot-send-image</code>（原图 ≤10MB）、<code>/bot-send-voice</code>（opus 语音）、<code>/bot-send-video</code>（mp4 视频）、<code>/bot-send-doc</code>（markdown 生成飞书云文档）</td>
+</tr>
+<tr>
+<td>模型回复标记</td>
+<td>模型在回复中单独一行输出 <code>[lark-file: 路径]</code>、<code>[lark-image: 路径]</code>、<code>[lark-voice: 路径]</code>、<code>[lark-video: 路径]</code>、<code>[lark-doc: 路径]</code> 即可附带媒体（标记行不显示在回复中）</td>
+</tr>
+<tr>
+<td>大文件</td>
+<td>超过 IM 上限且开启 <code>driveLargeFiles</code> 时，自动分片上传云空间并回复分享链接（≤200MB）</td>
+</tr>
+<tr>
+<td>安全边界</td>
+<td>本地文件必须位于 <code>outboundAllowedDirs</code>（默认 <code>cwd</code>）内，realpath 校验防路径穿越；URL 由 SDK 内置 SSRF 防护兜底</td>
+</tr>
+</tbody></table>
+<h3>进程重启与恢复通知（ops）</h3>
+<ul>
+<li>在<strong>主聊天</strong>发送配置的重启命令（默认 <code>重启进程</code>）即可安全重启 DSH 进程：写入重启标记 → 调度 detached 重启（优先 <code>dsh-safe-restart.ps1</code> 安全重启脚本，失败自动回滚配置；否则使用内置 detached helper）→ 延迟退出</li>
+<li>进程恢复后，<code>dsh-ops</code> 检测到重启标记，向发起重启的聊天发送 <code>✅ DSH 进程已恢复，重启完成</code> 通知并清除标记；通知失败保留标记下次重试</li>
+</ul>
+<h3>凭据安全</h3>
+<ul>
+<li>App Secret 通过 Harness 凭据服务（<code>credentialRef</code>）解析，<strong>不写入插件配置</strong>；App ID 建议通过环境变量注入</li>
+</ul>
+<hr>
+<h2>安装</h2>
+<h3>方式一：直接安装到 DSH profile</h3>
+<pre><code># 从 GitHub Releases 安装（发布后）
+pnpm dsh plugin --profile web add https://github.com/tkwkeven/dsh-lark-all/releases/download/v1.0.0/dsh-lark-all-1.0.0.tgz
+
+# 本地源码目录安装（开发）
+pnpm dsh plugin --profile web add /absolute/path/to/dsh-lark-all
+</code></pre>
+<h3>方式二：从源码构建安装</h3>
+<pre><code>git clone https://github.com/tkwkeven/dsh-lark-all.git
+cd dsh-lark-all
+pnpm install
+pnpm build        # 产出 dist/index.js（含 d.ts 与 source map）
+pnpm pack         # 产出 dsh-lark-all-1.0.0.tgz
+</code></pre>
+<hr>
+<h2>飞书开放平台配置</h2>
+<ol>
+<li>在<a href="https://open.feishu.cn/app">飞书开放平台</a>创建企业自建应用，启用「机器人」能力。</li>
+<li>添加权限：<ul>
+<li>必选：<code>im:message.p2p_msg:readonly</code>、<code>im:message.group_at_msg:readonly</code>、<code>im:message:send_as_bot</code>、<code>im:resource</code></li>
+<li>「进行中表情」：<code>im:message.reactions:write_only</code></li>
+<li>可选：<code>docx:document</code>（云文档收发）、<code>drive:drive</code>（大文件上传云空间）</li>
+</ul>
+</li>
+<li>在「事件与回调」选择**「使用长连接接收事件」**，订阅 <code>im.message.receive_v1</code>（接收消息）。</li>
+<li>创建并发布应用版本，把机器人加入需要使用的聊天。</li>
+<li>配置凭据（二选一）：</li>
+</ol>
+<pre><code># 开发时环境变量注入
+export LARK_APP_ID='cli_your-app-id'
+export LARK_APP_SECRET='your-app-secret'
+pnpm dsh --profile web
+
+# 长期运行推荐：App ID 放 ~/.dsh/.env，App Secret 通过 Harness 凭据设置界面保存（引用名 LARK_APP_SECRET）
+</code></pre>
+<blockquote>
+<p>⚠️ 不要把真实凭据提交到 Git。</p>
+</blockquote>
+<hr>
+<h2>DSH 配置</h2>
+<p>插件包自带 <code>cordis.patch.yml</code>，安装后自动插入两行：</p>
+<pre><code>- insert:
+    - id: lark-channel
+      name: dsh-lark-all
+      config:
+        appId: !!js process.env.LARK_APP_ID
+        appSecretRef: LARK_APP_SECRET
+        cwd: !!js process.env.DSH_LARK_CWD ?? process.cwd()
+        responseTimeoutMs: 21600000
+    - id: dsh-ops
+      name: dsh-lark-all/ops
+      config:
+        appId: !!js process.env.LARK_APP_ID
+        appSecretRef: LARK_APP_SECRET
+        cwd: !!js process.env.DSH_LARK_CWD ?? process.cwd()
+</code></pre>
+<p>在 profile 自己的 <code>cordis.patch.yml</code>（最后应用的一层）中覆盖配置：</p>
+<pre><code>- id: lark-channel
+  config:
+    appId: cli_your-app-id        # 建议保留环境变量方式
+    singlePolicy: allowlist
+    singleAllowFrom: [ou_xxx]
+    groupPolicy: allowlist
+    groupAllowChats: [oc_xxx]
+    taskReasoningEffort: max      # 任务会话固定的推理强度
+    restartExitDelayMs: 2000      # 重启时退出延迟（配合 relaunch helper）
+</code></pre>
+<h3>完整配置项</h3>
+<p><strong>访问策略与输入</strong></p>
+<table>
+<thead>
+<tr>
+<th>配置</th>
+<th>默认</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>domain</code></td>
+<td><code>feishu</code></td>
+<td><code>feishu</code>（中国版）或 <code>lark</code>（国际版）</td>
+</tr>
+<tr>
+<td><code>singlePolicy</code> / <code>groupPolicy</code></td>
+<td><code>open</code></td>
+<td><code>open</code> / <code>allowlist</code> / <code>disabled</code></td>
+</tr>
+<tr>
+<td><code>singleAllowFrom</code> / <code>groupAllowChats</code></td>
+<td><code>[]</code></td>
+<td>白名单（<code>ou_*</code> / <code>oc_*</code>）</td>
+</tr>
+<tr>
+<td><code>groupRequireMention</code></td>
+<td><code>true</code></td>
+<td>群聊要求 @机器人</td>
+</tr>
+<tr>
+<td><code>respondToMentionAll</code></td>
+<td><code>false</code></td>
+<td>响应 @所有人</td>
+</tr>
+<tr>
+<td><code>imageInputMode</code></td>
+<td><code>auto</code></td>
+<td><code>auto</code> / <code>always</code> / <code>never</code></td>
+</tr>
+<tr>
+<td><code>replyInThread</code></td>
+<td><code>false</code></td>
+<td>回复是否进话题</td>
+</tr>
+</tbody></table>
+<p><strong>超时与回复</strong></p>
+<table>
+<thead>
+<tr>
+<th>配置</th>
+<th>默认</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>responseTimeoutMs</code></td>
+<td><code>300000</code></td>
+<td>单轮回复上限（合并版默认 6 小时）</td>
+</tr>
+<tr>
+<td><code>mediaDownloadTimeoutMs</code></td>
+<td><code>30000</code></td>
+<td>媒体下载超时</td>
+</tr>
+<tr>
+<td><code>sendTimeoutMs</code></td>
+<td><code>30000</code></td>
+<td>发送超时</td>
+</tr>
+<tr>
+<td><code>sendRetries</code></td>
+<td><code>2</code></td>
+<td>发送重试次数</td>
+</tr>
+<tr>
+<td><code>maxReplyChars</code></td>
+<td><code>20000</code></td>
+<td>单条回复上限</td>
+</tr>
+<tr>
+<td><code>maxReplyImages</code></td>
+<td><code>4</code></td>
+<td>单条回复图片上限</td>
+</tr>
+</tbody></table>
+<p><strong>入站媒体</strong></p>
+<table>
+<thead>
+<tr>
+<th>配置</th>
+<th>默认</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>inboundFiles</code></td>
+<td><code>true</code></td>
+<td>接收文件到 inbox</td>
+</tr>
+<tr>
+<td><code>inboundMedia</code></td>
+<td><code>true</code></td>
+<td>接收语音/视频到 inbox</td>
+</tr>
+<tr>
+<td><code>inboundDir</code></td>
+<td><code>''</code></td>
+<td>自定义 inbox 目录（空用 <code>&lt;cwd&gt;/.lark-inbox</code>）</td>
+</tr>
+<tr>
+<td><code>inboundResourceLimitBytes</code></td>
+<td><code>104857600</code></td>
+<td>入站资源上限（飞书 100MB）</td>
+</tr>
+<tr>
+<td><code>inboundTextPreviewChars</code></td>
+<td><code>6000</code></td>
+<td>文本类文件预览长度</td>
+</tr>
+</tbody></table>
+<p><strong>出站媒体</strong></p>
+<table>
+<thead>
+<tr>
+<th>配置</th>
+<th>默认</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>outboundMedia</code></td>
+<td><code>true</code></td>
+<td>出站媒体总开关（命令 + 标记）</td>
+</tr>
+<tr>
+<td><code>outboundAllowedDirs</code></td>
+<td><code>[]</code></td>
+<td>允许的出站本地目录（空默认 <code>[cwd]</code>）</td>
+</tr>
+<tr>
+<td><code>maxOutboundFileBytes</code></td>
+<td><code>31457280</code></td>
+<td>文件上限（30MB）</td>
+</tr>
+<tr>
+<td><code>maxOutboundAudioBytes</code></td>
+<td><code>31457280</code></td>
+<td>语音上限</td>
+</tr>
+<tr>
+<td><code>maxOutboundVideoBytes</code></td>
+<td><code>31457280</code></td>
+<td>视频上限</td>
+</tr>
+<tr>
+<td><code>maxOutboundImageBytes</code></td>
+<td><code>10485760</code></td>
+<td>图片上限（10MB）</td>
+</tr>
+<tr>
+<td><code>driveLargeFiles</code></td>
+<td><code>false</code></td>
+<td>超限文件改传云空间并回复链接</td>
+</tr>
+<tr>
+<td><code>maxDriveFileBytes</code></td>
+<td><code>209715200</code></td>
+<td>云空间上传上限（200MB）</td>
+</tr>
+<tr>
+<td><code>sendFileMarkers</code></td>
+<td><code>true</code></td>
+<td>解析模型回复 <code>[lark-*: 路径]</code> 标记</td>
+</tr>
+<tr>
+<td><code>docxInbound</code></td>
+<td><code>true</code></td>
+<td>读取 docx 分享内容</td>
+</tr>
+<tr>
+<td><code>docxOutbound</code></td>
+<td><code>true</code></td>
+<td>允许 <code>/bot-send-doc</code> 与 <code>[lark-doc:]</code></td>
+</tr>
+</tbody></table>
+<p><strong>任务会话</strong></p>
+<table>
+<thead>
+<tr>
+<th>配置</th>
+<th>默认</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>taskSessions</code></td>
+<td><code>true</code></td>
+<td>任务会话总开关</td>
+</tr>
+<tr>
+<td><code>taskPresets</code></td>
+<td><code>{}</code></td>
+<td>额外前缀 → agent preset 映射</td>
+</tr>
+<tr>
+<td><code>taskDefaultPreset</code></td>
+<td><code>code</code></td>
+<td>裸 <code>任务：</code> 前缀使用的 preset</td>
+</tr>
+<tr>
+<td><code>taskReasoningEffort</code></td>
+<td><code>max</code></td>
+<td>新建任务会话固定的推理强度（模型不支持时会按路由自动收敛）</td>
+</tr>
+<tr>
+<td><code>reportIdentity</code></td>
+<td><code>wdsh</code></td>
+<td>任务报告前缀中的身份标识</td>
+</tr>
+<tr>
+<td><code>taskCounterFile</code></td>
+<td><code>''</code></td>
+<td>每日任务计数器路径</td>
+</tr>
+<tr>
+<td><code>chatQueue</code></td>
+<td><code>false</code></td>
+<td>关闭（默认）→ 任务并行；<code>true</code> → 同聊天严格串行</td>
+</tr>
+</tbody></table>
+<p><strong>重启</strong></p>
+<table>
+<thead>
+<tr>
+<th>配置</th>
+<th>默认</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>restartCommand</code></td>
+<td><code>重启进程</code></td>
+<td>主聊天中触发的重启命令</td>
+</tr>
+<tr>
+<td><code>restartMarkerFile</code></td>
+<td><code>''</code></td>
+<td>重启标记路径（ops 消费）</td>
+</tr>
+<tr>
+<td><code>restartLaunch</code></td>
+<td><code>dsh web</code></td>
+<td>重启后启动的命令行</td>
+</tr>
+<tr>
+<td><code>restartLogFile</code></td>
+<td><code>''</code></td>
+<td>重启后进程日志</td>
+</tr>
+<tr>
+<td><code>restartExitDelayMs</code></td>
+<td><code>4000</code></td>
+<td>调度重启后退出延迟</td>
+</tr>
+</tbody></table>
+<p><strong>其他</strong></p>
+<table>
+<thead>
+<tr>
+<th>配置</th>
+<th>默认</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>progressReaction</code></td>
+<td><code>true</code></td>
+<td>收到消息先添加进行中表情</td>
+</tr>
+<tr>
+<td><code>progressEmoji</code></td>
+<td><code>Typing</code></td>
+<td>进行中表情（<code>Typing</code>/<code>THUMBSUP</code>/<code>THINKING</code>/<code>GLANCE</code>/<code>Fire</code>…）</td>
+</tr>
+<tr>
+<td><code>doneEmoji</code></td>
+<td><code>''</code></td>
+<td>完成表情（如 <code>CheckMark</code>；空 = 关闭）</td>
+</tr>
+<tr>
+<td><code>maxInFlightMessages</code></td>
+<td><code>8</code></td>
+<td>并行处理上限</td>
+</tr>
+<tr>
+<td><code>systemPrompt</code></td>
+<td>内置</td>
+<td>通道系统提示词覆盖</td>
+</tr>
+</tbody></table>
+<hr>
+<h2>使用方法</h2>
+<h3>1. 基础命令（发给机器人）</h3>
+<table>
+<thead>
+<tr>
+<th>命令</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>/bot-ping</code></td>
+<td>连通性检查，返回 <code>pong</code></td>
+</tr>
+<tr>
+<td><code>/bot-help</code></td>
+<td>查看命令帮助</td>
+</tr>
+<tr>
+<td><code>/bot-image-test</code></td>
+<td>发送蓝色测试图片，检查图片链路</td>
+</tr>
+<tr>
+<td><code>/bot-status</code></td>
+<td>查看连接状态</td>
+</tr>
+<tr>
+<td><code>/bot-cancel</code></td>
+<td>取消当前生成</td>
+</tr>
+</tbody></table>
+<h3>2. 普通聊天</h3>
+<p>直接发文字、图片、文件、语音、视频或云文档分享即可。普通消息进入该聊天的常驻 Harness 会话，与 Web 端同一套模型配置。</p>
+<h3>3. 并行任务会话</h3>
+<pre><code>任务：帮我调研一下开源社区的 Cordis 插件生态
+ptc任务：写一个 PowerShell 脚本批量重命名文件
+标准任务：总结这篇文档的要点
+极简任务：翻译这段话
+创造任务：设计一个产品原型方案
+</code></pre>
+<ul>
+<li>每条任务消息创建独立会话并在话题中运行，带实时流式卡片</li>
+<li>任务还在运行时，继续发 <code>任务：…</code> 即可并行处理</li>
+<li>在任务消息的话题（或回复任务消息的回复链）里继续发消息 = 继续该任务会话，每轮一张新的「第 N 轮」卡片</li>
+<li>任务完成后，报告以回复形式投递到话题内；超长报告自动分页</li>
+</ul>
+<h3>4. 发送媒体</h3>
+<pre><code>/bot-send-file C:\path\to\demo.txt
+/bot-send-image C:\path\to\photo.png
+/bot-send-voice C:\path\to\audio.opus
+/bot-send-video C:\path\to\clip.mp4
+/bot-send-doc C:\path\to\report.md
+</code></pre>
+<p>也可以让模型在回复中直接输出标记（独立一行）：</p>
+<pre><code>[lark-file: C:\path\to\demo.txt]
+[lark-image: C:\path\to\photo.png]
+[lark-doc: C:\path\to\report.md]
+</code></pre>
+<p>超过 IM 上限的文件在开启 <code>driveLargeFiles</code> 后自动上传云空间并回复分享链接。</p>
+<h3>5. 接收媒体</h3>
+<ul>
+<li><strong>文件</strong>：下载到 <code>&lt;cwd&gt;/.lark-inbox/&lt;chatId&gt;-&lt;messageId&gt;/</code>，文本类文件附带内容预览，可直接问文件内容相关问题</li>
+<li><strong>语音/视频</strong>：下载到 inbox 并告知时长与路径</li>
+<li><strong>原图</strong>：超过附件限制的图片自动降级为 inbox 文件并告知路径</li>
+<li><strong>云文档</strong>：docx 分享自动读取正文；sheet/bitable 识别名称与链接</li>
+</ul>
+<h3>6. 重启进程</h3>
+<p>在主聊天发送 <code>重启进程</code>（可配置 <code>restartCommand</code>）。机器人回复确认后调度安全重启，约 10~60 秒后恢复；<code>dsh-ops</code> 会向该聊天发送恢复通知。</p>
+<h3>7. 验证链路</h3>
+<pre><code>/bot-ping        → pong
+/bot-image-test  → 文字 + 蓝色图片
+</code></pre>
+<p>再发普通文字和一张图片验证模型与入站附件链路；发 <code>demo.txt</code> 后 <code>/bot-send-file C:\绝对\路径\demo.txt</code> 验证文件出站；向机器人发送一个文件或语音验证入站下载。</p>
+<hr>
+<h2>安全建议</h2>
+<ul>
+<li>生产环境使用白名单策略（<code>singlePolicy</code> / <code>groupPolicy: allowlist</code>），并为 agent 配置最小文件和工具权限</li>
+<li>App Secret 只存 Harness 凭据服务，App ID 走环境变量，<strong>绝不写进配置或提交 Git</strong></li>
+<li>出站媒体目录用 <code>outboundAllowedDirs</code> 收窄；不要在允许目录里放敏感文件</li>
+<li>群聊保持 <code>groupRequireMention: true</code> 防止误触发</li>
+</ul>
+<hr>
+<h2>开发</h2>
+<pre><code>pnpm install
+pnpm check      # tsc --noEmit + esbuild 打包校验
+pnpm build      # 产出 dist/index.js（esbuild 打包，@deepseek-ai/* 保持 external）
+pnpm pack       # 产出 .tgz
+</code></pre>
+<p>源码结构：</p>
+<pre><code>src/
+├── index.ts          # 插件入口（name/inject/Config/apply）
+├── bridge.ts         # 通道桥：连接、消息路由、命令、重启调度
+├── conversations.ts  # 会话管理：普通会话 + 并行任务会话 + 卡片流
+├── card.ts           # 流式交互卡片状态机与渲染
+├── inbound.ts        # 入站内容解析（文本/图片/文件/语音/视频）
+├── media.ts          # 出站媒体构造与发送
+├── docx.ts           # 飞书云文档读写
+├── drive.ts          # 云空间大文件分片上传
+├── config.ts         # 配置 schema（schemastery）
+└── util.ts           # 工具函数
+ops.js                # 重启恢复通知（直接执行的纯 JS 入口）
+</code></pre>
+<h2>致谢与许可</h2>
+<p>协议与配置行为参考 <a href="https://github.com/larksuite/openclaw-lark">larksuite/openclaw-lark</a>；通道桥核心源自 <a href="https://github.com/sliverp/DeepSeek-harness-lark">sliverp/DeepSeek-harness-lark</a>（MIT）。本项目在二者基础上合并增强，使用 <a href="https://github.com/tkwkeven/dsh-lark-all/blob/HEAD/LICENSE">MIT</a> 许可证；打包产物中的第三方软件见 <a href="https://github.com/tkwkeven/dsh-lark-all/blob/HEAD/THIRD_PARTY_NOTICES.md">THIRD_PARTY_NOTICES.md</a>。</p>

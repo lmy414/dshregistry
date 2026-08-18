@@ -1,0 +1,161 @@
+<h1>dsh-memory</h1>
+<blockquote>
+<p>为 <a href="https://github.com/deepseek-ai/deepseek-harness">DeepSeek Harness</a> agent 装上<strong>分层长期记忆</strong>：五路 RRF 融合召回 · 确认制写入 · Fernet 加密库 · 会话自动转录</p>
+<p><em>Layered long-term memory for DSH agents: five-lane RRF recall, confirm-before-write, encrypted vault, automatic session harvest.</em></p>
+</blockquote>
+<p><a href="https://github.com/boomzikazita/dsh-memory/blob/HEAD/LICENSE"><img src="https://img.shields.io/badge/License-MIT-yellow.svg" alt="License: MIT"></a>
+<a href="https://github.com/topics/dsh-plugin"><img src="https://img.shields.io/badge/dsh-plugin-blue" alt="dsh-plugin"></a>
+<a href="https://github.com/deepseek-ai/deepseek-harness"><img src="https://img.shields.io/badge/DSH-0.1.0--rc.6-green" alt="DSH"></a></p>
+<hr>
+<h2>为什么需要它</h2>
+<p>Agent 默认没有跨会话记忆：每次对话都是一张白纸。直接把所有历史塞进上下文又贵又噪声大。本插件用<strong>分层记忆 + 按需召回</strong>解决这个矛盾：</p>
+<ul>
+<li><strong>默认零注入</strong>——只有命中实体/主题关键词时，才在当轮注入一小段证据（primer 门控）</li>
+<li><strong>手术级预算</strong>——按任务类型自动切换 400 / 1200 / 2000 字符注入档位，不多花一个 token</li>
+<li><strong>确认制写入</strong>——agent 只能提交「记忆提案」，人确认后才落盘，杜绝记忆污染</li>
+<li><strong>敏感内容强制加密</strong>——guard 钩子在写入前扫描密钥/口令，命中即拦截并引导进 Fernet 加密库</li>
+</ul>
+<h2>架构</h2>
+<pre><code>                        ┌─────────────────────────────────────┐
+   用户消息 ──────────▶ │ primer 门控（agent/pre-step）        │
+                        │ 命中关键词才召回，预算 400/1200/2000  │
+                        └──────────────┬──────────────────────┘
+                                       ▼
+   ┌──────────────────────────────────────────────────────────┐
+   │                  RRF 五路融合召回（rrf_recall.py）          │
+   ├───────┬───────┬───────┬───────┬──────────────────────────┤
+   │ L1    │ L2    │ L3    │ L4    │ L5                       │
+   │ 规则层 │ 会话层 │ 语义层 │ wiki  │ 时间窗                   │
+   │MEMORY │SQLite │Honcho │活指针 │ daily 日志               │
+   │/USER  │FTS5   │MCP可选│目录   │ YYYY-MM-DD 溯源          │
+   └───────┴───────┴───────┴───────┴──────────────────────────┘
+                                       ▼
+              带来源标记 + 可信度分级的「证据账本」
+</code></pre>
+<p>写入路径（确认制）：</p>
+<pre><code>agent: memory_suggest ──▶ SUGGESTIONS.jsonl（待确认队列）
+                              │ memory_confirm ✅ / memory_reject ❌
+                              ▼
+        memory → MEMORY.md ｜ user → USER.md ｜ skill → ~/.dsh/skills/&lt;name&gt;/SKILL.md
+        （读-改-原子写 + pre-image 哈希记录进 DREAMS.md 审计日志）
+</code></pre>
+<h2>工具（10 个）</h2>
+<table>
+<thead>
+<tr>
+<th>工具</th>
+<th>作用</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>memory_recall</code></td>
+<td>五路 RRF 召回。<code>query</code> + 可选 <code>date</code>（L5 时间窗：<code>today</code>/<code>yesterday</code>/<code>-N</code>/<code>YYYY-MM-DD</code>）、<code>deep</code>（深度召回 topk=8/预算=2000）、<code>topk</code>、<code>budget</code></td>
+</tr>
+<tr>
+<td><code>memory_suggest</code></td>
+<td>提交写入提案（不直接写）。<code>track</code>: <code>memory</code> 全局规则 / <code>user</code> 用户档案 / <code>skill</code> 技能草案。自带敏感模式扫描与预算检查</td>
+</tr>
+<tr>
+<td><code>memory_confirm</code> / <code>memory_reject</code></td>
+<td>采纳 / 拒绝提案。采纳走原子写 + 并发冲突检测</td>
+</tr>
+<tr>
+<td><code>memory_vault_set</code> / <code>memory_vault_get</code></td>
+<td>Fernet 加密库读写。写入后明文只允许出现 <code>→ vault:&lt;ref&gt;</code> 引用</td>
+</tr>
+<tr>
+<td><code>memory_harvest</code></td>
+<td>会话日志（JSONL.zstd）增量转录 → L2 FTS5 索引 + 纠正信号提取</td>
+</tr>
+<tr>
+<td><code>memory_health</code></td>
+<td>各层健康检查：L1 预算占用 / 文件完整性 / vault 可解密 / L2 索引 / git 状态</td>
+</tr>
+<tr>
+<td><code>memory_backup</code></td>
+<td>记忆目录 git 备份并推送远端（<code>.vault-key</code>/<code>scratch</code> 自动忽略）</td>
+</tr>
+<tr>
+<td><code>memory_notify</code></td>
+<td>飞书消息推送（周报/告警/提醒），未配置凭据时返回提示不报错</td>
+</tr>
+</tbody></table>
+<h2>钩子（3 个）</h2>
+<table>
+<thead>
+<tr>
+<th>钩子</th>
+<th>时机</th>
+<th>行为</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>primer</td>
+<td><code>agent/pre-step</code></td>
+<td>关键词门控召回注入；默认零注入</td>
+</tr>
+<tr>
+<td>harvest</td>
+<td><code>turn/end</code></td>
+<td>每轮结束自动转录会话到 L2</td>
+</tr>
+<tr>
+<td>guard</td>
+<td><code>tools/pre-execute</code></td>
+<td>写类工具敏感扫描（密钥/Cookie/口令），命中拦截并引导 vault</td>
+</tr>
+</tbody></table>
+<h2>安装</h2>
+<pre><code>dsh plugin --profile web add github:boomzikazita/dsh-memory
+</code></pre>
+<h2>配置</h2>
+<p><code>cordis.patch.yml</code>：</p>
+<pre><code>- insert:
+    - id: dsh-memory
+      name: 'dsh-memory'
+      config:
+        memoryDir: '~/.dsh/memories'   # 记忆根目录
+        budgetMemory: 4400             # MEMORY.md 字符预算
+        budgetUser: 2750               # USER.md 字符预算
+        guardBlock: false              # true = guard 命中硬拦截；false = 警告
+        primerBudget: 800              # primer 注入字符预算
+        primerTopK: 3                  # primer 注入条数
+</code></pre>
+<p><strong>环境变量</strong></p>
+<table>
+<thead>
+<tr>
+<th>变量</th>
+<th>用途</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>DSH_HONCHO_MCP_URL</code> / <code>DSH_HONCHO_MCP_TOKEN</code></td>
+<td>L3 语义层（Honcho MCP 桥）。不配置则 L3 静默跳过，不影响其他四层</td>
+</tr>
+<tr>
+<td><code>DSH_WIKI_ROOT</code></td>
+<td>L4 wiki 目录路径</td>
+</tr>
+<tr>
+<td><code>LARK_APP_ID</code> / <code>LARK_APP_SECRET</code> / <code>LARK_CHAT_ID</code></td>
+<td><code>memory_notify</code> 飞书推送</td>
+</tr>
+</tbody></table>
+<h2>记忆文件布局</h2>
+<pre><code>~/.dsh/memories/
+├── MEMORY.md          # L1 全局规则（§ 分隔条目）
+├── USER.md            # L1 用户档案
+├── SUGGESTIONS.jsonl  # 待确认提案队列
+├── VAULT.md.enc       # Fernet 加密库（密文，可随 git 同步）
+├── DREAMS.md          # 采纳审计日志（pre-image 哈希）
+├── index.sqlite       # L2 FTS5 会话索引
+└── daily/             # L5 时间窗日志
+</code></pre>
+<h2>依赖</h2>
+<ul>
+<li><strong>Python 3</strong>（召回/加密/转录脚本由插件 host 侧调用）</li>
+<li>Python 包：<code>cryptography</code>（vault 必需）；<code>zstandard</code>（读取压缩会话日志，可选）</li>
+</ul>
+<h2>License</h2>
+<p><a href="https://github.com/boomzikazita/dsh-memory/blob/HEAD/LICENSE">MIT</a></p>

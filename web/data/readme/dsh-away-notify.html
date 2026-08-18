@@ -1,0 +1,86 @@
+<h1>dsh-away-notify</h1>
+<p>DeepSeek Harness（DSH）插件：<strong>当任务完成、而你又不在 DSH 界面时，向 Windows 发送系统通知（右下角 Toast）。</strong></p>
+<blockquote>
+<p>场景：你给 DSH 派了一个长任务，然后切去别的网站刷视频或把窗口最小化。任务做完时，Windows 右下角会弹出「DSH 任务完成」，不用再盯着界面干等。</p>
+<p>如果你正盯着 DSH 界面，任务完成时<strong>不会</strong>打扰你 —— 只有你离开界面时才通知。</p>
+</blockquote>
+<h2>功能</h2>
+<ul>
+<li>✅ <strong>只在离开界面时通知</strong>：页面隐藏（切走/最小化）且任务完成 → 弹系统 Toast；你正在看页面 → 不弹</li>
+<li>✅ <strong>任务完成检测</strong>：监听 <code>agent/status</code>（running → idle 翻转），浏览器后台节流也不影响</li>
+<li>✅ <strong>Windows 原生通知</strong>：PowerShell 5.1 + WinRT Toast API，右下角标准样式，自动注册 AUMID，零依赖</li>
+<li>✅ <strong>设置卡片</strong>：设置 → 通用 →「任务完成通知（离开界面时）」，含总开关与「测试」按钮</li>
+<li>✅ <strong>可配置</strong>：总开关、是否提醒子代理会话（<code>~/.dsh/plugins/away-notify.json</code>，改配置即时生效）</li>
+</ul>
+<h2>安装</h2>
+<pre><code>dsh plugin --profile web add dsh-away-notify
+</code></pre>
+<p>然后重启 dsh web 使插件生效（bundle 插件需要重启加载）。</p>
+<h3>从源码安装（开发用）</h3>
+<pre><code>dsh plugin --profile web add link:../dsh-away-notify
+# 或直接把本目录加入 profile 的 package.json 依赖 + dsh.profile.bundles
+</code></pre>
+<h2>配置</h2>
+<p>配置保存在 <code>~/.dsh/plugins/away-notify.json</code>（默认值如下）：</p>
+<pre><code>{
+  "enabled": true,
+  "includeSubagents": false
+}
+</code></pre>
+<table>
+<thead>
+<tr>
+<th>配置</th>
+<th>默认</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>enabled</code></td>
+<td><code>true</code></td>
+<td>总开关。关闭后不再弹任何通知</td>
+</tr>
+<tr>
+<td><code>includeSubagents</code></td>
+<td><code>false</code></td>
+<td>是否也提醒子代理（subagent）会话；默认只提醒主会话</td>
+</tr>
+</tbody></table>
+<p>也可通过设置卡片里的开关直接切换（会写回该文件）。</p>
+<h2>工作机制</h2>
+<pre><code>浏览器（Client 半片）                    DSH 后台（Host 半片）
+────────────────────                    ──────────────────
+visibilitychange 事件
+  ↓ 上报 hidden 状态
+POST /away-notify/visibility  ──────►  维护 hidden 标志
+                                      监听 agent/status
+                                        running→idle 翻转 = 任务完成
+                                       且 hidden = true？
+                                          ↓ 是
+                                      PowerShell 弹 Windows Toast
+                                      （右下角「DSH 任务完成」）
+</code></pre>
+<ul>
+<li>完成检测在 Host：不依赖浏览器 JS 是否在跑（最小化/后台节流均无影响）。</li>
+<li>可见性检测在 Client：只有浏览器知道 <code>visibilityState</code>；页面每次切换可见/隐藏时上报一次。</li>
+<li>通知在 Host 执行：浏览器最小化、切到别的应用、甚至锁屏都能弹。</li>
+</ul>
+<h2>日志</h2>
+<p>诊断日志写入 <code>%TEMP%\dsh-away-notify\notify.log</code>（JSON 行），记录启动、可见性上报、通知触发等事件。</p>
+<h2>测试</h2>
+<blockquote>
+<p>✅ <strong>2026-08-18 全链路测试通过</strong>：测试通知、设置卡片、Host 完成检测、页面可见性上报、端到端（切走 + 任务完成 → 弹通知）均验证通过。</p>
+</blockquote>
+<ul>
+<li>设置卡片里的「测试」按钮：立即弹一条「DSH 任务完成」测试通知（需插件已启用）。</li>
+<li>或命令行：<code>Invoke-RestMethod -Method Post http://127.0.0.1:3080/away-notify/test</code></li>
+<li>端到端：给 DSH 派任务 → 切走页面（切标签页/最小化）→ 任务完成时右下角弹「DSH 任务完成」；盯着页面时任务完成<strong>不</strong>打扰。</li>
+</ul>
+<h2>开发注意事项</h2>
+<ul>
+<li><strong>Client 半片改动生效方式</strong>：dsh web 从 profile 的实体拷贝伺服 client bundle（<code>~/.dsh/profiles/web/node_modules/dsh-away-notify/</code>，<code>file:</code> 依赖安装时被拷贝而非软链）。改 <code>lib/client.js</code> 后需同步拷贝到该路径，再刷新页面（服务端 <code>Cache-Control: no-cache</code>，刷新即生效）。Host 半片改动需同步拷贝 + 重启 dsh web。</li>
+<li><strong>Cordis <code>ctx.effect</code> 陷阱</strong>：<code>ctx.effect(回调)</code> 立即执行回调，只有回调返回值才是卸载时的清理函数。注册 DOM 监听器必须写成 <code>ctx.effect(() =&gt; () =&gt; removeEventListener(...))</code>，否则监听器注册即被移除（第一版曾因此导致切走上报失效，已修复）。</li>
+<li>诊断日志：<code>%TEMP%\dsh-away-notify\notify.log</code>（JSON 行，含 start/visibility/complete-hidden-false/notify/test/error 事件），排查先看它。</li>
+</ul>
+<h2>许可证</h2>
+<p><a href="https://github.com/Kevin87654/dsh-away-notify/blob/HEAD/LICENSE">MIT</a></p>

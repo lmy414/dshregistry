@@ -1,0 +1,134 @@
+<h1>dsh-cost-guard — DeepSeek V4-Flash-0731 纯 API 省钱守卫</h1>
+<p>面向「只用 API、不自部署」场景的成本插件，装配在 router / mode-boost 之上，<strong>不碰 persona</strong>
+（路由归它们），只做「钱」的事。定价口径 = DeepSeek 官方 2026-08-17 峰谷分级（¥/百万 token）：</p>
+<table>
+<thead>
+<tr>
+<th>Flash-0731</th>
+<th>缓存命中</th>
+<th>未命中</th>
+<th>输出</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>空闲（每日非高峰时段）</td>
+<td>¥0.05</td>
+<td>¥1.5</td>
+<td>¥4.5</td>
+</tr>
+<tr>
+<td>高峰（每日 09:00-12:00 / 14:00-18:00）</td>
+<td>¥0.10</td>
+<td>¥3.0</td>
+<td>¥9.0</td>
+</tr>
+</tbody></table>
+<p>同请求「命中:未命中 = 1:30」；高峰 = 空闲 × 2；Pro 为 Flash 的 3 倍。插件按 model id 自动选档。</p>
+<h2>启动即生效（运行时热装，免重启）</h2>
+<pre><code>dev_inject_plugin D:\DSH\测试\优化\dsh-cost-guard
+</code></pre>
+<p>持久化（重启后自动恢复）：<code>dsh plugin --profile web add &lt;此目录&gt;</code> 或 <code>dev_install_package</code>。</p>
+<h2>工具</h2>
+<table>
+<thead>
+<tr>
+<th>工具</th>
+<th>作用</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>cost_status</code></td>
+<td>当前项目仪表盘：模型/峰谷/费率/累计用量（输入/输出/缓存命中/缓存写/推理）/已花 ¥/命中率/全命中可省金额/预算</td>
+</tr>
+<tr>
+<td><code>cost_budget {budget}</code></td>
+<td>设当前项目 ¥ 预算（0 清除）；超支自动注入一次「收敛交付」近场引导</td>
+</tr>
+<tr>
+<td><code>cost_peak</code></td>
+<td>当前峰谷状态、下一切换点、错峰建议</td>
+</tr>
+<tr>
+<td><code>cost_defer {task, maxTokens?}</code></td>
+<td>把一次 LLM 任务登记进错峰队列；高峰排队、空闲 daemon 自动执行（10 分钟粒度），结果落 <code>~/.dsh/cost-guard/results/&lt;id&gt;.json</code></td>
+</tr>
+<tr>
+<td><code>cost_deferred</code></td>
+<td>队列状态：queued/running/done/failed + 结果路径</td>
+</tr>
+<tr>
+<td><code>cost_guide {target}</code></td>
+<td>手动注入收敛/深度/错峰/预算引导（近场、前缀缓存中性）</td>
+</tr>
+</tbody></table>
+<h2>原理（一句话）</h2>
+<ul>
+<li><strong>用量</strong>：从 durable <code>assistant/message</code> 事件里 <code>data.usage</code> 折叠（<code>TokenUsage</code>：inputTokens /
+outputTokens / cacheReadTokens / cacheWriteTokens / reasoningTokens），resume 后仍准确；</li>
+<li><strong>成本</strong>：<code>cached×hit + (input+write)×miss + (output+reasoning)×out</code>（推理按输出价，保守口径）；</li>
+<li><strong>缓存纪律</strong>：persona 不碰（保持 30× 前缀缓存红利）；引导只走 <code>inbox next-step</code> 近场（离散事件触发，
+不刷屏、不改 system 前缀）；</li>
+<li><strong>错峰</strong>：<code>isPeakHour()</code> = 时区小时 ∈ {9,14}；daemon 用 <code>ctx.setInterval</code> 每 10 分钟只跑队列里的
+queued 项且仅在空闲时段。</li>
+</ul>
+<h2>提示词包（与插件互补，任选）</h2>
+<ol>
+<li>system 静态区（只加一次，放最前、别随会话变）：<pre><code>Cost discipline: every tool call is billed work — batch reads, reuse prior
+results, stop when enough information exists, never run environment checks
+or exhaustive scans; finish each task with a one-line delivery note.
+</code></pre>
+</li>
+<li>每条任务末尾的收敛后缀：<pre><code>(converge) 用能确定完成的最少步骤工作；不重复已做的读取；信息足够就交付。
+</code></pre>
+</li>
+<li>高峰时段的高价值任务前：<pre><code>It is peak pricing now. Do this in the fewest steps — one deep pass, no
+revert loops; register anything deferrable via cost_defer.
+</code></pre>
+</li>
+</ol>
+<blockquote>
+<p>与 mode-boost/router 的分工：它们管「用哪种思维模式/风格」；cost-guard 管「钱包」。
+不要向 system 注入动态内容（会整会话缓存 miss，吞噬 30× 红利）——动态信号一律走消息尾。</p>
+</blockquote>
+<h2>会话级收敛开关（输入框按钮）</h2>
+<p><strong>消息输入框右侧「收敛」按钮</strong>（发送按钮旁）是一个<strong>会话级开关</strong>：</p>
+<ul>
+<li><strong>点一次</strong> → 本会话进入收敛模式：注入一次收敛引导（"用最少的额外步骤完成当前目标——批量读取、复用上下文已有信息、现在就产出。每次工具调用都是计费动作"），此后该会话<strong>持续收敛思考</strong>（引导进入上下文后残留影响贯穿本会话后续轮次），按钮变绿显示「收敛中」；</li>
+<li><strong>再点一次</strong> → 关闭：撤回未消费的引导消息，退出收敛模式；</li>
+<li>状态<strong>持久化</strong>（<code>session-budgets.json</code> 的 <code>converged</code> 字段），跨会话独立、重启后恢复。与守卫开关、自动深度分流无关。</li>
+</ul>
+<h2>自动深度分流（可选保险，默认关）</h2>
+<p>面板标题栏「<strong>深度</strong>」开关（或 <code>~/.dsh/cost-guard/config.json</code> 的 <code>config.autoDeep.enabled</code>）：
+开启后，识别到<strong>复杂任务</strong>（含"重构/架构/设计/集成/迁移/分布式/性能/复杂…"等关键词且消息足够长）
+自动向该会话注入一次深度引导（"值得多花几步做对，避免返工=重复计费"），每会话一次；
+不命中关键词、消息过短、或该会话已开启收敛模式时不介入（防止收敛与深度指令矛盾）。
+关键词/最短长度可调：<code>config.autoDeep = { enabled: true, minChars: 40, keywords: [...] }</code>。</p>
+<h2>启用（项目级开关）</h2>
+<p>成本守卫支持<strong>项目级开关</strong>（项目 = 会话的工作目录 <code>cwd</code>，同一目录下的所有会话共享开关/预算）：
+面板「项目」开关 / 工具 <code>cost_enable {mode: on|off|auto}</code> / 直接编辑 <code>~/.dsh/cost-guard/config.json</code> 的 <code>projects</code> 字段。</p>
+<p><strong>项目级开关的优先级</strong>：项目显式设置（面板「项目」开关 / <code>cost_enable</code> 工具）&gt; 全局默认
+（面板「全局」开关，持久化 <code>config.json</code> 的 <code>projects</code> 字段）。面板标题栏现在是两个开关：「项目」+「全局」；
+工具 <code>cost_enable {mode: on|off|auto}</code> 可在会话中途切换（auto = 清除该项目设置，回落全局默认）。
+每个项目可独立设置 <code>cost_budget</code>，互不影响。</p>
+<h2>图形控制界面（client 面板）</h2>
+<p>注入后，会话视图（conversation.view）会出现「成本守卫」标签页：</p>
+<ul>
+<li><strong>监控卡片</strong>：模型 / 峰谷徽标 / 已花 ¥ / 缓存命中率条 / 全命中可省 ¥ / 预算；</li>
+<li><strong>预算（三级作用域）</strong>：① <strong>项目级</strong>（默认，面板「预算 ¥」行）——该目录全部会话共享；② <strong>会话级</strong>——只限当前会话（<code>cost_budget</code> 加 <code>scope=session</code>），会话明细行带「预 ¥X」标记；③ <strong>新会话预算</strong>——在<strong>项目分组每行的「新会话」栏</strong>设置/显示（<code>scope=next</code>）：预置给该目录<strong>下一个新建的顶层会话</strong>，一次性消费（子代理不会消费）。超支自动注入收敛引导；会话级与预置持久化在 <code>~/.dsh/cost-guard/session-budgets.json</code>。</li>
+<li><strong>错峰队列</strong>：queued/running/done/failed 状态实时刷新；</li>
+<li><strong>延期结果</strong>：cost_defer 产出的结果摘要（前 160 字符 + 用量）；</li>
+<li><strong>启用开关</strong>：每个项目一键切换 <code>enabled</code>（持久化到 <code>~/.dsh/cost-guard/config.json</code> 的 <code>projects</code> 字段），停用时该项目引导/队列/daemon 全部静默。</li>
+<li><strong>项目分组（按会话细分）</strong>：每个目录项目下展开列出各会话（短 id、归档/活跃、独立花费、命中率、token 量），可<strong>单独删除某条会话统计</strong>，也可整项目删除。删除按钮为<strong>两步确认</strong>（点击一次变「确认？」再点一次执行，3 秒未确认自动还原）——面板运行在沙箱 iframe 中，<code>window.confirm</code> 会被静默拦截，故不用系统弹窗。</li>
+<li><strong>删除项目</strong>：项目分组中每行右侧红色「删除」按钮——从统计中彻底移除该项目：清除该目录全部会话的 ledger 历史（今日/本周/本月统计随之减少）、项目级开关与预算配置，并清空相关缓存。注意：项目 = 工作目录，删除后在该目录新开的会话会重新出现在分组中；操作结果（成功/失败原因）会显示在分组标题下方。</li>
+</ul>
+<p>面板数据源：<code>GET /cost-guard/api/state</code>（同源 fetch，8s 轮询）；开关调 <code>POST /cost-guard/api/enable</code>。</p>
+<blockquote>
+<p>⚠️ <strong>面板注册靠重启</strong>：client-modules 对包元数据按名缓存、<strong>永不过期</strong>——插件集变化需<strong>重启 web</strong> 生效（harness 设计）。正常安装（<code>dsh plugin add</code> / <code>dev_install_package</code> + 重启）后面板与「收敛」按钮自动注册；热注入（<code>dev_inject_plugin</code>）场景如未出现，请重启 web 一次。</p>
+<p>✅ <strong>兼容性（v0.1.17）</strong>：移除旧版基于越权访问 <code>dsh-client-modules</code> 私有 API（<code>processOne</code>/<code>composed</code>/<code>notifyGraphChanged</code>）的「开机自愈」——它会在运行时手动重算并广播整个 client 插件图，时序不可控，可能打乱 <code>window.__DSH_BOOT__</code>、导致<strong>其他 UI 插件消失</strong>。现在只依赖 harness 的标准装配，不再触碰任何内部状态。</p>
+</blockquote>
+<h2>测试报告与使用说明</h2>
+<ul>
+<li>两轮对比测试报告（成本守卫 vs 无守卫，含收敛省钱原理与分轮数据）：<a href="https://github.com/sixtysevenlf/dsh-cost-guard/blob/HEAD/docs/%E6%B5%8B%E8%AF%95%E6%8A%A5%E5%91%8A.md">docs/测试报告.md</a></li>
+<li>安装与使用说明：<a href="https://github.com/sixtysevenlf/dsh-cost-guard/blob/HEAD/INSTALL.md">INSTALL.md</a></li>
+<li>可分发的安装包：GitHub Release 附件 <code>dsh-external-dsh-cost-guard-0.1.21.tgz</code>（npm pack 产物，<code>dsh plugin --profile web add &lt;tgz&gt;</code> 安装）</li>
+</ul>

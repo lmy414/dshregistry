@@ -1,0 +1,236 @@
+<h1>dsh-ontology</h1>
+<p>English | <a href="https://github.com/tancheng33/dsh-ontology/blob/HEAD/README.zh.md">中文</a></p>
+<p>A typed, inference-capable <strong>ontology</strong> for <a href="https://github.com/deepseek-ai/deepseek-harness">DeepSeek Harness</a> — durable domain knowledge the agent declares, asserts against, and queries under schema constraints.</p>
+<p>Most agent memory is a bag of strings: the agent writes prose, later reads prose, and nothing ever tells it that what it just recorded contradicts what it recorded last week. This plugin gives the agent a <strong>vocabulary it must respect</strong>. You declare what kinds of things exist and how they may relate; every claim is then checked against that model before it is stored, and claims that follow from other claims are derived rather than repeated.</p>
+<pre><code>ontology_define   declare classes and typed relations   (the TBox)
+ontology_assert   record entities and facts             (the ABox, validated)
+ontology_query    look things up, traverse, infer
+ontology_retract  remove, with dependency protection
+</code></pre>
+<h2>Why a TBox, not a notes file</h2>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>notes-style memory</th>
+<th>dsh-ontology</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>Structure</td>
+<td>free text</td>
+<td>classes, typed relations, entities, triples</td>
+</tr>
+<tr>
+<td>Bad input</td>
+<td>silently stored</td>
+<td>rejected, naming the constraint it broke</td>
+</tr>
+<tr>
+<td>Implied facts</td>
+<td>restated by hand, drift apart</td>
+<td>derived on read from <code>transitive</code> / <code>symmetric</code> / <code>inverseOf</code></td>
+</tr>
+<tr>
+<td>Retraction</td>
+<td>orphaned prose lingers</td>
+<td>facts cascade with their entity; derived facts vanish with their premise</td>
+</tr>
+<tr>
+<td>Reading it back</td>
+<td>grep and hope</td>
+<td>query by class (subclass-aware), triple pattern, neighbourhood, or shortest path</td>
+</tr>
+</tbody></table>
+<p>The constraint is the point. When the agent asserts <code>ada depends_on api</code> and <code>depends_on</code> is declared <code>Component -&gt; Component</code>, it gets back:</p>
+<pre><code>REJECTED ada depends_on api: ada is not in the domain of depends_on
+  (requires one of: Component; has: Person)
+</code></pre>
+<p>That is a real signal — either the claim is wrong, or the model of the domain is incomplete. Free-text memory can produce neither.</p>
+<h2>Install</h2>
+<pre><code>dsh plugin --profile &lt;name&gt; add dsh-ontology
+dsh --profile &lt;name&gt;
+</code></pre>
+<p>Or from a checkout / git host:</p>
+<pre><code>dsh plugin --profile &lt;name&gt; add ./dsh-ontology
+dsh plugin --profile &lt;name&gt; add github:tancheng33/dsh-ontology
+</code></pre>
+<blockquote>
+<p>A <code>github:</code> install builds from source, so pnpm ≥10 needs the build allowlisted. Add <code>allowBuilds: { dsh-ontology: true }</code> to the profile's <code>pnpm-workspace.yaml</code> and re-run, and pin a commit (<code>#&lt;sha&gt;</code>) so a later push cannot silently change what runs. Installing from npm needs no allowance.</p>
+</blockquote>
+<p>The bundle brings its own storage stack (<code>dsh-storage</code> + <code>dsh-storage-json</code> + <code>dsh-storage-domain</code>) under the same row ids <code>dsh-web-app</code> uses, so it works in a bare profile and composes cleanly with one that already has storage. Data lands in <code>$DSH_HOME/storages/&lt;domain&gt;.json</code>.</p>
+<h2>Configuration</h2>
+<p>Override any of these in your profile's <code>cordis.patch.yml</code>:</p>
+<table>
+<thead>
+<tr>
+<th>Key</th>
+<th>Default</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>domain</code></td>
+<td><code>ontology</code></td>
+<td>Storage domain name; one name is one isolated graph. Must match <code>/^[a-z][a-z0-9_]*$/</code>.</td>
+</tr>
+<tr>
+<td><code>strict</code></td>
+<td><code>true</code></td>
+<td>Reject facts that violate the vocabulary. <code>false</code> stores them with the violations recorded, for exploratory modelling.</td>
+</tr>
+<tr>
+<td><code>inference</code></td>
+<td><code>true</code></td>
+<td>Allow queries to return entailed facts.</td>
+</tr>
+<tr>
+<td><code>promptSection</code></td>
+<td><code>true</code></td>
+<td>Contribute the vocabulary summary to the system prompt.</td>
+</tr>
+<tr>
+<td><code>promptMaxTerms</code></td>
+<td><code>60</code></td>
+<td>Upper bound on terms in that summary.</td>
+</tr>
+<tr>
+<td><code>promptOrder</code></td>
+<td><code>150</code></td>
+<td>Where the section lands in the assembled prompt.</td>
+</tr>
+<tr>
+<td><code>defaultLimit</code> / <code>maxLimit</code></td>
+<td><code>50</code> / <code>500</code></td>
+<td>Query result sizes.</td>
+</tr>
+<tr>
+<td><code>maxEntities</code> / <code>maxFacts</code></td>
+<td><code>20000</code> / <code>100000</code></td>
+<td>Capacity guards; a write past the bound fails loudly.</td>
+</tr>
+</tbody></table>
+<p>Running two isolated graphs is just two rows:</p>
+<pre><code>- insert:
+    - id: ontology-team
+      name: dsh-ontology
+      config: { domain: team_ontology, strict: true, inference: true, promptSection: true,
+                promptMaxTerms: 60, promptOrder: 150, defaultLimit: 50, maxLimit: 500,
+                maxEntities: 20000, maxFacts: 100000 }
+</code></pre>
+<p>(A patch replaces a row's whole <code>config</code>, so restate every key.)</p>
+<h2>A worked example</h2>
+<p><strong>Declare the vocabulary.</strong> Order does not matter — entries are resolved by repeated passes, so a subclass may precede its parent and a relation may precede its inverse.</p>
+<pre><code>// ontology_define
+{
+  "classes": [
+    { "id": "Service", "subClassOf": ["Component"] },
+    { "id": "Component", "comment": "A deployable unit of the system" },
+    { "id": "Person" }
+  ],
+  "relations": [
+    { "id": "depends_on", "domain": ["Component"], "range": ["Component"],
+      "characteristics": ["transitive"] },
+    { "id": "owns", "domain": ["Person"], "range": ["Component"], "inverseOf": "owned_by" },
+    { "id": "owned_by", "domain": ["Component"], "range": ["Person"] },
+    { "id": "version", "domain": ["Component"], "rangeKind": "literal" }
+  ]
+}
+</code></pre>
+<p><strong>Assert instances.</strong> Entities are created before the facts of the same call, so one call introduces an individual and its relationships together.</p>
+<pre><code>// ontology_assert
+{
+  "entities": [
+    { "id": "api", "classes": ["Service"] },
+    { "id": "auth", "classes": ["Service"] },
+    { "id": "pg", "classes": ["Component"] },
+    { "id": "ada", "classes": ["Person"] }
+  ],
+  "facts": [
+    { "subject": "api", "predicate": "depends_on", "object": "auth" },
+    { "subject": "auth", "predicate": "depends_on", "object": "pg" },
+    { "subject": "ada", "predicate": "owns", "object": "api", "source": "CODEOWNERS" },
+    { "subject": "api", "predicate": "version", "object": "2.1.0" }
+  ]
+}
+</code></pre>
+<p><strong>Query, including what was never asserted.</strong></p>
+<pre><code>// ontology_query
+{ "mode": "facts", "subject": "api", "predicate": "depends_on", "includeInferred": true }
+</code></pre>
+<pre><code>api depends_on auth
+api depends_on pg (inferred: transitive)
+</code></pre>
+<pre><code>// ontology_query
+{ "mode": "path", "from": "ada", "to": "pg", "depth": 4 }
+</code></pre>
+<pre><code>connected in 3 step(s):
+  ada owns api
+  api depends_on auth
+  auth depends_on pg
+</code></pre>
+<h2>Query modes</h2>
+<table>
+<thead>
+<tr>
+<th>Mode</th>
+<th>Answers</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>schema</code></td>
+<td>What vocabulary exists? (Start here.)</td>
+</tr>
+<tr>
+<td><code>stats</code></td>
+<td>How big is the graph, and how much is inferable?</td>
+</tr>
+<tr>
+<td><code>entities</code></td>
+<td>Which individuals are in class X (including its subclasses), or match text Y?</td>
+</tr>
+<tr>
+<td><code>facts</code></td>
+<td>Which triples match this pattern? Each omitted position is a wildcard.</td>
+</tr>
+<tr>
+<td><code>neighbors</code></td>
+<td>What surrounds this entity, out to depth N?</td>
+</tr>
+<tr>
+<td><code>path</code></td>
+<td>How are these two entities connected?</td>
+</tr>
+</tbody></table>
+<h2>The rules it enforces</h2>
+<p><strong>Subsumption.</strong> <code>subClassOf</code> is transitive: an entity declared <code>Service</code> is also a <code>Component</code>, so it satisfies a <code>Component</code> domain and is returned by a <code>Component</code> query. Cycles are refused at definition time — a cycle would make "is an X" unfalsifiable for every class on it.</p>
+<p><strong>Domain and range.</strong> A relation's <code>domain</code> constrains subjects, its <code>range</code> constrains objects, both closed under subsumption. An empty list means unconstrained, which is the honest encoding of "not yet decided" rather than a silent allow-all.</p>
+<p><strong>Entity vs literal.</strong> <code>rangeKind: "literal"</code> makes a relation attribute-valued (a version string, a date). A literal-valued relation can be neither symmetric, transitive, nor inverted — the derived triple would have a literal in subject position — and that incoherence is refused at definition time rather than producing nonsense later.</p>
+<p><strong>Functional cardinality.</strong> A <code>functional</code> relation admits at most one object per subject. A second, different object is a <code>functional-conflict</code>, not a silent overwrite. Re-asserting the <em>same</em> object stays idempotent.</p>
+<p><strong>Entailment.</strong> <code>transitive</code>, <code>symmetric</code>, and <code>inverseOf</code> are applied to a fixpoint, so the rules compose (the inverse of a transitive relation is itself closed transitively). Entailed facts are <strong>derived on read and never stored</strong> — retract a premise and everything resting on it disappears, with no stale derivation left behind. Each carries <code>via</code> naming the rule that produced it.</p>
+<p><strong>Retraction safety.</strong> Retracting an entity cascades to every fact mentioning it. Retracting a <em>term</em> is refused while anything still depends on it — a class that still classifies an entity or appears in a relation signature, a relation still asserted — and the refusal names the dependent.</p>
+<h2>Code Mode</h2>
+<p>Every tool is reachable as a typed call, with the canonical JSON value (not the rendered prose) as the result:</p>
+<pre><code>const { facts } = await tools.ontology_query({
+  mode: 'facts', predicate: 'depends_on', includeInferred: true,
+})
+const upstream = facts.filter(fact =&gt; fact.via === 'transitive').map(fact =&gt; fact.object)
+</code></pre>
+<h2>Using the reasoning core on its own</h2>
+<p>The rule engine is pure — no IO, no storage, no Cordis — and ships as its own entry point, so it can be used outside a harness:</p>
+<pre><code>import { entail, findPath, validateFactInput } from 'dsh-ontology/ontology'
+</code></pre>
+<h2>Development</h2>
+<pre><code>pnpm install
+pnpm test        # 47 unit tests: rules, tools, prompt section
+pnpm typecheck
+pnpm build
+</code></pre>
+<p><code>tests/memory-domain.ts</code> is an in-memory stand-in for one open storage domain, so the store and the tools are tested end to end — real validation, real entailment, real tool results — without a backend.</p>
+<h2>Requirements</h2>
+<ul>
+<li>DeepSeek Harness <code>&gt;= 0.1.0-rc.6</code></li>
+<li>Node <code>^22.19 || &gt;=24</code></li>
+</ul>
+<h2>License</h2>
+<p>MIT</p>

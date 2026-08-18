@@ -1,0 +1,116 @@
+<h1>dsh-vision-fallback（视觉代理）</h1>
+<p>给 DeepSeek Harness（DSH）的 text-only 会话加一个「视觉代理」开关：</p>
+<ul>
+<li><strong>文本请求完全不干预</strong> —— 原样走你原来选的模型（哪个都行，Flash/Pro/其他）</li>
+<li><strong>含图请求自动转发</strong> —— 直接把你当前消息里的图片 + 这句话发给视觉模型（OpenAI 兼容，默认火山方舟豆包），不带任何历史上下文</li>
+<li><strong>开关式使用</strong> —— 输入框旁一个「视觉代理」开关，点开即用，点关恢复原状</li>
+<li><strong>多视觉服务商</strong> —— 设置页「Vision 模型」里可增删服务商、设默认、测试连接，热生效</li>
+</ul>
+<blockquote>
+<p>⚠️ <strong>诚实声明（请先读）</strong></p>
+<p>这个插件是作者用 <strong>deepseek-v4-pro 通过 vibe coding</strong>（人机来回试错式开发）写出来的。
+作者并不是 DSH 的开发者，对 DSH 内部机制的理解大量来自读源码 + 踩坑 + 猜，
+<strong>不保证正确、不保证稳定，有 bug 是常态</strong>。它目前只在一个人的 Windows 机器上、
+配合 deepseek-v4-pro + 火山方舟豆包跑通过。请自行评估、自行修改，出问题别指望作者。
+具体的不确定点和已知坑见文末 <a href="#%E4%B8%8D%E7%A1%AE%E5%AE%9A%E4%B8%8E%E5%B7%B2%E7%9F%A5%E9%97%AE%E9%A2%98">不确定与已知问题</a>。</p>
+</blockquote>
+<hr>
+<h2>工作原理</h2>
+<pre><code>你在会话里选了任意文本模型，然后点开「视觉代理」开关
+        │
+        ├─ 纯文本消息 ──→ 你原来的模型（插件只是把历史里的旧图片块剥掉后原样转发）
+        │
+        └─ 当前消息带图 ──→ 视觉服务商（只发：这张图 + 这句话，无历史/无 system/无工具）
+                            ↑ 可在「设置 → Vision 模型」面板换服务商
+</code></pre>
+<p>开关的本质是：开启时把会话的模型切到本插件注册的 <code>vision-fallback</code> 路由
+（因为 DSH 的 <code>read_image</code> 要求当前路由声明图片输入，纯文本模型过不了这个门槛），
+同时记住你原来的模型；关闭时恢复。所以开启后模型选择器里会显示「视觉代理」，
+这是机制使然，不代表你的文本模型变了。</p>
+<h2>目录结构</h2>
+<pre><code>lib/index.js         宿主插件：注册路由、设置 schema（llm-vision-fallback 段）、凭据解析、模型发现
+lib/adapter.js       VisionFallbackAdapter：路由判定（仅最后一条消息带图才走视觉）+ SSE 流式翻译
+lib/translate.js     OpenAI 兼容 SSE → DSH StreamChunk 协议（改写自官方 dsh-llm-deepseek）
+lib/serialize.js     视觉请求序列化：只发最后一条消息；原图直发；文本历史图片剥离
+client/index.js      浏览器半：输入框旁「视觉代理」开关 + 设置页「Vision 模型」面板
+cordis.patch.yml     bundle patch：插入插件行
+test/vf-smoke.mjs    冒烟测试：文本透传 + 真实视觉请求（自包含，无需外部图片）
+</code></pre>
+<h2>安装</h2>
+<pre><code># 1. 安装进 profile
+dsh plugin --profile web add D:\dsh-vision-fallback
+
+# 2. 把插件加入 profile 的 bundle 列表
+#    编辑 %DSH_HOME%\profiles\web\package.json，在 dsh.profile.bundles 里追加：
+#    "@local/dsh-vision-fallback"
+
+# 3. 插件依赖自包含
+cd D:\dsh-vision-fallback
+pnpm install
+
+# 4. 重启 dsh web
+dsh web
+</code></pre>
+<blockquote>
+<p>坑：<code>dsh plugin add</code> 会以 <code>link:</code> 方式把插件链入 profile，Node 解析插件内部 import 时
+会还原到真实路径，所以<strong>插件目录里必须有自己的 node_modules</strong>（上面第 3 步）。
+另外 package.json 的 <code>exports</code> 里<strong>必须保留 <code>"./package.json"</code> 条目</strong>，
+否则 client-modules 扫描会报 ERR_PACKAGE_PATH_NOT_EXPORTED 并永久缓存“不是客户端包”。</p>
+</blockquote>
+<h2>配置</h2>
+<p>热生效于 <code>%DSH_HOME%\settings.yaml</code> 的 <code>llm-vision-fallback:</code> 段：</p>
+<pre><code>llm-vision-fallback:
+  defaultProvider: ark        # 含图请求走哪个服务商
+  providers:                  # 可配多个，面板里也可管理
+    ark:
+      displayName: 豆包(火山方舟)
+      baseUrl: https://ark.cn-beijing.volces.com/api/v3
+      model: doubao-seed-2-1-turbo-260628
+      apiKeyEnv: ARK_API_KEY  # 凭据引用：key 本身存在 DSH 凭据库，绝不在配置文件里
+</code></pre>
+<ul>
+<li>API Key 通过 DSH 凭据服务写入（设置页/凭据入口），<strong>本仓库不含任何密钥</strong></li>
+<li>想加服务商（硅基流动 / 百炼千问 / GLM / OpenRouter / 本地 vLLM…）：只要 OpenAI 兼容即可</li>
+</ul>
+<h2>使用</h2>
+<ol>
+<li>会话里选好你的文本模型（任意）</li>
+<li>点输入框旁的「<strong>视觉代理</strong>」开关（变蓝，显示「视觉代理 · 你的模型名」）</li>
+<li>正常聊天 = 你的模型；让 agent 看某张图（<code>read_image</code>）= 自动转发视觉服务商</li>
+<li>想换视觉服务商：<strong>设置 → Vision 模型</strong> 面板</li>
+</ol>
+<h2>开发与测试</h2>
+<pre><code>node test\vf-smoke.mjs    # 文本透传(假dispatch) + 真实视觉请求；凭据读 %DSH_HOME%\.credentials.yaml
+</code></pre>
+<h2>不确定与已知问题</h2>
+<p><strong>开发性质</strong></p>
+<ul>
+<li>vibe coding 产物，作者对 DSH 内部 API（LlmAdapter seam、slots、RPC 信封）的理解靠读源码试错，不保证符合官方意图</li>
+<li>仅验证环境：Windows 11 + deepseek-v4-pro + 火山方舟豆包（单个账号）；其他系统/服务商未测</li>
+</ul>
+<p><strong>使用中需要注意</strong></p>
+<ul>
+<li>宿主侧（lib/）改动必须重启 dsh web；客户端（client/）改动刷新页面即可</li>
+<li>视觉请求只发最后一条消息（图片 + 文字）：多轮"追问上一张图"的场景不适用，追问时请重新发图</li>
+<li>原图直发、不做压缩：超大图可能超过豆包的图片 token 上限（"Total tokens of image and text exceed max message tokens"）</li>
+<li>视觉回复的 max_tokens 被钳制在 8192</li>
+<li>视觉服务商必须 OpenAI 兼容（<code>/chat/completions</code> + SSE + <code>/models</code>）</li>
+<li>开关开启期间会话路由挂在 <code>vision-fallback</code> 上：若插件卸载/停用，该会话会失效，需手动切回原模型</li>
+</ul>
+<p><strong>已知坑（都在这上面摔过）</strong></p>
+<ul>
+<li><code>link:</code> 安装 + Node realpath → 插件目录必须自包含依赖（见安装第 3 步）</li>
+<li>package.json <code>exports</code> 缺 <code>./package.json</code> → 设置面板永远不加载</li>
+<li>客户端 RPC 返回是 <code>{result:{ok,value}}</code> 信封，忘了解包 = 面板永远“不可写”</li>
+<li>历史里有旧图片时曾把所有文本请求都发给视觉模型 → 现已改为“仅最后一条消息带图才路由”</li>
+<li>视觉模型不认 <code>developer</code> 角色、不认 thinking 参数 → 已做归一化/剥离</li>
+</ul>
+<p><strong>未做 / 可能坏的地方</strong></p>
+<ul>
+<li>手写 client bundle（未走官方 tsdown 构建链），HMR 无支持</li>
+<li>多图同时读、并发切换开关、子代理会话里的表现未验证</li>
+<li>推理强度（off/high/max）透传只验证过 deepseek-official 一家</li>
+<li>官方「模型」设置页也会显示本插件的 provider 行，但它不理解本插件的配置结构——请在专属面板里改配置</li>
+</ul>
+<h2>License</h2>
+<p>MIT</p>

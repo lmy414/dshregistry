@@ -1,0 +1,125 @@
+<h1>dsh-autoresume — dsh 会话重启自动续跑插件</h1>
+<p>web 进程重启后，若目标会话停在"被打断的中间态"（open turn / 无结果的 tool call / turn/end interrupted），
+自动向该会话注入一条「继续」，让 agent 接着干活——无需人工干预。</p>
+<h2>特性</h2>
+<ul>
+<li>只服务<strong>一个</strong>配置的 <code>targetSessionId</code>，绝不扫描其他会话</li>
+<li>通过 <code>ctx.sessionPersistence.inspect()</code> 读取会话持久化事件流做状态判定</li>
+<li>判定逻辑：<ul>
+<li><strong>interrupted</strong>（注入「继续」）：turn/step 打开未闭合、存在无对应 <code>tool/result</code> 的 <code>tool/call</code>、最后一个 <code>turn/end</code> 原因为 <code>interrupted</code></li>
+<li><strong>completed</strong>（不动作）：最后是 <code>assistant/message</code>，或 <code>turn/end</code> 为 <code>completed</code> 且其后无新用户消息</li>
+<li><strong>settled</strong>（不动作）：<code>cancelled</code> / <code>error</code> 等已闭合终态；以及闭合轮次后出现的手动用户消息</li>
+</ul>
+</li>
+<li>注入方式：<code>ctx.agents.get(target)</code> → <code>agent.followup(userMessage)</code>（消息 <code>source.kind=plugin, form=notice</code>）</li>
+<li><strong>进程级一次性</strong>：每个 web 进程只判定/注入一次；<code>bootGraceMs</code> 宽限窗口内有效（profile HMR 装卸插件不误触发）</li>
+<li>目标会话未就绪时按 <code>pollIntervalMs</code> 重查</li>
+</ul>
+<h2>安装</h2>
+<pre><code># 1. 构建
+npm run build
+
+# 2. 注册到 web profile
+dsh plugin --profile web add /path/to/dsh-autoresume
+
+# 3. 配置目标会话（编辑 web profile 的 cordis.patch.yml）
+- insert:
+    - id: dsh-autoresume
+      name: 'dsh-autoresume'
+      config:
+        targetSessionId: '&lt;your-session-id&gt;'   # 必填
+
+# 4. 验证注册
+dsh --profile web --dump-config   # 应出现 id: dsh-autoresume
+
+# 5. 重启生效
+sudo systemctl restart dsh-web
+</code></pre>
+<h2>配置项</h2>
+<table>
+<thead>
+<tr>
+<th>键</th>
+<th>默认</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>targetSessionId</code></td>
+<td>（必填）</td>
+<td>要自动续跑的目标会话 ID；未配置则插件不动作</td>
+</tr>
+<tr>
+<td><code>bootGraceMs</code></td>
+<td><code>120000</code></td>
+<td>web 进程启动后允许判定的宽限窗口（毫秒）</td>
+</tr>
+<tr>
+<td><code>initialDelayMs</code></td>
+<td><code>3000</code></td>
+<td>首次检查延迟（等会话恢复）</td>
+</tr>
+<tr>
+<td><code>pollIntervalMs</code></td>
+<td><code>5000</code></td>
+<td>会话未就绪时的重查间隔</td>
+</tr>
+<tr>
+<td><code>promptText</code></td>
+<td><code>继续（自动）</code></td>
+<td>注入的续跑提示词</td>
+</tr>
+</tbody></table>
+<h2>工作原理</h2>
+<pre><code>web 重启 → 插件加载 → 宽限窗口内 inspect(目标会话)
+  ├─ interrupted → agent.followup('继续（自动）') → 自动接续
+  ├─ completed / settled → 不动作（避免重复注入）
+  └─ 会话未就绪 → 5s 后重查
+</code></pre>
+<h2>架构</h2>
+<pre><code>src/
+├── service.js    # 服务端：状态机判定 + 注入（构建到 lib/）
+└── client.js     # 客户端占位（构建到 lib/）
+scripts/
+├── build.mjs     # 构建：src → lib
+└── self-test.mjs # 状态机单测（9 用例）
+</code></pre>
+<h2>开发</h2>
+<pre><code>npm run build   # src → lib
+npm test        # 状态机自测
+</code></pre>
+<h2>故障排查</h2>
+<table>
+<thead>
+<tr>
+<th>现象</th>
+<th>原因</th>
+<th>处理</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>插件不动作</td>
+<td><code>targetSessionId</code> 未配置</td>
+<td>检查 cordis.patch.yml 配置项</td>
+</tr>
+<tr>
+<td>注入后 agent 不接续</td>
+<td>会话处于 <code>running</code> 而非 <code>idle</code></td>
+<td>插件只在 idle 时注入，等其空闲</td>
+</tr>
+<tr>
+<td>重启后无「继续」</td>
+<td>超过 <code>bootGraceMs</code> 窗口</td>
+<td>增大窗口或确认在启动后 2 分钟内判定</td>
+</tr>
+<tr>
+<td>HMR 装卸后误触发</td>
+<td>——</td>
+<td>已防：判定仅在新进程启动宽限内进行</td>
+</tr>
+</tbody></table>
+<h2>卸载</h2>
+<pre><code>dsh plugin --profile web remove dsh-autoresume
+</code></pre>
+<h2>License</h2>
+<p>Apache-2.0</p>

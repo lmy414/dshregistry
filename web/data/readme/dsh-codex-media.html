@@ -1,0 +1,82 @@
+<h1>dsh-codex-media</h1>
+<p><strong>用本机 Codex(ChatGPT Plus 额度)给 DeepSeek Harness 补上「识图 / 生图 / 改图」,并且能在 Web 输入框里直接粘贴图片。</strong></p>
+<p>一个包,两个角色:</p>
+<ol>
+<li><strong>Host 插件</strong>(<code>lib/host.js</code>)——通过 <code>ctx.webServer</code> 的公开 seam 注入粘贴桥:<ul>
+<li><code>tapIndex</code> 往 SPA 的 index.html 注入 <code>bridge.js</code>;</li>
+<li>提供 <code>POST /codex-media/upload</code>,把粘贴的图片字节存进官方附件库(<code>ctx.attachments</code>,即 <code>~/.dsh/attachments</code>),返回 <code>sha256:</code> 引用。</li>
+</ul>
+</li>
+<li><strong>MCP server</strong>(<code>mcp/server.mjs</code>,stdio)——四个工具,经 <code>dsh-mcp-client</code> 注册为 <code>mcp__codexmedia__*</code>:<table>
+<thead>
+<tr>
+<th>工具</th>
+<th>作用</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>identify_image</code></td>
+<td>识图:本地路径 / <code>sha256:</code> 引用 / <code>clipboard</code></td>
+</tr>
+<tr>
+<td><code>generate_image</code></td>
+<td>生图:Codex 托管 <code>image_generation</code>,输出到你传的路径</td>
+</tr>
+<tr>
+<td><code>edit_image</code></td>
+<td>改图:带参考图重绘</td>
+</tr>
+<tr>
+<td><code>clipboard_to_image</code></td>
+<td>剪贴板图片存盘(pwsh -STA 助手)</td>
+</tr>
+</tbody></table>
+</li>
+</ol>
+<h2>工作原理(粘贴为什么能发出去)</h2>
+<p>DSH 的发送门禁在 <code>dsh-host-apiproxy</code> 的 <code>prompt</code> 端点:消息里含图片且当前模型不声明 image 输入(DeepSeek 只有 <code>["text"]</code>)时,直接拒绝发送。</p>
+<p>本插件<strong>不改这个门禁</strong>,而是在更早的一环把图片变成文本:注入的 <code>bridge.js</code> 在捕获阶段拦截带图的粘贴(纯文本粘贴不干预),把图片上传成官方附件,再往输入框插入文本引用 <code>[图片] sha256:…</code>。消息发出时是纯文本,门禁永不触发;模型看到引用后调用 <code>identify_image</code>/<code>edit_image</code> 解析附件文件交给 Codex 识别。</p>
+<pre><code>粘贴图片 ──► bridge.js 拦截 ──► POST /codex-media/upload ──► ctx.attachments(sha256)
+                                                                        │
+模型 ◄── 文本引用 [图片] sha256:… ◄── 插入输入框 ◄──────────────────────┘
+   │
+   └─► mcp__codexmedia__identify_image ──► 解析附件路径 ──► codex exec -i ──► 文本回答
+</code></pre>
+<h2>依赖</h2>
+<ul>
+<li>DSH ≥ 0.1.0-rc.6,Node ≥ 22.19</li>
+<li>本机安装并登录 ChatGPT 的 <strong>Codex CLI</strong>(识图/生图/改图走 Plus 额度)</li>
+<li>Windows(剪贴板助手用 <code>pwsh -STA</code>;非 Windows 上 <code>clipboard</code> 输入不可用,其余功能正常)</li>
+</ul>
+<h2>安装</h2>
+<pre><code># 1) 把插件装进 profile 并注册为 bundle(参考 dsh-vision-proxy 的安装方式)
+dsh plugin --profile web add github:yujianjian1013/dsh-codex-media
+# 或手动: profiles/&lt;name&gt;/package.json 的 dependencies 加
+#   "dsh-codex-media": "github:yujianjian1013/dsh-codex-media"
+#   并在 dsh.profile.bundles 里加 "dsh-codex-media",然后 pnpm install
+</code></pre>
+<p>包内的 <code>cordis.patch.yml</code> 会自动插入 host 插件行。MCP 行是机器相关的,加到你 profile 自己的 <code>cordis.patch.yml</code>:</p>
+<pre><code>- insert:
+    - id: mcp-codexmedia
+      name: '@deepseek-ai/dsh-mcp-client'
+      config:
+        serverName: codexmedia
+        transport: stdio
+        command: node
+        args: !!js '(() =&gt; { const { createRequire } = process.getBuiltinModule("node:module"); const home = process.env.DSH_HOME || ((process.env.USERPROFILE || "") + "/.dsh"); return [createRequire(home + "/profiles/web/package.json").resolve("dsh-codex-media/mcp/server.mjs")]; })()'
+</code></pre>
+<p>重启 <code>dsh web</code>,刷新页面。</p>
+<h2>使用</h2>
+<ul>
+<li><strong>识图</strong>:在输入框 Ctrl+V 粘贴图片(截图 Win+Shift+S)→ 自动出现 <code>[图片] sha256:…</code> → 发送,模型会自己调 <code>identify_image</code>。也支持直接说"识图一下剪贴板"(<code>image: clipboard</code>)。</li>
+<li><strong>生图</strong>:直接说"画一只……"→ 模型调 <code>generate_image</code>,<code>output_path</code> 按会话工作目录传入。</li>
+<li><strong>改图</strong>:粘贴参考图 + "把它改成……"→ <code>edit_image</code> 带参考图重绘。</li>
+</ul>
+<h2>注意</h2>
+<ul>
+<li>生图/改图消耗 ChatGPT 订阅的图像额度;原图留存在 <code>~\.codex\generated_images</code>,可定期清理。</li>
+<li>Codex 连接 <code>chatgpt.com</code> 时 WebSocket 偶发重置(10054)会自动降级 HTTPS 重试,属正常现象。</li>
+<li><code>scripts/</code> 里保留了一个不依赖 DSH 的纯 PowerShell 版(<code>codex-media.ps1</code>,见 <code>scripts/README.md</code>)。</li>
+</ul>
+<h2>License</h2>
+<p>MIT</p>

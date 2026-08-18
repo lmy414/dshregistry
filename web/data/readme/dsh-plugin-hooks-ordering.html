@@ -1,0 +1,244 @@
+<h1>dsh-plugin-hooks-ordering</h1>
+<p><strong>English</strong> | <a href="https://github.com/xinyuehtx/dsh-plugin-hooks-ordering/blob/HEAD/README.zh-CN.md">简体中文</a></p>
+<p>Deterministic <code>before</code>/<code>after</code> ordering for <a href="https://github.com/cordiverse/cordis">Cordis</a> hooks whose participants are contributed by independent, mutually-unaware plugins — for both <code>waterfall</code> and <code>serial</code> dispatch, with an optional <a href="https://github.com/deepseek-ai/deepseek-harness">DeepSeek-Harness</a> layer that controls real dsh hooks out of the box.</p>
+<ul>
+<li><strong>Playground (live):</strong> <a href="https://xinyuehtx.github.io/dsh-plugin-hooks-ordering/">https://xinyuehtx.github.io/dsh-plugin-hooks-ordering/</a></li>
+<li><strong>Runnable demo:</strong> <code>pnpm run demo</code></li>
+</ul>
+<hr>
+<h2>The problem</h2>
+<p>Cordis dispatches waterfall listeners in <strong>registration order</strong> — their position in the internal listener array, with <code>prepend</code> as the only lever. Registration order is in turn driven by <code>inject</code>-dependency activation, which is <strong>non-deterministic between unrelated plugins</strong>.</p>
+<p>The consequence: a plugin <strong>cannot reliably state a relative order</strong> such as <em>"run me after that other plugin."</em> Concretely:</p>
+<ul>
+<li>There is no <code>before</code>/<code>after</code>/<code>stage</code> declaration on <code>ctx.on</code> — only a boolean <code>prepend</code>, and <code>prepend</code> is <em>last-prepender-wins</em>, so it is not a stable "always first" either.</li>
+<li>The only robust ordering primitive Cordis offers is <code>inject</code>: if plugin B injects a service plugin A provides, B activates after A. That pins order <strong>globally and single-directionally</strong>, and forces B to depend on A — impossible across vendors that must not depend on each other.</li>
+<li>Two plugins may need <strong>opposite</strong> relative order on <strong>different</strong> hooks. A single activation order cannot express that.</li>
+</ul>
+<p>So ordering that matters — auth before logging, sanitizer before serializer, metrics last — silently depends on load order that nobody controls. Change an unrelated <code>inject</code>, and the order flips.</p>
+<pre><code>raw ctx.on, load order [auth, logging, metrics]  -&gt;  auth, logging, metrics
+raw ctx.on, load order [metrics, logging, auth]  -&gt;  metrics, logging, auth   ← same plugins, flipped
+</code></pre>
+<p>This is not hypothetical. In <code>deepseek-harness</code> the waterfall hook <code>agent/pre-step</code> is subscribed by a dozen+ independent packages, <code>tools/post-execute</code> by six, <code>llm/stream</code> by five — and several places document that the relative order is load-bearing yet decided only by <code>prepend</code> and registration timing (see <a href="#how-ordering-is-done-in-dsh-today-and-the-limits-of-each">How ordering is done in dsh today</a>).</p>
+<h2>The solution</h2>
+<p>You do <strong>not</strong> modify or fork Cordis. This package is an ordinary Cordis plugin that <strong>brackets</strong> a chosen hook and decides participant order itself, independent of plugin load timing.</p>
+<p><strong>Waterfall</strong> (<code>HookOrdering</code>) brackets the hook with a single <code>prepend</code>ed listener and exploits the onion model:</p>
+<ul>
+<li>Code <strong>before</strong> the listener's <code>next()</code> runs ahead of the entire native chain — the <strong><code>front</code></strong> phase.</li>
+<li>Code <strong>after</strong> <code>next()</code> runs behind everything, including the hook's built-in default — the <strong><code>back</code></strong> phase.</li>
+</ul>
+<p><strong>Serial</strong> (<code>SerialHookOrdering</code>) has no <code>next()</code> to wrap, so it brackets with two coordinators: a <code>prepend</code>ed <strong>front</strong> coordinator that runs ahead of the native chain (a bail there short-circuits the whole dispatch), and an appended <strong>back</strong> coordinator that runs best-effort last.</p>
+<p>In both, participants register into the coordinator (not the raw hook) with <code>before</code>/<code>after</code> names, and a <strong>stable topological sort</strong> decides their order.</p>
+<pre><code>HookOrdering, load order [auth, logging, metrics]  -&gt;  auth, logging, &lt;host default&gt;, metrics
+HookOrdering, load order [metrics, logging, auth]  -&gt;  auth, logging, &lt;host default&gt;, metrics   ← stable
+</code></pre>
+<h3>Why this belongs in a plugin, not in Cordis</h3>
+<p>Cordis is deliberately minimal: it provides ordering <em>primitives</em> (array position, <code>prepend</code>, the <code>next()</code> chain). Ordering <em>policy</em> — numeric orders, <code>before</code>/<code>after</code>, topological sort — differs per hook and is not a kernel concern. Building it as a plugin means zero framework modification and no fork to maintain.</p>
+<h2>Layers</h2>
+<p>The package is layered so you can use it at the altitude you need:</p>
+<table>
+<thead>
+<tr>
+<th>Layer</th>
+<th>Entry point</th>
+<th>What it gives you</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>1. Algorithm</td>
+<td><code>@tengxiaohtx/dsh-plugin-hooks-ordering/topo-sort</code>, <code>/dag</code></td>
+<td>The pure stable topological sort and the constraint-graph (JSON) renderer. Zero dependencies, no Cordis.</td>
+</tr>
+<tr>
+<td>2. Cordis services</td>
+<td><code>@tengxiaohtx/dsh-plugin-hooks-ordering</code> (root), <code>/waterfall</code>, <code>/serial</code></td>
+<td><code>HookOrdering</code> and <code>SerialHookOrdering</code> — control any hook in any Cordis app.</td>
+</tr>
+<tr>
+<td>3. DeepSeek-Harness</td>
+<td><code>@tengxiaohtx/dsh-plugin-hooks-ordering/dsh</code></td>
+<td>A dsh plugin + <code>cordis.patch.yml</code> that controls the real dsh hooks for you.</td>
+</tr>
+</tbody></table>
+<h2>Install</h2>
+<pre><code>pnpm add @tengxiaohtx/dsh-plugin-hooks-ordering
+# peer dependency:
+pnpm add @deepseek-ai/cordis
+</code></pre>
+<h2>Usage</h2>
+<h3>Waterfall hooks</h3>
+<pre><code>import HookOrdering from '@tengxiaohtx/dsh-plugin-hooks-ordering'
+
+ctx.plugin(HookOrdering)
+
+// The hook owner (or app composition) takes control ONCE. This installs the
+// single bracket listener; controlling twice throws, so the prepend race
+// cannot come back.
+ctx.hooksOrdering.control('request/assemble')
+
+// Vendor A — names only its own constraint, imports nothing from vendor B.
+ctx.hooksOrdering.register('request/assemble', 'front', {
+  name: 'auth',
+  before: ['logging'],
+  run: (req) =&gt; authenticate(req),
+})
+
+// Vendor B — a different package, unaware of A.
+ctx.hooksOrdering.register('request/assemble', 'front', {
+  name: 'logging',
+  run: (req) =&gt; log(req),
+})
+
+// Vendor C — must run after everything, even the host default.
+ctx.hooksOrdering.register('request/assemble', 'back', {
+  name: 'metrics',
+  run: (req) =&gt; emitMetrics(req),
+})
+</code></pre>
+<p>Regardless of the order these three plugins load or register, <code>auth</code> runs before <code>logging</code>, and <code>metrics</code> runs last.</p>
+<h3>Logging the constraint DAG</h3>
+<p>Pass a <code>log</code> file to write the constraint graph (JSON) on <strong>every registration change</strong>, so it always reflects current state — handy when debugging an unexpected order or a cycle:</p>
+<pre><code>ctx.plugin(HookOrdering, { log: './hooks-ordering-dag.json' })
+</code></pre>
+<pre><code>{
+  "sections": [
+    {
+      "hook": "request/assemble",
+      "phase": "front",
+      "nodes": ["auth", "logging"],
+      "edges": [{ "from": "auth", "to": "logging" }]   // auth runs before logging
+    },
+    {
+      "hook": "request/assemble",
+      "phase": "back",
+      "nodes": ["metrics"],
+      "edges": []
+    }
+  ]
+}
+</code></pre>
+<p>The graph is rendered <strong>without</strong> topological sorting, so a cycle is shown faithfully rather than throwing. You can also read it programmatically at any time via <code>ctx.hooksOrdering.dumpDag()</code> (returns the JSON string). Write failures are reported via <code>console.warn</code> and never thrown back into the fiber.</p>
+<h3>Serial hooks</h3>
+<pre><code>import { SerialHookOrdering } from '@tengxiaohtx/dsh-plugin-hooks-ordering'
+
+ctx.plugin(SerialHookOrdering)
+ctx.serialHooksOrdering.control('turn/stopping')
+
+// front: runs ahead of the native chain. Returning a bail value (anything but
+// null/false/undefined) short-circuits the whole serial dispatch.
+ctx.serialHooksOrdering.register('turn/stopping', 'front', {
+  name: 'guard',
+  run: (turn) =&gt; (isAllowed(turn) ? undefined : 'DENIED'),
+})
+
+// back: best-effort last (see Semantics and limits).
+ctx.serialHooksOrdering.register('turn/stopping', 'back', {
+  name: 'audit',
+  run: (turn) =&gt; recordAudit(turn),
+})
+</code></pre>
+<h3>In DeepSeek-Harness</h3>
+<p>The <code>/dsh</code> entry is a dsh plugin that mounts both services and takes control of the dsh hooks that multiple packages contribute to (<code>agent/pre-step</code>, <code>tools/pre-execute</code>, <code>tools/post-execute</code>, <code>system-prompt/assemble</code>, <code>llm/stream</code>, … and the serial <code>agent/turn-stopping</code>). Add one row to your profile patch:</p>
+<pre><code>- insert:
+    - id: hooks-ordering
+      name: '@tengxiaohtx/dsh-plugin-hooks-ordering/dsh'
+      config:
+        # hooks: ['agent/pre-step', 'tools/post-execute']   # default: all known dsh waterfall hooks
+        # serialHooks: ['agent/turn-stopping']              # default: [agent/turn-stopping]
+        # log: './hooks-ordering-dag.json'                  # optional DAG log
+</code></pre>
+<p>Controlling a hook with no registered participants is a transparent pass-through, so this row changes nothing until a plugin registers with <code>before</code>/<code>after</code>. A package <code>cordis.patch.yml</code> is shipped at the root (declared via the <code>dsh.bundle.patch</code> manifest field) with the same row.</p>
+<h2>Recommended assembly order</h2>
+<p>Ordering is enforced by the coordinator, not by load position — but the coordinator must be <strong>in place before other plugins prepend</strong>. So:</p>
+<ol>
+<li><strong>Mount this plugin and <code>control()</code> the target hooks first</strong> — before the contributing plugins load. The single bracket must be prepended ahead of any competitor; if another plugin prepends after <code>control()</code>, it lands <em>outside</em> the bracket and escapes ordering (the documented <code>prepend</code> race, kept out of the coordinated set by design).</li>
+<li><strong>Then load the contributors.</strong> They <code>register()</code> into the coordinator with <code>before</code>/<code>after</code> names; load order among them no longer matters.</li>
+</ol>
+<p>In a dsh profile this means placing the <code>hooks-ordering</code> row early (it activates once its services are available); the row order in <code>cordis.patch.yml</code> carries no load semantics, but the coordinator it installs is what makes every later contributor's declared order hold.</p>
+<h2>How ordering is done in dsh today (and the limits of each)</h2>
+<p>These are the existing ways to influence hook order in <code>deepseek-harness</code> — the "bypasses" this plugin supersedes. Each is real and each falls short of a declarative relative order:</p>
+<ol>
+<li><strong><code>{ prepend: true }</code> on <code>ctx.on(...)</code></strong> — the engine's only placement lever (<code>unshift</code> vs <code>push</code>, <code>vendor/cordis/src/events.ts:143</code>). It is binary and <em>last-prepender-wins</em>: two plugins that both prepend race, and neither can say "first among the front." Used e.g. by <code>packages/spill/spill-policy/src/index.ts:209</code> and <code>packages/llm/llm/src/invariant.ts:88</code>.</li>
+<li><strong>Registration / <code>ctx.plugin(...)</code> call order</strong> — default append makes call order the execution order. It works only while one composition site controls every call, and breaks the moment independent vendors load in an order nobody owns. Relied on deliberately (and fragilely) in <code>packages/skill/tool-skill/src/index.ts:164</code> and <code>packages/examples/agent-spine-demo/src/index.ts:257</code>.</li>
+<li><strong><code>inject</code> dependencies</strong> — gates a plugin's <em>activation</em> on service availability (e.g. <code>static inject = [...]</code> in <code>packages/core/agent-loop/src/index.ts:297</code>). This orders a plugin relative to <em>services</em>, <strong>globally and single-directionally</strong>, and forces a dependency edge. It cannot express the relative order of two listeners already on the same hook, nor opposite orders on different hooks.</li>
+<li><strong>Order invariant assertions</strong> — detect a wrong order after the fact (<code>packages/context/time-context/src/invariant.ts:66</code>) but do not enforce one.</li>
+<li><strong>Profile <code>cordis.patch.yml</code> row order</strong> — explicitly carries <em>no</em> load semantics ("activation is service-availability driven", <code>packages/bundle/base/cordis.patch.yml:13</code>), so it cannot sequence listeners at all.</li>
+</ol>
+<p><code>HookOrdering</code>/<code>SerialHookOrdering</code> replace all five with a single declarative primitive: name your <code>before</code>/<code>after</code>, register into the coordinator, and the order is stable regardless of load timing — with the constraint graph available as a JSON DAG when it goes wrong.</p>
+<h2>API</h2>
+<h3><code>ctx.hooksOrdering</code> — the <code>HookOrdering</code> service (waterfall)</h3>
+<table>
+<thead>
+<tr>
+<th>Method</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>control(hook)</code></td>
+<td>Install the bracket on a waterfall <code>hook</code>. Call once per hook. Returns a disposer. Throws <code>HookControlError</code> if already controlled.</td>
+</tr>
+<tr>
+<td><code>register(hook, phase, entry)</code></td>
+<td>Add a participant to <code>'front'</code> or <code>'back'</code>. Returns a disposer. Throws <code>HookControlError</code> if the hook is not controlled.</td>
+</tr>
+<tr>
+<td><code>plan(hook, phase)</code></td>
+<td>Return the participant names in the order they would run — for tests and diagnostics.</td>
+</tr>
+<tr>
+<td><code>dumpDag()</code></td>
+<td>Return the constraint DAG of every controlled hook as a JSON string.</td>
+</tr>
+</tbody></table>
+<p>Config: <code>ctx.plugin(HookOrdering, { log?: string })</code>.</p>
+<h3><code>ctx.serialHooksOrdering</code> — the <code>SerialHookOrdering</code> service (serial)</h3>
+<p>Same surface as <code>HookOrdering</code> (<code>control</code> / <code>register</code> / <code>plan</code> / <code>dumpDag</code>, same config). The entry's <code>run</code> may <strong>return</strong> a value: a bail value (anything but <code>null</code>/<code>false</code>/<code>undefined</code>) short-circuits the serial dispatch and becomes its result.</p>
+<h3><code>HookEntry</code> / <code>SerialHookEntry</code></h3>
+<table>
+<thead>
+<tr>
+<th>Field</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>name</code></td>
+<td>Unique within a <code>(hook, phase)</code>. Referenced by other entries' <code>before</code>/<code>after</code>.</td>
+</tr>
+<tr>
+<td><code>before?</code></td>
+<td>Names this entry must precede.</td>
+</tr>
+<tr>
+<td><code>after?</code></td>
+<td>Names this entry must follow.</td>
+</tr>
+<tr>
+<td><code>run(...payload)</code></td>
+<td>Called with the hook payload (waterfall: dispatched args without Cordis' trailing <code>next</code>). Awaited. Serial <code>run</code> may return a bail value.</td>
+</tr>
+</tbody></table>
+<h3><code>topoSort(entries)</code> (<code>.../topo-sort</code>) and <code>buildDag(sections)</code> (<code>.../dag</code>)</h3>
+<p>The zero-dependency stable topological sort, exported standalone. Ties keep input order; an unknown <code>before</code>/<code>after</code> target is a no-op; a cycle throws <code>OrderingCycleError</code>. <code>buildDag</code> renders the constraint graph as a plain object (<code>{ sections: [{ hook, phase, nodes, edges }] }</code>) for <code>JSON.stringify</code> — it never sorts and never throws on a cycle.</p>
+<h2>Semantics and limits</h2>
+<ul>
+<li><strong>Waterfall and serial only.</strong> The waterfall bracket needs <code>next()</code>; serial uses two coordinators with bail semantics. <code>emit</code>/<code>parallel</code>/<code>bail</code> hooks have no ordered chain to coordinate.</li>
+<li><strong>One coordinator per hook.</strong> A second <code>prepend</code> would reintroduce the race, so <code>control</code> rejects a double-take.</li>
+<li><strong>It orders what it owns.</strong> The coordinator controls its <code>front</code>/<code>back</code> registries and their internal order, and places them relative to the native chain. It does not reorder foreign listeners <em>among themselves</em>.</li>
+<li><strong>Waterfall <code>back</code> is exact; serial <code>back</code> is best-effort.</strong> Waterfall <code>back</code> runs after the whole native chain via <code>next()</code>. Serial has no <code>next()</code>, so its <code>back</code> coordinator is appended at <code>control()</code> time and runs after the listeners present then — a native listener added <em>after</em> <code>control()</code> will run after it, and any bail (native or front) skips it entirely.</li>
+<li><strong>Unknown reference = no-op.</strong> A cross-vendor <code>after: ['maybe-absent']</code> imposes no constraint when that peer is not loaded — cross-vendor plugins cannot assume each other's presence.</li>
+<li><strong>Cycles fail loud at dispatch.</strong> Conflicting constraints throw <code>OrderingCycleError</code> naming the blocked entries (and <code>dumpDag()</code> still renders the cycle for inspection).</li>
+</ul>
+<h2>Development</h2>
+<pre><code>pnpm install
+pnpm test            # vitest, unit + real-cordis integration
+pnpm test:coverage   # 100% per-file gate
+pnpm typecheck
+pnpm lint
+pnpm build           # tsdown -&gt; lib/ (ESM + d.ts)
+pnpm demo            # the problem and the fix, waterfall + serial, side by side
+pnpm playground:build   # -&gt; playground/dist (deployed to GitHub Pages)
+</code></pre>
+<p>CI installs with pnpm against the public npm registry (see <code>.npmrc</code>).</p>
+<h2>License</h2>
+<p><a href="https://github.com/xinyuehtx/dsh-plugin-hooks-ordering/blob/HEAD/LICENSE">MIT</a></p>

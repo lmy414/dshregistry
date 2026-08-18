@@ -1,0 +1,146 @@
+<h1>dsh-plugin-gate</h1>
+<p><strong>Installation safety gate &amp; data-protection guard for DeepSeek Harness — 60 static signature rules (31 high / 24 medium / 5 low) scan plugin sources for malicious install scripts, credential theft, obfuscation and network callbacks before you run <code>dsh plugin add</code>, and 12 destructive-command patterns plus workspace-boundary checks stop <code>rm -rf</code>-class accidents before they happen.</strong></p>
+<p>The plugin marketplace is growing fast (thousands of entries), and malicious code mixed into a plugin is only a matter of time. <code>dsh-plugin-gate</code> gives the agent a <code>gate_scan</code> tool that inspects a plugin source — a <strong>local directory</strong> or an <strong>npm tarball</strong> — for the classic malware shapes:</p>
+<table>
+<thead>
+<tr>
+<th>Domain</th>
+<th>What it checks</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong>Scripts</strong></td>
+<td>npm lifecycle scripts (pre/install/postinstall), exec/spawn/shell:true, curl</td>
+</tr>
+<tr>
+<td><strong>Obfuscation</strong></td>
+<td>eval / new Function / vm.runIn*, hex-escape floods, base64 blobs, char-array packing</td>
+</tr>
+<tr>
+<td><strong>Permissions</strong></td>
+<td>credential env reads (<code>OPENAI_API_KEY</code> etc.), ssh/aws/npmrc file reads, writes to system/home/dotfile paths, chmod 777, sandbox-escalation requests</td>
+</tr>
+<tr>
+<td><strong>Network</strong></td>
+<td>external URLs &amp; hosts, fetch/axios/socket/WebSocket/DNS APIs, cloud-metadata endpoints (169.254.169.254), Discord/Telegram/Slack webhooks, .onion, read-then-send exfiltration shape</td>
+</tr>
+<tr>
+<td><strong>Secrets</strong></td>
+<td>hardcoded <code>sk-</code> keys, <code>ghp_</code> tokens, AWS keys, private key blocks, bearer tokens</td>
+</tr>
+<tr>
+<td><strong>Supply chain</strong></td>
+<td>exact-version direct dependencies checked against <strong>Google OSV</strong> (ranges and official @deepseek-ai packages skipped; configurable, offline-degrades)</td>
+</tr>
+</tbody></table>
+<p>The gate is <strong>read-only</strong>: it never executes scanned code and never writes files.</p>
+<h2>Install</h2>
+<p>In your DSH profile:</p>
+<pre><code>dsh plugin --profile &lt;profile&gt; add dsh-plugin-gate
+# or add the bundle patch manually:
+#   dsh --profile &lt;profile&gt; --patch ./node_modules/dsh-plugin-gate/cordis.patch.yml
+</code></pre>
+<h2>Usage</h2>
+<p>Ask the agent to scan a plugin before installing it (the plugin also injects prompt guidance that tells the agent to do this automatically):</p>
+<pre><code>gate_scan target: "npm:dsh-plugin-some-package"
+gate_scan target: "npm:dsh-plugin-some-package@1.2.3"   # pinned version
+gate_scan target: "./downloaded-plugin"                 # local directory
+</code></pre>
+<h3>v1.1 - Data-protection guard</h3>
+<p>Before any destructive operation, ask the agent to evaluate it with gate_guard (also injected into prompt guidance):</p>
+<pre><code>gate_guard command: "rm -rf ./node_modules"
+gate_guard path: ".dsh-memory-setup/memory.json" action: "delete"
+</code></pre>
+<ul>
+<li><strong>BLOCK</strong> - device/root-level destruction (rm -rf /, rmdir /s /q, format, dd to a block device, mkfs, drive-root deletes): refuse.</li>
+<li><strong>WARN</strong> - recursive/force deletes, targets outside the workspace, or critical files (memory.json, .git, ...): confirm the exact target first.</li>
+<li><strong>PASS</strong> - no destructive signature detected.</li>
+</ul>
+<p>Result shape:</p>
+<pre><code>{
+  "verdict": "BLOCK" | "WARN" | "PASS",
+  "score": 254,
+  "summary": { "high": 0, "medium": 1, "low": 3, "categories": { "network": 4 } },
+  "network": { "hosts": [...], "unallowlisted": [...], "readAndSendFiles": [...] },
+  "hits": [{ "rule": "fetch_call", "category": "network", "severity": "medium",
+             "file": "lib/index.js", "line": 12, "evidence": "...", "hint": "..." }],
+  "recommendations": [...]
+}
+</code></pre>
+<h3>Verdict semantics</h3>
+<ul>
+<li><strong>BLOCK</strong> — at least one high-severity signature. Do not install until the maintainer ships a clean rebuild you can scan again.</li>
+<li><strong>WARN</strong> — medium-severity patterns that need manual review (network I/O, home-path writes, base64 blobs). Inspect every hit in context.</li>
+<li><strong>PASS</strong> — no risky signatures. Heuristic only — keep normal caution with unknown maintainers.</li>
+</ul>
+<p>Context-aware rules: <code>exec()</code>/<code>execSync()</code> hits are downgraded when the file does not import <code>child_process</code> (typical <code>RegExp#exec</code> false positive); code-context rules (exec, eval, curl|sh, PowerShell…) are downgraded to low when found in <strong>comments or documentation</strong> (examples, not behavior) — while secrets and webhooks stay flagged even in comments. Dependencies installed from git/http/file URLs are flagged as <code>risky_dependency</code>, and &gt;4000-char minified lines as <code>minified_line</code> (low).</p>
+<h2>Configuration</h2>
+<table>
+<thead>
+<tr>
+<th>Key</th>
+<th>Default</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>maxFiles</code></td>
+<td>1000</td>
+<td>hard cap on scanned files per directory walk</td>
+</tr>
+<tr>
+<td><code>maxFileBytes</code></td>
+<td>2 MiB</td>
+<td>per-file text cap</td>
+</tr>
+<tr>
+<td><code>includeNodeModules</code></td>
+<td>false</td>
+<td>descend into node_modules</td>
+</tr>
+<tr>
+<td><code>maxTarballBytes</code></td>
+<td>32 MiB</td>
+<td>npm tarball download cap</td>
+</tr>
+<tr>
+<td><code>allowlistHosts</code></td>
+<td>[]</td>
+<td>hosts never listed as unallowlisted</td>
+</tr>
+<tr>
+<td><code>osvCheck</code></td>
+<td>true</td>
+<td>query Google OSV for known vulnerabilities on exact-version deps</td>
+</tr>
+<tr>
+<td><code>osvMaxDeps</code></td>
+<td>8</td>
+<td>max exact-version direct deps checked</td>
+</tr>
+<tr>
+<td><code>osvTimeoutMs</code></td>
+<td>10000</td>
+<td>per-dep OSV query timeout</td>
+</tr>
+<tr>
+<td><code>promptSection</code></td>
+<td>true</td>
+<td>inject agent guidance</td>
+</tr>
+<tr>
+<td><code>sectionOrder</code></td>
+<td>5</td>
+<td>prompt section order</td>
+</tr>
+</tbody></table>
+<h2>Development</h2>
+<pre><code>node --check lib/*.js
+node test/rules.test.mjs   # main-module mode (node --test is blocked in the DSH sandbox)
+node test/scan.test.mjs
+</code></pre>
+<p>Pure logic lives in <code>lib/rules.js</code> (signatures), <code>lib/targz.js</code> (in-memory tar.gz), <code>lib/scan.js</code> (orchestration + verdict). The Cordis plugin is <code>lib/index.js</code>.</p>
+<h2>Security</h2>
+<p>The gate never executes scanned content. It is a heuristic signature scanner — it can miss novel malware and over-flag innocent code. Review BLOCK/WARN hits yourself; see <a href="https://github.com/863683348/dsh-plugin-gate/blob/HEAD/SECURITY.md">SECURITY.md</a>.</p>
+<h2>License</h2>
+<p>MIT</p>

@@ -1,0 +1,112 @@
+<h1>dsh-llm-cost</h1>
+<blockquote>
+<p>让 DeepSeek Harness 显示<strong>每个 turn、每个 step 的 LLM 成本</strong>（美元），并在价格过期时用 LLM + 联网自动更新价格表。</p>
+</blockquote>
+<p>DSH 已经精确记录了每个 step 的真实 token 用量（<code>assistant/message</code> 的 <code>usage</code>：输入/输出/缓存读/缓存写），但<strong>没有任何美元成本概念</strong>。<code>dsh-llm-cost</code> 补上缺失的那一环：把「用量 × 单价」变成 DSH 的持久事实（<code>costUsage</code> session projection），并在每个对话框下方的 stats 行里渲染出该 turn 的成本。</p>
+<h2>工作原理</h2>
+<ul>
+<li><strong>host 端（node）</strong>：一个 session projection 单元（照 <code>token-meter</code> 的骨架），在 <code>session/event</code> 上折叠：<ul>
+<li><code>request/context</code>（解析后的 provider/model 路由，post-fallback）决定每个 step 用的模型；</li>
+<li><code>assistant/message</code>（或 <code>assistant/chunk</code> 的 usage chunk）报告该 step 的用量；</li>
+<li>单价表 → <code>costUsd</code>，同一 turn/step 的重复采样做<strong>替换</strong>而非重复累计。</li>
+</ul>
+</li>
+<li><strong>client 端（浏览器）</strong>：注册到 <code>conversation.chat.turnTail</code> 扩展链，读 <code>useProjection('costUsage')</code>，在每个完成的 assistant 消息下方渲染 <code>$0.0042 · 1.2K tok</code>；并注册 <code>conversation.session.header.utilities</code> 在会话头右上角显示<strong>整个 session 的累计成本</strong>。</li>
+<li><strong>未定价模型</strong>：显示 <code>unknown</code>，绝不静默显示 <code>$0.00</code>（避免「未知」被误读成「免费」）。</li>
+</ul>
+<h2>功能</h2>
+<table>
+<thead>
+<tr>
+<th>层</th>
+<th>内容</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>成本投影</td>
+<td><code>costUsage</code>：<code>totalCostUsd</code>、<code>pricedSteps</code>/<code>unpricedSteps</code>、token 分桶、<code>byModel</code> 聚合、<code>steps[]</code> 每步明细</td>
+</tr>
+<tr>
+<td>每 turn 渲染</td>
+<td>对话框下方 stats 行：<code>$0.0042 · 1.2K tok</code> / <code>unknown</code></td>
+</tr>
+<tr>
+<td>累计成本</td>
+<td>会话头右上角：整个 session 的累计 <code>$</code>（含 <code>+ N unknown</code> 提示）</td>
+</tr>
+<tr>
+<td>自动维护</td>
+<td><code>llm_cost_refresh</code> 工具：联网搜索当前价格 → LLM 抽取 JSON → 写入 override 文件并即时生效</td>
+</tr>
+</tbody></table>
+<h2>安装</h2>
+<pre><code># git（推荐：lib/ 已提交，免本地构建）
+dsh plugin --profile web add github:chenyinrusi/dsh-llm-cost#v0.3.1
+
+# 本地 tarball（内网 / 离线）
+dsh plugin --profile web add ./dsh-llm-cost-0.3.1.tgz
+</code></pre>
+<blockquote>
+<p>npm 渠道暂未发布。如需 <code>dsh plugin --profile web add dsh-llm-cost</code>，先在仓库跑 <code>npm login &amp;&amp; npm publish</code>。</p>
+</blockquote>
+<p>本地验证：<code>pnpm dsh web --patch ./cordis.patch.yml</code>（或 <code>--dump-config</code> 查看层）。</p>
+<h2>配置</h2>
+<p><code>cordis.patch.yml</code> 里该行的 <code>config</code> 可设（全部可选）：</p>
+<table>
+<thead>
+<tr>
+<th>键</th>
+<th>默认</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>pricing</code></td>
+<td>内置快照</td>
+<td>内联的定价覆盖，合并到快照之上</td>
+</tr>
+<tr>
+<td><code>pricingFile</code></td>
+<td><code>~/.dsh/llm-cost/pricing.override.json</code></td>
+<td>refresh 工具写出的覆盖文件</td>
+</tr>
+<tr>
+<td><code>refreshProvider</code></td>
+<td>无</td>
+<td>价格抽取调用的 provider 路由（可选：配了则<strong>优先</strong>用）</td>
+</tr>
+<tr>
+<td><code>refreshModel</code></td>
+<td>无</td>
+<td>价格抽取调用的模型 id（可选：配了则<strong>优先</strong>用）</td>
+</tr>
+</tbody></table>
+<p>配置由 zod <code>Config</code> schema 校验（cordis 在 <code>apply</code> 前执行）：省略 <code>config</code> 键 = 全默认；<code>config: {}</code> 合法；<strong>不要写空 <code>config:</code> 键</strong>——YAML 会解析成 <code>null</code>，被 schema 响亮拒绝（带 entry 名）。未知键被静默丢弃。</p>
+<h2>自动维护价格（<code>llm_cost_refresh</code>）</h2>
+<p>这个工具<strong>自己调用 LLM + 联网</strong>完成整条链路，不需要 agent 逐步编排：</p>
+<ol>
+<li><code>ctx.web.search</code> 对目标模型搜索「current API price per million tokens」；</li>
+<li>用<strong>记忆 + 最便宜优先的 fallback 链</strong>抽取：先试 <code>refreshProvider</code>/<code>refreshModel</code>（若配置），再试<strong>上一次成功的模型</strong>（持久化记住），然后自动枚举 <code>ctx.llm.listProviders()</code> + <code>listModels()</code> 里所有可用模型，按单价排序（免费/最便宜在前，未标价最后），<strong>一个失败就换下一个</strong>；</li>
+<li>宽松校验（坏模型直接丢弃，绝不污染价格表）→ 合并进 registry → 写 <code>pricingFile</code>。</li>
+</ol>
+<p>前置：DSH 里要装一个 web 搜索 provider（<code>dsh-web-search-*</code>）+ 至少一个可用的 LLM 路由。<code>refreshProvider</code>/<code>refreshModel</code> <strong>不再是必须</strong>——不配也能自动挑最便宜的可用模型。抽取结果建议先人工抽查——它写的是 override 文件，<strong>不会</strong>覆盖内置快照。</p>
+<blockquote>
+<p>定价是会过期的数据（intro 价、模型改名、峰谷调整）。把 <code>src/config/llm_models.toml [pricing_v2]</code> 作为单一事实来源，跑 <code>npm run gen</code>（<code>node scripts/gen-pricing.mjs</code>）重新生成 <code>pricing.json</code> + <code>src/pricing-data.ts</code>，锁步发布。</p>
+</blockquote>
+<h2>数据</h2>
+<p><code>pricing.json</code> 是内置 JSON 快照，由 <code>scripts/gen-pricing.mjs</code> 从 <code>llm_models.toml [pricing_v2]</code> 生成（默认读相邻 <code>customized_agentic_system/src/config/llm_models.toml</code>）。计费字段：<code>inputPerM</code>（cache miss）/ <code>outputPerM</code> / <code>cacheReadPerM</code>（cache hit）/ <code>cacheWritePerM</code>（<code>cacheWrite1hPerM</code> 保留，batch/storage 维度 v1 不计入显示值）。</p>
+<p><strong>峰谷定价</strong>：字段存的是<strong>峰值价</strong>；<code>offPeakFactor</code>（如 0.5）声明闲时折扣。峰时窗口 = 01:00–04:00 &amp; 06:00–10:00 UTC，其余时段成本 × <code>offPeakFactor</code>。成本计算按事件时间戳判定，未声明 <code>offPeakFactor</code> 的模型恒按峰值价。</p>
+<h2>匹配阶梯（对齐 <code>models.py:get_pricing</code>）</h2>
+<pre><code>0. provider === "ollama"  → 免费
+1. 模型 id 精确匹配
+2. 最长 key 子串匹配（防 "gpt-5.4" 吞掉 "gpt-5.4-mini"）
+3. 未知 → unknown（显示 "unknown"，不显示 $0.00）
+</code></pre>
+<h2>开发</h2>
+<pre><code>npm install
+npm test          # node --test（纯逻辑层，无需 DSH 工具链）
+npm run gen       # 重新生成价格快照
+npm run build     # tsdown 打包 host + client + 声明文件
+</code></pre>
+<h2>License</h2>
+<p>MIT © 2026 Chen (Jarry) Pan</p>

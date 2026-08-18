@@ -1,0 +1,205 @@
+<h1>dsh-smart-router · DSH 智能路由插件</h1>
+<p><a href="https://github.com/rouyiemei/dsh-smart-router/blob/HEAD/README.en.md">English</a> · 简体中文</p>
+<p><a href="https://github.com/rouyiemei/dsh-smart-router/blob/HEAD/LICENSE"><img src="https://img.shields.io/badge/License-MIT-yellow.svg" alt="License: MIT"></a>
+<a href="https://github.com/topics/dsh-plugin"><img src="https://img.shields.io/badge/DeepSeek%20Harness-Plugin-4D6BFE" alt="DeepSeek Harness"></a>
+<a href="https://github.com/topics/dsh-plugin"><img src="https://img.shields.io/badge/topic-dsh--plugin-blue" alt="dsh-plugin"></a></p>
+<h2>为什么做这个插件</h2>
+<p>2026 年 8 月，DeepSeek V4 系列全面涨价并启用峰谷定价。Flash 的 output 价格从 ¥2 翻倍到 ¥4.5（高峰 ¥9），Pro 更是涨了 3–5 倍。我的月账单从 ¥120 飙到了 ¥700+。</p>
+<p>我开始疯狂寻找替代方案。OpenCode Go 号称"低价订阅"，实际上是把官方价格原样卖给你，还限了量；MiMo-V2.5 便宜但写代码力不从心；GLM-5.1 和 Kimi K3 的定价比 Flash 还贵。订阅计划也研究了个遍——小米的 Token Plan Pro 覆盖得了用量但性能过不了自己那关，智谱的 Coding Plan 额度太紧，Google AI Pro 和 ChatGPT 订阅都不提供 API。</p>
+<p>算来算去，没有任何一个方案能同时满足"性能不降、价格可接受"。</p>
+<p>887M tokens/月，80% 是缓存命中的 input——这是我用 DS Flash 积累下来的用量结构。调价后 output 涨价才是费用暴涨的主因，而 output 里一大半是 thinking tokens，又不能完全关掉。</p>
+<p>最后我想明白了：<strong>与其找一个便宜的模型来替代，不如让同一个系统在不同任务上调用不同的模型。</strong> 简单的文件操作、格式化、问答交给便宜模型；需要真正推理、复杂编码的时候再上 Flash。按需分配，而不是一刀切。</p>
+<p>这就是 dsh-smart-router 的由来。它不是什么高大上的架构创新，只是一个被涨价逼出来的实用工具：根据任务复杂度自动路由到最合适的模型，让你在能力和成本之间找到属于自己的平衡点。</p>
+<blockquote>
+<p>如果你也被 AI API 的账单刺痛过，希望这个小工具能帮你省下一些钱。</p>
+</blockquote>
+<h2>它解决什么问题</h2>
+<ul>
+<li><strong>性能分层</strong>：困难任务（架构/重构/疑难调试）交给强模型，简单任务（闲聊/收尾/小改动）交给便宜快速的模型，一般任务走中间档——像 cc-switch 为 Claude Code 配置「主模型 / 快速模型 / 视觉模型」那样，为 DSH 配置三档能力。</li>
+<li><strong>视觉能力</strong>：很多人会额外装视觉插件给 DSH 看图。本插件把视觉路由<strong>整合进路由器</strong>：消息里带图 → 自动走视觉档模型；纯文本 → 按难度走三档。开箱即用，默认内置<strong>免费匿名视觉模型</strong>（OVHcloud Qwen2.5-VL-72B-Instruct，无需 Key），也可换成你自己配置的任何视觉模型。</li>
+<li><strong>缓存友好</strong>：建议三档选同一供应商的同一系列（如同一家的 pro / flash 版），前缀缓存命中率更高、更省钱（设置页内置提示）。</li>
+</ul>
+<h2>安装</h2>
+<pre><code>dsh plugin --profile web add dsh-smart-router
+</code></pre>
+<p>重启 <code>dsh web</code> 后：</p>
+<ol>
+<li>打开 <strong>设置 → 智能路由</strong>：为 困难 / 一般 / 简单 / 视觉 四行各选一个模型（下拉里就是你已配置的模型，视觉行只列支持图片的模型）。</li>
+<li>回到会话，点右下角模型选择器，选 <strong>Smart Router（自动路由）</strong>。</li>
+<li>直接开聊：分类器自动分流，每个请求都会路由到对应档位的模型。</li>
+</ol>
+<blockquote>
+<p>不配置任何档位也能用：请求会回退到你的默认模型（fail-open，绝不静默失败）。</p>
+</blockquote>
+<h2>工作原理</h2>
+<pre><code>你选择虚拟模型「smart」（声明 text+image，DSH 图片准入直接放行）
+        │
+        ▼
+SmartRouterAdapter.stream(请求)
+        │
+        ├─ 消息含图？ ──→ 视觉侧车（默认 replace 模式）：
+        │       图块分割 → 视觉模型返回结构化证据（摘要/OCR/版面）
+        │       → 替换回文本（按附件缓存 1h）→ 继续走下方难度分类
+        │       （visionMode=route 时：整段路由到视觉档，旧行为）
+        │
+        └─ 纯文本：难度分类 ──→ hard → 困难档
+             （启发式默认 / LLM 可选）──→ normal → 一般档
+                                  └─→ easy → 简单档
+        │
+        ▼
+   ctx.llm.prepareCall({provider, model}).stream(请求)  ← 透传 DSH 流式协议
+        │
+        └─ 档位缺失 → 困难→一般→简单→默认模型 阶梯回退；全部失败才报错
+</code></pre>
+<ul>
+<li>路由在 <strong>LLM 适配器层</strong>完成（参考 llm-adaptive / dsh-vision-mix 的架构）：注册虚拟 provider，<code>stream()</code> 内按请求内容决策后经 <code>prepareCall().stream()</code> 转发，<strong>不修改宿主源码</strong>，与其它视觉插件互不冲突。</li>
+<li>分类器两种模式：<strong>启发式</strong>（默认，零成本零延迟，关键词 + 代码量 + 文件引用数评分）；<strong>LLM</strong>（更准，复用简单档模型做一次小调用，带 120s 缓存）。</li>
+<li><strong>视觉模型只做辅助</strong>：图片被分割出去，由视觉模型返回结构化证据（参考 modlens / dsh-tool-vision 的 evidence 方案：摘要 + OCR 全文 + 版面阅读顺序 + 实体 + 主色调 + 不确定项），替换回原图块位置后再由三级难度模型作答；证据按附件 id 缓存（默认 1 小时），分析失败时图块降级为占位文本，请求不中断。</li>
+<li>视觉准入：虚拟模型声明 <code>inputModalities: ['text', 'image']</code>，DSH 的图片预检（<code>MODEL_DOES_NOT_SUPPORT_IMAGES</code>）直接放行——不需要打宿主补丁（对比 dsh-easyvision 的 patch 方案）。</li>
+</ul>
+<h2>设置说明（设置 → 智能路由）</h2>
+<table>
+<thead>
+<tr>
+<th>设置</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>启用路由</td>
+<td>关闭后请求直接走默认模型</td>
+</tr>
+<tr>
+<td>分类方式</td>
+<td><code>heuristic</code> 启发式（默认） / <code>llm</code> LLM 分类</td>
+</tr>
+<tr>
+<td>困难 / 一般 / 简单</td>
+<td>各档 { 提供方, 模型, 思考档位 }，留空 = 未配置（阶梯回退）</td>
+</tr>
+<tr>
+<td>视觉</td>
+<td>默认 <code>ovh-vision / Qwen2.5-VL-72B-Instruct</code>（免费匿名）；可换任何自配视觉模型</td>
+</tr>
+<tr>
+<td>视觉处理方式</td>
+<td><code>replace</code> 结构化替换（默认，图块→证据文本→难度分类） / <code>route</code> 整段路由到视觉模型</td>
+</tr>
+<tr>
+<td>默认回退</td>
+<td>留空 = 会话当前默认模型</td>
+</tr>
+<tr>
+<td>LLM 分类器</td>
+<td>可选，默认复用简单档模型</td>
+</tr>
+</tbody></table>
+<p><strong>思考强度（推理）两级层级</strong>：对话框模型选择器上的思考强度（Off / High）是<strong>总开关</strong>：</p>
+<ul>
+<li><strong>Off</strong>：所有难度等级都不使用思考模式（关闭 extended thinking）</li>
+<li><strong>High</strong>：各难度等级使用上方配置的推理强度（如 hardEffort=high、normalEffort=max 等）</li>
+</ul>
+<p>设置页各档模型区域会显示此提示。</p>
+<p>手写配置（<code>~/.dsh/profiles/web/settings.yaml</code> 或 profile 的 settings 提供方）：</p>
+<pre><code>smart-router:
+  enabled: true
+  classifier: heuristic        # heuristic | llm
+  hardProvider: deepseek-official
+  hardModel: deepseek-v4-pro
+  normalProvider: deepseek-official
+  normalModel: deepseek-chat
+  easyProvider: deepseek-official
+  easyModel: deepseek-flash
+  visionProvider: zhipu-vision # 免费额度，需在 设置→模型 填入 GLM_API_KEY
+  visionModel: glm-4v-flash
+  visionMode: replace          # replace（结构化替换，默认）| route（整段路由）
+  visionCacheTtl: 3600         # 视觉证据缓存秒数，0 = 关闭
+  visionFallbacks: []
+  fallbackProvider: ''
+  fallbackModel: ''
+</code></pre>
+<p>安装时插件会<strong>幂等 seed</strong> 两条免费视觉路由到 <code>llm-pi-ai</code>（只补缺失键、绝不覆盖你的配置）：</p>
+<table>
+<thead>
+<tr>
+<th>路由</th>
+<th>模型</th>
+<th>成本</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>ovh-vision</code></td>
+<td>OVHcloud Qwen2.5-VL-72B-Instruct（匿名端点）</td>
+<td>免费，无需 Key（约 2 次/分/IP）</td>
+</tr>
+<tr>
+<td><code>zhipu-vision</code></td>
+<td>智谱 GLM-4V-Flash</td>
+<td>免费额度，需在设置页填 <code>GLM_API_KEY</code></td>
+</tr>
+</tbody></table>
+<blockquote>
+<p>视觉默认值开箱即用；需要更稳定/更强的视觉时，把视觉行换成你已配置的模型即可。</p>
+</blockquote>
+<h2>与其它视觉插件共存</h2>
+<p>本插件只在「会话模型 = smart」时参与路由，不接管任何现有 provider 路由，也不改动宿主；
+其它视觉插件（modlens、dsh-vision-router 等）可同时安装、互不影响。</p>
+<h2>开发与测试</h2>
+<pre><code>npm test          # node --test tests/（80 个用例：分类器/路由链/视觉侧车/schema/配置 API/seed 幂等）
+</code></pre>
+<p>本地挂载调试：</p>
+<pre><code>dsh plugin --profile web add C:\Users\...\dsh-smart-router   # 目录安装
+dsh --profile web --dump-config | grep smart-router          # 确认已挂载
+</code></pre>
+<h2>鸣谢（References）</h2>
+<p>本项目实际参考了以下开源项目与 DSH 内部机制，在此致谢：</p>
+<table>
+<thead>
+<tr>
+<th>项目</th>
+<th>参考点</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><a href="https://github.com/farion1231/cc-switch">farion1231/cc-switch</a></td>
+<td>分级模型配置的产品形态（Claude Code 四档：主/快速/思考/视觉）</td>
+</tr>
+<tr>
+<td><a href="https://github.com/dylan121322/llm-adaptive">dylan121322/llm-adaptive</a></td>
+<td>adapter 级路由架构：<code>registerAdapter</code> + <code>prepareCall().stream()</code> 透传；LLM 分类器判定标准</td>
+</tr>
+<tr>
+<td><a href="https://github.com/BruceLanLan/dsh-tier-router">BruceLanLan/dsh-tier-router</a></td>
+<td>档位配置 schema 与阶梯回退、失败升级的取舍</td>
+</tr>
+<tr>
+<td><a href="https://github.com/haiziyao/dsh-vision-mix">haiziyao/dsh-vision-mix</a></td>
+<td>在 adapter 层声明 <code>inputModalities: ['text','image']</code> 通过 DSH 图片准入（零宿主补丁）</td>
+</tr>
+<tr>
+<td><a href="https://github.com/liustack/modlens">liustack/modlens</a></td>
+<td>结构化视觉证据方案：summary/OCR/layout/semantics/visual/uncertainty 模板与「vision parsing engine」提示词（源码级参考）</td>
+</tr>
+<tr>
+<td><a href="https://github.com/gloryxpnv/dsh-tool-vision">gloryxpnv/dsh-tool-vision</a></td>
+<td>同款结构化 JSON 证据模板；<code>vision-bridge</code> 图块→描述文本替换、失败保持宿主行为的模式</td>
+</tr>
+<tr>
+<td><a href="https://github.com/ysr666/dsh-vision-router">ysr666/dsh-vision-router</a></td>
+<td>免费视觉链方案：OVHcloud 匿名端点（免 Key）；图片准入机制分析；按图内容缓存</td>
+</tr>
+<tr>
+<td><a href="https://github.com/s3yf1337/dsh-easyvision">s3yf1337/dsh-easyvision</a></td>
+<td>用 <code>resolveModelInfo().inputModalities</code> 判读模型视觉能力的模式</td>
+</tr>
+<tr>
+<td><a href="https://github.com/akqwpeter-prog/dsh-media-skills">akqwpeter-prog/dsh-media-skills</a></td>
+<td>向 <code>llm-pi-ai</code> 幂等 seed 免费视觉路由（zhipu-vision）的模式</td>
+</tr>
+<tr>
+<td>DeepSeek Harness 内部</td>
+<td><code>dsh-llm</code>（LlmAdapter/llm 服务/prepareCall 契约）、<code>dsh-settings</code>（installSettingsSection）、<code>dsh-agent-loop</code>（agent/request 瀑布）、<code>dsh-client-modules</code>（客户端 bundle 契约）</td>
+</tr>
+</tbody></table>
+<h2>许可证</h2>
+<p>MIT</p>

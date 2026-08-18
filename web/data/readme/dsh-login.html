@@ -1,0 +1,143 @@
+<h1>dsh-login — dsh-web 登录插件</h1>
+<p>给 dsh-web 加一道登录门：打开 dsh-web 的端口时先要输入用户名和密码，验证通过后才
+能看到界面。账号信息<strong>不落明文</strong>：密码用 scrypt（随机盐）哈希，整个凭据文件再用
+AES-256-GCM 加密后写入本地配置文件（<code>$DSH_HOME/dsh-login.json</code>，默认
+<code>~/.dsh/dsh-login.json</code>）。</p>
+<p>适合部署于服务器上的dsh-web服务
+需要自行架设nginx服务，把服务映射到局域网内使用</p>
+<ul>
+<li>纯主机侧 Cordis 插件，不修改任何 dsh 源码；</li>
+<li>通过 <code>dsh plugin</code> 以 bundle 方式挂载（<code>dsh.bundle.patch</code>），依赖列表只有
+<code>cordis</code> / <code>dsh-host-webserver</code> / <code>schemastery</code> 三个 peer；</li>
+<li>自带独立 CLI（<code>dsh-login</code>），不启动 web 也能管理账号。</li>
+</ul>
+<h2>特性</h2>
+<table>
+<thead>
+<tr>
+<th>能力</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>全量请求门禁</td>
+<td>包住 webserver 的 <code>register</code> / <code>registerUpgrade</code> / <code>registerFallback</code>：SPA 回退、<code>/api</code> 传输、WebSocket/SSE 升级全部先过会话校验</td>
+</tr>
+<tr>
+<td>会话</td>
+<td>内存会话 + <code>HttpOnly; SameSite=Strict</code> Cookie（默认 24h，可配置）；服务重启全员下线</td>
+</tr>
+<tr>
+<td>首启引导</td>
+<td>没有账号时打开端口显示“创建管理员账号”页（bootstrap），建完即登录</td>
+</tr>
+<tr>
+<td>加密存储</td>
+<td>凭据文件 AES-256-GCM 加密；密钥来自 <code>DSH_LOGIN_SECRET</code>（64 hex 或口令）→ 密钥文件 <code>$DSH_HOME/dsh-login.key</code>（自动生成）→ 明文模式（警告）</td>
+</tr>
+<tr>
+<td>口令安全</td>
+<td>scrypt（N=2^14, r=8, p=1）随机盐哈希，恒时比较；用户名不存在时烧一次假哈希防枚举</td>
+</tr>
+<tr>
+<td>爆破防护</td>
+<td>每用户名+IP 滑动窗口限速（默认 5 次/30s → 429）+ 失败延时</td>
+</tr>
+<tr>
+<td>CLI</td>
+<td><code>status</code> / <code>set-user</code> / <code>remove-user</code> / <code>list-users</code> / <code>reset</code>，运行中改账号会被 mtime 轮询热加载</td>
+</tr>
+</tbody></table>
+<h2>安装（本机 web profile）</h2>
+<pre><code># 1) 把本插件加入 web profile（等价于 pnpm add link:... 到 ~/.dsh/profiles/web）
+dsh plugin --profile web add link:D:\code\dsh\dsh-login-plugin
+
+# 2) 重启 dsh web
+#    下次打开 http://127.0.0.1:3080 会先看到登录页；首次访问创建管理员账号。
+</code></pre>
+<blockquote>
+<p>仓库内 <code>node_modules</code> 是指向 <code>~/.dsh/profiles/node_modules</code> 的 junction
+（与 dsh-ssh 等本地开发包的做法一致，测试与 <code>link:</code> 安装后的模块解析都靠它）。
+若把仓库挪到别处，重建 junction：
+<code>New-Item -ItemType Junction -Path &lt;repo&gt;\node_modules -Target $env:USERPROFILE\.dsh\profiles\node_modules</code></p>
+</blockquote>
+<p>卸载：<code>dsh plugin --profile web remove dsh-login</code>，重启后端口恢复开放。</p>
+<h2>首次使用（二选一）</h2>
+<p><strong>A. 网页引导（默认）</strong>：打开端口 → “创建管理员账号” → 设置用户名密码 → 自动登录。</p>
+<p><strong>B. CLI（适合禁掉网页引导）</strong>：</p>
+<pre><code># 在运行 dsh web 的机器上执行（无需启动 web）
+node D:\code\dsh\dsh-login-plugin\lib\cli.js set-user --user admin
+# 输入密码（交互式提示，避免命令行历史残留）
+</code></pre>
+<p>之后把 <code>bootstrap</code> 设为 <code>denied</code>（见下）即可禁止网页自助建号。</p>
+<h2>配置</h2>
+<p>在 profile 的用户层给插件行加配置（<code>dsh plugin --profile web add</code> 后会自动把
+<code>dsh-login</code> 行插入组合；改配置就编辑 <code>~/.dsh/profiles/web/cordis.patch.yml</code> 的
+<code>- insert:</code> 里那行 <code>dsh-login</code>，或直接读插件的 <code>cordis.patch.yml</code>）：</p>
+<pre><code>- id: dsh-login
+  config:
+    sessionTtlHours: 12        # 会话有效期（小时），默认 24
+    bootstrap: denied          # 禁止网页自助建号，只用 CLI 管账号
+    maxAttempts: 10            # 爆破限速：10 次/30s
+    cookieName: dsh_session
+    loginPath: /login
+    logoutPath: /logout
+    storePollMs: 2000          # 检测 CLI 改账号的轮询间隔（0=关闭）
+</code></pre>
+<p>全部配置项（均带默认值）：<code>enabled</code>(true)、<code>storeFile</code>(<code>$DSH_HOME/dsh-login.json</code>)、
+<code>keyFile</code>(<code>$DSH_HOME/dsh-login.key</code>)、<code>sessionTtlHours</code>(24)、<code>cookieName</code>、
+<code>bootstrap</code>(<code>auto</code>|<code>denied</code>)、<code>maxAttempts</code>(5)、<code>attemptWindowMs</code>(30000)、
+<code>failDelayMs</code>(400)、<code>storePollMs</code>(2000)、<code>loginPath</code>(<code>/login</code>)、<code>logoutPath</code>(<code>/logout</code>)。</p>
+<p>主密钥优先级：环境变量 <code>DSH_LOGIN_SECRET</code>（64位 hex 原样使用；任意长口令则 scrypt
+派生）→ 密钥文件（不存在则自动生成 64 hex，0600）→ 无密钥时降级明文 JSON（仍
+scrypt 哈希，插件会打警告）。</p>
+<h2>登录机制</h2>
+<ul>
+<li>未登录导航请求（<code>GET/HEAD</code> + <code>Accept: text/html</code>）→ 返回登录页（200）；</li>
+<li>未登录其它请求（含对 <code>/api/*</code> 的直接访问、静态资源探测）→ <code>401</code> JSON；</li>
+<li>未登录 WebSocket/SSE 升级 → 握手直接 <code>401</code> 关闭；</li>
+<li>已登录 → 原 handler 照常处理。</li>
+<li>公开路径（免登录）：登录页、退出页、<code>/api/auth/{login,bootstrap,logout,status}</code>。</li>
+<li>退出：<code>POST /api/auth/logout</code>（清 Cookie），或访问 <code>/logout</code> 页面；会话只存内存，
+重启即全部失效。</li>
+</ul>
+<h2>CLI 参考</h2>
+<pre><code>dsh-login status
+dsh-login set-user --user &lt;name&gt; [--password &lt;p&gt;]   # 新建或重置密码
+dsh-login remove-user --user &lt;name&gt;
+dsh-login list-users
+dsh-login reset --yes                                # 删除凭据文件（全部账号）
+</code></pre>
+<h2>测试</h2>
+<pre><code>node test/unit.test.mjs          # 14 项：crypto / store / sessions / 页面
+node test/integration.test.mjs   # 4 项：真实 webserver + frontend-static + 插件
+</code></pre>
+<p>集成测试覆盖：真实挂载顺序（登录插件最后加载，回退表已注册→原位重包）、反序
+（注册期包装）、bootstrap→登录→SPA/API→登出全流程、WebSocket 升级鉴权、密文
+存储无明文、CLI 外部改账号被热加载、bootstrap 禁用路径。测试通过 scrypt 实际计算，
+运行约 1–2 s。</p>
+<h2>安全模型（请读）</h2>
+<ul>
+<li><strong>默认只绑 127.0.0.1</strong>：登录门禁解决“端口裸奔”，但明文 HTTP 在网络上可被嗅探。
+若 <code>--host 0.0.0.0</code> 暴露到局域网/公网，请在前面加 TLS 反向代理，并设置
+<strong>强口令</strong>；<code>DSH_LOGIN_SECRET</code> 建议放环境变量（环境变量与 web 进程同属一个
+用户空间，这是本项目能提供的最高一级的主密钥隔离）。</li>
+<li>自动生成的密钥文件与凭据文件同目录：防的是“文件被拷贝/误发/备份泄露”这类
+意外读取；对能读整个 <code>$DSH_HOME</code> 的攻击者，scrypt 哈希才是最后防线。</li>
+<li>首启引导：零账号时第一个到达的人即可建管理员账号，所以在暴露到不可信网络
+<strong>之前</strong>先用 CLI 建号并设 <code>bootstrap: denied</code>。</li>
+<li>会话令牌 256 位随机，仅存内存与 HttpOnly Cookie；<code>SameSite=Strict</code> 挡住跨站
+请求伪造。若把 GUI 暴露给多用户，请自行评估多账号并发（本插件支持多用户，
+会话相互独立）。</li>
+</ul>
+<h2>目录结构</h2>
+<pre><code>lib/crypto.js        scrypt 哈希/校验、AES-256-GCM、密钥派生
+lib/store.js         加密凭据存储（原子写、热重载）
+lib/sessions.js      内存会话 + Cookie 工具
+lib/login-page.js    登录 / 引导 / 退出页（单文件内联样式脚本）
+lib/paths.js         $DSH_HOME 与密钥文件解析
+lib/index.js         插件本体：门禁包装 + 公开路由
+lib/cli.js           账号管理 CLI
+test/unit.test.mjs / test/integration.test.mjs
+cordis.patch.yml     bundle 补丁（把 dsh-login 行插入组合）
+</code></pre>

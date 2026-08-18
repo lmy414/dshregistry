@@ -1,0 +1,136 @@
+<h1>dsh-file-confirm — 文件改动确认机制</h1>
+<p><a href="https://awesome-dsh-plugin.com"><img src="https://awesome-dsh-plugin.com/badge.svg" alt="Awesome DSH Plugin"></a>
+<a href="https://www.npmjs.com/package/dsh-file-confirm"><img src="https://img.shields.io/npm/v/dsh-file-confirm" alt="npm"></a>
+<a href="https://github.com/hfh1999/dsh-file-confirm/blob/HEAD/LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License"></a></p>
+<p>双面插件：<strong>任何文件改动（write / edit / str_replace_editor 的写命令）执行前，都会在
+输入区出现确认条，确认条内直接展示 diff 红绿文本</strong>（新建全绿、编辑红删绿增）；
+用户点「允许本次」才放行，点「拒绝」则该次工具调用以失败结束（模型能看到拒绝原因并调整）。</p>
+<h2>演示效果</h2>
+<p><img src="https://raw.githubusercontent.com/hfh1999/dsh-file-confirm/HEAD/showtime.png" alt="文件改动确认演示"></p>
+<h2>使用流程</h2>
+<pre><code>模型调用 write / edit / str_replace_editor
+  → 确认条弹出（标题 + 文件路径 + 内嵌 diff 红绿预览）
+  → 你点「允许本次」→ 工具执行，文件写入
+  → 你点「拒绝」   → 工具失败，模型收到拒绝原因并调整
+</code></pre>
+<ul>
+<li>只拦文件写操作；<code>read</code>、搜索、bash 等不受影响</li>
+<li>其他工具的审批（如 bash 沙箱升级）仍走内置面板</li>
+<li>长文本 diff 不截断，块内滚动查看</li>
+</ul>
+<h2>文档</h2>
+<ul>
+<li><a href="https://github.com/hfh1999/dsh-file-confirm/blob/HEAD/CHANGELOG.md">Changelog</a></li>
+<li><a href="https://github.com/hfh1999/dsh-file-confirm/blob/HEAD/TESTING.md">测试说明</a></li>
+</ul>
+<h2>与生态对比</h2>
+<table>
+<thead>
+<tr>
+<th>插件</th>
+<th>定位</th>
+<th>差异</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>dsh-tool-approval</code></td>
+<td>任意工具调用预审批（include/exclude 通配符）</td>
+<td>通用黑盒确认（只显示工具名+原因），<strong>无内容预览</strong></td>
+</tr>
+<tr>
+<td><code>dsh-permgate</code></td>
+<td>细粒度权限网关（规则/白黑名单/分类）</td>
+<td>重型权限管理，需要配置规则</td>
+</tr>
+<tr>
+<td><code>dsh-change-review</code></td>
+<td>会话内 write/edit <strong>事后</strong> diff 审查</td>
+<td>写后审查，非写前确认</td>
+</tr>
+<tr>
+<td><strong>本插件</strong></td>
+<td><strong>写前确认 + 内嵌 diff 内容预览</strong></td>
+<td>零配置、专注文件写入、允许/拒绝前看到确切改动</td>
+</tr>
+</tbody></table>
+<h2>原理</h2>
+<p>利用 DSH 的官方扩展点，<strong>零侵入、不修改任何内置包</strong>：</p>
+<pre><code>工具调用
+  │
+  ▼
+tools/pre-execute（可重排 allow/deny/ask 门）   ← Host 半身在此拦截
+  │ 返回 { kind:'ask', reason }
+  ▼
+ctx.approval.request() → web 网关 → 浏览器
+  │
+  ▼
+conversation.composer（chain slot, priority 0） ← Browser 半身在此接管渲染
+  │  内置 ApprovalPanel 是 priority 1（先注册先被尝试，我的条目先被选中）
+  ▼
+确认条（标题 + 文件路径 + 内嵌 diff 红绿文本 + 拒绝 / 允许本次）
+</code></pre>
+<ul>
+<li>Host 半身（<code>lib/index.js</code>）：监听 <code>tools/pre-execute</code>，对文件改动工具返回
+<code>{ kind: 'ask', reason }</code>；其余工具调用 <code>next()</code> 委托，与其他门共存。</li>
+<li>Browser 半身（<code>lib/client.js</code>）：在 <code>conversation.composer</code> chain slot 注册
+priority 0 条目，selector 只匹配文件改动类审批；其他审批（如 bash 沙箱升级）
+返回 null，仍由内置 ApprovalPanel 处理。</li>
+<li>diff 渲染：从会话快照的配对工具调用参数（<code>argsRaw</code>）取内容，
+用简易行级 diff（公共前后缀 + 中间替换）渲染红删绿增：<ul>
+<li><code>write</code> → 新内容全文（绿）</li>
+<li><code>edit</code> → old_string / new_string 行级对照（红删绿增）</li>
+<li><code>str_replace_editor</code> → str_replace / insert / write 命令分别渲染</li>
+</ul>
+</li>
+<li>确认响应复用内置 wire 编码：<code>wait.respond({ ok, value: { sessionId, approvalId, outcome } })</code>，审计记录（approval/asked、approval/decided）照常写入。</li>
+</ul>
+<h2>安装（bundle）</h2>
+<pre><code>dsh plugin --profile web add dsh-file-confirm
+</code></pre>
+<p>或手动在 <code>$DSH_HOME/profiles/web/cordis.patch.yml</code> 里挂载：</p>
+<pre><code>- insert:
+    - id: file-confirm
+      name: dsh-file-confirm
+      config:
+        tools: [write, edit, str_replace_editor]   # 可自定义
+        # pathPattern: '^src/'                     # 可选：仅对匹配路径确认
+        # enabled: true
+</code></pre>
+<p>然后重启 <code>dsh web</code> 并刷新浏览器页面。</p>
+<h2>配置（cordis.patch.yml 中该行的 config）</h2>
+<table>
+<thead>
+<tr>
+<th>键</th>
+<th>默认</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>tools</code></td>
+<td><code>[write, edit, str_replace_editor]</code></td>
+<td>拦截的工具名列表</td>
+</tr>
+<tr>
+<td><code>pathPattern</code></td>
+<td>无</td>
+<td>RegExp 字符串；仅对匹配的文件路径确认</td>
+</tr>
+<tr>
+<td><code>enabled</code></td>
+<td><code>true</code></td>
+<td>总开关</td>
+</tr>
+</tbody></table>
+<h2>卸载</h2>
+<pre><code>dsh plugin --profile web remove dsh-file-confirm
+</code></pre>
+<h2>文件</h2>
+<pre><code>cordis.patch.yml   bundle patch：dsh plugin add 时自动注册插件行
+package.json       双面插件声明（dsh.bundle + dsh.client）
+lib/index.js       Host 半身：tools/pre-execute 拦截
+lib/client.js      Browser 半身：conversation.composer chain + 内嵌 diff 确认条
+showtime.png       演示截图
+</code></pre>
+<h2>许可证</h2>
+<p><a href="https://github.com/hfh1999/dsh-file-confirm/blob/HEAD/LICENSE">MIT</a> © 2026 dsh-file-confirm contributors</p>

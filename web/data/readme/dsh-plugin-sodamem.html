@@ -1,0 +1,210 @@
+<h1>dsh-plugin-sodamem</h1>
+<p>Long-term memory for <a href="https://github.com/deepseek-ai/deepseek-harness">DeepSeek Harness</a>, backed by <a href="https://github.com/SodaMem/SodaMem">SodaMem</a>.</p>
+<ul>
+<li><strong>Recall</strong> — while a turn is being assembled, the plugin retrieves an evidence block for that turn's question and contributes it to the prompt. BM25 + vector + entity fusion, no model call.</li>
+<li><strong>Retain</strong> — when the turn closes, its messages are ingested back into the store.</li>
+</ul>
+<p>Neither is a tool call, so the model can't skip either one and neither costs tool-schema space.</p>
+<p>SodaMem is a separate open-source memory engine that runs as a local daemon. This repo is only the <code>dsh</code> plugin; you need the daemon running for it to do anything.</p>
+<h2>What you get that a notes file doesn't</h2>
+<p><strong>Every recalled fact names the turn it came from.</strong> This is one line of a real evidence block, verbatim:</p>
+<pre><code>support=I flew United to Boston last week.
+predicate=User flew United to Boston
+entities=airline=United|destination=Boston
+source=s4/s4_turn_0        ← the actual turn, not "some earlier chat"
+date=2023-06-10
+</code></pre>
+<p><code>FactEvent → SourceSpan → RawTurn</code> is a foreign-key chain. When the model asserts something about the user, there is a row explaining why.</p>
+<p><strong>Facts expire.</strong> SodaMem keeps four time axes — when the event happened, when the fact was true, when it was said, when it was stored. "I moved to Chicago last year" and "I'm moving next year" are different rows, and a fact that stopped being true stops coming back. Corrections are ADD-only: a new version plus a <code>SUPERSEDES</code> edge, never an in-place rewrite.</p>
+<p><strong>The engine is benchmarked and the answers are published.</strong></p>
+<table>
+<thead>
+<tr>
+<th>benchmark</th>
+<th>score</th>
+<th></th>
+</tr>
+</thead>
+<tbody><tr>
+<td>LongMemEval-S</td>
+<td>92.8% (464/500)</td>
+<td><a href="https://github.com/SodaMem/SodaMem/tree/main/benchmarking/artifacts/">500 answers + 8,427 evidence rows</a>, re-gradable with any judge</td>
+</tr>
+<tr>
+<td>LoCoMo</td>
+<td>86.88% (1338/1540)</td>
+<td>end-to-end QA, LLM-as-judge</td>
+</tr>
+</tbody></table>
+<p>Those are SodaMem's numbers — the engine this plugin talks to, not the plugin itself.</p>
+<h2>Why not the MCP bridge?</h2>
+<p>SodaMem already has an MCP integration for <code>dsh</code>, in the main SodaMem repo (<a href="https://github.com/SodaMem/SodaMem/tree/main/integrations/deepseek-harness"><code>integrations/deepseek-harness/</code></a>). It exposes memory as <strong>tools</strong>, which means the model has to choose to call them — and on most turns it simply doesn't. The strongest thing SodaMem offers, the zero-LLM <code>GET /v1/context</code> evidence block, ends up left to the model's discretion.</p>
+<p>MCP cannot fix that. A tool is pull-only, and nothing in the protocol lets a server contribute to the prompt or observe a turn closing. This plugin uses the harness's own seams instead — <code>system-prompt/assemble</code> for recall and <code>agent/turn-stopping</code> for retain — so both happen unconditionally.</p>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>MCP bridge</th>
+<th>This plugin</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>Recall</td>
+<td>model calls a tool, if it decides to</td>
+<td>every turn, automatically</td>
+</tr>
+<tr>
+<td>Retain</td>
+<td>model calls a tool, if it decides to</td>
+<td>every closed turn, automatically</td>
+</tr>
+<tr>
+<td>Model can skip it</td>
+<td>yes</td>
+<td>no</td>
+</tr>
+<tr>
+<td>Costs tool-schema space</td>
+<td>yes</td>
+<td>no</td>
+</tr>
+</tbody></table>
+<p><strong>Do not run both against the same store.</strong> They would recall the same facts twice and ingest every turn twice. Pick one.</p>
+<h2>Requirements</h2>
+<ul>
+<li>Node &gt;= 22 (the harness requires it; the plugin uses <code>AbortSignal.any</code>)</li>
+<li>A <strong>running SodaMem daemon</strong> — see below</li>
+</ul>
+<h2>Install</h2>
+<pre><code>dsh plugin --profile tui add dsh-plugin-sodamem
+</code></pre>
+<p>That is all that is needed. The package ships a <code>dsh.bundle</code> manifest pointing
+at <a href="https://github.com/SodaMem/dsh-plugin-sodamem/blob/HEAD/cordis.patch.yml"><code>cordis.patch.yml</code></a>, so <code>dsh</code> adds the plugin to the
+profile's bundle list and composes its row — with working defaults — into the
+profile tree. Confirm it landed:</p>
+<pre><code>dsh --profile tui --dump-config | grep -A6 'id: sodamem'
+</code></pre>
+<p>Start the daemon first (once per machine):</p>
+<pre><code>sodamem daemon ensure          # defaults to http://127.0.0.1:8000
+</code></pre>
+<p>Fact extraction needs LLM credentials on the <strong>daemon</strong> side. Put <code>SODAMEM_LLM_PROVIDER</code> / <code>SODAMEM_LLM_API_KEY</code> / <code>SODAMEM_LLM_MODEL</code> in the daemon's environment or <code>.env</code>. Without them recall still works, but every retain will be accepted and then fail during extraction.</p>
+<h2>Configure</h2>
+<p>The bundled <code>cordis.patch.yml</code> ships defaults that boot (<code>apiUrl</code>
+<code>http://127.0.0.1:8000</code>, <code>userId</code> <code>default</code>). To change them, override the row
+in <strong>your own</strong> profile <code>cordis.patch.yml</code>, which applies after every bundle
+layer:</p>
+<pre><code># $DSH_HOME/profiles/&lt;profile&gt;/cordis.patch.yml
+- id: sodamem
+  config:
+    apiUrl: 'http://127.0.0.1:8000'
+    apiKey: 'dev'
+    userId: 'your-user-id'
+    tokenBudget: 1200
+</code></pre>
+<p>A patch <strong>replaces</strong> the targeted row's whole <code>config</code> rather than merging into
+it, so restate every key you want to keep.</p>
+<p>Without installing as a bundle, the same row can be inserted ad hoc:</p>
+<pre><code>npx @deepseek-ai/dsh web --patch ./sodamem-plugin.patch.yml
+</code></pre>
+<h3>Config fields</h3>
+<p>There are four, and they are all connection or scope facts.</p>
+<table>
+<thead>
+<tr>
+<th>field</th>
+<th>required</th>
+<th>default</th>
+<th>what it is</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>apiUrl</code></td>
+<td>yes</td>
+<td>—</td>
+<td>Origin of the SodaMem daemon</td>
+</tr>
+<tr>
+<td><code>apiKey</code></td>
+<td>yes</td>
+<td>—</td>
+<td>Sent on every request. Any non-empty string works when the daemon runs with auth disabled — there is no magic fallback</td>
+</tr>
+<tr>
+<td><code>userId</code></td>
+<td>yes</td>
+<td>—</td>
+<td>The SodaMem <code>user_id</code> every read and write is scoped to</td>
+</tr>
+<tr>
+<td><code>tokenBudget</code></td>
+<td>no</td>
+<td><code>1200</code></td>
+<td>Token budget for the recalled evidence block</td>
+</tr>
+</tbody></table>
+<p>There is deliberately <strong>no switch that turns recall or retain on or off</strong>, and no strategy selector. Auto-injection is the entire point of the plugin; a knob to disable it would just be a slower way to use the MCP bridge.</p>
+<p><code>session_id</code> on retain is the agent's id (in <code>dsh</code>, an agent and its session share one identity). <code>agent_id</code> is deliberately <strong>not</strong> sent — it would be the session id, which would narrow retrieval and fragment recall across sessions.</p>
+<h2>Remote mode only</h2>
+<p>The plugin talks HTTP to a daemon. It has no data-root option and imports nothing that can open a store locally, and that is a deliberate constraint rather than an unfinished feature.</p>
+<p>Two processes writing one <code>SODAMEM_DATA_ROOT</code> corrupt it — per-user SQLite without cross-process WAL is not safe under concurrent writers, which is why the daemon is pinned to a single worker (SodaMem <a href="https://github.com/SodaMem/SodaMem/blob/main/mcp_server/README.md"><code>mcp_server/README.md</code></a> and <a href="https://github.com/SodaMem/SodaMem/blob/main/docs/adr/0001-control-plane-db.md">ADR 0001 §2</a>). A plugin loaded inside an arbitrary harness process is the worst possible candidate for being that second writer — you would not know how many of them are running. So there is exactly one writer, the daemon, and everyone else is a client.</p>
+<h2>When SodaMem is down or slow</h2>
+<p><strong>A SodaMem problem is never a <code>dsh</code> problem.</strong> Every call is wrapped so that no error, rejection, timeout, or abort escapes into the turn.</p>
+<table>
+<thead>
+<tr>
+<th></th>
+<th></th>
+</tr>
+</thead>
+<tbody><tr>
+<td>Recall deadline</td>
+<td><strong>1500 ms</strong></td>
+</tr>
+<tr>
+<td>Retain deadline</td>
+<td><strong>5000 ms</strong></td>
+</tr>
+<tr>
+<td>Daemon unreachable, erroring, slow, or returning junk</td>
+<td>recall contributes nothing; the turn proceeds normally</td>
+</tr>
+<tr>
+<td>Turn cancelled</td>
+<td>in-flight SodaMem requests are aborted with it</td>
+</tr>
+</tbody></table>
+<p>The deadlines cover the <strong>whole</strong> call, headers and response body alike, so a daemon that answers <code>200</code> and then stalls mid-body cannot hang a turn.</p>
+<p>Recall fires <strong>once per question</strong>, not once per prompt assembly — a tool loop that takes six steps still issues one <code>GET /v1/context</code>. Steering mid-turn is a new question, so it earns its own recall.</p>
+<p>Retain ingests only what a human or the model actually said. Tool results and the harness's runtime-context snapshot are excluded — the snapshot is where this plugin's own recalled evidence lives, and ingesting it would feed the store its own output back on every turn.</p>
+<p>The one thing to know: when recall misses its deadline, the turn proceeds <em>without memory</em> and nothing surfaces to the user. The plugin logs a warning (<code>ctx.logger.warn</code>) on every degraded turn, and that log is the only signal you get. See the performance note below.</p>
+<p>On load the plugin also issues a cheap warm-up request, so the daemon's lazy store open — measured at ~630 ms against a ~130 ms steady state — is paid before your first question instead of by it. Nothing waits on that warm-up, and it is harmless when no daemon is running yet.</p>
+<h2>Performance</h2>
+<p>Measured on a real 1000-fact store (auth on, single-worker daemon, loopback, one machine, chromadb 1.1.1, chroma schema verified at 9 <code>sysdb</code> migrations). Full method, caveats, and reproduction steps: <a href="https://github.com/SodaMem/dsh-plugin-sodamem/blob/main/NOTES-latency.md"><code>NOTES-latency.md</code></a> (shipped in the package too).</p>
+<blockquote>
+<p><strong>Retraction.</strong> An earlier version of this section claimed cold start returns <strong>HTTP 500 in 10 runs out of 10</strong> from a Chroma panic, and that warm steady state was <strong>p50 17 ms</strong>. <strong>Both are withdrawn.</strong> They were measured against a store whose chroma schema had been migrated by a different chromadb version than the one reading it — a defect of the test machine, not of the daemon or the plugin. The 17 ms figure was that broken store answering with vector search switched off, so it understated real warm latency by roughly 7x. Full account, including the old numbers: <a href="https://github.com/SodaMem/dsh-plugin-sodamem/blob/main/NOTES-latency.md#retraction-2026-08-18--the-cold-start-finding-and-the-warm-p50-are-withdrawn"><code>NOTES-latency.md</code></a>, and a summary in <a href="https://github.com/SodaMem/dsh-plugin-sodamem/blob/main/CHANGELOG.md"><code>CHANGELOG.md</code></a>.</p>
+</blockquote>
+<ul>
+<li><strong>Cold start costs extra, but it succeeds.</strong> The daemon opens a user's store lazily. Across 3 daemon restarts the first request returned <strong>HTTP 200 every time</strong>, with full vector routes and no degraded retrieval (0 degraded / 17 citations, 3/3). It costs about <strong>630 ms</strong> against a ~130 ms steady state; the second request is already warm. The plugin absorbs that one-time cost with a fire-and-forget warm-up at load (<code>src/warmup.ts</code>), so it lands before the user's first question rather than on it.</li>
+<li><strong>Warm, steady state: p50 130 ms</strong> (min 101, p95 164, p99 186, max 296 — 200 sequential requests, six store-relevant queries, <code>token_budget</code> 1200). That is what auto-injection adds to time-to-first-token once the store is open. It is the zero-LLM path, so it does not grow with model spend.</li>
+<li><strong>Multi-client is the caveat, and it is smaller than previously stated — but do not read it as comfortable.</strong> The daemon runs one worker by design, and <code>/v1/context</code> latency grows near-linearly with concurrent clients: median <strong>128 / 211 / 361 / 672 ms</strong> at concurrency 1 / 2 / 4 / 8. At concurrency 8 the worst of 40 requests was <strong>732 ms on an otherwise idle machine</strong>, and <strong>986–1268 ms across five runs on a loaded one</strong> (load avg 14, where sequential p50 was 197 ms rather than 130 ms). So the margin against the 1500 ms recall deadline is somewhere between <strong>~1.2x and ~2x depending on what else the box is doing</strong> — real headroom, not an order of magnitude, and the loaded machine's worst run came within 16% of the deadline. The withdrawn figures put it within 10% of the deadline on the broken store; the correction is smaller than that retraction alone would suggest.</li>
+</ul>
+<p><strong>Read the concurrency numbers as a shape, not as absolute milliseconds.</strong> The probe runs five rounds per level, which does not warm the BM25 index cache the way 200 sequential requests do, and its right-hand column is the worst of n rather than a p99. What reproduces across machines is the near-linear queueing; what moves is the millisecond.</p>
+<p>So: the shape is unchanged — enough concurrent clients on one single-worker daemon and recall will start silently dropping. Nothing measured here reaches that point at 8 clients, on either machine. That is a property of the daemon's read path, not of this plugin; auto-injection is what makes it reachable, by turning an occasional tool call into a per-turn one. The numbers behind this, and the caveats on each, are in <a href="https://github.com/SodaMem/dsh-plugin-sodamem/blob/main/NOTES-latency.md"><code>NOTES-latency.md</code></a>.</p>
+<h2>Development</h2>
+<pre><code>npm install
+npm run typecheck
+npm test          # no live daemon required; HTTP is mocked at the fetch boundary
+npm run build     # dual ESM/CJS into dist/
+
+npm run test:integration   # real dsh runtime + real daemon; not run by CI
+</code></pre>
+<p><code>npm run test:integration</code> loads the plugin into a real <code>dsh</code> runtime — real
+Cordis <code>Context</code>, real session store, real system-prompt registry, real agent
+loop — and drives real turns against a running SodaMem daemon. It stubs only the
+LLM adapter. See <a href="https://github.com/SodaMem/dsh-plugin-sodamem/blob/HEAD/test-integration/README.md"><code>test-integration/README.md</code></a> for
+how to start the daemon.</p>
+<p>The unit tests cannot prove the plugin works inside the loop: they mock the
+Cordis registration boundary, so they cannot see ordering. Treat the integration
+suite as the gate.</p>
+<h2>License</h2>
+<p>Apache-2.0. See <a href="https://github.com/SodaMem/dsh-plugin-sodamem/blob/HEAD/LICENSE"><code>LICENSE</code></a> and <a href="https://github.com/SodaMem/dsh-plugin-sodamem/blob/HEAD/NOTICE"><code>NOTICE</code></a>.</p>

@@ -1,0 +1,79 @@
+<h1>dsh-web-search-ext</h1>
+<p>Multi-backend <code>web_search</code> provider for <a href="https://github.com/deepseek-ai/deepseek-harness">DeepSeek Harness</a> (DSH), registered into the web capability seam (<code>ctx.web</code>) under one stable provider id (<code>web-search-ext</code>).</p>
+<p>The built-in <code>web_search</code> tool is backend-pluggable; the in-box default (<code>deepseek-official</code>) requires a DeepSeek API key. This plugin provides a key-free-capable alternative with <strong>automatic failover</strong> between backends.</p>
+<h2>Current backends</h2>
+<table>
+<thead>
+<tr>
+<th>Backend</th>
+<th>With key</th>
+<th>Without key</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong>Exa</strong></td>
+<td>REST <code>POST https://api.exa.ai/search</code> (higher limits, highlight snippets)</td>
+<td>Anonymous hosted MCP <code>POST https://mcp.exa.ai/mcp</code> (JSON-RPC 2.0, documented public fallback, rate-limited → HTTP 429)</td>
+</tr>
+<tr>
+<td><strong>Firecrawl</strong></td>
+<td><code>POST https://api.firecrawl.dev/v2/search</code> (Bearer)</td>
+<td>Keyless requests when <code>firecrawlKeyless: true</code> (unofficial; may be rate-limited or removed)</td>
+</tr>
+</tbody></table>
+<p>On any backend failure (429, 401/402/403, 5xx, network, malformed body) the search fails over to the next backend. A 429 additionally starts a per-backend cooldown (default 60 s) so a saturated backend is skipped on subsequent searches. When all backends fail, the error lists each failure (including cooldown state).</p>
+<h2>Adding another backend (e.g. SearXNG)</h2>
+<p>The provider is deliberately small and uniform; a backend is:</p>
+<ol>
+<li>one <code>async function &lt;name&gt;Search(options, apiKey?, request, signal)</code> that returns <code>{ sources, truncated: false }</code> and throws <code>WebError</code> (<code>WEB_RATE_LIMIT</code> for 429, <code>WEB_PROVIDER_ERROR</code> otherwise, aborts as <code>WEB_ABORTED</code>);</li>
+<li>one entry pushed onto <code>plan</code> in <code>search()</code> when its availability condition holds (key present, or keyless mode allowed);</li>
+<li>its config fields in the <code>Config</code> schema and key resolution in <code>resolveKey()</code>.</li>
+</ol>
+<p>No other code changes: failover, cooldown, abort handling, and snippet bounding all apply automatically. A self-hosted <a href="https://docs.searxng.org/">SearXNG</a> instance (JSON API) is the natural next candidate — no key, no rate limit of your own, fully local.</p>
+<h2>Install</h2>
+<pre><code>dsh plugin --profile web add dsh-web-search-ext
+# or from a local checkout:
+dsh plugin --profile web add ./path/to/dsh-web-search-ext
+</code></pre>
+<p>Installing a plugin requires restarting the running <code>dsh web</code> process (the profile bundle list is resolved at boot). Config changes afterwards are hot — no restart.</p>
+<p>The bundle patch selects this provider for the <code>web_search</code> tool by setting <code>web.searchProvider: web-search-ext</code>. The official <code>deepseek-official</code> provider stays registered but unused; an explicit selection also prevents <code>WEB_PROVIDER_AMBIGUOUS</code>.</p>
+<h2>Keys (optional but recommended)</h2>
+<p>Any of these, in order of precedence per backend:</p>
+<ol>
+<li>Literal key in the settings section (<code>exaApiKey</code> / <code>firecrawlApiKey</code>)</li>
+<li>Credentials service: <code>EXA_API_KEY</code> / <code>FIRECRAWL_API_KEY</code> (the Web "Models" page writes them; <code>~/.dsh/.credentials.yaml</code>)</li>
+<li>Launch environment variable of the same name</li>
+</ol>
+<p>No keys at all still works: Exa uses its anonymous MCP endpoint and Firecrawl is tried keyless.</p>
+<h2>Configuration</h2>
+<p>Settings namespace <code>web-search-ext</code> in <code>~/.dsh/settings.yaml</code> (hot-reloaded):</p>
+<pre><code>web-search-ext:
+  preferred: exa               # exa | firecrawl — which backend to try first
+  # exaApiKeyEnv: EXA_API_KEY      # defaults shown
+  # firecrawlApiKeyEnv: FIRECRAWL_API_KEY
+  # exaApiUrl: https://api.exa.ai/search
+  # exaMcpUrl: https://mcp.exa.ai/mcp
+  # firecrawlBaseUrl: https://api.firecrawl.dev/v2
+  numResults: 8                # default result count when the tool doesn't cap it
+  maxSnippetChars: 500         # snippet length bound
+  rateLimitCooldownSec: 60     # skip a 429'd backend this long; 0 disables
+  firecrawlKeyless: true       # allow keyless Firecrawl requests
+</code></pre>
+<p>Or select this provider without the bundle patch: <code>DSH_WEB_SEARCH_PROVIDER=web-search-ext</code>.</p>
+<h2>Uninstall</h2>
+<pre><code>dsh plugin --profile web remove dsh-web-search-ext   # then restart dsh web
+</code></pre>
+<h2>Security notes</h2>
+<ul>
+<li>The only outbound requests are to the configured Exa and Firecrawl endpoints; nothing else is contacted.</li>
+<li>API keys travel only in the <code>authorization</code> header of their own backend's requests — never in bodies, never to the other backend, never in error messages.</li>
+<li>No install-time scripts: plain ESM JavaScript, no build step, no <code>postinstall</code>/<code>prepare</code>.</li>
+<li>Snippets are bounded (<code>maxSnippetChars</code>) and Firecrawl's page-markdown descriptions are stripped of image links before entering model context.</li>
+</ul>
+<h2>Verified against (2026-08-17)</h2>
+<ul>
+<li>Exa anonymous MCP: live call to <code>mcp.exa.ai/mcp</code> returned structured <code>Title:/URL:/Highlights:</code> results without credentials.</li>
+<li>Exa REST without key: HTTP 402 (<code>X402_PAYMENT_REQUIRED</code>) — treated as "no key", not an error to surface.</li>
+<li>Firecrawl v2 without key: live call returned <code>data.web[]</code> (v1 shape <code>data[]</code> is also handled).</li>
+<li>Test suite: <code>node test/failover.test.mjs</code> — 10 mocked failover/mapping scenarios + live smoke calls.</li>
+</ul>

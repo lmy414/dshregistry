@@ -1,0 +1,358 @@
+<p><a href="https://github.com/JohnXu22786/adversarial-review/blob/HEAD/README.zh.md">简体中文</a></p>
+<h1>gavel-review</h1>
+<p>An adversarial, multi-perspective code review plugin. Multiple independent review perspectives (lenses) attack a code change in parallel — each perspective cares only about its own category of problems and does not interfere with the others; an arbitration layer then merges cross-lens findings, deduplicates them, grades them by severity, and outputs a report with evidence and fix suggestions. The whole process is read-only and never modifies code.</p>
+<p>The plugin ships with a deterministic static sentinel (model-free rule scanning), suppression rules (to prevent the same class of problems from being reported repeatedly), and a review history (incremental comparison against known issues), and provides two entry points:</p>
+<ul>
+<li><strong>dsh (DeepSeek Harness) plugin entry</strong>: registers the <code>gavel_review</code> tool that the model can call directly within a session;</li>
+<li><strong>Standalone CLI entry</strong>: runs locally from the command line, compatible with any model service speaking the OpenAI Chat Completions protocol.</li>
+</ul>
+<p>Zero third-party runtime dependencies (the core engine and CLI use only Node built-ins).</p>
+<hr>
+<h2>Design philosophy</h2>
+<p>A single reviewer is easily biased by their own perspective: the person writing code cannot see their own blind spots, and generic review often mixes style issues with real defects. gavel's approach is to <strong>split "breaking" into multiple specialized directions, attack in parallel, then merge the results</strong>:</p>
+<ul>
+<li>Each lens carries a set of <strong>actionable checkpoint lists</strong> (e.g., "null and uninitialized", "injection", "complexity"); a finding must map to a concrete checkpoint, and reports can be traced back to list entries;</li>
+<li>Lenses fan out in parallel and do not wait for each other (which lenses are enabled is independently configurable);</li>
+<li>The static sentinel runs before the model as a deterministic backstop with rules, guaranteeing output even if the model fails;</li>
+<li>The arbitration layer clusters cross-lens findings by "file + line proximity + title token overlap"; when multiple perspectives hit the same issue it gains a <strong>corroboration bonus</strong>, and severity may be raised by one level;</li>
+<li>Severity is <strong>computed deterministically</strong> (impact × 2 + confidence + corroboration); the same input always yields the same verdict;</li>
+<li>An optional <strong>deep review</strong> stage challenges each candidate finding one by one; refuted findings are downgraded to "observation" rather than deleted — the decision process stays transparent.</li>
+</ul>
+<h2>Review pipeline</h2>
+<pre><code>Input (diff text / file path)
+   │
+   ▼
+① Ingest collect ────── parse unified diff or read files, build line mapping
+   │
+   ▼
+② Static sentinel tripwire ── deterministic regex rules (hardcoded credentials, dangerous calls, leftover debug ...)
+   │
+   ▼
+③ Lens probing probe ──── correctness / security / maintainability attack in parallel (LLM calls)
+   │
+   ▼
+④ Deep review deep (optional) ── challenge-based re-validation of candidate findings (serial)
+   │
+   ▼
+⑤ Arbitration merge ──── cross-lens clustering, deduplication, fingerprinting, severity grading
+   │
+   ▼
+⑥ Suppression filter suppress ── findings matching suppression rules are archived and no longer reported
+   │
+   ▼
+⑦ Docket record docket ──── append history, mark known issues (incremental review)
+   │
+   ▼
+Report (Markdown / JSON)
+</code></pre>
+<h2>Directory structure</h2>
+<pre><code>adversarial-review/
+├── package.json          # package manifest; dsh.bundle.patch points at the integration patch
+├── cordis.patch.yml      # dsh integration patch (plugin load line + default config)
+├── bin/gavel.mjs         # CLI launcher
+├── src/
+│   ├── index.ts          # public entry (library API + dsh plugin module exports)
+│   ├── cli.ts            # standalone CLI (review / history / rules)
+│   ├── core/
+│   │   ├── types.ts      # domain model
+│   │   ├── engine.ts     # orchestration engine (pipeline master)
+│   │   ├── diff.ts       # unified diff parser
+│   │   ├── tripwire.ts   # static sentinel rule engine
+│   │   ├── lenses.ts     # lens registry and checkpoint lists
+│   │   ├── merge.ts      # cross-lens merging, clustering, fingerprinting
+│   │   ├── severity.ts   # severity grading (deterministic)
+│   │   ├── suppress.ts   # suppression rules
+│   │   ├── docket.ts     # review history (JSONL)
+│   │   └── report.ts     # Markdown / JSON report rendering
+│   ├── llm/              # model client (interface + HTTP implementation)
+│   └── dsh/plugin.ts     # dsh adapter: Cordis plugin + tool registration
+├── test/                 # node:test test suite (97 tests)
+└── examples/             # sample diffs, rule files
+</code></pre>
+<hr>
+<h2>Installing in DSH</h2>
+<pre><code>dsh plugin --profile demo add github:JohnXu22786/adversarial-review
+</code></pre>
+<p>This installs the published plugin and its bundle patch (see the detailed manual steps under "dsh (DeepSeek Harness) integration" below). The plugin registers the <code>gavel_review</code> tool; the model can then call it directly within a session.</p>
+<h2>Standalone CLI usage</h2>
+<p>Requires Node.js &gt;= 20.19 (running the source directly requires &gt;= 23.6, see below). You can use the built artifacts without installing any dependencies:</p>
+<pre><code># Build (before first use)
+npm install
+npm run build
+
+# Review a diff file
+node bin/gavel.mjs review --diff examples/sample.diff \
+  --api-key $GAVEL_API_KEY --model deepseek-chat
+
+# Review the most recent commit
+node bin/gavel.mjs review --base HEAD~1
+
+# Review given files (whole-file mode)
+node bin/gavel.mjs review --path src/order.js --path src/notify.js
+
+# Combined options: deep review + emit suppression rules + report files + CI gate
+node bin/gavel.mjs review --diff p.patch --deep --emit-rules \
+  --out report.md --json-out report.json --fail-on required
+
+# Inspect docket and rules
+node bin/gavel.mjs history --stats
+node bin/gavel.mjs rules --list
+</code></pre>
+<p>Common options:</p>
+<table>
+<thead>
+<tr>
+<th>Option</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>--diff &lt;path|-&gt;</code></td>
+<td>unified diff text file (<code>-</code> reads stdin); mutually exclusive with <code>--base</code> and <code>--path</code></td>
+</tr>
+<tr>
+<td><code>--base &lt;ref&gt;</code></td>
+<td>run <code>git diff --unified=8 &lt;ref&gt;</code> (e.g. <code>HEAD~1</code>)</td>
+</tr>
+<tr>
+<td><code>--path &lt;p&gt;</code></td>
+<td>whole-file review; repeatable</td>
+</tr>
+<tr>
+<td><code>--lens &lt;a,b&gt;</code></td>
+<td>lens subset: <code>correctness,security,maintainability</code>; exits with an error on invalid ids</td>
+</tr>
+<tr>
+<td><code>--deep</code></td>
+<td>enable deep review (challenge-based re-validation)</td>
+</tr>
+<tr>
+<td><code>--emit-rules</code></td>
+<td>generate suppression rules for findings at "must fix" or above</td>
+</tr>
+<tr>
+<td><code>--rules &lt;path&gt;</code></td>
+<td>rule file (default <code>&lt;history-dir&gt;/rules.json</code>)</td>
+</tr>
+<tr>
+<td><code>--no-history</code></td>
+<td>disable docket and history comparison</td>
+</tr>
+<tr>
+<td><code>--history-dir &lt;d&gt;</code></td>
+<td>docket directory (default <code>.gavel/</code>)</td>
+</tr>
+<tr>
+<td><code>--out / --json-out</code></td>
+<td>Markdown / JSON report output paths</td>
+</tr>
+<tr>
+<td><code>--fail-on &lt;level&gt;</code></td>
+<td>exit code 2 if any finding reaches that level (CI gate)</td>
+</tr>
+<tr>
+<td><code>--model / --base-url / --api-key</code></td>
+<td>model routing; environment variables <code>GAVEL_MODEL</code> / <code>GAVEL_BASE_URL</code> / <code>GAVEL_API_KEY</code> (or <code>DEEPSEEK_API_KEY</code>)</td>
+</tr>
+</tbody></table>
+<p>When the build artifacts are absent, the CLI automatically falls back to executing the TypeScript source directly under <code>src/</code> (Node &gt;= 23.6 has built-in type stripping).</p>
+<p>Exit codes: <code>0</code> success (including "no findings"); <code>1</code> argument or run error (missing API key, invalid flags, unknown lens, I/O failure); <code>2</code> the <code>--fail-on</code> gate tripped (a finding reached the configured level); <code>130</code> review cancelled via signal.</p>
+<h2>dsh (DeepSeek Harness) integration</h2>
+<p>dsh uses an "everything is a plugin" architecture: a plugin is an npm package that declares an integration patch via the <code>dsh.bundle.patch</code> field in <code>package.json</code>; the patch inserts a plugin line into the Cordis config line list; the plugin registers capabilities in <code>apply(ctx, config)</code> with reversible effects. This plugin's dsh integration points:</p>
+<ul>
+<li><strong>Manifest</strong>: <code>package.json</code> → <code>"dsh": { "bundle": { "patch": "./cordis.patch.yml" } }</code></li>
+<li><strong>Patch</strong>: <code>cordis.patch.yml</code> (inserts a plugin line with id <code>gavel</code>, including default config)</li>
+<li><strong>Plugin module</strong>: <code>src/dsh/plugin.ts</code>, named exports <code>name</code> / <code>inject</code> / <code>Config</code> / <code>apply</code> (same loading convention as dsh tool plugins: the loader takes <code>exports.default ?? exports</code>, then assembles it via <code>ctx.registry.plugin()</code>)</li>
+<li><strong>Tool interface</strong>: inside <code>apply()</code> it registers the <code>gavel_review</code> tool via <code>ctx.tools.register(defineTool(...))</code>; the model can call it within a session without human involvement</li>
+</ul>
+<h3>Manual install steps</h3>
+<pre><code># 1. Build artifacts (lib/)
+npm install &amp;&amp; npm run build
+
+# 2. Integrate via dsh's plugin management command (equivalent to pnpm install + automatic bundle patch detection)
+dsh plugin --profile &lt;your profile&gt; add &lt;this package path or the published package name&gt;
+
+# 3. (Optional) override config by id in the profile's cordis.patch.yml
+# override example:
+# - id: gavel
+#   name: 'gavel-review'
+#   config:
+#     deep: true
+#     historyDir: .review
+#     maxFindingsPerLens: 8
+</code></pre>
+<p>If there is no plugin management command, you can manually add the above line to the profile's <code>cordis.patch.yml</code> and add the package to the dependencies — the mechanism is the same.</p>
+<h3>Tool interface: <code>gavel_review</code></h3>
+<table>
+<thead>
+<tr>
+<th>Parameter</th>
+<th>Type</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>diff</code></td>
+<td>string</td>
+<td>unified diff text (suggested <code>git diff --unified=8</code> output). At least one of <code>diff</code> / <code>paths</code></td>
+</tr>
+<tr>
+<td><code>paths</code></td>
+<td>string[]</td>
+<td>list of file paths to review (whole-file review)</td>
+</tr>
+<tr>
+<td><code>lenses</code></td>
+<td>string[]</td>
+<td>lens subset (<code>correctness</code> / <code>security</code> / <code>maintainability</code>); all by default</td>
+</tr>
+<tr>
+<td><code>deep</code></td>
+<td>boolean</td>
+<td>whether to deep review; defaults to the deployment config</td>
+</tr>
+<tr>
+<td><code>emitRules</code></td>
+<td>boolean</td>
+<td>generate suppression rules for findings at "must fix" or above and write them to the rule file</td>
+</tr>
+</tbody></table>
+<p>The tool returns canonical JSON (declared via a <code>{ type: 'json' }</code> output), whose structure is the report itself; what is rendered to the model is Markdown text. The model-facing description already states: read-only, suitable for invocation after merge/commit/refactor.</p>
+<h3>Deployment config (<code>gavel</code> line <code>config</code>)</h3>
+<table>
+<thead>
+<tr>
+<th>Field</th>
+<th>Default</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>toolName</code></td>
+<td><code>gavel_review</code></td>
+<td>name of the registered tool</td>
+</tr>
+<tr>
+<td><code>provider</code> / <code>model</code></td>
+<td>empty</td>
+<td>model routing; empty falls back to the current agent, then to <code>deepseek-official</code> / <code>deepseek-v4-flash</code></td>
+</tr>
+<tr>
+<td><code>lenses</code></td>
+<td>all three</td>
+<td>enabled lenses</td>
+</tr>
+<tr>
+<td><code>deep</code></td>
+<td><code>false</code></td>
+<td>whether deep review is the default</td>
+</tr>
+<tr>
+<td><code>history</code></td>
+<td><code>true</code></td>
+<td>whether to write the docket and compare against history</td>
+</tr>
+<tr>
+<td><code>historyDir</code></td>
+<td><code>.gavel</code></td>
+<td>docket and rule file directory</td>
+</tr>
+<tr>
+<td><code>maxCharsPerLens</code></td>
+<td><code>24000</code></td>
+<td>per-lens context cap (characters)</td>
+</tr>
+<tr>
+<td><code>maxFindingsPerLens</code></td>
+<td><code>12</code></td>
+<td>maximum findings reported per lens</td>
+</tr>
+<tr>
+<td><code>maxTokens</code></td>
+<td><code>3000</code></td>
+<td>per-lens call output cap (tokens)</td>
+</tr>
+</tbody></table>
+<h3>Runtime behavior</h3>
+<ul>
+<li>Inside the tool, lens calls fan out in parallel through the injected <code>ctx.llm</code> streaming interface (Promise fan-out; a single failing lens does not take down the whole run, and failures are recorded in the report's "parse failures" section); <code>exec.signal</code> is passed through end to end, supporting session cancellation;</li>
+<li>The docket and rule files are written under <code>historyDir</code> (relative to the working directory); write failures do not block the review;</li>
+<li>Uninstalling the plugin unregisters the tool (reversible Cordis effect) with no leftover listeners.</li>
+</ul>
+<blockquote>
+<p>Version note: dsh is in developer preview and its API may evolve. This plugin is implemented against the current contract of the rc-series packages (<code>ctx.tools.register</code> + <code>defineTool</code>, <code>ctx.llm.stream</code>); if the upstream interface changes, only one file, <code>src/dsh/plugin.ts</code>, needs adjustment.</p>
+<p>Dependency note: the package root entry (<code>exports["."]</code>) also serves as the dsh plugin module and statically imports dsh ecosystem packages; therefore, <strong>importing the root entry as a library requires installing the optional peer dependencies</strong> (<code>@deepseek-ai/dsh-tools</code>, <code>@deepseek-ai/dsh-llm</code>, <code>@deepseek-ai/schemastery</code>, <code>@deepseek-ai/cordis</code>, <code>@deepseek-ai/dsh-agent</code>). The standalone CLI (<code>bin/gavel.mjs</code>) and the engine submodules do not go through the root entry and keep zero third-party runtime dependencies.</p>
+</blockquote>
+<hr>
+<h2>Severity grading</h2>
+<p>Score = impact × 2 + confidence + corroboration bonus (+1 when multiple independent perspectives hit the same issue), capped at 10:</p>
+<table>
+<thead>
+<tr>
+<th>Score</th>
+<th>Level</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>9-10</td>
+<td><code>blocker</code></td>
+<td>fatal impact with high confidence, or corroborated by multiple perspectives</td>
+</tr>
+<tr>
+<td>7-8</td>
+<td><code>required</code></td>
+<td>should be handled before shipping</td>
+</tr>
+<tr>
+<td>5-6</td>
+<td><code>recommended</code></td>
+<td>should be handled soon</td>
+</tr>
+<tr>
+<td>3-4</td>
+<td><code>optional</code></td>
+<td>handle depending on cost</td>
+</tr>
+<tr>
+<td>0-2</td>
+<td><code>informational</code></td>
+<td>signals worth noting</td>
+</tr>
+</tbody></table>
+<p>Impact/confidence are self-reported by each lens in its findings (0-3); score computation and grading are fully deterministic. Findings refuted by the deep review stage are fixed at <code>informational</code> and marked <code>verified: refuted</code>.</p>
+<h2>Static sentinel (deterministic rules)</h2>
+<p>16 built-in rule categories, covering: hardcoded credentials, private key material, dynamic code execution, shell concatenation, SQL concatenation, empty exception handling, leftover debug, unfinished markers, broad type ignores, passwords embedded in connection strings, disabled TLS verification, destructive commands, download-and-execute, untrusted deserialization, weak random numbers in security-sensitive contexts, and debug logging. Rules are scoped by file language; hits participate in merging and grading (they can synthesize <code>mixed</code> sources with lens findings).</p>
+<h2>Suppression rules</h2>
+<p>The rule file is JSON (default <code>.gavel/rules.json</code>):</p>
+<pre><code>{
+  "version": 1,
+  "rules": [
+    { "id": "r-001", "file": "src/**/*.js", "source": "any",
+      "key": "console.log", "reason": "known noise", "createdAt": "2026-08-01T10:00:00Z" }
+  ]
+}
+</code></pre>
+<p>Matching: file glob (supports <code>**</code> / <code>*</code> / <code>?</code>) + source (<code>lens</code> / <code>tripwire</code> / <code>any</code>) + title keyword (case-insensitive substring). A match moves the finding from the main report into the "suppressed findings" section. <code>--emit-rules</code> auto-generates candidate rules for findings above the threshold (editable by hand), and the CLI provides <code>rules --list / --add / --drop</code> for management.</p>
+<h2>Review history (docket)</h2>
+<p><code>.gavel/docket.jsonl</code>, an append-only JSONL file, one review summary per line (time, scope, fingerprint set). Uses:</p>
+<ul>
+<li>Newly reported findings are compared against historical fingerprints (file + line-number bucket + title tokens); matches are marked <code>known</code> and shown in the report as "fingerprint matches a known issue in history";</li>
+<li><code>gavel history --stats</code> shows run counts, level distribution, and files with the most findings.</li>
+</ul>
+<h2>Development and testing</h2>
+<pre><code>npm test          # full node:test suite (97 tests; tests run the source directly, requires Node &gt;= 23.6)
+npm run typecheck # tsc --noEmit
+npm run build     # produces lib/ (run automatically via the prepare hook on npm install)
+</code></pre>
+<p>Code conventions: pure ESM, erasable TypeScript syntax (no enums/decorators), relative imports within source files use the <code>.ts</code> suffix (<code>tsc</code> rewrites them to <code>.js</code> at build time), so tests and the CLI can run the source directly.</p>
+<h2>Design trade-offs and limitations</h2>
+<ul>
+<li><strong>Report-only, never modifies</strong>: the plugin never touches code; fix suggestions are just text.</li>
+<li><strong>The lens set is configurable but fixed</strong>: the default three perspectives cover correctness/security/maintainability; developers can extend their own lenses and checkpoint lists in <code>lenses.ts</code>.</li>
+<li><strong>The sentinel is heuristic</strong>: regex rules produce a small number of false positives; hits carry each rule's own impact/confidence and go through the same deterministic grading (so e.g. hardcoded credentials can land at <code>required</code>/<code>blocker</code>), and they can be suppressed by suppression rules.</li>
+<li><strong>Deep review adds cost</strong>: each round of deep review is an additional serial model call; it is off by default and enabled on demand.</li>
+</ul>
+<hr>
+<h2>License</h2>
+<p>MIT — see <a href="https://github.com/JohnXu22786/adversarial-review/blob/HEAD/LICENSE">LICENSE</a>.</p>

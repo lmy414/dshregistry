@@ -1,0 +1,339 @@
+<p><a href="https://github.com/JohnXu22786/model-catalog/blob/HEAD/README.zh.md">简体中文</a></p>
+<h1>Model Catalog — Model Catalog Auto-Discovery (dsh plugin)</h1>
+<p>This plugin is designed for the dsh ecosystem (a plugin-based DeepSeek harness where everything is a plugin): once you configure an OpenAI-compatible API host in dsh (official API, relay gateway, local inference service, etc.), the plugin automatically pulls model information from that host's endpoints — model listings, pricing (input/output/cache prices per million tokens), inference parameters (context length, max output, capability flags: tool calling / structured output / vision / parallel tools, etc.) — normalizes it, and generates ready-to-use model configs, saving you the manual work.</p>
+<p><strong>Core value</strong>:</p>
+<ul>
+<li>Host-type auto-detection, no protocol details to configure;</li>
+<li>End-to-end unit normalization (per-token USD / per-million USD / multipliers / per-call);</li>
+<li>Traceable pricing (captured_at + source endpoint), structured dynamic pricing;</li>
+<li>Optional lightweight live probing for missing capabilities;</li>
+<li>Three outputs: full catalog, dsh config fragment, human-readable report.</li>
+</ul>
+<hr>
+<h2>Features</h2>
+<ul>
+<li><strong>Host type auto-detection</strong>: standard compatible (minimal fields) / rich metadata (<code>/models</code> with pricing and parameter lists) / multiplier-priced gateway (quota system) / capability-flag proxy (<code>/model/info</code> capability booleans) / Ollama / vLLM; fails with an error when all endpoint probes fail, and supports manual <code>--kind</code>.</li>
+<li><strong>Normalized model records</strong>: <code>id / context window / max output / pricing family (input, output, cache_read, cache_write, internal_reasoning, in USD/1M) / capability flags / source provenance</code>.</li>
+<li><strong>Pricing source chain</strong>: host endpoint → user override config → external price mirror → built-in default table → marked unknown (with warning).</li>
+<li><strong>Built-in default table</strong>: model facts and pricing fallback for the official API (DeepSeek); dynamic pricing (peak/off-peak billing from 2026-08-16) expressed as structured tiers.</li>
+<li><strong>Capability probe verification</strong> (switchable): sends minimal requests to live-test capabilities missing from metadata (tool calling / structured output / streaming), results cached per <code>(baseUrl, model)</code>.</li>
+<li><strong>Cache and concurrency safety</strong>: classification/probe/mirror results cached with TTL; file locking + atomic writes prevent concurrent processes from corrupting each other; corrupted caches auto-recover.</li>
+<li><strong>Interactive config generation</strong>: the <code>pick</code> command lists models and prices; select one to generate a dsh config fragment.</li>
+<li><strong>Self-contained</strong>: manifest + entry factory + tool/event interfaces, directly loadable by the harness (see <a href="https://github.com/JohnXu22786/model-catalog/blob/HEAD/docs/integration.md">integration docs</a>).</li>
+</ul>
+<h2>How It Works</h2>
+<pre><code>baseUrl + apiKey
+   │
+   ▼
+① Host detection (probe endpoints, result cached 1h)
+   ├─ /models rich metadata     → augmented
+   ├─ /v1/models                → ├─ /api/pricing → quota
+   │                              ├─ /version     → vllm
+   │                              ├─ /model/info  → flag
+   │                              └─ otherwise    → bare
+   ├─ /api/tags                 → ollama
+   └─ all failed                → unknown (error; override with --kind)
+   │
+   ▼
+② Fetch (parse model listings/pricing/capabilities by type)
+   │
+   ▼
+③ Normalize (unit conversion + source-chain completion + alias resolution)
+   │
+   ▼
+④ Capability probing (optional; only fills gaps missing from metadata)
+   │
+   ▼
+⑤ Output
+   ├─ out/catalog.json     full catalog (schema: model-catalog/v1)
+   ├─ out/dsh-models.json  dsh config fragment (schema: dsh/models/v1)
+   └─ out/report.md        human-readable report
+</code></pre>
+<h2>Installing in DSH</h2>
+<pre><code>dsh plugin --profile demo add github:JohnXu22786/model-catalog
+</code></pre>
+<p>Remove with:</p>
+<pre><code>dsh plugin --profile demo remove model-catalog
+</code></pre>
+<h2>Quick Start</h2>
+<p>Requirements: Node.js ≥ 21 (no runtime dependencies; only TypeScript needed to build).</p>
+<pre><code>npm install          # install dev dependencies
+npm run build        # compile to dist/
+
+# Discover the DeepSeek official API model catalog
+export DEEPSEEK_API_KEY=sk-xxx
+node dist/src/main.js discover --base-url https://api.deepseek.com
+
+# Discover a local Ollama
+node dist/src/main.js discover --base-url http://127.0.0.1:11434 --probe always
+
+# Relay gateway (multiplier pricing)
+node dist/src/main.js discover --base-url https://gateway.example.com --api-key-env GATEWAY_KEY
+
+# Interactively pick models and generate a dsh config fragment (answers can be piped in one shot:
+#   line 1 = baseUrl, line 2 = key env var name (blank = auto-detect), line 3 = model number)
+node dist/src/main.js pick --base-url https://api.deepseek.com
+</code></pre>
+<p>After running, three artifacts land in the <code>out/</code> directory. Hand <code>dsh-models.json</code> to the dsh harness to complete model configuration (field docs in <a href="https://github.com/JohnXu22786/model-catalog/blob/HEAD/docs/integration.md">integration docs</a>).</p>
+<h2>Host Types</h2>
+<table>
+<thead>
+<tr>
+<th>Type</th>
+<th>Detection</th>
+<th>Pricing source</th>
+<th>Notes</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>bare</code> standard compatible</td>
+<td><code>/v1/models</code> with minimal fields only</td>
+<td>none → fallback chain</td>
+<td>The most basic OpenAI-compatible form; the DeepSeek official API is this type, completed by the built-in default table</td>
+</tr>
+<tr>
+<td><code>augmented</code> rich metadata</td>
+<td><code>/models</code> includes <code>context_length</code>/<code>pricing</code>/<code>supported_parameters</code></td>
+<td>provided directly by the host (USD-per-token strings)</td>
+<td>Implemented by a few gateways</td>
+</tr>
+<tr>
+<td><code>quota</code> multiplier-priced gateway</td>
+<td><code>/api/pricing</code> (compatible with legacy map form)</td>
+<td>multiplier × $2.0 × group multiplier</td>
+<td>Common quota pricing system in relay gateways</td>
+</tr>
+<tr>
+<td><code>flag</code> capability-flag proxy</td>
+<td><code>/model/info</code> (falls back to <code>/v1/model/info</code> on 404)</td>
+<td>per-token USD numbers</td>
+<td>Returns capability booleans and prices</td>
+</tr>
+<tr>
+<td><code>ollama</code></td>
+<td><code>/api/tags</code></td>
+<td>none → fallback chain</td>
+<td>Local service; <code>/api/show</code> provides capabilities and context</td>
+</tr>
+<tr>
+<td><code>vllm</code></td>
+<td><code>/v1/models</code> + <code>/version</code></td>
+<td>none → fallback chain</td>
+<td>Local inference service, no key required</td>
+</tr>
+</tbody></table>
+<h2>Normalization and Unit Conversion</h2>
+<p>All per-token prices in the catalog are normalized to <strong>USD per million tokens (USD/1M)</strong>; per-call prices are marked separately:</p>
+<table>
+<thead>
+<tr>
+<th>Input form</th>
+<th>Conversion</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>USD-per-token string (e.g. <code>"0.00000056"</code>, <code>"$0.00003"</code>)</td>
+<td>×1e6, rounded to 6 decimal places</td>
+</tr>
+<tr>
+<td>USD-per-token number (e.g. <code>1.5e-7</code>)</td>
+<td>×1e6</td>
+</tr>
+<tr>
+<td>Multiplier (quota system, <code>model_ratio</code>)</td>
+<td>input = <code>model_ratio × 2.0 × group_ratio</code>; output = <code>model_ratio × completion_ratio × 2.0 × group_ratio</code> (<code>completion_ratio</code>/<code>group_ratio</code> default 1; <code>group_ratio</code> uses the default group when it is a map)</td>
+</tr>
+<tr>
+<td>Per-call (<code>quota_type=1</code>)</td>
+<td><code>per-call USD = model_price × group_ratio</code>, <code>billing: "per-call"</code></td>
+</tr>
+</tbody></table>
+<p><code>augmented</code> pricing field mapping: <code>prompt → input</code>, <code>completion → output</code>, <code>input_cache_read → cacheRead</code>, <code>input_cache_write → cacheWrite</code>, <code>internal_reasoning → internalReasoning</code>.</p>
+<h2>Pricing Source Priority</h2>
+<pre><code>1. Host endpoint (full trust: if the host provides some prices, no other sources are consulted)
+2. User override config data/overrides.json (replacement semantics: override only the fields configured)
+3. External price mirror --external-url (only fills fully-missing pricing; result cached 1h)
+4. Built-in default table data/builtin-table.json (only fills gaps; includes DeepSeek official model facts)
+5. None of the above → pricing: null, marked "unknown" in the report with a warning
+</code></pre>
+<p>Capability fields, context and max output follow the same "host &gt; override &gt; mirror &gt; built-in table" priority (override is replacement; the rest only fill gaps).</p>
+<h3>Dynamic Pricing</h3>
+<p>The DeepSeek official API has billed by <strong>peak/off-peak</strong> time-of-day since 2026-08-16 (peak: 01:00–04:00 and 06:00–10:00 UTC; half price at other times). In the catalog:</p>
+<ul>
+<li><code>pricing.dynamic: true</code>;</li>
+<li><code>pricing.amounts</code> holds the baseline tier (first off-peak tier) prices;</li>
+<li><code>pricing.tiers</code> carries all tiers (label, UTC window, per-tier prices);</li>
+<li>the report (report.md) lists dynamic-priced models separately with a note that billing is per-tier;</li>
+<li>the built-in default table records the official prices of the day; if they differ from the official docs, follow the docs and update <code>data/builtin-table.json</code>.</li>
+</ul>
+<h2>Capability Probing</h2>
+<p>For capabilities <strong>missing</strong> from metadata (tool calling / structured output / streaming), sends minimal probe requests (<code>max_tokens</code> tiny, message very short) to live-test host support:</p>
+<ul>
+<li>Tool calling: sends <code>tools</code> + forced <code>tool_choice</code>;</li>
+<li>Structured output: <code>response_format: {type: "json_object"}</code> (message contains the word "json" to dodge the classic JSON-mode rejection trap);</li>
+<li>Streaming: <code>stream: true</code>; the response must actually be SSE (has <code>data:</code> events and a <code>[DONE]</code> terminator); a plain JSON body is judged unsupported.</li>
+</ul>
+<p>Interpretation: <code>2xx</code> = supported; <code>400/404/405/422</code> = unsupported (error-body summary kept as evidence); <code>401/403</code> = abort all probing with a warning (avoid wasting quota); <code>5xx/network/timeout</code> = stays unknown with a short-lived error cache.</p>
+<ul>
+<li>Modes: <code>auto</code> (default; probes only with a key or a local host) / <code>never</code> / <code>always</code>;</li>
+<li>Results cached per <code>(baseUrl, model, capability)</code> for 24h (errors 30m);</li>
+<li>Capabilities that cannot be cheaply live-tested (vision, parallel tools) rely on metadata only; no probing.</li>
+</ul>
+<h2>Cache and Concurrency Safety</h2>
+<ul>
+<li>Cache directory <code>var/</code> (<code>vault.json</code>): host classification (1h), probe results (24h/30m), external mirror (1h);</li>
+<li>All writes go through "temp file + atomic rename"; corrupted cache files are reset automatically without affecting operation;</li>
+<li>Cross-process file lock (<code>var/.lock</code>): stale locks (&gt;5 minutes) are taken over automatically; wait timeout (10s) raises an error;</li>
+<li><code>cache --clear</code> wipes everything in one command.</li>
+</ul>
+<h2>Configuration</h2>
+<p>Config file <code>catalog.config.json</code> (in the plugin root; overridable with <code>--config FILE</code>; all fields optional):</p>
+<pre><code>{
+  "baseUrl": "https://api.deepseek.com",
+  "apiKeyEnv": "DEEPSEEK_API_KEY",
+  "probe": "auto",
+  "externalUrl": "https://example.com/mirror.json",
+  "outputDir": "out",
+  "cacheDir": "var",
+  "httpTimeoutMs": 10000
+}
+</code></pre>
+<table>
+<thead>
+<tr>
+<th>Field</th>
+<th>Default</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>baseUrl</code></td>
+<td>none</td>
+<td>Host address; also <code>--base-url</code> on the CLI</td>
+</tr>
+<tr>
+<td><code>apiKeyEnv</code></td>
+<td>auto</td>
+<td>Key environment variable name; auto-detects <code>MODELCAT_API_KEY</code> / <code>DEEPSEEK_API_KEY</code> / <code>OPENAI_API_KEY</code></td>
+</tr>
+<tr>
+<td><code>kindHint</code></td>
+<td>none</td>
+<td>Force host type (bare/augmented/quota/flag/ollama/vllm)</td>
+</tr>
+<tr>
+<td><code>probe</code></td>
+<td><code>auto</code></td>
+<td>Capability probe mode</td>
+</tr>
+<tr>
+<td><code>catalogTtlSec</code></td>
+<td>900</td>
+<td>Catalog freshness (reused by the plugin <code>list</code> tool)</td>
+</tr>
+<tr>
+<td><code>probeTtlSec</code></td>
+<td>86400</td>
+<td>Probe result cache TTL</td>
+</tr>
+<tr>
+<td><code>detectTtlSec</code></td>
+<td>3600</td>
+<td>Host classification cache TTL</td>
+</tr>
+<tr>
+<td><code>externalUrl</code></td>
+<td>none</td>
+<td>External price mirror URL (structure in data/mirror.example.json)</td>
+</tr>
+<tr>
+<td><code>outputDir</code> / <code>cacheDir</code></td>
+<td><code>out</code> / <code>var</code></td>
+<td>Output and cache directories</td>
+</tr>
+<tr>
+<td><code>concurrency</code></td>
+<td>4</td>
+<td>Fetch concurrency (e.g. Ollama <code>/api/show</code>)</td>
+</tr>
+<tr>
+<td><code>httpTimeoutMs</code></td>
+<td>10000</td>
+<td>HTTP timeout</td>
+</tr>
+</tbody></table>
+<p>Keys are only passed via environment variables (<code>--api-key</code> is for transient CLI use only); no artifact file ever contains a plaintext key.</p>
+<h2>Data Files</h2>
+<table>
+<thead>
+<tr>
+<th>File</th>
+<th>Purpose</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>data/builtin-table.json</code></td>
+<td>Built-in default table (fallback): DeepSeek official model facts and time-of-day pricing</td>
+</tr>
+<tr>
+<td><code>data/overrides.example.json</code> → copy to <code>data/overrides.json</code></td>
+<td>Manual overrides: per-field replacement</td>
+</tr>
+<tr>
+<td><code>data/aliases.example.json</code> → copy to <code>data/aliases.json</code></td>
+<td>Alias mapping: old names/aliases → canonical ids</td>
+</tr>
+<tr>
+<td><code>data/mirror.example.json</code></td>
+<td>External mirror format example (self-hostable isomorphic JSON)</td>
+</tr>
+</tbody></table>
+<h2>Outputs</h2>
+<table>
+<thead>
+<tr>
+<th>File</th>
+<th>Content</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>out/catalog.json</code></td>
+<td>Full catalog (schema <code>model-catalog/v1</code>): metadata, warnings, all normalized entries</td>
+</tr>
+<tr>
+<td><code>out/dsh-models.json</code></td>
+<td>dsh config fragment (schema <code>dsh/models/v1</code>): directly consumable by the harness</td>
+</tr>
+<tr>
+<td><code>out/report.md</code></td>
+<td>Human-readable: catalog tables, unknown-pricing list, dynamic pricing, warnings</td>
+</tr>
+</tbody></table>
+<h2>CLI Overview</h2>
+<pre><code>model-catalog discover [args]          discover and output the model catalog (default command)
+model-catalog pick [args]              interactively pick models and generate a dsh config fragment
+model-catalog probe --model ID [args]  run capability probing for a single model
+model-catalog cache --clear            clear the cache
+model-catalog config                   show effective config
+
+--base-url URL      --api-key-env NAME   --api-key KEY
+--kind KIND         --probe MODE         --out DIR
+--cache DIR         --external-url URL   --config FILE
+--model ID          --help
+</code></pre>
+<h2>dsh Integration</h2>
+<p>The plugin is self-contained: <code>manifest.json</code> declares the entry and interfaces, and <code>dist/src/plugin.js</code> exports a <code>createPlugin()</code> factory registering 5 tools (<code>catalog.discover/list/refresh/select/probe</code>) and 2 events (<code>catalog.updated/catalog.failed</code>). It is also installable via the dsh bundle (<code>package.json</code> → <code>dsh.bundle</code> → <code>cordis.patch.yml</code>): the Cordis entry <code>dist/src/dsh.js</code> exports <code>name</code>/<code>inject</code>/<code>apply</code> and registers the same 5 tools on the harness. Harness loading, tool parameters and returns, event payloads, and how config fragments are consumed are all covered in <strong><a href="https://github.com/JohnXu22786/model-catalog/blob/HEAD/docs/integration.md">docs/integration.md</a></strong>.</p>
+<h2>Limitations and Notes</h2>
+<ul>
+<li>Capabilities like vision and parallel tools cannot be cheaply live-tested; they come from metadata only (unknown when missing);</li>
+<li>If a multiplier gateway's <code>group_ratio</code> is a map without a <code>default</code> group, it counts as 1 — actual group multipliers can be corrected in the override config;</li>
+<li>Probe requests consume a small number of tokens (at most 3 requests per model, 1–16 tokens each); keyless standard hosts are not probed in <code>auto</code> mode;</li>
+<li>Built-in default table prices are fallbacks; for dynamic pricing, follow the official docs and the tiers.</li>
+</ul>
+<h2>Development</h2>
+<pre><code>npm run build    # compile TypeScript
+npm test         # compile + run all tests (node:test, no external test deps)
+</code></pre>
+<p>Test coverage: unit conversion, host detection, per-type fetching, normalization priority chain, probe interpretation and caching, cache store (TTL/locking/corruption recovery), output artifacts, and an end-to-end pipeline (local mock host).</p>
+<h2>License</h2>
+<p>MIT — see <a href="https://github.com/JohnXu22786/model-catalog/blob/HEAD/LICENSE">LICENSE</a>. Copyright (c) 2026 JohnXu22786.</p>

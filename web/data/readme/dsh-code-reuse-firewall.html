@@ -1,0 +1,142 @@
+<h1>dsh-code-reuse-firewall</h1>
+<p><strong>Pre-write reuse firewall for DeepSeek Harness — for PYTHON repositories.</strong>
+Before the agent writes a new helper / service / manager, <code>reuse_check</code>
+deterministically surfaces the existing Python implementations that already
+cover that intent, so the agent reuses or extracts instead of duplicating.</p>
+<h2>Why</h2>
+<p>Static checkers only catch what <em>looks</em> wrong. The expensive failure mode in
+AI-maintained codebases is the opposite: two implementations of the same
+capability drift apart silently, because nothing looked broken when the second
+copy was written. The fix is to intervene <strong>before</strong> the second copy exists —
+surface the overlap while the new code is still a plan, not a file.</p>
+<p>The retrieval is <strong>deterministic and LLM-free</strong> (callable-name, docstring
+lexical, and string-literal channels with IDF-weighted query coverage, stdlib
+Python only), backed by the
+<a href="https://github.com/keyiadiannao/Auto_code_audit">Auto_code_audit</a> capability
+channel. It was validated on an unfamiliar mid-size project (arrow-py): a 1s
+scan surfaced nine near-identical locale <code>_format_timeframe</code> methods, four
+<code>describe</code> twins, and <code>api.get</code> vs <code>ArrowFactory.get</code> near-duplicates with zero
+noise in the dead-code / hardcoded / style categories.</p>
+<h2>Requirements</h2>
+<ul>
+<li>A checkout of <a href="https://github.com/keyiadiannao/Auto_code_audit">Auto_code_audit</a>
+(its <code>capability_retrieval.py</code> is the retrieval engine).</li>
+<li>A Python 3.10+ interpreter (default <code>python</code>).</li>
+</ul>
+<h2>Install</h2>
+<pre><code>dsh plugin add github:keyiadiannao/dsh-code-reuse-firewall#master
+</code></pre>
+<p>Then configure the audit checkout and interpreter in your profile:</p>
+<pre><code>- id: dsh-code-reuse-firewall
+  config:
+    auditRoot: 'D:/path/to/Auto_code_audit'   # required
+    pythonPath: 'python'                       # default
+    maxK: 5                                    # top-K candidates
+    minScore: 0.1                              # score floor
+    timeoutMs: 30000                           # child-process cap
+</code></pre>
+<h2>Usage</h2>
+<p>The agent calls <code>reuse_check</code> <strong>before writing new code</strong>:</p>
+<blockquote>
+<p>调用 reuse_check：我要实现「从 JSON 配置读取并支持环境变量覆盖」，根目录是
+D:/project/src。看看有没有现成的实现可以复用。</p>
+<p>(call reuse_check: I'm about to implement "load a JSON config with
+environment-variable overrides", root D:/project/src. Is there an existing
+implementation to reuse?)</p>
+</blockquote>
+<p>The tool returns top candidates with paths, scores, and per-channel evidence:</p>
+<pre><code>Existing implementations overlapping "load a JSON config with env overrides":
+  [0.72] config.py:load_config  (src/config.py) (name=0.72 doc=0.10 literal=0.00)
+  [0.51] util.py:ConfigLoader.load  (src/util.py) (name=0.51 doc=0.00 literal=0.00)
+</code></pre>
+<p><strong>Hash-locked candidates are flagged.</strong> When an existing implementation lives
+in a file pinned by a frozen-JSON provenance manifest (e.g.
+<code>current_dependency_files</code> / <code>files_sha256</code> in <code>frozen_results/</code> or <code>configs/</code>),
+the tool marks it 🔒 LOCKED with the locking manifests. Editing such a file
+invalidates the frozen results that reference it — the correct reuse is to
+<strong>import</strong> it, never to copy-and-modify its implementation. Derived run-output
+trees (<code>outputs/</code>, <code>reports/</code>, <code>logs/</code>, <code>runs/</code>, <code>cache/</code>) are treated as
+snapshots, not edit constraints, so scripts that merely appear in run metadata
+are not falsely flagged.</p>
+<pre><code>  [0.32] lib/protocol.py:_split_hash_payload  (lib/protocol.py) (name=0.32) 🔒 LOCKED by configs/generation_b_training_compatibility.json
+
+⚠ 1 candidate(s) are in hash-locked files: REUSE by import, do not copy-and-modify their implementation (editing invalidates frozen results).
+</code></pre>
+<p><strong>Advisory evidence, not a verdict.</strong> The agent decides whether to reuse,
+extract a shared component, or write new code — and must never delete or
+rewrite anything based on retrieval alone (the same ground rule as
+Auto_code_audit: deterministic output is evidence, not a defect verdict).</p>
+<h3>Signal-strength caveat (honest limits)</h3>
+<p>A natural-language <code>--describe</code> query has NO code yet, so the retrieval engine's
+strongest signals — normalized AST structure, call-name overlap, string-literal
+overlap — cannot fire. The pre-write channel relies on the weaker
+name/docstring-lexical/string-literal channels. In practice:</p>
+<ul>
+<li>A well-named existing function whose docstring matches your description WILL
+be surfaced (verified: <code>load_config</code> for "load a JSON config with env
+overrides").</li>
+<li><strong>Describe in English keywords</strong> a function name/docstring would use
+(<code>load json config settings environment env override</code>). Chinese-only
+descriptions match poorly against English code — the engine tokenizes CJK
+into bigrams with no Chinese↔English mapping.</li>
+<li>Structurally-similar-but-differently-named code (the strongest reuse signal)
+is only found AFTER code exists, via the engine's <code>--file</code> / <code>--base</code> modes —
+which are not yet exposed through this plugin.</li>
+<li>Each candidate carries per-channel evidence (name / docstring / string-literal
+scores) in the tool result, so the agent can judge WHY something matched
+instead of trusting one blended score.</li>
+</ul>
+<p>So treat <code>reuse_check</code> as a <strong>low-signal pre-write hint</strong>, not a full reuse
+audit. The high-signal modes are roadmap items below.</p>
+<h2>Configuration</h2>
+<table>
+<thead>
+<tr>
+<th>Key</th>
+<th>Default</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>auditRoot</code></td>
+<td>— (required)</td>
+<td>Auto_code_audit checkout containing <code>capability_retrieval.py</code></td>
+</tr>
+<tr>
+<td><code>pythonPath</code></td>
+<td><code>python</code></td>
+<td>Python interpreter for the retrieval script</td>
+</tr>
+<tr>
+<td><code>maxK</code></td>
+<td>5</td>
+<td>Top-K candidates per query</td>
+</tr>
+<tr>
+<td><code>minScore</code></td>
+<td>0.3</td>
+<td>Score floor (aligned with the engine's default; measured hits sit at 0.33+, lower scores are mostly noise)</td>
+</tr>
+<tr>
+<td><code>timeoutMs</code></td>
+<td>30000</td>
+<td>Child-process timeout — retrieval never hangs a turn</td>
+</tr>
+</tbody></table>
+<p>The plugin parses the retrieval JSON with a <code>schema_version === 1</code> contract
+check: if Auto_code_audit ever changes its output schema, <code>reuse_check</code> fails
+loudly with "out of contract" instead of silently mis-parsing.</p>
+<h2>Development</h2>
+<pre><code>pnpm run build        # tsdown: host + client bundle
+pnpm run typecheck    # tsc --noEmit
+pnpm test             # vitest
+</code></pre>
+<h2>Roadmap</h2>
+<ul>
+<li><code>tools/pre-execute</code> guard: run a reuse check automatically before write-tool
+calls when a <code>reuse_check</code> was not already performed (dsh-tool-git style).</li>
+<li><code>--file</code> / <code>--base</code> modes (check a new/changed file or diff against a git ref)
+exposed through the tool.</li>
+</ul>
+<h2>License</h2>
+<p>MIT</p>

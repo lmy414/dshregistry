@@ -1,0 +1,109 @@
+<h1>dsh-decision-map · 决策地图</h1>
+<p>把当前会话的 <strong>执行轨迹</strong> 画成一张普通人一眼能看懂的图。它是 DeepSeek Harness 的一个<strong>正式 bundle 插件</strong>（双面：Node 半边 + 浏览器半边），在会话视图里新增一个「决策地图」标签页，展示两块内容：</p>
+<ol>
+<li><p><strong>一条卡片式时间线</strong> —— 从用户开口到任务完成，每个动作是一张卡片，卡片左侧有一颗 emoji 节点图标坐在时间线脊柱上：</p>
+<ul>
+<li><code>💭 思考</code>（琥珀色）—— 该步产生了推理（reasoning）</li>
+<li><code>🔧 工具</code>（蓝色）—— 一次工具调用</li>
+<li><code>✍️ 写文件</code>（绿色）—— 对 <code>write</code> / <code>edit</code> 这类会改动文件的工具的调用</li>
+</ul>
+<p>轮次之间用「第 N 轮 · N 个动作 · 跨度 X」分隔；每张卡片标注类型、工具名、耗时、<code>第N轮·第S步</code>，下方缩进显示详情（思考显示推理片段、工具显示参数）。<strong>点击任一卡片</strong>，右侧会展开一个详情面板，显示该动作的类型、耗时、时间与完整详情（选中卡片有高亮描边）——与内置「轨迹」的点击查看一致。与「轨迹」账本式视图的区别：决策地图把每一步做成带图标的卡片、按时间顺序铺开，一眼能看懂每一步「做了什么、花了多久」。</p>
+</li>
+<li><p><strong>一排统计卡</strong> —— 总 Token（含输入/输出拆分）、工具调用次数、轮次数、最耗时的步骤。</p>
+</li>
+</ol>
+<p>纯前端绘制：内联样式 + 简单 <code>div</code>，不引用任何外部库、CDN、字体或图片（emoji 是系统自带字形）。配色使用 shell 自带的 <code>--dsw-static-*</code> 静态色与 <code>--dsw-alias-*</code> 主题别名，明暗主题自动适配。</p>
+<hr>
+<h2>目录结构</h2>
+<pre><code>dsh-decision-map/
+├── package.json          # 双面包身份声明（dsh.bundle.patch + dsh.client）
+├── cordis.patch.yml      # bundle patch：insert 一行 { id: decision-map, name: dsh-decision-map }
+├── lib/
+│   ├── index.js          # node half：注册 decisionMap 会话投影（fold 事件日志 → 时间线 + 统计）
+│   └── client.js         # browser half：注册 conversation.view 标签页，读投影并渲染
+└── README.md
+</code></pre>
+<p>无构建、无 TypeScript、<strong>零运行时依赖</strong>：装下来开箱即用。node half 不 <code>import</code> 任何包（会话投影 seam 只调用 <code>schema.parse(value)</code>，所以 schema 用一段手写的 <code>.parse</code> 校验器实现，不必依赖 <code>zod</code>——这也让 <code>link:</code> 本地安装不再需要物化任何依赖）；browser half 是手写的 <code>window.__ModuleLoader__.load({ id, factory })</code> bundle（与随发行版交付的客户端插件同一形态，但无需 tsdown 打包）。</p>
+<hr>
+<h2>身份声明（取证结论）</h2>
+<h3>1. package.json 里的 bundle 身份字段</h3>
+<pre><code>"dsh": {
+  "bundle": { "patch": "./cordis.patch.yml" }
+}
+</code></pre>
+<p>这是 profile 组合器解析 bundle 的契约：<code>dsh.bundle.patch</code> 指向包内的一份 patch 文件。本包同时声明了浏览器半边：</p>
+<pre><code>"dsh": {
+  "bundle": { "patch": "./cordis.patch.yml" },
+  "client": { "platform": "web" }
+}
+</code></pre>
+<p><code>dsh.client.platform: "web"</code> 让 <code>@deepseek-ai/dsh-client-modules</code> 的 node half 把本包扫进 <code>window.__DSH_BOOT__</code> 浏览器名录，并经由 <code>exports["./client"]</code> 提供 <code>/plugins/dsh-decision-map/client.js</code>。</p>
+<h3>2. cordis.patch.yml 的 insert 结构</h3>
+<p>顶层是一个数组，<code>insert</code> 下列出要插入的插件行，每行 <code>{ id, name }</code>（可选 <code>config</code> / <code>disabled</code> 等）：</p>
+<pre><code>- insert:
+    - id: decision-map
+      name: dsh-decision-map
+</code></pre>
+<p><code>name</code> 是包名（由 loader 解析），<code>id</code> 是这行的稳定标识，供后续 patch 层按 id 覆盖。</p>
+<h3>3. 会话轨迹数据用哪个服务</h3>
+<ul>
+<li>原始事件日志由 <code>ctx.sessions</code>（<code>SessionStore</code>，来自 <code>@deepseek-ai/dsh-session</code>）持有，<code>session.events</code> 是 append-only 的 <code>{ type, seq, time, data }</code> 事件序列。</li>
+<li>本项目不直接订阅事件，而是走 <strong>会话投影 seam</strong>（<code>ctx.sessionProjections</code>，来自 <code>@deepseek-ai/dsh-session-projection</code>）：node half 注册一个纯函数 fold 单元，框架负责在每个提交事件上驱动它，并把成品值经 api-proxy 的 tail page 与 <code>session/projection</code> push 帧送达浏览器。这与 <code>@deepseek-ai/dsh-session-stats</code> 的 <code>sessionStats</code> 是同一套机制，是「node 计算 → 浏览器读取」的<strong>无构建</strong>宿主→客户端通道。</li>
+</ul>
+<p>折叠的事件：<code>turn/start</code>、<code>step/start</code>、<code>assistant/chunk</code>（reasoning/text/tool-call delta）、<code>assistant/message</code>（<code>usage</code>）、<code>tool/call</code>、<code>tool/result</code>、<code>step/end</code>。token 取 <code>usage</code> 的 <code>inputTokens + cacheReadTokens + cacheWriteTokens + outputTokens</code>；工具耗时按 <code>callId</code> 配对 <code>tool/call → tool/result</code>；「最耗时步骤」按 <code>step/start → step/end</code>；「思考」节点的耗时为该步首次 reasoning 到首个非 reasoning token 的时长（TTFT）。</p>
+<h3>4. 浏览器半挂标签页的真实 slot 接缝</h3>
+<p><code>conversation.view</code>（<code>kind: 'list'</code>、<code>scope: 'session'</code>）是会话视图标签环。browser half 这样注册：</p>
+<pre><code>ctx.slots.inject("conversation.view", () =&gt; ctx.slots.register({
+  name: "conversation.view",
+  id: "decision-map",      // 标签 id，也作为 ViewTab.id
+  order: 20,               // 标签顺序
+  label: "决策地图",        // 标签显示名（plain string 或 () =&gt; string）
+}, DecisionMapView));
+</code></pre>
+<p><code>slots.inject</code> 把注册挂到本插件 fiber 上，插件卸载时自动移除标签。视图组件通过标准 session kit 的 <code>useProjection("decisionMap")</code> 读取 node half 算好的值。</p>
+<hr>
+<h2>安装与使用</h2>
+<p>用 <code>dsh plugin</code> 把本包装进某个 profile。因为本包声明了 <code>dsh.bundle.patch</code>，<code>dsh plugin add</code> 会自动把它并入该 profile 的 <code>dsh.profile.bundles</code> 层栈，随后 profile 组合器应用本包自带的 <code>cordis.patch.yml</code>（即 <code>insert</code> 那行 <code>{ id: decision-map, name: dsh-decision-map }</code>）——<strong>无需手工编辑 profile 的 <code>cordis.patch.yml</code></strong>。</p>
+<pre><code># 方式 A：在本包目录内（package.json 所在目录）用 `.`：
+cd /path/to/dsh-decision-map
+dsh plugin --profile web add .
+
+# 方式 B：在本包目录的父级目录，用相对路径：
+dsh plugin --profile web add ./dsh-decision-map
+
+# 方式 C：发布到 npm 后按包名安装：
+dsh plugin --profile web add dsh-decision-map
+</code></pre>
+<p>注意：<code>dsh plugin add</code> 会把相对路径锚定到「你执行命令时所在的目录」，所以别在包目录内写成 <code>add ./decision-map</code>（那会指向不存在的子目录）。重启（或触发配置热重载）后，进入任意会话，标题栏的视图标签里会出现「决策地图」。</p>
+<blockquote>
+<p>说明：<code>sessionProjections</code> 注册表随 base bundle 挂载于宿主平面；<code>sessionStats</code> 等既有投影键的送达链路（tail page / push 帧）会自动携带本包新增的 <code>decisionMap</code> 键，无需任何客户端侧注册。</p>
+</blockquote>
+<hr>
+<h2>数据流</h2>
+<pre><code>会话事件日志 (session.events)
+        │  每个提交事件
+        ▼
+ctx.sessionProjections.register({ key: "decisionMap", init/apply/view })
+        │  折叠成 { timeline, stats }，view 输出经手写 .parse 校验器校验
+        ▼
+api-proxy tail page + session/projection push 帧（宿主 → 浏览器）
+        │
+        ▼
+useProjection("decisionMap")  ← 决策地图标签页组件
+        │
+        ▼
+时间线 + 统计卡（React.createElement + 内联样式）
+</code></pre>
+<h2>生命周期与可撤销性</h2>
+<ul>
+<li>node half：<code>ctx.sessionProjections.register(...)</code> 本身就是注册表在调用方 fiber 上登记的 effect，卸载即移除 <code>decisionMap</code> 键及其缓存单元（与 <code>dsh-session-stats</code> 一致）。</li>
+<li>browser half：<code>ctx.slots.inject("conversation.view", ...)</code> 把注册挂到本插件 fiber，卸载即移除标签页。</li>
+</ul>
+<p>两半都不创建进程级/页面级副作用，均可被 Cordis 的 stop/update/unload 干净回收。</p>
+<h2>已知取舍</h2>
+<ul>
+<li><strong>投影值随 tail page 全量携带</strong> —— <code>decisionMap</code> 的 <code>timeline</code> 是完整动作列表，会话很长时投影值会变大（每个节点只含 <code>type/turn/step/seq/time/durationMs/label/detail</code>，<code>detail</code> 已截断至 120 字符）。这是该 seam 的既定代价，对常规会话可忽略。</li>
+<li><strong>「写文件」是启发式分类</strong> —— 仅把工具名恰为 <code>write</code> / <code>edit</code> 的调用标为绿色；<code>bash</code> 等既能读也能写的工具归入「工具」，不臆测其是否落盘。</li>
+<li><strong>思考耗时是 TTFT 近似</strong> —— 推理的墙钟时间用「该步首次 reasoning 到首个非 reasoning token」近似；无输出 token 的步其思考节点耗时为空。</li>
+<li><strong>token 是 provider 上报值</strong> —— 只有 adapter 上报了 <code>usage</code> 的 <code>assistant/message</code> 才计入；未上报则为 0，与核心的 token 记账口径一致。</li>
+</ul>

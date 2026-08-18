@@ -1,0 +1,383 @@
+<h1>DSH Feishu Plugin</h1>
+<p>将飞书机器人连接到 <a href="https://github.com/deepseek-ai/DeepSeek-Harness">DeepSeek Harness</a> 的本地 Cordis 插件。用户在飞书中发送文字消息后，插件会把消息作为任务交给指定的 <code>dsh</code> profile 执行，并将结果回复到原会话。</p>
+<h2>功能</h2>
+<ul>
+<li>通过飞书开放平台长连接接收消息，无需公网回调地址</li>
+<li>使用 <code>open_id</code> 白名单限制可执行任务的用户</li>
+<li>支持用户在飞书内申请授权及管理员审批、撤销和查询</li>
+<li>动态授权持久化保存，重启后继续生效</li>
+<li>执行期间定时更新同一条飞书消息，显示运行时长和最新输出</li>
+<li>在排队、执行和结果消息中显示当前 Provider 与模型</li>
+<li>按飞书会话和用户隔离并持久化最近对话上下文</li>
+<li>主动运行必要脚本，并通过飞书处理 Harness 原生一次性权限审批</li>
+<li>支持飞书文件入站下载与 Harness 生成文件自动回传</li>
+<li>串行任务队列，避免多个任务同时操作同一工作区</li>
+<li>任务接收、开始、完成、失败和队列深度日志</li>
+<li>自动过滤重复消息</li>
+<li>执行超时和输出长度限制</li>
+<li>自动拆分过长的飞书回复</li>
+<li>插件停止时终止仍在运行的子进程</li>
+</ul>
+<p>目前只支持文字消息。</p>
+<h2>前置条件</h2>
+<ul>
+<li>已从源码安装 DeepSeek Harness，并可通过 <code>dsh</code> 命令运行</li>
+<li>Node.js 20 或更高版本</li>
+<li>pnpm</li>
+<li>一个已启用机器人能力的飞书企业自建应用</li>
+</ul>
+<h2>安装</h2>
+<p>克隆仓库并安装依赖：</p>
+<pre><code>git clone https://github.com/yangzhaofeng496/dsh-feishu-plugin.git
+cd dsh-feishu-plugin
+pnpm install
+pnpm check
+</code></pre>
+<p>将插件添加到 Harness 的 <code>web</code> profile：</p>
+<pre><code>dsh plugin --profile web add "$(pwd)"
+</code></pre>
+<p>将配套的执行轨迹插件添加到 <code>headless</code> profile：</p>
+<pre><code>dsh plugin --profile headless add "$(pwd)/headless-trace"
+</code></pre>
+<p>第一个命令负责飞书连接和任务调度；第二个命令让 headless Agent 输出结构化的模型请求与工具执行事件。未安装 trace 子插件时，任务仍能执行，但飞书只能显示运行心跳和最终输出。</p>
+<h2>配置飞书应用</h2>
+<p>在<a href="https://open.feishu.cn/">飞书开放平台</a>创建企业自建应用，然后完成以下设置：</p>
+<ol>
+<li>添加“机器人”应用能力。</li>
+<li>在“权限管理”中开通接收消息和以应用身份发送消息所需的即时通讯权限。</li>
+<li>在“事件与回调”中选择“使用长连接接收事件/回调”。</li>
+<li>添加事件 <code>im.message.receive_v1</code>（接收消息）。</li>
+<li>确保机器人拥有读取消息资源、上传文件和发送消息所需权限。</li>
+<li>创建版本并发布应用，使机器人和权限配置生效。</li>
+</ol>
+<p>具体权限名称可能随飞书开放平台界面更新而变化。发布前请确认机器人能够接收用户消息，并能向原会话发送消息。</p>
+<h2>保存凭据</h2>
+<p>不要把 App Secret 写入 Git 仓库或 <code>cordis.patch.yml</code>。将它保存到 Harness 凭据文件 <code>~/.dsh/.credentials.yaml</code>：</p>
+<pre><code>FEISHU_APP_ID: cli_xxxxxxxxxxxxxxxx
+FEISHU_APP_SECRET: xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+</code></pre>
+<p>限制该文件只对当前用户可读：</p>
+<pre><code>chmod 600 ~/.dsh/.credentials.yaml
+</code></pre>
+<h2>启用插件</h2>
+<p>编辑 <code>~/.dsh/profiles/web/cordis.patch.yml</code>，加入或覆盖 <code>feishu</code> 配置：</p>
+<pre><code>- id: feishu
+  disabled: false
+  config:
+    appIdEnv: FEISHU_APP_ID
+    appSecretEnv: FEISHU_APP_SECRET
+    adminOpenIds:
+      - ou_admin_xxxxxxxxxxxxxxxxxxxxxxxxxx
+    allowedOpenIds:
+      - ou_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+    authorizationFile: ~/.dsh/feishu-authorizations.json
+    contextFile: ~/.dsh/feishu-contexts.json
+    contextMaxTurns: 8
+    contextMaxChars: 20000
+    attachmentDirectory: .dsh-feishu/inbox
+    maxInboundFileBytes: 31457280
+    maxOutboundFileBytes: 31457280
+    maxOutboundFiles: 5
+    dshCommand: /absolute/path/to/dsh
+    dshProfile: headless
+    providerName: deepseek-official
+    modelName: deepseek-v4-pro
+    workspace: /absolute/path/to/your/workspace
+    timeoutMs: 900000
+    maxOutputChars: 50000
+    streamUpdateIntervalMs: 5000
+    streamHeartbeatIntervalMs: 30000
+    streamPreviewChars: 2400
+    maxMessageEdits: 15
+    approvalTimeoutMs: 600000
+</code></pre>
+<p>配置字段：</p>
+<table>
+<thead>
+<tr>
+<th>字段</th>
+<th>说明</th>
+<th>默认值</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>appIdEnv</code></td>
+<td>App ID 在凭据文件中的键名</td>
+<td><code>FEISHU_APP_ID</code></td>
+</tr>
+<tr>
+<td><code>appSecretEnv</code></td>
+<td>App Secret 在凭据文件中的键名</td>
+<td><code>FEISHU_APP_SECRET</code></td>
+</tr>
+<tr>
+<td><code>adminOpenIds</code></td>
+<td>可以审批和撤销授权的管理员 <code>open_id</code> 列表</td>
+<td>空列表</td>
+</tr>
+<tr>
+<td><code>allowedOpenIds</code></td>
+<td>允许发布任务的飞书用户 <code>open_id</code> 列表</td>
+<td>空列表</td>
+</tr>
+<tr>
+<td><code>authorizationFile</code></td>
+<td>动态授权和待审批申请的持久化文件</td>
+<td><code>~/.dsh/feishu-authorizations.json</code></td>
+</tr>
+<tr>
+<td><code>contextFile</code></td>
+<td>对话上下文持久化文件</td>
+<td><code>~/.dsh/feishu-contexts.json</code></td>
+</tr>
+<tr>
+<td><code>contextMaxTurns</code></td>
+<td>每个会话保留的最近对话轮数</td>
+<td><code>8</code></td>
+</tr>
+<tr>
+<td><code>contextMaxChars</code></td>
+<td>每个会话保留的最大字符数</td>
+<td><code>20000</code></td>
+</tr>
+<tr>
+<td><code>attachmentDirectory</code></td>
+<td>飞书入站文件在工作区内的保存目录</td>
+<td><code>.dsh-feishu/inbox</code></td>
+</tr>
+<tr>
+<td><code>maxInboundFileBytes</code></td>
+<td>单个入站文件大小上限</td>
+<td><code>31457280</code>（30 MB）</td>
+</tr>
+<tr>
+<td><code>maxOutboundFileBytes</code></td>
+<td>单个回传文件大小上限</td>
+<td><code>31457280</code>（30 MB）</td>
+</tr>
+<tr>
+<td><code>maxOutboundFiles</code></td>
+<td>单个任务最多自动回传的文件数量</td>
+<td><code>5</code></td>
+</tr>
+<tr>
+<td><code>dshCommand</code></td>
+<td><code>dsh</code> 可执行文件路径</td>
+<td><code>dsh</code></td>
+</tr>
+<tr>
+<td><code>dshProfile</code></td>
+<td>实际执行任务的 Harness profile</td>
+<td><code>headless</code></td>
+</tr>
+<tr>
+<td><code>providerName</code></td>
+<td>状态消息中显示的 Provider 名称</td>
+<td><code>deepseek-official</code></td>
+</tr>
+<tr>
+<td><code>modelName</code></td>
+<td>收到运行时事件前显示的模型名称</td>
+<td><code>deepseek-v4-pro</code></td>
+</tr>
+<tr>
+<td><code>workspace</code></td>
+<td>执行任务时使用的工作目录</td>
+<td>当前目录</td>
+</tr>
+<tr>
+<td><code>timeoutMs</code></td>
+<td>单个任务超时时间，单位毫秒</td>
+<td><code>900000</code></td>
+</tr>
+<tr>
+<td><code>maxOutputChars</code></td>
+<td>捕获的最大输出字符数</td>
+<td><code>50000</code></td>
+</tr>
+<tr>
+<td><code>streamUpdateIntervalMs</code></td>
+<td>飞书进度消息刷新间隔，单位毫秒，最小 1000</td>
+<td><code>5000</code></td>
+</tr>
+<tr>
+<td><code>streamHeartbeatIntervalMs</code></td>
+<td>没有新事件时更新运行时长的心跳间隔</td>
+<td><code>30000</code></td>
+</tr>
+<tr>
+<td><code>streamPreviewChars</code></td>
+<td>进度消息中保留的最新输出字符数</td>
+<td><code>2400</code></td>
+</tr>
+<tr>
+<td><code>maxMessageEdits</code></td>
+<td>主动更换进度消息前的最大编辑次数</td>
+<td><code>15</code></td>
+</tr>
+<tr>
+<td><code>approvalTimeoutMs</code></td>
+<td>等待飞书权限决定的最长时间，单位毫秒</td>
+<td><code>600000</code></td>
+</tr>
+</tbody></table>
+<p><code>allowedOpenIds</code> 默认为空，因此没有普通用户能够执行任务。<code>adminOpenIds</code> 中的管理员始终拥有执行权限。未授权用户可以在飞书内发起授权申请，由管理员审批，无需重启插件。</p>
+<h2>飞书内授权</h2>
+<p>未授权用户发送：</p>
+<pre><code>申请授权
+</code></pre>
+<p>或：</p>
+<pre><code>/request
+</code></pre>
+<p>机器人会记录申请，并回复申请人的 <code>open_id</code>。管理员可以使用：</p>
+<pre><code>/requests
+/approve ou_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+/revoke ou_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+/users
+</code></pre>
+<p>命令说明：</p>
+<table>
+<thead>
+<tr>
+<th>命令</th>
+<th>权限</th>
+<th>作用</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>申请授权</code>、<code>/request</code></td>
+<td>所有人</td>
+<td>创建或更新自己的授权申请</td>
+</tr>
+<tr>
+<td><code>/requests</code></td>
+<td>管理员</td>
+<td>查看待审批申请</td>
+</tr>
+<tr>
+<td><code>/approve &lt;open_id&gt;</code></td>
+<td>管理员</td>
+<td>批准用户执行任务</td>
+</tr>
+<tr>
+<td><code>/revoke &lt;open_id&gt;</code></td>
+<td>管理员</td>
+<td>撤销普通用户权限</td>
+</tr>
+<tr>
+<td><code>/users</code></td>
+<td>管理员</td>
+<td>查看管理员和已授权用户</td>
+</tr>
+</tbody></table>
+<p>动态授权默认保存在 <code>~/.dsh/feishu-authorizations.json</code>。该文件以 <code>0600</code> 权限创建，不应提交到 Git。配置文件中的管理员不能通过飞书命令撤销，必须由本机管理员修改 <code>adminOpenIds</code> 并重启服务。</p>
+<h2>对话上下文</h2>
+<p>每个成功任务都会保存用户原始需求和 Harness 最终回答。下一条任务执行时，插件会把最近上下文注入新的 headless Agent，从而理解“继续刚才的任务”“修改上一版”等指代。</p>
+<p>上下文使用 <code>chat_id + open_id</code> 隔离：不同群聊、不同单聊和不同用户互不可见。默认最多保留最近 8 轮、20000 字符，超出后从最早内容开始裁剪。失败或超时任务不会写入上下文。</p>
+<p>可在飞书中使用：</p>
+<pre><code>/new       新建会话并清除此前上下文
+/clear     清除当前上下文
+/history   查看最近上下文摘要
+/context   查看上下文轮数和字符用量
+</code></pre>
+<p>上下文默认保存在 <code>~/.dsh/feishu-contexts.json</code>，以 <code>0600</code> 权限创建。该文件可能包含任务和回答中的敏感内容，请勿提交到 Git 或发送给他人。</p>
+<h2>脚本执行与权限审批</h2>
+<p>插件会在任务前加入执行指导：能够通过 Harness 工具完成的操作应直接执行，不要求用户复制脚本后自行运行。普通工作区读写和沙箱内命令按 Harness 当前权限策略执行。</p>
+<p>当工具使用 <code>sandbox_permissions</code> 请求更高权限时，headless trace 会接管 Harness 原生 <code>approval/request</code>，并在飞书发送：</p>
+<pre><code>🔐 任务 12ab34cd 请求一次性权限
+工具：bash
+原因：需要安装项目依赖
+审批编号：a1b2c3d4
+
+批准：/allow a1b2c3d4
+拒绝：/deny a1b2c3d4
+</code></pre>
+<p>任务发起者或管理员可以回复：</p>
+<pre><code>/allow a1b2c3d4
+</code></pre>
+<p>或：</p>
+<pre><code>/deny a1b2c3d4
+</code></pre>
+<p>批准仅对该次工具调用有效，不会永久提升权限。审批通道位于任务专属随机临时目录，任务结束后自动删除；默认等待 10 分钟，超时后按不可用处理并保持拒绝。其他普通用户不能审批不属于自己的任务。</p>
+<h2>文件传输</h2>
+<h3>从飞书发送给 Harness</h3>
+<p>授权用户可以直接向机器人发送文件、图片、音频或视频。插件通过消息资源接口下载文件，并保存到：</p>
+<pre><code>&lt;workspace&gt;/.dsh-feishu/inbox/&lt;message_id&gt;/&lt;safe_filename&gt;
+</code></pre>
+<p>随后插件自动创建任务，把工作区相对路径交给 Harness。文件名会移除路径和危险分隔符；超过 <code>maxInboundFileBytes</code> 或为空的文件会被拒绝。入站目录必须位于工作区内部。</p>
+<h3>从 Harness 回传飞书</h3>
+<p>任务指导要求 Harness 在生成交付文件后，在最终回答中输出：</p>
+<pre><code>DSH_FILE: outputs/report.pdf
+</code></pre>
+<p>每个文件单独一行。插件会检查文件真实路径、普通文件类型、大小和工作区边界，然后上传并发送到原飞书会话。符号链接解析后如果越出工作区会被拒绝。</p>
+<p>用户也可以手动要求机器人发送已有文件：</p>
+<pre><code>/send outputs/report.pdf
+</code></pre>
+<p>只接受工作区内部路径；默认单任务最多自动发送 5 个文件，每个文件不超过 30 MB。飞书平台的文件上传接口本身也限制单文件不超过 30 MB。</p>
+<h2>启动</h2>
+<pre><code>dsh web --port 3081
+</code></pre>
+<p>成功启动时终端会显示类似日志：</p>
+<pre><code>[feishu] bridge started with 1 authorized user(s), 1 admin(s), 0 pending request(s)
+[ws] ws client ready
+dsh web: http://127.0.0.1:3081
+</code></pre>
+<p>随后在飞书中直接向机器人发送文字任务。也可以发送 <code>/help</code> 查看简要说明。</p>
+<h2>流式进度</h2>
+<p>收到任务后，插件先发送一条排队消息。任务开始执行后，同一条消息会按 <code>streamUpdateIntervalMs</code> 定时更新：</p>
+<pre><code>⚙️ Harness 正在执行
+任务：12ab34cd
+模型：deepseek-official / deepseek-v4-pro
+已运行：15 秒
+
+最新输出：
+正在检查项目结构…
+</code></pre>
+<p>任务结束时，该消息会更新为完成或失败状态，完整结果另发一条消息。trace 子插件会展示 Agent 生命周期、模型请求、工具名称、脱敏且限长的工具参数和成功/失败状态，不包含模型内部隐藏推理。包含 <code>secret</code>、<code>token</code>、<code>password</code>、<code>authorization</code>、<code>apiKey</code> 或 <code>credential</code> 的参数字段会替换为 <code>[REDACTED]</code>。输出中的 ANSI 终端控制字符会在发送到飞书前清理。</p>
+<p>插件每 5 秒检查一次状态，但只有出现新事件时才编辑消息；没有新事件时默认每 30 秒发送一次运行心跳。为规避飞书单条消息编辑次数限制，达到 <code>maxMessageEdits</code> 后会自动发送一条“进度续接”消息并继续更新。如果飞书提前返回错误码 <code>230072</code>，插件也会立即切换到新消息。无需将检查间隔设置得更低。</p>
+<p><code>providerName</code> 和 <code>modelName</code> 是任务排队及收到首个运行时事件前的备用展示值。trace 子插件收到 <code>agent_created</code> 或 <code>model_request</code> 后，会自动改用 Harness 实际报告的 Provider 和模型，因此能识别 settings 层的动态覆盖。</p>
+<h2>运行日志</h2>
+<p>插件会在运行 <code>dsh web</code> 的终端输出日志：</p>
+<pre><code>[feishu] received message om_xxx; type=text; sender=ou_xxx
+[feishu] queued task 12ab34cd; queue depth=1
+[feishu] task 12ab34cd started
+[feishu] task 12ab34cd completed in 15230ms; output=2048 chars
+</code></pre>
+<p>日志不会输出 App Secret，但可能包含用户 <code>open_id</code>、飞书消息 ID 和任务执行错误。共享日志前请按需脱敏。</p>
+<h2>常见问题</h2>
+<h3>飞书显示“链接测试成功”，终端却没有收到消息</h3>
+<ul>
+<li>确认订阅方式为长连接。</li>
+<li>确认已订阅 <code>im.message.receive_v1</code>。</li>
+<li>确认包含机器人能力和最新权限的应用版本已经发布。</li>
+<li>确认终端出现 <code>ws client ready</code>。</li>
+</ul>
+<h3>提示“此用户尚未获准执行任务”</h3>
+<p>发送“申请授权”，然后请管理员使用 <code>/requests</code> 和 <code>/approve &lt;open_id&gt;</code> 完成审批。也可以继续将固定用户写入 <code>allowedOpenIds</code> 后重启服务。</p>
+<h3>插件启动失败并提示缺少凭据</h3>
+<p>确认 <code>~/.dsh/.credentials.yaml</code> 中的键名与 <code>appIdEnv</code>、<code>appSecretEnv</code> 完全一致。</p>
+<h3>任务执行失败</h3>
+<p>在同一台机器上手动验证以下命令和目录：</p>
+<pre><code>/absolute/path/to/dsh --profile headless "连接测试"
+</code></pre>
+<p>同时确认 <code>workspace</code> 存在，并且运行 Harness 的系统用户有权访问该目录。</p>
+<h2>安全建议</h2>
+<ul>
+<li>始终配置 <code>allowedOpenIds</code>，不要将机器人作为无鉴权的远程命令入口。</li>
+<li>为 Harness 设置独立且范围受限的工作区。</li>
+<li>不要在仓库中提交 App Secret、API Key 或 <code>.credentials.yaml</code>。</li>
+<li>对删除文件、联网和 Shell 执行等高风险能力使用受限 profile。</li>
+<li>定期检查飞书应用权限和授权用户列表。</li>
+</ul>
+<h2>开发</h2>
+<pre><code>pnpm install
+pnpm check
+</code></pre>
+<p>主要文件：</p>
+<ul>
+<li><code>src/index.mjs</code>：飞书长连接、任务队列及 Harness 调用</li>
+<li><code>cordis.patch.yml</code>：DSH bundle 插件声明</li>
+<li><code>headless-trace/</code>：headless profile 的结构化执行轨迹插件</li>
+</ul>
+<h2>License</h2>
+<p><a href="https://github.com/yangzhaofeng496/dsh-feishu-plugin/blob/HEAD/LICENSE">MIT</a></p>

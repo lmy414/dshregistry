@@ -1,0 +1,95 @@
+<h1>dsh-bundle-dedup-guard</h1>
+<p><a href="https://github.com/Lstalu/dsh-bundle-dedup-guard/actions/workflows/ci.yml"><img src="https://github.com/Lstalu/dsh-bundle-dedup-guard/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+<a href="https://www.npmjs.com/package/dsh-bundle-dedup-guard"><img src="https://img.shields.io/npm/v/dsh-bundle-dedup-guard" alt="npm version"></a>
+<a href=""><img src="https://img.shields.io/badge/node-%3E%3D22.13-green" alt="node"></a>
+<a href="https://github.com/Lstalu/dsh-bundle-dedup-guard/blob/HEAD/LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue" alt="License"></a></p>
+<p><strong>A DeepSeek Harness plugin that catches duplicate loader entry ids in profile bundle lists — on every plugin load.</strong></p>
+<p>If a profile's <code>dsh.profile.bundles</code> lists an <strong>aggregate bundle</strong> (a bundle whose patch inserts all of its sub-plugins, e.g. <code>@linxin666/dsh-web-ui-all</code>) <strong>and its sub-plugins individually</strong>, the loader receives the same loader-entry <code>id</code> twice. <code>EntryGroup.update</code> throws <code>duplicate loader entry id: &lt;id&gt;</code> before any plugin starts, and the whole profile fails to boot. This plugin exists so that never happens silently again.</p>
+<hr>
+<h2>Why this exists</h2>
+<p><strong>Incident, 2026-08-18:</strong> a web profile listed <code>@linxin666/dsh-web-ui-all</code> (which aggregates 13 sub-plugins into one patch) <em>and</em> all 13 sub-plugins separately. Every sub-plugin id was inserted twice; the first collision reported was <code>duplicate loader entry id: ui-dsh-aionui-panel</code>. Fixing only the <code>bundles</code> list was not enough — the <code>dsh plugin</code> command's <code>reconcilePlugins</code> re-appends <strong>every <code>dependencies</code> entry that declares <code>dsh.bundle</code></strong> to the bundle list after each pnpm operation, so the sub-plugins came back an hour later and crashed the next boot.</p>
+<p>Full incident record: <a href="https://github.com/Lstalu/dsh-bundle-dedup-guard/blob/HEAD/docs/KNOWN-ISSUE-bundle-duplicate.md">docs/KNOWN-ISSUE-bundle-duplicate.md</a>.</p>
+<h2>How it works</h2>
+<p>The loader's failure path is: <code>cordis-plugin-include</code>'s <code>applyEntryPatches</code> <strong>flattens</strong> every bundle's insert entries without deduplicating, then <code>cordis-plugin-loader</code>'s <code>EntryGroup.update</code> dedups by id and <strong>throws on the first duplicate</strong> — before any plugin entry is created. This plugin re-implements exactly that "flatten + dedup by id" semantics in pure Node, and reports the offending ids, their sources (which bundle/patch inserted each), and the fix.</p>
+<h3>Checks on every plugin load</h3>
+<table>
+<thead>
+<tr>
+<th>Trigger</th>
+<th>When</th>
+<th>Notes</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>Apply</td>
+<td>every boot</td>
+<td>instant health check as the plugin mounts</td>
+</tr>
+<tr>
+<td>Loader events</td>
+<td><code>loader/entry-init</code> / <code>loader/partial-dispose</code></td>
+<td>runtime hot loads / plugin additions, debounced 800 ms</td>
+</tr>
+<tr>
+<td>Manifest watch</td>
+<td><code>fs.watch</code> on the profile dir</td>
+<td>the moment <code>package.json</code> or <code>cordis.patch.yml</code> changes — i.e. <code>dsh plugin add</code>, marketplace installs, or hand edits — warn immediately, before the next restart</td>
+</tr>
+</tbody></table>
+<h3>What it reports</h3>
+<ul>
+<li><strong>Duplicate loader entry ids</strong> — each id inserted by more than one source, with the full source chain (e.g. <code>ui-dsh-aionui-panel: @linxin666/dsh-web-ui-all ← @linxin666/dsh-client-ui-aionui-panel</code>).</li>
+<li><strong>Unresolved bundles</strong> — listed in <code>bundles</code> but not resolvable (the loader would loud-fail too).</li>
+<li><strong>Bundle-less packages</strong> — listed but without a <code>dsh.bundle.patch</code> (a misconfiguration per the loader contract).</li>
+<li><strong>Predictive reconcile warning</strong> — a <code>dependencies</code> entry that declares <code>dsh.bundle</code> but is <em>not</em> in <code>bundles</code>. <code>dsh plugin</code>'s reconcile will append it on the next install/update; if it's a sub-plugin covered by an aggregate, that re-creates the crash. The warning names the covered ids. Fix: move such packages to <code>devDependencies</code> (reconcile only reads <code>dependencies</code>).</li>
+</ul>
+<p>Reports are written to <code>$DSH_HOME/dsh-bundle-dedup-guard/reports/&lt;profile&gt;-&lt;timestamp&gt;.json</code> and <code>&lt;profile&gt;.latest.json</code>.</p>
+<h3>Known limitation</h3>
+<p>The loader deduplicates <strong>before</strong> creating any plugin entry, so when duplicates already exist at boot, an in-process check cannot run — the tree never mounts. For that case use the standalone CLI below: it is pure disk reads and works even when boot is broken.</p>
+<h2>Installation</h2>
+<p><strong>As a profile bundle (recommended while in development):</strong></p>
+<ol>
+<li>Add to the profile's <code>package.json</code> <code>dependencies</code>:<pre><code>"dsh-bundle-dedup-guard": "link:F:/path/to/dsh-bundle-dedup-guard"
+</code></pre>
+</li>
+<li>Add <code>"dsh-bundle-dedup-guard"</code> to <code>dsh.profile.bundles</code> (first entry is fine).</li>
+<li>Link it into the profile's <code>node_modules</code> (pnpm does this for <code>dsh plugin add</code>).</li>
+</ol>
+<p><strong>From npm:</strong></p>
+<pre><code>dsh plugin --profile web add dsh-bundle-dedup-guard
+</code></pre>
+<h2>Usage</h2>
+<p>The plugin checks automatically — no interaction needed. For manual diagnosis (including when boot already crashed):</p>
+<pre><code># check all profiles (DSH_HOME defaults to ~/.dsh)
+node bin/check.mjs
+
+# a specific profile
+node bin/check.mjs --profile web
+
+# a specific manifest file (e.g. a pre-fix backup, for testing)
+node bin/check.mjs --manifest &lt;path-to-package.json&gt;
+
+# machine-readable JSON, skip report files
+node bin/check.mjs --profile web --json --no-write
+</code></pre>
+<p>Exit codes: <code>0</code> = healthy, <code>1</code> = duplicates / unresolved bundles / bundle-less packages found (useful as a CI gate).</p>
+<h2>Fixing duplicates</h2>
+<p>Edit <code>dsh.profile.bundles</code> so each id has exactly one source. The common shape is "aggregate + sub-plugins":</p>
+<ul>
+<li>keep the aggregate (e.g. <code>@linxin666/dsh-web-ui-all</code>)</li>
+<li>remove the individually listed sub-plugin entries</li>
+<li><strong>also move the sub-plugins from <code>dependencies</code> to <code>devDependencies</code></strong> — otherwise <code>dsh plugin</code> reconcile re-appends them on the next install/update (the exact recurrence from 2026-08-18)</li>
+</ul>
+<p>Then re-run <code>node bin/check.mjs --profile &lt;name&gt;</code> until green, and restart.</p>
+<h2>Development</h2>
+<pre><code>npm test          # node --test, zero dependencies
+npm run check     # run the guard against your local profiles
+</code></pre>
+<ul>
+<li><code>lib/check.mjs</code> — the check core (pure Node, no third-party deps)</li>
+<li><code>index.mjs</code> — the Cordis plugin entry (<code>apply</code> + listeners)</li>
+<li><code>bin/check.mjs</code> — standalone CLI (works without a booted tree)</li>
+<li><code>test/</code> — unit tests with fixture profiles</li>
+</ul>
+<h2>License</h2>
+<p>MIT</p>

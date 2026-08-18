@@ -1,0 +1,273 @@
+<h1>dsh-config-form</h1>
+<p>One settings page for every plugin that opts in. An adopting plugin declares its fields; this plugin routes and renders them.</p>
+<p>It is a router and a renderer, not a framework. Storage is the author's choice — pass a <code>store</code> and this plugin keeps nothing, or omit it and the settings seam keeps the values for you. Authorization over the values stays with the declaring plugin.</p>
+<p>If Fabric's split is the analogy: dsh already ships the <em>Mod Menu</em> part — the Settings shell, the Plugins section, and the <code>settings.plugins.tab</code> slot. What was missing is <em>Cloth Config</em>: a declarative form API. That is this.</p>
+<p><a href="https://www.npmjs.com/package/dsh-config-form"><img src="https://img.shields.io/npm/v/dsh-config-form" alt="npm"></a></p>
+<p>Status: <strong>published as <a href="https://www.npmjs.com/package/dsh-config-form"><code>dsh-config-form</code></a> 0.1.0.</strong> One tab in Settings → Plugins: adopting plugins on the left, the selected one's form on the right.</p>
+<pre><code>dsh plugin --profile web add dsh-config-form
+</code></pre>
+<h2>Why opt-in and not auto-discovery</h2>
+<p>The first design was a page that auto-discovered every plugin's configuration. It was measured and abandoned, because the premise did not hold.</p>
+<p>Twelve third-party plugins were installed and inspected. <strong>One</strong> registers a settings namespace. Six ship their own settings page but keep configuration outside the seam — four in browser <code>localStorage</code>, the rest in files they write themselves. So <code>ctx.settings.describe()</code> sees almost nothing of the ecosystem, and a schema-driven renderer would have had ~12 official namespaces to render, which the in-tree hand-written cards already cover.</p>
+<p>The bottleneck was never the wire allowlist (bypassing it gained exactly one namespace). It is that nobody adopted the seam — because adopting it does not, by itself, get you a page.</p>
+<p>What the survey <em>did</em> show is demand: every plugin with a settings page hand-writes the same four things.</p>
+<table>
+<thead>
+<tr>
+<th>Each plugin hand-rolls</th>
+<th>What adopting this gives instead</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>A React form (12 of 12, including the one storing correctly)</td>
+<td>A declaration; the renderer is shared</td>
+</tr>
+<tr>
+<td>Storage — <code>localStorage</code> that is lost on cache clear, or a path that ignores <code>DSH_HOME</code></td>
+<td>Keep yours and pass a <code>store</code>, or let the settings seam hold it: layered resolution, revision fencing, external-edit reload</td>
+</tr>
+<tr>
+<td>An HTTP route plus its security check</td>
+<td>One shared route with the check written once</td>
+</tr>
+<tr>
+<td>Secret handling</td>
+<td><code>ctx.credentials</code>, values in <code>.credentials.yaml</code></td>
+</tr>
+</tbody></table>
+<p>That third row is not convenience. Of the seven surveyed plugins exposing their own route, <strong>two check same-origin, two check loopback, none check both</strong> — and some of those routes write files.</p>
+<h2>Adopting it</h2>
+<p><strong>Plugin authors: <a href="https://github.com/begonia599/dsh-config-form/blob/HEAD/ADOPTING.md">ADOPTING.md</a> is the guide</strong> — field reference, secrets, ownership, collisions to avoid, and exactly what adopting does <em>not</em> take over.</p>
+<p>Everything an adopting plugin writes. No React, no route, no storage, no admission check, no knowledge of the settings or credentials seams:</p>
+<pre><code>export const inject = ['configForm']
+
+export function apply(ctx: Context) {
+  const cfg = ctx.configForm.declare&lt;GitSettings&gt;(ctx, {
+    id: 'demo-git',                          // becomes the settings namespace
+    title: { zh: 'Git', en: 'Git' },
+    groups: [
+      { title: { zh: '常规', en: 'General' }, fields: [
+        { kind: 'text', key: 'defaultBranch', label: { zh: '默认分支', en: 'Default branch' },
+          default: 'main', pattern: '^[^\\s]+$' },
+        { kind: 'boolean', key: 'signCommits', label: { zh: '签名提交', en: 'Sign commits' }, default: false },
+      ] },
+      { title: { zh: '高级', en: 'Advanced' }, collapsed: true, fields: [
+        { kind: 'number', key: 'fetchDepth', label: { zh: '抓取深度', en: 'Fetch depth' }, default: 0, min: 0, step: 1 },
+        { kind: 'select', key: 'conflictStyle', label: { zh: '冲突风格', en: 'Conflict style' },
+          default: 'merge', options: [{ value: 'merge', label: 'merge' }, { value: 'diff3', label: 'diff3' }] },
+      ] },
+      { title: { zh: '凭据', en: 'Credentials' }, fields: [
+        { kind: 'secret', key: 'token', label: { zh: '访问令牌', en: 'Access token' }, ref: 'DEMO_GIT_TOKEN' },
+      ] },
+    ],
+  })
+
+  cfg.get().defaultBranch                    // resolved: default → base → user
+  cfg.watch(next =&gt; { /* the user saved; apply it */ })
+  await cfg.secret('token')                  // resolved only at the operation boundary
+}
+</code></pre>
+<p>The context is passed explicitly because it decides <strong>ownership</strong>: the settings registration and the form's row both unwind with the declaring plugin's fiber, so unloading removes the form and a hot reload can re-declare the same id.</p>
+<p><code>declare</code> is a hard dependency (<code>inject: ['configForm']</code>), matching Cloth Config: without the base plugin there is nowhere to render.</p>
+<p><code>base</code> carries a deployment layer, so a plugin with its own <code>cordis.yml</code> config passes it and a user's reset returns to the deployed value:</p>
+<pre><code>ctx.configForm.declare(ctx, spec, { base: { defaultBranch: config.defaultBranch }, applies: 'live' })
+</code></pre>
+<h2>Two properties the design guarantees</h2>
+<p><strong>Secrets cannot reach the settings document.</strong> A <code>secret</code> field is compiled <em>out</em> of the schema and routed to <code>ctx.credentials</code>. The settings section therefore contains no <code>role('secret')</code> node, which is what makes the seam's incomplete redaction inapplicable: <code>redactSecrets</code> walks only <code>object</code>/<code>dict</code>/<code>array</code>, so a secret behind a <code>union</code>, <code>intersect</code>, <code>transform</code>, or <code>lazy</code> node is returned verbatim with nothing recording the miss (<code>TODO(settings-wire-redaction)</code>, <code>packages/settings/settings/src/redact.ts:86</code>). <code>src/redaction-guard.ts</code> re-walks exactly those relations and withholds values for any namespace it cannot clear — it should never fire for a compiled declaration, and stays as the guard for a future escape hatch accepting a raw schema. It also strips <code>meta.default</code> from secret nodes, closing the separate leak where a declared fallback rides the schema after values were redacted.</p>
+<p><strong>A write can only touch declared value fields.</strong> Edits travel as path ops under a revision fence, never as a whole-section replace: a page holds a partial view by construction, and rebuilding a section from it deletes what the response never carried — the defect that removed a stored <code>apiKey</code> when an editor saved <code>{baseURL, reasoning}</code> (<a href="https://github.com/begonia599/dsh-config-form/blob/HEAD/.agents/notes/implemented/architecture/2026-07-30-config-plane-boundaries.md">config-plane boundaries</a>). An undeclared key, or a secret key, is refused before the seam is touched.</p>
+<h2>Security</h2>
+<p><code>dsh-host-webserver</code> applies <strong>no TLS, auth, or origin policy</strong>, so a route registered on it inherits none of the built-in face's enforcement. <code>src/admission.ts</code> requires all three:</p>
+<ol>
+<li>a loopback peer address;</li>
+<li>a loopback <code>Host</code> header — a rebound DNS name resolving to 127.0.0.1 fails here, which the peer check alone does not stop;</li>
+<li>same-origin provenance for any state-changing method.</li>
+</ol>
+<p>This follows the harness's own conclusion that reading configuration is exactly as privileged as writing it.</p>
+<h2>HTTP face</h2>
+<table>
+<thead>
+<tr>
+<th>Request</th>
+<th>Effect</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>GET &lt;route&gt;/api/forms</code></td>
+<td>The list pane: one row per adopting plugin</td>
+</tr>
+<tr>
+<td><code>GET &lt;route&gt;/api/forms/&lt;id&gt;</code></td>
+<td>The detail pane: declaration, values, <code>base</code>/<code>user</code> layers, <code>revision</code>, secret states</td>
+</tr>
+<tr>
+<td><code>POST &lt;route&gt;/api/forms/&lt;id&gt;</code></td>
+<td><code>{ revision, set, unset }</code> → fenced path-op write; answers with the re-read state</td>
+</tr>
+<tr>
+<td><code>PUT &lt;route&gt;/api/forms/&lt;id&gt;/secret/&lt;key&gt;</code></td>
+<td><code>{ value }</code> → store through the credential seam</td>
+</tr>
+<tr>
+<td><code>DELETE &lt;route&gt;/api/forms/&lt;id&gt;/secret/&lt;key&gt;</code></td>
+<td>Remove that credential</td>
+</tr>
+<tr>
+<td><code>GET &lt;route&gt;/api/namespaces</code></td>
+<td>Audit view over EVERY namespace, adopting or not, with its redaction verdict</td>
+</tr>
+</tbody></table>
+<p>Config: <code>route</code> (default <code>/config-form</code>).</p>
+<h2>Run it</h2>
+<p>Requires a built checkout and <strong>Node satisfying the repo's <code>engines</code> (<code>^22.19.0 || &gt;=24.0.0</code>)</strong>. On 22.17.x, <code>tsdown</code> resolves its config loader to <code>unrun</code> — an optional peer nobody installs — instead of Node's native TypeScript support, and <code>pnpm run build</code> fails; <code>NODE_OPTIONS=--experimental-strip-types</code> works around it, but upgrading Node is the fix. <code>pnpm run build</code>'s <code>build:web</code> step shells out to <code>pnpm</code>, so it needs <code>pnpm</code> on <code>PATH</code> even when the outer run came through corepack.</p>
+<pre><code>pnpm pack                                            # in this package
+dsh plugin --profile web add ./dsh-config-form-0.1.0.tgz
+dsh web --patch &lt;abs-path&gt;/cordis.dev.yml
+curl http://127.0.0.1:3080/config-form/api/forms
+</code></pre>
+<p><strong>Install the tarball, not <code>link:</code>.</strong> A <code>link:</code> install resolves through the link's
+realpath, which leaves the Harness home tree, so the plugin's <code>@deepseek-ai/*</code>
+imports never reach the 195 links <code>dsh</code> provisions at
+<code>$DSH_HOME/profiles/node_modules/@deepseek-ai/</code> — the mechanism behind "in-box
+bundle names always resolve from the dsh installation itself". Under a source
+launch tsx resolves it anyway and the breakage is invisible; under the built CLI it
+fails with <code>Cannot find package '@deepseek-ai/schemastery'</code>. A tarball unpacks into
+<code>$DSH_HOME/profiles/&lt;name&gt;/node_modules/</code>, one level below those links, so it
+resolves under both launches. Re-pack after each edit.</p>
+<p><code>cordis.dev.yml</code> names TypeScript source with an absolute <strong><code>file://</code> URL</strong>: the loader hands <code>name</code> to <code>import()</code>, so on Windows a bare <code>G:/...</code> parses as a URL with scheme <code>g:</code> and fails with <code>ERR_UNSUPPORTED_ESM_URL_SCHEME</code>.</p>
+<p><code>examples/demo-git-plugin.ts</code> is a worked adopter that the dev overlay loads, so the page has something to list.</p>
+<p>The service is published with <code>ctx.provide()</code> rather than as a <code>Service</code> subclass on purpose: a subclass binds this package to one <code>@deepseek-ai/cordis</code> module instance, and an out-of-tree plugin cannot guarantee it resolves the copy the host loaded — the host may run its source plane while an installed package resolves built <code>lib</code>. Every other import here is a pure function or an erased type.</p>
+<h2>Verified</h2>
+<pre><code>node --import tsx/esm dsh-config-form/tests/guard.check.ts    # 12 checks
+node --import tsx/esm dsh-config-form/tests/dsl.check.ts      # 19 checks
+node --import tsx/esm dsh-config-form/tests/client.check.ts   # 16 checks
+</code></pre>
+<p>The declaration language rejects, at declare time: a non-kebab-case id, no groups, a duplicate key across groups, a non-identifier key, a non-POSIX credential reference, a select with no options / repeated values / an undeclared default, and an unparseable pattern. A compiled schema omits secrets, keeps value fields, resolves defaults, and refuses an out-of-range number, an undeclared select value, and a pattern violation.</p>
+<p>The audit clears object- and dict-nested secrets, catches a secret behind a <code>union</code> or <code>transform</code>, withholds on an unrecognized envelope, and strips a secret's fallback while preserving a non-secret's.</p>
+<p>Exercised against the running server:</p>
+<table>
+<thead>
+<tr>
+<th>Check</th>
+<th>Result</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>Write two fields with the current revision</td>
+<td>200; <code>revision</code> 0 → 1; <code>user</code> layer holds exactly those two keys</td>
+</tr>
+<tr>
+<td>Write with a stale revision</td>
+<td><strong>409 <code>conflict</code></strong></td>
+</tr>
+<tr>
+<td>Write an undeclared key</td>
+<td><strong>400 <code>undeclared-field</code></strong></td>
+</tr>
+<tr>
+<td>Write the secret key into the settings section</td>
+<td><strong>400 <code>undeclared-field</code></strong></td>
+</tr>
+<tr>
+<td><code>PUT</code> a secret</td>
+<td>200; <code>configured: true</code>, <code>source: file</code></td>
+</tr>
+<tr>
+<td><code>PUT</code> a blank secret</td>
+<td><strong>400</strong> — a blank draft is not a removal</td>
+</tr>
+<tr>
+<td><code>PUT</code>/<code>DELETE</code> an undeclared secret</td>
+<td><strong>400 <code>undeclared-field</code></strong></td>
+</tr>
+<tr>
+<td>Secret value present in any response</td>
+<td><strong>no</strong></td>
+</tr>
+<tr>
+<td><code>settings.yaml</code> after both writes</td>
+<td><code>demo-git: { defaultBranch: develop, fetchDepth: 50 }</code> — no secret</td>
+</tr>
+<tr>
+<td><code>.credentials.yaml</code> after both writes</td>
+<td><code>DEMO_GIT_TOKEN: sk-…</code></td>
+</tr>
+<tr>
+<td><code>DELETE</code> the secret, then <code>unset</code> both fields</td>
+<td>credential removed; values back to schema defaults; <code>user</code> empty</td>
+</tr>
+<tr>
+<td><code>Host: evil.example.com</code></td>
+<td><strong>403 <code>host-not-loopback</code></strong></td>
+</tr>
+<tr>
+<td><code>POST</code> with neither <code>Sec-Fetch-Site</code> nor <code>Origin</code></td>
+<td><strong>403 <code>cross-origin</code></strong></td>
+</tr>
+</tbody></table>
+<p>The browser half is checked in jsdom against a stubbed HTTP face: the artifact registers under its package id, declares <code>['slots', 'locale']</code>, registers exactly one <code>settings.plugins.tab</code>, lists every adopter, auto-selects the first, renders a stored value, renders a <code>collapsed</code> group as a disclosure, renders a secret as an empty write-only box leaking neither value nor reference, badges an overridden field, and — on save — posts <code>{revision, set, unset}</code> rather than a whole section.</p>
+<p>Wiring is checked against the running server: the injected route reaches <code>index.html</code>, the plugin joins the boot graph, and <code>/plugins/dsh-config-form/client.js</code> serves the artifact.</p>
+<h2>The browser half</h2>
+<p><code>lib/client.js</code> is hand-written in the loader's artifact format — <code>window.__ModuleLoader__.load({id, factory})</code>, externals through the injected <code>require</code>, <code>React.createElement</code> instead of JSX — so no bundler pipeline is reproduced out of tree. <code>react</code> is a platform seed module, so it resolves through the same table.</p>
+<p>It registers exactly ONE <code>settings.plugins.tab</code>, holding the list and the form. Not one card per adopter: that would re-scatter what this exists to unify.</p>
+<p>The route prefix reaches the page through <code>webServer.tapIndex()</code>, because the client cannot read plugin config and the prefix is a deployment choice. Colors come only from tokens <code>ui-theme</code>'s <code>design-platform.css</code> declares — text is <code>--dsw-alias-label-*</code>; there is no <code>--dsw-alias-text-*</code>, and naming an undeclared token silently resolves to its light-mode fallback, which is how the in-tree Models editor once shipped a light-only surface under the dark theme.</p>
+<p><strong>The base plugin must be installed as a package, not loaded by path.</strong> The client scanner looks for <code>dsh.client</code> on enabled entries' PACKAGES, so an entry named by a <code>file://</code> URL loads the host half only — the browser tab simply never appears. Install the packed tarball (see above); a <code>link:</code> install additionally needs the profile on the same drive, because a cross-drive relative path does not exist and pnpm mangles the absolute form into a broken link whose only symptom is <code>dsh: warning: … declares no dsh.bundle</code>.</p>
+<h2>Publishing</h2>
+<pre><code>pnpm run build      # tsdown transpiles src/ -&gt; lib/index.js; also the `prepare` hook
+pnpm run check      # the three check suites
+pnpm pack           # or: pnpm publish
+</code></pre>
+<p>The build transpiles without type checking or project references, so it is self-contained: a git install runs <code>prepare</code> with only this package's devDependencies present — no sibling monorepo, and none of the <code>@deepseek-ai/*</code> peers, whose types a dts pass would demand. <code>turtle-ui</code> is the shipped precedent. Types instead ship as source: <code>exports['.'].types</code> points at <code>src/index.ts</code>, which an adopting plugin can compile because it already has those peers.</p>
+<p><code>clean: false</code> in <code>tsdown.config.ts</code> is load-bearing — <code>lib/client.js</code> is the hand-written browser artifact, and the default clean would delete it.</p>
+<p><strong>Verified against the packed tarball</strong>, installed into a fresh profile and booted with the BUILT CLI under plain Node (no tsx), which is what a user actually runs:</p>
+<table>
+<thead>
+<tr>
+<th>Check</th>
+<th>Result</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>dsh plugin add &lt;tarball&gt;</code></td>
+<td>appends <code>dsh-config-form</code> to <code>dsh.profile.bundles</code></td>
+</tr>
+<tr>
+<td><code>GET /api/forms</code></td>
+<td>200, lists the adopter</td>
+</tr>
+<tr>
+<td><code>GET /api/forms/&lt;id&gt;</code></td>
+<td>values resolved, secret reported unconfigured/writable</td>
+</tr>
+<tr>
+<td><code>index.html</code></td>
+<td>carries the injected route</td>
+</tr>
+<tr>
+<td><code>/plugins/dsh-config-form/client.js</code></td>
+<td>200</td>
+</tr>
+<tr>
+<td><code>POST</code> a field</td>
+<td>lands; <code>user</code> layer holds only that key</td>
+</tr>
+<tr>
+<td><code>pnpm publish --dry-run</code></td>
+<td>runs <code>prepare</code>, resolves <code>dsh-config-form@0.1.0</code></td>
+</tr>
+</tbody></table>
+<p>And against the <strong>published</strong> package, installed from npm into a fresh profile and booted with the built CLI: the bundle joins <code>dsh.profile.bundles</code>, the endpoint lists the adopter, the client artifact serves, a write lands, and boot logs zero module-resolution errors.</p>
+<p>Publishing note: npm now issues only granular access tokens, and a token's <strong>Bypass 2FA</strong> switch is <code>false</code> by default. With an account at <code>auth-and-writes</code>, a write-capable token still fails <code>EOTP</code> until that switch is on — the permission scope is not what gates it.</p>
+<p>The tarball contains <code>LICENSE</code>, <code>README.md</code>, <code>cordis.patch.yml</code>, <code>lib/{index,client}.js</code>, <code>package.json</code>, and <code>src/*.ts</code> — no tests, examples, or build config.</p>
+<p><code>publint</code> reports one warning: <code>exports['./client']</code> is CJS-shaped while <code>"type": "module"</code> makes it ESM. It is a false positive for this artifact class. <code>lib/client.js</code> is never imported — the Node half resolves that export to a PATH and serves the file, and the browser loads it as a classic script through <code>window.__ModuleLoader__</code>. Renaming it <code>.cjs</code> would diverge from every in-tree and third-party client artifact.</p>
+<h2>Next</h2>
+<ol>
+<li><strong>Field types beyond the five.</strong> Arrays of objects and dictionaries are the obvious gaps; add an escape hatch accepting a raw schemastery node for exotic cases, at which point the redaction audit stops being belt-and-braces.</li>
+<li><strong>Per-field validation messages.</strong> A rejected save reports the Host's first message; mapping it onto the offending control is unstarted.</li>
+<li><strong>Adopters.</strong> A base plugin's value is its adopters, and today there is one demo. The pitch to the six surveyed plugins that hand-wrote a settings page is that adopting deletes their React bundle, their storage, their route, and their security check.</li>
+</ol>
+<h2>Found while building this</h2>
+<p>Two upstream defects worth reporting:</p>
+<ul>
+<li><strong><code>dsh plugin</code> breaks on a BOM.</strong> <code>readProfileManifest</code> (<code>packages/boot/app-boot/src/profile.ts:272</code>) calls <code>JSON.parse</code> without stripping a UTF-8 BOM, so one dependency shipping a BOM-prefixed <code>package.json</code> fails the whole command. <code>dsh-mcp-manager</code> ships one; Node and npm both tolerate it. One-line fix.</li>
+<li><strong><code>dsh-global-rules</code> ignores <code>DSH_HOME</code>.</strong> It resolves <code>join(homedir(), '.dsh', 'AGENTS.md')</code> and never reads <code>DSH_HOME</code>, so it edits the real home no matter how the harness was pointed. <code>dsh-myrules</code>, <code>dsh-plugin-toggle</code>, and <code>dsh-mcp-manager</code> all read it.</li>
+</ul>

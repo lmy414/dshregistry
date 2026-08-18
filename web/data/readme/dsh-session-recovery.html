@@ -1,0 +1,121 @@
+
+
+<h1>dsh-session-recovery</h1>
+<p><strong>Recover deleted/corrupted DeepSeek Harness sessions &amp; memory from raw disk</strong></p>
+<p><a href="https://github.com/deepseek-ai/deepseek-harness"><img src="https://img.shields.io/badge/DeepSeek%20Harness-dsh-4B32C3" alt="DeepSeek Harness"></a>
+<a href="https://nodejs.org"><img src="https://img.shields.io/badge/Node-24%2B-339933" alt="Node"></a>
+<a href="https://github.com/Coprexist/dsh-session-recovery/blob/HEAD/LICENSE"><img src="https://img.shields.io/badge/License-MIT-blue" alt="License"></a>
+<a href="https://awesome-dsh-plugin.com"><img src="https://awesome-dsh-plugin.com/badge.svg" alt="Awesome DSH Plugin"></a></p>
+<p>English · <a href="https://github.com/Coprexist/dsh-session-recovery/blob/HEAD/README.zh.md">中文</a></p>
+
+
+<hr>
+<blockquote>
+<p>🛟 After <code>rm -rf ~/.dsh</code> or file corruption, dsh conversation logs (<code>session.jsonl.zstd</code>) and memory (<code>memory.db</code>) can usually be recovered <strong>straight from the raw block device</strong> — this repo is a battle-tested manual plus the scripts that made it work.</p>
+</blockquote>
+<h2>✨ Features</h2>
+<table>
+<thead>
+<tr>
+<th></th>
+<th></th>
+</tr>
+</thead>
+<tbody><tr>
+<td>🧠 <strong>Memory recovery</strong></td>
+<td>Locate <code>memory.db</code> by its <code>SQLite format 3</code> header, dump the window, rescue rows via SQLite's official <code>.recover</code> (skips corrupt pages, keeps readable data).</td>
+</tr>
+<tr>
+<td>💬 <strong>Session recovery</strong></td>
+<td>Scan disk for zstd frame magic <code>0xFD2FB528</code>, cluster frames by disk offset, split sessions at <code>turn</code> resets, rebuild official-format <code>session.jsonl.zstd</code>.</td>
+</tr>
+<tr>
+<td>🔧 <strong>Automatic repair</strong></td>
+<td>Renumber <code>seq</code> contiguously, deep-fix <code>sourceEventSeqs</code>/<code>messageSeqs</code>, normalize <code>surfaceOp</code> — the rebuilt log passes DSH's validation.</td>
+</tr>
+<tr>
+<td>🔁 <strong>Resume repair</strong></td>
+<td>Rebuilt sessions can fail at <em>resume</em> (<code>invalid persisted inbox splice</code>, <code>Messages with role 'tool' must be a response to tool_calls</code>) — <code>repair-session.js</code> (or the <code>/session-repair</code> web command) replays DSH's inbox/surface/wire rules and fixes the file.</td>
+</tr>
+<tr>
+<td>🛡️ <strong>Safe by design</strong></td>
+<td>Scripts only <strong>read</strong> the block device and write to a directory you choose; the original disk is never modified.</td>
+</tr>
+</tbody></table>
+<h2>🚀 Quick Start</h2>
+<pre><code># 1. Stop everything that writes to disk (systemd services, dsh itself)
+systemctl stop dsh-web
+
+# 2. Recover memory (SQLite)
+node scripts/recover-memory.js /dev/&lt;dev&gt; /tmp/recovered/
+
+# 3. Scan disk for session frames
+node scripts/scan-zstd.js /dev/&lt;dev&gt; &gt; /tmp/session-events.jsonl
+
+# 4. Split mixed events into per-session files
+node scripts/split-sessions.js /tmp/session-events.jsonl 2026-08-16T07:05:06Z
+
+# 5. Rebuild a session file (official format)
+node scripts/rebuild-session.js \
+  --input /tmp/sess-A.jsonl \
+  --id session-xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx \
+  --created-at 1786705157736 \
+  --cwd /path/to/workspace \
+  --out-dir ~/.dsh/sessions/--workspace-encoded--/
+
+# 6. Before resuming: verify/repair the rebuilt session (fixes inbox splice
+#    skew, duplicate/orphaned tool results, dangling tool calls)
+node scripts/repair-session.js \
+  ~/.dsh/sessions/--workspace-encoded--/&lt;session-id&gt;/session.jsonl.zstd --dry-run
+node scripts/repair-session.js \
+  ~/.dsh/sessions/--workspace-encoded--/&lt;session-id&gt;/session.jsonl.zstd
+#   → writes session.jsonl.zstd.repaired (+ .bak-&lt;ts&gt;); review, then replace:
+cp ~/.dsh/sessions/--workspace-encoded--/&lt;session-id&gt;/session.jsonl.zstd.repaired \
+   ~/.dsh/sessions/--workspace-encoded--/&lt;session-id&gt;/session.jsonl.zstd
+</code></pre>
+<p>📖 <strong>Full step-by-step manual</strong> (Chinese, with every DSH validation rule and error you may hit): <strong><a href="https://github.com/Coprexist/dsh-session-recovery/blob/HEAD/RECOVERY.md">RECOVERY.md</a></strong></p>
+<h2>📦 Install as a dsh plugin</h2>
+<blockquote>
+<p><strong>Note</strong>: primarily a recovery toolkit (scripts + manual); it also installs as a dsh plugin that adds the <strong><code>/session-repair</code> command to the web UI</strong>.</p>
+</blockquote>
+<p>From a directory containing this repo (local install, no publish needed):</p>
+<pre><code>dsh plugin --profile web add file:/path/to/dsh-session-recovery
+systemctl restart dsh-web
+</code></pre>
+<p>Then type in <strong>any</strong> session in the web UI:</p>
+<pre><code>/session-repair --dry-run              # analyze the current session (writes nothing)
+/session-repair &lt;session-id-or-path&gt;   # repair → writes .repaired + a backup
+/session-repair --apply &lt;id&gt;           # also replace the original file
+</code></pre>
+<p>By default only a new <code>.repaired</code> file plus a backup are written; <code>--apply</code> overwrites the original (refused for the live session hosting the command — run it from another session). Restart <code>dsh-web</code> after applying.</p>
+<p>Requires <strong>Node 24+</strong> (<code>node:sqlite</code>, <code>node:zlib</code>).</p>
+<h2>📖 Background</h2>
+<p>DeepSeek Harness stores its data under <code>~/.dsh</code>:</p>
+<pre><code>~/.dsh/
+├── sessions/&lt;workspace-encoded&gt;/&lt;session-id&gt;/session.jsonl.zstd   # conversation log
+├── memory/memory.db                                               # dsh-mneme memory
+└── storages/workspace.json                                        # workspace registry
+</code></pre>
+<p>The session log is a <strong>concatenated stream of zstd frames — one frame per JSONL line</strong> (<a href="https://github.com/deepseek-ai/deepseek-harness/tree/master/packages/session/session-persistence-jsonl">source</a>). That per-line framing is exactly what makes partial recovery possible: even if some frames are overwritten, the intact frames around them still decode independently.</p>
+<h2>🗂️ Repository Layout</h2>
+<pre><code>├── RECOVERY.md            # Full recovery manual (Chinese, battle-tested)
+├── cordis.patch.yml       # dsh plugin patch (registers /session-repair)
+├── docs/
+│   ├── awesome-entry.yml  # Ready-to-submit Awesome DSH Plugin list entry
+│   └── GITHUB-PUBLISH.md  # Publish &amp; PR checklist
+├── lib/
+│   ├── index.js           # dsh plugin entry: /session-repair command
+│   └── repair.js          # Shared repair core (CLI + plugin)
+├── scripts/
+│   ├── scan-zstd.js       # Disk scan: find &amp; cluster zstd session frames
+│   ├── split-sessions.js  # Split mixed recovered events into per-session files
+│   ├── rebuild-session.js # Rebuild official-format session.jsonl.zstd
+│   ├── repair-session.js  # Fix rebuilt sessions that fail to resume
+│   ├── make-test-fixture.js # Generate damaged samples to test repair offline
+│   └── recover-memory.js  # Locate &amp; rescue memory.db (SQLite .recover)
+└── package.json           # dsh plugin manifest (dsh.bundle + main entry)
+</code></pre>
+<h2>🔖 Topics</h2>
+<p><code>dsh-plugin</code> · <code>dsh</code> · <code>deepseek-harness</code> · <code>session-recovery</code> · <code>data-recovery</code> · <code>zstd</code> · <code>sqlite</code></p>
+<h2>📄 License</h2>
+<p><a href="https://github.com/Coprexist/dsh-session-recovery/blob/HEAD/LICENSE">MIT</a></p>

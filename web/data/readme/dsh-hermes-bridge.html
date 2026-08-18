@@ -1,0 +1,270 @@
+<h1>dsh-hermes-bridge</h1>
+<p>DSH ↔ WeChat bridge plugin: <strong>inbound dispatch (WeChat → DSH agent) + outbound push (DSH → WeChat)</strong>, powered by the <a href="https://github.com/">Hermes</a> gateway as the WeChat transport. Zero-LLM outbound push via <code>hermes send</code>, and a persistent per-cwd session pool that reuses DSH agent sessions (15–20× cheaper than one-shot headless invocations).</p>
+<p>微信 ↔ DSH 双向桥插件：入站调度（微信消息 → DSH agent 执行）+ 出站推送（任务进度/结果 → 微信）。出站走 <code>hermes send</code> 零 LLM 消耗；按工作目录复用常驻会话，比一次性 headless 调用省 15–20× token。</p>
+<blockquote>
+<p><strong>⚠️ Read this first — environment assumptions.</strong> This plugin was developed against one specific environment (see <a href="#environment-assumptions">Environment assumptions</a>). DSH and Hermes deployments vary wildly between users; this plugin <strong>cannot</strong> work out-of-the-box everywhere. Please review the assumptions and adapt the configuration to your setup before expecting it to run.</p>
+<p><strong>⚠️ 先读环境假设。</strong> 本插件基于特定开发环境编写（见「环境假设」章节）。DSH 与 Hermes 的部署方式千奇百怪，本插件<strong>无法</strong>开箱即用于所有环境，请先核对假设并适配你的配置。</p>
+</blockquote>
+<h2>Why</h2>
+<p>The one-way manual chain "WeChat → Hermes skill → <code>dsh --profile headless</code>" works but burns tokens on cold starts, loses session context between messages, and cannot notify you when a long task finishes. This plugin productizes the chain as a first-class DSH plugin:</p>
+<ul>
+<li><strong>Session reuse</strong> — agents stay alive per working directory (<code>ctx.agents.create/resume + followup</code>), so follow-up messages continue the same conversation.</li>
+<li><strong>Automatic pushback</strong> — every task reports <code>接单 → 开跑 → 完成/失败</code> to WeChat with structured <code>changes / verification / leftovers</code>.</li>
+<li><strong>Zero-LLM outbound</strong> — notifications go through <code>hermes send</code> (iLink REST), no model call, no gateway dependency for bot-token platforms.</li>
+<li><strong>Web UI visible</strong> — tasks are registered via <code>ctx.jobs</code> (falls back gracefully when the job controller is absent).</li>
+</ul>
+<h2>How it works</h2>
+<pre><code>WeChat ──▶ Hermes gateway ──▶ dsh-run.sh (bridge-first) ──▶ POST 127.0.0.1:8643/v1/tasks
+                                                              │
+                                                              ▼
+                                              persistent session pool (per cwd)
+                                                              │
+                                          DSH agent (full toolset, followup + whenIdle)
+                                                              │
+WeChat ◀── hermes send ──◀── structured result pushback ──◀──┘
+</code></pre>
+<p>Inbound: Hermes (or any HTTP client) POSTs a task to the plugin's loopback endpoint. The plugin dispatches to the per-cwd resident agent session and pushes progress back via <code>hermes send</code>. If the bridge is down, the shell script falls back to one-shot <code>dsh --profile headless</code>.</p>
+<h2>Environment assumptions</h2>
+<p>Developed and verified on <strong>one specific machine</strong> (see the deployment notes in <code>DEVELOPMENT.md</code>). Your environment will differ; check each item:</p>
+<table>
+<thead>
+<tr>
+<th>Assumption</th>
+<th>Value used here</th>
+<th>What to adapt on your side</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>DSH version</td>
+<td><code>0.1.0-rc.7</code> (Node ≥ 22)</td>
+<td><code>ctx.agents</code> / <code>ctx.agentPresets</code> / session APIs are <strong>rc-stage snapshots</strong> — a DSH upgrade may break them. Pin the rc range you run, or adjust code.</td>
+</tr>
+<tr>
+<td>DSH profile</td>
+<td><strong>web profile</strong> (persistent host; <code>dsh web</code> keeps the plugin resident)</td>
+<td>A headless-only deployment must host the plugin some other way (its HTTP loopback must stay alive).</td>
+</tr>
+<tr>
+<td>DSH model config</td>
+<td><code>provider: tokenrhythm / model: deepseek-v4-flash-0731</code> (from your <code>~/.dsh/settings.yaml</code> <code>agent-default-model</code>)</td>
+<td>Point <code>provider</code>/<code>model</code> at <strong>your</strong> default model. <code>{{model}}</code> is resolved from <code>agentOptions.model</code> — if the persona template says <code>{{model}} has no value</code>, you are missing <code>model</code>.</td>
+</tr>
+<tr>
+<td>Hermes install</td>
+<td>venv at <code>~/.hermes/hermes-agent/venv/bin/hermes</code>, gateway service <code>hermes-gateway.service</code> (user systemd)</td>
+<td><code>hermesBin</code> config must point at your hermes CLI; the gateway service name/port may differ.</td>
+</tr>
+<tr>
+<td>WeChat channel</td>
+<td>iLink personal-bot channel (<code>ilinkai.weixin.qq.com</code>) reached by Hermes</td>
+<td>Your channel may be Telegram/Discord/Slack/etc. The <strong>outbound</strong> path only needs <code>hermes send --to &lt;platform&gt;:&lt;target&gt;</code> — switch <code>pushTarget</code> accordingly. The <strong>inbound</strong> trigger (Hermes skill / hook) is channel-specific.</td>
+</tr>
+<tr>
+<td><code>hermes send</code> targets</td>
+<td>verified with <code>hermes send --list</code></td>
+<td>Run <code>hermes send --list</code> yourself; chat IDs are environment-specific.</td>
+</tr>
+<tr>
+<td>HTTP loopback</td>
+<td><code>127.0.0.1:8643</code></td>
+<td>Change <code>port</code> if it collides; the host is hardcoded to loopback (security).</td>
+</tr>
+<tr>
+<td>Session persistence</td>
+<td><code>~/.dsh/sessions</code> (per-user)</td>
+<td>If your <code>DSH_HOME</code> differs, session resume paths change accordingly.</td>
+</tr>
+</tbody></table>
+<p><strong>Known limits (not bugs):</strong></p>
+<ul>
+<li><strong>WeChat rate limit</strong>: the iLink channel throttles <code>sendmessage</code> (<code>ret=-2</code> → 30s cooldown, handled by Hermes). Bursts of pushes can be dropped/serialized. Keep push volume low (the plugin pushes once per task state, which is fine).</li>
+<li><strong>No auth layer on the host</strong>: <code>dsh web</code> has no authentication by design. Run it loopback-only; do not expose it.</li>
+<li><strong>rc-stage API drift</strong>: any DSH upgrade needs a regression pass (see <code>DEVELOPMENT.md</code> for what to re-verify).</li>
+</ul>
+<h2>Install</h2>
+<p>From GitHub (npm publish pending — package name reserved as <code>@dsh-pulse/dsh-hermes-bridge</code>):</p>
+<pre><code>git clone https://github.com/dsh-pulse/dsh-hermes-bridge.git
+cd dsh-hermes-bridge &amp;&amp; npm install   # installs peer deps if missing
+
+# register in your web profile patch
+cat &gt;&gt; ~/.dsh/profiles/web/cordis.patch.yml &lt;&lt;'EOF'
+- insert:
+    - id: hermes-bridge
+      name: 'file:/absolute/path/to/dsh-hermes-bridge/lib/index.js'
+      config:
+        port: 8643
+        authToken: '${env.DSH_BRIDGE_TOKEN}'   # REQUIRED — plugin refuses to start without it
+        pushTarget: 'weixin:&lt;chat_id&gt;'          # REQUIRED
+        hermesBin: '/path/to/hermes'            # optional, default 'hermes'
+        workspaceRoots: ['/path/to/workspace']  # optional cwd whitelist
+EOF
+</code></pre>
+<p>Requires <code>@deepseek-ai/cordis</code> (peer dependency) — ships inside DSH. The plugin is designed for the <strong>web profile</strong> (persistent host); do not install into <code>headless</code>.</p>
+<h2>Configuration (Config schema)</h2>
+<table>
+<thead>
+<tr>
+<th>key</th>
+<th>type</th>
+<th>default</th>
+<th>description</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>port</code></td>
+<td>number</td>
+<td><code>8643</code></td>
+<td>loopback listen port (host is hardcoded <code>127.0.0.1</code>)</td>
+</tr>
+<tr>
+<td><code>authToken</code></td>
+<td>string</td>
+<td>—</td>
+<td><strong>required</strong>; Bearer token checked on every request (constant-time compare)</td>
+</tr>
+<tr>
+<td><code>pushTarget</code></td>
+<td>string</td>
+<td>—</td>
+<td><strong>required</strong>; e.g. <code>weixin:&lt;chat_id&gt;</code> — resolved by <code>hermes send</code></td>
+</tr>
+<tr>
+<td><code>hermesBin</code></td>
+<td>string</td>
+<td><code>hermes</code></td>
+<td>path to the hermes CLI</td>
+</tr>
+<tr>
+<td><code>retries</code></td>
+<td>number</td>
+<td><code>1</code></td>
+<td>outbound push retries</td>
+</tr>
+<tr>
+<td><code>maxTextLen</code></td>
+<td>number</td>
+<td><code>1500</code></td>
+<td>push text truncation</td>
+</tr>
+<tr>
+<td><code>preset</code></td>
+<td>string</td>
+<td><code>standard</code></td>
+<td>agent preset mounted in session setup</td>
+</tr>
+<tr>
+<td><code>provider</code> / <code>model</code></td>
+<td>string</td>
+<td>dsh defaults</td>
+<td>agent model (align with your <code>agent-default-model</code>)</td>
+</tr>
+<tr>
+<td><code>workspaceRoots</code></td>
+<td>string[]</td>
+<td><code>[]</code></td>
+<td>cwd whitelist (realpath prefix check; empty = unrestricted)</td>
+</tr>
+<tr>
+<td><code>maxAgents</code></td>
+<td>number</td>
+<td><code>3</code></td>
+<td>resident session cap (LRU eviction)</td>
+</tr>
+<tr>
+<td><code>maxQueue</code></td>
+<td>number</td>
+<td><code>8</code></td>
+<td>task queue cap (429 when full)</td>
+</tr>
+<tr>
+<td><code>taskTtlMs</code></td>
+<td>number</td>
+<td><code>86400000</code></td>
+<td>finished task retention (24h)</td>
+</tr>
+</tbody></table>
+<h2>API (all endpoints require <code>Authorization: Bearer &lt;token&gt;</code>)</h2>
+<table>
+<thead>
+<tr>
+<th>Endpoint</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>POST /v1/tasks</code></td>
+<td>Inbound task <code>{task, context?, cwd?, sessionId?, title?}</code> → <code>202 {taskId}</code></td>
+</tr>
+<tr>
+<td><code>GET /v1/tasks/:id</code></td>
+<td>Task status + structured result (<code>changes/verification/leftovers</code>)</td>
+</tr>
+<tr>
+<td><code>POST /v1/tasks/:id/cancel</code></td>
+<td>Cancel (queued → failed immediately; running → intent flagged)</td>
+</tr>
+<tr>
+<td><code>POST /v1/notify</code></td>
+<td>Pure push <code>{text}</code> (no agent involved)</td>
+</tr>
+<tr>
+<td><code>GET /v1/health</code></td>
+<td>Liveness</td>
+</tr>
+</tbody></table>
+<p>Pushback messages (one per state, no spam):</p>
+<pre><code>📥 已接单 br-xxxxxxxx
+🔧 开跑 br-xxxxxxxx
+✅ br-xxxxxxxx（6m12s）
+改动：…
+验证：…
+遗留：…
+</code></pre>
+<h2>Security</h2>
+<ul>
+<li><strong>Loopback only</strong>: <code>server.listen(port, '127.0.0.1')</code> — the host is hardcoded, exposing it requires source changes.</li>
+<li><strong>Auth required</strong>: <code>authToken</code> is mandatory; the plugin refuses to activate without it. Token lives in your profile patch (600 perms) or env, never in code.</li>
+<li><strong>cwd whitelist</strong>: when <code>workspaceRoots</code> is set, paths outside it are rejected (<code>403</code>) both at ingress and inside <code>executeTask</code>.</li>
+<li><strong>Zero shell</strong>: all child processes use <code>spawn(args[])</code> — task text never passes through a shell.</li>
+<li><strong>Redaction</strong>: outbound push strips <code>sk-</code>/<code>sk_tr_</code>/<code>ghp_</code> token patterns and credentials paths before sending.</li>
+</ul>
+<blockquote>
+<p>⚠️ This plugin executes arbitrary DSH agent work with full tool access. Only feed it trusted instructions (keep the WeChat-side discipline in your Hermes skill layer), and never expose the HTTP port beyond loopback.</p>
+</blockquote>
+<h2>Troubleshooting</h2>
+<table>
+<thead>
+<tr>
+<th>Symptom</th>
+<th>Cause / fix</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>prompt variable "{{model}}" has no value</code></td>
+<td><code>agentOptions.model</code> missing — set <code>model</code> (align with your <code>agent-default-model</code>).</td>
+</tr>
+<tr>
+<td>Task reports <code>done</code> but result is empty</td>
+<td>Check the session log for <code>turn/end</code> with <code>reason.kind == "error"</code> — the plugin now flags those as <code>failed</code>; verify model/provider.</td>
+</tr>
+<tr>
+<td><code>hermes send</code> fails <code>Could not resolve target</code></td>
+<td>Run <code>hermes send --list</code>, put the exact target in <code>pushTarget</code>.</td>
+</tr>
+<tr>
+<td><code>EADDRINUSE</code> on the port</td>
+<td>Another instance holds it — change <code>port</code>, or restart the host once after code edits (ESM module cache).</td>
+</tr>
+<tr>
+<td>WeChat pushes missing/serialized</td>
+<td>iLink rate limit (<code>ret=-2</code>, 30s cooldown) — keep push volume low.</td>
+</tr>
+<tr>
+<td>Hermes still runs headless instead of bridge</td>
+<td>The plugin is invoked via <code>dsh-run.sh</code> which <strong>internally tries the bridge first</strong> (then falls back). If your skill calls something else, point it at <code>dsh-run.sh</code>. See <code>DEVELOPMENT.md</code> §Troubleshooting-Hermes.</td>
+</tr>
+</tbody></table>
+<h2>Development</h2>
+<p>See <strong><code>DEVELOPMENT.md</code></strong> (EN) / <strong><code>DEVELOPMENT.zh-CN.md</code></strong> (中文) — architecture decisions, the problems we hit and how they were solved, test strategy, and what to re-verify after a DSH upgrade.</p>
+<h2>License</h2>
+<p>MIT</p>

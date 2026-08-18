@@ -1,0 +1,101 @@
+<h1>dsh-plugin-inline-image</h1>
+<p><a href="https://github.com/usavv1547-cyber/dsh-plugin-inline-image/actions/workflows/ci.yml"><img src="https://github.com/usavv1547-cyber/dsh-plugin-inline-image/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+<a href="https://www.npmjs.com/package/dsh-plugin-inline-image"><img src="https://img.shields.io/npm/v/dsh-plugin-inline-image" alt="npm version"></a>
+<a href="https://github.com/usavv1547-cyber/dsh-plugin-inline-image/blob/HEAD/LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License: MIT"></a></p>
+<p>DSH（DeepSeek Harness）Web 插件：在 Web 服务器上开放一条<strong>受严格约束的只读图片路由</strong>
+<code>/dsh-image/&lt;alias&gt;/&lt;相对路径&gt;</code>，让 agent 可以把工作区里的图片<strong>直接内嵌显示在对话中</strong>，
+无需点击文件链接，也无需临时起本地 HTTP 服务器。</p>
+<h2>为什么需要它</h2>
+<p>DSH Web UI 的 markdown 渲染器会把 <code>http(s)</code> 图片链接渲染成 <code>&lt;img&gt;</code>，但：</p>
+<ul>
+<li>服务器没有为工作区文件提供任何静态路由（未命中的路径全部回落到 SPA）；</li>
+<li>渲染器的 URL 消毒器只放行 <code>http:</code> / <code>https:</code> / <code>mailto:</code>，<code>data:</code> 内嵌被拒绝。</li>
+</ul>
+<p>因此 agent 生成的图表（matplotlib PNG 等）之前只能以"可点击文件"形式给出。装上本插件后，
+agent 在消息里写：</p>
+<pre><code>![分布图](/dsh-image/sixsigma/distributions.png)
+</code></pre>
+<p>图片就会直接显示在对话里。</p>
+<h2>安装</h2>
+<blockquote>
+<p>⚠️ 安装后需要<strong>重启 <code>dsh web</code></strong> 才会加载插件，重启会短暂中断当前 Web 会话。</p>
+</blockquote>
+<pre><code># 1) 安装到 web profile（等价于在 ~/.dsh/profiles/web 里 pnpm add）
+dsh plugin --profile web add dsh-plugin-inline-image
+
+# 2) 把插件加入 bundle 清单：编辑 ~/.dsh/profiles/web/package.json
+#    "dsh": { "profile": { "bundles": [ ..., "dsh-plugin-inline-image" ] } }
+
+# 3) 配置插件（见下），然后重启 dsh web
+</code></pre>
+<blockquote>
+<p>本地开发时可用 <code>dsh plugin --profile web add file:/本地路径/dsh-plugin-inline-image</code> 代替第 1 步。</p>
+</blockquote>
+<h3>配置（~/.dsh/profiles/web/cordis.patch.yml）</h3>
+<p>在 <code>cordis.patch.yml</code> 里追加：</p>
+<pre><code>- insert:
+    - id: inline-image
+      name: 'dsh-plugin-inline-image'
+      config:
+        # alias -&gt; 允许对外提供图片的绝对目录
+        roots:
+          sixsigma: /Users/guoguo/6sigma
+        # 默认 false：.svg 不开放（可携带脚本，XSS 面）；确需时改为 true
+        allowSvg: false
+</code></pre>
+<p>不配置 <code>roots</code> 时，插件会自动回退到 harness 已注册的全部 workspace
+（按 workspace id 作为 alias），方便直接用现有工作区。</p>
+<h3>使用</h3>
+<p>配置了 alias <code>sixsigma</code> 指向 <code>/Users/guoguo/6sigma</code> 后：</p>
+<table>
+<thead>
+<tr>
+<th>消息内容</th>
+<th>效果</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>![](/dsh-image/sixsigma/fig.png)</code></td>
+<td>内嵌显示 <code>/Users/guoguo/6sigma/fig.png</code></td>
+</tr>
+<tr>
+<td><code>![](/dsh-image/sixsigma/reports/chart.webp)</code></td>
+<td>内嵌显示子目录图片</td>
+</tr>
+</tbody></table>
+<p>给 agent 的提示词可以加一句：<em>"要内嵌展示图片时，用相对链接
+<code>/dsh-image/&lt;alias&gt;/&lt;相对路径&gt;</code>，如 <code>![](/dsh-image/sixsigma/fig.png)</code>。"</em></p>
+<h2>安全设计（纵深防御）</h2>
+<ol>
+<li><strong>只允许 GET / HEAD</strong>，其余方法返回 405；</li>
+<li><strong>逐段校验</strong>：每个路径段先 URL 解码，段不得为空、不得为 <code>.</code> / <code>..</code>、
+不得在解码后包含 <code>/</code>、<code>\</code>、NUL（<code>%2e%2e</code>、<code>..%2f</code> 等编码穿越均被拒）；</li>
+<li><strong>词法包含检查</strong>：<code>resolve + normalize</code> 后必须仍在 root 之下，否则 403；</li>
+<li><strong>真实路径检查</strong>：<code>realpath()</code> 解析符号链接后再次校验必须仍在 root 之下，
+防止 root 内的符号链接逃逸到任意文件（403）；</li>
+<li><strong>扩展名白名单</strong>：仅常见栅格图格式（png/jpg/jpeg/webp/gif/avif/bmp/ico）；
+SVG 默认 415（可选 <code>allowSvg</code> 打开）；Content-Type 一律由白名单推导；</li>
+<li>服务器进程外无任何暴露（路由挂在现有 <code>dsh web</code> 进程上）。</li>
+</ol>
+<h2>测试</h2>
+<pre><code>cd dsh-plugin-inline-image
+npm install
+node --test          # 15 项：正常读取 / HEAD / 405 / 各类穿越 / 符号链接逃逸 / MIME / SVG / 404 / 插件接线
+</code></pre>
+<h2>与官方路线的关系</h2>
+<p>DSH 消息协议已为"助手输出图片"预留了 <code>ImageBlock</code>
+（<code>packages/llm</code> 中类型注释：<em>valid in user or assistant content … assistant-side
+rendering is forward compatibility</em>）。本插件是让这一能力<strong>当下可用</strong>的轻量落地；
+官方后续若实现完整的 assistant 附件通道，本插件可作为过渡方案。
+功能请求已提交：<a href="https://github.com/deepseek-ai/deepseek-harness/discussions/2995">https://github.com/deepseek-ai/deepseek-harness/discussions/2995</a></p>
+<h2>参与贡献</h2>
+<p>欢迎提交 issue 和 PR！插件小而聚焦：单文件实现 + 一套覆盖正常路径与各类
+逃逸尝试的测试。路径处理是本插件的<strong>安全核心契约</strong>，改动路径/路由/扩展名
+白名单的 PR 必须附带对应攻击面测试。</p>
+<ul>
+<li>开发与测试指南、发布流程：<a href="https://github.com/usavv1547-cyber/dsh-plugin-inline-image/blob/HEAD/CONTRIBUTING.md">CONTRIBUTING.md</a></li>
+<li>CI：push/PR 自动在 Node 18/20/22 上运行全部测试</li>
+<li>发布：打 <code>v&lt;version&gt;</code> tag 即自动 <code>npm publish</code> + 生成 GitHub Release</li>
+</ul>
+<h2>License</h2>
+<p>MIT</p>

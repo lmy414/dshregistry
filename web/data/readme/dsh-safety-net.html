@@ -1,0 +1,223 @@
+<h1>dsh-safety-net</h1>
+<p>Self-protection guardrails for the DeepSeek Harness (DSH). When an agent runs
+autonomously, a wrong write can silently destroy the harness itself — this
+plugin makes that damage <strong>impossible by default</strong> and <strong>reversible by
+command</strong>.</p>
+<blockquote>
+<p>中文文档见 <a href="https://github.com/Asuna486-desuwa/dsh-safety-net/blob/HEAD/README.zh-CN.md">README.zh-CN.md</a> · Chinese docs live in
+<a href="https://github.com/Asuna486-desuwa/dsh-safety-net/blob/HEAD/README.zh-CN.md">README.zh-CN.md</a></p>
+</blockquote>
+<h2>Why this plugin exists</h2>
+<p>DSH's own runtime state lives in plain files under <code>~/.dsh</code> (profiles,
+session state, patches) and under the plugin data directory. An agent that
+misreads its sandbox boundaries can <code>write</code>/<code>edit</code> those files, corrupt the
+harness, and leave you unable to start DSH at all. <code>dsh-safety-net</code> is the
+seatbelt: it hard-blocks mutations on DSH critical assets, snapshots files
+before refusing, and keeps a CLI recovery channel that works even when the
+GUI is gone.</p>
+<h2>The four guardrails</h2>
+<h3>1. Protected-path guard (hard interception)</h3>
+<p><code>fs/write-intent</code> and <code>fs/edit-intent</code> waterfall listeners hard-block any
+mutation that targets a DSH critical path. Protected by default:</p>
+<table>
+<thead>
+<tr>
+<th>Rule id</th>
+<th>Path</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>dsh-home</code></td>
+<td><code>~/.dsh</code> (the DSH data root, <code>$DSH_HOME</code> override)</td>
+</tr>
+<tr>
+<td><code>plugin-data</code></td>
+<td><code>~/.claude/plugins/data/dsh-deepseek-dsh</code></td>
+</tr>
+<tr>
+<td><code>profile-manifest</code> / <code>profile-patch</code></td>
+<td><code>~/.dsh/profiles</code> (profile manifests &amp; patches)</td>
+</tr>
+<tr>
+<td><code>session-state</code></td>
+<td><code>~/.dsh/state</code> (session state)</td>
+</tr>
+</tbody></table>
+<p>A blocked mutation raises an <code>FS_POLICY_DENIED</code> error — the agent cannot
+silently retry its way past it. Extra paths can be added via
+<code>safetyNet.extraProtectedPaths</code> (see <a href="#configuration">Configuration</a>).</p>
+<h3>2. Backup before destroy</h3>
+<p>Before a protected path is refused, the original file is snapshotted into the
+backup store. Nothing is ever destroyed: every blocked write/edit leaves a
+restorable copy behind (unless the snapshot itself fails), so the worst case
+is one command away from being undone.</p>
+<h3>3. CLI self-recovery channel</h3>
+<p>Five slash commands, registered on the DSH CLI surface, work even when the
+GUI is down:</p>
+<ul>
+<li><code>/safety-net-status</code> — guardrail health report (protected rules, backups, strict mode)</li>
+<li><code>/safety-net-backup</code> — manual full snapshot of protected assets</li>
+<li><code>/safety-net-restore</code> — list backups, or restore one by id</li>
+<li><code>/safety-net-repair</code> — detect missing critical files and print recovery instructions</li>
+<li><code>/safety-net-approve &lt;path&gt;</code> — one-time approval to write a protected path (grants a single bypass, then the guard is re-armed)</li>
+</ul>
+<p>See <a href="#commands">Commands</a> for details.</p>
+<h3>4. Strict privilege tiering</h3>
+<p>Strict mode is <strong>on by default</strong>: safety-net <em>declares</em> a read-only default
+sandbox mode and warns when the host sandbox default is wider
+(<code>workspace-write</code> / <code>danger-full-access</code>). The declaration is advisory —
+actual enforcement stays with the host sandbox backend, which safety-net
+cannot force. Turn strict off only if you understand the trade-off
+(<code>safetyNet.strict: false</code>).</p>
+<h2>Installation</h2>
+<p>Requires Node.js ≥ 20 and a running DeepSeek Harness (DSH) host.</p>
+<blockquote>
+<p><strong>Dependencies</strong>: <code>@deepseek-ai/cordis</code> and <code>@deepseek-ai/dsh-fs</code> are declared
+as <strong>peer dependencies</strong> — they are provided by the DSH host runtime itself
+and are not fetched from the public npm registry (the <code>dsh-fs</code> version DSH
+ships may not exist on public npm). Install this plugin <em>inside</em> a DSH
+profile; do not <code>npm install</code> it standalone.</p>
+</blockquote>
+<p><strong>From npm</strong>:</p>
+<pre><code>dsh plugin add dsh-safety-net
+</code></pre>
+<p><strong>From git</strong>:</p>
+<pre><code>dsh plugin add git+https://github.com/Asuna486-desuwa/dsh-safety-net.git
+</code></pre>
+<p><strong>Manual mount</strong>: clone the repository and wire it into your DSH plugin flow
+as usual — <code>cordis.patch.yml</code> already declares the bundle patch, and
+<code>package.json</code> carries the <code>dsh.bundle</code> metadata.</p>
+<h2>Configuration</h2>
+<p>All options live under the <code>safetyNet</code> key:</p>
+<pre><code>safetyNet:
+  # Strict mode: declares a read-only default and warns if the host sandbox
+  # default is not tightened. Default: true
+  strict: true
+  # Additional paths to protect (beyond the built-in DSH critical paths)
+  extraProtectedPaths: []
+  # Reserved — retention-based pruning wiring lands in a later release. Default: 30
+  backupRetention: 30
+</code></pre>
+<table>
+<thead>
+<tr>
+<th>Key</th>
+<th>Type</th>
+<th>Default</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>safetyNet.strict</code></td>
+<td>boolean</td>
+<td><code>true</code></td>
+<td>Declares a read-only default sandbox mode; warns when the host sandbox default is wider (<code>workspace-write</code> / <code>danger-full-access</code>).</td>
+</tr>
+<tr>
+<td><code>safetyNet.extraProtectedPaths</code></td>
+<td>string[]</td>
+<td><code>[]</code></td>
+<td>Extra paths treated as DSH critical assets.</td>
+</tr>
+<tr>
+<td><code>safetyNet.backupRetention</code></td>
+<td>number</td>
+<td><code>30</code></td>
+<td>Max snapshots kept in the backup store before pruning (reserved; pruning wiring lands in a later release).</td>
+</tr>
+<tr>
+<td><code>safetyNet.dshHome</code></td>
+<td>string</td>
+<td>env <code>DSH_HOME</code> or <code>~/.dsh</code></td>
+<td>Override the DSH data root (used by the guard, the backup store and the status report alike).</td>
+</tr>
+<tr>
+<td><code>safetyNet.pluginDataRoot</code></td>
+<td>string</td>
+<td><code>~/.claude/plugins/data</code></td>
+<td>Override the plugin data root (mainly for tests/injection).</td>
+</tr>
+</tbody></table>
+<p>The backup store is created under <code>&lt;DSH_HOME&gt;/safety-net/backups/</code>.</p>
+<h2>Commands</h2>
+<p>Command names are registered without a slash (<code>safety-net-status</code>, ...) and
+are shown below with a leading <code>/</code> as they appear in the DSH UI/CLI.</p>
+<table>
+<thead>
+<tr>
+<th>Command</th>
+<th>Behavior</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>/safety-net-status</code></td>
+<td>Reports guardrail health: number of protected rules, stored backups, strict mode, and the resolved DSH home.</td>
+</tr>
+<tr>
+<td><code>/safety-net-backup</code></td>
+<td>Manually snapshots every protected asset into the backup store.</td>
+</tr>
+<tr>
+<td><code>/safety-net-restore</code></td>
+<td>With no argument, lists all backups (newest first).</td>
+</tr>
+<tr>
+<td><code>/safety-net-restore &lt;id&gt;</code></td>
+<td>Restores the files of the given backup id to their original locations.</td>
+</tr>
+<tr>
+<td><code>/safety-net-repair</code></td>
+<td>Detects missing critical files and prints recovery instructions (never auto-modifies anything).</td>
+</tr>
+<tr>
+<td><code>/safety-net-approve &lt;path&gt;</code></td>
+<td>Grants a one-time write bypass for a protected path (calls <code>guard.approveOnce</code>); the next matching mutation passes, then the guard re-arms.</td>
+</tr>
+</tbody></table>
+<h2>Unblocking a false positive</h2>
+<p>If a legitimate write is blocked — e.g. you really need to modify a file under
+a protected path — keep this in mind:</p>
+<ul>
+<li><strong>one-time bypass</strong>: <code>/safety-net-approve &lt;path&gt;</code> grants a single write
+approval for that path; the next matching mutation passes, then the guard
+re-arms. (This wires <code>guard.approveOnce</code> into the CLI.)</li>
+<li>paths you added via <code>safetyNet.extraProtectedPaths</code> are <strong>add-only at
+runtime</strong>: to stop protecting one, remove the entry from the config and
+restart DSH;</li>
+<li>the built-in rules (<code>~/.dsh</code>, profiles, state, plugin data) cannot be
+removed through configuration. <code>strict</code> only <em>declares</em> the sandbox posture
+and does <strong>not</strong> lift path interception. To modify a built-in protected
+file, unload this plugin first (<code>dsh plugin remove dsh-safety-net</code>), do the
+edit, then re-add it.</li>
+</ul>
+<p>A runtime one-time approval channel (<code>approveOnce</code>, already unit-tested on the
+guard) is planned for v0.2; until then the blocked error message points at the
+two options above.</p>
+<h2>Backup layout</h2>
+<pre><code>&lt;DSH_HOME&gt;/safety-net/backups/
+└── &lt;timestamp-id&gt;/          # e.g. 1750000000000-a1b2c3
+    ├── _meta.json           # maps each snapshot file back to its EXACT original path
+    └── &lt;relative-path&gt;      # original path, drive letter stripped, '/' separators
+</code></pre>
+<p>Each snapshot is one directory named by a time-based id; the original relative
+path is preserved beneath it, and <code>_meta.json</code> records the full original path
+(drive letter included) so restore writes every file back to exactly where it
+came from — even across Windows drive letters.</p>
+<h2>Scope &amp; disclaimer</h2>
+<p>This plugin intentionally does <strong>not</strong>:</p>
+<ul>
+<li>provide a GUI panel — recovery lives in the CLI, where it still works when
+the GUI is down;</li>
+<li>sync backups to the cloud — backups are local files under
+<code>&lt;DSH_HOME&gt;/safety-net/backups/</code>;</li>
+<li>restore file <em>content</em> diffs — restore is whole-file, snapshot-point based;</li>
+<li>intercept operations on non-critical paths — only DSH critical assets and
+paths you explicitly add are protected.</li>
+</ul>
+<h2>Development &amp; testing</h2>
+<pre><code>node --test tests/*.test.mjs
+</code></pre>
+<p>Tests run against an injected fake fs adapter and injected <code>dshHome</code> /
+<code>pluginDataRoot</code> overrides — they never touch your real <code>~/.dsh</code>.</p>
+<h2>License</h2>
+<p>MIT</p>

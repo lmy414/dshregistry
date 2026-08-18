@@ -1,0 +1,62 @@
+<h1>DSH Plugin Guard</h1>
+<p>DeepSeek Harness 插件的安装前安全检查插件。默认离线、只读，不执行被扫描代码，不跟随符号链接，也不会把插件内容发送给大模型或第三方服务。</p>
+<blockquote>
+<p>重要：静态扫描只能发现已知风险信号，不能证明插件安全。<code>REVIEWABLE</code> 的含义是“可以继续人工审查”，不是“绝对安全”。</p>
+</blockquote>
+<h2>能检查什么</h2>
+<ul>
+<li>提示词注入：覆盖系统/用户指令、隐藏行为、工具描述投毒、中英文隐蔽指令</li>
+<li>文件勒索与破坏：递归删除、磁盘格式化、权限破坏、批量加密、赎金文本</li>
+<li>凭据与数据外传：环境变量枚举、SSH/云凭据、浏览器数据、secret → network 组合链</li>
+<li>供应链：安装生命周期脚本、下载即执行、未锁定依赖、编码载荷</li>
+<li>动态执行与越权：<code>eval</code>、shell/subprocess、持久化、自修改、关闭 TLS 校验</li>
+<li>DSH 元数据：<code>package.json</code> 可解析性和 <code>dsh.bundle.patch</code> 激活声明</li>
+<li>Unicode 欺骗：零宽字符与双向控制字符</li>
+</ul>
+<p>评分按“唯一规则 + 同规则递减贡献”计算，避免大型插件仅因重复匹配就轻易满分。只要出现关键级问题，或多类高危问题组合，结论会直接变为 <code>DO_NOT_INSTALL</code>。</p>
+<h2>安装到 DeepSeek Harness</h2>
+<p>在本目录生成 tarball，再安装到<strong>实际启动 Web UI 的同一个 profile</strong>。官方默认 Web UI 通常使用 <code>web</code> profile：</p>
+<pre><code>npm pack
+dsh plugin --profile web add ./dsh-plugin-guard-0.1.1.tgz
+dsh --profile web --dump-config
+</code></pre>
+<p>配置中应出现 <code>id: plugin-guard</code>。然后停止并重新运行 <code>dsh web</code>，再新建对话；新会话会获得 <code>plugin_guard_scan</code> 工具。自定义 profile 用户必须把上述 <code>web</code> 替换成自己实际运行的 profile。DSH profile 彼此隔离，把插件装进 <code>security</code> 不会自动让 <code>web</code> profile 使用它。</p>
+<p>Harness 仍处于 developer preview；本项目按 2026-08-18 可见的 <code>@deepseek-ai/dsh</code> RC 插件格式实现。升级 Harness 后应重新运行测试并核对 <code>dsh.bundle.patch</code>、Loader 和 <code>defineTool</code> 接口。</p>
+<h2>在 Harness 中使用</h2>
+<p>把待审插件先下载或解压到当前工作区，然后要求 Harness：</p>
+<pre><code>使用 plugin_guard_scan 扫描 ./untrusted-plugin，先不要安装或运行它。
+</code></pre>
+<p>工具默认只允许扫描当前 DSH 会话中经过验证的 <code>session.header.cwd</code>，不会使用 DSH 服务进程的启动目录。相对路径从该会话 workspace 解析；没有有效 workspace 时工具会拒绝扫描。需要增加额外的只读扫描根目录时，由用户在启动 Harness 前显式设置：</p>
+<pre><code>export DSH_PLUGIN_GUARD_ROOTS="/absolute/review/inbox:/another/allowed/root"
+</code></pre>
+<p>这些目录只会扩展当前会话 workspace，不会启用 <code>process.cwd()</code> 兜底。这个限制用于防止模型把扫描器当成任意文件读取工具。</p>
+<h2>独立命令行</h2>
+<p>不安装到 Harness 也能直接扫描：</p>
+<pre><code>node ./bin/dsh-plugin-guard.js /path/to/plugin
+node ./bin/dsh-plugin-guard.js /path/to/plugin --json
+</code></pre>
+<p>退出码：<code>0</code> 可继续人工审查；<code>1</code> 谨慎；<code>2</code> 不要安装；<code>3</code> 扫描失败。</p>
+<h2>验证</h2>
+<pre><code>npm test
+npm run check
+</code></pre>
+<p>测试覆盖：干净插件、提示词注入与命令执行组合、凭据外传链、安装脚本、未锁定依赖、会话 workspace 解析、缺失 workspace 时失败、额外根目录和符号链接边界。</p>
+<h2>安全设计</h2>
+<ul>
+<li>零运行时扫描依赖；不需要 API key。</li>
+<li>目标文件使用 <code>lstat</code>，符号链接直接跳过。</li>
+<li>单文件、总字节数、文件数和 finding 数都有硬上限。</li>
+<li>二进制文件不解析；被截断或预算耗尽时 <code>scanComplete=false</code>，结论至少为 <code>CAUTION</code>。</li>
+<li>扫描证据限制长度，避免把大段恶意提示词重新注入模型上下文。</li>
+<li>插件工具只隐式信任 DSH 验证过的会话 workspace；CLI 仅扫描用户明确给出的路径。</li>
+</ul>
+<h2>参考方法</h2>
+<p>规则分类借鉴 NVIDIA SkillSpector 的两阶段安全分析、OpenClaw/Hermes 社区的提示词与凭据防护实践，以及 Agent Skills 供应链研究。此实现刻意把第一版限定为确定性的本地静态扫描；未来可在隔离进程中增加 AST、依赖漏洞库和可选语义复核，但语义模型绝不能直接服从被扫描内容。</p>
+<h2>已知边界</h2>
+<ul>
+<li>不分析图片、加密文件、编译二进制或运行时下载后的真实行为。</li>
+<li>正则规则可能误报，也可能被高级混淆绕过。</li>
+<li>不联网查询 OSV/CVE；依赖漏洞需要另行使用可信的 SCA 工具检查。</li>
+<li>不替代沙箱、最小权限、网络出口控制、人工代码审查和可恢复备份。</li>
+</ul>
+<p>发现绕过方式或误报，请先阅读 <a href="https://github.com/MangShe3-0/dsh-plugin-guard/blob/HEAD/SECURITY.md">SECURITY.md</a>。</p>

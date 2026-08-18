@@ -1,0 +1,199 @@
+<h1>dsh-spill-s3</h1>
+<p><a href="https://www.npmjs.com/package/dsh-spill-s3"><img src="https://img.shields.io/npm/v/dsh-spill-s3?color=4D6BFE" alt="npm"></a>
+<a href="https://github.com/tancheng33/dsh-spill-s3/blob/HEAD/LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue" alt="license"></a></p>
+<p>English | <a href="https://github.com/tancheng33/dsh-spill-s3/blob/HEAD/README.zh.md">中文</a></p>
+<p>An <strong>S3-compatible backend</strong> for the <a href="https://github.com/deepseek-ai/deepseek-harness">DeepSeek Harness</a> spill storage seam (<code>ctx.spillStore</code>). Oversized tool output goes to object storage — AWS S3, MinIO, Cloudflare R2, or any S3-compatible server — instead of the disk of whichever machine happened to run the agent.</p>
+<h2>Why</h2>
+<p>When a tool result is too large for the model's context, the harness <em>spills</em> it: the full text is persisted and the model gets a locator plus retrieval guidance. The shipped backend, <code>@deepseek-ai/dsh-spill-local</code>, writes that text to a private directory on the local host. That is the right default, and the wrong deployment for a team:</p>
+<table>
+<thead>
+<tr>
+<th></th>
+<th><code>dsh-spill-local</code></th>
+<th><code>dsh-spill-s3</code></th>
+</tr>
+</thead>
+<tbody><tr>
+<td>Where artifacts live</td>
+<td>a private dir on the agent's host</td>
+<td>your bucket</td>
+</tr>
+<tr>
+<td>A headless/containerized run</td>
+<td>artifacts die with the container</td>
+<td>artifacts outlive it</td>
+</tr>
+<tr>
+<td>Another engineer wants to look</td>
+<td>shell onto that host</td>
+<td>already has bucket access</td>
+</tr>
+<tr>
+<td>Encryption at rest / lifecycle / retention</td>
+<td>whatever the host does</td>
+<td>whatever your bucket policy says</td>
+</tr>
+</tbody></table>
+<p>This plugin swaps the <strong>substrate</strong>, not the policy. It implements the one method the seam declares — <code>saveText</code> — and leaves retention (<code>@deepseek-ai/dsh-output-retention</code>) and tool-result replacement (<code>@deepseek-ai/dsh-spill-policy</code>) exactly where they already live.</p>
+<h2>Install</h2>
+<pre><code>dsh plugin --profile &lt;name&gt; add dsh-spill-s3
+</code></pre>
+<p>The bundle patch <strong>disables <code>spill-local</code></strong> as it inserts this row: <code>ctx.spillStore</code> accepts exactly one implementation per context, and loading a second throws cordis' duplicate-service error.</p>
+<p><code>bucket</code> ships empty on purpose — the row fails validation until you set it. Silently defaulting a bucket name is how spilled output ends up somewhere nobody intended. Set it in your profile's <code>cordis.patch.yml</code>:</p>
+<pre><code>- id: spill-s3
+  config:
+    endpoint: https://s3.us-east-1.amazonaws.com
+    region: us-east-1
+    bucket: my-agent-spill
+    prefix: dsh-spill
+    forcePathStyle: false      # AWS virtual-host style
+    accessKeyIdRef: AWS_ACCESS_KEY_ID
+    secretAccessKeyRef: AWS_SECRET_ACCESS_KEY
+    sessionTokenRef: AWS_SESSION_TOKEN
+    serverSideEncryption: AES256
+    retrieval: cli
+    presignExpiresSeconds: 3600
+    timeoutMs: 30000
+</code></pre>
+<p>A patch replaces a row's <strong>whole</strong> <code>config</code>, so restate every key you want to keep.</p>
+<h3>MinIO / R2 / self-hosted</h3>
+<pre><code>- id: spill-s3
+  config:
+    endpoint: http://127.0.0.1:9000
+    region: us-east-1          # any consistent value; it only scopes the signature
+    bucket: agent-spill
+    forcePathStyle: true       # required on a bare IP — no wildcard DNS
+    serverSideEncryption: ''   # some servers reject the header
+    # …restate the rest
+</code></pre>
+<h2>Configuration</h2>
+<table>
+<thead>
+<tr>
+<th>Key</th>
+<th>Default</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>endpoint</code></td>
+<td><code>https://s3.us-east-1.amazonaws.com</code></td>
+<td>Service endpoint origin.</td>
+</tr>
+<tr>
+<td><code>region</code></td>
+<td><code>us-east-1</code></td>
+<td>Region in the SigV4 credential scope. S3-compatible servers accept any consistent value.</td>
+</tr>
+<tr>
+<td><code>bucket</code></td>
+<td><em>(required)</em></td>
+<td>Destination bucket. It must already exist — this plugin never creates one.</td>
+</tr>
+<tr>
+<td><code>prefix</code></td>
+<td><code>dsh-spill</code></td>
+<td>Key prefix. Artifacts land under <code>&lt;prefix&gt;/session-&lt;hash&gt;/</code>.</td>
+</tr>
+<tr>
+<td><code>forcePathStyle</code></td>
+<td><code>true</code></td>
+<td><code>host/bucket/key</code> addressing. Required by MinIO and bare-IP endpoints; set <code>false</code> for AWS virtual-host style.</td>
+</tr>
+<tr>
+<td><code>accessKeyIdRef</code></td>
+<td><code>AWS_ACCESS_KEY_ID</code></td>
+<td>Credential <strong>reference</strong> — a name, not a value.</td>
+</tr>
+<tr>
+<td><code>secretAccessKeyRef</code></td>
+<td><code>AWS_SECRET_ACCESS_KEY</code></td>
+<td>Reference for the secret key.</td>
+</tr>
+<tr>
+<td><code>sessionTokenRef</code></td>
+<td><code>AWS_SESSION_TOKEN</code></td>
+<td>Reference for an STS session token. Ignored when unset.</td>
+</tr>
+<tr>
+<td><code>serverSideEncryption</code></td>
+<td><code>AES256</code></td>
+<td><code>x-amz-server-side-encryption</code> value. Empty sends no header.</td>
+</tr>
+<tr>
+<td><code>retrieval</code></td>
+<td><code>cli</code></td>
+<td>How the model is told to read an artifact: <code>cli</code>, <code>presigned</code>, or <code>locator-only</code>.</td>
+</tr>
+<tr>
+<td><code>presignExpiresSeconds</code></td>
+<td><code>3600</code></td>
+<td>Presigned URL lifetime (1..604800).</td>
+</tr>
+<tr>
+<td><code>timeoutMs</code></td>
+<td><code>30000</code></td>
+<td>Upload timeout.</td>
+</tr>
+</tbody></table>
+<h3>Credentials are references, not values</h3>
+<p><code>accessKeyIdRef</code> names a credential; the value is resolved <strong>per upload</strong> through <code>ctx.credentials</code>, falling back to the process environment when no credential provider is mounted. Nothing secret belongs in <code>cordis.patch.yml</code>.</p>
+<p>Because resolution is per operation (the seam's own contract), a rotated key reaches the next upload without restarting anything. Pair it with a central secret store — e.g. <a href="https://github.com/tancheng33/dsh-credentials-vault"><code>dsh-credentials-vault</code></a> — and the agent host never holds a long-lived AWS key at all.</p>
+<h3>Choosing a <code>retrieval</code> mode</h3>
+<table>
+<thead>
+<tr>
+<th>Mode</th>
+<th>The model is told</th>
+<th>Cost</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>cli</code> <em>(default)</em></td>
+<td>run <code>aws s3 cp s3://…</code></td>
+<td>needs the AWS CLI and credentials on the machine running commands</td>
+</tr>
+<tr>
+<td><code>presigned</code></td>
+<td>fetch this URL</td>
+<td><strong>puts a bearer URL in the model's context and the durable session log</strong></td>
+</tr>
+<tr>
+<td><code>locator-only</code></td>
+<td>ask the user</td>
+<td>safest; the model cannot self-serve</td>
+</tr>
+</tbody></table>
+<p><code>presigned</code> is genuinely useful — it makes a spilled artifact readable with a plain <code>web_fetch</code> — but a presigned URL is a bearer credential with a lifetime. It is opt-in for that reason.</p>
+<h2>Key layout</h2>
+<pre><code>&lt;prefix&gt;/session-&lt;sha256(sessionId)[0:16]&gt;/&lt;18 random hex&gt;-&lt;safe name&gt;
+</code></pre>
+<ul>
+<li><strong>The session id is hashed.</strong> Bucket keys are visible to every principal with <code>s3:ListBucket</code> and are copied into inventories, access logs, and analytics pipelines. Per-session grouping survives; the id does not leak.</li>
+<li><strong>The random component precedes the name.</strong> It satisfies the seam's collision-free requirement and makes a key unguessable to someone holding only prefix-level read. Putting it first also keeps a prefix listing from clustering by tool name.</li>
+<li><strong>The suggested name is sanitized, never trusted.</strong> <code>[A-Za-z0-9._-]</code> is kept, everything else collapses to <code>-</code>, runs of two or more dots become <code>-</code> (so <code>..</code> never appears in a derived key), and leading dots/dashes are stripped. The seam calls <code>suggestedName</code> "a hint, never a path", and this treats it as one.</li>
+</ul>
+<h2>Design notes</h2>
+<p><strong>No AWS SDK.</strong> The signing is ~150 lines of <code>node:crypto</code> against the published SigV4 contract. <code>@aws-sdk/client-s3</code> is tens of megabytes of transitive dependencies for a single <code>PUT</code>, and a spill backend that inflates every install is a spill backend nobody mounts. The trade — owning a signer — is bounded because SigV4 is a stable wire format, and it is checked against a real server (below) rather than only against itself.</p>
+<p><strong>The signature covers the real payload digest</strong>, not <code>UNSIGNED-PAYLOAD</code>. The body is already in memory, and a signed digest makes the stored artifact tamper-evident in transit.</p>
+<p><strong><code>saveText</code> rejects on a storage failure</strong>, per the seam contract — it never returns a locator for an object that was not written. The spill policy treats a rejection as best-effort and keeps the inline result, so a bucket outage degrades to today's behavior instead of losing output. Failures carry a machine-readable <code>kind</code>: <code>network</code> (never reached the server), <code>http</code> (the server refused, with status), or <code>config</code>.</p>
+<p><strong>Cancellation is chained.</strong> The caller's <code>AbortSignal</code> and the configured timeout both abort the in-flight request, so a spill cannot hold a cancelled tool result open.</p>
+<h2>Tests</h2>
+<p>50 tests, including four that run against a <strong>real S3-compatible server</strong>. Unit tests pin the <em>shape</em> of a signature; only a live server proves it is <em>correct</em> — a self-consistent but wrong signer would pass every unit test and fail every upload.</p>
+<pre><code>npm test          # unit tests only
+
+# with a live server (verifies signing, presigned GET, and percent-encoded keys)
+docker run -d --name minio -p 19000:9000 \
+  -e MINIO_ROOT_USER=dshtest -e MINIO_ROOT_PASSWORD=dshtest12345 \
+  cgr.dev/chainguard/minio:latest server /data
+DSH_SPILL_S3_TEST_ENDPOINT=http://127.0.0.1:19000 npm test
+</code></pre>
+<h2>Limitations</h2>
+<ul>
+<li><strong><code>saveText</code> only.</strong> The seam declares one method, and this implements exactly it. There is no retrieval, search, or delete API here — retrieval is what <code>retrievalHint</code> describes, and deletion belongs to your bucket's lifecycle policy.</li>
+<li><strong>The bucket must exist.</strong> Creating buckets requires privileges a spill backend should not hold.</li>
+<li><strong>No multipart upload.</strong> Spilled tool output is a single <code>PUT</code>. Objects beyond the 5 GiB single-<code>PUT</code> limit are not supported; the harness's own output caps make that unreachable in practice.</li>
+<li><strong><code>isolation</code>-style claims.</strong> Server-side encryption is whatever your bucket and the <code>serverSideEncryption</code> header negotiate. This plugin does not encrypt client-side, and does not claim to.</li>
+</ul>
+<h2>License</h2>
+<p>MIT</p>

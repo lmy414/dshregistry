@@ -1,0 +1,267 @@
+<h1>dsh-excel-kit</h1>
+<p><strong>The most reliable read-only Excel analysis toolkit for dsh (DeepSeek Harness).</strong></p>
+<p>One sentence of value: stream any xlsx, however large, into compact, useful analysis (describe / filter / pivot) — without ever loading the whole workbook into memory, and without ever writing or formatting a cell.</p>
+<blockquote>
+<p><strong>Version lock warning</strong>: this plugin is built and verified against <strong>DSH <code>0.1.0-rc.6</code></strong>. Do <strong>NOT</strong> <code>npm install dsh-excel-kit@latest</code> blindly — use the locked range <code>&gt;=0.1.0-rc.6 &lt;0.2.0</code> (or whatever the host you run declares). The dsh plugin ABI may change between versions.</p>
+</blockquote>
+<hr>
+<h2>Features (3–5 core)</h2>
+<ol>
+<li><strong>Streaming, big-file safe</strong> — a home-grown xlsx reader built on <code>yauzl</code> (streaming zip) + <code>sax</code> (streaming XML). No <code>XLSX.readFile</code>, no whole-workbook load, no OOM on 100 MB+ files.</li>
+<li><strong>Three focused read tools</strong> — <code>excel_describe</code>, <code>excel_filter</code>, <code>excel_pivot</code>. They return <strong>compact JSON</strong> (aggregates, samples, matched rows) — never a firehose of raw rows.</li>
+<li><strong>Spill integration</strong> — oversized tool results are persisted through <code>ctx.spillStore</code> and replaced in the value with a compact summary + <code>spilled</code> locator.</li>
+<li><strong>Date-aware typing</strong> — <code>numFmtId</code> from <code>xl/styles.xml</code> is used to convert Excel serial dates into ISO strings (<code>2024-01-01</code> / <code>2024-01-01T10:30:00.000Z</code>).</li>
+<li><strong>Cancellable &amp; concurrency-safe</strong> — every long scan forwards <code>exec.signal</code> (AbortSignal); read-only tools declare <code>isConcurrencySafe</code>.</li>
+</ol>
+<hr>
+<h2>How it works</h2>
+<p>The plugin is a normal dsh plugin: entry exports <code>name</code> / <code>inject</code> / <code>apply</code> and registers tools onto <code>ctx.tools</code>. Under the hood it opens the xlsx as a zip, streams only the entries it needs, and parses rows one at a time.</p>
+<h3>Capability seams: dsh ⇄ this plugin</h3>
+<table>
+<thead>
+<tr>
+<th>dsh capability</th>
+<th>How this plugin adapts it</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>ctx.tools.register</code> (dsh-tools)</td>
+<td>Registers <code>excel_describe</code> / <code>excel_filter</code> / <code>excel_pivot</code> via a <code>defineTool</code> shape: <code>parameters</code> are <strong>MCP-style top-level JSON Schema</strong> (<code>{ type: 'object', properties, required }</code>), <code>output.schema</code> declares the <code>{ content, structuredContent }</code> wrapper, <code>output.render</code> projects <code>content</code>, <code>isConcurrencySafe</code>, and async <code>execute(args, exec)</code> returns <code>{ content: ContentBlock[], structuredContent: &lt;result&gt; }</code>.</td>
+</tr>
+<tr>
+<td><code>exec.signal</code> (AbortSignal)</td>
+<td>Forwarded into the streaming reader (<code>streamSheet</code>, sharedStrings load); aborts stop decompression/parsing promptly.</td>
+</tr>
+<tr>
+<td><code>ctx.spillStore</code> (dsh-spill)</td>
+<td>Results larger than the threshold (default 32 KB) are persisted via <code>ctx.spillStore.saveText({owner, source, suggestedName, content})</code>; the returned value becomes <code>{ spilled: { locator, bytes, retrievalHint }, tool, summary }</code>. A same-interface in-memory fallback is used when no real spillStore exists.</td>
+</tr>
+<tr>
+<td><code>dsh.bundle</code> in <code>package.json</code></td>
+<td>Declares <code>cordis.patch.yml</code> so <code>dsh plugin --profile &lt;name&gt; add dsh-excel-kit</code> injects the <code>excel-kit</code> entry into the profile config.</td>
+</tr>
+<tr>
+<td><code>ctx.excel</code> (potential future service)</td>
+<td>The <code>XlsxStreamReader</code> is exported so a future provider service can reuse the same streaming engine cross-plugin. (Not yet registered as a service.)</td>
+</tr>
+</tbody></table>
+<h3>The streaming reader (the moat)</h3>
+<ul>
+<li><code>yauzl</code> opens the file with <code>lazyEntries</code> and reads the central directory — no whole-file decompression.</li>
+<li><code>xl/sharedStrings.xml</code> (when present) is parsed into a <strong>chunked, spilled string array</strong>: strings accumulate into a chunk, and when a chunk crosses 8 MB it is flushed to a temp file; random access goes through a small LRU cache of on-disk chunks. Memory stays bounded even for huge shared-string tables.</li>
+<li><code>xl/worksheets/sheetN.xml</code> is parsed with <code>sax</code> and rows are assembled <strong>one <code>&lt;row&gt;</code> at a time</strong>; cells handle <code>inlineStr</code>, <code>s</code> (SST index), numeric (incl. <code>E</code> scientific notation), <code>t="str"</code>, <code>t="b"</code>, <code>t="d"</code> and empty cells.</li>
+<li><code>xl/styles.xml</code> <code>numFmtId</code> is used to detect date columns (built-in 14–22 / 45–47, and custom formats containing <code>y</code>/<code>m</code>/<code>d</code>); date cells are emitted as ISO strings.</li>
+<li>Row data is handed to a callback and never accumulated into a full-table array.</li>
+</ul>
+<hr>
+<h2>Tools at a glance</h2>
+<table>
+<thead>
+<tr>
+<th>Tool</th>
+<th>Purpose</th>
+<th>Key parameters</th>
+<th>Returns</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>excel_describe</code></td>
+<td>Profile a workbook/sheet</td>
+<td><code>file_path</code> (req), <code>sheet</code>, <code>max_rows</code>, <code>sample</code> (default 3)</td>
+<td>sheets, rows, cols, per-column type distribution, non-empty count, empty rate, numeric min/max/mean, samples</td>
+</tr>
+<tr>
+<td><code>excel_filter</code></td>
+<td>Filter rows by conditions</td>
+<td><code>file_path</code> (req), <code>sheet</code>, <code>conditions</code> (req), <code>columns</code>, <code>limit</code> (default 100, cap 500)</td>
+<td>matched/returned, projected rows</td>
+</tr>
+<tr>
+<td><code>excel_pivot</code></td>
+<td>Group-and-aggregate</td>
+<td><code>file_path</code> (req), <code>sheet</code>, <code>rows</code> (req), <code>values</code> (req), <code>limit</code> (default 50)</td>
+<td>groups, nested keys like `dept</td>
+</tr>
+</tbody></table>
+<p>Condition operators: <code>eq | ne | gt | gte | lt | lte | contains | in | between</code>.</p>
+<p>Aggregation operators: <code>count | sum | mean | min | max</code>.</p>
+<blockquote>
+<p><strong>Return contract</strong>: every tool's <code>execute</code> resolves to <code>{ content: [{type:'text', text}], structuredContent: &lt;result&gt; }</code> (dsh-tools rc.6 registry shape). The JSON payloads below are the <code>structuredContent</code> values; <code>content</code> is the human-readable rendering shown by the model. When a result exceeds the spill threshold (32 KB default), <code>structuredContent</code> becomes <code>{ spilled: { locator, bytes, retrievalHint }, tool, summary }</code>.</p>
+</blockquote>
+<hr>
+<h2>Install</h2>
+<p>Requires a dsh installation (<code>0.1.0-rc.6</code> compatible). From the plugin's package directory:</p>
+<pre><code># 1) inside dsh, add the plugin to a profile
+dsh plugin --profile &lt;name&gt; add dsh-excel-kit
+
+# 2) or install manually then apply via dsh.bundle patch
+npm install dsh-excel-kit
+</code></pre>
+<p>The <code>dsh.bundle.patch</code> (<code>cordis.patch.yml</code>) inserts:</p>
+<pre><code>- insert:
+    - id: excel-kit
+      name: 'dsh-excel-kit'
+</code></pre>
+<p><strong>Do not install <code>@latest</code> blindly</strong> — pin to the compatible range (see the warning at the top).</p>
+<hr>
+<h2>Configuration</h2>
+<p>The plugin follows the dsh <code>name</code> / <code>inject</code> / <code>apply</code> contract and ships <strong>no plugin-level <code>Config</code></strong> (a plain, non-schemastery <code>Config</code> object breaks the cordis loader, which calls <code>Config.validate()</code>). Behavior is tuned by constants in source and documented in this README:</p>
+<table>
+<thead>
+<tr>
+<th>Tuning knob</th>
+<th>Default</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>spillThreshold</code></td>
+<td><code>32 * 1024</code> (32 KB)</td>
+<td>Result serialization threshold (bytes) above which <code>ctx.spillStore</code> is used.</td>
+</tr>
+<tr>
+<td>filter <code>limit</code></td>
+<td><code>100</code> (hard cap <code>500</code>)</td>
+<td>Max rows returned by <code>excel_filter</code>.</td>
+</tr>
+<tr>
+<td>pivot <code>limit</code></td>
+<td><code>50</code></td>
+<td>Max groups returned by <code>excel_pivot</code>.</td>
+</tr>
+</tbody></table>
+<p>Per-profile overrides belong in the profile's <code>cordis.patch.yml</code> layer (e.g. disabling the plugin entry), not in a plugin <code>Config</code>.</p>
+<hr>
+<h2>Usage examples</h2>
+<h3>1) excel_describe</h3>
+<pre><code>{
+  "tool": "excel_describe",
+  "arguments": {
+    "file_path": "/data/reports/2026-08-sales.xlsx",
+    "sheet": "Sheet1",
+    "sample": 3
+  }
+}
+</code></pre>
+<p>Compact result (truncated):</p>
+<pre><code>{
+  "file_path": "/data/reports/2026-08-sales.xlsx",
+  "sheet": "Sheet1",
+  "sheets": ["Sheet1", "Sheet2"],
+  "total_rows": 10001,
+  "total_cols": 6,
+  "columns": [
+    { "col": 0, "header": "id", "total": 10001, "non_empty": 10000, "empty_rate": 0.0001,
+      "types": { "number": 10000 }, "numeric": { "min": 1, "max": 10000, "mean": 5000.5, "sum": 50005000 },
+      "samples": [1, 2, 3] },
+    { "col": 4, "header": "order_date", "total": 10001, "non_empty": 10000, "empty_rate": 0.0001,
+      "types": { "date": 10000 }, "samples": ["2026-08-01", "2026-08-02", "2026-08-03"] }
+  ]
+}
+</code></pre>
+<h3>2) excel_filter</h3>
+<pre><code>{
+  "tool": "excel_filter",
+  "arguments": {
+    "file_path": "/data/reports/2026-08-sales.xlsx",
+    "conditions": [
+      { "column": "region", "op": "in", "values": ["华东", "华南"] },
+      { "column": "amount", "op": "gte", "value": 5000 }
+    ],
+    "columns": ["id", "region", "amount"],
+    "limit": 100
+  }
+}
+</code></pre>
+<p>Result shape:</p>
+<pre><code>{
+  "file_path": "/data/reports/2026-08-sales.xlsx",
+  "sheet": "Sheet1",
+  "columns": ["id", "region", "amount"],
+  "matched": 823,
+  "returned": 100,
+  "truncated": true,
+  "rows": [
+    { "row": 4, "values": { "id": 3, "region": "华东", "amount": 12800 } }
+  ]
+}
+</code></pre>
+<h3>3) excel_pivot</h3>
+<pre><code>{
+  "tool": "excel_pivot",
+  "arguments": {
+    "file_path": "/data/reports/2026-08-sales.xlsx",
+    "rows": ["region", "channel"],
+    "values": [
+      { "column": "amount", "agg": "sum" },
+      { "column": "amount", "agg": "mean" },
+      { "column": "id", "agg": "count" }
+    ]
+  }
+}
+</code></pre>
+<p>Result shape:</p>
+<pre><code>{
+  "file_path": "/data/reports/2026-08-sales.xlsx",
+  "sheet": "Sheet1",
+  "rows": ["region", "channel"],
+  "values": [{ "column": "amount", "agg": "sum" }, { "column": "amount", "agg": "mean" }, { "column": "id", "agg": "count" }],
+  "groups": 8,
+  "truncated": false,
+  "data": [
+    { "key": "华东|线上", "group": { "region": "华东", "channel": "线上" },
+      "values": { "sum:amount": 1234567.89, "mean:amount": 5234.56, "count:id": 236 } }
+  ]
+}
+</code></pre>
+<hr>
+<h2>Verification record</h2>
+<table>
+<thead>
+<tr>
+<th>Check</th>
+<th>Command</th>
+<th>Assertion target</th>
+<th>Result</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>Build</td>
+<td><code>npm run build</code></td>
+<td><code>tsc</code> strict passes</td>
+<td><strong>PASS</strong> (fixed 2026-08-18): <code>npx tsc --noEmit</code> 0 errors; <code>noEmitOnError:true</code> added to tsconfig to prevent emitting on error</td>
+</tr>
+<tr>
+<td>Unit</td>
+<td><code>npm test</code></td>
+<td>20+ assertions: date conversion, condition matching, describe/filter/pivot correctness, SST/date/empty cells, SheetJS cross-check</td>
+<td><strong>PASS</strong> 19/19 (tsx --test, ~9.3s)</td>
+</tr>
+<tr>
+<td>Fixtures</td>
+<td><code>npm run gen:fixtures</code></td>
+<td>small.xlsx ~1 MB + large.xlsx ~100 MB generated streaming</td>
+<td><strong>PASS</strong> small.xlsx 1,725,588 B (<del>1.65 MiB); large.xlsx 139,715,025 B (</del>133.2 MiB)</td>
+</tr>
+<tr>
+<td>Integration</td>
+<td><code>npm run test:integration</code></td>
+<td>1 MB vs 100 MB timing; peak RSS delta <code>&lt; 800 MB</code>; three tools usable on 100 MB; compact JSON results</td>
+<td><strong>PASS</strong> 6/6. describe large 26.9s / RSS +153.2 MB / JSON 2215 B; filter large 20.9s / +63.6 MB (matched 63,228); pivot large 21.8s / +36.2 MB; SST-chunk spill case 34.3s / +5.9 MB</td>
+</tr>
+</tbody></table>
+<p>Numbers recorded by QA (2026-08-18) from independent verification runs.</p>
+<hr>
+<h2>Known limitations</h2>
+<ul>
+<li><strong>Read-only by design</strong>: v0.1.0 strictly forbids writing or formatting. No <code>set_cell</code>, no style mutation.</li>
+<li>SheetJS CE is a dependency for test cross-validation only; the production reader never calls <code>XLSX.readFile</code>.</li>
+<li><code>excel_filter</code> and <code>excel_pivot</code> reference columns by <strong>header name</strong> (first row). Empty header cells fall back to <code>colN</code> (1-based).</li>
+<li><code>mean</code>/<code>sum</code>/<code>min</code>/<code>max</code> operate on numeric values (numbers or numeric strings); non-numeric cells are ignored for numeric aggs. <code>count</code> counts non-empty values of the column within a group.</li>
+<li>Group keys in <code>excel_pivot</code> join values with <code>|</code>; a value containing <code>|</code> may collide with a nested key (rare in practice).</li>
+<li>Only the first sheet's <code>xlsx</code> (<code>.xlsx</code>, zip-based) format is supported — not legacy <code>.xls</code>, <code>.xlsb</code>, or password-encrypted files.</li>
+<li>Streams are bounded, but <code>excel_describe</code> with default settings scans every row (that's the point — it is streaming, not free).</li>
+</ul>
+<hr>
+<h2>License</h2>
+<p>MIT — see <a href="https://github.com/helibeiqi/dsh-excel-kit/blob/HEAD/LICENSE">LICENSE</a>.</p>

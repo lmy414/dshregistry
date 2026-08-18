@@ -1,0 +1,87 @@
+<h1>dsh-remote-picker</h1>
+<p><a href="https://www.npmjs.com/package/dsh-remote-picker"><img src="https://img.shields.io/npm/v/dsh-remote-picker" alt="npm version"></a>
+<a href="https://www.npmjs.com/package/dsh-remote-picker"><img src="https://img.shields.io/npm/dm/dsh-remote-picker" alt="npm downloads"></a>
+<a href="https://github.com/Yuuichu/dsh-remote-picker/blob/HEAD/LICENSE"><img src="https://img.shields.io/npm/l/dsh-remote-picker" alt="License"></a>
+<a href="https://github.com/topics/dsh-plugin"><img src="https://img.shields.io/badge/dsh-plugin-ready-2ea44f.svg" alt="dsh plugin"></a></p>
+<p>远程访问场景下 DeepSeek Harness 目录选择器的修复插件：当 Web GUI 服务于远程浏览器（tailscale serve / cloudflared / 反向代理 + <code>--trusted-host</code>）时，强制使用<strong>浏览器内 browse</strong> 交互，而不是会在无人值守主机上弹出、远程浏览器无法驱动的 <strong>native OS 对话框</strong>。</p>
+<blockquote>
+<p>关联上游讨论：<a href="https://github.com/deepseek-ai/deepseek-harness/discussions/2713">deepseek-ai/deepseek-harness#discussions/2713</a>
+官方 <code>directory-picker-auto</code> 组件自身也承认该缺陷（Playwright smoke 用 overlay 绕过：<code>apps/web/tests/pin-browse-picker.overlay.yml</code>）。</p>
+</blockquote>
+<h2>本插件服务的远程流程</h2>
+<p>这个插件只在一个特定的远程访问流程中有意义。先看清这条链路，再决定是否需要安装：</p>
+<pre><code>手机 / 笔记本浏览器（任意网络：4G、公司网、家里 WiFi）
+        │  https://&lt;你的主机名&gt;.ts.net  （或 cloudflared 公网域名）
+        ▼
+tailscale serve / cloudflared  ──  HTTPS 反向代理（TLS 终结，仅网内可达）
+        │  转发到本机
+        ▼
+dsh web  ──  绑定 127.0.0.1:3080，启动参数带 --trusted-host &lt;你的主机名&gt;
+</code></pre>
+<p><strong>流程各环节与责任</strong>：</p>
+<table>
+<thead>
+<tr>
+<th>环节</th>
+<th>做什么</th>
+<th>与本插件的关系</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>① <code>dsh web --trusted-host &lt;主机名&gt;</code></td>
+<td>保持回环绑定（安全），并把远程域名加入 <code>/api</code> 白名单（防 DNS rebinding 围栏）</td>
+<td>前提：没有它远程页面能开但 API 全 403</td>
+</tr>
+<tr>
+<td>② <code>tailscale serve --bg 3080</code>（或 cloudflared）</td>
+<td>把 <code>https://&lt;主机名&gt;.ts.net</code> 反代到本机 3080；HTTPS 是必须的（明文 HTTP 下浏览器没有 <code>crypto.randomUUID</code>，DSH 的 RPC 全挂）</td>
+<td>前提：提供远程入口</td>
+</tr>
+<tr>
+<td>③ 手机浏览器打开远程地址</td>
+<td>日常对话、查看任务、发消息</td>
+<td>正常，无需本插件</td>
+</tr>
+<tr>
+<td>④ 设置 → 工作区 → 选择目录</td>
+<td>远程用户挑选/创建工作区文件夹</td>
+<td><strong>本插件接管的位置</strong>：原生对话框在电脑上弹出，手机看不到；插件强制浏览器内目录树</td>
+</tr>
+<tr>
+<td>⑤ 设置页/API Key 管理</td>
+<td>官方设计仅回环可用（403）</td>
+<td>与本插件无关，请在本机浏览器操作</td>
+</tr>
+</tbody></table>
+<p><strong>一句话</strong>：如果你的使用方式符合"①+②+③"（通过 tailscale serve 或 cloudflared 从手机/远程浏览器使用 DSH），那你<strong>一定会</strong>在④遇到目录选择器故障——这个插件就是为④准备的。如果只在电脑本机用（<code>http://127.0.0.1:3080</code>），不需要装。</p>
+<h2>问题</h2>
+<p><code>dsh web</code> 默认绑定 <code>127.0.0.1</code>，通过 tailscale serve / cloudflared 等反代对外提供 HTTPS 入口。<code>@deepseek-ai/dsh-host-directory-picker-auto</code> 的启动判定是：<strong>回环绑定 + darwin/win32 → native 后端</strong>。反代场景下浏览器是远程的（手机/笔记本），native 对话框会弹在电脑屏幕上——远程用户看不到、无法操作，工作区目录选择直接失败。</p>
+<h2>修复方式</h2>
+<p>本插件的 bundle patch（<code>dsh.bundle.patch</code> 机制）在启动组合中：</p>
+<ol>
+<li><strong>禁用</strong> 官方 <code>directory-picker</code>（auto）行；</li>
+<li><strong>挂载</strong> browse 后端 + 客户端界面（<code>@deepseek-ai/dsh-host-directory-picker-browse</code> + <code>@deepseek-ai/dsh-client-ui-directory-picker-browse</code>）——即 seam 文档化的切换点；</li>
+<li>附带 <code>remote-picker</code> 自检行：启动后验证 browse 能力已装载，异常时输出警告（fail loud）。</li>
+</ol>
+<p>浏览器内 browse 选择器通过 <code>/api</code> 目录树浏览工作区文件夹，远程可用、本地可用，全平台一致。</p>
+<h2>安装</h2>
+<pre><code>dsh plugin --profile web add dsh-remote-picker
+</code></pre>
+<p>或手动（profile 是 pnpm workspace）：</p>
+<pre><code>cd ~/.dsh/profiles/web
+npx -y pnpm@11 add -w dsh-remote-picker
+</code></pre>
+<p>安装后重启 <code>dsh web</code> 生效。</p>
+<blockquote>
+<p>⚠️ 若你的 <code>cordis.patch.yml</code> 已手工加过同款 disable+insert（远程访问排查期的常见做法），先移除那段，避免重复装载。</p>
+</blockquote>
+<h2>验证</h2>
+<ul>
+<li>启动日志出现 <code>dsh-remote-picker: in-browser browse directory picker active</code></li>
+<li>远程浏览器（手机/另一台电脑）：设置 → 工作区 → 选择目录 → 出现可浏览的目录树</li>
+<li>本地浏览器 <code>http://127.0.0.1:3080</code> 同样可用（browse 是处处可用的交互）</li>
+</ul>
+<h2>与本包相关的上游补丁</h2>
+<p>完整的 <code>trustedHosts</code> 信号修复（auto 组件自动判定 browse）已整理为补丁提交到上游讨论区，等待官方采纳；本插件是其插件形态的等价物，无需等待上游。</p>
+<h2>License</h2>
+<p>MIT</p>

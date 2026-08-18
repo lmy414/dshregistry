@@ -1,0 +1,84 @@
+<h1>dsh-side-session</h1>
+<p>类似 Claude Code <code>/btw</code> 的<strong>侧边临时会话窗口</strong>，用于 <a href="https://github.com/deepseek-ai/deepseek-harness">DeepSeek Harness (DSH)</a>。</p>
+<p>在主会话的会话头部点击「侧边会话」，右侧浮出一个临时会话窗口：它 <strong>fork 主会话已完成的历史回合</strong>（作为参考上下文），并<strong>补全主会话的最新动态</strong>（当前进行中的轮次里已提交的用户消息、助手消息、工具调用），再注入 boundary 提示词告知代理「这是侧边临时会话、主会话 ID、历史只是参考、避免干扰主会话」。侧边会话<strong>不显示在会话列表</strong>，<strong>关闭即销毁、无法再次打开</strong>。</p>
+<h2>特性（对照需求）</h2>
+<table>
+<thead>
+<tr>
+<th>需求</th>
+<th>实现</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>1. 创建时 fork 主会话</td>
+<td>子会话以主会话已完成轮次的日志前缀为 seed（<code>meta.seedLength</code> 标记边界）</td>
+</tr>
+<tr>
+<td>2. 代理与主会话一致</td>
+<td><code>agentPresets.composeFrom(childCtx, parent.ctx)</code> 挂载同一 preset（工具/技能/提示词/权限行一致）；继承 <code>cwd</code>、模型路由（provider/model）、sandbox 模式、approval 策略</td>
+</tr>
+<tr>
+<td>3. 注入侧边会话提示词</td>
+<td>双保险：system prompt section + <strong>第一条 user 消息</strong>（<code>Side conversation boundary...</code>），明确「fork 的历史只是参考上下文，只有 boundary 之后的用户消息才是活跃指令」</td>
+</tr>
+<tr>
+<td>4. 不进列表 + 关闭后不可重开</td>
+<td>子会话以 <code>origin: 'subagent'</code> 创建（UI 会话列表天然过滤）；关闭时 <code>handle.dispose()</code> 销毁 agent 并用 shell 删除持久化落盘文件，进程重启后也不存在</td>
+</tr>
+</tbody></table>
+<h2>为什么是「fork + 补全」而不是纯 fork</h2>
+<p>事件级 fork（seed）要求「无未闭合轮次」，所以只能取到主会话<strong>最后一个已完成 turn</strong> 之前的历史。主会话长期运行时，这个历史是滞后的。</p>
+<p>解决：<code>recentMainContext()</code> 直接读主会话的<strong>内存日志</strong>——不受重放约束，当前进行中轮次里已提交的事件（用户消息、助手消息、工具调用）全部可见——取 fork 边界之后的最新活动，随 boundary 消息注入。侧边会话因此<strong>既知道历史，也知道主会话此刻在干什么</strong>。</p>
+<h2>为什么延迟初始化</h2>
+<p>点击按钮<strong>立即</strong>弹出面板（不等待任何创建过程）；fork + 子 agent 的创建发生在<strong>首条消息发送时</strong>。打开但未使用不会产生任何会话。</p>
+<h2>架构</h2>
+<pre><code>┌─────────────────────────── Host（DSH 进程）───────────────────────────┐
+│ lib/index.js（零依赖 ESM，不 import 任何 @deepseek-ai/*）             │
+│  webServer 路由 POST /side-session/api/&lt;method&gt;                       │
+│   create → fork seed + 近期上下文快照 + boundary 消息 + 子 agent       │
+│   prompt → agent.followup（host 内驱动）                              │
+│   cancel → agent.cancel                                               │
+│   close  → dispose agent + 删除落盘文件                               │
+│   list / status                                                       │
+└───────────────────────────────────────────────────────────────────────┘
+┌────────────────────────── Client（浏览器）────────────────────────────┐
+│ lib/client.js（ModuleLoader bundle，/plugins/@dsh-external/...）      │
+│  conversation.session.header.actions  「侧边会话」按钮                 │
+│  shell.overlay                       浮动侧边面板                     │
+│    助手消息复用主会话的 MarkdownText（GFM/KaTeX/代码块/复制按钮）、    │
+│    思考折叠、工具调用 chip、运行状态、错误显示                         │
+│  RPC：fetch POST /side-session/api/&lt;method&gt;                           │
+└───────────────────────────────────────────────────────────────────────┘
+</code></pre>
+<ul>
+<li>Host/Client 通过 webServer JSON 路由通信（与 <code>dsh-balance-plugin</code> 等 profile 插件相同的零依赖范式：profile bundle 只能解析 profile 自己的 node_modules，不能 import <code>@deepseek-ai/*</code>）。</li>
+<li>面板复用标准 <code>sessions</code> 服务：<code>binding(sessionId)</code> 绑定会话、<code>session.subscribe()/getSnapshot()</code> 渲染消息流；fork 历史与 boundary 消息在渲染时过滤（<code>seq &lt; seedLength</code>、<code>source.plugin === 'side-session'</code>）。</li>
+<li>消息发送不走 wire 的 <code>session.prompt</code>（它会拒绝 <code>origin: 'subagent'</code> 的会话），由 host 半部直接 <code>agent.followup()</code>。</li>
+</ul>
+<h2>安装</h2>
+<p>静态 profile 插件，纯 JS 无构建步骤，支持本地路径 / tarball / GitHub 安装：</p>
+<pre><code># 本地路径（仓库或 tarball 均可，效果等价）
+dsh plugin --profile web add /path/to/dsh-side-session
+# 或 GitHub（若发布到公开仓库）
+dsh plugin --profile web add github:你的名字/dsh-side-session
+</code></pre>
+<p><code>dsh plugin add</code> 会把它写入 profile 的 <code>package.json</code>（<code>dsh.profile.bundles</code> 自动追加，patch 机制生效）。<strong>重启 dsh web 后生效</strong>。</p>
+<h2>使用</h2>
+<ol>
+<li>打开 DSH Web 界面并进入任意会话。</li>
+<li>会话头部点击「侧边会话」→ 右侧立即打开侧边临时会话窗口（fork 与 agent 创建延迟到首条消息）。</li>
+<li>在窗口中提问，代理将以与主会话相同的目录 / 工具 / 技能 / 权限工作，遵守 boundary 提示词（历史仅供参考、非破坏性探索、不干扰主线程）。</li>
+<li>点击「关闭」→ 侧边会话被销毁并删除落盘记录，无法再次打开。</li>
+</ol>
+<h2>文件</h2>
+<ul>
+<li><code>lib/index.js</code> — Host 半部（零依赖）：fork + 近期上下文快照 + boundary 消息注入，创建 / 发送 / 停止 / 关闭 / 列出侧边会话；webServer JSON 路由。</li>
+<li><code>lib/index.js</code> — Host 半部（零依赖）：fork + 近期上下文快照 + boundary 消息注入，创建 / 发送 / 停止 / 关闭 / 列出侧边会话；webServer JSON 路由。</li>
+<li><code>lib/client.js</code> — Client 半部（ModuleLoader bundle）：头部按钮 + 浮动面板 UI，助手消息复用主会话 MarkdownText。</li>
+<li><code>package.json</code> — <code>dsh.bundle.patch</code>（layer patch）、<code>dsh.client</code>（web 平台声明）、peerDependencies（运行时契约文档，代码本身零依赖）。</li>
+<li><code>cordis.patch.yml</code> — bundle patch：把插件行插入 profile 的 layer stack。</li>
+<li><code>dsh.plugin.json</code> — 插件清单（元数据）。</li>
+<li><code>LICENSE</code> — MIT。</li>
+</ul>
+<h2>License</h2>
+<p>MIT</p>

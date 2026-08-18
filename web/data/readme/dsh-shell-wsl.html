@@ -1,0 +1,254 @@
+<h1>dsh-shell-wsl</h1>
+<blockquote>
+<p>English · <a href="https://github.com/kaixinyujue/dsh-shell-wsl/blob/HEAD/README.zh.md">中文</a></p>
+</blockquote>
+<p>A <strong>real-Linux bash execution environment</strong> for <a href="https://github.com/deepseek-ai/deepseek-harness">DeepSeek Harness</a> (dsh) on Windows: every <code>bash</code> tool call is routed into a <strong>disposable Docker container</strong> (Docker Desktop / WSL2 backend), with the workspace bind-mounted for two-way file sharing and automatic integration with the official permission presets.</p>
+<pre><code>docker run --rm --name dsh-exec-&lt;pid&gt;-&lt;seq&gt; -i
+  -v &lt;session workspace&gt;:/workspace[:ro] -w /workspace/&lt;rel&gt; -e ... ubuntu:24.04 bash -c &lt;command&gt;
+</code></pre>
+<p>The model keeps using the official <code>bash</code> tool (no new tools, no tool-layer changes); commands genuinely run in a container on the WSL2 Linux kernel. The executor declares the official <code>sandboxMode</code> capability bit (<code>workspace-write</code>), so permission presets (read-only / workspace-write / danger-full-access) integrate automatically — read-only sessions mount the workspace <code>:ro</code>, everything else mounts read-write.</p>
+<p>See the design document: <code>dsh-shell-wsl-design.md</code> (checked line-by-line against the <code>@deepseek-ai/dsh</code> 0.1.0-rc.6 source contracts).</p>
+<h2>Why a container, instead of the other approaches</h2>
+<p>On Windows, dsh exposes only <code>pwsh</code> by default (the official <code>tool-bash</code> is disabled on win32). The common community approaches to getting bash back each come with trade-offs:</p>
+<table>
+<thead>
+<tr>
+<th></th>
+<th><strong>dsh-shell-wsl (this plugin)</strong></th>
+<th>Git Bash (MSYS2) approaches</th>
+<th>WSL distro-direct approaches</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>Runtime</td>
+<td><strong>Real Linux</strong>: WSL2 kernel + Ubuntu 24.04 userspace</td>
+<td>MSYS2 emulation layer, not Linux</td>
+<td>Real Linux, but tied to a specific installed distro</td>
+</tr>
+<tr>
+<td>Isolation</td>
+<td>Disposable container, destroyed via <code>--rm</code> after every call</td>
+<td>No container isolation; runs as a host process</td>
+<td>Distro lives forever; state accumulates across sessions</td>
+</tr>
+<tr>
+<td>Permission-preset linkage</td>
+<td>Native: read-only automatically mounts <code>:ro</code></td>
+<td>Most implementations require danger-full-access, or fail to start inside the sandbox</td>
+<td>Common implementations let bash bypass the DSH file policy</td>
+</tr>
+<tr>
+<td>Prerequisite</td>
+<td>Docker Desktop only</td>
+<td>Git for Windows</td>
+<td>WSL2 + at least one distro</td>
+</tr>
+<tr>
+<td>State &amp; reproducibility</td>
+<td>Stateless; every call starts from a pinned image</td>
+<td>Stateless</td>
+<td>Stateful; easy to pollute with earlier commands</td>
+</tr>
+</tbody></table>
+<p><strong>The trade-off</strong>: one container cold start per command buys you real Linux, isolation, and permission linkage. If you want a zero-dependency, millisecond-start POSIX-ish environment, a Git Bash approach fits better. If you want a stateful Linux environment deeply tied to your distro, a WSL-direct approach fits better. If you want a <strong>clean, reproducible, permission-constrained real-Linux execution environment inside a Windows session</strong>, this plugin is exactly that.</p>
+<ul>
+<li><strong>Real Linux</strong>: genuine WSL2 kernel and Ubuntu userspace — Linux binaries, apt, pipes and process semantics work as-is</li>
+<li><strong>Zero pollution</strong>: every command runs in a brand-new container that is destroyed afterwards; no leftover <code>cd</code>, variables, or apt installs</li>
+<li><strong>Permission linkage</strong>: session permission presets map directly to read-only/read-write mounts (danger-full-access is equivalent to workspace-write under a container executor — see §7)</li>
+<li><strong>Complete lifecycle</strong>: background jobs, timeout tree-kill, orphan-container cleanup, and infrastructure-error classification, all inherited from the official executor contract</li>
+<li><strong>Zero tool-layer changes</strong>: the model keeps using the official <code>bash</code> tool; nothing new to learn</li>
+</ul>
+<hr>
+<h2>1. Environment requirements (P0 — verify before installing)</h2>
+<ol>
+<li><strong>Docker Desktop running</strong> (WSL2 backend), with the <code>docker</code> CLI available on Windows:<pre><code>docker version            # both client and server sections must print
+docker context show       # desktop-linux
+</code></pre>
+</li>
+<li><strong>Pre-warm the image</strong> (a first-time pull can exceed the default 120s timeout — pull it first):<pre><code>docker pull ubuntu:24.04
+</code></pre>
+</li>
+<li><strong>Verify the mount path</strong> (replace the path with your workspace):<pre><code>docker run --rm -v E:\your\workspace:/workspace -w /workspace ubuntu:24.04 bash -c "uname -a &amp;&amp; pwd &amp;&amp; ls"
+</code></pre>
+Expected: <code>Linux ... microsoft-standard-WSL2</code>, <code>/workspace</code>, and <code>ls</code> showing your Windows-side files.</li>
+<li>A distro is only required for the <code>wsl</code> transport (the default docker-cli transport needs none):
+in that case also run <code>wsl --install -d Ubuntu</code> and enable WSL integration for that distro in Docker Desktop.</li>
+</ol>
+<blockquote>
+<p>Note: run the commands above in <strong>your own terminal</strong>. An agent's tool sandbox may block
+<code>docker</code>/WSL probing (E_ACCESSDENIED / named pipes); the plugin itself runs in the host
+process and is not affected.</p>
+</blockquote>
+<h2>2. Installation</h2>
+<pre><code>dsh plugin --profile web add dsh-shell-wsl
+</code></pre>
+<p>This adds the package to <code>~/.dsh/profiles/web/package.json</code> and writes <code>dsh.profile.bundles</code>;
+the <code>dsh.bundle.patch</code> bundle metadata brings <code>cordis.patch.yml</code> into the patch stack
+(layer order: bundle layer → profile layer → <code>$DSH_HOME/cordis.patch.yml</code> → <code>--patch</code> layer).</p>
+<p>The patch does two things: inserts the <code>shell-wsl</code> row (auto-disabled outside win32, stays
+portable), and sets the host <code>pwsh-sandbox</code> row <code>disabled: true</code> (<code>ctx.shell</code> can only have
+one provider — duplicate service registration fails loud).</p>
+<p>Git-hosted plugins need the prepare script allowed in the profile's <code>pnpm-workspace.yaml</code>
+under <code>allowBuilds</code>, per pnpm's prompt.</p>
+<h2>3. Web UI: enable the wsl-container preset</h2>
+<p>Under the web surface the host tool rows are disabled by dsh-web-app and tools come from agent
+presets, so enable the preset after installing the plugin:</p>
+<pre><code>powershell -ExecutionPolicy Bypass -File &lt;plugin dir&gt;\scripts\install-preset.ps1 -SetDefault
+</code></pre>
+<p>Or manually: copy <code>presets/wsl-container/</code> to <code>~/.dsh/.agent-presets/wsl-container/</code> and switch
+the default preset to <code>WSL 容器模式</code> on the Web settings page. The preset changes exactly two
+rows relative to standard: <code>tool-bash</code> → <code>disabled: false</code> and <code>tool-pwsh</code> → <code>disabled: true</code>
+(the latter is mandatory — <code>tool-pwsh</code> also consumes <code>ctx.shell</code>, and leaving it enabled would
+run PowerShell command strings through the container executor, which makes no sense).</p>
+<h2>4. tui / headless integration</h2>
+<p>For tui/headless, the agent plane lives in the host (base patch: tool-bash disabled on win32,
+tool-pwsh enabled). Flip the rows in the <strong>profile patch</strong> (not the bundle patch — under web
+that would double-register the <code>bash</code> tool name against the preset):</p>
+<pre><code># ~/.dsh/profiles/&lt;profile&gt;/cordis.patch.yml
+- id: tool-bash
+  disabled: false
+
+- id: tool-pwsh
+  disabled: true
+</code></pre>
+<h2>5. Configuration</h2>
+<h3>5.1 Composition layer (cordis row config — edit this via the patch layers)</h3>
+<table>
+<thead>
+<tr>
+<th>Field</th>
+<th>Default</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>transport</code></td>
+<td><code>docker-cli</code></td>
+<td><code>docker-cli</code> (Windows-side CLI) or <code>wsl</code> (<code>wsl.exe -d &lt;distro&gt; -- docker</code>)</td>
+</tr>
+<tr>
+<td><code>distro</code></td>
+<td><code>Ubuntu</code></td>
+<td>Used only by the wsl transport</td>
+</tr>
+<tr>
+<td><code>image</code></td>
+<td><code>ubuntu:24.04</code></td>
+<td>Must include bash (alpine/busybox don't — that surfaces as a runner failure)</td>
+</tr>
+<tr>
+<td><code>workspaceMount</code></td>
+<td><code>/workspace</code></td>
+<td>Mount point inside the container</td>
+</tr>
+<tr>
+<td><code>workspaceRoot</code></td>
+<td>none (fallback)</td>
+<td>Fixed workspace root; normally the per-call policy's workspaceRoot is used</td>
+</tr>
+<tr>
+<td><code>containerPrefix</code></td>
+<td><code>dsh-exec</code></td>
+<td>Container name prefix: <code>&lt;prefix&gt;-&lt;pid&gt;-&lt;seq&gt;</code>, ≤63 chars</td>
+</tr>
+</tbody></table>
+<pre><code># Example: switch images (rewrite the row config in the profile patch — patch replaces the
+# whole row config, so restate every field)
+- id: shell-wsl
+  config:
+    transport: docker-cli
+    image: debian:bookworm-slim
+</code></pre>
+<h3>5.2 Settings layer (settings.yaml, hot-reload, budget fields only)</h3>
+<pre><code># ~/.dsh/settings.yaml
+bash:
+  timeoutMs: 120000
+  maxTimeoutMs: 600000
+  maxOutputBytes: 64000
+  maxSpillBytes: 67108864
+  graceMs: 3000
+</code></pre>
+<p>Environment identity fields (transport/image/…) must <strong>not</strong> go into settings.yaml — the base
+constructor registers the <code>bash</code> settings namespace with the base schema, and unknown keys are
+rejected by the schema.</p>
+<h2>6. Behavior semantics</h2>
+<ul>
+<li><strong>Normal exit costs nothing extra</strong>: <code>--rm</code> is trusted; no additional docker command is spawned.</li>
+<li><strong>kill / timeout / cancel</strong>: the docker.exe tree is killed with <code>taskkill /T /F</code> on the Windows
+side, then a best-effort <code>docker rm -f &lt;name&gt;</code> is appended; the lazy reaper is armed.</li>
+<li><strong>Lazy reaper</strong>: before the next spawn (only when a kill happened, or on the first spawn of this
+executor instance — covering host-crash recovery) a <code>docker ps -a</code> prefix scan force-removes
+every leftover container not in the live-handle table. The reaper never runs during normal operation.</li>
+<li><strong>Infrastructure error classification</strong>: daemon down, docker CLI missing, image pull failure,
+image without bash, distro missing → <code>WslContainerUnavailableError</code> (isError, the model stops
+retrying); a command's own nonzero exit stays an ordinary <code>[exit code: N]</code>.</li>
+<li><strong>read-only</strong>: mounts <code>:ro</code>; writing /workspace inside the container is an ordinary EROFS-class
+command error. <strong>workspace-write / danger-full-access</strong>: both mount read-write (a container
+executor cannot grant host-wide access, so danger-full-access is equivalent to workspace-write).</li>
+<li><strong>workdir</strong>: Windows absolute paths map to <code>/workspace/&lt;rel&gt;</code> by case-insensitive prefix match
+against the workspace root; container paths already under <code>/workspace</code> pass through; paths
+outside the workspace fall back to <code>/workspace</code> with a one-line stderr warning (non-blocking).</li>
+<li><strong>env</strong>: <code>ENV_OVERRIDES</code> (NO_COLOR/TERM/PAGER/GIT_PAGER) + spec.env + spec.dshEnv materialize as
+<code>-e KEY=VALUE</code> (passed as argv parameters, no quoting issues), and <code>LANG=C.UTF-8</code> is forced.
+Under the wsl transport, Windows paths in <code>DSH_*</code> are translated to <code>/mnt/&lt;drive&gt;/...</code>.</li>
+<li><strong>stdin</strong>: <code>docker run -i</code> keeps stdin open, so hooks' stdin data channel works.</li>
+<li>Background jobs, timeouts, output caps, spill files, and the <code>[exit code: N]</code> marker contract
+are all inherited from <code>LocalBashExecutor</code> / <code>ctx.subprocess</code> — zero reimplementation.</li>
+</ul>
+<h2>7. Known limitations</h2>
+<ul>
+<li><strong>No interactive PTY / persistent shell</strong>: every call is a brand-new container (matching the
+official fresh-shell semantics; apt installs, <code>cd</code> and variables don't survive across calls).
+If you need a persistent shell / PTY, extend via the official <code>terminal</code> capability family —
+this plugin deliberately keeps the one-shot semantics.</li>
+<li><strong>Occasional timeouts on short commands</strong>: usually a first-time image pull; pre-warm with
+<code>docker pull</code> (see §1).</li>
+<li><strong>Mount I/O is slower than native Windows</strong>: inherent to Docker Desktop file sharing
+(9p / grpcfuse).</li>
+<li><strong><code>rm -rf</code> inside the mount is not blocked by ACL</strong>: the container can only see the mounted
+volume and has no write access to the system drive — the same risk surface as workspace-write mode.</li>
+<li><strong>danger-full-access is equivalent to workspace-write</strong>: a container executor cannot grant
+host-wide access; both mount read-write (see §6).</li>
+<li><strong>No <code>docker</code> / <code>wsl.exe</code> inside the container, on purpose</strong>: do Docker/WSL troubleshooting
+in <strong>the user's own terminal</strong> (probing from inside the agent sandbox is unreliable too).</li>
+<li><strong>Private image registries</strong>: the docker-cli transport shares Docker Desktop credentials; the
+wsl transport needs a credential helper configured inside the distro.</li>
+<li><strong>Chinese / UTF-8 output</strong>: the container forces <code>LANG=C.UTF-8</code>; rendering is normal.</li>
+</ul>
+<h2>8. Acceptance checklist (mirrors design doc §9)</h2>
+<blockquote>
+<p>This plugin has completed a full acceptance round: the runtime chain (tool table / real Linux /
+mount / workdir mapping / two-way file sharing / background jobs / timeout / no orphan
+containers / read-only mount enforcement / file-tool regression) and the unit + integration
+test suites all pass. The checklist below is kept for re-verification and regression runs.</p>
+</blockquote>
+<ol>
+<li>The <code>bash</code> tool appears; <code>uname -s</code> → <code>Linux</code>.</li>
+<li>With <code>workdir</code> set to <code>E:\…\sub</code>, <code>pwd</code> inside the container → <code>/workspace/sub</code>; files are visible in both directions.</li>
+<li><code>run_in_background</code> + <code>job_output</code> / <code>job_kill</code> work end-to-end.</li>
+<li>After timeout/kill, <code>docker ps -a --filter name=dsh-exec-</code> is empty; also empty after normal runs.</li>
+<li>With Docker Desktop stopped, a bash call surfaces as an infrastructure error (runner failure), not a command failure.</li>
+<li>In a read-only session, writing /workspace inside the container fails (ro mount); workspace-write can write.</li>
+<li>Under the <code>wsl-container</code> preset there is only <code>bash</code>, no <code>pwsh</code>.</li>
+<li>Windows-side read/write/edit file tools behave unchanged (regression).</li>
+<li><code>npm test</code> is fully green (6 test files, 49 cases); <code>$env:DSH_WSL_INTEGRATION="1"; npm run test:integration</code> is fully green (9 cases, requires Docker Desktop running).</li>
+</ol>
+<h2>9. Development</h2>
+<pre><code># One-time environment prep: junction the deps to the local DSH install's node_modules
+# (avoids installing peer dependencies)
+New-Item -ItemType Directory -Force node_modules | Out-Null
+cmd /c mklink /J node_modules\@deepseek-ai "$env:APPDATA\npm\node_modules\@deepseek-ai\dsh\node_modules\@deepseek-ai"
+cmd /c mklink /J node_modules\@types       "$env:APPDATA\npm\node_modules\@deepseek-ai\dsh\node_modules\@types"
+# TypeScript lives outside the plugin dir (npm reify ELOOPs on junctioned node_modules)
+npm install --prefix ..\.dsh-dev-tools --no-save --no-package-lock typescript
+
+npm run build                    # tsc → lib/
+npm test                         # unit tests (pure functions + executor tests with a fake subprocess)
+$env:DSH_WSL_INTEGRATION = "1"
+npm run test:integration         # real-docker integration tests (requires Docker Desktop running)
+</code></pre>
+<p>Layout: <code>src/</code> (pure functions: paths/env/naming/classify/argv + the executor index) → compiled to
+<code>lib/</code>; <code>tests/</code> (unit + optional integration); <code>cordis.patch.yml</code> (bundle patch layer);
+<code>presets/wsl-container/</code> (web preset); <code>scripts/install-preset.ps1</code>.</p>
+<h2>License</h2>
+<p>MIT</p>

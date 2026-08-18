@@ -1,0 +1,142 @@
+<h1>dsh-rewind — 会话回退插件 (Conversation Rollback for DSH)</h1>
+<p>一个 100% 开源的 DeepSeek Harness（<code>dsh</code>）插件 bundle，借鉴 opencode / dsh-turn-rewind 的 <strong>OpenCode 式架构</strong>：为非 git 场景实现内容寻址的文件快照台账，并通过 DSH 官方 <code>sessions.fork</code> <strong>重开一个新会话</strong>来回退对话——恢复文件 + 从选中的那一轮输入重新续起。</p>
+<ul>
+<li><strong>回退重开（fork）</strong>：每条用户消息下方出现一个<strong>纯图标回退按钮</strong>。点击后弹出确认弹窗，预览"回退会撤销的文件"，确认后：<strong>先恢复这些文件</strong>，再通过 DSH 官方 <code>sessions.create</code> / <code>sessions.fork</code> <strong>新建一个会话</strong>（从选中的这一轮输入之后继续），并把这条输入的原文<strong>填回新会话的输入框</strong>，方便你改完重新发送。<strong>原会话会自动归档</strong>（从会话列表消失；DSH 没有"删除单个会话"的 RPC，归档是官方机制——数据与历史仍在磁盘上，新会话继续可回退）。</li>
+<li><strong>内容寻址快照（非 git）</strong>：每个 agent turn 第一次 step 前，用递归目录遍历（不用 git）把工作区哈希成 sha256 的内容寻址快照，存进 <code>$DSH_HOME/rewind-ledger</code> <strong>台账目录</strong>（内容寻址的 blob + per-turn manifest 都放在这里；<code>rewind</code> 的第一版原型数据与之无关，已废弃）；回退时把工作区恢复到那个 turn 的快照。支持新增/删除/修改/权限/文本与二进制。</li>
+</ul>
+<blockquote>
+<p><strong>为什么是"重开新会话"而不是"原地折叠"</strong>：DSH 的会话日志是只读追加、不可物理截断；而且 DSH 浏览器端<strong>不会</strong>根据第三方插件追加的普通 <code>user/message</code> + <code>surfaceOp.replace</code> 折叠对话。所以采取与 turn-rewind 同款的做法——恢复文件后 fork 一个新会话（原会话归档、从列表隐藏）。浏览器打开新会话时天然只显示到选中的那一轮为止，可靠且不需要 DSH 内部支持第三方 surface 折叠。</p>
+</blockquote>
+<hr>
+<h2>快速开始</h2>
+<h3>安装</h3>
+<p>要求 <code>dsh</code> 与 <code>pnpm</code> 在 PATH 上。</p>
+<pre><code>REM 说明：%USERPROFILE% 是当前用户的 home（等价于 PowerShell 的 $env:USERPROFILE）。
+REM 以下命令在 cmd 与 PowerShell 中均可运行（PowerShell 请把 %USERPROFILE% 换成 $env:USERPROFILE）。
+
+# 1) 克隆
+cd %USERPROFILE%
+git clone https://github.com/2501136589/dsh-rewind.git
+cd dsh-rewind
+
+# 2) 安装进 web profile
+#    推荐（无空格路径）：
+dsh plugin --profile web add .
+#    若路径含空格导致相对锚定解析出错，则进 profile 目录直接 pnpm：
+cd %USERPROFILE%\.dsh\profiles\web
+pnpm add "link:&lt;dsh-rewind 的绝对路径&gt;"
+</code></pre>
+<p>无论哪种方式，最后都要让 <code>@xiaoxin/dsh-rewind</code> 出现在 web profile 的 <code>package.json</code> 里：</p>
+<pre><code>"dsh": { "profile": { "bundles": [ "@deepseek-ai/dsh-base", "@deepseek-ai/dsh-web-app", "@xiaoxin/dsh-rewind" ] } },
+"dependencies": { "@xiaoxin/dsh-rewind": "link:&lt;路径&gt;" }
+</code></pre>
+<blockquote>
+<p>注意：bundle 行必须用 <code>- insert:</code> 包裹在 bundle 的 <code>cordis.patch.yml</code> 里（本仓库已配好），否则 loader 会把它当“按 id 覆盖已有 entry”而静默忽略，导致按钮不出现。</p>
+</blockquote>
+<p>然后<strong>完全停掉再启动 <code>dsh web</code></strong>（装载器与浏览器客户端 bundle 在新进程里才注册），再 <strong>Ctrl+F5</strong> 强刷。成功后，每条已完成的助手消息旁会出现一个纯图标回退按钮。</p>
+<h3>通过 npm 安装（可选）</h3>
+<p>发布到 npm 后，可用 <code>dsh plugin --profile web add @xiaoxin/dsh-rewind</code> 直接安装 package 名。</p>
+<h3>常见问题</h3>
+<ul>
+<li><strong><code>declares no dsh.bundle in its package.json</code></strong>：<code>dsh plugin</code> 没把这个包识别为 bundle。确认 <code>package.json</code> 里有 <code>"dsh": { "bundle": { "patch": "./cordis.patch.yml" } }</code>。</li>
+<li><strong><code>client bundle not found</code></strong>：确认 <code>exports["./client"]</code> 指向真实存在的 <code>lib/client.js</code>。</li>
+<li><strong>重启了但没有回退按钮</strong>：先确认 profile 的 <code>dsh.profile.bundles</code> 里有 <code>@xiaoxin/dsh-rewind</code>；再确认 <code>cordis.patch.yml</code> 用的是 <code>- insert:</code> 包裹 loader 行（本仓库已配好）。然后<strong>完全停掉再启动 <code>dsh web</code></strong>（不是只刷新页面），再 Ctrl+F5。</li>
+</ul>
+<hr>
+<h2>目录结构</h2>
+<pre><code>dsh-rewind/
+├─ package.json          # bundle 清单：dsh.bundle.patch + dsh.client（web）
+├─ cordis.patch.yml      # 装载 host 插件的 loader 行（必须用 - insert:）
+├─ lib/
+│  ├─ index.js           # host 侧入口：装配快照采集、/rewind 命令与 HTTP 路由
+│  ├─ snapshot.js        # 非 git 工作区遍历 + sha256 内容寻址快照/差异
+│  ├─ ledger.js          # 内容寻址 blob/manifest 台账（$DSH_HOME/rewind-ledger）
+│  ├─ host-rewind.js     # turn 采集、消息→fork 边界解析、恢复、HTTP handler
+│  ├─ client.js          # 浏览器侧：用户消息回退按钮 + 重开会话
+│  └─ types/*.d.ts       # 类型声明
+├─ test/                 # smoke 测试（node 直跑，无外部依赖）
+├─ LICENSE               # MIT
+└─ README.md
+</code></pre>
+<p>一个包同时承载 host 逻辑（<code>dsh.bundle.patch</code> → <code>cordis.patch.yml</code>）和浏览器 UI（<code>dsh.client.platform:"web"</code> + <code>exports["./client"]</code>）。<code>dsh-client-modules</code> 会扫描 loader 行里的包，发现 <code>dsh.client.*</code> 声明后把 <code>lib/client.js</code> 喂给浏览器。host 侧不依赖 git：快照靠 <code>snapshot.js</code> 的目录遍历 + <code>ledger.js</code> 的内容寻址存储。</p>
+<hr>
+<h2>用法</h2>
+<h3>浏览器界面</h3>
+<ol>
+<li>打开一个会话，在每条<strong>用户输入</strong>下方的时间/操作栏里会看到一个<strong>纯图标回退按钮</strong>（向后/撤销箭头）。</li>
+<li>点击后弹出<strong>确认弹窗</strong>：先列出"回退会撤销的文件改动"（对比选中那一轮快照与当前工作区）。</li>
+<li>确认后：插件先恢复这些文件，然后通过 DSH 官方 <code>sessions.fork</code>/<code>create</code> <strong>新建一个会话</strong>（从选中那一轮之后继续），并把这条输入的原文<strong>填回新会话输入框</strong>。</li>
+<li>在新会话输入框里编辑这条输入并发送——agent 从已恢复文件、且只带选中轮之前历史的状态继续。<strong>原会话会被自动归档，从会话列表隐藏</strong>（数据与历史仍在磁盘上；可在 <code>cordis.patch.yml</code> 里设 <code>archiveOriginalSession: false</code> 保留原会话）。</li>
+</ol>
+<h3>命令方式（等价，便于脚本/无 UI 调用）</h3>
+<p><code>/rewind &lt;messageSeq|messageId&gt; [rewind|list-files|dry-run]</code></p>
+<ul>
+<li><code>messageSeq</code> —— 目标<strong>用户消息</strong>的 seq；也可传 <code>messageId</code>（会按 <code>user/message</code> 的 <code>data.message.id</code> 解析）。必须是某轮的<strong>开场用户消息</strong>。</li>
+<li>默认 <code>rewind</code>（恢复文件 + fork 新会话）；<code>list-files</code> / <code>dry-run</code> 只预览不执行。</li>
+<li><strong><code>/rewind list</code></strong>（或直接 <code>/rewind</code>）：列出本会话所有可回退的用户消息 —— 每条显示 <code>seq | turn | 是否有快照 | 消息预览</code>，照着抄 seq 即可。</li>
+<li>⚠️ <strong>seq 不是"第几条消息"</strong>：seq 是会话日志的<strong>原始事件流水号</strong>，<code>user/message</code>、<code>turn/start</code>、<code>tool/call</code> 等所有事件共用一条递增计数器，所以用户消息的 seq 往往不连续（例如 <code>1, 47, 92…</code>）。<code>/rewind list</code> 会直接给出可用值；浏览器按钮弹窗里显示的也是这套 seq。</li>
+</ul>
+<hr>
+<h2>回退的语义细节（务必了解）</h2>
+<ul>
+<li><strong>会话与文件是两套独立的回退</strong>：文件靠内容寻址快照回退；对话靠官方 <code>sessions.fork</code>/<code>create</code> 重开新会话。两者各自可靠，不需要 DSH 内部支持第三方表面折叠。</li>
+<li><strong>重开新会话</strong>：确认后，插件调用 <code>apiProxy.sessions.fork({ sessionId, atSeq: 选中轮之前的 turn/end })</code>（首轮则 <code>sessions.create({ cwd })</code>）新建一个会话，其历史天然只到选中的那一轮为止；然后调用 <code>apiProxy.workspace.archiveSession</code> <strong>归档原会话</strong>（默认，可在 <code>cordis.patch.yml</code> 关掉）——DSH 没有"删除单个会话"的 RPC，归档会把原会话从侧栏列表和搜索中排除，但它的数据与台账快照仍在磁盘上，分叉后的新会话继续回退不受影响。浏览器打开新会话即看到折叠后的效果。</li>
+<li><strong>采集边界 = turn</strong>：每个 agent turn 的第一次 step（<code>agent/pre-step</code> 且 <code>step===1</code>）前，对工作区做一次快照（哈希成 sha256 内容寻址树存进台账）。这是 opencode 式"step 前打 baseline"，而不是每条用户消息/每次写入。</li>
+<li><strong>内容寻址、几乎不复制</strong>：每个文件按内容 sha256 去重存储（相同内容只存一份），台账只在 <code>$DSH_HOME/rewind-ledger/</code> 下按工作区 sha256 分目录。支持新增/删除/修改/权限/文本与二进制；超大或超总量会明确失败，不静默漏。</li>
+<li><strong>只能回退到"开启采集"之后的 turn</strong>：启用插件之前的轮次没有快照，无法回退，会明确提示。</li>
+<li><strong>快照边界与对话边界一致</strong>：一个 turn 的"开场用户消息"才能在 Web 上回退（对应它的快照 + 它之前的 turn/end 作为 fork 点）。</li>
+<li><strong>分叉会话也能继续回退（血缘解析）</strong>：fork 出来的新会话会<strong>原样拷贝</strong>父会话的事件（seq 逐条一致）直到 <code>header.seedLength</code>。在这些"拷贝来的消息"上回退时，插件沿 <code>header.parentSession</code> 血缘链向上找到真正录制这些快照的会话，用它的台账（<code>checkpointOwnerFor</code>）。所以 A→回退→A2，在 A2 里继续回退 A 的消息、甚至回退 A2 自己续写的新轮次，都成立；消息在血缘链上每一层的 <code>seedLength</code> 之内，就继续向上找。</li>
+<li><strong>文件无改动也能回退</strong>：回退的核心是"重开会话"；当工作区已经与该快照一致时，弹窗仍提供"确认回退"（只做 fork + 填回原文），不会卡死。</li>
+<li><strong>回退只动本会话自己的文件（跨会话隔离）</strong>：多个会话共享同一工作区时，快照是"整个目录"的状态。回退范围被限制为<strong>该会话自己碰过的文件</strong>——从会话事件里的 fs 写工具调用（<code>write</code>/<code>edit</code> 一族，<code>tool/call</code>）∪ 该会话<strong>连续快照之间的漂移</strong>（覆盖 shell 副作用）。所以 B 会话回退时，A 会话后来改的文件<strong>不会出现在预览里、也不会被还原</strong>。会话事件完全取不到时才回退到"全量差异"（scope=workspace，旧行为）。</li>
+</ul>
+<hr>
+<h2>架构</h2>
+<h3>Host 侧（<code>lib/index.js</code> + <code>host-rewind.js</code> + <code>snapshot.js</code> + <code>ledger.js</code>）</h3>
+<ul>
+<li><strong>采集</strong>：<code>TurnCheckpointCoordinator</code> 用<strong>PREPENDED</strong> 的 <code>agent/pre-step</code> 监听器，在 <code>step===1</code> 时对 <code>session.header.cwd</code> 做一次快照（<code>walkWorkspace</code> 递归遍历，跳过 <code>.git</code>/<code>node_modules</code>/台账目录；<code>snapshot.js</code> 哈希成 sha256 树），并把内容寻址 blob + per-turn manifest 写入 <code>ledger.js</code> 的 <code>LedgerStore</code>（<code>$DSH_HOME/rewind-ledger</code>）。绝不阻塞/否决 agent。</li>
+<li><strong>回退</strong>：<code>/rewind &lt;messageSeq|messageId&gt;</code> 命令 + 同名 <code>/rewind</code> HTTP 路由。<ol>
+<li><code>messageTargetFor</code> 把目标用户消息解析为 <code>{ turn, turnStartSeq, previousTurnEndSeq }</code>（必须是该轮的<strong>开场用户消息</strong>）；</li>
+<li>用 <code>diffTrees(快照entries, 当前树)</code> 得到改动文件预览；</li>
+<li><code>engine.applyRestoreFiles</code> 把工作区恢复到快照（删新增/恢复修改/找回删除，路径做越界防护）；</li>
+<li><code>createConversationRestart</code> 调 <code>apiProxy.sessions.fork</code>（有 previousTurnEndSeq 时）或 <code>sessions.create</code>（首轮；先经 <code>workspace.list</code> 解析源会话工作区、把 <code>workspaceId</code> 带进载荷，避免生成"无工作区"的新会话）得到新会话 id。</li>
+</ol>
+</li>
+</ul>
+<h3>浏览器侧（<code>lib/client.js</code>）</h3>
+<ul>
+<li><code>apply(ctx)</code> 注入 <code>conversation.session.header.actions</code> 槽，用一个 session 作用域组件经过 React portal 把回退按钮放进每条<strong>用户消息</strong>的 action 行（<code>data-chat-flow-kind="user"</code> + <code>data-chat-anchor-key</code> + <code>data-time-hover-root</code>）。</li>
+<li>点击弹窗 → <code>GET /rewind?sessionId=..&amp;messageSeq=..</code> 预览文件改动 → 确认后 <code>POST /rewind</code> 恢复文件并 fork 新会话。</li>
+<li>成功后 <code>openSessionWithDraft</code>: <code>ctx.sessions.open(新会话id)</code> + 在该会话 <code>scope</code> 上 <code>ctx.conversation.input.for(scope).setDraft(原文)</code>，把这条输入原文填回新会话输入框。</li>
+</ul>
+<h3>为什么走官方 <code>sessions.fork</code> + 同源 HTTP，而不是 <code>session.command</code> + 表面替换</h3>
+<p>之前版本想走 <code>session.command</code> + <code>surfaceOp.replace</code> 原地折叠，但 DSH 浏览器端不渲染第三方 surface-replace，聊天永远不动。改用官方的 <code>sessions.fork</code>（新建会话）是平台原生支持、必定在浏览器端正确显示历史截断的方式；同源 HTTP 路由让浏览器能预览恢复前的文件改动，无需第三方 Remote 命名空间。</p>
+<hr>
+<h2>局限与后续</h2>
+<ul>
+<li><strong>重开会话而非原地折叠</strong>：回退会新建一个会话，并把原会话<strong>归档</strong>（从列表隐藏，默认行为，可用 <code>archiveOriginalSession: false</code> 关闭）。DSH 目前没有"删除单个会话"的 RPC，也没有在 UI 里取消归档的入口——归档后原会话从侧栏/搜索消失，但其数据仍在磁盘上（<code>~/.dsh/sessions/...</code>）。需要"物理删除"时，那要 DSH 平台支持第三方删除会话，超出本插件（也是一切第三方 bundle 的边界）。</li>
+<li><strong>快照边界 = turn</strong>：只能在"开启采集之后"的轮次回退；首轮没有上一轮 turn/end，会走 <code>sessions.create</code>。<strong>首轮回退会先通过 <code>workspace.list</code> 找到源会话所在的工作区，把新会话挂进同一工作区</strong>——不会出现"没有工作区"的新会话。</li>
+<li><strong>工作区遍历的取舍</strong>：<code>walkWorkspace</code> 跳过 <code>.git</code>、<code>node_modules</code> 和台账目录，不回退这些内容；超大文件/超总量会明确失败而不是静默漏。</li>
+<li><strong>跨会话隔离是启发式的</strong>：回退范围来自 fs 写工具调用 + 连续快照漂移。若 agent 用 shell 命令在<strong>最后一个 turn</strong> 里改文件（没有后续快照可对、也没有写工具调用），这类改动可能不被归因；会话事件缺失时整体退回"全量差异"（不隔离）。两个会话改过<strong>同一个文件</strong>时，后回退的一方可覆盖另一方的该文件改动（真正的冲突，无法自动裁决）。</li>
+<li><strong>并发/漂移</strong>：演示级实现没做 turn-rewind 那样的恢复点细锁、rescue 点、hash 验证后 rollback 与操作日志。若用于生产，建议参考 <code>dsh-turn-rewind</code> 补齐这些护栏（它已含完整的 Change Ledger）。</li>
+</ul>
+<h3>台账维护（<code>scripts/repair-ledger.mjs</code>）</h3>
+<p>内容寻址台账是<strong>只增不减</strong>的：采集绝不删除 blob（避免"UI 还列着某轮、blob 已被 GC"的 <code>BLOB_NOT_FOUND</code>）。需要瘦身时手动跑一次修复：</p>
+<pre><code>node scripts/repair-ledger.mjs            # 默认修 $DSH_HOME/rewind-ledger（无 DSH_HOME 则 ~/.dsh/rewind-ledger）
+node scripts/repair-ledger.mjs &lt;其他目录&gt; # 指定台账目录
+</code></pre>
+<p>它会删除：① 包含 <code>node_modules</code>/<code>.git</code> 路径的旧时代污染 manifest；② 引用了缺失/损坏 blob 的 manifest；然后 <code>collectGarbage</code> 清掉不再被任何 manifest 引用的 blob。</p>
+<h2>测试</h2>
+<pre><code>cd dsh-rewind
+node test/client-smoke.mjs      # 客户端：槽注册 + openSessionWithDraft 回填 helper
+node test/render-smoke.mjs      # 组件渲染：纯图标按钮 + Modal
+node test/host-smoke.mjs        # host：快照采集/差异/恢复 + messageTargetFor + fork
+node test/host-undo-smoke.mjs   # 端到端：恢复新增/删除/修改 + blob 哈希校验 + fork
+node test/host-fork-lineage-smoke.mjs # fork 血缘：A2/A3 里回退父会话消息的台账解析
+node test/host-scoped-rewind-smoke.mjs # 跨会话隔离：B 回退不碰 A 改过的文件
+# 或一次跑全部：
+npm test   # = 上面 6 个脚本依次执行
+</code></pre>
+<p>测试在临时工作区 + 临时 <code>DSH_HOME</code> 下直跑，不触网、不读真实 DSH 环境，<code>node</code> 即可。</p>
+<hr>
+<h2>License</h2>
+<p><a href="https://github.com/2501136589/dsh-rewind/blob/HEAD/LICENSE">MIT</a></p>

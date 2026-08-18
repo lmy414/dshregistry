@@ -1,0 +1,92 @@
+<h1>huahua-dsh-plugin-orchestra</h1>
+<p>DSH 插件管理系统（host + client profile 插件）：插件清单、更新检测、升级/回滚、备份、跨 agent 迁移。</p>
+<ul>
+<li>设计文档：docs/S1_架构设计草案.md（权威源）、docs/S2_工具层设计.md、docs/S3_面板设计.md、docs/adr/ADR-001~003</li>
+<li>当前阶段：<strong>一期功能 1-5 交付（M2 ✅ 核心引擎 / M3 ✅ 面板）</strong>——105/105 用例全绿（引擎 86 + 面板 19），S7 终审 🔴-1/🟡-3 已清零（client bundle + verify.mjs 门禁），待用户验收</li>
+<li>领域模型：src/domain/（单一权威类型源，与 --json schemaVersion 同源，S2 §3.6.4）</li>
+</ul>
+<h2>安装与使用</h2>
+<pre><code># 1. 安装为 DSH profile 插件（npm 发布后）
+dsh plugin --profile web add huahua-dsh-plugin-orchestra
+
+# 或本地路径安装（开发态）
+dsh plugin --profile web add file:./huahua-dsh-plugin-orchestra
+
+# 2. CLI 命令（node lib/cli/index.js，或经 bin 安装后直接 orchestra）
+node lib/cli/index.js list --json                # 插件清单（L1 用途摘要，缓存优先）
+node lib/cli/index.js check --json               # 检查更新（--force 绕 TTL 缓存但保留 ETag）
+node lib/cli/index.js upgrade &lt;pkg&gt; [--to &lt;ver&gt;] [--dry-run] [--yes]   # 升级：自动备份，失败自动回滚
+node lib/cli/index.js downgrade &lt;pkg&gt; --to &lt;ver&gt; [--yes]               # 降级
+node lib/cli/index.js rollback &lt;pkg&gt; [--backup &lt;id&gt;] [--yes]           # 回滚（缺省最近有效快照）
+node lib/cli/index.js backup list|create &lt;pkg&gt;|prune &lt;pkg&gt; [--force]   # 备份管理
+</code></pre>
+<ul>
+<li><strong>面板</strong>：安装后 settings 页出现「插件管理」入口卡（含可更新数角标）+ 右上角通知中心；清单/详情/变更日志/升级/回滚/备份/设置齐全（S3）。</li>
+<li><strong>数据目录</strong>：<code>~/.dsh/plugin-orchestra/</code>（config.json / cache/ / backups/ / logs/，单一来源，S1 §13）。</li>
+<li><strong>环境变量</strong>：<code>DSH_ORCHESTRA_*</code>（如 DSH_ORCHESTRA_PROFILE / DSH_ORCHESTRA_DATA_DIR）；<code>GITHUB_TOKEN</code> / <code>GH_TOKEN</code> 提升 GitHub 限流配额（匿名 60/h → 5000/h）。</li>
+<li><strong>退出码</strong>：0 ok / 2 用法错 / 3 目标不存在 / 4 无操作 / 5 失败已回滚（可重试）/ 6 失败需人工 / 130 中断；非 TTY 写命令需 <code>--yes</code>（<code>--dry-run</code> 只读演练豁免）。</li>
+</ul>
+<h2>构建与测试</h2>
+<pre><code>pnpm install        # 安装 devDeps（typescript 等）
+pnpm typecheck      # 双 tsconfig 类型检查（host + client）
+pnpm build          # tsc 编译（host → lib/，client → lib/client/）+ bundle-client（lib/client.js 浏览器产物，DSH loader 格式）
+pnpm test           # build + node --test（node:test，无需额外框架）
+pnpm test:client    # vitest + jsdom（组件测试，CI 跑）
+pnpm test:client:direct  # node 直跑面板纯函数单测（沙箱/无 jsdom 环境）
+</code></pre>
+<blockquote>
+<p>注：沙箱/CI 中若 node --test 的 runner 子进程被拒（spawn EPERM），
+可改为直接执行 <code>node tests/xxx.test.mjs</code>（node:test 内联运行）。</p>
+</blockquote>
+<h2>目录</h2>
+<pre><code>src/
+├── index.ts          # host 插件入口（re-export src/host/index）
+├── domain/           # 领域模型：类型 + 常量 + 接口签名（零框架依赖）
+│   ├── model.ts      # PluginRecord / UnifiedSource / ChangelogEntry ...
+│   ├── updater.ts    # UpdateSource 接口 / VersionInfo / UpdateReport ...
+│   ├── operation.ts  # op.state.json 阶段 / OperationResult / 退出码 ...
+│   ├── config.ts     # ConfigSchema / 键白名单 schema / 面板设置视图
+│   └── errors.ts     # 分级错误码（可重试/不可重试）
+├── host/             # host 半边（cordis 插件装配 + 服务）
+│   ├── index.ts      # 插件入口 + buildServices 装配（三服务 + Remote）+ 陈旧锁恢复
+│   ├── remote.ts     # Typert Remote 契约 + 实现（16 方法）
+│   ├── config-service.ts  # ConfigService（S1 §13 单一来源 config.json + 环境变量优先级）
+│   ├── inventory/    # 清单服务：scanner（四态 spec / status local）/ spec / purpose（L0/L1/L2）/ inventory-service（缓存指纹）
+│   ├── updater/      # 更新引擎：sources/（GitHub ETag + npm corgi）/ update-engine（single-flight）/ router / rate-limit / cache / semver / http / errors
+│   └── install/      # 操作引擎：operation-engine（原子序列+崩溃恢复）/ op-state / backup（manifest 四态）/ path-guard（🔴-3）/ spawn / verify / drift / checksum
+├── cli/             # orchestra CLI（退出码 0-6/130 + --json 外壳 + --force 白名单 + DX 契约）
+│   └── index.ts / args.ts / app.ts / output.ts / help.ts / services.ts
+└── client/          # client 半边（S3 面板，React）
+    ├── index.ts      # client 装配入口（remote.$mount + shell + UI 安装）
+    ├── install.ts    # installPluginOrchestraUi：settings 入口卡 + 通知中心 floater
+    ├── contribution.ts  # Typert contribution（16 方法字段级 parse + strict codec）
+    ├── shell.ts      # createBrowserShell（registerSlot/prompt/openExternal/copyText/...）
+    ├── store.ts      # host-backed 数据源（useSyncExternalStore + 事件订阅 + 轮询兜底）
+    ├── model.ts      # 视图折叠/筛选/排序/通知去重/recoverySuggestion（纯函数）
+    ├── i18n.ts       # 冻结双语 catalog（zh-CN / en）
+    ├── markdown.ts   # 受限 Markdown 渲染器（剥离 HTML，安全铁律）
+    ├── diff.ts       # 并排行级 LCS diff（自研 ~60 行）
+    ├── orchestra.css / css.d.ts
+    └── components/   # PluginOrchestraApp（根）/ context / common / Icons
+        ├── inventory/PluginListPage.tsx    # 清单页（搜索/筛选/排序/行内操作）
+        ├── detail/PluginDetailPage.tsx     # 详情页（5 Tabs + 用途解读 L0/L1/L2）
+        ├── ops/ops.tsx                      # ConfirmDialog（dry-run 预览）/ OperationProgress / ResultBanner / RecoveryDialog
+        ├── notify/NotificationCenter.tsx    # 通知中心 floater + 角标
+        ├── backups/BackupListView.tsx       # 备份管理（verified/corrupt）
+        └── settings/SettingsPage.tsx        # 设置页（ADR-002 参数）
+</code></pre>
+<h2>测试</h2>
+<pre><code>tests/
+├── 引擎侧（node:test，86 用例全绿）：path-guard 9 / operation-engine 17 / t19-fixes 6 / update-sources 11 / rate-limit 4 /
+│   cli 14 / config-service 5 / remote 5 / inventory 5 / spec 4 / backup-manifest 3 / package-contract 2 / bundle-client 1
+└── client/（面板，19 用例全绿）：model 8 / markdown 4 / diff 3 / contribution 4 + components.spec.tsx（vitest）
+</code></pre>
+<h2>文档</h2>
+<ul>
+<li>docs/L1_项目蓝图.md：顶层蓝图（里程碑 M1-M4 ✅）｜ docs/L3_项目纪要.md：阶段纪要</li>
+<li>docs/S1<del>S3：架构/工具层/面板设计 ｜ docs/adr/ADR-001</del>003：决策记录</li>
+<li>docs/S4_评审报告.md / S5_复核放行意见.md / S6_引擎层复核报告.md：质量门</li>
+<li>docs/handoff/：S1 阶段 handoff + 一期交付 handoff ｜ docs/一期-验收报告.md：验收报告（痛点→功能→证据）</li>
+</ul>
+<h2>License</h2>
+<p>MIT — see LICENSE.</p>

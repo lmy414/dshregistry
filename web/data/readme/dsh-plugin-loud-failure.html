@@ -1,0 +1,342 @@
+<h1>dsh-plugin-loud-failure</h1>
+<p><a href="https://github.com/Rhymer-Lcy/dsh-plugin-loud-failure/actions/workflows/ci.yml"><img src="https://github.com/Rhymer-Lcy/dsh-plugin-loud-failure/actions/workflows/ci.yml/badge.svg" alt="ci"></a>
+<a href="https://github.com/Rhymer-Lcy/dsh-plugin-loud-failure/blob/HEAD/LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="license: MIT"></a></p>
+<p>A <a href="https://github.com/deepseek-ai/deepseek-harness">DeepSeek Harness</a> plugin that turns silent tool failures into loud ones.</p>
+<p>A tool call can exit 0 and still have failed. <code>pandoc</code> drops a glyph and only warns; a pipe swallows a Python traceback; a <code>;</code> chain hides <code>command not found</code>; NumPy prints a <code>RuntimeWarning</code> and hands back <code>nan</code>. The exit code says success, the model reads success, and the mistake travels downstream. This plugin is one <code>tools/post-execute</code> waterfall listener: it matches the text a tool returned against a rule table and, on a hit, either <strong>blocks</strong> the result (it becomes an <code>isError</code> result whose content leads with the explanation and keeps the original output) or <strong>attaches a notice</strong> that lands in the model's next request. It changes no tool and no loop: it takes part in the ordered post-execute waterfall (context-only matches delegate and keep downstream decisions; blocking matches short-circuit on purpose) and unmounts cleanly.</p>
+<h2>Contents</h2>
+<ul>
+<li><a href="#why">Why</a></li>
+<li><a href="#how-it-works">How it works</a></li>
+<li><a href="#install">Install</a></li>
+<li><a href="#configuration">Configuration</a></li>
+<li><a href="#built-in-rules">Built-in rules</a></li>
+<li><a href="#what-the-model-sees">What the model sees</a></li>
+<li><a href="#verification">Verification</a></li>
+<li><a href="#design-notes">Design notes</a></li>
+<li><a href="#model-experience">Model Experience</a></li>
+<li><a href="#known-limitations-and-deferred-work">Known Limitations and Deferred Work</a></li>
+<li><a href="#development">Development</a></li>
+<li><a href="#license">License</a></li>
+</ul>
+<h2>Why</h2>
+<p>Every built-in rule comes from a failure that was observed to hide behind a successful exit code:</p>
+<table>
+<thead>
+<tr>
+<th>Observed</th>
+<th>What the model saw</th>
+<th>What had happened</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>pandoc ... --pdf-engine=xelatex</code> prints <code>Missing character: There is no ₂ in font ...</code></td>
+<td>a PDF was written, exit 0</td>
+<td>the subscript in <code>SpO₂</code> was silently dropped from the PDF</td>
+</tr>
+<tr>
+<td><code>python script.py | tail -n 20</code></td>
+<td>the last 20 lines, exit 0</td>
+<td>a traceback scrolled by; <code>tail</code> supplied the exit status</td>
+</tr>
+<tr>
+<td><code>pandocc in.md -o out.pdf; ls -l out.pdf</code></td>
+<td><code>bash: pandocc: command not found</code> followed by a listing, exit 0</td>
+<td>nothing was built; <code>ls</code> supplied the exit status</td>
+</tr>
+<tr>
+<td><code>python calc.py</code> prints <code>RuntimeWarning: invalid value encountered in divide</code></td>
+<td>an array, exit 0</td>
+<td>the array contained <code>nan</code></td>
+</tr>
+<tr>
+<td>a PowerShell 5.1 command run with <code>2&gt;&amp;1</code></td>
+<td><code>NativeCommandError</code>, <code>$?</code> false</td>
+<td>the program had exited 0; PowerShell wrapped its stderr</td>
+</tr>
+<tr>
+<td>a Windows console printing <code>���</code></td>
+<td>text, exit 0</td>
+<td>GBK/UTF-8 code-page mismatch; the text was corrupted</td>
+</tr>
+</tbody></table>
+<p>The harness already records everything the model sees and lets any plugin rewrite a tool result before the model sees it. This plugin uses exactly that seam to make the failure visible at the moment it happens, instead of three steps later.</p>
+<h2>How it works</h2>
+<pre><code>flowchart LR
+  call["tool/call"] --&gt; pre["tools/pre-execute"] --&gt; exec["tools/execute"] --&gt; post["tools/post-execute&lt;br/&gt;(this plugin)"] --&gt; result["tool/result"]
+  post --&gt;|"error rule matched"| block["block: isError result&lt;br/&gt;header + original output"]
+  post --&gt;|"context rule matched"| notice["accept + additionalContexts&lt;br/&gt;plugin-sourced notice"]
+  post --&gt;|"no match"| next["next()"]
+</code></pre>
+<ol>
+<li>At load, the plugin merges the built-in rules with the configured ones (a user rule with a built-in id replaces it) and compiles every pattern. An unusable table (invalid regular expression, duplicate id, stateful flag, empty message) rejects the plugin load with the offending rule id, so a broken config fails at boot, not at the first tool call.</li>
+<li>On every <code>tools/post-execute</code>, the text blocks of the result (optionally also the JSON of a successful canonical value) are matched against the rules whose <code>when</code> and <code>tools</code> filters apply. A result counts as failed for the <code>when</code> filter when it is <code>isError</code> <strong>or</strong> its text carries a failure marker the shipped shell tools append themselves: a <code>[exit code: N]</code> line with N != 0, a <code>[status: ...]</code> trailer with a non-zero exit code, or a <code>[sandbox: file access denied ...]</code> notice. The model already sees those; they are not silent, so <code>when: success</code> rules stay quiet.</li>
+<li>If any matching rule has <code>action: error</code>, the listener returns <code>{ kind: 'block' }</code> with feedback that begins with a header naming every matched rule and its message, followed by the original content blocks unchanged; context the tool body deferred is carried on the decision so a block does not drop it. The registry turns that into an <code>isError</code> result: the canonical value is gone, so a Code Mode program cannot consume a poisoned value either.</li>
+<li>Otherwise (only <code>context</code> matches) the listener delegates with <code>next()</code> and appends one <code>UserMessage</code> to the decision's <code>additionalContexts</code>. Its source is <code>{ kind: 'plugin', plugin: 'loud-failure', form: 'notice', summary }</code>, so the Web UI shows a collapsed one-line row and the session log records exactly what the model was told.</li>
+<li>No match: <code>next()</code>. Rules with <code>action: off</code> never run.</li>
+</ol>
+<p>Because the listener is registered through <code>ctx.on</code>, it is torn down with the plugin; a config change reloads the plugin and registers a fresh listener.</p>
+<h2>Install</h2>
+<p>Requires DeepSeek Harness <code>0.1.0-rc.6</code> (<code>@deepseek-ai/dsh-tools</code> and <code>@deepseek-ai/dsh-llm</code> at <code>0.1.0-rc.6</code>) and Node.js 20+. That is the only version this plugin has been tested against; the harness is a developer preview that may break compatibility, so the peer ranges are pinned and bumped per release. <code>dsh plugin add</code> prints peer-dependency warnings for <code>@deepseek-ai/*</code>: expected, because the profile resolves those packages from the harness installation rather than installing them next to the plugin.</p>
+<p><strong>From a release tarball (no build step, no build authorization):</strong></p>
+<pre><code>dsh plugin --profile web add https://github.com/Rhymer-Lcy/dsh-plugin-loud-failure/releases/download/v0.1.1/dsh-plugin-loud-failure-0.1.1.tgz
+dsh --profile web --dump-config   # shows a "# == dsh-plugin-loud-failure" layer
+</code></pre>
+<p><strong>From GitHub at a pinned commit:</strong> a git install fetches source, so <code>pnpm</code> must be allowed to run this package's <code>prepare</code> script (it runs <code>tsc</code>). The first <code>add</code> fails and prints the exact key to allow (for a pinned commit the key includes the codeload URL); append it to the profile's <code>pnpm-workspace.yaml</code>, then rerun:</p>
+<pre><code>dsh plugin --profile web add github:Rhymer-Lcy/dsh-plugin-loud-failure#&lt;commit-sha&gt;
+</code></pre>
+<pre><code># $DSH_HOME/profiles/web/pnpm-workspace.yaml (key copied from pnpm's message)
+allowBuilds:
+  "dsh-plugin-loud-failure@https://codeload.github.com/Rhymer-Lcy/dsh-plugin-loud-failure/tar.gz/&lt;commit-sha&gt;": true
+</code></pre>
+<p>Treat that authorization as what it is: code from this repository runs on your machine at install time, outside any agent sandbox. Pin the commit.</p>
+<p><strong>From a source checkout, without installing:</strong></p>
+<pre><code>git clone https://github.com/Rhymer-Lcy/dsh-plugin-loud-failure.git
+cd dsh-plugin-loud-failure &amp;&amp; pnpm install &amp;&amp; pnpm run build
+</code></pre>
+<pre><code># overlay.yml
+- insert:
+    - id: loud-failure
+      name: /absolute/path/to/dsh-plugin-loud-failure/lib/index.js
+</code></pre>
+<pre><code>dsh web --patch ./overlay.yml
+</code></pre>
+<p>Uninstall with <code>dsh plugin --profile web remove dsh-plugin-loud-failure</code>.</p>
+<h2>Configuration</h2>
+<p>The bundle inserts one row, <code>id: loud-failure</code>, with the schema defaults restated. A patch replaces a row's whole <code>config</code>, so an override in your profile's <code>cordis.patch.yml</code> must restate every key it keeps.</p>
+<table>
+<thead>
+<tr>
+<th>Key</th>
+<th>Type</th>
+<th>Default</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>builtinRules</code></td>
+<td>boolean</td>
+<td><code>true</code></td>
+<td>Load the <a href="#built-in-rules">built-in rule table</a> before user rules.</td>
+</tr>
+<tr>
+<td><code>rules</code></td>
+<td><code>Rule[]</code></td>
+<td><code>[]</code></td>
+<td>User rules. An id shared with a built-in rule replaces that rule in place; new ids append in order; two user rules with the same id fail the load.</td>
+</tr>
+<tr>
+<td><code>shellTools</code></td>
+<td><code>string[]</code></td>
+<td><code>[bash, pwsh, job_output]</code></td>
+<td>Tools inspected by rules that omit <code>tools</code>. Add other shell-like tools here (for example a terminal-read tool from another bundle).</td>
+</tr>
+<tr>
+<td><code>excerptChars</code></td>
+<td>natural</td>
+<td><code>240</code></td>
+<td>Maximum characters of the matched excerpt shown to the model.</td>
+</tr>
+<tr>
+<td><code>scanValue</code></td>
+<td>boolean</td>
+<td><code>false</code></td>
+<td>Also scan the JSON of a successful canonical value, for tools whose text projection hides stderr. Note: this <code>JSON.stringify</code>s the whole value before matching, and a match shows up to <code>excerptChars</code> characters of that otherwise hidden value to the model and the session log.</td>
+</tr>
+</tbody></table>
+<p>A rule:</p>
+<table>
+<thead>
+<tr>
+<th>Field</th>
+<th>Type</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>id</code></td>
+<td>string, required</td>
+<td>Stable identifier.</td>
+</tr>
+<tr>
+<td><code>pattern</code></td>
+<td>string, required</td>
+<td>JavaScript regular-expression source.</td>
+</tr>
+<tr>
+<td><code>flags</code></td>
+<td>string</td>
+<td>Any of <code>i</code>, <code>m</code>, <code>s</code>, <code>u</code>. <code>g</code> and <code>y</code> are rejected because they carry state between calls.</td>
+</tr>
+<tr>
+<td><code>tools</code></td>
+<td><code>string[]</code></td>
+<td>Tools the rule applies to. Omitted or empty: <code>shellTools</code>. <code>['*']</code>: every tool.</td>
+</tr>
+<tr>
+<td><code>when</code></td>
+<td><code>success</code> | <code>error</code> | <code>any</code></td>
+<td>Which outcomes the rule inspects. Default <code>success</code>, so a result that already failed is not decorated twice.</td>
+</tr>
+<tr>
+<td><code>action</code></td>
+<td><code>error</code> | <code>context</code> | <code>off</code>, required</td>
+<td><code>error</code> blocks, <code>context</code> attaches a notice, <code>off</code> disables the rule.</td>
+</tr>
+<tr>
+<td><code>message</code></td>
+<td>string, required</td>
+<td>What the signature means and what the model should do next. It is shown to the model verbatim.</td>
+</tr>
+</tbody></table>
+<p>Disable one built-in rule and add one of your own:</p>
+<pre><code># $DSH_HOME/profiles/web/cordis.patch.yml
+- id: loud-failure
+  config:
+    builtinRules: true
+    rules:
+      - id: no-such-file-with-success
+        pattern: unused
+        action: off
+        message: unused
+      - id: cuda-oom
+        pattern: 'CUDA out of memory|torch\.OutOfMemoryError'
+        tools: [bash, pwsh, job_output]
+        action: error
+        message: 'The GPU ran out of memory; whatever this run was supposed to produce is incomplete. Reduce the batch size or free VRAM, then rerun.'
+    shellTools: [bash, pwsh, job_output]
+    excerptChars: 240
+    scanValue: false
+</code></pre>
+<h2>Built-in rules</h2>
+<p>All built-in rules use <code>when: success</code> and apply to <code>shellTools</code>.</p>
+<table>
+<thead>
+<tr>
+<th>id</th>
+<th>action</th>
+<th>Fires on</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>pandoc-missing-character</code></td>
+<td>error</td>
+<td>a line starting with <code>Missing character: There is no </code> or <code>[WARNING] Missing character: There is no </code> (xelatex/lualatex through pandoc; the PDF is missing glyphs)</td>
+</tr>
+<tr>
+<td><code>python-traceback-with-success</code></td>
+<td>error</td>
+<td>a line starting with <code>Traceback (most recent call last):</code> (leading whitespace or ANSI colour codes allowed) in a result that reported success</td>
+</tr>
+<tr>
+<td><code>shell-command-not-found</code></td>
+<td>error</td>
+<td><code>bash: [line N:] name: command not found</code> and <code>sh: N: name: not found</code> lines</td>
+</tr>
+<tr>
+<td><code>windows-command-not-recognized</code></td>
+<td>error</td>
+<td>a line of the form <code>'name' is not recognized as an internal or external command</code> or <code>[prefix: ][The term ]'name' is not recognized as a/the name of a cmdlet</code></td>
+</tr>
+<tr>
+<td><code>fatal-signal-with-success</code></td>
+<td>error</td>
+<td>a shell crash line: <code>Segmentation fault</code> (with or without <code>(core dumped)</code>), or <code>Bus error</code> / <code>Aborted</code> with <code>(core dumped)</code>, optionally prefixed by <code>bash: line N: PID</code></td>
+</tr>
+<tr>
+<td><code>numpy-runtime-warning</code></td>
+<td>context</td>
+<td><code>RuntimeWarning: invalid value encountered</code> / <code>divide by zero encountered</code> / <code>overflow encountered</code></td>
+</tr>
+<tr>
+<td><code>powershell-native-command-error</code></td>
+<td>context</td>
+<td><code>NativeCommandError</code></td>
+</tr>
+<tr>
+<td><code>latex-undefined-references</code></td>
+<td>context</td>
+<td><code>LaTeX Warning: There were undefined references</code> / <code>Citation ... undefined</code> / <code>Reference ... undefined</code></td>
+</tr>
+<tr>
+<td><code>latex-rerun-needed</code></td>
+<td>context</td>
+<td><code>Rerun to get cross-references right</code>, <code>Rerun to get outlines right</code>, <code>rerunfilecheck Warning</code></td>
+</tr>
+<tr>
+<td><code>pandoc-could-not-fetch-resource</code></td>
+<td>context</td>
+<td><code>[WARNING] Could not fetch resource</code></td>
+</tr>
+<tr>
+<td><code>no-such-file-with-success</code></td>
+<td>context</td>
+<td><code>No such file or directory</code></td>
+</tr>
+<tr>
+<td><code>permission-denied-with-success</code></td>
+<td>context</td>
+<td><code>Permission denied</code></td>
+</tr>
+<tr>
+<td><code>unicode-replacement-character</code></td>
+<td>context</td>
+<td>any U+FFFD replacement character in the output</td>
+</tr>
+</tbody></table>
+<p>The <code>error</code> rules are line-anchored to the shape the tools actually print, which rules out the common quoted-substring mention (<code>grep -r "command not found" logs/</code>, a README quoting the pandoc warning); a file that echoes a genuine log line verbatim will still match, and that is a known limitation. The <code>context</code> rules are deliberately broader because a notice is cheap and the model keeps the original result.</p>
+<h2>What the model sees</h2>
+<p>A blocked result, exactly as rendered (the second content block is the untouched original output):</p>
+<pre><code>[loud-failure] Tool "bash" reported success, but its output matched a rule (pandoc-missing-character) that indicates a silent failure. dsh-plugin-loud-failure marked this result as an error; do not treat the call as successful.
+
+- pandoc-missing-character (error): pandoc/xelatex dropped one or more glyphs; the produced PDF is missing characters even though the exit code was 0. Rewrite the character (for example write SpO2 instead of a subscript digit) or switch to a font that has it, then rebuild and re-check for this warning.
+  excerpt: "pandoc thesis.md -o thesis.pdf --pdf-engine=xelatex\n[WARNING] Missing character: There is no ₂ in font Microsoft YaHei/OT!\n[exit code: 0]"
+
+The original tool output follows unchanged.
+</code></pre>
+<p>A notice attached to a successful result (the result itself is unchanged; this arrives as a <code>user</code>-role message with source <code>{"kind":"plugin","plugin":"loud-failure","form":"notice","summary":"loud-failure: bash output matched numpy-runtime-warning"}</code>):</p>
+<pre><code>[loud-failure] Notice for tool "bash": its output matched a rule (numpy-runtime-warning) that often means a silent failure. Verify before relying on this result.
+
+- numpy-runtime-warning (context): NumPy raised a RuntimeWarning about NaN, division by zero, or overflow. Downstream numbers may be NaN or inf while the exit code stays 0. Check the affected arrays before using the result.
+  excerpt: "python calc.py\ncalc.py:12: RuntimeWarning: invalid value encountered in divide\n[0.5 nan 0.25]"
+</code></pre>
+<h2>Verification</h2>
+<p><code>pnpm run check</code> runs typecheck, tests, build, and a pack dry-run; CI runs it on Ubuntu and Windows with Node 20 and 22. 87 tests in total.</p>
+<ul>
+<li><code>tests/rules.test.ts</code> covers merging (including the duplicate-user-id rejection), compilation failures (each with its message), filters, statelessness, excerpt bounds, the failure-marker detector, and every built-in rule against real signatures plus the negative cases (clean output, non-shell tools, already-failed results, quoted mentions, <code>Aborted</code> as a plain word).</li>
+<li><code>tests/plugin.test.ts</code> mounts the plugin next to the real <code>ToolRuntime</code> and drives tool calls through the complete pipeline: block with original output preserved, notice with the plugin source, precedence of <code>error</code> over <code>context</code>, tool and <code>when</code> filters, results carrying <code>[exit code: N]</code> / job-status / sandbox markers left alone by <code>success</code> rules, <code>when: any</code> still applying to them, deferred tool context surviving a block, built-in override, a user rule with <code>tools</code> omitted, <code>scanValue</code>, composition with a downstream <code>tools/post-execute</code> listener, clean unmount, and fail-loud on a bad rule table.</li>
+<li>The bundle was also exercised against <code>@deepseek-ai/dsh@0.1.0-rc.6</code> on Windows: <code>dsh plugin add</code> from a checkout, from the v0.1.0 release tarball URL, and from <code>github:...#&lt;sha&gt;</code> (with the <code>allowBuilds</code> key) all compose, and <code>--dump-config</code> shows the layer; booting <code>dsh --profile web</code> with an overlay that injects an invalid rule fails at boot with <code>RuleConfigError: rule "bad": invalid pattern</code> raised from the installed plugin's <code>apply</code>, and booting with the shipped config serves the Web UI.</li>
+</ul>
+<h2>Design notes</h2>
+<ul>
+<li><strong><code>tools/post-execute</code>, not <code>tools/result</code>.</strong> <code>tools/result</code> only observes the frozen outcome; the point here is to change what the model sees, which is exactly what post-execute is for (replace content, block with feedback, attach context).</li>
+<li><strong>Block keeps the original output and the deferred context.</strong> A blocked result would otherwise erase the evidence the model needs to fix the problem. The header comes first so the model reads the verdict before the noise; the original blocks follow unchanged, and context the tool body deferred rides on the decision instead of being dropped.</li>
+<li><strong>Two severities, no third.</strong> <code>error</code> is for signatures that mean the work did not happen; <code>context</code> is for signatures that mean "check before you trust". Anything softer than that is not worth a token.</li>
+<li><strong>Regular expressions, not a model.</strong> The signatures are literal strings emitted by tools; a regex is deterministic, cheap, testable, and auditable in the config dump. Semantics belong to the model, which gets the rule message and the excerpt.</li>
+<li><strong>Fail loud at load.</strong> A rule table is configuration; a bad one should stop the boot with the rule id, not degrade into a listener that never fires.</li>
+<li><strong>Waterfall etiquette.</strong> A blocking decision short-circuits, as a decision-owning policy listener should; a context decision delegates first and enriches whatever came back, so downstream replacements survive. Listeners registered before this one wrap it and can still override either outcome.</li>
+</ul>
+<h2>Model Experience</h2>
+<h3>Request context and condition</h3>
+<h4>What the model sees</h4>
+<p>Only when a rule matches. For an <code>error</code> match: the tool result becomes <code>isError: true</code> and its content is one text block rendered as in <a href="#what-the-model-sees">What the model sees</a>, followed by the original content blocks. For a <code>context</code>-only match: the tool result is unchanged and one <code>user</code>-role notice message with source <code>{ kind: 'plugin', plugin: 'loud-failure', form: 'notice', summary }</code> is appended after the recorded tool results of that batch. Rule messages are configuration and appear verbatim; the excerpt is bounded by <code>excerptChars</code>.</p>
+<h4>Token effect</h4>
+<p>Conditional. Zero when nothing matches. On a match: the header plus, per matched rule, its message and up to <code>excerptChars</code> characters of excerpt. A block adds only that header; the original blocks that follow are the same bytes the model would have received anyway.</p>
+<h4>KV Cache effect</h4>
+<p>Append-only. The plugin contributes no system-prompt section and never rewrites earlier history; a block changes the content of the current tool result before it is first recorded, and a notice is appended after that batch's tool results. Neither invalidates any previously reusable prefix.</p>
+<h2>Known Limitations and Deferred Work</h2>
+<ul>
+<li><strong>Text only.</strong> The listener inspects text blocks (and, with <code>scanValue</code>, the JSON of a successful value). A failure that leaves no trace in the output, such as a library returning a negative status that the script never prints, cannot be caught here; the pattern for those is to print the value and let a rule catch it.</li>
+<li><strong>Regular expressions can false-positive.</strong> The <code>context</code> rules are broad by design; disable one with <code>action: off</code> if it is noisy in your workload. A blocked result still carries the original output, so a false <code>error</code> costs the model one corrective step, not the information.</li>
+<li><strong>Only three failure markers are recognized.</strong> <code>[exit code: N]</code>, a <code>[status: ...]</code> trailer with a non-zero exit code, and the sandbox denial notice. Other ways a shell tool can report failure in text (signal names, timeouts) are not yet treated as failed outcomes, so a <code>success</code> rule can still fire on them.</li>
+<li><strong>Whole-text scan.</strong> Very large tool outputs are scanned once per rule; the shipped shell tools already truncate long output, so this has not been a cost in practice, but there is no size cap yet.</li>
+<li><strong><code>run_code</code> aggregate output.</strong> Code Mode sub-dispatches each pass through post-execute and are inspected individually; the outer <code>run_code</code> result (program logs and return value) is inspected as ordinary text when <code>run_code</code> is listed in <code>shellTools</code>, which it is not by default.</li>
+<li><strong>No per-agent scoping.</strong> The listener is registered on the plugin context and sees every agent's calls. Scoping to a subagent preset is a Cordis-level exercise not attempted here.</li>
+</ul>
+<h2>Development</h2>
+<pre><code>pnpm install
+pnpm run check          # typecheck + test + build + pack dry-run
+pnpm run test:watch
+</code></pre>
+<p>Source lives in <code>src/</code> (<code>rules.ts</code> is pure and unit-tested; <code>index.ts</code> is the Cordis adapter); tests in <code>tests/</code>; <code>lib/</code> is build output produced by <code>tsc</code> and by the <code>prepare</code> script on git installs.</p>
+<h2>License</h2>
+<p><a href="https://github.com/Rhymer-Lcy/dsh-plugin-loud-failure/blob/HEAD/LICENSE">MIT</a></p>

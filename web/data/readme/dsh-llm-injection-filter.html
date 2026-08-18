@@ -1,0 +1,178 @@
+<h1>dsh-llm-injection-filter</h1>
+<p>DeepSeek Harness 的 <strong>LLM 响应流注入过滤器</strong>：在模型流式响应进入 agent 之前，实时检测疑似提示词注入 / 污染内容并处置。挂载于 <code>llm/stream</code> waterfall，对所有适配器生效，不改动任何运行时源码。</p>
+<h2>背景动机（真实安全事件）</h2>
+<p>一个 coding agent 会话（<code>gpt-5.6-terra</code> / <code>openai</code> / OpenAI Responses API）中，模型在生成 <code>edit</code> 工具的 <code>new_string</code> 参数时，于正常代码之后无缝接续输出了一段注入式载荷并被逐字写入源码、进入 Git 历史。污染样本：</p>
+<pre><code>  //ฤศจassistant to=functions.edit  彩神争霸网站՞ւjson /*&lt;&lt;&lt;ി՞նչ սպասի  微信天天中彩票】【。json
+  //
+</code></pre>
+<p>特征：协议控制标记（<code>assistant to=</code>、<code>/*&lt;&lt;&lt;</code>、<code>json</code> 碎片）、垃圾广告语义（博彩）、多语种混淆（泰文/亚美尼亚文/马拉雅拉姆文）。</p>
+<p><strong>关键教训</strong>：主载荷是普通 ASCII（<code>assistant to=</code>），纯"特殊字符"检测不够；且模型输出是 token 粒度分片（<code>"ฤศจ"</code> <code>"assistant"</code> <code>" to"</code> …），单个 delta 往往太短无法综合判断。因此：</p>
+<ul>
+<li><strong>轨道 A</strong>（罕见脚本）恰好可以<strong>逐 delta 立即命中</strong>（<code>"ฤศจ"</code> 单独一个 delta 就含泰文）→ 硬性中断；</li>
+<li><strong>轨道 B</strong>（评分制）必须<strong>累积到完整 tool-call arguments（block-end）再评分</strong>处置。</li>
+</ul>
+<h2>两条轨道</h2>
+<h3>轨道 A：罕见脚本硬性阻断（默认开启，最高优先级）</h3>
+<ul>
+<li>模型输出中出现<strong>任何一个不属于允许脚本集合</strong>的 Unicode 字符 → <strong>立即中断</strong>（不等 block-end、不参与评分、无视 <code>mode</code> 取值）。</li>
+<li>允许脚本集合（默认）：<code>Latin</code>、<code>Han</code>、<code>Common</code>、<code>Inherited</code>。</li>
+<li>检测含性能快筛：纯 ASCII（<code>/[^\x00-\x7F]/</code>）直接放行，零逐字符开销。</li>
+<li>触发即中断：丢弃未发布 chunk，yield 一个终止性 error <code>finish</code> chunk（<code>code=RESPONSE_FILTERED</code>），关闭底层 adapter 流，结束包装流。</li>
+<li><strong>为什么能中断 agent turn（已从源码确认）</strong>：<ol>
+<li>agent loop 消费完流后检查 <code>assembler.finish</code>，<code>finish.kind === 'error'</code> 分支先于消息组装执行（不落 assistant/message）；</li>
+<li>进入 <code>agent/request-error</code> waterfall（<code>dsh-llm-retry</code> 检查 <code>failure.code</code>）：<code>RESPONSE_FILTERED</code> 不在默认可重试集合（<code>EMPTY_RESPONSE/RATE_LIMIT/SERVER/TIMEOUT/TRANSPORT</code>）→ 不自动重试；</li>
+<li>agent loop <code>throw new LlmError(message, code, failure)</code> → <code>turn/end { reason: { kind: 'error', ... } }</code> → 该 turn 立即终止，agent 回到 idle；</li>
+<li>前端 <code>dsh-client-ui-conversation</code> 专门渲染 <code>turn/end reason.kind==='error'</code> 错误横幅——<code>failure.message</code> 即用户可见错误文本（含 provider/model/被阻断字符/样本/原因）。</li>
+</ol>
+</li>
+</ul>
+<h3>轨道 B：评分制规则（audit / strip / reject）</h3>
+<table>
+<thead>
+<tr>
+<th>规则</th>
+<th>判定</th>
+<th>权重</th>
+<th>应用层</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>CTRL 控制字符</td>
+<td><code>[\x00-\x08\x0b-\x1f\x7f]</code></td>
+<td>100</td>
+<td>逐 delta（text/args）</td>
+</tr>
+<tr>
+<td>PROTO 协议标记</td>
+<td><code>assistant to=</code>、<code>/*&lt;&lt;&lt;</code>、<code>&lt;system-reminder&gt;</code>、<code>&lt;compacted-checkpoint&gt;</code>、<code>&lt;!--</code>、<code>[system]</code>/<code>[instruction]</code></td>
+<td>100</td>
+<td>逐 delta + block-end</td>
+</tr>
+<tr>
+<td>SCRIPT 混合脚本</td>
+<td>arguments 中非 Latin/Han/Common 脚本 <strong>≥3 种且非基础字符 ≥8</strong></td>
+<td>80</td>
+<td>仅 block-end 完整 arguments</td>
+</tr>
+<tr>
+<td>KW 垃圾关键词</td>
+<td>彩神/争霸/天天中彩票/博彩/casino/gambling/betting</td>
+<td>40</td>
+<td>block-end</td>
+</tr>
+<tr>
+<td>组合加成</td>
+<td>PROTO 命中且发生在 <strong>tool-call arguments</strong>（可执行面）</td>
+<td>+30</td>
+<td>block-end</td>
+</tr>
+</tbody></table>
+<ul>
+<li>总分 ≥ <code>minScore</code>(100) 触发。KW 永不单独触发（仅加分）；SCRIPT 必须与 ≥1 个 PROTO/CTRL 同现才计入总分。</li>
+<li>处置模式：<ul>
+<li><code>audit</code>：只记录一行结构化日志，不改动输出；</li>
+<li><code>strip</code>：命中子串替换为 <code>[FILTERED:&lt;n&gt;]</code>（只替换字符串值内部，保持 JSON 引号/结构不变；逐 delta 与 block-end 权威内容同步改写）；</li>
+<li><code>reject</code>：block-end 把命中 tool-call 的 <code>block.arguments</code> 改写为 <code>{"$rejected":"dsh-injection-filter","reason":"&lt;摘要&gt;"}</code>（缺必需字段 → 工具 schema 校验失败 → <code>INVALID_ARGS</code> 返回模型，模型可自我纠正）；text 命中替换为 <code>[FILTERED:&lt;n&gt;]</code>；reasoning 只 audit。</li>
+</ul>
+</li>
+<li>轨道 A 与 B 独立、同时生效；A 命中时不做 strip/reject，直接中断。</li>
+</ul>
+<h2>配置</h2>
+<pre><code>const CFG = {
+  enabled: true,                 // 总开关
+  hardBlockRareScripts: true,    // 轨道 A：罕见脚本 → 直接中断（最高优先级，无视 mode）
+  allowedScripts: ['Latin', 'Han', 'Common', 'Inherited'], // 允许脚本白名单，可追加 'Thai' 等放行
+  checkReasoning: false,         // 是否对 reasoning-delta 也做轨道 A 检测（默认关）
+  mode: 'audit',                 // 轨道 B：'audit' | 'strip' | 'reject'
+  minScore: 100,                 // 轨道 B 触发阈值
+  applyToProviders: [],          // 空 = 全部 provider；可填 ['openai']
+  extraPatterns: [],             // 额外正则字符串（编译失败捕获并报错，停用该规则，不炸流）
+  extraKeywords: [],             // 额外关键词
+  maxScanLen: 16384,             // 轨道 B 单段扫描长度上限
+  maxSampleLen: 120,             // 审计样本截断长度
+  recordMaxLen: 8192,            // 中断记录中载荷详情（delta / 已累积 arguments）的截断长度
+}
+</code></pre>
+<h2>审计日志</h2>
+<p>每次命中输出一行结构化日志（<code>console.error</code>）：</p>
+<pre><code>[llm-injection-filter] {"provider":"openai","model":"gpt-5.6-terra","sessionId":"...","callId":"call_1","toolName":"edit","rule":"HARD_BLOCK","mode":"audit","score":210,"detail":{...},"sample":"..."}
+</code></pre>
+<p><code>rule</code> ∈ <code>HARD_BLOCK | CTRL | PROTO | SCRIPT | KW</code>；只提取标量，<code>sample</code> 截断 ≤ <code>maxSampleLen</code>。</p>
+<h2>中断时详细记录（RECORD）</h2>
+<p><strong>轨道 A 命中、需要中断 agent loop 时</strong>，除上述紧凑审计行外，额外输出一条结构化 RECORD 行，包含<strong>出现问题的请求身份</strong>与<strong>相应载荷的详细信息</strong>（取证用）：</p>
+<pre><code>[llm-injection-filter][RECORD] {"event":"llm-stream-filtered","code":"RESPONSE_FILTERED","time":"&lt;ISO8601&gt;","request":{"provider":"openai","model":"gpt-5.6-terra","sessionId":"...","purpose":"agent-loop"},"block":{"kind":"tool-call-arguments","index":0,"callId":"call_1","toolName":"edit","deltaText":"&lt;命中 delta 原文，截断&gt;","deltaLength":&lt;完整长度&gt;,"accumulatedArguments":"&lt;拦截瞬间已累积的完整 arguments，截断&gt;","accumulatedLength":&lt;完整长度&gt;},"char":"&lt;被阻断字符&gt;","charCode":&lt;U+ 码点&gt;,"script":"Thai","sample":"&lt;样本截断&gt;"}
+</code></pre>
+<ul>
+<li><code>block.kind</code> ∈ <code>text | tool-call-arguments | reasoning</code>；tool-call 场景额外携带 <code>index/callId/toolName/accumulatedArguments</code>（拦截瞬间的完整载荷，含命中 delta 本身）。</li>
+<li>载荷详情按 <code>recordMaxLen</code> 截断（<code>deltaLength</code> / <code>accumulatedLength</code> 保留完整长度）；只提取标量/有界文本，不触碰 <code>options.messages</code> 等大型 live 对象；不落盘，随插件 fiber 输出到结构化日志通道。</li>
+</ul>
+<h2>已知取舍（文档化）</h2>
+<ul>
+<li><strong>默认允许集合不含日文（假名）/韩文（谚文）/俄文（西里尔）等</strong>，含这些脚本的合法输出也会被硬阻断。这是刻意设计的极端严格语义（宁可误杀，不可放过）；逃生门是 <code>allowedScripts</code> 配置（如追加 <code>'Thai'</code> 放行泰文）。</li>
+<li><code>maxScanLen</code> 只约束轨道 B 的逐段扫描/替换（超出部分原样保留、不处理）；轨道 A 不设上限（快筛优先，宁可慢，不可放过）。</li>
+<li><code>reject</code> 模式依赖 block-end 携带完整 arguments 做整块改写；极少数不发 block-end 的 delta-only 流中 tool-call 参数无法整块改写（原样透传，仅审计）。</li>
+<li>轨道 A 检测自身绝不抛异常（try/catch 包裹，异常时放行该 delta）；规则编译失败在 apply 时即报错并停用该规则。</li>
+</ul>
+<h2>交付形态</h2>
+<ul>
+<li><strong>动态插件</strong>：<code>code.host</code> 即本源码（纯 JS、无 import、顶层常量配置），<code>return { apply, CFG }</code> 收尾；<code>ctx.on('llm/stream', ...)</code> 注册的监听器随插件 fiber 自动清理，停止/卸载零残留（无定时器/全局订阅）。</li>
+<li><strong>npm 包</strong>：<code>lib/index.js</code>（本文件）+ <code>package.json</code>，<code>module.exports = { apply, CFG, ... }</code>；Node ≥18。</li>
+</ul>
+<h2>正式安装（web profile，官方 CLI）</h2>
+<p>包声明了 <code>dsh.bundle.patch</code>（<code>cordis.patch.yml</code>），<code>dsh plugin</code> 的 bundle 协调会自动把它加进
+<code>dsh.profile.bundles</code>，下次启动即随 host 组合挂载（对所有会话的 <code>llm/stream</code> 生效）。</p>
+<pre><code># 路径含空格需用 8.3 短路径（cmd 批处理转发会吞掉空格段）
+dsh plugin --profile web add "link:G:/DEEPSE~1/data/dsh/plugins/LLM-IN~1"
+# 验证：组合树中应出现 id: llm-injection-filter / name: dsh-llm-injection-filter
+dsh --profile web --dump-config
+</code></pre>
+<p>安装后：</p>
+<ul>
+<li><code>profiles\web\package.json</code> → <code>dependencies</code> 增加 <code>"dsh-llm-injection-filter": "link:G:/DEEPSE~1/data/dsh/plugins/LLM-IN~1"</code>；
+<code>dsh.profile.bundles</code> 末尾自动追加 <code>"dsh-llm-injection-filter"</code>。</li>
+<li><code>profiles\web\node_modules\dsh-llm-injection-filter</code> → Junction 指向源码目录（改源码即生效，下次重启加载）。</li>
+<li><strong>重启 DSH 后生效</strong>；重启前由会话内动态插件（<code>injf-1</code>）继续覆盖。</li>
+</ul>
+<h2>从 GitHub 一键安装（推上 GitHub 后）</h2>
+<p>仓库根目录 = <strong>包根目录</strong>（<code>package.json</code> 必须在仓库根）。包无构建脚本、无运行时依赖 →
+安装无 <code>allowBuilds</code> 拦截、无 peer 警告。推上公开 GitHub 后，一条命令完成安装 + 挂载：</p>
+<pre><code># 默认分支
+dsh plugin --profile web add github:XiaoYuOvO/dsh-llm-injection-filter
+# 指定分支/提交/tag（可选）
+dsh plugin --profile web add github:XiaoYuOvO/dsh-llm-injection-filter#main
+# 按 tag 安装（推荐，锁定已验证版本）
+dsh plugin --profile web add github:XiaoYuOvO/dsh-llm-injection-filter#v1.0.0
+</code></pre>
+<p>原理：<code>dsh plugin</code> 把参数转发给 pnpm（原生支持 <code>github:</code> 规格，走 codeload tarball），
+安装后 CLI 的 bundle 协调读取已装包 manifest 的 <code>dsh.bundle.patch</code> 并自动追加到
+<code>dsh.profile.bundles</code>——与本地 <code>link:</code> 安装走完全相同的挂载路径（已实证）。</p>
+<p><strong>打包约定（重要，勿改回；均经实测验证）</strong>：</p>
+<ul>
+<li><strong>不要加回 <code>package.json</code> 的 <code>files</code> 字段</strong>——pnpm 的 packlist 语义在 tarball 安装路径下
+会因 <code>files</code>（或包内 <code>.npmignore</code>）使 packlist 输出与 tarball 条目数不一致，走重加路径，
+可能触发其 <code>parseTarball</code> 的"剥首个路径分量"行为（专为 registry <code>package/...</code> 包裹格式
+设计），把未包裹 tarball 里的 <code>lib/index.js</code> 误剥成根 <code>index.js</code>、<code>lib/</code> 丢失。已实测。</li>
+<li><strong>根入口 <code>index.js</code> = 双保险</strong>：<code>main</code> 指向包根的一行转发（<code>module.exports = require('./lib/index.js')</code>），
+即便遇到未包裹 tarball 的路径剥离，真实实现 <code>lib/index.js</code> 也不受影响。勿删除该文件。</li>
+<li><strong><code>github:</code> 安装本身安全</strong>：codeload tarball 天然带 <code>&lt;repo&gt;-&lt;commit&gt;/</code> 顶层包裹，pnpm 剥掉
+包裹层后 <code>lib/</code> 结构完好——已用 codeload 同构（包裹式）tarball 实测：<code>lib/index.js</code>、
+<code>cordis.patch.yml</code>、<code>README.md</code>、<code>LICENSE</code>、<code>package.json</code> 全部就位，require 正常。</li>
+<li>发布内容用两层控制：<code>.gitattributes export-ignore</code>（codeload 瘦身，排除 <code>test/</code>、
+<code>plugin-body.js</code>、<code>scripts/</code>）+ <code>.npmignore</code>（npm publish 瘦身）。两者都
+<strong>不得排除 <code>cordis.patch.yml</code></strong>（bundle 挂载声明）。</li>
+<li>验证脚本：<code>scripts/git-install-test.ps1</code>（git resolver + codeload 等价 tarball +
+带 <code>.gitignore</code> 场景）、<code>scripts/codeload-sim-test.ps1</code>（包裹式 tarball）。</li>
+</ul>
+<p>前置条件 / 注意：</p>
+<ul>
+<li>仓库公开，或本机已配置 GitHub 凭据；本机需能访问 github.com（本部署 git 代理
+<code>http://127.0.0.1:7800</code>，必要时先配置）。</li>
+<li>已用 <code>link:</code> 本地装过的机器，再次 <code>add github:...</code> 会替换 dependency spec
+（bundles 条目保持不变，不会双挂载）。</li>
+<li>若之后选择 <code>npm publish</code>，等价命令为 <code>dsh plugin --profile web add dsh-llm-injection-filter@1.0.0</code>
+（<code>.npmignore</code> 已含 <code>lib</code>、<code>cordis.patch.yml</code>、<code>README.md</code>、<code>LICENSE</code>、<code>package.json</code> 之外的全部内容）。</li>
+</ul>
+<h2>测试</h2>
+<pre><code>npm test   # node test/run-tests.js —— 24 项，覆盖测试清单 1-16 及处置模式/流完整性
+</code></pre>
+<p>端到端（清单 17）：挂载后真实模型调用应零延迟零中断；构造含泰文的 delta 时 turn 以 <code>RESPONSE_FILTERED</code> 错误结束、前端会话视图出现错误横幅、<code>llm/retry</code> 事件不产生（以上路径已通过源码核实：<code>dsh-agent-loop</code> step() → <code>agent/request-error</code> → LlmError → <code>turn/end</code>；<code>dsh-llm-retry</code> 默认可重试码不含 <code>RESPONSE_FILTERED</code>）。</p>

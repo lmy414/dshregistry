@@ -1,0 +1,183 @@
+<h1>dsh-session-caption</h1>
+<p><a href="https://github.com/JohnXu22786/session-titler/blob/HEAD/README.zh.md">简体中文</a></p>
+<p><strong>Two-phase session captioning</strong> (automatic naming) for DeepSeek Harness (dsh): while a session is active, a title is generated instantly from keywords; once idle, the cheapest capable model is called to refine it. Everything runs in the background without interrupting the main flow — no wasted spend on titles.</p>
+<pre><code>user sends message ──► [Phase 1] instant keyword captioning (zero cost, millisecond)
+                           │
+                           └─► session idle for 5s ──► [Phase 2] budget-model refinement + one-line summary
+                                                          │
+                                                          └─► written to session/title (traceable)
+</code></pre>
+<h2>Problem It Solves</h2>
+<p>New harness sessions are timestamp-numbered by default, making long session lists hard to scan. Existing approaches either only "wait for idle then generate" (no title while the user waits) or call the model every turn (expensive). This plugin splits the two ideas into complementary phases:</p>
+<ul>
+<li><strong>Phase 1 · Instant captioning</strong>: the moment a user message lands, keywords are extracted from the latest message and a title appears with near-zero latency, <strong>without calling any model</strong>;</li>
+<li><strong>Phase 2 · Idle refinement</strong>: once the session goes quiet, a single auxiliary call upgrades the title from a "keyword string" to a natural phrase and also produces a <strong>one-line session summary</strong> (within the same request, no extra billing);</li>
+<li><strong>Cost guardrail</strong>: refinement defaults to the cheapest tier among registered models (<code>flash</code>/<code>haiku</code>/<code>mini</code> etc.), with explicit model override and full phase-2 disabling both available.</li>
+</ul>
+<h2>Features</h2>
+<ul>
+<li><strong>Two-phase pipeline</strong>: instant keyword captioning → idle budget-model refinement, title evolves with the session;</li>
+<li><strong>Cost control</strong>: budget routing picks and caches the cheapest model from the registered model directory by name pattern, invalidated automatically on model topology changes;</li>
+<li><strong>Original keyword algorithm</strong>: noise stripping (code blocks/URLs/Markdown) → script detection (Latin/CJK) → stopword and function-word filtering → order-preserving/character-budget truncation, works for Chinese, English, Japanese, and Korean;</li>
+<li><strong>Multilingual</strong>: title language follows the message language; Latin titles are length-capped by word count, CJK titles by character count;</li>
+<li><strong>Title deduplication</strong>: identical titles are not written twice; cross-session duplicates get a numbered suffix automatically (<code>Fix Login Bug (2)</code>);</li>
+<li><strong>Summary integration</strong>: refinement also produces a one-line session summary, written to the session log via the <code>session/caption-note</code> event for list UIs, export tools, etc.;</li>
+<li><strong>Respects manual titles</strong>: automatic generation stops completely after a manual rename — never overrides (even a rename during an in-flight refinement call is not written back);</li>
+<li><strong>Zero-config to start</strong>: defaults work out of the box; every behavior is tunable.</li>
+</ul>
+<h2>Installing in DSH</h2>
+<p>Install the latest version into a profile from GitHub:</p>
+<pre><code>dsh plugin --profile demo add github:JohnXu22786/session-titler
+</code></pre>
+<p>Remove it:</p>
+<pre><code>dsh plugin --profile demo remove dsh-session-caption
+</code></pre>
+<p>This plugin is a standard dsh <strong>bundle</strong> (configuration layer + plugin code), installed into a profile via <code>dsh plugin</code>:</p>
+<pre><code># install from a local directory (development / self-use)
+dsh plugin --profile demo add /path/to/dsh-session-caption
+
+# or install a packed tarball (same for tarball / git references)
+npm pack
+dsh plugin --profile demo add ./dsh-session-caption-0.1.0.tgz
+</code></pre>
+<p>On install, pnpm links the package into the profile's <code>node_modules</code>; <code>dsh</code> recognizes the <code>dsh.bundle</code> declaration in <code>package.json</code> and adds the <code>cordis.patch.yml</code> layer to <code>dsh.profile.bundles</code>. Takes effect after restart:</p>
+<pre><code>dsh --profile demo --dump-config   # should show the "session-caption" line
+dsh
+</code></pre>
+<h3>How Loading Works (for harness developers)</h3>
+<ol>
+<li><strong>Bundle manifest</strong>: <code>dsh.bundle.patch</code> in <code>package.json</code> points to <code>cordis.patch.yml</code> — the only required bundle metadata;</li>
+<li><strong>Configuration layer</strong>: <code>cordis.patch.yml</code> first disables the built-in single-phase title provider by line id (the session title service accepts only one provider at a time), then inserts this plugin's configuration line;</li>
+<li><strong>Entry file</strong>: <code>lib/src/index.js</code> exports the standard Cordis plugin contract — <code>name</code> (<code>session-caption</code>), <code>inject</code> (<code>['sessionTitle', 'sessions', 'llm']</code>), <code>Config</code> (schemastery validation schema), <code>apply(ctx, config)</code>;</li>
+<li><strong>Capability registration</strong>: <code>apply</code> registers the two-phase flow as the <strong>sole provider</strong> of <code>ctx.sessionTitle</code> (<code>automatic: 'all-user-messages'</code>), and also listens to <code>session/event</code> and <code>llm/adapters-updated</code>; all listeners, timers, and registrations are reclaimed automatically on plugin unload.</li>
+</ol>
+<blockquote>
+<p>Note: the <code>session-title</code> service is single-provider by design. If another plugin also registers a title provider, the two replace each other; this plugin's bundle layer disables the built-in <code>session-title-llm</code> line by default.</p>
+</blockquote>
+<h2>Configuration</h2>
+<p>All fields are optional; defaults are listed below. Global config goes into <code>$DSH_HOME/cordis.patch.yml</code>, overridden by line id:</p>
+<pre><code># $DSH_HOME/cordis.patch.yml (home-level, applies to all profiles)
+- id: session-caption
+  config:
+    instant:
+      enabled: true        # phase 1 switch
+      prefix: ''           # instant caption prefix, e.g. '⚡ '
+      maxWords: 6          # max words for Latin titles
+      maxCjkChars: 14      # max characters for CJK titles
+    refine:
+      enabled: true        # phase 2 switch
+      maxWords: 5          # target words for refined titles (Latin)
+      maxCjkChars: 10      # target characters for refined titles (CJK)
+      maxInputBytes: 4096  # byte cap for refine input messages (after JSON framing)
+      maxOutputTokens: 64  # token cap for refine output
+      timeoutMs: 60000     # per-call timeout for refinement
+    budget:
+      preferCheap: true    # only pick from the low-cost model directory
+      # patterns: [...]    # low-cost model name patterns (ordered by value)
+    summary:
+      enabled: true        # summary switch
+      maxChars: 120        # max characters for the summary
+    timing:
+      idleDelayMs: 5000    # idle-detection delay (refine trigger point)
+      activityWindowMs: 1500  # activity window after an event
+      modelCacheMs: 120000    # budget routing cache duration
+    model:
+      provider: ''         # explicit refine routing (paired with model)
+      model: ''            # e.g. deepseek-official / deepseek-v4-flash
+    dedup:
+      enabled: true        # title dedup (skip identical + cross-session numbering)
+      suffix: '({n})'      # numbering suffix template, must contain {n} placeholder (from 2)
+    debug: false           # debug logging
+</code></pre>
+<blockquote>
+<p>With <code>instant.enabled</code> off, phase 1 no longer produces keyword titles, but phase 2 still only runs in the <strong>idle window</strong> (auto-generation requests during busy periods are skipped; the title is generated by the timer once the session quiets down) — it never becomes "call the model on every message".</p>
+</blockquote>
+<h3>Model Selection Precedence (phase 2)</h3>
+<ol>
+<li>Explicit <code>model.provider</code> + <code>model.model</code> configuration;</li>
+<li>With <code>budget.preferCheap</code> on, scan the model directories of all configurable providers, match by the pattern names in <code>budget.patterns</code>, and take the best (default order: <code>flash</code> → <code>haiku</code> → <code>lite</code> → <code>mini</code> → <code>nano</code> → <code>fast</code> → …; for the same tier, the shortest name wins), result cached for <code>timing.modelCacheMs</code>;</li>
+<li>The session's own model route (<code>request.route</code>);</li>
+<li>If none is available, skip refinement and keep the instant caption.</li>
+</ol>
+<h2>Interface</h2>
+<h3>Provider</h3>
+<p>Registered on <code>ctx.sessionTitle</code>, <code>id</code> <code>session-caption</code>, automatic mode <code>all-user-messages</code>:</p>
+<table>
+<thead>
+<tr>
+<th>Field</th>
+<th>Value</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>id</code></td>
+<td><code>session-caption</code></td>
+<td>source identifier written to <code>session/title</code> events</td>
+</tr>
+<tr>
+<td><code>automatic</code></td>
+<td><code>all-user-messages</code></td>
+<td>one generation per new user message</td>
+</tr>
+<tr>
+<td><code>generate(request)</code></td>
+<td>—</td>
+<td>active → instant caption; idle → refinement</td>
+</tr>
+</tbody></table>
+<p><code>generate</code> receives <code>{ session, messages, route?, signal }</code> and returns <code>{ title, messageSeqs, model? }</code>. <code>CaptionSkippedError</code> is thrown in these cases (the service keeps the existing title, not treated as a failure):</p>
+<ul>
+<li>the user manually renamed (<code>source.kind === 'user'</code>);</li>
+<li>no extractable keywords in the instant phase;</li>
+<li>the refined result equals the current title (dedup; also marks the session as stable to avoid repeated generation);</li>
+<li>no usable model route.</li>
+</ul>
+<h3>Events</h3>
+<table>
+<thead>
+<tr>
+<th>Event</th>
+<th>Type</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>session/title</code></td>
+<td>log-only (built into the harness)</td>
+<td>snapshot of every accepted title, with source and message seq</td>
+</tr>
+<tr>
+<td><code>session/caption-note</code></td>
+<td>log-only (contributed by this plugin)</td>
+<td>one-line summary on refinement: <code>{ title, note, messageSeqs }</code></td>
+</tr>
+</tbody></table>
+<p>Like <code>title</code>, <code>caption-note</code> never enters the model context; replay tools that don't recognize the event can safely skip it (informational record).</p>
+<h3>Directory Structure</h3>
+<pre><code>src/
+├── index.ts       # plugin entry: name / inject / Config / apply
+├── config.ts      # config schema and runtime validation
+├── context.ts     # structured Harness context types
+├── flow.ts        # two-phase orchestration (generate / event feeding / dedup / summary)
+├── keywords.ts    # phase 1: keyword caption engine
+├── refine.ts      # phase 2: budget-model refinement + summary
+├── budget.ts      # cost routing: cheapest model selection and caching
+├── pacemaker.ts   # idle pacemaker: activity awareness + refine timing
+├── normalizer.ts  # title cleaning, length capping, comparison
+├── language.ts    # Latin/CJK script detection
+├── events.ts      # custom event declarations
+└── errors.ts      # CaptionSkippedError: skipped refinements
+</code></pre>
+<h2>Development</h2>
+<pre><code>npm install     # dev dependencies (incl. three forwarding packages under dev/pkgs, file: refs, reinstallable)
+npm run typecheck   # tsc type checking
+npm test            # vitest unit and flow tests (86 cases)
+npm run build       # compile to lib/src/
+</code></pre>
+<blockquote>
+<p><strong>Runtime dependency note</strong>: at runtime the plugin uses <code>@deepseek-ai/dsh-llm</code>, <code>@deepseek-ai/dsh-session</code>, <code>@deepseek-ai/dsh-session-title</code>, which are provided by the dsh installation itself and are <strong>not declared as dependencies/peerDependencies</strong> in the manifest — the npm transitive dependency chain of these three packages is currently incomplete (one transitive package is unpublished), and declaring them would break installation; if loaded into a custom profile lacking these packages, loading fails with <code>ERR_MODULE_NOT_FOUND</code> — just install the package into the profile's <code>node_modules</code>.</p>
+<p><strong>Local dev mirror</strong>: the <code>stubs/</code> directory is a minimal API mirror of these three packages (checked member-by-member against the released rc.1); <code>dev/pkgs/</code> holds three thin forwarding packages (<code>file:</code> deps) for tsc resolution and local tests; they are not shipped with the plugin (<code>files</code> only includes <code>lib/src</code>, the configuration layer, and docs).</p>
+</blockquote>
+<h2>License</h2>
+<p>MIT — see <a href="https://github.com/JohnXu22786/session-titler/blob/HEAD/LICENSE">LICENSE</a>.</p>

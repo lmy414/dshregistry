@@ -1,0 +1,546 @@
+<h1>dsh-memory-bridge</h1>
+<p><a href="https://github.com/gangwolf2312-creator/dsh-memory-bridge/blob/HEAD/README.en.md">English</a> | 中文</p>
+<p>为 DeepSeek Harness 提供<strong>长期记忆</strong>的桥接插件：对话自动沉淀为可检索、可审计、可治理的记忆树，并在后续对话中按需注入上下文。它最初是一个<strong>可进化的私人记忆系统</strong>——面向个人使用而设计，现在开源出来给有兴趣的人自取。</p>
+<ul>
+<li>存储：明文 Markdown 真源 + SQLite 索引（可读、可修、可迁移）</li>
+<li>检索：BM25 + 多路 RRF 相关度排序召回（零 LLM、零外部服务）</li>
+<li>治理：遗忘曲线、审计闭环、全局收缩——记忆会老化但可解释</li>
+<li>UI：设置页内 7 个可视化 tab（总览 / 事件图谱 / 知识图谱 / 时间线 / 待审 / 画像 / 审计）</li>
+</ul>
+<hr>
+<h2>项目定位</h2>
+<p><strong>核心适用场景：上下文窗口受限的记忆系统。</strong></p>
+<p>DeepSeek 云端模型（V4）提供 <strong>100 万 token 的上下文窗口</strong>（<a href="https://www.orcarouter.ai/blog/deepseek-v4-review">公开资料</a>），在这个前提下，DSH 自带的机制（resume 恢复整个会话 + compaction 压缩超长上下文）足以维持记忆——"把历史都塞进窗口"是可行的。</p>
+<p>但<strong>一旦接入本地模型</strong>（Ollama 等），情况完全不同：上下文窗口通常是 <strong>4K-32K，且需显式配置、性能随长度显著下降</strong>（<a href="https://docs.ollama.com/context-length">Ollama 文档</a>）——窗口缩小几十倍，"把历史都塞进去"不再可行。<strong>这时候记忆必须结构化、可检索、按需注入</strong>，而不是依赖长上下文硬扛。</p>
+<p><strong>本插件解决的正是这个实用场景</strong>：</p>
+<blockquote>
+<p>当上下文窗口受限（本地模型 / 小窗口模型）时，如何仍然拥有可用的长期记忆？</p>
+</blockquote>
+<p>方案：把对话中值得留存的（你是谁、做过什么、哪些决定被认可、哪些经验被验证）<strong>提取、结构化、存储</strong>，在每轮对话中<strong>只注入相关的几条</strong>（而非全部历史）。即使窗口很小，记忆依然可用。</p>
+<p><strong>与 DSH 原生上下文的关系（边界说明）</strong>：</p>
+<table>
+<thead>
+<tr>
+<th>场景</th>
+<th>DSH 原生行为</th>
+<th>本插件的角色</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong>新会话</strong></td>
+<td>历史为空</td>
+<td>插件注入是<strong>唯一的跨会话记忆来源</strong>（核心价值）</td>
+</tr>
+<tr>
+<td><strong>resume 旧会话</strong></td>
+<td>全部历史重放进上下文</td>
+<td>插件注入<strong>叠加</strong>在历史上（不替代）；两者并行占窗口</td>
+</tr>
+<tr>
+<td><strong>长会话超窗</strong></td>
+<td>compaction 压缩历史为摘要</td>
+<td>插件注入<strong>补充</strong>摘要缺失的细节（互补）</td>
+</tr>
+</tbody></table>
+<blockquote>
+<p><strong>明确的边界</strong>：本插件注入的是 <strong>system prompt 中的动态上下文</strong>（<code>systemPrompt.context</code>），<strong>不替代、不抑制 DSH 的会话历史注入</strong>（历史由 dsh-session 的 <code>deriveMessages</code> 全量生成，插件无 API 裁剪）。<strong>会话内的历史瘦身是 DSH compaction 的职责</strong>，本插件负责的是<strong>跨会话的持久事实</strong>——两者互补，不重叠。</p>
+</blockquote>
+<p><strong>用户群体</strong>：</p>
+<table>
+<thead>
+<tr>
+<th>群体</th>
+<th>使用方式</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong>本地模型用户</strong></td>
+<td>上下文窗口小（4K-32K），最需要"按需注入"而非"全量塞入"——核心场景</td>
+</tr>
+<tr>
+<td><strong>DeepSeek 云端用户</strong></td>
+<td>1M 窗口下是"锦上添花"：获得结构化检索、治理、可视化，而非靠窗口硬扛</td>
+</tr>
+<tr>
+<td><strong>记忆敏感用户</strong></td>
+<td>明文存储 + 完整溯源 + 人工审批通道，数据透明可控</td>
+</tr>
+<tr>
+<td><strong>开发者 / 自托管者</strong></td>
+<td>引擎与桥接分离、零外部服务依赖、可二次开发</td>
+</tr>
+</tbody></table>
+<p><strong>边界声明</strong>：这是一个<strong>记忆基础设施</strong>，不是"记忆完美的智能体"——提取质量依赖所选 LLM，检索是<strong>相关度排序召回</strong>（非语义联想，也有多跳扩展），这些取舍在"已知局限"中如实说明。</p>
+<hr>
+<h2>在 Harness 中：提供什么 · 解决什么 · 价值</h2>
+<h3>提供什么（能力清单，站在使用者视角）</h3>
+<table>
+<thead>
+<tr>
+<th>能力</th>
+<th>怎么用</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong>跨会话持久记忆</strong></td>
+<td>对话自动沉淀为记忆卡，后续会话按需检索注入——补足 DSH 会话上下文之外的持久事实层</td>
+</tr>
+<tr>
+<td><strong>记忆检索工具</strong></td>
+<td>agent 可用 <code>memory_search</code> / <code>memory_add_run</code> / <code>memory_review</code> 三个工具主动读写记忆</td>
+</tr>
+<tr>
+<td><strong>记忆可视化</strong></td>
+<td>设置页 7 个 tab：事件图谱、知识图谱、时间线、待审、画像、审计、总览</td>
+</tr>
+<tr>
+<td><strong>经验与画像</strong></td>
+<td>"记住教训/踩坑"立即沉淀永久经验；偏好信号聚合提案；画像蒸馏 + 人工审批</td>
+</tr>
+<tr>
+<td><strong>治理闭环</strong></td>
+<td>遗忘曲线、利用率收缩、审计反馈——记忆库不无限膨胀</td>
+</tr>
+</tbody></table>
+<h3>解决什么（痛点）</h3>
+<table>
+<thead>
+<tr>
+<th>痛点</th>
+<th>本插件的解法</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong>跨会话记忆缺失</strong>：新会话/压缩后不携带旧事实，resume 只能续旧对话</td>
+<td>自动提取沉淀到持久层，注入相关记忆恢复背景（跨会话的持久事实，非会话内历史）</td>
+</tr>
+<tr>
+<td><strong>窗口小存不下全部记忆</strong>：本地模型 4K-32K 塞不下全部历史；会话内超长由 DSH compaction 处理，跨会话事实由本插件按需注入（分档限量）</td>
+<td>只注入相关的几条记忆（L2≤3/L1≤1/寒暄 0），避免把全部历史塞进提示词</td>
+</tr>
+<tr>
+<td><strong>历史不可检索/治理</strong>：会话日志是流水文本，不可查"我之前说过什么偏好"</td>
+<td>结构化记忆卡 + 相关度排序检索 + 分档注入 + 治理闭环</td>
+</tr>
+<tr>
+<td><strong>记忆不可信</strong>：模型"记得"可能是幻觉</td>
+<td>检索零 LLM 相关度召回；写入带证据标签 + 溯源；低置信走人工审批</td>
+</tr>
+<tr>
+<td><strong>数据黑盒</strong>：记忆锁在数据库/向量库里，不可读不可改</td>
+<td>明文 Markdown 真源，可读可修可迁移</td>
+</tr>
+<tr>
+<td><strong>记忆库膨胀</strong>：越积越多，噪音淹没信号</td>
+<td>遗忘曲线（30 天闲置完结）+ 利用率治理 + 降权淡出</td>
+</tr>
+<tr>
+<td><strong>投入产出不明</strong>：装了记忆插件不知道有没有用</td>
+<td>审计 tab：注入命中率 / 利用率 / 提取成本，闭环可量化</td>
+</tr>
+</tbody></table>
+<h3>价值</h3>
+<ul>
+<li><strong>对对话质量</strong>：关键轮次注入相关记忆（偏好、项目背景、既定决策），减少重复说明与前后矛盾——模型基于检索到的记忆回应，而非凭空"记得"。</li>
+<li><strong>对成本</strong>：注入按需限量 + 寒暄零注入 + 提取门卫（寒暄轮跳过 LLM 提取），记忆不成为每轮的 token 负担；KV-cache 友好（常驻基线 digest 未变不重建）。</li>
+<li><strong>对可靠性</strong>：记忆是独立数据层而非模型自律——检索可复现、写入可溯源、治理可审计；即使提取失败，原始对话永远在 <code>runs</code> 表。</li>
+<li><strong>对掌控感</strong>：数据明文在本地，可人工编辑/删除；经验与画像经人工审批才固化；全部决策写 <code>decision_log</code>。</li>
+</ul>
+<hr>
+<h2>设计理念</h2>
+<p><strong>一句话：记忆是独立可靠的数据层，不是模型自律的产物。</strong></p>
+<p>四条原则：</p>
+<ol>
+<li><strong>明文为真源，索引只做加速</strong>。每张记忆卡是一个 Markdown 文件，SQLite 只是可重建的检索索引——数据不锁死、可人工编辑、索引坏了不丢数据。</li>
+<li><strong>确定性算法检索，读取端零 LLM</strong>。读取端（检索）零 LLM：BM25 + 多路 RRF 融合，同一数据状态下结果可复现、可审计。LLM 只参与写入端（从对话提取），不确定性被关在写入管道里。</li>
+<li><strong>提取主动写，注入克制读</strong>。每轮对话自动提取（LLM + 零 LLM 规则双通道）；注入按对话意图分档（关键 ≤3 条、一般 ≤1 条、寒暄 0 条），记忆是"按需翻阅"不是"无脑塞进上下文"。</li>
+<li><strong>遗忘是记忆的一部分</strong>。30 天闲置枝完结、低利用卡降权、关键事实豁免——遗忘由规则驱动，可解释、可翻查、可恢复。</li>
+</ol>
+<p><strong>记忆树形态</strong>：记忆不是平铺列表，而是按时间生长的树——<strong>枝 = 事件链（主题演进），叶 = 事件卡（发生了什么）</strong>；事件完结生成"果摘要"作为导航路标；版本演化走 <code>supersedes</code> 时序链（旧事实失效但保留审计）；每条卡带溯源（来源文件 / 回合 / 证据标签 / 佐证计数），<strong>可回到原始对话</strong>。</p>
+<p><strong>记忆与知识分离</strong>：<code>memory-tree</code>（关于"你"的经历）与 <code>memory-wiki</code>（关于"世界"的规范）是两个独立库，知识条目不进记忆树，避免污染画像与经历。</p>
+<hr>
+<h2>重大决策</h2>
+<table>
+<thead>
+<tr>
+<th>决策</th>
+<th>选择</th>
+<th>理由（反对方案）</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>记忆存储</td>
+<td>Markdown 真源 + SQLite 索引</td>
+<td>纯数据库不可读不可人工核对；纯文件检索慢。双写兼顾透明与速度</td>
+</tr>
+<tr>
+<td>检索算法</td>
+<td>BM25 + RRF（jieba 分词 + FTS5）</td>
+<td>向量库需模型常驻、结果不可复现、依赖外部服务；词级相关度排序 + 多跳扩展对记忆场景足够且可审计</td>
+</tr>
+<tr>
+<td>写入管线</td>
+<td>LLM 提取 + 零 LLM 规则（双通道）</td>
+<td>单一 LLM 提取慢且贵；规则通道让"记住/踩坑/偏好"即时落卡</td>
+</tr>
+<tr>
+<td>读取注入</td>
+<td>拉式检索 + 常驻基线，分档限量</td>
+<td>全量注入污染上下文、稀释注意力</td>
+</tr>
+<tr>
+<td>真值裁决</td>
+<td>LLM 只输出"证据标签"，系统算置信、做准入</td>
+<td>模型自评当事实源会放大幻觉；directive/explicit 自动固化，uncertain 强制人工审</td>
+</tr>
+<tr>
+<td>归链</td>
+<td>确定性裁决（<code>resolve_chain</code>，别名/相似度/实体消歧）</td>
+<td>直接哈希 LLM 标题会因措辞漂移分裂成"同名假链"</td>
+</tr>
+<tr>
+<td>对话保底</td>
+<td>原始对话先落盘 <code>runs</code> 表，幂等状态机</td>
+<td>提取失败/禁用都不删原文——记忆管道出错，原始语料永远在</td>
+</tr>
+<tr>
+<td>进程模型</td>
+<td>host JS + Python sidecar（进程隔离）</td>
+<td>引擎生态成熟；sidecar 崩溃只影响记忆，不拖垮 harness</td>
+</tr>
+<tr>
+<td>Python 依赖</td>
+<td>声明式（<code>install-deps.ps1</code>），不内嵌、不静默安装</td>
+<td>静默 pip install = 在用户机器执行任意代码</td>
+</tr>
+<tr>
+<td>密钥</td>
+<td><code>apiKeyEnv</code> 环境变量优先，明文回退兼容</td>
+<td>明文 key 不落盘入库；<code>.gitignore</code> 排除 <code>config.json</code></td>
+</tr>
+</tbody></table>
+<hr>
+<h2>关键工程实现</h2>
+<h3>架构</h3>
+<pre><code>DeepSeek Harness (host 插件进程)
+├── lib/index.js                宿主：拉起 sidecar、HTTP 路由、agent 工具、
+│                               事件钩子（自动提取 / 零 LLM recorder / 注入 / 审计闭环）
+├── python/memory_bridge_server.py  sidecar：JSON-RPC over HTTP（127.0.0.1 随机端口），
+│                                   承载引擎、衰减治理、画像蒸馏
+├── engine/                     记忆树引擎源码（core/ + memory/，依赖声明式安装）
+└── client/client.js            设置页 UI（7 tab，浏览器直连 host 代理）
+</code></pre>
+<h3>存储层：明文真源 + 幂等写</h3>
+<ul>
+<li>卡 = Markdown 文件（front matter 元数据 + 正文），目录按类型分（<code>events/cards</code>、<code>events/chains</code>、<code>lessons/pending</code>、<code>lessons/permanent</code>、<code>profiles</code>）</li>
+<li>全部写操作幂等（同 id 覆盖 / <code>INSERT OR IGNORE</code>），崩溃重启对账（<code>extracting</code> 回滚为 <code>staged</code>）</li>
+<li>溯源字段贯穿：<code>source_path</code>（文件）、<code>trace_event_id</code>（回合）、<code>evidence</code>（证据标签）、<code>corroborations</code>（佐证）</li>
+</ul>
+<h3>写入管线（双通道）</h3>
+<ol>
+<li><strong>LLM 提取</strong>（turn/end 自动）：增量扫本轮 user+assistant 文本 → 入 <code>runs</code> 队列 → 门卫 <code>should_extract</code>（零 LLM，寒暄轮标记 skipped 省调用）→ LLM 提取 → 事件卡/经验/知识分流落库 → 归链 → 冲突裁决 → 失败退避。JSON 输出有截断容错（补引号/插逗号/补闭合括号）；<strong>截断降级</strong>（v0.3 抢救修复）：<code>finish_reason=length</code> 或 JSON 需结构修复 → 本批卡/wiki 强制 <code>evidence=uncertain</code> → 卡进 <code>lesson_pending</code> / wiki 进 <code>pending</code>（待审），残缺内容不自动固化（此前修复器成功会掩盖内容残缺）；单条提取 <code>max_tokens</code> 已由 1024 提至 2048。</li>
+<li><strong>零 LLM 规则 recorder</strong>（user/message 即时，纯规则不抢 TTFT）：<ul>
+<li>"记住教训/踩坑/经验教训" → <strong>立即 lesson_permanent</strong>（永久经验）</li>
+<li>"记住/记下/别忘了" → 立即事件卡</li>
+<li>"我喜欢/习惯/别用" → 偏好信号入账 → 聚合 ≥3 同类 → lesson_pending 提案</li>
+</ul>
+</li>
+</ol>
+<h3>读取管线（注入 + 审计闭环）</h3>
+<ul>
+<li><strong>user/message 预取</strong>：意图分档（L2 ≤3 / L1 ≤1 / 寒暄 L0 零注入——寒暄按<strong>整句近似匹配</strong>判定，含"好/行/嗯"的真实问题不误判；50ms 超时宁缺勿滥）+ <strong>数据驱动相关度门槛</strong>（v0.5 起废除人工词表，v0.6 校准：query 核心词经 jieba 词性提取（实词）；事件卡需 <strong>Σ idf ≥ 6.0 的多词重叠</strong>，或<strong>名词/形容词单稀有词</strong>（idf ≥ 4.2），或 <strong>query 相邻核心词对在卡/链标题中相邻</strong>（短语精确命中，救"记忆插件"类高频项目专名）——实测排障问句"问题+解决=5.78"不再误注入无关卡，"数据库迁移"不再因动词"迁移"单词命中 apiKey 卡；事实卡（偏好/经验）≥1 核心词重叠即注入）+ <strong>只读注入检索</strong>（v0.5：注入查询不写命中/未命中/归档记账，防无关查询批量归档；UI 检索记账不受影响）+ <strong>事实卡优先</strong>（v0.3：lesson/permanent/偏好卡置顶，事件流水补位）+ <strong>常驻基线快照</strong>（approved 画像 + 高置信永久经验，<strong>相关性闸门</strong>：query 不含身份/偏好/经验类语义词时不注入画像经验；digest 变更检测、KV-cache 友好）→ 缓存 → system prompt 渲染时注入带溯源文本</li>
+<li><strong>审计闭环</strong>：turn 结束后判定注入是否被回复利用（规则归因零 LLM）→ 命中滚动 / 连续 ≥3 次未命中降权淡出（"没被利用" ≠ "记忆错误"）</li>
+</ul>
+<h3>生命周期治理（规则驱动，零 LLM）</h3>
+<ul>
+<li><strong>遗忘曲线</strong>：30 天闲置枝自动完结、子卡枯萎（<code>status=wilted</code>、排除检索但保留数据）</li>
+<li><strong>全局治理</strong>：<code>inject_used_rate &lt; 0.3</code> → 自动收缩注入条数（3→2→1）；动作写 <code>decision_log</code> 可审计</li>
+<li><strong>安全豁免</strong>：lesson_permanent / approved / explicit / directive / 佐证 ≥1 的卡豁免衰减</li>
+</ul>
+<h3>画像蒸馏</h3>
+<ul>
+<li>手动触发（UI「画像」tab 或 RPC <code>distill</code>）：收集事件树 → LLM 生成画像摘要 + 用户人格维度（MBTI + 8 轴，属画像数据而非 persona 库）→ 防抖/去重 → 草稿 → <strong>人工采纳</strong>固化（version+1，草稿移入 <code>approved/</code> 防重复采纳）→ 进入注入常驻基线</li>
+<li>画像 = 用户画像信息（身份/偏好/协作方式），作为模型的稳定用户背景；<strong>相关性闸门</strong>（v0.3 抢救修复）：仅在 query 含身份/偏好/经验类语义词时随常驻基线注入，无关主题/寒暄不携带</li>
+</ul>
+<h3>工程保障</h3>
+<ul>
+<li><strong>故障隔离</strong>：sidecar 崩溃只影响记忆，不拖垮 harness；jieba 缺失时返回可操作安装指引而非崩溃</li>
+<li><strong>安全</strong>：POST 严格同源校验；GET 无 Origin 须带本地标记 header（防跨站状态污染）；RPC 参数路径穿越白名单；Sidecar 仅监听 127.0.0.1；密钥脱敏回显 + <code>apiKeyEnv</code> 渐进迁移</li>
+<li><strong>可移植</strong>：引擎路径自动探测（env → config → 自动），Python 可执行文件同理；无 Node 原生依赖</li>
+<li><strong>可测试</strong>：独立冒烟脚本（真实 spawn sidecar）、引擎 324 个单元测试、JSON 修复器专项用例</li>
+<li><strong>版本规范</strong>（2026-08-19 起）：每次 bug 修复或功能更新<strong>变更版本号</strong>（semver：修复=patch、新功能=minor）并随代码同 commit、打 <code>vX.Y.Z</code> tag 同步推送；当前 <code>v0.1.1</code></li>
+</ul>
+<hr>
+<h2>特色</h2>
+<ul>
+<li><strong>为受限上下文而生</strong>：本地模型窗口 4K-32K 也能有可用的长期记忆——注入只带相关几条，不靠大窗口硬扛（云端 1M 窗口下同样省 token）</li>
+<li><strong>本地零外部服务</strong>：读取端（检索/注入/治理）零 LLM、零向量库、零外部依赖；写入端可选本地模型或云端 API（mode 决定）</li>
+<li><strong>记忆与知识分离</strong>：记忆 = 关于"你"的经历（会变、有时效）；知识 = 关于"世界"的规范（稳定、可复用）。<strong>分开存是为了检索不被污染</strong>——搜规范时不会翻出私人经历，反之亦然；两者检索策略也不同（记忆 BM25+RRF，知识条文级倒排）</li>
+<li><strong>树状组织、弱图谱关系</strong>：事件按<strong>链</strong>聚合（枝=主题演进，叶=单次事件）。树是<strong>确定性归链</strong>（resolve_chain，标题/别名/实体消歧），图谱只是树的可视化投影——不强依赖实体关系网（实体关系提取难且不稳），用确定性的"归属链"组织记忆</li>
+<li><strong>记忆会"生长"</strong>：事件 → 事件链 → 经验 → 画像的蒸馏路径，不是日志堆积</li>
+<li><strong>双通道写入</strong>：LLM 提取的广度 + 规则即时响应的速度（"记住教训"立即沉淀）</li>
+<li><strong>克制注入</strong>：按意图分档 + 常驻基线 + 审计反馈，控制注入量、避免占满上下文</li>
+<li><strong>可视化</strong>：力导向事件图谱 / 知识图谱 / 时间线，图谱与树联动</li>
+</ul>
+<hr>
+<h2>已知局限</h2>
+<p><strong>如实披露</strong>（非 bug，是设计边界或未完成项）：</p>
+<table>
+<thead>
+<tr>
+<th>项</th>
+<th>状态</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>提取质量依赖所选 LLM</td>
+<td>设计边界</td>
+<td>写入端用 LLM，选错模型（如 reasoner 思考模型）会污染提取；默认预设已关思考，文档有"非思考模型"选型建议</td>
+</tr>
+<tr>
+<td>检索是词级相关度召回，非语义联想</td>
+<td>设计边界</td>
+<td>BM25+RRF 按词命中相关度排序（含沿链/实体多跳扩展），对<strong>措辞漂移</strong>召回有限（靠别名/归链缓解），不适合"语义联想"类查询（如"和上次那个类似的东西"）</td>
+</tr>
+<tr>
+<td>画像蒸馏为手动触发</td>
+<td>未完成</td>
+<td><code>DistillWorker</code>（每周 + idle 门槛自动调度）已实现，sidecar 未启动后台线程，当前需手动点「蒸馏画像」</td>
+</tr>
+<tr>
+<td><code>persona.py</code>（引擎内置人格库）</td>
+<td>刻意不接线</td>
+<td>agent 人格由 <strong>DSH 侧 persona 插件/系统提示词</strong>管理（引擎 README §9.5 明确不迁移清单）；本插件只负责"记忆"，不负责"分身人格"</td>
+</tr>
+<tr>
+<td>偏好信号需 ≥3 次同类提及才提案</td>
+<td>设计边界</td>
+<td>避免单次随口一说即沉淀；反复表达才入 pending</td>
+</tr>
+<tr>
+<td><strong>无法替代会话历史全量重放</strong></td>
+<td>设计边界</td>
+<td>resume 旧会话时 DSH 会把全部历史重放进上下文，插件注入<strong>叠加</strong>在历史上、<strong>无法替代或抑制</strong>（历史由 dsh-session <code>deriveMessages</code> 全量生成，插件无裁剪 API）；会话内历史瘦身需靠 DSH compaction</td>
+</tr>
+<tr>
+<td>本地小模型边缘波动</td>
+<td>设计边界</td>
+<td>4B 级本地模型在规范条文/别名等边缘用例有波动，云端全绿，低置信走 pending 人工兜底</td>
+</tr>
+</tbody></table>
+<h3>语言环境说明（当前主要面向中文）</h3>
+<p><strong>当前插件主要面向中文环境</strong>。以下环节深度依赖中文，英文用户需要自行改造：</p>
+<table>
+<thead>
+<tr>
+<th>环节</th>
+<th>依赖中文的位置</th>
+<th>英文用户改造建议</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong>零 LLM 规则触发词</strong></td>
+<td><code>rules.py</code>（记住/记下/记住教训/踩坑/我喜欢/习惯/别用 等）+ <code>guard.py</code>（_DIRECTIVE / _FACT_HINTS / _CHIT_CHAT 等）</td>
+<td>在对应元组中<strong>追加英文触发词</strong>（如 remember / lesson learned / I like / don't use / today / project / thanks）——纯数据改动，不影响逻辑</td>
+</tr>
+<tr>
+<td><strong>LLM 提取提示词</strong></td>
+<td><code>extract.py</code> 的 <code>_EXTRACT_PROMPT</code> / <code>_EXTRACT_PROMPT_SMALL</code>（中文提取指令 + 示例）</td>
+<td>编写<strong>英文版提示词</strong>并实测提取质量（提示词是提取质量命门，不能照译）</td>
+</tr>
+<tr>
+<td><strong>画像蒸馏提示词</strong></td>
+<td><code>distill.py</code> 的 <code>DISTILL_PROMPT</code>（中文）</td>
+<td>同步英文版</td>
+</tr>
+<tr>
+<td><strong>UI 文案</strong></td>
+<td><code>client/client.js</code> 的 141 行中文 UI 字符串（tab 名/标签/提示）</td>
+<td>替换为英文或中英并存</td>
+</tr>
+<tr>
+<td><strong>Agent 工具描述</strong></td>
+<td><code>lib/index.js</code> 的 3 个工具 <code>description</code>（模型可见）</td>
+<td>英文化利于模型理解工具用途</td>
+</tr>
+</tbody></table>
+<blockquote>
+<p><strong>注意</strong>：中英并存（方案 A）时，若需按对话语言自动切换提示词，还需要新增<strong>语言检测逻辑</strong>（当前未实现，提取提示词固定为中文）。不做语言检测也可用——英文内容仍会被中文提示词提取（LLM 能理解中文指令），只是英文用户需自行评估提取质量是否可接受。</p>
+</blockquote>
+<hr>
+<h2>安装</h2>
+<h3>适配版本</h3>
+<table>
+<thead>
+<tr>
+<th>依赖</th>
+<th>版本要求</th>
+<th>依据</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>DeepSeek Harness</td>
+<td><strong>0.1.0-rc.7+</strong></td>
+<td>插件依赖 <code>@deepseek-ai/dsh-tools@^0.1.0-rc.7</code>，client 注入的 5 个服务（connection/runtime/locale/ui-settings/ui-theme）在 rc.7 下实测可用</td>
+</tr>
+<tr>
+<td>Python</td>
+<td>3.10+</td>
+<td>sidecar 使用 <code>X | Y</code> 类型语法（3.10+）</td>
+</tr>
+<tr>
+<td>Node 原生依赖</td>
+<td>无</td>
+<td>纯 JS host + Python sidecar</td>
+</tr>
+</tbody></table>
+<blockquote>
+<p>说明：rc.7 之前的版本未验证（settings 挂载机制在 rc.7 有调整），建议使用 rc.7 及以上。</p>
+</blockquote>
+<pre><code>:: 1) 从 GitHub 安装
+dsh plugin --profile web add github:&lt;owner&gt;/dsh-memory-bridge
+
+:: 2) 安装 Python 依赖（jieba 分词，声明式；清华镜像，失败自动回退阿里云）
+pwsh &lt;你的插件目录&gt;/engine/install-deps.ps1
+</code></pre>
+<p>重启 harness 后生效。卸载：<code>dsh plugin --profile web remove dsh-memory-bridge</code></p>
+<blockquote>
+<p>已带 <code>dsh-plugin</code> / <code>dsh-category-memory</code> topics——可从 <strong>DSH 设置 → 插件市场（Marketplace）</strong> 的 memory 分类下发现并一键安装。</p>
+</blockquote>
+<blockquote>
+<p>依赖策略：jieba 走声明式安装，不内嵌、不在安装时静默 pip install；缺失时 sidecar 返回可操作指引，不拖垮 harness。</p>
+</blockquote>
+<hr>
+<h2>配置（设置页 → 记忆 → 提取配置）</h2>
+<table>
+<thead>
+<tr>
+<th>项</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>mode</td>
+<td><code>off</code> 纯规则 / <code>local</code> 本地模型 / <code>cloud</code> 云端记忆 API / <code>main</code> 主对话模型兜底 / <code>hybrid</code> 本地优先·云端兜底</td>
+</tr>
+<tr>
+<td>local.preset</td>
+<td><code>qwen3-it-4b-flm</code>（推荐，内置关思考）或 <code>custom</code>（自填 baseUrl/model/apiKey/apiKeyEnv）</td>
+</tr>
+<tr>
+<td>cloud.*</td>
+<td>云端记忆 API（baseUrl / model / apiKey / apiKeyEnv / batchSize / maxCallsPerMinute）</td>
+</tr>
+<tr>
+<td>sanitize</td>
+<td>提取前脱敏（手机号/邮箱/身份证/密钥），云端默认开启</td>
+</tr>
+</tbody></table>
+<ul>
+<li><strong>模型选择</strong>：提取/注入用<strong>非思考模型</strong>最稳（reasoning 输出推理链会污染 JSON 提取）；默认预设已关思考；custom 请选 instruct 变体；云端用 <code>deepseek-chat</code> 勿用 <code>deepseek-reasoner</code></li>
+<li><strong>API key</strong>：<code>apiKeyEnv</code> 环境变量优先，回退明文；回读一律脱敏；配置先校验后落盘</li>
+</ul>
+<hr>
+<h2>UI（设置页 → 记忆）</h2>
+<table>
+<thead>
+<tr>
+<th>Tab</th>
+<th>内容</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>总览</td>
+<td>统计 / 状态 / 审计摘要 / 最近活动</td>
+</tr>
+<tr>
+<td>事件图谱</td>
+<td>力导向图 + 记忆树导航联动、孤立节点/实体开关、方向箭头流动线</td>
+</tr>
+<tr>
+<td>知识图谱</td>
+<td>wiki 条目力导向图（上位/版本关系）+ 搜索 + 列表</td>
+</tr>
+<tr>
+<td>时间线</td>
+<td>事件流按日分组（今天/昨天/2-6 天前），倒序</td>
+</tr>
+<tr>
+<td>待审</td>
+<td>提取队列 / pending 经验审批</td>
+</tr>
+<tr>
+<td>画像</td>
+<td>已审批画像 + 「蒸馏画像」 + 草稿采纳/驳回</td>
+</tr>
+<tr>
+<td>审计</td>
+<td>注入/提取统计 + 「立即维护」 + 决策日志</td>
+</tr>
+</tbody></table>
+<h2>界面预览</h2>
+<table>
+<thead>
+<tr>
+<th></th>
+<th></th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong>总览</strong>：统计卡片 / 记忆构成 / 本地推理状态 / 提取注入审计 / 配置表单</td>
+<td><strong>事件图谱</strong>：力导向图 + 记忆树联动导航</td>
+</tr>
+<tr>
+<td><img src="https://raw.githubusercontent.com/gangwolf2312-creator/dsh-memory-bridge/HEAD/docs/screenshots/overview.png" alt="总览"></td>
+<td><img src="https://raw.githubusercontent.com/gangwolf2312-creator/dsh-memory-bridge/HEAD/docs/screenshots/event-graph.png" alt="事件图谱"></td>
+</tr>
+<tr>
+<td><strong>审计</strong>：注入/提取统计 + 手动维护 + 决策日志</td>
+<td></td>
+</tr>
+<tr>
+<td><img src="https://raw.githubusercontent.com/gangwolf2312-creator/dsh-memory-bridge/HEAD/docs/screenshots/audit.png" alt="审计"></td>
+<td></td>
+</tr>
+</tbody></table>
+<hr>
+<h2>Agent 工具</h2>
+<table>
+<thead>
+<tr>
+<th>工具</th>
+<th>用途</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>memory_search</code></td>
+<td>确定性算法检索记忆卡（BM25+RRF，零 LLM），返回链上下文与反馈提示</td>
+</tr>
+<tr>
+<td><code>memory_add_run</code></td>
+<td>agent 主动把当前轮写入 run 队列（可指定 tier）</td>
+</tr>
+<tr>
+<td><code>memory_review</code></td>
+<td>查看待提取 run 队列 / 指定 run 状态</td>
+</tr>
+</tbody></table>
+<hr>
+<h2>HTTP API</h2>
+<ul>
+<li><code>GET</code>：<code>overview</code> <code>health</code> <code>search?q=</code> <code>browse?kind=</code> <code>card?id=</code> <code>review?runId=</code> <code>wiki?q=</code> <code>config</code> <code>lemonade-status</code> <code>audit</code> <code>graph</code> <code>profile-status</code>（需 <code>x-dsh-memory: 1</code> header 或同源 Origin）</li>
+<li><code>POST</code>：<code>card-action</code> <code>add-run</code> <code>config</code> <code>lemonade-ensure</code> <code>extract</code> <code>maintenance</code> <code>distill</code> <code>distill-approve</code> <code>distill-reject</code>（同源校验）</li>
+<li><code>inject</code> / <code>recordUsage</code> / <code>recorder</code> 不暴露为 HTTP 路由：宿主在事件钩子内部直连 sidecar</li>
+</ul>
+<hr>
+<h2>开发与测试</h2>
+<pre><code>REM 独立启动 sidecar（脱离 harness 联调）
+python -u &lt;插件目录&gt;\python\memory_bridge_server.py --root &lt;引擎目录&gt; --config &lt;插件目录&gt;\config.example.json
+
+REM 冒烟测试（bundled engine 缺 jieba → 可操作指引；本地引擎 → 全功能）
+python smoke_sidecar.py
+
+REM 引擎单元测试（324 个）
+python -m pytest &lt;引擎目录&gt;\tests -q
+</code></pre>

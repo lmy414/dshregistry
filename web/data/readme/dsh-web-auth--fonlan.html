@@ -1,0 +1,120 @@
+<h1>dsh-web-auth</h1>
+<p>为 <a href="https://github.com/deepseek-ai/deepseek-harness">DSH</a> Web GUI 增加<strong>密码访问认证</strong>的插件：所有 HTTP 请求与 WebSocket 升级都必须携带有效会话，未登录一律跳转到登录页。装上它之后，把 dsh 反代到公网（或直接暴露端口）才不至于裸奔。</p>
+<h2>特性</h2>
+<ul>
+<li><strong>登录页 + HttpOnly 签名 Cookie</strong>（HMAC-SHA256，7 天滑动续期），浏览器自动携带，HTTP / WebSocket / SSE / 静态资源全覆盖</li>
+<li><strong>首次设置</strong>：未配置密码时，登录页显示「设置访问密码」表单（引导流程，见下文安全说明）</li>
+<li><strong>GUI 改密</strong>：设置 → 插件 →「访问认证」卡片（插件配置 tab），需旧密码；改密后<strong>轮换签名密钥，所有已登录会话立即下线</strong></li>
+<li><strong>退出登录</strong>：设置卡片按钮，或访问 <code>/logout</code></li>
+<li><strong>防爆破</strong>：登录与改密接口按客户端 IP 限速（连续 5 次失败锁 1 分钟起，指数退避至 30 分钟；15 分钟内累计）</li>
+<li><strong>反代友好</strong>：Cookie <code>Secure</code> 自动跟随 <code>x-forwarded-proto</code>；限速信任回环对端的 <code>X-Forwarded-For</code></li>
+<li><strong>监听地址切换</strong>：设置卡片可一键把 dsh 的监听地址在 <code>127.0.0.1</code>（仅本机）与 <code>0.0.0.0</code>（所有网卡 / 局域网可访问）之间切换，热生效、无需重启进程（写入 <code>web-auth</code> settings 命名空间 → host 半区应用 patch → HMR 重绑 webserver）</li>
+<li>密码以 <strong>scrypt 加盐哈希</strong>存储（<code>$DSH_HOME/web-auth/password.hash</code>，0600），永不回显、不落明文配置</li>
+</ul>
+<h2>安装</h2>
+<pre><code>dsh plugin --profile web add @fonlan/dsh-web-auth
+</code></pre>
+<p>从 npm 安装：<code>dsh plugin add</code> 会把包写入 profile 的依赖与 bundle 栈（<code>cordis.patch.yml</code> 自动 insert 插件行，host 半区 + 浏览器半区一次挂载）。升级到新版本：</p>
+<pre><code>dsh plugin --profile web update @fonlan/dsh-web-auth
+</code></pre>
+<blockquote>
+<p>安装后<strong>需要重启 dsh web 进程</strong>才生效（当前会话会短暂断连重连）。</p>
+</blockquote>
+<h2>激活（首次设置密码）</h2>
+<p>重启后打开 dsh web，会被重定向到登录页：</p>
+<ol>
+<li>未设置过密码时，登录页显示「设置访问密码」——输入 <strong>≥8 位</strong>的新密码并确认</li>
+<li>设置成功后立即签发会话并跳回原页面；此后每次访问都要输密码</li>
+</ol>
+<p>改密入口在 <strong>设置 → 插件 → 插件配置 → 访问认证</strong>（需先登录）。</p>
+<h2>行为细节</h2>
+<table>
+<thead>
+<tr>
+<th>场景</th>
+<th>行为</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>未登录访问页面（GET/HEAD）</td>
+<td><code>302</code> → <code>/login?next=原路径</code>，登录后跳回</td>
+</tr>
+<tr>
+<td>未登录访问 API（POST 等）</td>
+<td><code>401</code> JSON</td>
+</tr>
+<tr>
+<td>反代域名下已登录访问任意路径（含 <code>/api</code>、插件前缀）</td>
+<td>改写为回环来源放行，网关特权方法与插件围栏不再 403</td>
+</tr>
+<tr>
+<td>跨站请求（即使带 Cookie）</td>
+<td>仍被围栏 <code>403</code> 拒绝</td>
+</tr>
+<tr>
+<td>未登录 WebSocket 升级</td>
+<td>握手直接 <code>401</code> 拒绝</td>
+</tr>
+<tr>
+<td>登录失败</td>
+<td>跳回登录页显示「密码错误」（统一文案）</td>
+</tr>
+<tr>
+<td>连续失败</td>
+<td>按 IP 限速，提示「尝试过于频繁」</td>
+</tr>
+<tr>
+<td>会话过期</td>
+<td>跳回登录页；滑动续期：剩余不足 24h 自动刷新</td>
+</tr>
+<tr>
+<td>修改密码</td>
+<td>校验旧密码 → 轮换签名密钥 → <strong>全员下线</strong>，跳转登录页</td>
+</tr>
+<tr>
+<td>切换监听地址（设置卡片）</td>
+<td>校验取值（仅 <code>127.0.0.1</code> / <code>0.0.0.0</code>）→ 写入 <code>web-auth</code> settings 命名空间（revision 设栅）→ host 半区应用 patch（profile 优先，home 兜底）→ HMR 热重载 webserver 重新绑定；<strong>WebSocket 短暂断连后自动重连</strong></td>
+</tr>
+<tr>
+<td><code>/logout</code></td>
+<td>清除 Cookie，跳转登录页</td>
+</tr>
+</tbody></table>
+<h3>切换监听地址</h3>
+<p>dsh 默认只监听 <code>127.0.0.1</code>。在 <strong>设置 → 插件 → 插件配置 → 访问认证</strong> 卡片底部可以把它切换为 <code>0.0.0.0</code>（所有网卡，局域网可访问），或切回仅本机——无需重启 dsh 进程：</p>
+<ul>
+<li>切换写入 <code>web-auth</code> settings 命名空间（<code>$DSH_HOME/settings.yaml</code>，revision 设栅）；host 半区监听到提交后应用到当前部署的 patch 层：profile 的 <code>cordis.patch.yml</code>；若 home 层（<code>$DSH_HOME/cordis.patch.yml</code>）已声明 webserver 行则写 home 层（home 优先级更高，改在低层会被覆盖）。文件里其余内容（注释、<code>!!js</code> 端口表达式）原样保留。</li>
+<li>dsh 的 HMR 会监听到 patch 文件变化并热重载 webserver 行：<strong>关闭旧监听、按新地址重新绑定</strong>，全程无需重启进程。重启进程后该设置依然生效（settings 命名空间 + patch 文件都在）。</li>
+<li>切换瞬间所有连接（包括当前页面与 WebSocket）会断开重连，属正常现象；卡片会轮询状态确认新地址生效。</li>
+<li>注意：若你正通过<strong>局域网 IP</strong>（<code>0.0.0.0</code> 模式）访问并切回 <code>127.0.0.1</code>，切回后只能在本机访问，请改用 <code>127.0.0.1</code> 重新打开页面。</li>
+</ul>
+<blockquote>
+<p>该能力依赖 webserver 行位于 profile/home patch 层（默认安装即如此）。若你的 webserver 配置来自自定义 <code>--patch</code> overlay，请直接编辑 overlay 文件。</p>
+</blockquote>
+<h2>安全模型与风险（请务必阅读）</h2>
+<ul>
+<li><strong>认证是访问控制，不是安全边界</strong>。dsh 的 agent 拥有 bash 执行能力（远程代码执行级别），即使有密码保护，也不要把它当成不可攻破的堡垒：密码强度、反代层 WAF/限流、IP 白名单仍然值得做。</li>
+<li><strong>首密窗口期</strong>：未设置密码时，<strong>任何人</strong>都能访问登录页并抢注密码（设计如此，作为 bootstrap 通道）。启动日志会打印警告；请装好插件后<strong>第一时间设置密码</strong>。生产环境建议先用 <code>127.0.0.1</code> + SSH 端口转发完成首密设置，再开放公网。</li>
+<li><strong>会话是无状态的</strong>（HMAC 签名），服务端无法单独吊销某一个会话；<code>/logout</code> 只清浏览器 Cookie。密码泄露时请<strong>修改密码</strong>——这会轮换密钥并让所有会话失效。</li>
+<li>密码哈希与签名密钥存放于 <code>$DSH_HOME/web-auth/</code>（默认 <code>~/.dsh/web-auth/</code>），权限 0600；删除 <code>password.hash</code> 即回到未配置状态（认证关闭）。</li>
+<li>限速为<strong>进程内存级</strong>，多实例部署时各自独立，重启清零；如需更强防护请依赖反代层限流。</li>
+</ul>
+<h2>开发</h2>
+<pre><code>pnpm install
+npm run build      # host: tsc → lib/；client: esbuild → lib/client.js（ModuleLoader 格式）
+npm run typecheck
+npm run test       # 32 项单元 + 集成测试（node:test，真实 HTTP/WS 全流程）
+</code></pre>
+<p>仓库结构：</p>
+<ul>
+<li><code>src/auth-core.ts</code> — 纯逻辑：scrypt 哈希、Cookie 签名/校验、限速器、<code>next</code> 校验</li>
+<li><code>src/gate.ts</code> — 把认证闸门包到 node:http 服务器的 request/upgrade 监听器外层</li>
+<li><code>src/handlers.ts</code> — 登录页/登录/登出/改密/状态/监听切换 路由处理</li>
+<li><code>src/profile-patch.ts</code> — 监听地址切换：webserver 行的 patch 层文本改写（保留注释与 <code>!!js</code> 表达式）</li>
+<li><code>src/settings.ts</code> — <code>web-auth</code> settings 命名空间注册 + listenHost 变更应用（卡片的分发键与数据源）</li>
+<li><code>src/index.ts</code> — cordis 插件装配（host 半区）</li>
+<li><code>src/client/index.tsx</code> — 设置卡片（浏览器半区，<code>settings.plugin.item</code> 插槽，keyed by <code>web-auth</code> 命名空间）</li>
+<li><code>cordis.patch.yml</code> — bundle 补丁层（insert 插件行）</li>
+</ul>
+<h2>License</h2>
+<p>MIT</p>

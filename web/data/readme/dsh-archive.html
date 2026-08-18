@@ -1,0 +1,113 @@
+<h1>@imrascal/dsh-archive</h1>
+<p>A DeepSeek Harness (DSH) plugin that manages <strong>archived sessions and the trash</strong> from the settings panel.</p>
+<ul>
+<li><strong>Archived Sessions</strong>: review sessions that are hidden from the sidebar but keep their records;
+restore them individually or all at once, or move them to the trash.</li>
+<li><strong>Trash</strong>: review deleted sessions; restore, permanently purge, or empty the whole trash.</li>
+</ul>
+<p>Deletes are <strong>reversible</strong>: deleting a session moves it to the trash (<code>~/.dsh/trash</code>); only
+<em>purge</em> / <em>empty trash</em> are permanent. Live (running) sessions refuse deletion with a clear message.</p>
+<h2>Install</h2>
+<pre><code>dsh plugin --profile web add github:imrascal/dsh-archive
+</code></pre>
+<p>Or from a local checkout:</p>
+<pre><code>dsh plugin --profile web add file:C:/path/to/dsh-archive
+</code></pre>
+<p><strong>Restart the app</strong> after installing (the host half loads at boot), then refresh the page —
+the section appears under Settings → Archived Sessions.</p>
+<blockquote>
+<p><code>dsh plugin</code> forwards to pnpm, so <code>pnpm</code> must be on your PATH.</p>
+</blockquote>
+<h2>How it works</h2>
+<p>This feature originally lived as in-box patches across 12 files
+(<code>dsh-workspace</code>, <code>dsh-session-persistence-jsonl</code>, <code>dsh-host-apiproxy</code>, <code>dsh-client-runtime</code>,
+<code>dsh-client-ui-workspace</code>, ... — reference diffs in <a href="https://github.com/imrascal/dsh-archive/blob/HEAD/patches/"><code>patches/</code></a>). This plugin re-implements
+it as a standalone package with a <strong>dual-path design</strong>:</p>
+<table>
+<thead>
+<tr>
+<th>Path</th>
+<th>When</th>
+<th>Behavior</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong>Native</strong></td>
+<td>host/client already carry the archive API</td>
+<td>the client calls <code>ctx.workspaces.unarchiveSession / trashList / ...</code> directly — same RPC + store-frame sync as the in-box implementation</td>
+</tr>
+<tr>
+<td><strong>Fallback</strong></td>
+<td>an app update reverted host or client to stock</td>
+<td>the host half <strong>patches at runtime</strong>: adds the trash layer to <code>sessionPersistence</code> and the archive API to <code>workspaceRegistry</code>; the client talks to the plugin's own <code>/dsh-archive/session</code> HTTP route</td>
+</tr>
+</tbody></table>
+<p>So the feature <strong>survives app updates</strong>: trash data lives in <code>~/.dsh/trash</code> (data, not code) and the
+archive set lives in the workspace registry's persisted state. Whatever the update does to the
+packages, the plugin feature-detects at startup and fills in whatever is missing.</p>
+<h3>Layout</h3>
+<pre><code>dsh/index.js   host half: persistence trash layer + registry archive API + /dsh-archive/session route
+dsh/client.js  browser half: "Archived Sessions" settings section (settings.section slot), no build, react only
+cordis.patch.yml   bundle mount declaration
+patches/       reference diffs for the in-box host patches (the client patches are replaced by this plugin)
+scripts/       eval-check.mjs (client factory eval) and host-logic-test.mjs (host backend lifecycle)
+</code></pre>
+<h2>Migrating from an in-box patch (optional)</h2>
+<p>If your DSH install already carries the local archive-management patches (as this repo's dev
+machine did), the plugin and the in-box patch would register the same <code>archived-sessions</code> section.
+To migrate:</p>
+<ol>
+<li>Restore <code>node_modules/@deepseek-ai/dsh-client-ui-workspace/lib/client.js</code> to the official
+release (drops the embedded ArchivedSessionsSection registration; the host patches may stay —
+the plugin detects them and no-ops).</li>
+<li>Install and restart this plugin.</li>
+<li>The plugin stands down automatically when the same section id already exists; once the in-box
+patch is removed the plugin takes over.</li>
+</ol>
+<blockquote>
+<p>To move the host side back to stock as well, back up <code>~/.dsh</code> first, reverse <code>patches/</code>, and let
+this plugin's host half re-add the backend. Trash data and the archive set are unaffected.</p>
+</blockquote>
+<h2>Data safety</h2>
+<ul>
+<li>Deleting a session moves it to <code>~/.dsh/trash/&lt;sessionId&gt;-&lt;timestamp&gt;/</code>, restorable at any time.</li>
+<li><em>Delete permanently</em> / <em>Empty trash</em> are irreversible — both are guarded by a confirmation modal.</li>
+<li>Attachments are content-addressed and shared; deleting a session never deletes attachments.</li>
+<li>Live sessions cannot be deleted (<code>session-live</code>); the UI explains what to do.</li>
+</ul>
+<h2>Compatibility</h2>
+<ul>
+<li>Target DSH: <code>0.1.0-rc.5</code> and later — both the <strong>native Web UI</strong> (<code>dsh web</code> in a browser) and the
+<strong>desktop GUI</strong> (Electron window), which share the same host services and client bundle.</li>
+<li>Stock hosts (rc.5 unpatched, rc.6): the host half adds the trash layer and the registry API at
+runtime; the client falls back to <code>/dsh-archive/session</code>.</li>
+<li>Hosts that already carry the feature — rc.5 with the in-box patches, and <strong>rc.7+ where upstream
+merged the same backend</strong> (persistence trash layer, registry <code>unarchiveSession/deleteSession/ trash*</code>, API-proxy routes, client-runtime methods): every step feature-detects and no-ops; the
+client calls the native <code>ctx.workspaces</code> API directly. Service availability is checked per call,
+so a service that is provided late (rc.7 gates the registry behind an inject) is picked up
+automatically instead of stranding the section on the fallback path.</li>
+<li><code>deleteSession</code> is <strong>fail-closed</strong>: it refuses to run unless the persistence layer is trash-aware,
+so the plugin can never drive a stock hard-delete backend (nothing is removed on refusal).</li>
+<li>Host half shape-guards every patch; unrecognized services are skipped with a log line, never fatal.</li>
+<li><strong>Cordis 4 strict inject (0.2.1)</strong>: DSH Desktop ships <code>@deepseek-ai/cordis</code> 4.x, where reading a
+service property off a context (<code>ctx.sessionPersistence</code>) is only allowed when the current fiber
+declares it in <code>inject</code>; undeclared reads throw <code>cannot get property "X" without inject</code>. The host
+half resolves services through <code>ctx.get(...)</code> and through the patched methods' receiver
+(<code>this.ctx</code>, which Cordis shadows to the registry's own fiber) — never through
+<code>registry.ctx</code> on a traceable service wrapper, whose <code>ctx</code> property resolves to the <em>caller's</em>
+context. On older Cordis 3.x hosts both spellings work; the 0.2.1 path is required on Cordis 4.</li>
+<li><strong>Dual-store client resync (0.2.2)</strong>: after a fallback-path delete, the client refreshes BOTH the
+workspaces and the sessions stores. 0.2.0/0.2.1 only refreshed the workspaces view, so the deleted
+session stayed in the stale sessions list while dropping out of every workspace — the sidebar then
+rendered it in the <strong>Ungrouped</strong> bucket (visible until the next full reload).</li>
+<li>Platform: Windows / macOS / Linux (trash is plain Node <code>fs</code>; no platform assumptions).</li>
+</ul>
+<h2>Development</h2>
+<pre><code>npm install                                # fetches the @deepseek-ai/cordis devDependency
+node scripts/host-logic-test.mjs        # host lifecycle: delete → trash → restore → purge → empty → live refusal
+node scripts/host-robustness-test.mjs   # late service provision + fail-closed delete + route on-demand ensure
+node scripts/cordis4-strict-test.mjs    # REAL Cordis 4 strict-inject regression (0.2.1: "without inject" fix)
+node scripts/eval-check.mjs             # client bundle factory eval + apply + slot registration + late-service detection + dual-store resync (0.2.2)
+</code></pre>
+<h2>License</h2>
+<p>MIT</p>

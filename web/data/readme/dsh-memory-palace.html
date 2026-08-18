@@ -1,0 +1,209 @@
+<h1>dsh-memory-palace</h1>
+<p>把 WorkBuddy 的文件式记忆系统移植进 <a href="https://www.deepseek.com/harness/">DeepSeek Harness</a> —— 为 Harness 提供<strong>跨会话持久化、人类可直接编辑的 Markdown 记忆</strong>。</p>
+<p><a href="https://github.com/lovezi0/dsh-memory-palace/blob/HEAD/LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License: MIT"></a></p>
+<p>记忆就是普通文本文件，用记事本就能改。AI 每轮对话把它读进上下文，对话结束后把新内容追加进日志——不依赖任何私有格式、不落 JSON、不锁数据。</p>
+<h2>特性</h2>
+<ul>
+<li><strong>人类可读的真源</strong>：记忆全部存储在 Markdown 文件中（<code>MEMORY.md</code> + 每日日志 <code>YYYY-MM-DD.md</code>），任何编辑器可直接修改，数据永远属于你。</li>
+<li><strong>双层记忆</strong>：用户级（跨项目个人偏好，默认 <code>~/.deepseek-harness/MEMORY.md</code>）+ 工作区级（项目约定，默认 <code>&lt;cwd&gt;/.deepseek-harness/memory/</code>）。</li>
+<li><strong>自动读写</strong>：每轮对话将记忆注入系统提示词（同步读盘，零异步竞态）；每轮结束自动把轻量记录追加进当日日志（主路径由 agent 主动记，自动记录作兜底）。</li>
+<li><strong>日志蒸馏</strong>：超过保留天数（默认 30 天）的每日日志自动蒸馏进 <code>MEMORY.md</code> 后删除，长期记忆持续沉淀。</li>
+<li><strong>WorkBuddy / CodeBuddy 桥接</strong>：项目已存在 <code>.workbuddy/memory</code> 或 <code>.codebuddy/memory</code> 时直接读写这些目录，无需重复维护记忆。</li>
+<li><strong>记忆工具</strong>：<code>memory_note</code>（项目级写入）、<code>memory_note_user</code>（用户级写入）、<code>memory_read</code>（聚合读取）、<code>memory_delete</code>（按内容删除，两阶段确认 + 原生确认弹窗），全部内置去重，防止重复追加。</li>
+<li><strong>设置页集成</strong>：DSH 设置中内置「记忆」面板（中英双语），所有配置均可图形化调整，无需改配置文件。</li>
+<li><strong>主动记忆（主路径，插件模式）</strong>：注入「记忆公民指令」引导 agent 在「修复 bug/根因+绕过」「验证 build/test 通过」「完成里程碑/关键决策」「用户表达偏好/约束」时主动调 <code>memory_note</code> / <code>memory_note_user</code> 落档——零额外 LLM 调用、模型上下文完整，对标 WorkBuddy 的"智能记一笔"手感。</li>
+<li><strong>智能模式（LLM 智能会话摘要，可切换）</strong>：两种记忆模式在设置页「自动记录」卡片切换（默认插件模式，切换需重启 dsh）。智能模式下，每轮命中防闲聊闸门后由 harness 的 <code>ctx.llm.stream()</code> 把本会话<strong>新增对话增量</strong>（按 session 事件 seq 断点）提炼成摘要——<code>summary</code> 写每日日志（带 <code>[smart]</code> 标记）+ durable 事实写 MEMORY.md（<code>- [smart] &lt;fact&gt;</code>，按 user/project 分层去重）；摘要模型默认复用当前会话，可在设置页固定；失败自动降级轻量条目不丢记忆。</li>
+<li><strong>轻量兜底记录（可开关）</strong>：每轮结束对「有实质内容/工具/错误/明确记一笔」的轮次自动写轻量记录到每日日志（不调 LLM）；纯闲聊/无价值轮次不写。</li>
+<li><strong>自动错误捕获（可开关）</strong>：对话中出错时自动将「错误现象」按层级写入对应 <code>MEMORY.md</code>（用户级/项目级）；「根因/方案」由 agent 按记忆公民指令主动记；可在设置中关闭，默认开、关闭无需重启。</li>
+<li><strong>标准 npm 插件包</strong>：经 <code>dsh plugin</code> 一键装入 profile，<code>cordis.patch.yml</code> 声明 bundle patch，零手动改动 harness。</li>
+</ul>
+<h2>记忆文件布局</h2>
+<pre><code>~/.deepseek-harness/
+└── MEMORY.md                      # 用户级记忆（跨项目个人偏好）
+
+&lt;项目根&gt;/
+├── .workbuddy/memory/             # 桥接 WorkBuddy 记忆（已存在时，按序优先）
+│   ├── MEMORY.md                  # 项目级约定
+│   └── 2026-08-16.md              # 每日工作日志
+├── .codebuddy/memory/             # 桥接 CodeBuddy 记忆（已存在时）
+└── .deepseek-harness/memory/      # 回退目录（无 buddy 目录时自动创建）
+    ├── MEMORY.md
+    └── 2026-08-16.md
+</code></pre>
+<blockquote>
+<p><strong>桥接规则</strong>：<code>bridgeBuddyMemory</code> 开启时，只要项目里存在任一 buddy 记忆目录，就<strong>只</strong>读写这些目录，不再创建 <code>.deepseek-harness/memory/</code>；全部不存在时才回退到 dsh 目录。buddy 目录绝不被主动创建。</p>
+</blockquote>
+<h2>工作原理</h2>
+<p><strong>读取（每轮对话）</strong>——<code>systemPrompt.section</code> 同步读盘，把以下内容拼进系统提示词：</p>
+<pre><code>用户级 MEMORY.md
++ 工作区 MEMORY.md
++ 今日日志 YYYY-MM-DD.md
+→ 注入 system prompt，让 AI 跨会话保持一致
+</code></pre>
+<p><strong>写入（每轮结束）</strong>——监听 <code>session/event</code> 的 <code>turn/end</code>，经「防闲聊闸门」判定后异步追加：</p>
+<pre><code>turn/end ──► 轻量兜底闸门
+         │     有工具调用 / 有错误 / agent 主动记 / 命中偏好·决策关键词 → 放行
+         │     否则：跳过（不写、不调 LLM）
+         ├─► 轻量条目写入 YYYY-MM-DD.md（全部目标目录；可关）
+         ├─► 若本轮出错且开启「对话出错自动记录」→ 「错误现象」写入对应 MEMORY.md
+         └─► prune：超过 dailyLogRetentionDays 的日志蒸馏进 MEMORY.md 后删除
+</code></pre>
+<p><strong>工具</strong>——AI 在对话中按需调用：</p>
+<table>
+<thead>
+<tr>
+<th>工具</th>
+<th>层级</th>
+<th>作用</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>memory_note</code></td>
+<td>项目级</td>
+<td>把约定/偏好写入当前项目全部目标 <code>MEMORY.md</code>（去重）</td>
+</tr>
+<tr>
+<td><code>memory_note_user</code></td>
+<td>用户级</td>
+<td>把跨项目偏好写入 <code>~/.deepseek-harness/MEMORY.md</code>（去重）</td>
+</tr>
+<tr>
+<td><code>memory_read</code></td>
+<td>聚合</td>
+<td>一次性读取用户级 + 项目级记忆、今日日志与最近 3 份历史日志</td>
+</tr>
+<tr>
+<td><code>memory_delete</code></td>
+<td>用户级/项目级/每日级</td>
+<td>按内容删除记忆条目（两阶段确认：先预览匹配位置与内容，用户确认后再删；删除动作经 harness 原生确认弹窗硬闸门，真人点允许才真正执行）</td>
+</tr>
+</tbody></table>
+<h2>安装</h2>
+<p>前置要求：已安装 DeepSeek Harness 及其 CLI（<code>dsh</code> 命令可用）。</p>
+<p>方式一：直接通过 GitHub 安装（推荐，<code>lib/</code> 构建产物已随仓库分发，装即用）</p>
+<pre><code>dsh plugin --profile web add github:lovezi0/dsh-memory-palace
+# 锁定版本：dsh plugin --profile web add github:lovezi0/dsh-memory-palace#v1.1.4
+</code></pre>
+<p>方式二：clone 后本地安装（开发 / 修改源码场景）</p>
+<pre><code>git clone https://github.com/lovezi0/dsh-memory-palace.git
+cd dsh-memory-palace
+npm install
+npm run build        # src/ → lib/（纯复制，零外部构建依赖）
+dsh plugin --profile web add .    # 装入 web profile（profile 名按你的实际配置调整）
+</code></pre>
+<p>卸载：</p>
+<pre><code>dsh plugin --profile web remove dsh-memory-palace
+</code></pre>
+<h2>配置</h2>
+<p>可在 DSH 设置 →「记忆」面板中调整，或通过 profile 配置注入：</p>
+<table>
+<thead>
+<tr>
+<th>配置项</th>
+<th>默认值</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>总开关</td>
+<td><code>true</code></td>
+<td>总开关，关闭后不注入、不写入</td>
+</tr>
+<tr>
+<td>用户级记忆路径</td>
+<td><code>~/.deepseek-harness/MEMORY.md</code></td>
+<td>用户级记忆文件路径（支持 <code>~</code> 展开）</td>
+</tr>
+<tr>
+<td>工作区记忆目录</td>
+<td><code>.deepseek-harness/memory</code></td>
+<td>无 buddy 目录时回退的项目记忆目录</td>
+</tr>
+<tr>
+<td>日志保留天数</td>
+<td><code>30</code></td>
+<td>每日日志保留天数，过期蒸馏进 <code>MEMORY.md</code></td>
+</tr>
+<tr>
+<td>用户级记忆字数上限</td>
+<td><code>4000</code></td>
+<td>注入系统提示词的用户级记忆长度上限（字符）</td>
+</tr>
+<tr>
+<td>工作区级记忆字数上限</td>
+<td><code>3000</code></td>
+<td>注入系统提示词的工作区级记忆长度上限（字符）</td>
+</tr>
+<tr>
+<td>桥接 Buddy 记忆</td>
+<td><code>true</code></td>
+<td>检测并直接读写 WorkBuddy / CodeBuddy 项目记忆目录</td>
+</tr>
+<tr>
+<td>Buddy 记忆目录列表</td>
+<td><code>[".workbuddy/memory", ".codebuddy/memory"]</code></td>
+<td>要桥接的 buddy 目录列表（按优先级，已存在的全部同步写入）</td>
+</tr>
+</tbody></table>
+<h3>自动记录（设置页「记忆 → 自动记录」卡片）</h3>
+<table>
+<thead>
+<tr>
+<th>配置项</th>
+<th>默认值</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>记忆模式</td>
+<td><code>plugin</code></td>
+<td>两种互斥模式：<code>plugin</code>=记忆公民指令+轮次轻量+错误捕获（默认）；<code>smart</code>=LLM 智能会话摘要（summary→每日日志 + durable→MEMORY.md，带 <code>[smart]</code> 标记）。<strong>切换需重启 dsh 生效</strong></td>
+</tr>
+<tr>
+<td>轮次结束自动记录</td>
+<td><code>true</code></td>
+<td>插件模式下：它是「agent 主动记忆」主路径失效时的安全网，保证实质工作不丢，代价是只留原始文本、不做总结。智能模式下该开关仍为总闸门</td>
+</tr>
+<tr>
+<td>摘要模型</td>
+<td><code>""</code>（空=复用当前会话模型）</td>
+<td>智能模式专用：留空自动复用当前会话 provider/model；填 <code>provider/model</code>（如 <code>deepseek/deepseek-chat</code>）固定廉价模型省 token</td>
+</tr>
+<tr>
+<td>对话出错自动记录</td>
+<td><code>true</code></td>
+<td>插件模式下：自动捕获 in-session 错误并写入「错误现象」到对应 MEMORY.md；「根因/方案」由 agent 主动记；默认开启，<strong>关闭无需重启 dsh</strong>。智能模式下错误由 LLM 摘要统一提炼</td>
+</tr>
+</tbody></table>
+<blockquote>
+<p><strong>设置保存（v1.1.4 起）</strong>：设置页保存已<strong>真正落盘</strong>——插件注册了自有同源 route <code>/memory-palace/api</code>（服务端 <code>ctx.webServer</code>），前端 fetch 该 route、服务端直写 settings-file（<code>settings.yaml</code> 出现 <code>memory-palace:</code> 段），不再依赖 dsh 的 <code>settingsScope</code>（非 loopback 连接下其 <code>set()</code> 是 no-op）与 apiproxy 的 allowlist。保存<strong>无需重启</strong>即热生效；切换记忆模式仍按提示重启 dsh 更稳妥。</p>
+<p>历史方案（仍可用作兜底）：直接在 profile 的 <code>cordis.patch.yml</code> 注入配置（id-targeted config override，与插件 bundle insert 的 id 一致）：</p>
+<pre><code>- id: memory-palace
+  name: 'dsh-memory-palace'
+  config:
+    memoryMode: smart
+    summaryModel: ''
+</code></pre>
+<p>修改后重启 dsh 生效。</p>
+</blockquote>
+<h2>开发</h2>
+<p>目录结构、构建与测试、技术要点见 <a href="https://github.com/lovezi0/dsh-memory-palace/blob/HEAD/DEVELOPMENT.md">DEVELOPMENT.md</a>。</p>
+<h2>版本历史</h2>
+<ul>
+<li><strong>1.1.4</strong> — 智能模式摘要上线（LLM 智能会话摘要，与插件模式可切换）：摘要调用参考 dsh-sideband 加固（指令入 <code>system</code> 参数、<code>AbortSignal.timeout</code> 超时、<code>finish.kind</code> 细化）；修复设置-记忆保存不生效（自有同源 route <code>/memory-palace/api</code> 直写 settings-file，参考 dsh-better-sidebar，不动 harness）；修复长工具型任务不写记忆（turnBuffer 溢出误关闸门：上限 6k→30k、溢出保留尾部、闸门改 session 增量兜底）</li>
+<li><strong>1.1.2</strong> — 修复设置页「保存后自动切回插件模式」（save() 不再用保存前旧快照重置 draft）；说明 dsh web 端（非 loopback 连接）设置页保存为 memory 模式不落盘，关键配置请经 profile <code>cordis.patch.yml</code> 注入（见配置节）</li>
+<li><strong>1.1.1</strong> — 每日日志格式简化：文件头写当天日期（<code># YYYY-MM-DD</code>），条目不再每条带时间戳（<code>[ERROR]</code>/<code>[smart]</code> 作条目前缀；旧文件自动补头）</li>
+<li><strong>1.1.0</strong> — 新增「智能模式」（LLM 智能会话摘要）：与插件模式在设置页切换、默认插件模式；智能模式经 <code>session.events</code> 增量提炼 summary→每日日志 + durable→MEMORY.md（带 <code>[smart]</code> 标记）；摘要模型默认复用当前会话、可固定；失败降级轻量条目不丢记忆；切换需重启 dsh</li>
+<li><strong>1.0.0</strong> — 防闲聊闸门 / 记忆公民指令 / 新增删除记忆工具</li>
+<li><strong>outdated（0.x）</strong> — 双层 Markdown 记忆读写 / 设置页集成等 0.x 历史，见 <a href="https://github.com/lovezi0/dsh-memory-palace/blob/HEAD/CHANGELOG.md">CHANGELOG.md</a></li>
+</ul>
+<h2>废弃方案</h2>
+<p>插件侧 LLM 自动摘要（<code>ctx.llm.stream()</code> 路线）曾在 v0.7.1 因 4 个契约/时机坑废弃；<strong>v1.1.0 已重新论证并以「智能模式」可选形态复活</strong>——经 <code>session.events</code> / <code>deriveEventMessage</code> / <code>requestHeader()?.config</code> 根除旧坑，默认仍为插件模式。见 <a href="https://github.com/lovezi0/dsh-memory-palace/blob/HEAD/ABANDONED-LLM-SUMMARY.md">废弃方案：为什么不用 LLM 自动摘要</a>。</p>
+<h2>参考与致谢</h2>
+<p>v1.1 的智能模式与设置保存链路，深度参考了以下两个开源项目（本包实现为各自机制的简化落地，不含其完整功能）：</p>
+<ul>
+<li><strong><a href="https://github.com/omdsh-dev/DSH-better-sidebar">dsh-better-sidebar</a></strong>（omdsh-dev）——设置<strong>真保存</strong>机制：插件自带同源 HTTP route + 服务端 <code>settings</code> 直写 settings-file，绕开 dsh <code>settingsScope</code>（非 loopback 下 <code>set()</code> no-op）与 apiproxy allowlist 两层限制，全程无需改动 harness。</li>
+<li><strong><a href="https://github.com/ishuowang/dsh-sideband">dsh-sideband</a></strong>（ishuowang）——LLM 会话摘要的<strong>调用范式</strong>：摘要指令放 <code>system</code> 参数、<code>AbortSignal.timeout</code> 超时保护、<code>finish.kind</code> 细分（error/aborted/max-tokens）、流循环内中断检查。</li>
+</ul>
+<h2>License</h2>
+<p><a href="https://github.com/lovezi0/dsh-memory-palace/blob/HEAD/LICENSE">MIT</a></p>

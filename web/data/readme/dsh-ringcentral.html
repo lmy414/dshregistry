@@ -1,0 +1,316 @@
+<h1>dsh-ringcentral</h1>
+<p>RingCentral Team Messaging IM channel plugin for
+<a href="https://github.com/deepseek-ai/deepseek-harness">deepseek-harness</a> (dsh).
+It turns a RingCentral Bot Add-in into a first-class frontend for a dsh agent:
+inbound posts from RingCentral chats drive the agent loop, and assistant
+replies flow back as threaded RingCentral posts.</p>
+<p>English | <a href="https://github.com/ringclaw/dsh-ringcentral/blob/HEAD/README.zh-CN.md">中文说明</a></p>
+<h2>Architecture</h2>
+<pre><code>RingCentral user ──▶ WebSocket (PostAdded) ──▶ im-ringcentral ──▶ ctx.agents ──▶ dsh agent loop ──▶ LLM
+                                                │                                     │
+                                                └── admission / session / event ◀────┘
+                                                     (assistant reply ──▶ RingCentral post, threaded)
+</code></pre>
+<p>The plugin is a pure Cordis plugin following the dsh "Plugins, not loop changes"
+principle. It speaks the RingCentral Team Messaging v1 REST API + WebSocket
+subscription stream directly (no external SDK) and reuses the host dsh services
+for agents, sessions, models, compaction, and tool presentation.</p>
+<h2>Install</h2>
+<h3>1. Via dsh plugin manager</h3>
+<pre><code># install into a profile
+npx @deepseek-ai/dsh plugin --profile ringcentral add dsh-ringcentral
+
+# start
+export RC_BOT_TOKEN="your-bot-jwt"
+export DEEPSEEK_API_KEY="your-deepseek-key"
+npx @deepseek-ai/dsh --profile ringcentral
+</code></pre>
+<p>Or run the bundled installer: <code>sh install.sh</code>.</p>
+<h3>2. Local path</h3>
+<pre><code>cd /path/to/dsh-ringcentral
+pnpm install &amp;&amp; pnpm build
+npx @deepseek-ai/dsh plugin --profile ringcentral add /path/to/dsh-ringcentral
+export RC_BOT_TOKEN="your-bot-jwt"
+npx @deepseek-ai/dsh --profile ringcentral
+</code></pre>
+<h3>3. --patch development mode</h3>
+<p>The <code>--patch</code> overlay loads the plugin from a local absolute path without
+installing it into a profile. Generate the machine-local patch first, then
+boot:</p>
+<pre><code>cd /path/to/dsh-ringcentral
+pnpm install &amp;&amp; pnpm build        # dist entry (npx dsh cannot resolve .js -&gt; .ts)
+node scripts/gen-dev-patch.mjs    # writes cordis.local.yml with the real path
+export RC_BOT_TOKEN="your-bot-jwt"
+npx @deepseek-ai/dsh web --patch ./cordis.local.yml
+</code></pre>
+<p>Use <code>pnpm dev</code> (tsc --watch) while iterating: the loader hot-reloads the
+plugin whenever <code>dist/</code> changes. Pointing the patch at <code>src/index.ts</code> only
+works inside a deepseek-harness source tree (<code>pnpm dsh</code>), not with the
+<code>npx</code>-installed package.</p>
+<h2>RingCentral bot setup</h2>
+<ol>
+<li>Sign in at <a href="https://developers.ringcentral.com/">https://developers.ringcentral.com/</a>.</li>
+<li>Create an app with the <strong>Bot</strong> platform type.</li>
+<li>Grant at least: <code>TeamMessaging</code>, <code>ReadAccounts</code>, <code>WebSocketsSubscription</code>.</li>
+<li>Install or publish the bot to your RingCentral account.</li>
+<li>Copy the bot JWT and use it as <code>RC_BOT_TOKEN</code>.</li>
+</ol>
+<p>Optional owner credentials (JWT REST API app for your own account, with
+<code>TeamMessaging</code> + <code>WebSocketsSubscription</code> + <code>ReadMessages</code>) give
+<code>ringcentral_get_recent_messages</code> owner read fallback and outbound owner
+fallback. The history tool always reads through the bot client
+(<code>RC_BOT_TOKEN</code>) first; without owner credentials it uses only the bot
+client (chats the bot is a member of).</p>
+<h2>Configuration</h2>
+<p>Config follows dsh practice: <strong>the cordis config tree is the single source</strong>
+(profile <code>cordis.patch.yml</code> / <code>cordis.yml</code>), with Schema defaults applied
+automatically. The plugin reads environment variables directly only for
+secrets: <code>RC_BOT_TOKEN</code>, <code>RC_SERVER_URL</code>, <code>RC_USER_CLIENT_ID</code>,
+<code>RC_USER_CLIENT_SECRET</code>, <code>RC_USER_JWT_TOKEN</code>. To drive any other setting
+from an environment variable, use cordis <code>${VAR}</code> interpolation in your
+config, e.g. <code>access.groupMode: ${RC_GROUP_MODE:-open}</code>.</p>
+<p>The access-control block mirrors <code>@tencent-connect/dsh-qqbot</code> exactly
+(QQ's <code>c2c</code> surface is <code>dm</code> here). RingCentral's three non-DM chat types
+(Team / Everyone / Group) are all governed by the <code>group</code> surface.</p>
+<table>
+<thead>
+<tr>
+<th>Config</th>
+<th>Type</th>
+<th>Default</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>botToken</code></td>
+<td>string</td>
+<td><strong>required</strong></td>
+<td>Bot static JWT (env: <code>RC_BOT_TOKEN</code>)</td>
+</tr>
+<tr>
+<td><code>ownerCredentials.clientId</code> / <code>clientSecret</code> / <code>jwt</code></td>
+<td>string</td>
+<td>-</td>
+<td>Owner JWT (env: <code>RC_USER_*</code>)</td>
+</tr>
+<tr>
+<td><code>server</code></td>
+<td>string</td>
+<td><code>https://platform.ringcentral.com</code></td>
+<td>API server (env: <code>RC_SERVER_URL</code>)</td>
+</tr>
+<tr>
+<td><code>access.dmMode</code></td>
+<td>enum</td>
+<td><code>open</code></td>
+<td>DM handling: <code>disabled</code>, <code>allowlist</code>, <code>open</code></td>
+</tr>
+<tr>
+<td><code>access.dmAllow</code></td>
+<td>string[]</td>
+<td><code>[]</code></td>
+<td>Person ids allowed in DMs; empty or <code>["*"]</code> = allow all</td>
+</tr>
+<tr>
+<td><code>access.groupMode</code></td>
+<td>enum</td>
+<td><code>open</code></td>
+<td>Group handling: <code>disabled</code>, <code>allowlist</code>, <code>open</code></td>
+</tr>
+<tr>
+<td><code>access.groupAllow</code></td>
+<td>string[]</td>
+<td><code>[]</code></td>
+<td>Chat ids allowed in groups; empty or <code>["*"]</code> = allow all</td>
+</tr>
+<tr>
+<td><code>requireMention</code></td>
+<td>boolean</td>
+<td><code>true</code></td>
+<td>Require <code>@</code>-mention in group chats</td>
+</tr>
+<tr>
+<td><code>groupPrompt</code></td>
+<td>string</td>
+<td>-</td>
+<td>Extra system prompt for group chats</td>
+</tr>
+<tr>
+<td><code>directPrompt</code></td>
+<td>string</td>
+<td>-</td>
+<td>Extra system prompt for DMs</td>
+</tr>
+<tr>
+<td><code>processingPlaceholder.enabled</code></td>
+<td>boolean</td>
+<td><code>false</code></td>
+<td>Post <code>👀</code> → <code>⏳</code> while the agent works (texts/delay are fixed)</td>
+</tr>
+<tr>
+<td><code>historyMessageLimit</code></td>
+<td>number</td>
+<td><code>250</code></td>
+<td>Default record count for the history tool</td>
+</tr>
+<tr>
+<td><code>homeChannel</code></td>
+<td>string</td>
+<td>-</td>
+<td>Fallback target for the history tool</td>
+</tr>
+<tr>
+<td><code>textChunkLimit</code></td>
+<td>number</td>
+<td><code>4000</code></td>
+<td>Max chars per outgoing post</td>
+</tr>
+<tr>
+<td><code>provider</code> / <code>model</code></td>
+<td>string</td>
+<td>host default</td>
+<td>LLM route (fallback chain: per-peer prefs → config → settings.yaml → host)</td>
+</tr>
+<tr>
+<td><code>preset</code></td>
+<td>string</td>
+<td>-</td>
+<td>Agent preset id</td>
+</tr>
+<tr>
+<td><code>cwd</code></td>
+<td>string</td>
+<td><code>process.cwd()</code></td>
+<td>Agent working directory</td>
+</tr>
+<tr>
+<td><code>sessionIdleTimeout</code></td>
+<td>number</td>
+<td><code>1800000</code></td>
+<td>Idle session eviction (ms)</td>
+</tr>
+<tr>
+<td><code>showToolResults</code></td>
+<td>boolean</td>
+<td><code>false</code></td>
+<td>Show successful tool results (errors always show)</td>
+</tr>
+<tr>
+<td><code>debug</code></td>
+<td>boolean</td>
+<td><code>false</code></td>
+<td>Debug logging (includes inbound message logs)</td>
+</tr>
+</tbody></table>
+<h2>Commands</h2>
+<table>
+<thead>
+<tr>
+<th>Command</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>/new</code> (<code>/reset</code>, <code>/clear</code>)</td>
+<td>Start a new session (clear context)</td>
+</tr>
+<tr>
+<td><code>/compact</code></td>
+<td>Compress session history (summary replaces old records)</td>
+</tr>
+<tr>
+<td><code>/model</code></td>
+<td>Show or switch the model</td>
+</tr>
+<tr>
+<td><code>/stop</code></td>
+<td>Abort the current generation</td>
+</tr>
+<tr>
+<td><code>/rc-ping</code></td>
+<td>Connectivity test</td>
+</tr>
+<tr>
+<td><code>/rc-version</code></td>
+<td>Plugin version</td>
+</tr>
+<tr>
+<td><code>/rc-status</code></td>
+<td>Current session status</td>
+</tr>
+<tr>
+<td><code>/rc-help</code></td>
+<td>List all commands</td>
+</tr>
+</tbody></table>
+<h2>Session routing</h2>
+<p><code>sessionKey: ringcentral:&lt;accountScopeKey&gt;:&lt;scope&gt;:&lt;peerId&gt;</code> where scope is
+<code>direct</code> (peer = person id), <code>group</code> (peer = Group DM chat id), or
+<code>channel</code> (peer = Team/Everyone chat id), and <code>accountScopeKey</code> is a
+SHA-256 fingerprint of server + bot token. The <code>SessionId</code> is derived
+deterministically (SHA-256), so the same user/chat always routes to the same
+session and survives restarts. Resolution order: in-process reuse → persisted
+resume → fresh create.</p>
+<h2>Design principles</h2>
+<ul>
+<li><strong>Pure Cordis plugin</strong> — follows dsh "Plugins, not loop changes".</li>
+<li><strong>Declarative deps</strong> — <code>inject = ['agents']</code>; tools/compaction/presets are optional seams.</li>
+<li><strong>Session isolation</strong> — one agent per RingCentral peer.</li>
+<li><strong>Mini-Markdown outbound</strong> — replies are converted to RingCentral Mini-Markdown and chunked.</li>
+<li><strong>Threading</strong> — replies always anchor on the triggering post (threadId preferred), with owner fallback and unthreaded retry.</li>
+<li><strong>Idle eviction</strong> — inactive agents are disposed automatically.</li>
+<li><strong>Defensive degradation</strong> — missing tools/presets/owner credentials never crash the plugin.</li>
+</ul>
+<h2>Not in v1 (planned follow-ups)</h2>
+<ul>
+<li>Adaptive Card / note / calendar / task artifact tools</li>
+<li>Cron and out-of-process notification sender</li>
+<li>Multi-account support</li>
+<li>Native streaming (RingCentral has no stream API; the processing placeholder is the typing affordance)</li>
+</ul>
+<h2>Local development</h2>
+<pre><code>pnpm install
+pnpm build          # or: pnpm dev (watch)
+pnpm test
+pnpm typecheck
+
+# run against the npx-installed dsh
+export RC_BOT_TOKEN="xxx"
+node scripts/gen-dev-patch.mjs
+npx @deepseek-ai/dsh web --patch ./cordis.local.yml
+</code></pre>
+<p><code>cordis.dev.yml</code> is the committed template; <code>scripts/gen-dev-patch.mjs</code>
+replaces the <code>/path/to/dsh-ringcentral</code> placeholder with the machine's
+absolute path and writes the gitignored <code>cordis.local.yml</code>.</p>
+<h2>Troubleshooting</h2>
+<table>
+<thead>
+<tr>
+<th>Symptom</th>
+<th>Likely cause</th>
+<th>Fix</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>Plugin not starting</td>
+<td><code>RC_BOT_TOKEN</code> missing</td>
+<td>Set <code>RC_BOT_TOKEN</code> or <code>botToken</code> in <code>cordis.patch.yml</code></td>
+</tr>
+<tr>
+<td>Bot never replies in a group chat</td>
+<td><code>access.groupMode: disabled</code>, not allowlisted, or no mention</td>
+<td>Check <code>access.groupMode</code> / <code>access.groupAllow</code> and <code>@</code>-mention the bot</td>
+</tr>
+<tr>
+<td>DM ignored</td>
+<td><code>access.dmMode: disabled</code> or sender not in <code>access.dmAllow</code></td>
+<td>Check <code>access.dmMode</code> / <code>access.dmAllow</code></td>
+</tr>
+<tr>
+<td>History tool returns nothing</td>
+<td>Chat not visible to bot or owner</td>
+<td>Reads try the bot first, then the owner; pass a bare chat id or <code>channel:&lt;chatId&gt;</code> and make sure one client is a member</td>
+</tr>
+</tbody></table>
+<h2>License</h2>
+<p><a href="https://github.com/ringclaw/dsh-ringcentral/blob/HEAD/LICENSE">MIT</a></p>

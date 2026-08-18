@@ -1,0 +1,327 @@
+<h1>dsh-seatbelt-sandbox</h1>
+<p>macOS Seatbelt（libsandbox）沙箱适配器，为 DeepSeek Harness（dsh）提供 <strong>cordis 插件形态</strong>的 seatbelt rung 替换：部署时在 cordis.yml 里把 <code>sandbox</code> 插件从 <code>@deepseek-ai/dsh-sandbox-local</code> 换成 <code>dsh-seatbelt-sandbox</code>，即可让 dsh 的 macOS 沙箱从 Apple 弃用的 <code>sandbox-exec</code> CLI 切换到直接调用私有 <code>libsandbox</code> API 的自带 loader——<strong>无需修改 dsh 源码、无需提 PR</strong>。</p>
+<h2>当前状态（筹备阶段）</h2>
+<table>
+<thead>
+<tr>
+<th>项</th>
+<th>状态</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>单元测试（SBPL 方言 / argv 组装 / 缓存 / 探测 / fail-closed）</td>
+<td>✅ 12/12 通过（macOS arm64 实测）</td>
+</tr>
+<tr>
+<td><code>tsc</code> 严格模式编译</td>
+<td>✅ 通过</td>
+</tr>
+<tr>
+<td>macOS 二进制构建（<code>npm run build:native</code>）</td>
+<td>✅ 已完成（macOS arm64；<code>bin/darwin-arm64/seatbelt-run</code> 34KB 有效 Mach-O）</td>
+</tr>
+<tr>
+<td>macOS 真实内核 e2e（deny-write / workspace-write / 坏 profile 125）</td>
+<td>✅ 5/5 通过（macOS arm64 真实内核断言）</td>
+</tr>
+<tr>
+<td>dsh 装配集成（web profile 真实 boot + <code>[sandbox: file access denied]</code> 归因）</td>
+<td>✅ 已验证（macOS arm64 实测：<code>examples/verify-dsh-boot.mjs</code> 8 项 + <code>verify-integration.mjs</code> 4 项全过）</td>
+</tr>
+<tr>
+<td>npm 发布</td>
+<td>⏳ 未发布（<code>dsh-seatbelt-sandbox</code> 尚未 publish）</td>
+</tr>
+<tr>
+<td>darwin-x64 二进制</td>
+<td>⏳ 未构建（arm64 优先，x64 需 Intel macOS 环境）</td>
+</tr>
+</tbody></table>
+<blockquote>
+<p>代码与测试基于 dsh 源码逐行核实（landlock-run 先例形态、<code>confine()</code> 契约、SBPL 方言），<strong>macOS arm64 上已通过全部 25 项测试（12 单元 + 5 e2e + 8 真实 boot 装配）</strong>。在完成下方「发布前验收清单」前，请勿用于生产部署。</p>
+</blockquote>
+<h2>快速开始（筹备阶段）</h2>
+<h3>前置条件</h3>
+<ul>
+<li>macOS 主机（arm64；x64 需先补 darwin-x64 二进制，见状态表）</li>
+<li>已安装 dsh CLI（<code>npm i -g @deepseek-ai/dsh</code>）与 pnpm（<code>dsh plugin</code> 命令依赖 pnpm）</li>
+<li>Node.js ≥ 20；macOS Command Line Tools（含 clang，<code>build:native</code> 需要）</li>
+<li>仅 macOS 部署使用；Windows/Linux 请保留官方 <code>sandbox-local</code></li>
+</ul>
+<pre><code># 1. 获取源码
+#    git clone git@github.com:drscrewdriver/dsh-seatbelt-sandbox.git &amp;&amp; cd dsh-seatbelt-sandbox
+
+# 2. 安装依赖 + 构建（git 安装后 node_modules/、lib/、bin/ 三者全部缺失，缺一不可）
+npm install                 # node_modules/
+npm run build               # lib/（tsc 编译；缺了它插件 main 指向的 lib/index.js 不存在，加载直接失败）
+npm run build:native        # bin/darwin-&lt;arch&gt;/seatbelt-run（含 Mach-O 校验）
+./bin/darwin-$(uname -m)/seatbelt-run --self-test &amp;&amp; echo OK   # 自检：libsandbox 可用
+
+# 3. 完整测试（12 单元 + 5 macOS e2e，无 skip）
+npm test
+
+# 4. 接入 dsh（完整步骤见下节「dsh plugin 命令组装」）
+dsh plugin --profile web add /absolute/path/to/dsh-seatbelt-sandbox
+#    （或 git 安装：dsh plugin --profile web add git+ssh://git@github.com/drscrewdriver/dsh-seatbelt-sandbox.git）
+dsh web --dump-config | grep -B1 -A3 'sandbox-seatbelt'  # 确认官方行 disabled + 本插件新行
+node examples/verify-dsh-boot.mjs                         # 真实 boot 8 项断言，全绿即装配正确
+kill &lt;正在运行的 dsh web PID&gt; &amp;&amp; dsh web                  # 重启使新装配生效（必做：运行中实例不热载 bundle 层）
+</code></pre>
+<h2>为什么需要它</h2>
+<p>Apple 自 macOS 10.10 起弃用 <code>sandbox-exec</code> CLI，未来系统版本可能移除；但底层 <code>libsandbox.1.dylib</code> 的私有 API（<code>sandbox_init</code> / <code>sandbox_free_error</code>）仍是 macOS 安全架构核心（App Sandbox、sandboxd、Chromium/Firefox 都在生产环境直接调用）。任何需要 macOS 沙箱的语言生态都应基于该 API 构建 loader 模式：</p>
+<pre><code>sandbox_init(profile)   ← 沙箱化当前进程（不可逆，仅一次）
+execvp(cmd, argv)       ← 替换进程映像；沙箱是进程属性，跨 exec 保留
+</code></pre>
+<p>核心不变量：<strong>沙箱必须作用于最终运行目标命令的进程，且必须先于目标启动应用</strong>。</p>
+<p>纯 JS 无法自做 loader（无内建 FFI、无 execve 原语、V8 运行时窗口大），因此本包采用 <strong>C11 原生 loader 二进制 + JS seam</strong> 结构——与 dsh 仓库内 <code>native/landlock-run</code> 先例同构。</p>
+<h2>架构</h2>
+<pre><code>dsh-seatbelt-sandbox/
+├── native/seatbelt-run/src/main.c  # C11 loader：dlsym libsandbox → execvp（唯一审计面）
+├── src/
+│   ├── sbpl.ts                     # SBPL profile 生成（复制 dsh roots.ts/profiles.ts 语义）
+│   ├── loader.ts                   # launcherPath() / probe()（--self-test）
+│   ├── provider.ts                 # SeatbeltSandboxProvider extends SandboxProvider
+│   └── index.ts                    # 插件默认导出
+├── bin/darwin-{arm64,x64}/         # 预编译二进制（macOS 上 npm run build:native 生成）
+├── tests/                          # node:test 单元（任意平台）+ macOS e2e
+└── examples/cordis.yml             # 部署装配示例
+</code></pre>
+<h2>安装与构建</h2>
+<blockquote>
+<p>⚠️ 包尚未发布 npm。发布前请通过 git 安装或本地 <code>npm pack</code>（<code>&lt;github-owner&gt;</code> 为你的 GitHub 用户名，推送后替换）：</p>
+<pre><code>npm install &lt;github-owner&gt;/dsh-seatbelt-sandbox   # 或 npm pack 后安装 tarball
+</code></pre>
+</blockquote>
+<h3>三种安装方式的构建要求</h3>
+<table>
+<thead>
+<tr>
+<th>安装方式</th>
+<th>仓库自带</th>
+<th>必须现场执行</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>npm pack</code> tarball / npm 发布</td>
+<td><code>lib/</code>、<code>bin/</code> 随包（<code>files</code> 声明）</td>
+<td>无（直接可用）</td>
+</tr>
+<tr>
+<td>git 安装（<code>dsh plugin add git+ssh://…</code>）</td>
+<td>无（<code>lib/</code>、<code>bin/</code>、<code>node_modules/</code> 均不入库）</td>
+<td><code>npm install</code> + <code>npm run build</code> + <code>npm run build:native</code></td>
+</tr>
+<tr>
+<td>本地 path/link 安装（<code>dsh plugin add /本地/路径</code>）</td>
+<td>无（link 指向本地仓库）</td>
+<td>仓库侧先完成 <code>npm install</code> + <code>npm run build</code> + <code>npm run build:native</code></td>
+</tr>
+</tbody></table>
+<pre><code># git 安装后的构建（缺一不可）：
+cd ~/.dsh/profiles/web/node_modules/dsh-seatbelt-sandbox
+npm install
+npm run build             # 编译 lib/（缺了它插件加载失败：main 指向 lib/index.js）
+npm run build:native      # 生成 bin/darwin-&lt;arch&gt;/seatbelt-run
+</code></pre>
+<ul>
+<li>构建为 macOS-only（<code>scripts/build.sh</code> 在非 darwin 平台快速失败），使用系统自带 clang，无额外工具链。</li>
+<li>二进制按架构分发：<code>bin/darwin-arm64/</code> 与 <code>bin/darwin-x64/</code>，<code>launcherPath()</code> 按 <code>process.platform + process.arch</code> 解析；缺平台包时探测失败 → fail-closed（<code>SANDBOX_UNAVAILABLE</code>），绝不无约束直通。</li>
+</ul>
+<h2>部署装配（自托管 macOS）</h2>
+<blockquote>
+<p>⚠️ dsh 的 patch 语义（<code>dsh-app-boot</code> <code>applyEntryPatches</code>）：非 insert 行的 <code>name</code> 只做<strong>匹配检查</strong>、不能改名；<code>insert</code> 是<strong>追加</strong>；cordis loader 对重复 <code>id</code> 直接抛 <code>TypeError: duplicate loader entry id</code>。因此替换插件必须「禁用官方行 + 追加新 id 行」两步（见下方），直接写 <code>- id: sandbox / name: dsh-seatbelt-sandbox</code> 会被 name 匹配检查跳过、不生效。</p>
+</blockquote>
+<pre><code># cordis.patch.yml —— 唯一改动：禁用官方 sandbox 行 + 追加本插件行
+- id: sandbox
+  name: '@deepseek-ai/dsh-sandbox-local'   # name 仅作匹配检查，必须与官方行一致
+  disabled: true                          # 覆盖：官方行不加载
+- insert:
+    - id: sandbox-seatbelt                # 必须与官方行 id 不同（loader 禁止重复 id）
+      name: dsh-seatbelt-sandbox
+      # config 全部可选：
+      #   loaderPath: /absolute/path/to/seatbelt-run
+      #   probeTimeoutMs: 5000
+# sandbox-policy / bash / fs-sandbox 等其余插件与配置不动
+</code></pre>
+<p>完整示例见 <a href="https://github.com/drscrewdriver/dsh-seatbelt-sandbox/blob/HEAD/examples/cordis.yml">examples/cordis.yml</a>。消费方（<code>@deepseek-ai/dsh-bash-sandbox</code>、<code>@deepseek-ai/dsh-fs-sandbox</code> 等）只依赖 <code>ctx.sandbox</code> 服务（服务注入，与插件 id 无关），对后端实现零感知。</p>
+<p><code>loaderPath</code> 仅当二进制未随包分发（例如单独拷贝到固定路径、或需要跨架构指定）时使用；缺省时 <code>launcherPath()</code> 按 <code>process.platform + process.arch</code> 解析包内 <code>bin/darwin-&lt;arch&gt;/seatbelt-run</code>。</p>
+<h3>沙箱粒度配置（sandbox-policy，非本插件）</h3>
+<ul>
+<li>默认 <code>workspace-write</code>：workspace 内可写、外部写被内核拒（<code>operation not permitted</code>）、/tmp 与用户 temp 区授权；<code>read-only</code> 全只读；<code>danger-full-access</code> 无沙箱。</li>
+<li>运行时经环境变量切换（需重启）：<code>DSH_PERMISSION_MODE=read-only|workspace-write|danger-full-access</code>。</li>
+<li>拒绝是预期行为：命令报 <code>operation not permitted</code> 或 UI 归因 <code>[sandbox: file access denied …]</code> 表示沙箱在工作，不是环境故障。</li>
+</ul>
+<h3>dsh plugin 命令组装（完整步骤）</h3>
+<p>自托管部署用 dsh CLI 的插件管理命令把本插件组装进 profile（macOS 主机）：</p>
+<pre><code># 1. 组装（git 或本地路径，任选其一）
+dsh plugin --profile web add git+ssh://git@github.com/drscrewdriver/dsh-seatbelt-sandbox.git
+# 或本地路径（link 安装，改动即时生效）：
+dsh plugin --profile web add /Users/joshua/Desktop/dsh/dsh-seatbelt-sandbox
+
+# 2. 确认 reconcile 成功：dependencies 与 dsh.profile.bundles 均应含 dsh-seatbelt-sandbox
+cat ~/.dsh/profiles/web/package.json
+
+# 3. 构建（仅 git 安装需要；本地 path 安装需仓库侧已构建好）
+cd ~/.dsh/profiles/web/node_modules/dsh-seatbelt-sandbox
+npm install &amp;&amp; npm run build &amp;&amp; npm run build:native
+
+# 4. 确认组合树：官方 sandbox 行 disabled: true + 本插件新行（无重复 id）
+dsh web --dump-config | grep -B1 -A3 'sandbox-seatbelt'
+
+# 5. 装配验证（独立真实 boot，8 项断言；插件级 4 项断言）
+node ~/.dsh/profiles/web/node_modules/dsh-seatbelt-sandbox/examples/verify-dsh-boot.mjs
+node ~/.dsh/profiles/web/node_modules/dsh-seatbelt-sandbox/examples/verify-integration.mjs
+
+# 6. 重启 dsh web —— 必做！运行中的实例不会热加载 bundle 层（HMR 只 watch 用户层 patch）
+kill &lt;当前 dsh web 的 PID&gt;    # 如：lsof -nP -iTCP:3080 -sTCP:LISTEN 查 PID
+cd &lt;原启动目录&gt; &amp;&amp; dsh web
+</code></pre>
+<blockquote>
+<p>⚠️ 本地 path/link 安装时跑 <code>verify-integration.mjs</code>：该脚本 <code>import 'dsh-seatbelt-sandbox'</code> 从仓库自身 <code>node_modules</code> 解析，需先建自引用链接（<code>cd &lt;仓库&gt; &amp;&amp; ln -sf .. node_modules/dsh-seatbelt-sandbox</code>）；npm 包/git 真实安装无此问题。</p>
+</blockquote>
+<blockquote>
+<p>⚠️ peer 依赖：插件 <code>peerDependencies</code> 为 <code>@deepseek-ai/cordis</code> 与 <code>@deepseek-ai/dsh-sandbox</code>（与 dsh 运行时同版本）。本地 link 安装时从仓库自身 <code>node_modules</code> 解析；git 安装时 pnpm 自动安装 peers；若 <code>pnpm peers check</code> 报缺，在 profile 下 <code>dsh plugin --profile web add @deepseek-ai/cordis@^4.0.1 @deepseek-ai/dsh-sandbox@^0.1.0-rc.6</code>。</p>
+</blockquote>
+<blockquote>
+<p>回滚：<code>dsh plugin --profile web remove dsh-seatbelt-sandbox</code> 后重启，即恢复官方 <code>sandbox-local</code>。</p>
+</blockquote>
+<blockquote>
+<p>✅ 已落地（<a href="https://github.com/drscrewdriver/dsh-seatbelt-sandbox/issues/1">Issue #1</a> 前置条件）：</p>
+<ol>
+<li><code>package.json</code> 已声明 <code>"dsh": { "bundle": { "patch": "./cordis.patch.yml" } }</code>（<code>files</code> 含 <code>cordis.patch.yml</code>）—— <code>dsh plugin</code> reconcile 据此把包加入装配层；</li>
+<li><code>cordis.patch.yml</code> 按 dsh patch 语义写成「禁用官方 sandbox 行 + insert 追加 <code>dsh-seatbelt-sandbox</code> 行（新 id <code>sandbox-seatbelt</code>）」；</li>
+<li>注意：早期提交（0bd8b63 之前）的 patch 是纯 <code>insert</code> 追加同 id 行，会导致 boot 抛 <code>duplicate loader entry id</code>——请使用本仓库最新提交。</li>
+</ol>
+</blockquote>
+<h2>loader CLI 契约</h2>
+<pre><code>seatbelt-run &lt;profile-file&gt; [--] &lt;cmd&gt; &lt;args...&gt;
+seatbelt-run --self-test
+</code></pre>
+<ul>
+<li>profile 走文件传递（规避 ARG_MAX）；可选 <code>--</code> 分隔符与 dsh <code>confine</code> 惯例对齐，且与 inferglow <code>seatbelt-loader &lt;profile-file&gt; &lt;cmd&gt;</code> 契约兼容（无 <code>--</code> 形态同样可用，二进制可互换）。</li>
+<li>失败统一退出 <strong>125</strong>（对齐 dsh landlock launcher 约定），stderr 前缀 <code>seatbelt-run: </code>；沙箱 denial 是内核方言 <code>operation not permitted</code>，与 loader 失败可区分。</li>
+<li><code>--self-test</code> 应用空 profile <code>(version 1)</code>，退出 0 表示 libsandbox API 可用——插件的功能探测。</li>
+</ul>
+<h2>与官方 seatbelt rung 的行为差异</h2>
+<table>
+<thead>
+<tr>
+<th>维度</th>
+<th>官方 <code>@deepseek-ai/dsh-sandbox-local</code></th>
+<th>本插件</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>执行器</td>
+<td><code>sandbox-exec</code> CLI（已弃用）</td>
+<td><code>seatbelt-run</code>（直调 libsandbox，跨生态共享契约）</td>
+</tr>
+<tr>
+<td>探测</td>
+<td>真实 read-only profile + <code>true</code></td>
+<td><code>--self-test</code>（空 profile，与 inferglow/Python 生态一致）</td>
+</tr>
+<tr>
+<td>denial 方言</td>
+<td><code>operation not permitted</code></td>
+<td>相同</td>
+</tr>
+<tr>
+<td>runner 失败签名</td>
+<td><code>sandbox-exec: </code>（无退出码门控）</td>
+<td><code>seatbelt-run: </code> + <code>allowedExitCodes: [125]</code>（exit-gated，更强）</td>
+</tr>
+<tr>
+<td>enforcement</td>
+<td>full</td>
+<td>full（SBPL deny file-write* 按构造保证）</td>
+</tr>
+<tr>
+<td>探测失败</td>
+<td>fail-closed <code>SANDBOX_UNAVAILABLE</code></td>
+<td>相同</td>
+</tr>
+<tr>
+<td>SBPL 生成</td>
+<td><code>seatbeltProfileArgs</code>（dsh 内部）</td>
+<td>本包 <code>sbpl.ts</code>（复制上游语义，方言测试 pin 等价）</td>
+</tr>
+<tr>
+<td>profile 文件</td>
+<td>内联 <code>-p</code> 传递</td>
+<td>临时文件（provider 级缓存 + dispose 清理）</td>
+</tr>
+</tbody></table>
+<h2>契约跟踪责任（升级注意）</h2>
+<p>本插件通过 <code>peerDependencies</code> 锁定 <code>@deepseek-ai/cordis</code> 与 <code>@deepseek-ai/dsh-sandbox</code>。dsh 上游若演进 <code>ConfinedArgv</code> / <code>SandboxPolicy</code> / <code>SandboxProvider</code> 契约，需同步更新 <code>src/provider.ts</code>（契约变化集中于该单文件）；<code>src/sbpl.ts</code> 的 <code>writableRoots</code> / <code>seatbeltProfileText</code> 语义来自 dsh 的 <code>roots.ts</code> / <code>profiles.ts</code>（BSD-3-Clause，来源已标注），上游变更时同步镜像并由 <code>tests/sbpl.test.mjs</code> 的方言断言兜底。</p>
+<h2>测试</h2>
+<pre><code>npm test          # 单元测试任意平台可跑；macOS e2e 自动跳过
+npm run build:native &amp;&amp; npm test   # macOS 上跑完整套件（真实内核双向断言）
+</code></pre>
+<ul>
+<li>单元（<code>tests/sbpl.test.mjs</code>、<code>tests/provider.test.mjs</code>）：SBPL 方言、argv 组装、profile 缓存/清理、探测缓存、fail-closed。</li>
+<li>macOS e2e（<code>tests/seatbelt.e2e.mjs</code>）：read-only deny-write 不落盘 + <code>operation not permitted</code>、/dev/null 可写、workspace-write 双向断言、temp 区授权、坏 profile → 125 + <code>seatbelt-run: </code>。</li>
+<li>装配集成：<code>examples/cordis.yml</code> 替换后，<code>ctx.sandbox.confine()</code> 走新 provider，bash 沙箱的 <code>[sandbox: file access denied …]</code> 归因基于本插件的 denial 方言正确工作。</li>
+</ul>
+<h2>装配验证报告（macOS arm64，2026-08-17）</h2>
+<p>三层验证闭环，全部通过：</p>
+<table>
+<thead>
+<tr>
+<th>层</th>
+<th>验证</th>
+<th>结果</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>插件层</td>
+<td><code>npm test</code>：12 单元 + 5 macOS 真实内核 e2e</td>
+<td>17/17</td>
+</tr>
+<tr>
+<td>装配层</td>
+<td><code>examples/verify-dsh-boot.mjs</code>：复用 dsh CLI <code>runProfile</code>（与 <code>dsh web</code> 同一 boot 路径）真实 boot</td>
+<td>8/8</td>
+</tr>
+<tr>
+<td>会话层</td>
+<td>在真实 harness 会话中由 agent 执行行为验证（工作区写/外部写被拒+文件未创建/temp 授权/只读正常，全程无 <code>sandbox-exec</code> 踪迹）</td>
+<td>4/4</td>
+</tr>
+</tbody></table>
+<p>装配层 8 项断言明细：<code>ctx.sandbox</code> 构造器为 <code>SeatbeltSandboxProvider</code>；confine 产出 <code>[seatbelt-run, profileFile, --, ...argv]</code> 且无 <code>sandbox-exec</code>；read-only 写被内核拒（<code>operation not permitted</code>）且文件未创建；workspace-write 内成功外被拒；消费方 <code>ctx.shell</code>（bash-sandbox）经本插件 denial 方言正确归因 <code>denied=true</code> / <code>denied=false</code>。</p>
+<p><strong>结论：插件在 macOS arm64 上理论可用</strong>——沙箱能力由 Apple 内置 seatbelt（内核强制）承担，本插件接管「策略 → SBPL profile → 送入内核」适配段（弃用 CLI → 直调 libsandbox），拦截由内核执行、归因由本插件保障。正式生产部署前仅剩 npm 发布与 darwin-x64 二进制两件事（见状态表）。</p>
+<blockquote>
+<p>消融实验证据（<a href="https://github.com/drscrewdriver/dsh-seatbelt-sandbox/blob/HEAD/docs/ablation.md">docs/ablation.md</a>）：PATH 遮蔽模拟 <code>sandbox-exec</code> 归档后——本插件 8/8 全过、官方 rung 直接 <code>SANDBOX_UNAVAILABLE</code> fail-closed 拒绝一切命令；含可复现步骤与手动两阶段对照（卸载+遮蔽 → 报错 / 安装+遮蔽 → 正常）。</p>
+</blockquote>
+<h2>发布前验收清单（macOS）</h2>
+<pre><code># 1. 构建二进制 + 自检
+npm run build:native                                  # bin/darwin-&lt;arch&gt;/seatbelt-run + Mach-O 校验
+./bin/darwin-arm64/seatbelt-run --self-test &amp;&amp; echo OK
+
+# 2. 完整测试套件（真实内核断言，无 skip）
+npm test                                              # 12 单元 + 5 e2e 全部通过
+
+# 3. dsh 装配集成（`dsh plugin --profile web add` 后）✅ 已完成
+#    - `examples/verify-dsh-boot.mjs`：真实 boot，8 项全过（装配/argv 形态/无 sandbox-exec/内核拒绝/workspace-write/消费方归因）
+#    - `examples/verify-integration.mjs`：4 项全过（装配/read-only/workspace-write/fail-closed）
+#    - loader 缺失时抛 SANDBOX_UNAVAILABLE（fail-closed）
+
+# 4. 发布
+npm pack &amp;&amp; npm publish                               # 确认 tarball 含 bin/darwin-*/seatbelt-run
+</code></pre>
+<h2>推送到 GitHub</h2>
+<pre><code># 1. 在 GitHub 新建仓库（建议同名 dsh-seatbelt-sandbox）
+# 2. 关联并推送（master 分支）：
+git remote add origin git@github.com:&lt;your-org&gt;/dsh-seatbelt-sandbox.git
+git push -u origin master
+# 3. 推送后替换 README/示例中的 &lt;github-owner&gt; 为实际用户名
+# 4. 发布 npm 前：补 package.json 的 repository 字段，并完成「发布前验收清单」
+</code></pre>
+<h2>参考</h2>
+<ul>
+<li><code>.trae/specs/seatbelt-ts-adapter/</code>（工作区根，三件套 spec/checklist/tasks）——需求规格（本实现为"插件方式"落地）</li>
+<li>dsh <code>native/landlock-run</code>——C11 loader + JS seam 的包形态先例</li>
+<li>dsh <code>packages/sandbox/sandbox/src/{index.ts,roots.ts}</code>、<code>sandbox-local/src/profiles.ts</code>——契约与 SBPL 语义来源</li>
+<li>inferglow <code>sandbox/seatbelt_loader/</code>——Go 生态同契约实现</li>
+</ul>

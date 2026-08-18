@@ -1,0 +1,202 @@
+<h1>dsh-orchestrate</h1>
+<blockquote>
+<p><strong>One prompt. A team of agents.</strong> ｜ 一句话，一支 Agent 队伍。</p>
+</blockquote>
+<p><a href="https://github.com/ConradLu2740/dsh-orchestrate/blob/HEAD/README.en.md">English</a> ｜ 中文</p>
+<p><img src="https://raw.githubusercontent.com/ConradLu2740/dsh-orchestrate/HEAD/docs/concept.png" alt="dsh-orchestrate 概念图"></p>
+<p>让 DeepSeek Harness（dsh）的主 Agent 在合适时候<strong>主动、积极</strong>地调用子 Agent 完成并行任务：
+<code>orchestrate_delegate</code> 并行拆分、<code>orchestrate_review</code> 对抗审查、<code>orchestrate_explore</code> 多样性探索，
+<code>orchestrate_status</code> / <code>orchestrate_stop</code> / <code>orchestrate_converge</code> 跟踪、中止与收敛；
+附 <code>orchestration:policy</code> 决策注入（<strong>仅根 Agent 可见</strong>），教模型判断"何时该派、何时不该派"。</p>
+<blockquote>
+<p>⚠️ 第三方插件，非官方出品。构建于官方 <code>subagent</code> 能力族（<code>ctx.subagents</code>）之上，只做
+决策层 + 编排模式层 + 收敛层。</p>
+</blockquote>
+<h2>为什么</h2>
+<ul>
+<li>官方已有完整的 subagent 底层（spawn/continuable/toolFilter/structured output），但模型只有
+"可以派"的能力，没有"何时主动派、怎么拆、怎么等、怎么收"的编排层。</li>
+<li>一个 Agent 的能力有上限：长任务串行、方案没有第二视角、多方向只能拍脑袋。</li>
+<li>本插件把 Proma <code>agent-collaboration</code> 的协作方法论（并行拆分/对抗审查/多样性探索）工程化。</li>
+</ul>
+<p><strong>真实 API 验证（Spike C，2026-08-16）</strong>：10 个应编排任务 <strong>100% 主动触发</strong>编排，
+10 个对照任务 <strong>0% 误触发</strong>（deepseek-v4-flash）。触发率依赖任务书自包含——与插件设计一致。</p>
+<h2>安装</h2>
+<pre><code># 从当前 checkout 安装；provider 版本必须与宿主 DSH 匹配
+# 0.1.0-rc.6 是本项目当前验证过的组合
+dsh plugin --profile demo add \
+  @deepseek-ai/dsh-subagent-spawn-in-process@0.1.0-rc.6 .
+
+# 从 npm 安装同一组合
+dsh plugin --profile demo add \
+  @deepseek-ai/dsh-subagent-spawn-in-process@0.1.0-rc.6 \
+  dsh-orchestrate@0.3.1
+</code></pre>
+<p>插件默认使用 <code>spawn</code> provider；官方 provider 必须由 DSH profile 单独安装，且版本要与宿主 DSH 匹配。
+本仓库当前验证组合是 <code>0.1.0-rc.6</code>；<code>fork</code>/<code>acp</code> 需要用户自行安装并验证对应 provider。</p>
+<h2>使用</h2>
+<p>在 dsh Web UI 里对 Agent 说：</p>
+<pre><code>并行调研这三个方向：① SQLite vs DuckDB 存储，② RAG chunk 策略，③ 索引方案。
+</code></pre>
+<p>Agent 会主动调用 <code>orchestrate_delegate</code>，返回：</p>
+<pre><code>🧩 编排完成（run run-8ca117bf，3/3 成功）
+  [0] ✅ SQLite 更适合小规模…
+  [1] ✅ 512-token 重叠 10%…
+  [2] ✅ HNSW 优于 IVF…
+</code></pre>
+<p>长任务可后台化：<code>run_in_background: true</code> 立即返回 runId，稍后用 <code>orchestrate_converge</code> 收敛。</p>
+<h3>工具</h3>
+<table>
+<thead>
+<tr>
+<th>工具</th>
+<th>作用</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>orchestrate_delegate</code></td>
+<td>并行拆分：<code>tasks</code>（任务书数组）/ <code>task</code>（单任务）/ <code>template</code>（模板引用：<code>delegations/&lt;id&gt;.yml</code> + <code>templateArgs</code> 占位符填充）；并发默认 4、超时默认 10 分钟；支持 <code>run_in_background</code>（后台化）、<code>converge.mode: all/any</code>、<code>retryFailed</code>、<code>role</code>、<code>model</code>（per-run 模型）、<code>maxTokens</code>（软预算）；返回结构化汇总（每个结论标注来源子会话）</td>
+</tr>
+<tr>
+<td><code>orchestrate_review</code></td>
+<td>对抗式审查：spawn 多个只读审查者子 Agent 挑毛病，返回风险/假设挑战/边界/建议的机械汇总；父 Agent 逐条评估；支持 <code>aspects</code>/<code>reviewers</code>（1-5）/<code>model</code>/<code>maxTokens</code></td>
+</tr>
+<tr>
+<td><code>orchestrate_explore</code></td>
+<td>多样性探索：spawn 多个只读调研者子 Agent 沿独立方向探索，返回带置信度的发现报告；支持 <code>directions</code>（上限 6，超限截断提示）/<code>model</code>/<code>maxTokens</code></td>
+</tr>
+<tr>
+<td><code>orchestrate_converge</code></td>
+<td>收敛后台编排：按 <code>runId</code> 阻塞等待全部子会话完成并返回完整汇总（可重复读）</td>
+</tr>
+<tr>
+<td><code>orchestrate_status</code></td>
+<td>查询编排任务与子会话状态（含后台 run 的完成比例）</td>
+</tr>
+<tr>
+<td><code>orchestrate_stop</code></td>
+<td>中止进行中的编排任务（子会话以 aborted 收尾）</td>
+</tr>
+</tbody></table>
+<blockquote>
+<p>后台模式（<code>run_in_background: true</code>）忽略 <code>converge.mode=any</code> 与 <code>retryFailed</code>（语义不适用，调用时在 note 提示）。</p>
+</blockquote>
+<h3>角色（persona）</h3>
+<p>子 Agent 可指定 <code>role</code>（<code>orchestrate_delegate</code> 参数；review/explore 内定角色）：</p>
+<table>
+<thead>
+<tr>
+<th>role</th>
+<th>视角</th>
+<th>结构化输出</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>executor</code>（默认）</td>
+<td>独立完成子任务并汇报</td>
+<td><code>{ summary, findings[], open_questions[] }</code></td>
+</tr>
+<tr>
+<td><code>reviewer</code></td>
+<td>对抗式审查：风险/假设/边界/建议</td>
+<td><code>{ verdict, risks[], assumptions_challenged[], edge_cases[], suggestions[] }</code></td>
+</tr>
+<tr>
+<td><code>researcher</code></td>
+<td>方向探索，标注置信度</td>
+<td><code>{ summary, findings[], confidence, evidence[] }</code></td>
+</tr>
+<tr>
+<td><code>devil</code></td>
+<td>刁难压力测试：反面论点与推演</td>
+<td><code>{ challenge, counterpoints[], what_if[] }</code></td>
+</tr>
+</tbody></table>
+<h3>行为细节</h3>
+<ul>
+<li><strong>子 Agent 结构化输出</strong>：按角色强制对应 schema（官方 <code>structured_output</code> 机制）。</li>
+<li><strong>防递归</strong>：每个子 Agent 自动隐藏 <code>orchestrate_*</code> 工具（Spike B 验证 one visibility），
+且子请求显式传 <code>maxDepth=1</code>；toolFilter 降级时深度上限仍生效。</li>
+<li><strong>决策注入方案 C</strong>：<code>orchestration:policy</code> 段按 delegationDepth 过滤——<strong>仅根 Agent 可见</strong>，
+子 Agent 的 prompt 里完全没有该段（2026-08-16 落地）。</li>
+<li><strong>只读</strong>：依赖官方部署 sandbox 默认 <code>read-only</code>（若部署改为 workspace-write，子 Agent 将继承写权限）。</li>
+<li><strong>失败语义</strong>：子会话失败（error/refusal/max-tokens）标记为 failed，partial output 保留；
+<code>retryFailed</code> 只重试非中止类失败；<code>mode=any</code> 在成功数不足但所有任务已结束时返回失败汇总，不会永久等待。</li>
+<li><strong>成本控制</strong>：<code>converge.timeoutMs</code> 超时中止在途子会话；<code>maxTokens</code> 软预算（按输出长度
+估算 token，超限中止余下子会话，估算值返回在 <code>costTokens</code>）；任务数上限 20。</li>
+<li><strong>取消</strong>：用户/模型取消当前回合时，在途子会话一并中止（父级信号接入）。</li>
+</ul>
+<h3>使用限制</h3>
+<ul>
+<li><code>task</code> 路径不自动拆分（等价单任务）；请先自行将父任务拆成任务书数组。</li>
+<li>编排状态存于进程内，重启后需重新编排（跨重启恢复未实现）。</li>
+<li><code>costTokens</code> 为估算值（输出长度近似），非官方 token 计数。</li>
+<li>后台 run 受 <code>timeoutMs</code> 兜底；收敛语义依赖官方 one-shot 子会话（未用 continuable 后台）。</li>
+</ul>
+<h2>配置</h2>
+<table>
+<thead>
+<tr>
+<th>键</th>
+<th>默认</th>
+<th>含义</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>provider</code></td>
+<td><code>spawn</code></td>
+<td>in-process spawn provider 名</td>
+</tr>
+<tr>
+<td><code>auto</code></td>
+<td><code>true</code></td>
+<td>是否注入 <code>orchestration:policy</code> 决策段（<code>false</code> = 只被动响应）</td>
+</tr>
+<tr>
+<td><code>denyTools</code></td>
+<td><code>orchestrate_*</code></td>
+<td>子 Agent 需隐藏的工具名列表</td>
+</tr>
+<tr>
+<td><code>maxDepth</code></td>
+<td><code>1</code></td>
+<td>子 Agent 递归深度上限</td>
+</tr>
+<tr>
+<td><code>templatesDir</code></td>
+<td>包内 <code>delegations/</code></td>
+<td>任务书模板目录（可挂载外部模板库）</td>
+</tr>
+<tr>
+<td><code>registryCapacity</code></td>
+<td><code>100</code></td>
+<td>registry 保留编排记录上限（超出时淘汰最旧记录）</td>
+</tr>
+</tbody></table>
+<h2>模板库</h2>
+<p><code>delegations/</code> 提供 10 个任务书模板（调研对比/代码审查/竞品分析/bug 排查等），
+可通过 <code>orchestrate_delegate</code> 的 <code>template</code> 参数直接引用（模式插件化）：</p>
+<pre><code>调用 orchestrate_delegate，template=code-review-multi，templateArgs={ module: ['src/a', 'src/b'] }
+</code></pre>
+<p>模板约定：<code>templateArgs</code> 中值为字符串数组的参数（如 <code>module</code>/<code>items</code>/<code>competitor</code>）
+每个元素展开为一条独立任务，其余字符串参数作为公共上下文注入。
+欢迎 PR 贡献新模板（对标 dsh-bench 的 <code>datasets/</code>）。</p>
+<h2>评测（collab 套件）</h2>
+<p><strong>Collab real 扩展集（2026-08-17）</strong>：开发期间的 27 条任务全量运行与分批复测显示，显式应编排任务 11/12（91.7%），隐式自主编排 1/5（20.0%），应编排合计 12/17（70.6%），对照任务 0/10 误触发。该评测数据来自宿主项目开发环境，不随 standalone 仓库或 npm 包发布。</p>
+<h2>Roadmap</h2>
+<ul>
+<li> M1：<code>delegate</code> / <code>status</code> / <code>stop</code> + 决策注入 + 模板库（16 测试）</li>
+<li> M2：<code>review</code> / <code>explore</code> / persona / per-run 模型（30 测试）</li>
+<li> M3：模板参数化、后台化（<code>converge</code>）、决策注入方案 C、collab 套件、Spike C（54 + 37 测试）</li>
+<li> <code>0.3.0</code>：首次公开发布到 npm；entry 使用命名导出并在 release build 中禁用 workspace path aliases</li>
+<li> <code>0.3.1</code>：修复 <code>mode=any</code> 零成功时的收敛挂起；standalone 文档、CI、LICENSE 与发布元数据同步</li>
+<li> UI 卡片</li>
+</ul>
+<h2>Development</h2>
+<pre><code>pnpm install
+pnpm test       # 55 tests
+pnpm typecheck
+pnpm build
+</code></pre>
+<h2>License</h2>
+<p>MIT</p>

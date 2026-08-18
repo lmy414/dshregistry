@@ -1,0 +1,118 @@
+<h1>dsh-netguard</h1>
+<p>An egress policy for <a href="https://github.com/deepseek-ai/deepseek-harness">DeepSeek Harness</a>: a host
+allowlist on the <code>web_fetch</code> and <code>web_search</code> tools, checked at connect time, built as an
+out-of-repo plugin.</p>
+<p>The harness has no network control of any kind — its sandbox governs file effects only, and
+<code>web_fetch</code> is described in-source as an SSRF primitive with private-network protection "not
+implemented". This package adds the part that is achievable from an ordinary mounted plugin.</p>
+<p>📖 <strong><a href="https://charlotten7.github.io/dsh-netguard/">Full documentation</a></strong></p>
+<h2>Three things to know before you install it</h2>
+<p><strong>It ships in <code>audit</code> mode, where nothing is refused.</strong> Every decision is recorded and every
+request goes through, including the ones the policy would deny. <code>mode: enforce</code> is what turns
+records into refusals. Audit-first is deliberate — enforce-first on a dependency graph nobody can
+enumerate gets the control switched off in week one — but an installation left in audit mode has
+monitoring, not enforcement.</p>
+<p><strong>It is not an egress firewall.</strong> It governs those two tools and nothing else. It does not see one
+byte sent by <code>bash</code>, <code>run_code</code>, a terminal, an MCP server, or a delegated agent. A build script
+phoning home does not stop, and neither does a dependency's postinstall fetching a second stage.</p>
+<p><strong>It is not a containment boundary.</strong> It runs in-process at the agent's own uid. Against a
+confused or prompt-injected model that asks a tool to fetch a URL, it is a real control. Against a
+model that is deliberately exfiltrating, it is advisory — that model writes one line of
+<code>run_code</code>. The model channel itself is the dominant exfiltration path and nothing here touches
+it.</p>
+<p><a href="https://charlotten7.github.io/dsh-netguard/">What it does not do, in full →</a></p>
+<h2>Install</h2>
+<pre><code>dsh plugin --profile &lt;name&gt; add @deepseek-ai/dsh-headless@0.1.0-rc.6
+dsh plugin --profile &lt;name&gt; add dsh-netguard
+dsh --profile &lt;name&gt; --dump-config      # the dsh-netguard row should appear
+</code></pre>
+<p>Any harness from <code>0.1.0-rc.6</code> onwards in the <code>0.1.x</code> line works: the peer ranges accept it, and CI
+runs the end-to-end suite against <code>0.1.0-rc.6</code> and <code>0.1.0-rc.7</code>.</p>
+<p><strong>The composition is mandatory.</strong> <code>ctx.web</code> has no provider priority and no last-wins rule, so
+mounting this beside another fetch provider breaks <code>web_fetch</code> outright with
+<code>WEB_PROVIDER_AMBIGUOUS</code>. Write this into the profile's <code>cordis.patch.yml</code> — a patch replaces a
+row's whole <code>config</code>, so every key is restated:</p>
+<pre><code># $DSH_HOME/profiles/&lt;name&gt;/cordis.patch.yml
+- id: web
+  config:
+    fetchProvider: dsh-netguard
+    searchProvider: deepseek-official   # whatever your profile already uses
+
+- id: tool-web
+  config:
+    fetch: true                          # the base bundle ships this off
+    searchTimeoutMs: 60000
+
+# Only if your composition mounts the shipped provider; the base bundle does not.
+- remove: [web-fetch-http]
+
+- id: dsh-netguard
+  config:
+    mode: audit
+    allow: []
+    deny: []
+    spoolPath: /var/log/dsh/netguard.ocsf.jsonl
+</code></pre>
+<p>Get it wrong and the mount fails loud, naming the conflicting provider and quoting the patch you
+need. Install from the registry or a packed tarball, <strong>not</strong> from a git spec — <code>lib/</code> is a build
+output git does not carry.</p>
+<p><a href="https://charlotten7.github.io/dsh-netguard/install.html">Install and composition in full →</a></p>
+<h2>Configure</h2>
+<p>Every path must be absolute; a relative one resolves against the workspace, which is the directory
+the agent being recorded can rewrite. An empty allow list denies everything, and a deny match wins
+over every allow match.</p>
+<pre><code>- id: dsh-netguard
+  config:
+    mode: audit                          # or enforce
+    allow: ['**.github.com', 'registry.npmjs.org:443']
+    deny: ['*.internal.example']
+    spoolPath: /var/log/dsh/netguard.ocsf.jsonl
+</code></pre>
+<p>Pattern grammar is Codex's: <code>*.example.com</code> is subdomains only, <code>**.example.com</code> includes the
+apex. An allow entry may also scope to a path — <code>github.com/your-org/your-repo</code> grants that path
+and everything under it, re-checked on every redirect hop. A pattern that could be read two ways
+is refused at load rather than widened.</p>
+<p><a href="https://charlotten7.github.io/dsh-netguard/configuration.html">Configuration reference →</a> ·
+<a href="https://charlotten7.github.io/dsh-netguard/enforcement.html">What enforcement means →</a></p>
+<h2>What it records</h2>
+<p>One OCSF <strong>Network Activity (4001)</strong> record per decision, one JSON object per line, with the
+<code>security_control</code> profile declared. Verbatim: a validated hostname, port, resolved address,
+verdict, matched rule. Digested as HMAC-SHA256: the full URL, any search query, and any string
+that was supposed to be a hostname and is not.</p>
+<p>Records carry the same <code>correlation_uid</code> scheme <code>dsh-ocsf-forwarder</code> stamps on its tool-call
+records — <strong>HTTP Activity (4002)</strong> for <code>web_fetch</code> and <code>web_search</code>, not the Process Activity 1007
+it gives <code>bash</code> — so the two together answer <em>which tool call opened this connection</em>. Nothing is
+ever appended to the session log.</p>
+<p><a href="https://charlotten7.github.io/dsh-netguard/records.html">Record format and the privacy lane →</a></p>
+<h2>Reading it back</h2>
+<pre><code>dsh-netguard report                  # everything in the spool
+dsh-netguard report --since 24h
+dsh-netguard report --suggest        # a ready allow: block from the hosts it observed
+</code></pre>
+<p>Read <code>--suggest</code> output before using it. It reports what happened, not what should be permitted,
+and one line in it may be the request you mounted this plugin to stop.</p>
+<p>The CLI imports nothing from the harness, so it runs wherever the package is installed. A plugin
+installed into a profile puts its bin in that profile's <code>node_modules/.bin</code>, which is not on
+<code>PATH</code>:</p>
+<pre><code>"$DSH_HOME/profiles/&lt;name&gt;/node_modules/.bin/dsh-netguard" report
+</code></pre>
+<h2>Known limitations</h2>
+<p><code>bash</code>, <code>run_code</code>, terminals, MCP servers and delegated agents are not governed. The model
+channel is not governed. The spool is not rotated. The wildcard check uses a documented
+approximation rather than a public suffix list. Without a <code>search.delegate</code>, result URLs are not
+filtered — only the outbound query.</p>
+<p><a href="https://charlotten7.github.io/dsh-netguard/limitations.html">All known limitations →</a></p>
+<h2>Development</h2>
+<pre><code>nvm use 22           # Node ^22.19.0 || &gt;=24, and pnpm 11
+pnpm install
+pnpm run typecheck
+pnpm run test
+pnpm run test:coverage
+pnpm run test:e2e    # boots a real dsh against a mock model; no API key
+</code></pre>
+<p>Coverage is gated at 100% per file: this is a security control, so an arm nothing exercises is an
+arm nobody has checked.</p>
+<p>Design decisions and their rationale live in <a href="https://github.com/CharlotteN7/dsh-netguard/blob/HEAD/ADR.md">ADR.md</a>. Security policy is in
+<a href="https://github.com/CharlotteN7/dsh-netguard/blob/HEAD/SECURITY.md">SECURITY.md</a>.</p>
+<h2>License</h2>
+<p>MIT</p>

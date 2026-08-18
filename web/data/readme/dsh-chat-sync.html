@@ -1,0 +1,121 @@
+<h1>dsh-chat-sync</h1>
+<p>DSH（DeepSeek Harness）插件：<strong>把本地 Claude Code / Codex CLI / Cursor Agent 的历史与进行中的对话同步进 DSH Web GUI</strong>，侧边栏「对话同步」入口，一站式浏览 + 动态更新。</p>
+<h2>功能</h2>
+<table>
+<thead>
+<tr>
+<th>能力</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>三源汇聚</td>
+<td>同一列表浏览 Claude Code、Codex CLI、Cursor Agent 的所有本地会话（标题 / 项目 / 时间 / 大小 / 消息数）</td>
+</tr>
+<tr>
+<td>会话回放</td>
+<td>点开任意会话查看完整消息流：用户输入、助手回复（含模型名）、工具调用胶囊、工具结果、system 事件</td>
+</tr>
+<tr>
+<td>动态同步</td>
+<td>三个数据根目录 <code>fs.watch</code>（递归）→ 去抖扫描 → <strong>SSE 推送到浏览器</strong>：列表自动刷新，正在打开的会话按字节偏移<strong>增量追加</strong>新消息，无需手动刷新</td>
+</tr>
+<tr>
+<td>活跃标记</td>
+<td>最近有写入的会话带绿色脉动点（「动态同步」chip 可一键只看活跃会话）</td>
+</tr>
+<tr>
+<td>隐私围栏</td>
+<td>所有 API 仅接受 loopback 请求（socket + Host + same-origin 三重校验），不向局域网暴露任何对话内容</td>
+</tr>
+</tbody></table>
+<p>只读设计：插件<strong>只读取</strong>本地会话文件，绝不写入 / 修改任何 Claude、Codex、Cursor 的数据。</p>
+<h2>数据源</h2>
+<table>
+<thead>
+<tr>
+<th>源</th>
+<th>路径</th>
+<th>标题来源</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>Claude Code</td>
+<td><code>~/.claude/projects/&lt;项目&gt;/&lt;sessionId&gt;.jsonl</code></td>
+<td><code>ai-title</code> / <code>summary</code> 行，回退首条真实用户消息</td>
+</tr>
+<tr>
+<td>Codex CLI</td>
+<td><code>~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl</code></td>
+<td><code>~/.codex/session_index.jsonl</code> 的 thread name，回退首条用户消息</td>
+</tr>
+<tr>
+<td>Cursor Agent</td>
+<td><code>~/.cursor/projects/&lt;项目&gt;/agent-transcripts/&lt;uuid&gt;/&lt;uuid&gt;.jsonl</code></td>
+<td>Cursor <code>conversation-search.db</code>（node:sqlite 只读，不可用时自动回退），回退首条 <code>&lt;user_query&gt;</code></td>
+</tr>
+</tbody></table>
+<blockquote>
+<p>边界：Cursor 侧只收录 <strong>Agent transcripts</strong>（<code>agent-transcripts</code> 目录，即 Cursor Agent / 后台 Agent 会话）；旧版 Composer 聊天（state.vscdb 二进制 blob）不在范围内。</p>
+</blockquote>
+<h2>工作原理</h2>
+<ul>
+<li><strong>服务端半</strong>（<code>lib/index.js</code> → <code>lib/sources.js</code> + <code>lib/routes.js</code>）：扫描三源 jsonl，按 <code>(mtime, size)</code> 缓存会话元数据；<code>GET /api/dsh-chat-sync/*</code> 提供状态 / 列表 / 消息三个只读接口 + <code>/events</code> SSE 流。消息读取按<strong>字节偏移增量</strong>：会话文件是 append-only JSONL，解析结果与 <code>next</code> 偏移一并返回，客户端带 <code>from=&lt;next&gt;</code> 续读，只传新增消息。</li>
+<li><strong>动态同步</strong>：三个数据根目录递归 <code>fs.watch</code> → 400ms 去抖重扫 → diff 出变化会话 → SSE <code>changed</code> 帧广播。不支持递归 watch 的平台自动退化为轮询（<code>pollFallbackMs</code>）。正在打开的会话收到 <code>changed</code> 即增量拉取并自动滚动跟随。</li>
+<li><strong>浏览器半</strong>（<code>lib/client.js</code>，零构建手写 ModuleLoader 工厂）：遵循 dsh-ssh / task-board 的 DOM 扩展惯例注入侧边栏入口（MutationObserver 自愈），并在中栏以 React 根挂载浏览面板；与其他面板（任务看板 / SSH）通过 <code>dsh-panel-activate</code> 事件互让。</li>
+</ul>
+<h2>安装</h2>
+<pre><code># 本地 link 安装（开发推荐）
+dsh plugin --profile web add link:/Users/yangdongnan/work/dsh-chat-sync
+
+# 或从 GitHub 安装
+dsh plugin --profile web add github:&lt;you&gt;/dsh-chat-sync
+
+# 重启 dsh web 生效
+</code></pre>
+<p><code>dsh plugin</code> 会自动把声明了 <code>dsh.bundle</code> 的包追加进 profile 的 <code>dsh.profile.bundles</code>。</p>
+<h2>配置</h2>
+<p>默认零配置可用。需要调整时，在 profile 的 <code>cordis.patch.yml</code>（<code>~/.dsh/profiles/web/cordis.patch.yml</code>）按 id 覆盖：</p>
+<pre><code>- id: chat-sync
+  config:
+    enabled: true
+    watch: true            # 动态同步（文件监听 + SSE 推送）
+    pollFallbackMs: 5000   # 递归 watch 不可用时的轮询间隔（0 关闭）
+    debounceMs: 400        # 文件事件去抖窗口
+    maxSessions: 500       # 会话列表上限
+    maxMessageChars: 8000  # 单条消息截断长度
+    recentLiveMs: 180000   # 「活跃」判定窗口
+    titleHeadBytes: 65536  # 新文件标题提取读取的头部字节数
+</code></pre>
+<h2>API（均 loopback-only）</h2>
+<table>
+<thead>
+<tr>
+<th>路由</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>GET /api/dsh-chat-sync/status</code></td>
+<td>各源可用性 / 会话数 / 同步模式</td>
+</tr>
+<tr>
+<td><code>GET /api/dsh-chat-sync/sessions?source=&amp;q=&amp;limit=&amp;offset=&amp;live=1</code></td>
+<td>过滤后的会话列表</td>
+</tr>
+<tr>
+<td><code>GET /api/dsh-chat-sync/session?id=&lt;source:uuid&gt;&amp;from=&lt;next&gt;</code></td>
+<td>消息流（增量）</td>
+</tr>
+<tr>
+<td><code>GET /api/dsh-chat-sync/events</code></td>
+<td>SSE：<code>hello</code> / <code>changed</code> 帧</td>
+</tr>
+</tbody></table>
+<h2>开发与测试</h2>
+<pre><code>node --check lib/index.js lib/sources.js lib/routes.js lib/client.js
+node tests/smoke.mjs         # 端到端：假 home + 真 HTTP + SSE 动态推送
+node tests/client-load.mjs   # 浏览器半：ModuleLoader 契约 + apply 冒烟
+</code></pre>
+<h2>License</h2>
+<p>MIT</p>

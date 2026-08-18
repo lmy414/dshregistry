@@ -1,0 +1,296 @@
+<h1>DeepEye Vision for DSH</h1>
+<p>为 <a href="https://github.com/deepseek-ai/deepseek-harness">DeepSeek Harness</a> 提供视觉能力的原生 Cordis 插件。</p>
+<p>让纯文本模型获得"眼睛"：图片描述、OCR 文字提取、视觉问答、UI 布局分析、剪贴板截图分析，以及<strong>粘贴图片自动翻译</strong>（在纯文本模型会话里直接粘贴图片也能发）。</p>
+<h2>特性</h2>
+<ul>
+<li><strong>原生集成</strong> — 直接注册到 <code>ctx.tools</code>，无 MCP 中间层开销</li>
+<li><strong>多后端</strong> — 支持 OpenAI (GPT-4o)、Google Gemini、自定义 OpenAI-compatible 端点</li>
+<li><strong>智能预处理</strong> — 自动缩放过大图片、转换 JPEG 以节省 token</li>
+<li><strong>结果缓存</strong> — LRU 缓存减少重复 API 调用（含 TTL，键覆盖后端/模型，切换后端不会误命中）</li>
+<li><strong>友好错误处理</strong> — 鉴权失败/限流/超时给出可执行的修复建议，不再回显原始 API 报错</li>
+<li><strong>非阻塞剪贴板读取</strong> — <code>vision_clipboard</code> 异步读取系统剪贴板（不卡事件循环、可取消），且能区分「剪贴板是文本」「没有内容」并给出引导</li>
+<li><strong>System Prompt</strong> — 自动注入提示段落，让模型知道何时使用视觉能力</li>
+<li><strong>粘贴图片兼容</strong> — 纯文本模型（如 DeepSeek）会话中直接粘贴图片，自动翻译成文字后交给模型（见下文 pasteCompat）</li>
+</ul>
+<h2>安装</h2>
+<p>本插件是一个标准 dsh <strong>bundle</strong>（声明了 <code>dsh.bundle.patch</code>），通过 dsh 的 profile 插件机制安装：</p>
+<pre><code># 发布后（npm 安装）
+dsh plugin --profile web add dsh-plugin-deepeye
+
+# 本地开发时（从插件源码目录的上一级执行）
+dsh plugin --profile web add ./dsh-plugin-deepeye
+</code></pre>
+<p>安装时 dsh 会：</p>
+<ol>
+<li>首次使用自动初始化 profile（含 <code>@deepseek-ai/dsh-base</code>）</li>
+<li>用 pnpm 把本包链接进 profile 目录</li>
+<li>因本包声明了 <code>dsh.bundle</code>，自动追加到 <code>dsh.profile.bundles</code> 层叠</li>
+</ol>
+<p>验证与启动：</p>
+<pre><code>dsh --profile web --dump-config   # 确认出现 dsh-plugin-deepeye 层
+dsh web                           # web 是 --profile web 的别名
+</code></pre>
+<h2>配置</h2>
+<h3>API Key 解析优先级</h3>
+<p>插件支持多层 API Key 解析，用户可以选择最方便的方式：</p>
+<ol>
+<li><strong>cordis.yml 显式配置</strong> — <code>config.apiKey: !!js process.env.XXX</code></li>
+<li><strong>自动环境变量回退</strong> — 根据 <code>provider</code> 自动匹配对应环境变量</li>
+<li><strong>通用变量</strong> — <code>DEEPEYE_API_KEY</code>（适用于所有 provider）</li>
+</ol>
+<table>
+<thead>
+<tr>
+<th>provider</th>
+<th>自动回退的环境变量</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>openai</code></td>
+<td><code>OPENAI_API_KEY</code></td>
+</tr>
+<tr>
+<td><code>gemini</code></td>
+<td><code>GEMINI_API_KEY</code></td>
+</tr>
+<tr>
+<td><code>custom</code></td>
+<td><code>DEEPEYE_API_KEY</code></td>
+</tr>
+</tbody></table>
+<p><strong>最简配置</strong>：只需设置环境变量，无需在 cordis.yml 中显式写 <code>apiKey</code>：</p>
+<pre><code># .env 或系统环境变量
+export OPENAI_API_KEY=sk-xxx
+</code></pre>
+<pre><code># cordis.yml - 无需 apiKey 字段，自动从 OPENAI_API_KEY 读取
+- id: deepeye-vision
+  name: 'dsh-plugin-deepeye'
+  config:
+    provider: openai
+</code></pre>
+<h3>使用 OpenAI</h3>
+<pre><code>- id: deepeye-vision
+  name: 'dsh-plugin-deepeye'
+  config:
+    provider: openai
+    # apiKey: !!js process.env.OPENAI_API_KEY  # 可省略，自动回退
+    model: gpt-4o                    # 可选，默认 gpt-4o
+    # baseUrl: ''                    # 可选，代理或 Azure 端点
+</code></pre>
+<h3>使用 Gemini</h3>
+<pre><code>- id: deepeye-vision
+  name: 'dsh-plugin-deepeye'
+  config:
+    provider: gemini
+    model: gemini-2.0-flash          # 可选，默认 gemini-2.0-flash
+</code></pre>
+<h3>使用智谱 GLM-4V（免费）</h3>
+<p>智谱的 <code>glm-4v-flash</code> 是免费视觉模型，走 OpenAI-compatible 端点，对应 <code>provider: custom</code>。</p>
+<p>把 <a href="https://github.com/Favio8/dsh-plugin-deepeye/blob/HEAD/examples/zhipu-glm4v.cordis.patch.yml"><code>examples/zhipu-glm4v.cordis.patch.yml</code></a> 的内容合并到 profile 的用户 patch 层（<code>%USERPROFILE%\.dsh\profiles\web\cordis.patch.yml</code>，Linux/macOS 为 <code>~/.dsh/profiles/web/cordis.patch.yml</code>）：</p>
+<pre><code>- id: deepeye-vision
+  config:
+    provider: custom
+    baseUrl: https://open.bigmodel.cn/api/paas/v4
+    model: glm-4v-flash
+    maxTokens: 1024
+</code></pre>
+<p>API Key 通过环境变量提供（<code>custom</code> provider 自动读取 <code>DEEPEYE_API_KEY</code>）：</p>
+<pre><code># PowerShell
+$env:DEEPEYE_API_KEY = "&lt;你的智谱 API Key&gt;"
+</code></pre>
+<h3>使用自定义端点</h3>
+<p>适用于 vLLM、Ollama、LM Studio 等 OpenAI-compatible 服务：</p>
+<pre><code>- id: deepeye-vision
+  name: 'dsh-plugin-deepeye'
+  config:
+    provider: custom
+    baseUrl: http://localhost:8080/v1   # 必填：端点地址
+    model: qwen-vl-plus                 # 必填：模型名
+    # apiKey: !!js process.env.DEEPEYE_API_KEY  # 可省略
+</code></pre>
+<h3>完整配置参考</h3>
+<pre><code>- id: deepeye-vision
+  name: 'dsh-plugin-deepeye'
+  config:
+    provider: openai              # 'openai' | 'gemini' | 'custom'
+    apiKey: ''                    # 留空则自动读 env（见上表）
+    baseUrl: ''                   # custom 端点或代理地址
+    model: ''                     # 留空使用 provider 默认模型
+    cacheEnabled: true            # 结果缓存开关
+    cacheMaxSize: 200             # 缓存最大条目
+    cacheTtlSeconds: 86400        # 缓存条目有效期（秒，0 表示不过期）
+    maxImageDimension: 1536     # 图片最大尺寸（超过自动缩放）
+    jpegQuality: 85               # JPEG 压缩质量
+    maxTokens: 4096               # OpenAI-compatible 视觉模型最大输出 token
+    requestTimeout: 30000         # 单次请求超时（毫秒）
+    maxRetries: 2                 # 瞬时失败（429/5xx/网络错误）重试次数
+    retryDelay: 1000              # 首次重试前的基础延迟（毫秒，指数退避）
+    maxImageDownloadBytes: 20971520  # URL 图片最大下载字节数
+    pasteCompat: auto             # 'off' | 'auto' | 'force'，粘贴图片兼容模式
+</code></pre>
+<blockquote>
+<p>缓存键包含「provider + baseUrl + 图片 + prompt + model」：切换后端或模型不会误命中旧缓存；条目按 <code>cacheTtlSeconds</code> 过期。</p>
+</blockquote>
+<h3>粘贴图片兼容（pasteCompat）</h3>
+<p>DSH 前端原生支持把图片粘贴/拖拽进输入框（以附件形式存储，消息里是一个 <code>image</code> 引用块）。但有两道关卡会让带图消息发不出去：</p>
+<ol>
+<li><strong>宿主网关准入</strong>：<code>dsh-host-apiproxy</code> 在发送时校验模型能力——DeepSeek 等纯文本模型被显式声明为不支持图片（<code>MODEL_DOES_NOT_SUPPORT_IMAGES</code>），前端直接提示"当前模型不支持图片"，请求根本不会发出</li>
+<li><strong>适配器拒绝</strong>：即使消息提交成功，<code>dsh-llm-deepseek</code> 适配器也会拒绝 image 块（<code>UNSUPPORTED_CONTENT</code>）</li>
+</ol>
+<p>本插件通过两层机制解决：</p>
+<table>
+<thead>
+<tr>
+<th>层</th>
+<th>机制</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>准入</td>
+<td>包装 <code>ctx.llm.resolveModelInfo</code>：纯文本模型的 <code>inputModalities</code> 报告为"未知"而非"明确不支持"，通过网关准入，图片消息得以进入会话</td>
+</tr>
+<tr>
+<td>翻译</td>
+<td><code>llm/stream</code> 瀑布钩子：把 image 附件交给视觉后端翻译成文字，替换后重放请求——模型以文本形式"看到"图片</td>
+</tr>
+</tbody></table>
+<table>
+<thead>
+<tr>
+<th>模式</th>
+<th>行为</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>off</code></td>
+<td>不介入，粘贴图片行为与未安装插件时一致</td>
+</tr>
+<tr>
+<td><code>auto</code>（默认）</td>
+<td>仅当目标模型<strong>不支持图片输入</strong>时自动翻译；支持图片的模型（如 pi-ai）原样放行</td>
+</tr>
+<tr>
+<td><code>force</code></td>
+<td>无论模型是否支持图片，一律翻译后重放</td>
+</tr>
+</tbody></table>
+<ul>
+<li>翻译用的视觉后端与工具共用同一套配置（provider / apiKey / model / 缓存）</li>
+<li>视觉翻译失败时自动降级为友好提示文本，不会让会话报错</li>
+<li>仅改写含 <code>image</code> 块的请求，重放请求不含图片，不会重复改写</li>
+<li><code>resolveModelInfo</code> 包装有防重复标记（HMR 安全），且不改动模型路由与请求内容</li>
+<li>已实测：DeepSeek <code>deepseek-v4-flash</code> + 智谱 <code>glm-4v-flash</code>，粘贴截图后模型正常收到图片的文字翻译</li>
+</ul>
+<h2>启用方式</h2>
+<p>安装为 bundle 后（见上文「安装」），插件默认以 <code>provider: openai</code> 配置随 profile 自动加载。需要换后端或调整参数时，在 profile 的用户 patch 层按 id 定向覆盖其 <code>config</code>：</p>
+<pre><code># %USERPROFILE%\.dsh\profiles\web\cordis.patch.yml
+- id: deepeye-vision
+  config:
+    provider: openai
+    apiKey: !!js process.env.OPENAI_API_KEY
+</code></pre>
+<p>开发期也可以不落盘，直接用 <code>--patch</code> 临时叠加：</p>
+<pre><code>dsh web --patch ./examples/zhipu-glm4v.cordis.patch.yml
+</code></pre>
+<h2>提供的工具</h2>
+<table>
+<thead>
+<tr>
+<th>工具名</th>
+<th>功能</th>
+<th>必填参数</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>vision_describe</code></td>
+<td>详细描述图片内容</td>
+<td><code>image_source</code></td>
+</tr>
+<tr>
+<td><code>vision_ocr</code></td>
+<td>提取图片文字（OCR）</td>
+<td><code>image_source</code></td>
+</tr>
+<tr>
+<td><code>vision_ask</code></td>
+<td>根据图片回答问题</td>
+<td><code>image_source</code>, <code>question</code></td>
+</tr>
+<tr>
+<td><code>vision_layout</code></td>
+<td>UI 布局结构化分析（JSON）</td>
+<td><code>image_source</code></td>
+</tr>
+<tr>
+<td><code>vision_clipboard</code></td>
+<td>分析剪贴板截图</td>
+<td>无（自动读取剪贴板）</td>
+</tr>
+</tbody></table>
+<h3>图片来源格式</h3>
+<p>所有 <code>image_source</code> 参数支持四种格式：</p>
+<ul>
+<li><strong>本地路径</strong>: <code>/path/to/image.png</code> 或相对路径</li>
+<li><strong><code>file://</code> URL</strong>: <code>file:///path/to/image.png</code></li>
+<li><strong>HTTP(S) URL</strong>: <code>https://example.com/screenshot.png</code></li>
+<li><strong>Data URI</strong>: <code>data:image/png;base64,iVBOR...</code></li>
+</ul>
+<h2>环境变量</h2>
+<p>复制 <code>.env.example</code> 为 <code>.env</code> 并填入你的 key：</p>
+<table>
+<thead>
+<tr>
+<th>变量</th>
+<th>用途</th>
+<th>对应 provider</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>OPENAI_API_KEY</code></td>
+<td>OpenAI API Key</td>
+<td><code>openai</code></td>
+</tr>
+<tr>
+<td><code>GEMINI_API_KEY</code></td>
+<td>Gemini API Key</td>
+<td><code>gemini</code></td>
+</tr>
+<tr>
+<td><code>DEEPEYE_API_KEY</code></td>
+<td>通用 Key / 自定义端点</td>
+<td><code>custom</code> / 所有</td>
+</tr>
+</tbody></table>
+<h2>开发</h2>
+<pre><code>cd dsh-plugin-deepeye
+pnpm install        # 首次需安装依赖（含 sharp 原生库）
+pnpm run typecheck  # 类型检查
+pnpm test           # 单元测试（vitest）
+pnpm run build      # 构建 lib/（tsdown）
+</code></pre>
+<blockquote>
+<p><code>pnpm install</code> 会通过 <code>prepare</code> 自动构建 <code>lib/</code>。开发期修改 <code>src/</code> 后需
+重新 <code>pnpm run build</code> 并重启 dsh（或热重载）才会生效；
+若 <code>sharp</code> 未安装，插件仍可运行，但图片不会缩放/转 JPEG（token 开销更大），
+启动日志会给出一次性警告。</p>
+</blockquote>
+<h2>架构</h2>
+<pre><code>src/
+├── index.ts          # Cordis 插件入口 (name/inject/Config/apply)
+├── config.ts         # 配置 schema (schemastery)
+├── engine.ts         # VisionEngine: 统一执行管道
+├── cache.ts          # LRU 缓存
+├── image-utils.ts    # 图片加载 + 预处理
+├── errors.ts         # 错误分类与友好提示
+├── http.ts           # 超时/重试/退避 HTTP 封装
+├── layout.ts         # 布局 JSON 健壮提取
+├── prompts.ts        # 默认提示词
+├── paste-compat.ts   # 粘贴图片兼容：resolveModelInfo 能力包装（通过网关准入）+ llm/stream 瀑布钩子（图片→文字翻译重放）
+└── vision/
+    ├── base.ts       # VisionAdapter 接口
+    ├── openai.ts     # OpenAI 适配器
+    ├── gemini.ts     # Gemini 适配器
+    └── factory.ts    # 适配器工厂
+</code></pre>
+<h2>License</h2>
+<p>MIT</p>

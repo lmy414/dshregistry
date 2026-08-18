@@ -1,0 +1,612 @@
+<h1>@jieai/dsh-plugin-vet — Trust pipeline for DSH plugins</h1>
+<p>English | <a href="https://github.com/wulun811/dsh-plugin-vet/blob/HEAD/README.zh.md">中文</a></p>
+<p><a href="https://www.npmjs.com/package/@jieai/dsh-plugin-vet"><img src="https://img.shields.io/npm/v/@jieai/dsh-plugin-vet" alt="npm version"></a>
+<a href="https://github.com/wulun811/dsh-plugin-vet/blob/HEAD/LICENSE"><img src="https://img.shields.io/badge/License-MIT-yellow.svg" alt="License: MIT"></a>
+<a href="https://github.com/wulun811/dsh-plugin-vet/blob/HEAD/package.json"><img src="https://img.shields.io/badge/node-%3E%3D22.19-339933" alt="Node"></a></p>
+<blockquote>
+<p>Before installing any plugin, run it through dsh-plugin-vet: static rules produce a verdict (deterministic,
+unforgeable), the agent investigates sensitive points and quality issues following the <code>vet-audit-protocol</code>
+skill (no one can substitute for that), and a final scorecard is handed to a human/model to decide.</p>
+<p><strong>Positioning: a monitoring alarm, not an enforcer.</strong> vet only does "check → alarm → advise": checks at
+write time (static scan), watches at run time (runtime guard), and surfaces alarms (scorecard + GUI shield
+status light). <strong>vet never acts on your behalf</strong> — it never auto-uninstalls, never kills processes, never
+rewrites configs; deny mode is an explicit opt-in by the deployer and is not part of the product identity.
+The final disposition is always decided by the user on their own DSH.</p>
+</blockquote>
+<p>@jieai/dsh-plugin-vet is the <strong>trust-layer plugin</strong> in the deepseek-harness ecosystem: it occupies the whole
+<strong>download → scan → audit → score → decide → runtime watch</strong> trust pipeline. The runtime watch ships built-in
+<strong>honeypot lures</strong>: anyone quietly rifling through key files gets caught red-handed (opt-in, <code>honeypot.enabled</code>).
+It does <strong>not</strong> provide a plugin marketplace itself (catalog/distribution).</p>
+<ul>
+<li>📚 Architecture: <a href="https://github.com/wulun811/dsh-plugin-vet/blob/HEAD/docs/ARCHITECTURE.md">docs/ARCHITECTURE.md</a></li>
+<li>🧾 Audit protocol: <a href="https://github.com/wulun811/dsh-plugin-vet/blob/HEAD/AUDIT_PROTOCOL.md">AUDIT_PROTOCOL.md</a></li>
+<li>🛡️ Security policy: <a href="https://github.com/wulun811/dsh-plugin-vet/blob/HEAD/SECURITY.md">SECURITY.md</a></li>
+<li>🤝 Contributing: <a href="https://github.com/wulun811/dsh-plugin-vet/blob/HEAD/CONTRIBUTING.md">CONTRIBUTING.md</a></li>
+</ul>
+<hr>
+<h2>Installation</h2>
+<pre><code>dsh plugin --profile &lt;profile&gt; add @jieai/dsh-plugin-vet
+</code></pre>
+<p>Install-and-activate chain: pnpm install → <code>reconcilePlugins</code> reads <code>dsh.bundle</code> → on next start <code>loadProfile</code>
+resolves the bundle and mounts the plugin. Default configuration is in the Config section below
+(fail-open: reports only, never blocks).</p>
+<p><strong>Local tarball install</strong> (offline or verify-before-release scenario):</p>
+<pre><code>dsh plugin --profile &lt;profile&gt; add ./jieai-dsh-plugin-vet-0.1.4.tgz
+# or unpack directly into the profile's node_modules:
+# tar -xzf jieai-dsh-plugin-vet-0.1.4.tgz -C ~/.dsh/profiles/&lt;profile&gt;/node_modules/@jieai/
+// and add an insert mount entry in the profile's cordis.patch.yml:
+//   - insert:
+//       - id: plugin-vet
+//         name: '@jieai/dsh-plugin-vet'
+//         config:
+//           mode: report
+//           autoScan: true
+</code></pre>
+<blockquote>
+<p>Paths / relative paths / URLs all work (<code>dsh plugin add</code> falls back to pnpm's <code>file:</code> protocol; a local tgz is
+resolved directly).</p>
+<p><strong>First-install time note</strong>: the first <code>dsh plugin add</code> into a large profile can take several minutes — during
+that time pnpm does a full dependency resolution, updates the lockfile for 500+ packages and runs supply-chain
+policy validation over the whole dependency tree (vet itself carries only 2 runtime dependencies; the bulk of
+the time is parsing/validating the profile's existing tree, not vet). Subsequent installs/updates take seconds
+(validation results are reused).</p>
+</blockquote>
+<blockquote>
+<p><strong>Compatibility</strong>: vet targets DSH 0.1.0-rc.6+ (peer range <code>^0.1.0-rc.6</code>). pnpm may warn about unmet peer
+dependencies — this is expected: profile templates set <code>autoInstallPeers: false</code>, and at runtime the packages
+resolve from the DSH install closure (<code>$DSH_HOME/profiles/node_modules</code> fallback layer); you neither need nor
+should install another copy of the cordis family in the profile.</p>
+</blockquote>
+<blockquote>
+<p><strong>Watch scope = the profile vet is installed into.</strong> vet's guards are in-process events
+(<code>internal/plugin</code>) — whichever profile vet is installed into is the one whose loaded plugins it guards.
+For multi-profile deployments, install vet into every profile you want guarded
+(<code>dsh plugin --profile &lt;name&gt; add @jieai/dsh-plugin-vet</code>) and point <code>requireAudit</code> at the matching profile's
+cordis.patch.yml.</p>
+</blockquote>
+<h2>Config (cordis.yml)</h2>
+<table>
+<thead>
+<tr>
+<th>Key</th>
+<th>Default</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>mode</code></td>
+<td><code>report</code></td>
+<td><code>report</code> reports only, never blocks; <code>deny</code> explicitly enables blocking</td>
+</tr>
+<tr>
+<td><code>autoScan</code></td>
+<td><code>true</code></td>
+<td>Automatically static-scan new plugins (<code>internal/plugin</code>)</td>
+</tr>
+<tr>
+<td><code>scannerTimeoutMs</code></td>
+<td><code>15000</code></td>
+<td>Static-scan subprocess timeout</td>
+</tr>
+<tr>
+<td><code>requireAudit</code></td>
+<td><code>false</code></td>
+<td>Audit gate (opt-in): when enabled, loading a new plugin checks <code>~/.dsh/vet/audits/</code> for a health record — without one, <code>report</code> mode logs a yellow <code>audit-required</code> alarm, <code>deny</code> mode blocks. Records are written to disk by hand by the agent following the <code>vet-audit-protocol</code> skill</td>
+</tr>
+<tr>
+<td><code>rules</code></td>
+<td><code>{}</code> (all on)</td>
+<td>Per-rule switches (R1-R12)</td>
+</tr>
+<tr>
+<td><code>denyOn</code></td>
+<td><code>critical</code></td>
+<td>Blocking threshold in <code>mode: deny</code></td>
+</tr>
+<tr>
+<td><code>allowlist</code></td>
+<td><code>[]</code></td>
+<td>Package/plugin-id allowlist (skip scanning)</td>
+</tr>
+<tr>
+<td><code>runtimeGuard</code></td>
+<td><code>off</code></td>
+<td>Runtime guard (performance/stability cost, opt-in): <code>off</code> = disabled; <code>watch</code> enables the T1 sentinel + T2 hooks, <strong>alarm-only</strong></td>
+</tr>
+<tr>
+<td><code>runtimeIntervalMs</code></td>
+<td><code>2000</code></td>
+<td>T1 sentinel /proc sampling interval</td>
+</tr>
+<tr>
+<td><code>runtimeMemLimitMb</code></td>
+<td><code>2048</code></td>
+<td>T1 memory alarm threshold (host VmRSS, over limit → red)</td>
+</tr>
+<tr>
+<td><code>runtimeForkBurstN</code></td>
+<td><code>5</code></td>
+<td>T1 child-process burst alarm threshold (single-round delta → red)</td>
+</tr>
+<tr>
+<td><code>runtimeFdLimit</code></td>
+<td><code>512</code></td>
+<td>T1 file-descriptor alarm threshold (→ yellow)</td>
+</tr>
+<tr>
+<td><code>runtimeGrowthMb</code></td>
+<td><code>256</code></td>
+<td>T1 sustained memory-growth alarm threshold (<strong>net RSS growth over the full window</strong> → yellow, suspected leak; an early-window spike does not count as window-level sustained growth, so no false positive)</td>
+</tr>
+<tr>
+<td><code>runtimeGrowthWindowMs</code></td>
+<td><code>600000</code></td>
+<td>Growth-detection window (default 10 minutes)</td>
+</tr>
+<tr>
+<td><code>honeypot.enabled</code></td>
+<td><code>false</code></td>
+<td>Honeypot lures (needs <code>runtimeGuard: watch</code>): plants fake key lures in <code>honeypot.dir</code>; T2 reports touches (read/write/delete) of lure paths as a separate <code>honeypot</code> alarm class. Directory/file names and contents carry no honeypot keywords (anti-honeypot), default location <code>~/.dsh/.local</code>, lure values are well-formed but invalid fake credentials</td>
+</tr>
+<tr>
+<td><code>honeypot.dir</code></td>
+<td><code>''</code></td>
+<td>Lure directory; empty = <code>$HOME/.dsh/.local</code></td>
+</tr>
+<tr>
+<td><code>osvCheck</code></td>
+<td><code>true</code></td>
+<td>Query Google OSV for known vulnerabilities when scanning package.json (<strong>exact-version queries only</strong>: ranges (<code>*</code>/<code>&gt;=</code>/<code>^</code>/<code>~</code>) and version-less main packages are skipped, P3-1/P3-3 — avoids stale full-history false positives; since round-7 ranges are no longer stripped to query as exact lower bounds). Verified targets = the plugin itself + direct dependencies (cap 8, official <code>@deepseek-ai/*</code> packages skipped, P3-10); transitive trees exceed the OSV v1 scope and the scan budget. Default on sends package names to api.osv.dev; network failure degrades silently. Set false if privacy-sensitive</td>
+</tr>
+</tbody></table>
+<p>Official <code>@deepseek-ai/*</code> packages are exempt by default (built-in trust).</p>
+<h2>Tools</h2>
+<ul>
+<li><strong><code>scan_plugin</code></strong> — deterministic static scan: <code>target</code> = <code>dynamic-code</code> (source string) / <code>package</code> (package
+directory) / <code>file</code> (single file). Returns a scorecard (verdict + staticScore + findings). The verdict is
+produced only by static rules.</li>
+<li><strong><code>vet-audit-protocol</code> (skill)</strong> — audit-process protocol (<code>AUDIT_PROTOCOL.md</code>): the agent audits a new plugin
+in preset steps — scan_plugin static criteria (incl. R12 Cordis/DSH contract) → read manifest/source →
+verify each finding → proactively dig deeper (network/files/processes/credentials/library semantics) →
+<strong>contract &amp; code-quality audit</strong> (step 4.5: entry/Config-schema consistency, error handling/synchronous
+blocking/resource leaks/async correctness and other "badly written" issues — statically clean ≠ worth
+installing) → hand-write a health record to <code>~/.dsh/vet/audits/&lt;plugin&gt;-&lt;version&gt;-&lt;ts&gt;.md</code> using the system
+write capability. vet ships no audit tooling and does not investigate for the agent — it only provides the
+criteria and the on-disk convention.</li>
+</ul>
+<h2>Automatic behavior</h2>
+<ul>
+<li><strong><code>internal/plugin</code> auto-scan</strong> (<code>autoScan: true</code>): newly installed third-party npm packages are
+static-scanned on load; <code>deny</code> mode + verdict ≥ <code>denyOn</code> → load rolled back.</li>
+<li><strong>Audit gate</strong> (<code>requireAudit: true</code>): loading a third-party plugin without a health record — <code>report</code> mode
+logs a yellow <code>audit-required</code> alarm (enters the /vet/status.json alarm list, plugin loads normally); <code>deny</code>
+mode rolls back the load (references <code>vet-audit-protocol</code> as a prompt to audit first). <strong>Records match by
+exact version</strong> (P-1): after a plugin upgrade the old version's record no longer authorizes the new version —
+re-audit is required to clear the alarm/block.</li>
+<li><strong><code>tools/execute</code> interception</strong>: <code>cordis_define</code> / <code>run_code</code> / <code>workflow</code> are scanned before execution
+(<code>cordis_run</code>'s real schema carries no code payload, so the guard slot stays dormant — P3-11 synced);
+<code>report</code> mode prefixes non-clean results with <code>VET:</code> (clean executions don't pollute machine-readable
+output), <code>deny</code> mode blocks outright (isError).</li>
+<li><strong>Runtime guard (<code>runtimeGuard: watch</code>)</strong> — alarm-only:<ul>
+<li><strong>T1 sentinel</strong>: a sidecar subprocess reads the host /proc every <code>runtimeIntervalMs</code>
+(VmRSS / child-process count / fd count) and streams alarm JSON lines back to the host → shield turns
+yellow/red.</li>
+<li><strong>T2 hooks</strong>: in-process wrappers around fs / child_process (incl. fs.promises); dangerous operations
+(sensitive-path writes/deletes, key-file reads, subprocesses with shell/download/exfiltration keywords,
+honeypot-lure touches, <code>~/.dsh</code> config-root reconnaissance) are attributed via the stack to the plugin
+package name before alarming; official packages get full-class noise reduction via attribution (capability
+grant — official packages are the platform itself; their high-frequency <code>~/.dsh</code> session/config/storage
+reads don't spam; third parties can't forge attribution). <strong>Never blocks a call.</strong> Self-harm exemptions
+(fixed after real-world false positives):<ul>
+<li><strong>node_modules package-directory exemption</strong>: package names/inner files are public artifacts — package
+names containing credential/secret words are normal ecosystem (<code>@aws-sdk/credential-provider-*</code>,
+<code>@deepseek-ai/dsh-credentials-local</code>, etc.), and both host module resolution (require.resolve's internal
+realpathSync/stat of inner package.json) and vet's own scan reads touch them at high frequency, so they
+no longer false-positive as fs-probe; path segments before node_modules still judged normally
+(<code>~/.ssh/node_modules/x</code> still hits .ssh), and write/delete of system roots (/usr etc.) still alarms.</li>
+<li><strong>Attribution excludes vet itself</strong>: the wrapper frame is always the top of the alarm stack, and the vet
+root never participates in attribution mapping — host/unowned alarms are no longer pinned on vet (the
+alarm still fires, attributed to the real caller).</li>
+<li>Toolchain temp artifacts (tsc <code>&lt;src&gt;.&lt;pid&gt;.&lt;uuid&gt;.tmpdir</code>, <code>*.tmp</code>, <code>*.temp</code>, <code>*.swp</code>, etc.) are
+auto-exempt — the secrets/credentials in their names are just source filenames being compiled; deleting
+them is cleanup, not destruction; parent segments still judged normally (<code>~/.ssh/config.bak</code> still
+alarms).</li>
+</ul>
+</li>
+</ul>
+</li>
+<li><strong>GUI shield</strong>: a browser half registers into <code>conversation.session.header.actions</code> and polls
+/vet/status.json to show a green/yellow/red light + alarm count. Activation requires a <code>dsh web</code> restart
+(client-modules only scans the <code>dsh.client</code> declaration at startup).<ul>
+<li>Interaction: <strong>clickable</strong> — clicking expands the alarm panel (<strong>live metrics</strong>: memory/CPU/I-O/
+child-process/fd; <strong>guard status</strong>: when off, one click writes a <code>runtimeGuard: watch</code> config (takes
+effect on restart); <strong>alarm list</strong> with severity/attribution/<strong>per-item advice</strong>; recent-scan echo,
+refresh, updated time), outside clicks close it; when alarms exist a count badge appears next to the
+shield (green/yellow/red theme color, light/dark adaptive).</li>
+<li><strong>Per-item dismiss</strong>: each alarm can be "dismissed" — display-only (no longer counts toward shield level
+or count), the record is kept and can be "restored"; a dismissed alarm auto-expires once the alarm stops,
+so a recurrence is visible again (and can be dismissed again). Dismiss state shares the alarm store's
+lifecycle (resets on restart). Auth boundary (P3-12 recorded): dismiss/restore only do same-origin
+validation (alarm-only display-layer risk — a same-origin page script could hide alarms, but records
+aren't deleted and nothing else is affected; acceptable within the system).</li>
+<li><strong>Display caps</strong>: the panel shows the latest 8 alarms; the store is a ring buffer capped at 20, deduped
+per id within 60s, 24h TTL (sustained triggers naturally renew) — 100 alarms are not displayed in full,
+and needn't be (new alarms push out the oldest). Recent-scan echo (suspicious → yellow) also expires on
+the 24h TTL (P3-2: one suspicious scan no longer turns the shield permanently yellow; sustained scanning
+renews naturally).</li>
+</ul>
+</li>
+</ul>
+<h2>Static rule table (R1-R14)</h2>
+<table>
+<thead>
+<tr>
+<th>ID</th>
+<th>Name</th>
+<th>Default level</th>
+<th>Scope</th>
+<th>Determinism</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>R1</td>
+<td>constructor-chain escape</td>
+<td>critical</td>
+<td>code + files</td>
+<td>certain/likely</td>
+</tr>
+<tr>
+<td>R2</td>
+<td>Dynamic execution (eval/Function/import/require)</td>
+<td>high (files) / medium (code; bin entries drop to medium)</td>
+<td>both</td>
+<td>certain/likely</td>
+</tr>
+<tr>
+<td>R3</td>
+<td>Direct process access (runtime-graded; read-only members/generic/bin entries/app-type packages → info)</td>
+<td>critical (host) / high (sandbox)</td>
+<td>both</td>
+<td>certain</td>
+</tr>
+<tr>
+<td>R4</td>
+<td>Host closure capture (agent/TextEncoder…) + host-global prototype pollution</td>
+<td>critical (code) / high (files, independent of targetKind)</td>
+<td>both</td>
+<td>certain/likely</td>
+</tr>
+<tr>
+<td>R5</td>
+<td>ctx-escape attempt signal (withheld members/undeclared services; <code>ctx.logger</code> and other officially injected services are allowlisted)</td>
+<td>medium</td>
+<td>code only</td>
+<td>likely</td>
+</tr>
+<tr>
+<td>R6</td>
+<td>String coarse-scan fallback (obfuscation signals need combined evidence with dynamic execution)</td>
+<td>info</td>
+<td>both</td>
+<td>heuristic</td>
+</tr>
+<tr>
+<td>R7</td>
+<td>Hardcoded secrets</td>
+<td>high</td>
+<td>both</td>
+<td>likely</td>
+</tr>
+<tr>
+<td>R9</td>
+<td>Resource safety (unbounded allocation / exit-less synchronous loops / spawn-in-loop / ReDoS / non-terminating recursion / growth patterns in loops)</td>
+<td>high (allocation/dead-loop/fork) / medium (ReDoS/recursion/Map.set) / info (resident loops/+=/Promise.all)</td>
+<td>both</td>
+<td>certain/likely/heuristic</td>
+</tr>
+<tr>
+<td>R10</td>
+<td>Supply chain (package.json install hooks / dependency manifest)</td>
+<td>high (install hooks) / info (dependency manifest)</td>
+<td>files</td>
+<td>likely/heuristic</td>
+</tr>
+<tr>
+<td>R11</td>
+<td>Destructive file operations (fs deletes / sensitive-path reads-writes)</td>
+<td>high (sensitive paths) / medium (deletes)</td>
+<td>both</td>
+<td>likely</td>
+</tr>
+<tr>
+<td>R12</td>
+<td>Cordis/DSH contract (entry file / bundle-patch declaration / name / engines.node)</td>
+<td>high (missing patch / missing entry) / medium (no entry / missing name) / info (low node version)</td>
+<td>files</td>
+<td>certain/likely</td>
+</tr>
+<tr>
+<td>R13</td>
+<td>Hardcoded network exfiltration sinks (Discord/Telegram/Slack webhooks, cloud-metadata endpoints, .onion) in string literals</td>
+<td>high</td>
+<td>both</td>
+<td>likely</td>
+</tr>
+<tr>
+<td>R14</td>
+<td>Download-and-exec primitives in shipped non-JS scripts (.sh/.bash/.ps1/.cmd/.bat: curl</td>
+<td>sh, encoded PowerShell, IEX, certutil…)</td>
+<td>high (plugin) / info (generic)</td>
+<td>files</td>
+</tr>
+</tbody></table>
+<h2>Scoring model</h2>
+<p><code>staticScore = max(0, 100 - Σ(severity weight × hits × confidence coefficient))</code></p>
+<p>verdict (the single authoritative judgment; heuristics never upgrade): critical ≥ 1 → <code>critical</code>; otherwise
+high ≥ 1 → <code>suspicious</code>; otherwise → <code>clean</code>. <strong>The verdict is produced only by the static layer</strong>: staticScore
+and verdict are shown separately and never merged into a single total.</p>
+<h2>Capability boundary (honest list)</h2>
+<blockquote>
+<p>Static scanning is a "speed bump + forensics layer", not a security boundary. The following is split by
+<strong>impact on the verdict</strong>, and the forms it <strong>explicitly does not detect</strong> are listed truthfully (all
+empirically verified).</p>
+</blockquote>
+<h3>Detected — verdict-level (changes the verdict)</h3>
+<table>
+<thead>
+<tr>
+<th>Rule</th>
+<th>Problem class</th>
+<th>Hit → verdict</th>
+<th>Verified</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>R1</td>
+<td>Constructor-chain escape: <code>x.constructor("return process")</code> / <code>x["constructor"]("return " + "process")</code> / <code>new (globalThis.constructor.constructor)("return process")()</code> (dot/bracket-access + new forms; string args statically evaluable: literals/templates/concatenation/const bindings; new supports const-alias tracking)</td>
+<td>critical</td>
+<td>matrix + multi-file ✓</td>
+</tr>
+<tr>
+<td>R2</td>
+<td>Dynamic execution: <code>eval()</code> / <code>Function()</code> / <code>new Function</code> / <code>new AsyncFunction</code> (incl. parenthesized <code>new (Function)(...)</code>; escape-string args → critical) / <code>(async)=&gt;{}.constructor</code> capture (round-7.2: <code>new X.constructor</code> reported only when the base is a function literal — <code>new n.constructor(n.type, n)</code> object-clone no longer false-positives) / <code>vm.runInContext</code>/<code>runInNewContext</code> / dynamic <code>import()</code> / <code>require()</code></td>
+<td>high (files) / medium (code, escape-string → critical); bin entries judged as generic code, drop to medium</td>
+<td>matrix + round-7/7.2 regression ✓</td>
+</tr>
+<tr>
+<td>R3</td>
+<td>Direct process access: <code>getBuiltinModule</code>/<code>mainModule</code>/<code>module</code>/<code>exit</code> (incl. <code>reallyExit</code>) → critical; side-effect members (<code>kill</code>/<code>abort</code>/<code>chdir</code>/<code>umask</code>/<code>setuid</code>/<code>dlopen</code>/<code>binding</code>, etc.) and unknown members → high; <strong>read-only members (round-7.1)</strong>: <code>env</code>/<code>cwd</code>/<code>platform</code>/<code>pid</code>/<code>argv</code>/<code>execPath</code>/<code>stdin</code>/<code>stdout</code>/<code>stderr</code>/<code>nextTick</code>/<code>on</code>, etc. → info capability surface (reading cwd/env/pid isn't an escape channel; no-bin MCP/tool plugins like bridges no longer get hurt); <code>runtime='sandbox'</code> caps at high; shape degradation: generic packages / bin entry files / app-type packages → info</td>
+<td>critical / high / info</td>
+<td>matrix + round-7.1 regression ✓</td>
+</tr>
+<tr>
+<td>R4</td>
+<td>Host-closure capture: reading <code>.constructor</code> of agent/parallel/pipeline/phase/log/TextEncoder/TextDecoder/btoa/atob or feeding <code>Object.getPrototypeOf</code> (code scenario); host-global prototype pollution: <code>&lt;builtin&gt;.prototype.&lt;member&gt; = ...</code> override assignments and <code>Object.defineProperty(&lt;builtin&gt;.prototype, ...)</code> (Object/Array/String/Function/TextEncoder/URL/Buffer and 40+ builtins, round-7)</td>
+<td>critical (code) / high (files, since round-7.1 independent of targetKind — pollution semantics don't distinguish plugins from generic packages, generic no longer drops to info)</td>
+<td>matrix + round-7 regression ✓</td>
+</tr>
+<tr>
+<td>R7</td>
+<td>Hardcoded secrets: <code>sk-</code> / <code>AKIA</code> / <code>AIza</code> / <code>gh[pousr]_</code> / <code>xox[baprs]-</code> / env-var assignment / URL-embedded keys (placeholders excluded)</td>
+<td>high → suspicious</td>
+<td>matrix ✓</td>
+</tr>
+<tr>
+<td>R9</td>
+<td>Resource safety: <code>new Array(2**31)</code> / <code>Buffer.alloc(1GB)</code> unbounded allocation (≥1e8), <code>while(true)</code>/<code>for(;;)</code> exit-less <strong>synchronous</strong> loops (freezes the host; round-7.2: a labeled break whose label wraps the loop — <code>outer: for(;;){ ... break outer }</code> — counts as an exit signal), <code>spawn</code>/<code>exec</code>/<code>fork</code>/<code>new Worker</code> in exit-less loops (fork bomb)</td>
+<td>high → suspicious; ReDoS nested quantifiers <code>(a+)+</code>-class and overlapping alternation branches `(a</td>
+<td>aa)+<code>→ medium (first-char-disjoint branches like</code>(?:[^']</td>
+</tr>
+<tr>
+<td>R10</td>
+<td>Supply chain: <code>preinstall</code>/<code>install</code>/<code>postinstall</code>/<code>uninstall</code> hooks in package.json scripts (arbitrary code execution at install time) → high; dependency manifest → info (known-vulnerability check: OSV exact-version query, osvCheck can be disabled)</td>
+<td>high → suspicious (install hooks)</td>
+<td>matrix ✓</td>
+</tr>
+<tr>
+<td>R11</td>
+<td>Destructive file operations: <code>fs.unlink/rm/rmdir(+Sync)</code> deleting sensitive paths (/etc/root/.ssh etc.) → high, plain deletes → medium; <code>fs.writeFile</code> etc. writing sensitive paths → high; <code>fs.readdir</code> traversing sensitive directories → medium</td>
+<td>high → suspicious (sensitive paths); medium not into verdict</td>
+<td>matrix ✓</td>
+</tr>
+<tr>
+<td>R12</td>
+<td>Cordis/DSH contract: missing declared <code>dsh.bundle.patch</code> file → high; no entry (no main/exports["."] and no root index.js) → medium; declared entry file missing → high; plugin-intent package missing name → medium; <code>engines.node</code> major &lt; 22 → info</td>
+<td>high → suspicious (declared mount point/entry missing means guaranteed failure); medium/info not into verdict</td>
+<td>matrix ✓</td>
+</tr>
+<tr>
+<td>R13</td>
+<td>Network exfil: hardcoded Discord/Telegram/Slack webhooks, cloud-metadata endpoints (169.254.169.254 / metadata.*.internal / 100.100.100.200) and .onion destinations in string literals</td>
+<td>high → suspicious</td>
+<td>matrix + R13 tests ✓</td>
+</tr>
+<tr>
+<td>R14</td>
+<td>Non-JS scripts: curl</td>
+<td>sh, wget</td>
+<td>sh, PowerShell download-pipe / -enc / IEX, certutil/bitsadmin/mshta/regsvr32/rundll32 in .sh/.bash/.ps1/.cmd/.bat (generic → info)</td>
+</tr>
+</tbody></table>
+<h3>Detected — advisory level (downgrades score only, never changes the verdict)</h3>
+<table>
+<thead>
+<tr>
+<th>Rule</th>
+<th>Problem class</th>
+<th>Note</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>R5</td>
+<td>ctx-escape attempt signal: accessing sandbox-withheld framework members / undeclared services (<code>ctx.plugin</code>, etc.)</td>
+<td>code scenario only; medium</td>
+</tr>
+<tr>
+<td>R6</td>
+<td>String coarse scan: concatenated escape features, <code>getBuiltinModule</code>/<code>child_process</code>/dangerous-require module references, obfuscation features (<code>String.fromCharCode</code>/<code>Buffer.from(base64)</code>/<code>atob(</code>/<code>charCodeAt</code> — since round-7 reported only when combined with an in-file dynamic-execution signal (eval/new Function/vm etc.); routine byte handling for terminal protocols/encoding no longer false-positives)</td>
+<td>info/heuristic</td>
+</tr>
+<tr>
+<td>R8</td>
+<td>Scan timeout / file-too-large skip</td>
+<td>info meta-rule</td>
+</tr>
+</tbody></table>
+<h3>Runtime monitoring (when <code>runtimeGuard: watch</code>) — alarm only</h3>
+<table>
+<thead>
+<tr>
+<th>Layer</th>
+<th>Mechanism</th>
+<th>Catches</th>
+<th>Limits</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>T1 sentinel</td>
+<td>Subprocess polling host /proc</td>
+<td>Memory bomb (&gt;memLimit), <strong>sustained memory growth (leak; net window growth alarms by multiple)</strong>, fork bomb (child-process burst), fd surge</td>
+<td>Granularity = host-global (plugins share the process; can't attribute to a plugin)</td>
+</tr>
+<tr>
+<td>T2 hooks</td>
+<td>In-process wrapping of fs/child_process (incl. fs.promises)</td>
+<td>Sensitive-path writes/deletes (/etc, ~/.ssh, .env…), key-file reads, spawn with shell/download-exfiltration keywords</td>
+<td>Stack attribution best-effort; per-call wrapper overhead (I/O-heavy &lt;5%, hot paths 10-20% range)</td>
+</tr>
+<tr>
+<td>Shield</td>
+<td>Browser <code>conversation.session.header.actions</code> + /vet/status.json</td>
+<td>Green/yellow/red light + alarm count</td>
+<td>Requires <code>dsh web</code> restart to activate</td>
+</tr>
+</tbody></table>
+<h3>Explicitly not detected (empirically verified)</h3>
+<table>
+<thead>
+<tr>
+<th>Form</th>
+<th>Empirical result</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>Indirect references: alias function <code>const f = Function; f(...)</code>, <code>process["getBuiltinModule"]</code>, <code>globalThis.process</code>, indirect eval <code>(0, eval)</code></td>
+<td>R6 info or zero findings, verdict=clean</td>
+</tr>
+<tr>
+<td>Runtime/externally constructed payloads: base64 strings, hex/charCode assembly, reading code from network/env/args, self-modifying code</td>
+<td>base64 constructor string tested → <strong>zero findings</strong></td>
+</tr>
+<tr>
+<td>Non-source files: <code>.jsx</code>/<code>.tsx</code>/<code>.vue</code>/<code>.json</code>/binaries/wasm</td>
+<td>Not in the scan surface; shell/PowerShell/batch scripts (.sh/.bash/.ps1/.cmd/.bat) are covered by R14 (download-and-exec)</td>
+</tr>
+<tr>
+<td>Dependency chain/supply chain: import/require graph, dependency-version vulnerabilities, package.json scripts/install hooks, licenses, author reputation</td>
+<td>Not parsed</td>
+</tr>
+<tr>
+<td>Runtime behavior: network exfiltration, dynamic prototype-pollution chains, dead loops/resource exhaustion, timing, permission abuse</td>
+<td>No dataflow/behavior analysis; static <code>&lt;builtin&gt;.prototype</code> override assignments are caught by R4 (round-7)</td>
+</tr>
+<tr>
+<td>Semantic knowledge: the actual services a plugin injects, <code>process</code> in bundler polyfills, shadowing boundary</td>
+<td>R5 only recognizes 4 variable names; shadowing check is a v1 heuristic (undercounts)</td>
+</tr>
+<tr>
+<td>Legitimate <code>process</code> use by host tool packages (<code>process.env</code> config reads, <code>process.stdin/stdout</code> protocol, <code>process.execPath</code> spawn)</td>
+<td>Resolved: targetKind grading — non-DSH plugin packages/official packages (generic) downgrade R3/R2/R10/R9 dead-loop to capability-surface/advice (info/medium), not into verdict; DSH plugin packages stay strict. round-7 adds shape downgrades: app-type packages (package.json declares bin) and bin entry files are likewise downgraded to capability surface; round-7.1 read-only member classification: pure read-only members (<code>cwd</code>/<code>env</code>/<code>platform</code>/<code>pid</code>, etc.) drop to info even in plugin mode (no-bin MCP/tool plugins like bridges no longer hurt); side-effect/escape members (<code>kill</code>/<code>exit</code>, etc.) stay high/critical. 195 official packages tested all clean</td>
+</tr>
+</tbody></table>
+<h2>Trust boundaries</h2>
+<ol>
+<li><strong>The verdict is produced only by the deterministic static layer</strong> — rules are regex/AST judgments, not
+spoofable by prompt injection.</li>
+<li><strong>The static layer is physically isolated from plugin code</strong> — the scanner is a separate process; the AST is
+read-only and never eval'd.</li>
+<li><strong>Review goes through the agent protocol</strong> — the agent follows the vet-audit-protocol skill steps (static
+criteria first, sensitive points dug into one by one); the verdict is unaffected by the review step.</li>
+<li><strong>No single merged score</strong> — merging the verdict with subjective assessment is forbidden, to avoid polluting
+the verdict boundary.</li>
+<li><strong>This product is not a security boundary</strong> — positioned as a "speed bump + forensics layer" (bypassable
+forms in Known Limitations 1 below, aligned with DSH's official stance).</li>
+<li><strong>Fail-open by default</strong> — default <code>mode: report</code>; <code>deny</code> is explicitly enabled by the deployer.</li>
+<li><strong>Alarm-only</strong> — the runtime guard only watches, never kills; vet's automatic behavior (deny interception)
+exists only in the explicitly enabled opt-in mode. Alarms only carry advice; disposition is always left to
+the user on their DSH.</li>
+</ol>
+<h2>Known Limitations</h2>
+<ol>
+<li><strong>Static scanning is not a security boundary</strong>: obfuscated/encoded/dynamically generated code can bypass the
+AST rules; R6 only provides a "suspicious" signal.
+1b. <strong>Source enumeration limits</strong>: <code>internal/plugin</code> auto-scan only recursively collects ≤6 levels deep,
+non-hidden (non-dot-prefixed) .js/.ts/.mjs/.cjs files — deep or hidden directories are silently unscanned
+(no warning); use scan_plugin(target=package) manually for a full directory scan.</li>
+<li><strong>Agent review can be prompt-injected</strong>: the verdict never comes from the review step, but the agent may
+miss things — the confidence field lets users know.</li>
+<li><strong><code>internal/plugin</code> guard doesn't cover runtime dynamic-mount escapes</strong>: the vm path is intercepted at the
+call layer by the <code>tools/execute</code> guard.</li>
+<li><strong>R5 is code-only</strong>: ctx access in files scenarios isn't reported by default (high false-positive rate).</li>
+<li><strong>Scan duration</strong>: large plugin packages may time out and skip (R8 info); agent review proceeds per the
+vet-audit-protocol steps.</li>
+<li><strong>The verdict is the static layer's deterministic judgment</strong>; the agent's subjective assessment is recorded
+in the health record and doesn't constitute a security guarantee.</li>
+<li><strong>/vet/status.json has no auth</strong>: the shield's polling needs anonymous GET, and the route itself isn't
+authenticated — if dsh web binds to a non-loopback address, LAN clients can read scan conclusions/alarm
+targets. vet is an alarm-only observer and won't overreach into access control; if you care, keep loopback
+binding or trust your network (the POST guard toggle already has same-origin validation; no-Origin requests
+are rejected).</li>
+<li><strong><code>@deepseek-ai/*</code> is trusted by default</strong>: if the official ecosystem is ever compromised, tighten this
+(v1 keeps the switch). scan_plugin judges official packages as generic (capability-surface downgrade) —
+an official-package supply-chain attack would let static downgrade mask process access (recorded, P-5;
+official packages are the platform itself, same policy as the internal/plugin official exemption). vet's own
+exemption is likewise narrowed (P-3): it now matches by name AND verifies via realpath that the target is
+the current vet instance — a same-name impostor package (file: install has no registry validation) is judged
+by the strictest plugin rules.</li>
+<li><strong>R10's known-vulnerability check depends on an OSV network query</strong>: on by default, sending "package
+name + exact version" to api.osv.dev (disclosed in the README config section; set <code>osvCheck: false</code> if you
+care); network failure/timeout degrades silently to skip (never false-blocks); only exact versions are
+queried — <code>*</code>/<code>&gt;=</code>/<code>^</code>/<code>~</code> ranges and version-less main packages are skipped (P3-1/P3-3; round-7 fix:
+<code>^</code>/<code>~</code> no longer strip their prefix to query as exact lower bounds — the lower bound being affected while
+the actually installed version is already fixed would false-positive). Indirect transitive dependencies are
+not in the check surface.</li>
+<li><strong>R11 only recognizes <code>fs.*</code> forms</strong>: destructured/aliased calls (<code>const { unlinkSync } = require('fs')</code>)
+and runtime paths are missed (empirically recorded; a static boundary).</li>
+<li><strong>T1/T2 are "security cameras", not "vaults"</strong>: they catch obvious mischief (memory/fork bombs,
+sensitive-path operations, third-party spawn) but not worker threads/native plugins/low-traffic slow
+exfiltration; T2 doesn't cover ESM named-import snapshots, <code>process.binding</code>, and other side channels.</li>
+<li><strong>T2 attribution &amp; noise reduction</strong>: stack attribution is best-effort (shared services/timers across
+plugins can mis-attribute); official-package spawn is not alarmed by default (capability grant).</li>
+<li><strong>Shield activation requires a <code>dsh web</code> restart</strong>: client-modules scans the <code>dsh.client</code> declaration at
+startup; the browser won't load the shield before the restart, but the /vet/status.json endpoint and the
+runtime guard (host side) take effect on restart.</li>
+<li><strong>Runtime guard is off by default</strong> (<code>runtimeGuard: 'off'</code>): wrapping fs/child_process carries performance
+and stability costs; opt-in.</li>
+<li><strong><code>process.kill</code> stays high (intentional, round-7.1)</strong>: kill is a side-effect member and doesn't degrade
+with the read-only members — but a plugin killing its own spawned child (MCP/bridge-style) is a normal
+capability surface (dsh-bridges tested: 98/134 cleared; the remaining highs are all process.kill in
+run.js/util.js). Statically distinguishing <code>process.kill(child.pid)</code> (pid from this package's own spawn
+return) from arbitrary pids needs dataflow analysis — high cost, low benefit; kept as-is, to be ruled out
+manually by the agent during vet-audit-protocol review (conclusion recorded in the health record).</li>
+<li><strong>Platform support (Linux-first, graceful degradation elsewhere)</strong>: the static scan layer (scanner-bin /
+scan_plugin / R1-R12 / OSV), T2 runtime hooks, honeypot, GUI shield and audit protocol are all pure JS and
+run cross-platform (macOS/Windows). <strong>The T1 sentinel is Linux-only</strong>: it depends on /proc for
+VmRSS/children/fd; on non-Linux the sentinel exits gracefully and the metrics panel falls back to -1/0 (no
+errors, no log spam, by design). T2 sensitive paths match by path-segment name (backslashes are normalized,
+so <code>.ssh</code>/<code>.env</code>/<code>credentials</code> etc. hit on Windows too), but the "system-root prefix" (/etc /usr /var) is
+POSIX-shaped: on Windows, write/delete of <code>C:\Windows\System32</code>-style paths bypasses the system-root
+judgment (segment-name/keyword checks still apply); macOS has /etc /usr /var, so T2 is fully functional.
+Consistent with DSH current Linux-first adaptation state.</li>
+</ol>
+<h2>Development</h2>
+<pre><code>npm run build       # scanner-bin + src compiled to lib/ + client bundle
+npm run typecheck   # full tsc --noEmit
+npm test            # build + vitest (250 cases, incl. coverage thresholds)
+npx vitest run --coverage   # coverage report (lines/functions &gt;= 70%, branches &gt;= 50%)
+</code></pre>
+<p>Layout: <code>scanner-bin/</code> static engine (separate process); <code>src/</code> plugin body (tools/guards/audit/report/guard);
+<code>src/client/</code> GUI shield; <code>test/</code> fixtures + unit tests + adversarial matrix. Architecture in
+<code>docs/ARCHITECTURE.md</code>.</p>
+<h2>License</h2>
+<p><a href="https://github.com/wulun811/dsh-plugin-vet/blob/HEAD/LICENSE">MIT</a>.</p>

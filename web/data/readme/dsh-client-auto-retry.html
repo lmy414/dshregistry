@@ -1,0 +1,221 @@
+<h1>@frog755/dsh-client-auto-retry</h1>
+<blockquote>
+<p>DSH 客户端插件：检测到回合被中断 / 出错 / 超长（max-tokens）时，自动发送「继续」重试。
+只做自动重试，<strong>不做</strong>模型 / provider 切换。自带设置卡片。</p>
+</blockquote>
+<p>English version: <a href="https://github.com/Frog755/dsh-client-auto-retry/blob/HEAD/README-EN.md">README-EN.md</a></p>
+<p align="center">
+  <img src="https://raw.githubusercontent.com/Frog755/dsh-client-auto-retry/HEAD/assets/demo.svg" alt="dsh-client-auto-retry 工作流程">
+</p>
+
+<hr>
+<h2>它能做什么</h2>
+<p>DeepSeek Harness（DSH）的回合（turn）偶尔会因为网络抖动、provider 报错、超时、
+或输出达到 token 上限而中断。大多数情况下模型其实已经跑完大部分内容，只要再发一句
+「继续」就能接着完成，完全不需要人工介入、也不需要切换模型。</p>
+<p>这个插件就是干这件事的：</p>
+<ol>
+<li>监听会话事件流（<code>api.events.mux</code>）；</li>
+<li>发现 <code>turn/end</code> 的 <code>reason.kind</code> 属于 <code>error</code> / <code>interrupted</code> / <code>max-tokens</code> 时，
+等一个宽限期（默认 5 秒，给 host 留出重连/恢复的时间）；</li>
+<li>宽限期后向该会话自动发送「继续」（可配置文本）；</li>
+<li>带冷却期、连续次数上限、启动时扫描最近被中断的会话等防护措施，避免失控循环。</li>
+</ol>
+<h2>安装</h2>
+<h3>方式 A：通过 npm 安装（推荐）</h3>
+<p>在 DSH 的 profile 目录（例如 <code>~/.dsh/profiles/web</code>）里执行：</p>
+<pre><code>pnpm add @frog755/dsh-client-auto-retry
+</code></pre>
+<p>然后编辑该目录下的 <code>package.json</code>，把 <code>@frog755/dsh-client-auto-retry</code> 加入 <code>dsh.profile.bundles</code>
+（插件自带的 <code>cordis.patch.yml</code> 会以 bundle 层的形式把 <code>auto-retry</code> 行插入插件清单）：</p>
+<pre><code>{
+  "dependencies": {
+    "@frog755/dsh-client-auto-retry": "^0.3.0"
+  },
+  "dsh": {
+    "profile": {
+      "bundles": [
+        "@deepseek-ai/dsh-base",
+        "@deepseek-ai/dsh-web-app",
+        // ... 其他 bundle ...
+        "@frog755/dsh-client-auto-retry"
+      ]
+    }
+  }
+}
+</code></pre>
+<p>然后：</p>
+<pre><code>pnpm install
+</code></pre>
+<p><strong>重启 DeepSeek Harness</strong>（Host 侧插件只在进程内加载一次），再刷新浏览器页面即可。</p>
+<h3>方式 B：本地 link 开发调试</h3>
+<pre><code>{
+  "dependencies": {
+    "@frog755/dsh-client-auto-retry": "link:C:/Users/frog/.dsh/projects/dsh-client-auto-retry"
+  }
+}
+</code></pre>
+<p>改完 <code>lib/</code> 下的文件后刷新页面即可（Client 侧即时生效）；Host 侧 <code>lib/index.js</code>
+的改动需要重启。</p>
+<h2>设置项</h2>
+<p>设置入口：<strong>设置 → 通用 → 断联自动重试</strong>。所有项都实时生效（<code>applies: "live"</code>）。</p>
+<table>
+<thead>
+<tr>
+<th>字段</th>
+<th>默认值</th>
+<th>含义</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>graceMs</code></td>
+<td><code>5000</code></td>
+<td>宽限期：中断后等多少毫秒再自动发送「继续」</td>
+</tr>
+<tr>
+<td><code>cooldownMs</code></td>
+<td><code>20000</code></td>
+<td>冷却期：同一会话两次自动继续的最小间隔</td>
+</tr>
+<tr>
+<td><code>maxConsecutive</code></td>
+<td><code>5</code></td>
+<td>最多连续自动继续次数，超过后停下等人工介入</td>
+</tr>
+<tr>
+<td><code>continueText</code></td>
+<td><code>继续</code></td>
+<td>自动发送的文本内容</td>
+</tr>
+<tr>
+<td><code>scanOnBoot</code></td>
+<td><code>true</code></td>
+<td>页面加载时扫描最近被中断的会话并恢复</td>
+</tr>
+<tr>
+<td><code>freshMs</code></td>
+<td><code>900000</code></td>
+<td>扫描窗口：只恢复此时间段内被中断的会话（毫秒）</td>
+</tr>
+<tr>
+<td><code>verbose</code></td>
+<td><code>true</code></td>
+<td>在浏览器控制台输出 <code>[auto-retry]</code> 调试日志</td>
+</tr>
+</tbody></table>
+<h2>工作原理</h2>
+<pre><code>flowchart LR
+    A[api.events.mux 事件流] --&gt; B{turn/end?}
+    B -- "error / interrupted / max-tokens" --&gt; C[schedule: 宽限期 graceMs]
+    B -- "completed / aborted / blocked" --&gt; D[重置连续计数]
+    C --&gt; E{冷却期已过? 未超上限?}
+    E -- 否 --&gt; F[跳过, 等人工]
+    E -- 是 --&gt; G[fire: sessions.prompt 发送「继续」]
+    G --&gt; H[连续次数 +1]
+    A --&gt; I[user/message 到来] --&gt; D
+    A --&gt; J[scanOnBoot: 启动扫描最近中断会话] --&gt; C
+</code></pre>
+<p>核心逻辑都在 <code>lib/client.js</code> 的 <code>AutoRetryRunner</code> 里；<code>lib/index.js</code>（Host 半边）
+只负责注册设置 schema。</p>
+<h2>兼容性说明（重点）</h2>
+<blockquote>
+<p>📖 详细版见 <a href="https://github.com/Frog755/dsh-client-auto-retry/blob/HEAD/docs/COMPATIBILITY.md">docs/COMPATIBILITY.md</a>（含排查步骤与修改点索引）。</p>
+</blockquote>
+<h3>已适配版本</h3>
+<p>本插件是针对 <strong>DSH <code>0.1.0-rc.7</code></strong>（web 端 profile；desktop runtime 同版本）编写并验证的。
+<strong>不同版本 / 不同形态的 DSH（桌面端 App、更新或更旧的 rc、社区构建）接口可能不同，
+装不上或不生效时请按下表逐个核对。</strong></p>
+<h3>插件依赖的 DSH API 面</h3>
+<table>
+<thead>
+<tr>
+<th>#</th>
+<th>依赖点</th>
+<th>rc.7 中的形态</th>
+<th>其他版本可能的变化</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>1</td>
+<td>事件流打开</td>
+<td><code>api.events.mux({}, signal)</code> 返回 <code>AsyncIterable&lt;RpcRequest&lt;MuxFrame&gt;&gt;</code></td>
+<td>方法名、参数、返回类型</td>
+</tr>
+<tr>
+<td>2</td>
+<td>mux 帧信封</td>
+<td>帧是 RPC 信封 <code>{ rpcId, payload }</code>，真正内容在 <code>payload</code> 里（<code>session/event</code> 等）</td>
+<td>有的版本直接推裸帧 <code>{ type, sessionId, event }</code>；插件已同时兼容两种（见 <code>onMuxFrame</code>）</td>
+</tr>
+<tr>
+<td>3</td>
+<td>回合结束原因</td>
+<td><code>turn/end</code> 的 <code>data.reason.kind ∈ { completed, aborted, blocked, error, 'max-tokens', interrupted }</code></td>
+<td>枚举名可能增减；<code>TurnEndReasonMap</code> 本身设计为可被插件 merge 扩展</td>
+</tr>
+<tr>
+<td>4</td>
+<td>发送继续</td>
+<td><code>api.sessions.prompt({ sessionId, mode: 'queue', content: [{ type: 'text', text }] })</code> → <code>{ result: { ok } }</code></td>
+<td>请求/响应结构可能变</td>
+</tr>
+<tr>
+<td>5</td>
+<td>会话列表</td>
+<td><code>api.sessions.list({})</code> → <code>result.value</code>（或 <code>result.data</code>）数组；字段 <code>s.id</code>/<code>s.sessionId</code>、<code>s.updatedAt</code>/<code>s.lastActivityAt</code></td>
+<td>字段名可能变（插件已做兼容取值）</td>
+</tr>
+<tr>
+<td>6</td>
+<td>客户端加载格式</td>
+<td><code>window.__ModuleLoader__.load({ id, factory })</code>（<code>@deepseek-ai/dsh-client-runtime</code>）</td>
+<td>桌面端或其他构建可能用不同的模块加载器</td>
+</tr>
+<tr>
+<td>7</td>
+<td>设置 schema（Host）</td>
+<td><code>settingsNamespace(NS)</code> + <code>ctx.settings.register(ns, schema, { applies: 'live' })</code>（<code>@deepseek-ai/dsh-settings</code>）</td>
+<td>注册 API 或 <code>applies</code> 取值可能变</td>
+</tr>
+<tr>
+<td>8</td>
+<td>设置卡片（Client）</td>
+<td><code>ctx.slots.inject('settings.general.item')</code> + <code>slots.register(...)</code> + <code>ctx.locale.register(NS, { zh, en })</code> + <code>ctx.settingsScope.bind({ namespace: NS })</code> + <code>runtime.defineStore(...)</code></td>
+<td>slot id、locale/scope/store API 可能变</td>
+</tr>
+<tr>
+<td>9</td>
+<td>bundle 机制</td>
+<td><code>package.json</code> 的 <code>dsh.bundle.patch</code> 指向 <code>cordis.patch.yml</code>，<code>- insert: { id, name }</code> 插入插件行</td>
+<td>旧版本可能需要在 profile 的 <code>cordis.patch.yml</code> 里手动 <code>insert</code>，或机制完全不同</td>
+</tr>
+</tbody></table>
+<h3>遇到问题时怎么排查</h3>
+<ol>
+<li>打开浏览器 DevTools 控制台，看有没有 <code>[auto-retry]</code> 日志；<code>verbose</code> 默认开着。</li>
+<li>如果插件行根本没加载：先确认 <code>package.json</code> 里 <code>dsh.profile.bundles</code> 是否包含
+<code>dsh-client-auto-retry</code>，并已重启 DSH。</li>
+<li>如果加载了但不触发：在控制台手动调用 <code>api.events.mux({}, signal)</code> 观察帧结构，
+对照上表第 2、3 条 —— 你的版本帧信封 / <code>reason.kind</code> 枚举可能不同。</li>
+<li>如果触发了但发送失败：对照上表第 4、5 条检查 <code>sessions.prompt</code> / <code>sessions.list</code>
+的请求响应结构。</li>
+<li>如果设置卡片不出现：对照上表第 7、8 条检查 settings / slots 注册方式。</li>
+</ol>
+<h3>常见坑</h3>
+<ul>
+<li><strong>Host 侧改动需要重启 DSH</strong>：Cordis 插件进程内只加载一次，改 <code>lib/index.js</code> 后必须重启，
+否则只是刷新页面不会生效。</li>
+<li><strong>别把 <code>maxConsecutive</code> 设太大</strong>：如果 provider 持续报错，自动重试只会反复烧 token，
+建议保持默认 5 次以内，超限后由插件主动停手等你人工介入。</li>
+<li><strong><code>scanOnBoot</code> 只扫 <code>freshMs</code> 窗口内的会话</strong>：重启很久之后再打开页面不会误触老会话。</li>
+<li><strong>不要把插件当错误兜底</strong>：它只发「继续」，不做模型/provider 切换；如果需要故障转移，
+请在 DSH 的模型路由配置里做。</li>
+</ul>
+<h2>开发与调试</h2>
+<pre><code># 本地起项目（纯 ESM，无构建步骤，改完直接生效）
+# Client 侧：刷新页面
+# Host 侧：重启 DSH
+</code></pre>
+<p>日志前缀：<code>[auto-retry]</code>。<code>verbose: false</code> 可关闭非关键日志（连接日志仍会输出）。</p>
+<h2>License</h2>
+<p>MIT</p>

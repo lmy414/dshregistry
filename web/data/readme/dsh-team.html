@@ -1,0 +1,238 @@
+<h1>dsh-team — DeepSeek Harness 的 Agent Team</h1>
+<p><img src="https://raw.githubusercontent.com/huxint/dsh-team/HEAD/screenshots/image.png" alt="团队协作室运行截图"></p>
+<p>给 dsh 加一支可以指挥的团队：主会话作为 <strong>leader</strong>，可以派生若干<strong>常驻队友（teammate）</strong>，队友有自己的会话、记忆与工具；成员之间通过<strong>邮箱</strong>互发消息（消息成为收件人的下一个 turn），共享一份<strong>任务列表</strong>；会话视图环里多出一个 <strong>Agent 团队</strong>页签，把花名册、协作关系与消息流画成一间能看见的协作室。设计理念参考 Claude Code 的 agent team（共享任务列表 + 邮箱直连 + 成员自协调），实现完全走 dsh 的能力缝。</p>
+<p>整个能力是<strong>一个包、一行装配</strong>：宿主半边（<code>dsh-team</code>）与浏览器半边（<code>dsh-team/client</code>）从同一个 <code>package.json</code> 构建。</p>
+<h2>安装</h2>
+<p>npm 预构建包，一行装配：</p>
+<pre><code>dsh plugin --profile web add dsh-team
+</code></pre>
+<p>也可以克隆源码构建后挂 link：</p>
+<pre><code>git clone https://github.com/huxint/dsh-team.git
+cd dsh-team
+pnpm install
+pnpm run build
+dsh plugin --profile web add link:$PWD
+</code></pre>
+<p>包自带 <code>cordis.patch.yml</code>（<code>package.json</code> 里的 <code>dsh.bundle.patch</code> 指向它），<code>plugin add</code> 装进去即生效。web profile 的 base bundle（<code>@deepseek-ai/dsh-base</code>）已经带齐所需的 continuable subagent provider、session projection 与持久化；虚拟工作区还需要挂载 storage-domain（<code>@deepseek-ai/dsh-web-app</code> 已组合），没有它团队其余能力照常，只是 <code>team_note</code> / <code>team_board</code> 不会注册。</p>
+<p>验证装配与启动：</p>
+<pre><code>dsh --profile web --dump-config | grep 'id: team'
+dsh --profile web
+</code></pre>
+<p>在会话里让主会话调用 <code>team_spawn</code> 派生第一名队友，视图环里就会出现 <code>Agent 团队</code> 页签。卸载：</p>
+<pre><code>dsh plugin --profile web remove dsh-team
+</code></pre>
+<h2>能力一览</h2>
+<ul>
+<li><strong>具名常驻队友</strong>：<code>team_spawn</code> 把一个 <code>ctx.subagents</code> 的 continuable 子代变成团队成员——会话、日志、冷恢复、活动驻留与中断都由 harness 负责，队友不占会话树。</li>
+<li><strong>成员邮箱</strong>：<code>team_send</code> 把消息变成收件人的下一个 turn；投递由 leader 权威执行，队友之间的转发有会话预算。</li>
+<li><strong>共享任务列表</strong>：<code>team_task</code> 建 / 改 / 结案，<code>team_list</code> 看花名册、任务与最近流量。</li>
+<li><strong>虚拟工作区</strong>：共享黑板 + 每人一块私有便笺（<code>team_note</code> / <code>team_board</code>），落进 storage domain，跨重启、不占 turn。</li>
+<li><strong>协作室页签</strong>：会话视图环里的第三个页签，实时展示成员座位、走动、消息流、工作区与任务板。</li>
+</ul>
+<h2>设计</h2>
+<p>实现完全走 dsh 的能力缝，不造新运行时：</p>
+<ul>
+<li><strong>队友 = continuable subagent</strong>：<code>team_spawn</code> 用 <code>ctx.subagents.startContinuable()</code> 建具名常驻子代——会话、日志、冷恢复、活动驻留与中断全由 harness 负责，队友不进会话树；transcript 仍可读（内置 subagent 目录里标签是 <code>名字 (角色)</code>）。插件只补缝里没有的三样：<strong>具名成员、成员投递、共享任务列表</strong>。</li>
+<li><strong>投递权威永远是 leader 的</strong>：<code>followup()</code> 只认直接父级，leader 正是每个队友的直接父级，所以 peer↔peer 消息也是"由 leader 权威执行、消息源写明真实发送者"的一次投递；<code>relation</code> 只决定谁可以要求投递，从不决定谁来执行。消息源（<code>team-message</code>，带 <code>senderSessionId</code> / <code>chainId</code> / <code>hop</code>）随日志持久化。</li>
+<li><strong>会话预算防横向循环</strong>：<code>team_send</code> 把消息变成对方的下一个 turn，peer 互相回复能无限转下去，所以投递带机械约束——链深度（<code>maxChainHops</code>，默认 4）、同一有序对来回数（<code>maxChainRoundTrips</code>，默认 2）、一字不差的重发直接拒；这些只管队友→队友，发给 leader 从不拒绝。<code>hop</code> 随消息源持久化，协作室气泡可见。</li>
+<li><strong>两个虚拟工作区</strong>：共享黑板 + 每人一块私有便笺，落 <code>ctx.storageDomain</code>，先落盘、跨重启、不占任何人的 turn——留笔记不花会话预算，也是防死循环的正向出口。</li>
+<li><strong>leader 不在场，团队不丢</strong>：投递随 live leader 一起停，但拒绝语分得清 <code>LEADER_AWAY</code> / <code>NO_TEAM</code>；队友席位组装时就捕获，工作区照常可读写，leader 一回来即恢复。</li>
+<li><strong>只折叠一次</strong>：团队持久事实都骑在 harness 已认识的词汇上（团队工具 <code>tool/result</code> 的 meta、<code>user/message</code> 的 <code>team-message</code> 源），<code>src/fold.ts</code> 是唯一折叠实现，<code>src/projection.ts</code> 注册成 <code>team</code> projection，宿主算一次、框架推给浏览器。</li>
+<li><strong>工具作用域</strong>：leader 的 6 个工具在 <code>agent/created</code> 时注册进该 agent 自己的 ctx；队友侧在 <code>registerContinuableSetup</code> 的未发布组装窗口里注册 <code>team_send</code> / <code>team_list</code> 与身份提示段落。</li>
+</ul>
+<h2>模型看到的工具</h2>
+<table>
+<thead>
+<tr>
+<th>工具</th>
+<th>谁能用</th>
+<th>作用</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>team_spawn</code></td>
+<td>leader</td>
+<td>派生队友：<code>name</code> / <code>task</code> / <code>relation</code>，可选 <code>role</code>、<code>persona</code>、<code>model</code>、<code>reasoning_effort</code></td>
+</tr>
+<tr>
+<td><code>team_send</code></td>
+<td>leader + 队友</td>
+<td>邮箱。收件人写队友名、成员 id 或 <code>leader</code>；消息成为对方的下一个 turn，不等回复</td>
+</tr>
+<tr>
+<td><code>team_task</code></td>
+<td>leader</td>
+<td>共享任务列表：不带 <code>task_id</code> 是新建，带则更新；<code>assignee</code> 支持名字或 id</td>
+</tr>
+<tr>
+<td><code>team_relation</code></td>
+<td>leader</td>
+<td><code>managed</code> ⇄ <code>peer</code> 升降级</td>
+</tr>
+<tr>
+<td><code>team_dismiss</code></td>
+<td>leader</td>
+<td>解雇一个队友；不给参数则解散整队（中断当前工作，transcript 仍可读）</td>
+</tr>
+<tr>
+<td><code>team_list</code></td>
+<td>leader + 队友</td>
+<td>花名册（含 <code>running</code> / <code>idle</code> / <code>ready</code> 实时状态）、任务列表、最近邮箱流量</td>
+</tr>
+<tr>
+<td><code>team_note</code></td>
+<td>leader + 队友</td>
+<td>往共享黑板（或 <code>private: true</code> 的私有便笺）写一条笔记；不给 <code>text</code> 即删除</td>
+</tr>
+<tr>
+<td><code>team_board</code></td>
+<td>leader + 队友</td>
+<td>读工作区：不带 <code>key</code> 是索引，带 <code>key</code> 是全文</td>
+</tr>
+</tbody></table>
+<p>队友汇报用的是 harness 内置的 <code>report</code>（<code>@deepseek-ai/dsh-tool-subagent-report</code> 在子代作用域里注册，且不受 <code>toolFilter</code> 影响）——汇报会以 <code>subagent-report</code> 源落进 leader 日志，被同一份折叠记进消息流。</p>
+<p>每个写操作的工具卡片都有自己的标题（<code>Spawn teammate Alice</code> / <code>Alice joined the team</code> / <code>Message Alice</code> / <code>New task: …</code> / <code>Team disbanded</code>），失败时直接把拒绝原因写在卡片上；写操作一律 <code>isConcurrencySafe: () =&gt; false</code>，不会被并行调度打散。</p>
+<h2>模型与思考强度</h2>
+<ul>
+<li><code>model</code>：走 <code>AgentOptions.model</code>，只影响这一个队友；省略则继承 leader 的模型。</li>
+<li><code>reasoning_effort</code>：不是 <code>AgentOptions</code> 的字段（它是请求头状态），所以队友作用域里挂一个 <code>agent/request</code> waterfall，把 <code>reasoningEffort</code> 钉在<strong>这个队友自己的</strong>每次请求上。派生时就用 <code>ctx.llm.resolveModelInfo()</code> 校验该模型是否提供这个强度，<strong>当场失败</strong>而不是等到队友第一次发请求。</li>
+<li>强度记在成员事实里（随折叠持久化），冷恢复后仍然生效——subagent descriptor 本身不存这个字段。</li>
+</ul>
+<h2>团队协作室（视图页签）</h2>
+<p>团队协作室是<strong>会话视图环里的第三个页签</strong>：<code>对话 / 轨迹 / Agent 团队</code>（<code>src/client/</code>）。点开是一间<strong>占满整个标签页的 2.5D 办公室</strong>——一个能望进去的盒子：后墙加两面侧墙围着一块向远端收窄的地板，天花板上垂下一盏吊灯；家具都有顶、正、侧三个面。每个成员有自己的工位、自己的电脑，坐在自己的椅子上；要跟谁说话就<strong>站起来走过去</strong>。消息流、共享工作区、任务板收在<strong>右侧竖排的三扇门（dock）<strong>后面，点开哪扇，哪份账本就以一块</strong>磨砂玻璃抽屉</strong>盖在房间右侧展开。</p>
+<ul>
+<li><p><strong>有团队才有页签</strong>：客户端跟随器发现当前会话的 <code>team</code> 投影里有成员，才把这一条 <code>conversation.view</code> 注册进去；团队解散就把注册撤回（未知的 view id 会回落到对话页，撤回不会把读者卡住）。普通会话的视图环完全不变。</p>
+</li>
+<li><p><strong>房间就是整个页面</strong>：协作室在屏幕上时，插件在 <code>conversation.composer</code> 链的<strong>最后一位</strong>交出一个空的输入区——房间不跟一张输入卡片分屏，也就不需要什么"剧场模式"。座位是引用计数的：离开页签立刻还回去，两次挂载重叠也只占一个。</p>
+</li>
+<li><p><strong>平面与透视分离</strong>：<code>room.ts</code> 只认识一张 0–100 的<strong>纯几何平面</strong>——桌位、家具占位、寻路、休息角全在上面，<strong>不量 DOM</strong>，画面只是持久状态的一个函数。<code>stagecraft.ts</code> 把这层平面投进一个透视盒子（地板向远端收窄、越远越挤、越远越小），外墙的五个面和每个投影点读的是<strong>同一组常数</strong>，墙和地板永远对得齐。移动家具，绕行路线跟着走；换一个投影，布局原地不变。</p>
+</li>
+<li><p><strong>每张桌子都是一整套</strong>：带木纹的<strong>桌面 + 前裙板 + 侧挡板 + 挡腿板</strong>，上面放着键盘、该席位强调色的马克杯、一沓纸、一盆小植物，桌后立着<strong>显示器</strong>（加大号的屏幕、支架、底座），桌前一把<strong>办公椅</strong>（SVG 画的网面椅背、腰靠、座垫、气杆、五爪脚轮，还会偶尔轻轻上下落一下）。全部是 token 画出来的形状，没有一张贴图。</p>
+</li>
+<li><p><strong>屏幕在左肩，人在中间</strong>：显示器立在工位后侧、屏幕面向读者；成员背对房间坐在桌前，工作时不需要看清谁的脸。图层从近到远是<strong>椅背 → 坐着的成员 → 桌面和显示器</strong>——显示器站在成员左肩外侧，再大也不会挡住人，人也正好夹在桌子和椅子之间。成员一旦站起来走路、去休息角、或者正在跟人说话，才转过身来露脸。</p>
+</li>
+<li><p><strong>人是戴海兽头套的人</strong>：一具人形（鞋、裤子、衬衫、两条胳膊）+ 一头<strong>侧面</strong>的鲸鱼或鲨鱼当兜帽——只有侧着才像它。衣服按席位轮流换<strong>衬衫 / T恤 / 毛衣 / Polo / 卫衣 / 束腰外衣 / 马甲 / 外套 / 条纹 / 背带裤</strong>，鞋也轮流换<strong>运动鞋 / 短靴 / 乐福鞋 / 高帮 / 凉鞋</strong>（带鞋带与鞋底边），头发轮流换<strong>刘海 / 丸子头 / 卷发 / 短寸 / 马尾 / 板寸</strong>（发色与肤色各有几档，不跟强调色走），再各带一件小物（眼镜 / 耳机 / 围巾 / 工牌 / 背包）。leader 戴蓝鲸（喷水），队友按席位轮流拿到虎鲸（背鳍 + 白眼斑）、座头鲸（长鳍 + 头瘤）、独角鲸（长牙）、白鲸（额隆）、抹香鲸（方头）、鲨鱼（背鳍 + 鳃裂）。强调色是<strong>品牌 token 旋转出来的</strong>（<code>hue-rotate</code>），不写死颜色。背身时头套朝另一边、后脑勺有头发、腿收进椅子里。</p>
+</li>
+<li><p><strong>走路是真的走</strong>：<code>routeBetween</code> 在<strong>家具占位构成的可见性图</strong>上求最短路——每个障碍矩形外扩一圈净空，只在这些角上转弯，所以走的是真的绕行而不是两条写死的通道；<code>smooth</code> 再把转角削成小弧线，急转弯变圆角。<code>walk.ts</code> 用一个 rAF 循环按<strong>弧长</strong>推进整趟行程：起步加速、收尾减速（而不是每条腿各自匀速），步态相位跟着走过的距离走——走得快摆得快，走得慢摆得慢；朝向除了左右还分<strong>正身 / 背身</strong>。位置直接写在 DOM 节点上，只有转弯和停步才触发 React 渲染，一屋子人同时走也就每帧几次样式写入。</p>
+</li>
+<li><p><strong>传消息 = 走过去说</strong>：最新一条投递会让发信人从自己的座位<strong>走到收信人桌边</strong>（站在旁边一步，谁也不挡谁），<strong>到了才开口</strong>（头顶一句截短的话），收信人转头听（<code>···</code>）；这趟差事过去之后它再走回自己的位置。走的是本人，不是复制体——房间里每个成员永远只有一个。</p>
+</li>
+<li><p><strong>站在哪儿，就是它此刻在做什么</strong>：</p>
+<table>
+<thead>
+<tr>
+<th>成员的状态</th>
+<th>房间里的样子</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>正在跑一个 turn</td>
+<td>坐在自己桌前，屏幕亮着它那份预设画面</td>
+</tr>
+<tr>
+<td>刚收到一条消息</td>
+<td>留在自己桌前读（屏幕上就是这条消息）</td>
+</tr>
+<tr>
+<td>自己刚汇报完、名下没有未完成任务</td>
+<td>起身去休息角（沙发、茶几、绿植、饮水机）</td>
+</tr>
+<tr>
+<td>闲着没事</td>
+<td>坐着打盹（<code>zZ</code>）</td>
+</tr>
+</tbody></table>
+</li>
+<li><p><strong>屏幕上放的是预设画面</strong>：每个席位固定一种——leader 看<strong>仪表盘</strong>，队友轮流拿到<strong>代码、文档、邮件、表格、终端</strong>——像素条全部由主题 token 混出来。它此刻在做的那件事（进行中任务标题，或最近一条发给它的消息）也写在屏幕上；没活干的屏幕是暗的。</p>
+</li>
+<li><p><strong>不标区域，靠家具说话</strong>：后墙上有<strong>带窗洞进深、能看见云和海</strong>的两扇窗、铝框白板（笔槽里躺着三支笔和一块板擦、贴着两张便利贴、还有没擦干净的旧字迹）、挂钟（秒针真的在走）、一组<strong>高矮不一的</strong>书墙架（配小盆栽和一座奖杯）、海报和月历；左边服务墙上放着打印机、咖啡机和文件柜；右手边是休息角的地毯、沙发、落地灯与饮水机（水桶里的气泡会上浮），门口偶尔还有一只猫路过。房间里没有一个"工作区""休息区"的字牌——看得出来就不用写。</p>
+</li>
+<li><p><strong>绿植是一个家族</strong>：休息角、书架、窗台和桌上放的都是 SVG 真画的植物——龟背竹、虎尾兰、绿萝（从墙上垂下来）、仙人掌、琴叶榕、棕榈，各有叶脉、明暗两层叶片、上釉陶盆和托盘；每片叶子都铰在着生点上，错开相位轻轻摆动。</p>
+</li>
+<li><p><strong>闲着会自己找事做</strong>：没事干的成员过一会儿会起身去接水、走到窗边看海、或在植物旁伸懒腰（leader 永远守着第一张桌）。两个成员在同一处站定会自动分开一点，不会叠成一个人。</p>
+</li>
+<li><p><strong>名字在脚下</strong>：名牌贴在成员脚边的地面上（不会飘到别人桌子上），未完成任务数挂在肩上，运行状态点在身侧。</p>
+</li>
+<li><p><strong>右侧三扇门，各有计数</strong>：信箱 / 工作区 / 任务板各带一枚数字徽标（消息条数、笔记条数、<strong>未完成</strong>任务数）；抽屉关着的时候来了新投递，信箱那扇门会<strong>亮起呼吸圈</strong>，打开即消。同一时刻只开一扇，再点一次或点抽屉的 × 就收回去。整个房间的 sprite 被关在自己的 stacking context 里，dock 和抽屉永远浮在它们上面——哪怕有成员走到休息角，也不会挡住消息流的按钮或抽屉内容。</p>
+</li>
+<li><p><strong>信箱是日志，不是聊天</strong>（信箱抽屉里）：顶上一条<strong>花名册</strong>，每人<strong>一行</strong>——头像、名字、此刻在跑还是闲着、以及它最新的一句话（截短）；下面是流量本身，一条一行、越新越靠下，长内容截到一行、整句挂在 <code>title</code> 上。全队都写在<strong>同一侧</strong>：右边属于读者，而读者不在这里发言。<code>汇报</code> 走成功色边条，<code>已收工</code> 虚线弱化，第 3 跳起的 <code>hop</code> 徽标变警告色。鼠标停在一行上，对应成员的工位会亮起——<strong>同一份状态的两种投影互相指认</strong>，玻璃抽屉正好让你同时看见两边。</p>
+</li>
+<li><p><strong>共享工作区是软木板</strong>（工作区抽屉里）：每条笔记是一张钉着图钉的便签，微微歪着，鼠标停上去才摆正；作者一栏带着它的小头像，悬停同样点亮本人；标题旁边写着这份快照的时间。</p>
+</li>
+<li><p><strong>任务是泳道</strong>（任务板抽屉里）：待办 / 进行中 / 已完成三条泳道，道头一枚状态色圆点；卡片上指派人带小头像，结案备注跟在旁边。</p>
+</li>
+<li><p>点任何一个成员开对应 transcript（走 durable 的 subagent 地址，目录没拉取过就刷新后重试），点 leader 回主会话，<code>aria-current</code> 标出你正在看的那个。</p>
+</li>
+<li><p><strong>解散就关灯</strong>：不带参数的 <code>team_dismiss</code> 折叠出 <code>ended</code>，团队视图折成空，房间和页签一起收走——你此刻正读着某个队友的 transcript 也一样。</p>
+</li>
+<li><p><strong>全部动效在 <code>prefers-reduced-motion</code> 下关闭</strong>（走路的成员直接站到终点、云不飘、猫不路过、气泡不冒，抽屉直接出现）。</p>
+</li>
+</ul>
+<p>导航进队友会话时页签不会消失：跟随器认得"当前会话是这支团队的成员"，只把"你在这儿"的标记挪过去，同时改订 <strong>leader 的 <code>team</code> 投影</strong>——被读的那个队友自己折不出团队，只有盯着 leader，房间才既是活的、又能在团队解散的那一刻关掉。leader 本身没加载时，房间保留它最后看到的样子。</p>
+<h2>配置（<code>cordis.patch.yml</code> 可覆写）</h2>
+<table>
+<thead>
+<tr>
+<th>键</th>
+<th>默认</th>
+<th>含义</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>provider</code></td>
+<td><code>spawn</code></td>
+<td>派生队友用的 <code>ctx.subagents</code> provider（base bundle 提供 <code>spawn</code>）</td>
+</tr>
+<tr>
+<td><code>maxTeammates</code></td>
+<td><code>8</code></td>
+<td>单个 leader 的在册成员上限（1–64）</td>
+</tr>
+<tr>
+<td><code>maxRecentMessages</code></td>
+<td><code>50</code></td>
+<td>折叠保留、协作室显示的邮箱条数上限（1–1000）</td>
+</tr>
+<tr>
+<td><code>maxChainHops</code></td>
+<td><code>4</code></td>
+<td>一次队友间对话最多转手几次（1–64）；发给 leader 不计入</td>
+</tr>
+<tr>
+<td><code>maxChainRoundTrips</code></td>
+<td><code>2</code></td>
+<td>一条链里同一有序对最多几条消息（1–64）</td>
+</tr>
+<tr>
+<td><code>maxWorkspaceEntries</code></td>
+<td><code>32</code></td>
+<td>单个工作区区域（共享黑板 / 一块私有便笺）的条目上限（1–500）</td>
+</tr>
+<tr>
+<td><code>maxNoteChars</code></td>
+<td><code>4000</code></td>
+<td>单条笔记正文长度上限（200–200000）</td>
+</tr>
+</tbody></table>
+<h2>已知限制</h2>
+<ul>
+<li><strong>peer↔peer 的历史只在成员自己的会话里</strong>：leader 的折叠只看得见 leader 可见的流量，协作室同理——所以横向对话只有被预算拒绝后成员主动上报时才会进入 leader 的视野。</li>
+<li><strong>任务列表由 leader 写</strong>：队友的工具调用落在自己的日志里，leader 的持久状态读不到；队友用 <code>report</code> 汇报，由 leader 记账。需要队友自己留下的东西，走共享工作区。</li>
+<li><strong>协作室里的共享工作区是快照</strong>：队友直接写 durable 工作区，不经过任何会话日志，所以面板显示的是主会话最后一次读写时的索引（面板标了时间）。</li>
+<li><strong>输入框是"接管"不是"删除"</strong>：协作室在屏幕上时，插件在 <code>conversation.composer</code> 链的最后一位（优先级 100）交出一个空节点。这是链式槽的正门——不碰宿主 DOM——代价是它排在所有其它接管者之后：真有一个待批准的审批要接管输入框，座位仍然归它，你在这个页签里照样能回答被卡住的 agent。</li>
+<li><strong>解散清得掉房间，清不掉宿主的子代理目录</strong>：整队解散后本插件的房间与页签一起消失（折叠出 <code>ended</code>，团队视图折成空），但 harness 自己的子代理面板（"N 个子代理"）是由 durable 会话喂出来的，<code>ctx.subagents</code> 与会话存储都<strong>没有"释放 / 遗忘一个子代"的接口</strong>——插件没有正门能抹掉那些条目。这也正是"解散之后 transcript 仍然可读"的另一面。</li>
+<li><strong>leader 没加载时冷恢复的队友拿不到团队工具</strong>：花名册是从 leader 的日志折出来的，组装那一刻没有 live leader 就没有花名册，这个子代只会当作普通 subagent 组装（已经组装好的队友不受影响，见上）。</li>
+<li><strong>Code Mode 下的团队调用不入折叠</strong>：折叠读的是团队工具自己的 <code>tool/result</code>；<code>run_code</code> 里的嵌套调用不产生这些行（base bundle 默认不含 Code Mode）。</li>
+<li><strong>工具成功但结果没落日志</strong>（极端故障）会留下一个孤儿成员：活的花名册有、折叠没有，重启后消失。</li>
+<li>不嵌套：队友不能再开自己的团队（<code>NESTED_TEAM</code>）。</li>
+</ul>
+<h2>开发</h2>
+<p>改完源码重跑 <code>pnpm run build</code>：宿主行要重启 dsh，客户端 bundle 刷新页面即可。</p>
+<pre><code>pnpm run typecheck   # 源码 + 测试
+pnpm run test        # 折叠 / 投影 / 服务授权矩阵 / 工具契约 / 队友组装 / 会话预算 / 虚拟工作区 / 房间几何与走路 / 客户端跟随与页签 / 协作室与抽屉
+pnpm run build       # 宿主 ESM + 浏览器闭包工厂（构建期强制客户端 bundle 纯净性）
+pnpm run check       # 三件一起
+</code></pre>
+<p>构建与类型针对 npm 上的 <code>@deepseek-ai/dsh@0.1.0-rc.6</code>。遵循 harness 的插件纪律：注册即 effect、能力缝三角色、事件全 JSON 整值、模型可见即落日志、配置无硬编码。</p>
+<h2>License</h2>
+<p><a href="https://github.com/huxint/dsh-team/blob/HEAD/LICENSE">MIT</a></p>

@@ -1,0 +1,266 @@
+<p align="center">
+  <strong>给 DeepSeek Harness Web GUI 一个三档输入交通管制</strong>
+</p>
+<p align="center">
+  <strong>中文</strong> · <a href="https://github.com/drscrewdriver/dsh-input-traffic/blob/HEAD/README.en.md">English</a>
+</p>
+<p align="center">
+  <a href="https://github.com/drscrewdriver/dsh-input-traffic/blob/HEAD/LICENSE"><img alt="MIT License" src="https://img.shields.io/badge/license-MIT-263146?style=flat-square"></a>
+  <img alt="Public beta" src="https://img.shields.io/badge/status-public%20beta-7da1de?style=flat-square">
+</p>
+
+<h1>dsh-input-traffic</h1>
+<blockquote>
+<p>智能体忙碌时不再只有"打断"或"排队"二选一：红色打断立即输入、黄色下一轮插入、绿色排队到最后，三档并存；邻近 DeepSeek 高峰收费时段可一键冻结会话，错峰再恢复继续。</p>
+</blockquote>
+<p>无需修改 dsh 源码、无需提 PR：<code>dsh plugin</code> 命令组装 + bundle patch 装配的 cordis client 插件。</p>
+<h2>它能做什么</h2>
+<ul>
+<li><strong>三档插入并存</strong>：智能体忙碌时，每一条输入都先进入等待区，再按需选择何时进入对话——不再只有一个"打断"或只有一个"排队"：<ul>
+<li>🔴 <strong>红色（now）</strong>：打断当前轮次并立即输入——当前生成停止，消息作为新输入被 agent 立刻处理并回复；</li>
+<li>🟡 <strong>黄色（next）</strong>：下一自然轮插入——不打断当前执行，当前正在进行的动作（工具调用 / 本轮生成）结束后插入；</li>
+<li>🟢 <strong>绿色（later）</strong>：待整个逻辑执行完成后输入——排队等待，上一轮输入的所有动作都结束后再处理（默认状态）。</li>
+</ul>
+</li>
+<li><strong>黄色可逆</strong>：对已插话（黄色）的消息点绿色按钮，可撤销插入、收回排队状态。</li>
+<li><strong>排队内容可再编辑</strong>：已经排在队列中的消息可以直接在队列里编辑——多行编辑区随内容自动扩展，长消息也能完整查看与修改（Enter 保存 / Shift+Enter 换行 / Esc 取消）；也可<strong>打回输入框再编辑</strong>（回填 composer 修改后重新发送）。</li>
+<li><strong>队列管理</strong>：等待区的消息可以<strong>上移 / 下移调整顺序</strong>、删除，以及队列级「取消并清空」。</li>
+<li><strong>编辑不丢内容</strong>：编辑保存失败（消息已被 agent 认领）时，编辑内容自动退回主输入框，不会丢失；主输入框已有内容时不覆盖。</li>
+<li><strong>高峰期冻结</strong>：输入框右侧「冻结会话」按钮——邻近 DeepSeek 高峰收费时段（9:00-12:00、14:00-18:00）时主动暂停 API 消耗：当前轮次自然完成后暂停，未发送队列冻结保存；「恢复会话」后在非高价时间继续处理。</li>
+<li><strong>接管官方行为</strong>：插件生效时，官方设置面板的「繁忙时 Enter 键行为」设置行不再显示（Enter 行为固定为绿色排队）。</li>
+</ul>
+<h2>界面预览</h2>
+<p>等待区与冻结按钮在会话页面中的布局示意：</p>
+<pre><code>┌─ 输入区 ──────────────────────────────── 发送 ── [❄ 冻结会话] ─┐
+└────────────────────────────────────────────────────────────────┘
+┌─ 排队等待区（3 档规划 dock）────────────────────────────────────┐
+│ ┌ 2 条排队消息                                     🗑 取消并清空 ┐ │
+│ │ 🟢 排队   第一条消息内容预览…          ↑ ↓ 打回 编辑 删除      │ │
+│ │ 🟢 排队   第二条消息内容预览…          ↑ ↓ 打回 编辑 删除      │ │
+│ │   编辑中：多行文本区随内容自动扩展（上限约 8 行）              │ │
+│ │   Enter 保存 · Shift+Enter 换行 · Esc 取消                    │ │
+│ └──────────────────────────────────────────────────────────────┘ │
+└──────────────────────────────────────────────────────────────────┘
+</code></pre>
+<h2>三档语义</h2>
+<table>
+<thead>
+<tr>
+<th>档位</th>
+<th>颜色</th>
+<th>语义</th>
+<th>底层机制（dsh 现有 RPC 组合）</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong>later</strong>（默认）</td>
+<td>绿</td>
+<td>排队：上一轮输入的动作都结束后再处理；对已插话（黄色）的消息点绿 = <strong>撤销插入，收回排队</strong></td>
+<td>Enter 默认 queue → <code>agent.followup()</code>（next-turn）；收回 = <code>updateQueue(remove)</code> + <code>send(text)</code></td>
+</tr>
+<tr>
+<td><strong>next</strong></td>
+<td>黄</td>
+<td>下一自然轮插入：当前正在执行的动作结束后插入</td>
+<td><code>updateQueue(id, { kind: 'steer' })</code> → <code>agent.steer()</code>（next-step 步骤边界）</td>
+</tr>
+<tr>
+<td><strong>now</strong></td>
+<td>红</td>
+<td>打断并输入：停止当前轮次，消息立即被处理</td>
+<td><code>cancel()</code> → <code>updateQueue(remove)</code>（避免 inbox 重复插入拒绝）→ <code>send(text)</code>（重新提交，唤醒 driver 立即处理）</td>
+</tr>
+</tbody></table>
+<blockquote>
+<p>红色为什么是 cancel + remove + resend：harness 的 inbox 禁止重复插入同一条消息，打断后直接 steer 会被拒绝导致消息滞留（详见「常见问题」）。</p>
+</blockquote>
+<h2>会话冻结 / 恢复（高峰期暂停）</h2>
+<p>输入框右侧（发送按钮旁）的「冻结会话 / 恢复会话」按钮，用于即将进入 DeepSeek 高峰收费时段时暂停 API 消耗：</p>
+<ul>
+<li><strong>冻结</strong>：当前轮次<strong>不打断</strong>、自然完成后暂停；<strong>队列与冻结解耦</strong>——冻结只停止 agent 消费（执行/插入/追加），等待队列保持可见且<strong>完全可操作</strong>（排序、编辑、删除、设定红/黄/绿插入档位），与未冻结无明显区别；</li>
+<li><strong>恢复</strong>：按修改后的队列重新入队，<strong>按每条预定的档位执行</strong>（红=打断并立即处理，黄=插话，绿=排队），agent 按 FIFO 继续处理；</li>
+<li>引擎实现：冻结 = 逐条 <code>updateQueue(remove)</code> 分离队列（含档位的副本存于插件 store），当前轮次完成后 driver 因无 pending 自然停止；冻结期间对队列的修改（文本/顺序/档位）实时写回 store；恢复 = 逐条 <code>send(text)</code> 重新提交并唤醒 driver（红色档位的条目先 <code>cancel()</code> 再发送）；</li>
+<li>注意：含非文本内容（图片）的排队消息无法重发，冻结时会随队列释放（不会恢复）。</li>
+</ul>
+<h2>队列管理</h2>
+<p>等待区每条消息（未冻结时）提供：</p>
+<table>
+<thead>
+<tr>
+<th>操作</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>上移 / 下移</td>
+<td>调整 FIFO 顺序（整个队列按新顺序重建；含图片消息时禁用）</td>
+</tr>
+<tr>
+<td><strong>拖拽排序</strong></td>
+<td>按住行直接拖动到目标位置（原生 HTML5 DnD，无额外依赖）；与箭头按钮同样走服务端重建</td>
+</tr>
+<tr>
+<td>打回输入框编辑</td>
+<td>消息内容回填 composer 输入框并从队列移除，编辑后重新发送</td>
+</tr>
+<tr>
+<td>编辑 / 删除</td>
+<td>多行文本区直接修改排队内容 / 取消该消息</td>
+</tr>
+<tr>
+<td>红 / 黄 / 绿规划</td>
+<td>见「三档语义」</td>
+</tr>
+<tr>
+<td>取消并清空</td>
+<td>两步确认后停止当前执行并清空全部排队消息（首次点击弹出「确认清空？」）</td>
+</tr>
+</tbody></table>
+<p>排序的<strong>并发保护</strong>：重建期间若某条消息已被 agent 认领（<code>queue-item-not-found</code>），本次排序立即中止且不重发，提示「队列已变化，本次排序已取消」——绝不会把变化中的队列排乱。</p>
+<p>等待区的<strong>展开状态会记忆</strong>：手动收起/展开后，下次打开插件保持同样状态。</p>
+<p>编辑排队消息（行内编辑）时：</p>
+<ul>
+<li><strong>自动扩展</strong>：编辑区随内容实时增高，长消息完整展开，上限约 8 行，超出后内部滚动；</li>
+<li><strong>快捷键</strong>：<code>Enter</code> 保存，<code>Shift+Enter</code> 换行，<code>Esc</code> 取消（中文输入法组合期间不会误保存）；</li>
+<li><strong>失败兜底</strong>：保存时若消息已被 agent 认领（如「已经开始发送」），编辑内容自动退回主输入框并提示，<strong>不会丢失</strong>；仅当主输入框为空时回填，已有草稿不被覆盖。</li>
+</ul>
+<h2>安装</h2>
+<pre><code># 方式一：从 npm 安装（推荐）
+#   （profile 是 pnpm workspace root，add 需带 -w 参数）
+dsh plugin --profile web add dsh-input-traffic -w
+
+# 方式二：git 或本地路径组装
+# dsh plugin --profile web add /absolute/path/to/dsh-input-traffic -w
+#    （git 安装后需在 profile 的 node_modules 内现场构建：npm install --legacy-peer-deps &amp;&amp; npm run build）
+
+# 确认组合树包含新行
+dsh web --dump-config | grep -B1 -A2 'input-traffic'
+
+# 重启 dsh web —— 必做！运行中实例不热载 bundle 层
+dsh web
+</code></pre>
+<p>本地构建与测试：</p>
+<pre><code>npm install --legacy-peer-deps   # @deepseek-ai client 包链在 npm 上不完整，仅装工具链
+npm run build                    # tsc（lib/types）+ tsdown（lib/index.js + lib/client.js）
+node examples/verify-assembly.mjs  # 12 项装配断言
+npm test                         # 36 项 vitest 组件测试
+npm run lint                     # ESLint（src + tests，flat config）
+npm run verify                   # 一体化门禁：lint + test + build + verify-assembly
+</code></pre>
+<h2>开发（TDD + Lint）</h2>
+<p>本项目按 <strong>TDD</strong>（测试驱动开发）维护：先写失败用例，再实现到全绿。</p>
+<pre><code>npm run tdd        # vitest watch：改动即重跑，红→绿闭环
+</code></pre>
+<p>流程：</p>
+<ol>
+<li>在 <code>tests/</code> 新增/修改用例（红：确认新行为尚未实现）；</li>
+<li><code>npm run tdd</code> 观察失败；</li>
+<li>在 <code>src/</code> 最小实现（绿）；</li>
+<li><code>npm run verify</code> 全绿后提交（lint + 36 测试 + 构建 + 12 项装配断言）。</li>
+</ol>
+<p>Lint 说明：</p>
+<pre><code>npm run lint       # ESLint flat config（eslint.config.mjs）
+npm run lint:fix   # 自动修复可修复项
+</code></pre>
+<ul>
+<li>范围：<code>src/</code> 与 <code>tests/</code>（TypeScript + React）；构建产物 <code>lib/</code> 忽略；</li>
+<li>规则：<code>@typescript-eslint/recommended</code> + <code>react-hooks</code> 最佳实践；未使用变量报错（下划线前缀 <code>_</code> 可豁免）。</li>
+</ul>
+<h2>使用方式</h2>
+<ol>
+<li>智能体忙碌时直接输入并发送，消息<strong>统一进入等待区</strong>（默认绿色排队）；</li>
+<li>在等待区对消息点规划按钮：<ul>
+<li>🟡 黄色 = 插话——当前动作结束后插入；</li>
+<li>🔴 红色 = 打断——立即中断当前动作，消息随后被处理；</li>
+<li>🟢 绿色 = 保持排队（当前默认态）；对已插话的消息点绿 = 收回排队；</li>
+</ul>
+</li>
+<li>需要调整顺序 / 修改内容：用上移下移、打回输入框编辑或多行编辑（Enter 保存、Shift+Enter 换行）；</li>
+<li>邻近高峰时段：点击输入框右侧「冻结会话」，当前轮次完成后自动暂停；非高价时间点「恢复会话」继续。</li>
+</ol>
+<h2>常见问题</h2>
+<h3>打断后消息没有回复 / 对话停住</h3>
+<p>历史问题（已修复）。根因：harness 的 inbox 禁止重复插入同一条消息——打断后直接对原消息执行 steer 会被 <code>"message is already pending"</code> 拒绝，消息滞留在队列、agent 停摆。当前实现改为 <code>cancel → remove → resend</code>（新消息重新提交），打断消息会立即被 agent 处理并回复。若仍遇到，请确认插件为最新构建并重启 dsh web。</p>
+<h3>编辑保存失败后，内容去哪了？</h3>
+<p>不会丢。保存失败（消息已被 agent 认领）时，编辑内容会自动退回主输入框并弹出「编辑失败，内容已退回主输入框」提示；主输入框已有内容时不回填，仅提示编辑失败。</p>
+<h3>设置面板里找不到「繁忙时 Enter 键行为」</h3>
+<p>正常——插件接管后该设置行被隐藏，Enter 行为固定为绿色排队（旧偏好不会在隐藏的设置行背后继续生效）。</p>
+<h3>冻结后排队消息消失了</h3>
+<p>正常——冻结会把队列保存到插件内存（从等待区移除），恢复后重新出现。刷新页面会丢失冻结队列，请避免冻结后刷新。</p>
+<h3>上移/下移按钮不可用</h3>
+<p>队列中含图片等非文本消息时，排序会禁用（图片消息无法重发）。打回输入框编辑同理。</p>
+<h3>打断/插话按钮不可用</h3>
+<p>智能体空闲（未运行）时红黄两档禁用——空闲时消息本来就会被立即处理，无需规划。</p>
+<h2>卸载</h2>
+<pre><code>dsh plugin --profile web remove dsh-input-traffic
+</code></pre>
+<p>卸载后重启 dsh web，即恢复官方 queue dock 与「繁忙时 Enter 键行为」设置行。</p>
+<h2>兼容性与隐私</h2>
+<ul>
+<li>需要已安装 DeepSeek Harness 并使用 web profile；在 Windows / macOS / Linux 的 dsh web 上验证。</li>
+<li>插件为纯浏览器侧（client）插件，所有操作均通过 dsh 现有 RPC（<code>session.prompt</code> / <code>session.updateQueue</code> / <code>session.cancel</code>）完成，<strong>不改动任何官方源码</strong>。</li>
+<li>插件不读取、不上传任何会话内容以外的数据；冻结队列仅保存在本机浏览器内存。</li>
+<li>类型契约在 <code>src/types/contracts.d.ts</code> 本地声明（npm 上 dsh client 包链不完整），构建时以 harness 源码核实为准。</li>
+</ul>
+<h2>架构</h2>
+<pre><code>src/
+├── index.ts                  # node half（loader 行入口，空 apply）
+├── invariant.ts              # 接管不变量说明
+├── types/contracts.d.ts      # @deepseek-ai/* 平台面本地类型声明
+└── client/
+    ├── index.ts              # browser half apply：busyEnter 固定 queue + 三处 slot 注册
+    ├── steer-queue-dock.tsx  # 三档规划等待区（shadowing conversation.input.dock id queue）
+    ├── freeze-button.tsx     # 冻结/恢复按钮（conversation.input.right）
+    ├── freeze-store.ts       # 冻结状态共享 store（composer 按钮 ↔ dock 横幅）
+    ├── hide-enter-row.tsx    # 设置行隐藏（shadowing settings.general.item id composer-enter）
+    ├── locales.ts            # steer 字典（zh/en）
+    └── *.module.css
+</code></pre>
+<ul>
+<li><strong>slot shadowing</strong>：list 型 slot 同 id + 更低 priority（-1）覆盖官方条目（QueueDock、EnterBehaviorRow）。</li>
+<li><strong>构建链</strong>：tsdown 复制 harness <code>packages/client/tsdown.client.ts</code> 语义（<code>__ModuleLoader__.load</code> banner、CSS Modules lightningcss 内联、平台模块 external 表、bundle purity gate）。</li>
+<li><strong>消费方契约</strong>：<code>conversation.updateQueue / cancel / send / input.for(actx).notify / actions.setDraft</code>（官方 ui-conversation service，api-proxy.ts 核实）。</li>
+<li><strong>编辑区自动扩展</strong>：<code>resizeEditor</code>（steer-queue-dock.tsx 导出的纯函数）把 textarea 高度重置后按 <code>scrollHeight</code> 生长，CSS <code>max-height</code> 封顶后内部滚动。</li>
+</ul>
+<h2>真实环境验证（Windows，2026-08-17）</h2>
+<p><code>dsh web</code> 真实启动后浏览器端到端验证，全程控制台零应用错误：</p>
+<table>
+<thead>
+<tr>
+<th>验证项</th>
+<th>结果</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>插件装配</td>
+<td>组合树含 <code>input-traffic</code> 行；插件页签「已挂载已启用」；<code>/plugins/dsh-input-traffic/client.js</code> 200</td>
+</tr>
+<tr>
+<td>设置行隐藏</td>
+<td>设置面板「繁忙时 Enter 键行为」行不存在（DOM 全量搜索零匹配）</td>
+</tr>
+<tr>
+<td>红色 now</td>
+<td>打断后消息立即被处理：agent 明确回复被打断消息并继续；无滞留中间态</td>
+</tr>
+<tr>
+<td>黄色 next + 绿色撤回</td>
+<td>插话后点绿收回排队，消息回到等待区</td>
+</tr>
+<tr>
+<td>冻结 / 恢复</td>
+<td>当前轮次自然完成不打断、队列冻结保存、横幅提示；恢复后 FIFO 全部处理完成</td>
+</tr>
+<tr>
+<td>队列编辑（多行 / 失败退回）</td>
+<td>组件测试覆盖（32 项全绿）；真实环境复核待做</td>
+</tr>
+</tbody></table>
+<h2>参考</h2>
+<ul>
+<li><a href="https://github.com/drscrewdriver/dsh-input-traffic/blob/HEAD/dsh-plugin-creation-convention.md">dsh-plugin-creation-convention.md</a>（workspace 根部）——本插件遵循的 dsh 插件创建流程规约</li>
+<li>语义参考：<a href="https://github.com/yimeng-dev/dsh-traffic-light">dsh-traffic-light</a>（Session 运行状态红绿灯提示）</li>
+<li>harness 锚点：<code>packages/client/AGENTS.md</code>、<code>packages/client/tsdown.client.ts</code>、<code>packages/client/web/src/platform.ts</code>、<code>packages/bundle/web-app/cordis.patch.yml</code>、<code>packages/client/ui-conversation/src/client/queue/QueueDock.tsx</code>、<code>packages/host/apiproxy/src/api-proxy.ts</code></li>
+</ul>
+<h2>License</h2>
+<p>MIT</p>

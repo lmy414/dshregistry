@@ -1,0 +1,45 @@
+<h1>dsh-wending-git-workbench</h1>
+<p>外部 dsh Web GUI 插件：在官方输入选择器行提供分支入口，并打开 Codex 风格 Git 工作台。工作台覆盖更改列表、文本 diff、暂存/取消暂存、提交、<code>fetch</code>、<code>pull --ff-only</code>、<code>push</code>、分支切换与提交图谱。入口优先挂在 <code>conversation.input.selector.context</code>；若运行 shell 未声明该槽位，等待 <code>CONTEXT_FALLBACK_MS</code> 后回退到 <code>conversation.input.dock</code>。所有 Git 操作仅能作用于 DSH 已注册工作区，参数通过 argv 数组执行，不修改 Harness 源码。</p>
+<p>行为对齐 ZCode 的 <code>GitBranchSwitcher</code>：可搜索弹层、当前项打勾、「创建并检出新分支… / Git 图谱」底部操作、切换守卫（未解决冲突 / 进行中操作 / 目标分支被其他 worktree 检出）与可读报错。</p>
+<h2>仓库布局与构建</h2>
+<p>本插件仅依赖 npm 发布的 <code>@deepseek-ai/*</code> 官方 SDK，不要求 DeepSeek Harness 源码 checkout，也不会向官方仓库写入任何产物。类型门是 <code>pnpm run typecheck</code>。</p>
+<pre><code>pnpm install
+pnpm run typecheck   # tsc -b（含 sibling 引用项目）
+pnpm test            # vitest（core 纯函数 / 真实 git 服务 / jsdom 组件）
+pnpm run build       # tsc -b &amp;&amp; tsdown（lib/index.js + lib/invariant.js + lib/client.js）
+</code></pre>
+<p><code>lib/client.js</code> 是浏览器 bundle，由 host 的 client-modules 伺服；浏览器构建统一复用仓库根部 <code>shared/tsdown.client.ts</code>。</p>
+<p>独立包的 Git 安装可走 <code>prepare</code> 脚本：<code>tsdown --config tsdown.prepare.config.ts</code> 从 src 直接 transpile，不做类型检查（<code>tsconfig.prepare.json</code> 自包含）。本 monorepo 子包安装使用下文的 <code>link:</code> 机制。</p>
+<h2>激活</h2>
+<p>本包是 dsh profile bundle（<code>package.json</code> 声明 <code>"dsh": { "bundle": { "patch": "./cordis.patch.yml" } }</code>）。激活后重启对应 profile，bundle patch 会装入 host Git 服务、<code>/git/*</code> 路由和浏览器入口；进入已有会话后，可在输入框工具栏看到分支按钮。</p>
+<h3>当前分支安装</h3>
+<p>当前硬化版尚未发布到 npm，使用官方 <code>link:</code> 插件机制安装：</p>
+<pre><code>git clone https://github.com/dd2673/dsh-web-ui.git
+cd dsh-web-ui
+pnpm install &amp;&amp; pnpm -r build
+dsh plugin --profile &lt;独立测试 profile&gt; add link:$(pwd)/packages/dsh-git-graph
+</code></pre>
+<blockquote>
+<p><code>github:</code> 安装方式适用于包位于仓库根部的独立仓库（<code>prepare</code> 脚本自包含构建；pnpm ≥10 首次会被拒绝，需按报错提示把包 key 加进 profile 的 <code>pnpm-workspace.yaml</code> <code>allowBuilds</code> 后重试）。monorepo 内的子包请用上面的 <code>link:</code> 方式。</p>
+</blockquote>
+<h3>本地开发循环（本仓库 checkout）</h3>
+<pre><code>dsh plugin --profile &lt;name&gt; add link:/absolute/path/to/dsh-git-graph
+</code></pre>
+<p><code>link:</code> 安装直接引用本地目录，重建后立即生效、无需重装（改完 <code>pnpm run build</code> 后刷新页面即可）。注意 <code>link:</code> 后跟的是绝对路径（<code>~</code> 由 shell 展开，不是 pnpm 语义）。</p>
+<h2>卸载</h2>
+<pre><code>dsh plugin --profile &lt;profile&gt; remove dsh-wending-git-workbench
+</code></pre>
+<h2>设计要点</h2>
+<ul>
+<li>边界与加载链调研、关键决策见 <a href="https://github.com/dd2673/dsh-wending-git-workbench/blob/HEAD/docs/ADR-001-plugin-boundary.md">docs/ADR-001-plugin-boundary.md</a>。</li>
+<li>host half 的 <code>/git/*</code> 只接受已注册 workspace 的路径（realpath 校验），浏览器无法对任意目录执行 git。</li>
+<li>切换语义是工作区级：<code>git switch --no-guess &lt;branch&gt;</code> 作用于 repoRoot 磁盘树，影响该工作区所有会话；项目切换 = 激活目标工作区并打开其（复用或新建的）空白会话，不给既有会话换 cwd。</li>
+<li>挂载 seam：<code>conversation.input.selector.context</code>（官方声明的 session-maybe list 槽位）——输入选择器行的 context 洞，与官方工作区胶囊并排；hero（空白会话）与 active 会话相位都有分支胶囊；无会话 cwd 或非 git 工作区时分支 chip 自行隐藏。声明感知 + 回退：等待该槽位声明 <code>CONTEXT_FALLBACK_MS</code>（npm SDK rc.6 的 shell 已删除此声明），超时未声明则改挂 <code>conversation.input.dock</code>（session 相位才挂载，hero 无座位——rc.6 上接受的降级）；只挂一个座位，回退后迟到的 context 声明被忽略。</li>
+<li>工作区选择不在此插件内：官方工作区胶囊（<code>conversation.input.selector.workspace</code>）是唯一入口，本插件只提供 git 分支上下文。</li>
+<li>分支状态刷新：挂载/弹层打开/切换成功后拉取 + host SSE（<code>/git/events</code>，订阅期间每 2s 轮询 workspace 状态）推送外部变更 + window focus 刷新。</li>
+</ul>
+<h2>检查链</h2>
+<pre><code>pnpm run typecheck
+pnpm test
+pnpm run build
+</code></pre>

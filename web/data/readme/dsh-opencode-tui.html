@@ -1,0 +1,99 @@
+<h1>dsh-opencode-tui</h1>
+<p>让 <a href="https://github.com/deepseek-ai/deepseek-harness">DeepSeek Harness (dsh)</a> 使用
+<strong>opencode 原版 TUI</strong>：直接复用 opencode 的终端界面（会话列表、消息流、工具卡片、
+thinking 折叠、鼠标与主题全部由 opencode 原版提供），Agent/会话/工具/权限则由 dsh 驱动。</p>
+<h2>架构</h2>
+<p>opencode 的 TUI 是纯 HTTP 客户端：它通过一组 REST 端点（旧路径 <code>/session</code>、
+<code>/config/providers</code>、<code>/global/event</code> 等 + v2 <code>/api/*</code>）与 SSE 事件流与 server 通信。
+本仓库实现了一个 <strong>opencode server 协议兼容层</strong>，跑在 dsh 插件进程内，把 TUI 的
+请求映射到 dsh 的 agent/会话；TUI 二进制则是 opencode 官方仓库（anomalyco/opencode，
+dev 分支）界面代码的<strong>精简版</strong>（<code>tui/</code>）：只保留 TUI 及其直接依赖
+（tui/ui/plugin/sdk/core/schema/llm 等包），并裁剪 CLI 为仅直连模式；品牌已改为
+DSH（首页 Logo、侧边栏、提示与退出画面）。</p>
+<pre><code>┌──────────────────────────────────────────────────────────┐
+│ dsh --profile dsh-opencode-tui（Node 进程）               │
+│  插件 plugin.ts：                                         │
+│    ├─ src/oc-server.ts（薄主类：HTTP 生命周期+路由分发）  │
+│    │    ├─ src/session-store.ts（会话存储/SSE/模型选择）  │
+│    │    ├─ src/event-mapper.ts（DSH 事件→opencode 事件）  │
+│    │    ├─ src/routes/（api.ts v2 / legacy.ts 旧协议）    │
+│    │    └─ src/{types,projection,oc-proto,http-util}.ts   │
+│    └─ src/agent.ts（AgentManager → dsh agent 会话）       │
+└──────────────────────┬─────────────────────────────────────┘
+                       │ OPENCODE_URL=http://127.0.0.1:&lt;port&gt;
+┌──────────────────────▼─────────────────────────────────────┐
+│ tui/ lildax（opencode 界面精简版，DSH 品牌，直连兼容层）    │
+└────────────────────────────────────────────────────────────┘
+</code></pre>
+<p>DSH 事件（<code>session/event</code>）→ opencode 事件（<code>message.updated</code> /
+<code>message.part.updated</code> / <code>session.status</code>）→ SSE 推给 TUI，驱动消息流、
+thinking 折叠与工具卡片的实时渲染。</p>
+<h2>使用</h2>
+<pre><code># 唯一入口：dsh 标准启动方式
+dsh --profile dsh-opencode-tui
+</code></pre>
+<p>要求：</p>
+<ul>
+<li><code>dsh-opencode-tui</code> profile 已安装本包（<code>dsh plugin --profile dsh-opencode-tui add &lt;本仓库路径&gt;</code>）</li>
+<li>opencode TUI 二进制：默认找 <code>tui/packages/cli/dist/cli-linux-x64/bin/lildax</code>
+（本仓库）或 <code>$DSH_HOME/tui/...</code> 同路径，缺失时按报错提示构建：
+<code>cd tui/packages/cli &amp;&amp; bun run script/build.ts</code></li>
+</ul>
+<p>配置（profile 的 <code>config</code>）：</p>
+<ul>
+<li><code>binary</code>：lildax 路径</li>
+<li><code>preset</code>：agent preset id（默认 roster 默认）</li>
+<li><code>cwd</code>：工作目录（默认进程 cwd）</li>
+<li><code>serverPort</code>：兼容层端口（默认随机；可用环境变量 <code>DSH_OPENCODE_TUI_SERVER_PORT</code>）</li>
+<li><code>args</code>：透传给 TUI 的附加参数</li>
+</ul>
+<p>会话与消息全部存在 DSH 的会话存储（<code>DSH_OPENCODE_SESSION_ROOT</code> 可重定向，
+默认与 dsh web 互通）。Ctrl+C 退出对话框默认选 No（防误退），Tab 切到 Yes 后
+Enter 退出——这是 opencode 原版行为。</p>
+<h2>兼容层协议要点</h2>
+<p>TUI 实测请求（fork dev lildax）：</p>
+<ul>
+<li>启动（sync bootstrap，旧 + v2 混合）：<code>/path</code> <code>/project/current</code>
+<code>/config/providers</code> <code>/provider</code> <code>/experimental/*</code> <code>/agent</code> <code>/config</code>
+<code>/session</code> <code>/global/event</code>(SSE) <code>/command</code> <code>/lsp</code> <code>/mcp</code> <code>/formatter</code>
+<code>/session/status</code> <code>/provider/auth</code> <code>/vcs</code> + <code>/api/health</code> <code>/api/location</code>
+<code>/api/agent</code> <code>/api/integration</code> <code>/api/model</code> <code>/api/provider</code> <code>/api/reference</code>
+<code>/api/command</code> <code>/api/skill</code></li>
+<li>发送消息：<code>POST /session</code> → <code>POST /session/:id/message</code>
+（body <code>{parts: [{type:"text", text}]}</code>，响应 <code>{info, parts}</code>）</li>
+<li>消息列表：<code>GET /session/:id/message</code>（<code>[{info, parts}]</code>）</li>
+<li>事件流：<code>GET /global/event</code>（SSE，data 为 v2 GlobalEvent 信封
+<code>{directory, payload: {type, properties}}</code>；事件含 <code>message.updated</code> /
+<code>message.part.updated</code> / <code>session.status</code> / <code>session.updated</code> /
+<code>permission.asked</code> / <code>permission.replied</code>）</li>
+<li>旧路径 404 时 TUI 用 <code>gracefulFetch</code> 兜底（<code>/config/providers</code> <code>/provider</code>
+<code>/agent</code> <code>/config</code> 有默认值），其余 404 按 TUI 容错处理</li>
+</ul>
+<p>消息格式必须严格对齐旧 SDK 类型（<code>UserMessage</code>/<code>AssistantMessage</code> 无
+<code>content</code> 字段，需要 <code>agent</code>/<code>model</code>/<code>parentID</code>/<code>mode</code>/<code>path</code>/<code>cost</code>/<code>tokens</code>
+等），否则会话页渲染崩溃（TUI 弹崩溃对话框）。</p>
+<p>启动时从 DSH 持久层重建历史会话（<code>hydrate</code>，<code>ses_&lt;sha1&gt;</code> 稳定 id），打开历史
+会话发消息会 resume 原 DSH 会话继续。审批走 v2 <code>PermissionRequest</code>：
+DSH <code>approval/request</code> → <code>permission.asked</code> 事件 → TUI 权限对话框 →
+<code>POST /permission/:requestID/reply</code>（<code>{reply: "once"|"always"|"reject"}</code>）。</p>
+<h2>测试</h2>
+<p><code>scripts/</code> 下的 pty 测试（python + term_responder 应答器）：</p>
+<ul>
+<li><code>pty-test13.py</code>：文本回复端到端（发送 → DSH agent 回复 → TUI 渲染）</li>
+<li><code>pty-test14.py</code>：工具调用端到端（bash → 输出渲染）</li>
+<li><code>pty-test15.py</code> / <code>pty-test16.py</code>：审批对话框（触发 → 对话框 → Enter 批准 → 工具执行）</li>
+<li><code>pty-test18.py</code>：提问对话框完整流程（agent askUserQuestion → 选择 → DSH 收到答案）</li>
+<li><code>pty-test19.py</code>：Tab 切换权限模式 agent（read-only / workspace-write / full-access）</li>
+<li><code>pty-test20.py</code>：工具轮多思考块重启后保持独立（hydrate 回归）</li>
+<li><code>pty-test22.py</code>：会话删除（DELETE /session/:id → 列表/磁盘工件移除）</li>
+<li><code>test-blocks-*.mjs</code> / <code>test-tool-state.mjs</code> / <code>test-user-dedup.mjs</code>：兼容层单元测试</li>
+<li><code>term_responder.py</code>：OpenTUI 终端查询应答（<code>threaded=False</code> 时同步模式，
+与捕获主循环共用 fd，避免多 reader 竞争死锁）</li>
+<li><code>tools/</code>：调试工具（miniterm 屏幕模拟、extract-visible 文本提取、record-server 等）</li>
+</ul>
+<p>注意：</p>
+<ul>
+<li>沙箱 pty 的渲染限制：侧边栏区域、部分 flex 布局不渲染 → 屏幕断言优先用
+会话文件 / HTTP 响应（如 test20 用 GET /session/:id/message 验证 reasoning part）</li>
+<li>兼容层请求日志走 stderr（<code>[oc-server] ...</code>），诊断用</li>
+</ul>

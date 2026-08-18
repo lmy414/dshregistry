@@ -1,0 +1,147 @@
+<h1>dsh-auth-proxy</h1>
+<p>DSH Web GUI 的令牌鉴权反向代理插件：在 dsh web 前面加一道静态令牌登录墙。宿主侧在
+<code>127.0.0.1:&lt;port&gt;</code>（默认 8443）监听，未认证访问显示内置登录页，校验令牌后签发 HttpOnly
+会话 cookie，再把 HTTP 与 WebSocket 流量转发给回环 dsh webserver。<strong>零 DSH 源码改动</strong>：
+webserver 保持监听 <code>127.0.0.1:3080</code>，本插件持有对外 socket。</p>
+<pre><code>browser ──► auth proxy :8443 (127.0.0.1) ──► dsh webserver 127.0.0.1:3080
+                ├─ 未认证 → 内置登录页
+                ├─ POST 令牌 → HttpOnly 会话 cookie
+                └─ 已认证 → 转发 HTTP + WebSocket
+</code></pre>
+<h2>功能</h2>
+<ul>
+<li>内置登录页（POST <code>/__dsh_auth/login</code> 校验令牌），登出走 POST <code>/__dsh_auth/logout</code>。</li>
+<li>令牌比对使用 SHA-256 + <code>timingSafeEqual</code>，避免时序侧信道。</li>
+<li>会话 cookie：<code>HttpOnly; SameSite=Lax; Path=/</code>，<strong>永久有效</strong>（Max-Age 10 年）且<strong>无状态</strong>：
+值为 <code>payload.signature</code>（HMAC-SHA256，密钥由令牌派生），服务端不存会话，<strong>重启后 cookie 依然有效</strong>；
+<strong>更换令牌会使所有已登录会话立即失效</strong>（全体下线），登出仅清除客户端 cookie。</li>
+<li>IP 白名单（支持 CIDR，IPv4）可整体绕过令牌；失败登录锁定（按 IP，阈值与时长可配）。</li>
+<li>配置实时可改：Web UI「设置 &gt; 插件配置」卡片（走插件自有 <code>/api/dsh-auth-proxy/config</code>），
+无需改文件；对纯 HTTP 局域网地址自动注入 <code>crypto.randomUUID</code> polyfill，保证前端 RPC 可用。</li>
+<li>局域网地址可正常编辑 web-ui 设置（主题、语言、插件配置等）：dsh web 客户端按页面源判定回环，
+非回环来源会把设置面降级为只读；代理转发 HTML 时注入 loopback-compat 脚本，把
+<code>connection.isLoopback</code> 打开——与代理把 Host/Origin 改回回环后服务端按回环放行的事实一致，
+鉴权仍由本插件令牌墙把关。</li>
+<li>状态可视：宿主终端直接打印 <code>dsh-auth-proxy: listening on http://&lt;host&gt;:&lt;port&gt;</code>（console.log 镜像，
+dsh web 不把插件 <code>ctx.logger</code> 打到终端），设置卡片同样显示实际监听地址；通过 <code>accessUrls</code> 声明的
+入口地址（可含 HTTPS 域名）会展示在卡片与登录页，多域名场景一眼可知该用哪个 URL。</li>
+<li><strong>无 TLS，禁绑通配/公网</strong>：监听地址仅允许回环与内网（默认 <code>127.0.0.1</code>）；<code>0.0.0.0</code>、<code>::</code> 与公网 IP
+在保存与启动时都会被拒绝。外部访问请在前面挂 TLS 反向代理，回指本监听地址。</li>
+</ul>
+<h2>安装与卸载</h2>
+<p><code>dsh plugin</code> 把参数转发给 pnpm，在 profile 目录安装依赖，并按 <code>dsh.bundle</code> 声明自动把插件
+挂进 web profile roster（即 <code>cordis.patch.yml</code> 的 <code>auth-proxy</code> 行），无需额外激活步骤。</p>
+<p>安装（npm 发布版与 GitHub 直装二选一）：</p>
+<pre><code># npm 发布版
+dsh plugin --profile web add @wxyzh/dsh-auth-proxy
+
+# 或 GitHub 直装（固定 tag 版本）
+dsh plugin --profile web add github:wxyzh/dsh-auth-proxy#v0.1.0
+</code></pre>
+<p>本地开发用 link 方式（无需发布，直接挂源码目录）：</p>
+<pre><code>dsh plugin --profile web add link:&lt;abs 路径&gt;/dsh-auth-proxy
+</code></pre>
+<p>卸载（无论以哪种方式安装，都用包名）：</p>
+<pre><code>dsh plugin --profile web remove @wxyzh/dsh-auth-proxy
+</code></pre>
+<p>说明：<code>dsh plugin</code> 需要 pnpm 在 PATH 上；GitHub 直装时若 pnpm 拦截 <code>prepare</code> 构建脚本，
+按 CLI 提示在 profile 的 <code>pnpm-workspace.yaml</code> 添加 <code>allowBuilds</code> 键后重试。本插件是宿主 +
+浏览器双半插件：宿主侧 <code>src/index.ts</code>，浏览器侧 <code>src/client/</code>（设置卡片）。</p>
+<h2>配置</h2>
+<p>组合入口配置（<code>cordis.patch.yml</code>）：</p>
+<table>
+<thead>
+<tr>
+<th>字段</th>
+<th>默认</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>enabled</code></td>
+<td><code>true</code></td>
+<td>总开关</td>
+</tr>
+<tr>
+<td><code>host</code></td>
+<td><code>127.0.0.1</code></td>
+<td>监听地址（仅回环与内网；无 TLS，禁止 <code>0.0.0.0</code>/<code>::</code>/公网 IP）</td>
+</tr>
+<tr>
+<td><code>port</code></td>
+<td><code>8443</code></td>
+<td>对外监听端口</td>
+</tr>
+<tr>
+<td><code>targetHost</code></td>
+<td><code>127.0.0.1</code></td>
+<td>回环转发目标</td>
+</tr>
+<tr>
+<td><code>targetPort</code></td>
+<td><code>3080</code></td>
+<td>回环转发端口</td>
+</tr>
+<tr>
+<td><code>token</code></td>
+<td>见下</td>
+<td>共享访问令牌</td>
+</tr>
+<tr>
+<td><code>banner</code></td>
+<td><code>''</code></td>
+<td>登录页横幅文案</td>
+</tr>
+<tr>
+<td><code>allowedIps</code></td>
+<td><code>[]</code></td>
+<td>IP 白名单（如 <code>["127.0.0.1", "10.0.0.0/8"]</code>），空 = 一律要令牌</td>
+</tr>
+<tr>
+<td><code>accessUrls</code></td>
+<td><code>[]</code></td>
+<td>对外访问地址（可含 HTTPS 域名，多域名逗号分隔），仅用于展示</td>
+</tr>
+<tr>
+<td><code>maxFailures</code></td>
+<td><code>0</code></td>
+<td>失败锁定阈值（0 = 关闭锁定）</td>
+</tr>
+<tr>
+<td><code>lockoutMinutes</code></td>
+<td><code>15</code></td>
+<td>锁定时长（分钟）</td>
+</tr>
+</tbody></table>
+<p><strong>令牌</strong>：推荐用环境变量引用，不要把字面量写进配置：</p>
+<pre><code>token: !!js process.env.DSH_AUTH_TOKEN
+</code></pre>
+<p>安全默认：令牌为空或仍是占位符 <code>change-me</code> 时，<strong>代理保持禁用、绝不监听</strong>——只有配了真实令牌才会开放端口。</p>
+<p><strong>配置分层（改动前先读 <code>AGENTS.md</code>）</strong>：解析 = base 层（dsh-settings scope，无 settings 服务时
+退化为组合入口）+ 用户文件 <code>~/.dsh/dsh-auth-proxy.json</code>（<strong>文件层权威</strong>）。设置卡片只写该文件；
+文件层是唯一持久存储，重启生效。GET <code>/api/dsh-auth-proxy/config</code> 只回 <code>tokenSet</code> 布尔，永不回传令牌值。</p>
+<h2>安全说明</h2>
+<ul>
+<li>代理即网络边缘：<strong>不信任 <code>X-Forwarded-For</code></strong>（客户端可伪造，信任即白名单/锁定绕过），
+转发前剥离 <code>x-forwarded-for</code> / <code>x-real-ip</code>。</li>
+<li><strong>监听地址策略</strong>：无 TLS 意味着绑到通配（<code>0.0.0.0</code>/<code>::</code>）或公网 IP 会把明文令牌暴露到网络，
+因此默认 <code>127.0.0.1</code>，且仅接受回环与内网地址（<code>127/8</code>、<code>10/8</code>、<code>172.16/12</code>、<code>192.168/16</code>、<code>169.254/16</code>、
+<code>::1</code>）；保存（PUT）与启动（<code>sync()</code>）双重拒绝，日志与卡片会给出原因。外部访问请用 TLS 反向代理
+（nginx/Caddy 等）终止加密后回指 <code>127.0.0.1:8443</code>，<code>accessUrls</code> 里填对外域名。</li>
+<li>无 TLS：即使仅内网监听，令牌仍经明文 HTTP 传输，同网段可嗅探。这是为局域网 HTTP 可用性做的取舍；
+需要加密传输时请在前方套 TLS 终结。</li>
+<li>会话为<strong>无状态签名 cookie</strong>（HMAC 密钥派生自令牌，重启不失效）；<strong>无单点剔除能力</strong>——更换令牌即全体下线，
+登出仅清客户端 cookie；失败计数由定时清理兜底（每 30 分钟扫描，闲置超 1 小时的记录清除）。锁定为按 IP，IPv6 字面量（如 <code>::1</code>）不匹配 IPv4 白名单。</li>
+</ul>
+<h2>开发</h2>
+<ul>
+<li>构建：<code>npm run build</code>（<code>tsc</code> 出宿主侧 <code>lib/types/</code> + <code>tsdown</code> 出浏览器侧 <code>lib/client.js</code>）。</li>
+<li>类型检查：<code>npm run typecheck</code>。</li>
+<li>冒烟测试：<code>npm run smoke</code>（驱动构建产物，覆盖登录流程、XFF 伪造、热更新、重建、禁用）。</li>
+<li>仓库规则与安全不变式见 <code>AGENTS.md</code>；许可见 <code>LICENSE</code>（MIT）。</li>
+</ul>
+<h2>已知限制</h2>
+<ul>
+<li>会话永久有效且无状态（签名 cookie，重启不失效）；<strong>无单点剔除</strong>，改令牌即全体下线、登出仅清 cookie，属预期；失败计数表由定时清理兜底。</li>
+<li>当前目录已是 git 仓库（初始提交已建）。</li>
+</ul>

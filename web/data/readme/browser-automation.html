@@ -1,0 +1,440 @@
+<p><a href="https://github.com/JohnXu22786/browser-automation/blob/HEAD/README.zh.md">简体中文</a></p>
+<h1>Web Bridge — Browser Automation MCP Server (dsh plugin)</h1>
+<p>Web Bridge is an automation MCP server that uses a <strong>real browser</strong>. It gives agents a browser's eyes and hands: open web pages, read page structure, click, fill forms, take screenshots, and execute scripts. Its core mechanism is the <strong>accessibility-tree snapshot</strong> — rendering the page into a structured text tree with numbered interactive elements, so agents can interact with pages precisely without a vision model.</p>
+<ul>
+<li>Language: TypeScript (Node.js ≥ 20), communicating over the MCP protocol (stdio transport)</li>
+<li>Browser engines: Chromium / Firefox / WebKit (Chromium by default)</li>
+<li>Tool count: 22, all named with the <code>web_</code> prefix</li>
+</ul>
+<h2>Features</h2>
+<ul>
+<li><strong>Snapshot driven</strong>: <code>web_snapshot</code> produces an accessibility tree with reference numbers (ref), so elements can be clicked/filled precisely without guessing selectors</li>
+<li><strong>Real interactions</strong>: click, double-click, right-click, key combos, form filling, dropdown selection, hover, scroll, keyboard input</li>
+<li><strong>Visual capabilities</strong>: viewport / full-page / element screenshots (PNG/JPEG), returned to the caller or saved locally</li>
+<li><strong>Script execution</strong>: run JS in the page context; results are sanitized (circular references, BigInt, NaN, etc. safely converted)</li>
+<li><strong>Multi-tab</strong>: create, list, switch, and close tabs; popups are captured automatically</li>
+<li><strong>Fine-grained waiting</strong>: wait by load state / element state / URL match / fixed duration</li>
+<li><strong>Session management</strong>: lazy browser startup, <code>web_shutdown</code> releases resources, automatic cleanup on disconnect</li>
+</ul>
+<h2>Installation</h2>
+<pre><code>npm install          # install dependencies
+npm run build        # compile to dist/
+npx playwright install chromium   # install browser engine (required on first use)
+</code></pre>
+<blockquote>
+<p>Firefox / WebKit engines are also supported: <code>npx playwright install firefox</code>, switchable via configuration.</p>
+</blockquote>
+<h2>Quick Start</h2>
+<p><strong>Option A: generic MCP client (stdio)</strong></p>
+<pre><code>{
+  "mcpServers": {
+    "web-bridge": {
+      "command": "node",
+      "args": ["D:/path/to/browser-automation/dist/index.js"]
+    }
+  }
+}
+</code></pre>
+<p><strong>Option B: command line verification</strong></p>
+<pre><code>node dist/index.js --help        # view usage
+echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"probe","version":"1"}}}' | node dist/index.js
+</code></pre>
+<p><strong>Option C: load as a dsh plugin (see next section)</strong></p>
+<h2>Installing in DSH</h2>
+<pre><code>dsh plugin --profile demo add github:JohnXu22786/browser-automation
+</code></pre>
+<p>Adds this plugin to the dsh <code>demo</code> profile from <code>github:JohnXu22786/browser-automation</code>. See the next section for authorization, loading, and lifecycle details.</p>
+<h3>Cordis bundle (dsh.bundle)</h3>
+<p>As an alternative to the <code>dsh-plugin.json</code> MCP-server manifest, the repo ships
+a Cordis bundle for hosts that consume <code>dsh.bundle</code> manifests: <code>package.json</code>
+declares <code>dsh.bundle.patch</code> → <code>cordis.patch.yml</code>, and <code>index.js</code> is the bridge
+a dsh profile loads. The bridge spawns the built MCP server
+(<code>node dist/index.js</code>) over stdio, performs the MCP handshake, and re-exposes
+the 22 <code>web_*</code> tools to the harness — the server itself is untouched.</p>
+<p>In a source checkout <code>dist/</code> is gitignored, so the bridge runs <code>npm run build</code>
+once on first load; installed npm packages ship <code>dist/</code> in their <code>files</code> list
+and need no build step. Profile-level settings map to the same
+<code>WEB_BRIDGE_*</code> environment variables described below.</p>
+<h2>dsh Plugin Integration</h2>
+<p>This plugin follows the dsh "everything is a plugin" convention and describes itself via the <code>dsh-plugin.json</code> manifest in the root directory:</p>
+<table>
+<thead>
+<tr>
+<th>Field</th>
+<th>Value</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>id</code></td>
+<td><code>dsh.web-bridge</code></td>
+<td>Unique plugin identifier</td>
+</tr>
+<tr>
+<td><code>kind</code></td>
+<td><code>mcp-server</code></td>
+<td>Plugin type: provides an MCP tool set</td>
+</tr>
+<tr>
+<td><code>entry</code></td>
+<td><code>dist/index.js</code></td>
+<td>Entry file (run with <code>node dist/index.js</code>)</td>
+</tr>
+<tr>
+<td><code>transport</code></td>
+<td><code>stdio</code></td>
+<td>Transport: MCP clients communicate with the plugin via stdin/stdout</td>
+</tr>
+<tr>
+<td><code>config.envPrefix</code></td>
+<td><code>WEB_BRIDGE_</code></td>
+<td>Plugin config is injected via environment variables with this prefix</td>
+</tr>
+<tr>
+<td><code>tools</code></td>
+<td>22 items</td>
+<td>Tool list exposed by the plugin (name + title)</td>
+</tr>
+</tbody></table>
+<p><strong>Harness loading flow</strong> (the dsh runtime integrates the plugin as follows):</p>
+<ol>
+<li>Scan the plugin directory, read <code>dsh-plugin.json</code>, validate <code>kind</code> / <code>entry</code> / <code>runtime</code>;</li>
+<li>Check that the Node version satisfies <code>runtime.minVersion</code>;</li>
+<li>Spawn the plugin process with <code>spawn('node', [entry])</code>, connecting stdin/stdout to the MCP protocol (JSON-RPC 2.0, line-delimited);</li>
+<li>Map harness config to environment variables injected into the child process according to <code>config.envPrefix</code> (e.g. <code>actionTimeout</code> → <code>WEB_BRIDGE_ACTION_TIMEOUT</code>);</li>
+<li>After the MCP client handshake (initialize / notifications/initialized / tools/list), the tools in the <code>tools</code> list enter the agent's tool set automatically; each tool's schema and permission description are provided by the plugin in the <code>tools/list</code> response;</li>
+<li>When the session ends or the process exits, the harness closes stdin and the plugin recycles the browser and exits automatically (see "Lifecycle").</li>
+</ol>
+<p>Any standard MCP client (that does not support manifest) can also connect directly as in Option A.</p>
+<h2>Configuration</h2>
+<p>Priority: defaults &lt; config file (<code>--config</code> or <code>WEB_BRIDGE_CONFIG</code>) &lt; environment variables.</p>
+<h3>Environment variables (prefix <code>WEB_BRIDGE_</code>)</h3>
+<table>
+<thead>
+<tr>
+<th>Variable</th>
+<th>Default</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>WEB_BRIDGE_BROWSER</code></td>
+<td><code>chromium</code></td>
+<td>Engine: <code>chromium</code> / <code>firefox</code> / <code>webkit</code></td>
+</tr>
+<tr>
+<td><code>WEB_BRIDGE_HEADLESS</code></td>
+<td><code>true</code></td>
+<td>Headless mode</td>
+</tr>
+<tr>
+<td><code>WEB_BRIDGE_VIEWPORT</code></td>
+<td><code>1280x720</code></td>
+<td>Viewport size, e.g. <code>1440x900</code></td>
+</tr>
+<tr>
+<td><code>WEB_BRIDGE_EXECUTABLE</code></td>
+<td>—</td>
+<td>Custom browser executable path</td>
+</tr>
+<tr>
+<td><code>WEB_BRIDGE_USER_DATA_DIR</code></td>
+<td>—</td>
+<td>User data directory (persistent context; login state survives across sessions)</td>
+</tr>
+<tr>
+<td><code>WEB_BRIDGE_PROXY</code></td>
+<td>—</td>
+<td>Proxy address, e.g. <code>http://proxy:3128</code></td>
+</tr>
+<tr>
+<td><code>WEB_BRIDGE_LOCALE</code> / <code>WEB_BRIDGE_TIMEZONE</code></td>
+<td>—</td>
+<td>Locale and browser timezone</td>
+</tr>
+<tr>
+<td><code>WEB_BRIDGE_USER_AGENT</code></td>
+<td>—</td>
+<td>Custom User-Agent</td>
+</tr>
+<tr>
+<td><code>WEB_BRIDGE_IGNORE_HTTPS_ERRORS</code></td>
+<td><code>false</code></td>
+<td>Ignore certificate errors (debug only)</td>
+</tr>
+<tr>
+<td><code>WEB_BRIDGE_SANDBOX</code></td>
+<td><code>true</code></td>
+<td>Browser sandbox; set to <code>false</code> when no sandbox in container</td>
+</tr>
+<tr>
+<td><code>WEB_BRIDGE_PERMISSIONS</code></td>
+<td>—</td>
+<td>Permissions granted to the context, comma-separated (e.g. <code>geolocation,clipboard-read</code>)</td>
+</tr>
+<tr>
+<td><code>WEB_BRIDGE_ACTION_TIMEOUT</code></td>
+<td><code>10000</code></td>
+<td>Per-action timeout (ms, <code>0</code> = unlimited)</td>
+</tr>
+<tr>
+<td><code>WEB_BRIDGE_NAV_TIMEOUT</code></td>
+<td><code>60000</code></td>
+<td>Navigation timeout (ms, <code>0</code> = unlimited)</td>
+</tr>
+<tr>
+<td><code>WEB_BRIDGE_SETTLE_MS</code></td>
+<td><code>500</code></td>
+<td>Wait for async tasks to settle after an action (ms)</td>
+</tr>
+<tr>
+<td><code>WEB_BRIDGE_STORAGE_STATE</code></td>
+<td>—</td>
+<td>Session restore file path (non-persistent mode only)</td>
+</tr>
+<tr>
+<td><code>WEB_BRIDGE_TEST_ID_ATTR</code></td>
+<td><code>data-testid</code></td>
+<td>Attribute name used by the <code>testid=</code> selector</td>
+</tr>
+<tr>
+<td><code>WEB_BRIDGE_CONFIG</code></td>
+<td>—</td>
+<td>Config file path</td>
+</tr>
+</tbody></table>
+<h3>Config file</h3>
+<pre><code>{
+  "browser": { "name": "chromium", "headless": true, "viewport": { "width": 1280, "height": 720 } },
+  "context": { "ignoreHTTPSErrors": false, "permissions": ["geolocation"] },
+  "timeouts": { "action": 10000, "navigation": 60000, "settle": 500 },
+  "sandbox": true,
+  "testIdAttribute": "data-testid"
+}
+</code></pre>
+<p>Start: <code>node dist/index.js --config web-bridge.config.json</code>.</p>
+<h2>Tool List</h2>
+<p>Full tool descriptions and <strong>permission notes</strong> are returned by MCP <code>tools/list</code>; key points are listed here.</p>
+<h3>Navigation</h3>
+<table>
+<thead>
+<tr>
+<th>Tool</th>
+<th>Description</th>
+<th>Permission impact</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>web_open</code></td>
+<td>Open a URL (supports <code>http/https/file/data</code>), optional wait strategy</td>
+<td>Makes real network requests and renders the page</td>
+</tr>
+<tr>
+<td><code>web_back</code> / <code>web_forward</code></td>
+<td>History back / forward</td>
+<td>Triggers navigation, may reload the page</td>
+</tr>
+<tr>
+<td><code>web_refresh</code></td>
+<td>Refresh current page</td>
+<td>Re-requests all page resources</td>
+</tr>
+</tbody></table>
+<h3>Interaction</h3>
+<table>
+<thead>
+<tr>
+<th>Tool</th>
+<th>Description</th>
+<th>Permission impact</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>web_click</code></td>
+<td>Click (ref/selector; supports button, double-click, modifier keys)</td>
+<td>Dispatches mouse events, may trigger navigation/submit/scripts</td>
+</tr>
+<tr>
+<td><code>web_fill</code></td>
+<td>Clear and fill an input/textarea</td>
+<td>Modifies form data, may trigger validation</td>
+</tr>
+<tr>
+<td><code>web_type</code></td>
+<td>Type keystrokes into the focused element</td>
+<td>Sends keyboard events</td>
+</tr>
+<tr>
+<td><code>web_press</code></td>
+<td>Press keys (Enter, Control+a, etc.)</td>
+<td>Sends keyboard events</td>
+</tr>
+<tr>
+<td><code>web_select</code></td>
+<td>Dropdown selection (by value or label)</td>
+<td>Modifies form data</td>
+</tr>
+<tr>
+<td><code>web_hover</code></td>
+<td>Hover (triggers menus/tooltips)</td>
+<td>Dispatches mouse-move events</td>
+</tr>
+<tr>
+<td><code>web_scroll</code></td>
+<td>Scroll page/element (up/down/left/right/top/bottom/into_view)</td>
+<td>Only changes scroll position</td>
+</tr>
+</tbody></table>
+<h3>Observation</h3>
+<table>
+<thead>
+<tr>
+<th>Tool</th>
+<th>Description</th>
+<th>Permission impact</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>web_snapshot</code></td>
+<td>Generate an accessibility-tree snapshot (ref numbers + state annotations)</td>
+<td>Read-only, no network requests</td>
+</tr>
+<tr>
+<td><code>web_screenshot</code></td>
+<td>Screenshot (PNG/JPEG, viewport/full-page/element, can save locally)</td>
+<td>Read-only page; <code>save_to</code> writes to caller-specified path</td>
+</tr>
+<tr>
+<td><code>web_status</code></td>
+<td>Session status: running state, tabs, current page</td>
+<td>Read-only</td>
+</tr>
+</tbody></table>
+<h3>Scripting and viewport</h3>
+<table>
+<thead>
+<tr>
+<th>Tool</th>
+<th>Description</th>
+<th>Permission impact</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>web_evaluate</code></td>
+<td>Run JS in the page context, returns sanitized result</td>
+<td><strong>High risk</strong>: can read/write page data, cookies, login state; can make network requests</td>
+</tr>
+<tr>
+<td><code>web_resize</code></td>
+<td>Resize the viewport</td>
+<td>Only changes the rendered viewport</td>
+</tr>
+</tbody></table>
+<h3>Tabs and session</h3>
+<table>
+<thead>
+<tr>
+<th>Tool</th>
+<th>Description</th>
+<th>Permission impact</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>web_tab_new</code></td>
+<td>Create a new tab (optional URL, optional activation)</td>
+<td>Creates a tab; may make network requests</td>
+</tr>
+<tr>
+<td><code>web_tab_list</code></td>
+<td>List all tabs</td>
+<td>Read-only</td>
+</tr>
+<tr>
+<td><code>web_tab_switch</code></td>
+<td>Switch the active tab</td>
+<td>Read-only</td>
+</tr>
+<tr>
+<td><code>web_tab_close</code></td>
+<td>Close a tab (current by default)</td>
+<td>Closes the tab; unsaved data is lost</td>
+</tr>
+<tr>
+<td><code>web_wait</code></td>
+<td>Wait: load / networkidle / selector / url / sleep</td>
+<td>Read-only</td>
+</tr>
+<tr>
+<td><code>web_shutdown</code></td>
+<td>Close the browser and clean up the session</td>
+<td>Closes the browser process; login state is lost</td>
+</tr>
+</tbody></table>
+<h2>Snapshot and ref Mechanism</h2>
+<p><code>web_snapshot</code> renders the page as an indented structured text, for example:</p>
+<pre><code>title: Demo Home
+url: http://localhost:8080/index.html
+tree:
+  banner
+    navigation
+      [1] link "首页"
+      [2] link "文档"
+  main
+    heading "欢迎来到演示站点" (level: 1)
+    form
+      [3] textbox "用户名" (placeholder: "请输入用户名")
+      [4] checkbox "记住我" (unchecked)
+      [5] button "提交表单"
+</code></pre>
+<ul>
+<li><code>[n]</code> is a <strong>reference number (ref)</strong>, assigned only to interactive elements (buttons/links/inputs/dropdowns/checkboxes, etc.);</li>
+<li>Subsequent <code>web_click</code> / <code>web_fill</code> / <code>web_select</code> calls can locate elements by <code>ref</code> (<code>ref: 3</code>), or by selector (<code>selector: "#username"</code>, <code>text=keyword</code>, <code>testid=value</code>);</li>
+<li>The snapshot shows states: <code>(checked/unchecked)</code>, <code>(disabled)</code>, <code>(selected)</code>, <code>(expanded/collapsed)</code>, <code>(password)</code>, <code>(value: ...)</code>, <code>(placeholder: ...)</code>;</li>
+<li>The <code>value</code> of password boxes is never shown;</li>
+<li>The <code>selector</code> parameter snapshots only a subtree, <code>max_depth</code> limits depth, and <code>max_nodes</code> limits the total node count (protects against token bombs).</li>
+</ul>
+<p><strong>ref is a positional path</strong> (determined by the DOM structure): after navigation, old refs automatically become invalid (reporting an error and asking for a re-snapshot); if the page script adds/removes DOM without navigation, old refs may resolve to other elements — re-snapshot if an operation fails.</p>
+<h2>Wait Strategies</h2>
+<p><code>web_open</code>'s <code>wait_until</code>: <code>commit</code> (request sent) → <code>domcontentloaded</code> (DOM ready) → <code>load</code> (resources loaded) → <code>networkidle</code> (network idle). Default is <code>load</code>.</p>
+<p>Actions wait for <code>settleMs</code> (500ms) by default so async tasks (navigation, requests) settle.</p>
+<h2>Permissions and Security Notes</h2>
+<ul>
+<li>This plugin is <strong>not a security boundary</strong>. <code>web_evaluate</code> can run arbitrary scripts, <code>web_open</code> can access any site, and <code>save_to</code> can write to any path — only use it in trusted environments, and configure per-tool permissions at the harness layer.</li>
+<li>Prefer least privilege: use <code>web_snapshot</code> for routine observation (zero network requests, zero side effects), <code>web_screenshot</code> when visual confirmation is needed, and only consider <code>web_evaluate</code> as a last resort.</li>
+<li>The browser process is managed by the plugin: client disconnect, <code>web_shutdown</code>, and SIGINT/SIGTERM all recycle the browser process.</li>
+<li>Headless mode is on by default; set <code>WEB_BRIDGE_HEADLESS=false</code> for visual debugging.</li>
+</ul>
+<h2>Known Limitations</h2>
+<ul>
+<li><strong>Shadow DOM / iframe content is not in snapshots</strong>: the walker only covers the regular DOM subtree of the main document; if the page hosts interactive elements inside shadow DOM, use <code>web_evaluate</code> or the page's own test hooks (<code>testid=</code>).</li>
+<li><strong>ref is a positional path</strong>: see "Snapshot and ref Mechanism" above.</li>
+<li><strong>Popups activate automatically</strong>: new tabs opened via <code>target=_blank</code> etc. automatically become the active page (the agent's intuitive click behavior); use <code>web_tab_list</code> + <code>web_tab_switch</code> to get other tabs back.</li>
+<li>The statement-sequence form of <code>web_evaluate</code> (multi-statement including function declarations) executes for side effects and returns no value; expression and function forms return results. Use the <code>async</code> function form for async logic.</li>
+</ul>
+<h2>Development and Testing</h2>
+<pre><code>npm run build          # compile with tsc to dist/
+npm test               # all tests (unit + browser integration + MCP protocol chain)
+npm run test:unit      # unit tests only (config/tool functions/snapshot format/walker)
+npm run test:integration  # browser integration tests only
+</code></pre>
+<p>Test coverage: config parsing, walker behavior, snapshot format, result sanitization, 16+ real browser integration scenarios (navigation/click/form fill/screenshot/tabs/history/wait/scroll/failure paths), and a real stdio process chain (including browser-recycle assertions after disconnect).</p>
+<h2>Project Structure</h2>
+<pre><code>src/
+  index.ts       entry: CLI args, config loading, startup of the MCP server
+  config.ts      config (three-level default/file/env merge and validation)
+  server.ts      MCP server assembly, error mapping, lifecycle cleanup
+  browser.ts     browser session: lazy start / tabs / ref table / shutdown
+  walker.ts      page-side accessibility-tree walker (single source shared by Node tests and the page)
+  snapshot.ts    snapshot orchestration, ref assignment, text formatting
+  scripting.ts   script execution and result sanitization
+  locators.ts    ref/selector resolution
+  util.ts        argument validation, URL validation, timeout error classification
+  tools/         22 tool implementations (grouped by responsibility)
+  registry.ts    tool registry
+index.js          dsh Cordis bundle bridge (spawns dist/index.js over stdio)
+cordis.patch.yml  dsh bundle install row (id: web-bridge, name: web-bridge-mcp)
+dsh-plugin.json  plugin manifest (see README for dsh harness integration)
+test/           tests and fixtures
+</code></pre>
+<h2>License</h2>
+<p><a href="https://github.com/JohnXu22786/browser-automation/blob/HEAD/LICENSE">MIT</a></p>

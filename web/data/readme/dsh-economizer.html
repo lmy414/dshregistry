@@ -1,0 +1,166 @@
+<h1>dsh-economizer</h1>
+<p>A token-saving preset for DeepSeek Harness (dsh): tools / MCP / skills load on demand, schemas are injected at the tail of the conversation, and the tools array never changes - so the prefix cache stays valid from start to finish.</p>
+<p><a href="https://github.com/wings1848/dsh-economizer/blob/HEAD/LICENSE"><img src="https://img.shields.io/badge/License-MIT-yellow.svg" alt="License: MIT"></a>
+<a href="https://github.com/wings1848/dsh-economizer/actions/workflows/ci.yml"><img src="https://github.com/wings1848/dsh-economizer/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+<a href="https://github.com/wings1848/dsh-economizer/blob/HEAD/tests/"><img src="https://img.shields.io/badge/tests-32%2F32%20recall%20%2B%2018%2F18%20blind-brightgreen.svg" alt="tests"></a>
+<a href="https://github.com/wings1848/dsh-economizer/blob/HEAD/package.json"><img src="https://img.shields.io/badge/dependencies-0-brightgreen.svg" alt="dependencies"></a></p>
+<p>Read this in <a href="https://github.com/wings1848/dsh-economizer/blob/HEAD/README-zh.md">简体中文</a>.</p>
+<h2>Introduction</h2>
+<p>By default, dsh stuffs every tool schema (core + MCP + delegation + web) into every single request. DeepSeek's API has no server-side tool search, so those schemas are tokens you pay for on every turn even when unused; the skill catalog adds another ~9KB per turn.</p>
+<p>What this preset does:</p>
+<ul>
+<li>keep a small set of core tools resident, plus a name-only catalog of everything else (the skill catalog lists names only, no descriptions);</li>
+<li>when the model needs a tool, <code>tool_search</code> / <code>tool_load</code> inject the full schema at the tail of the conversation, and the model calls it by name;</li>
+<li>the tools array is fixed from boot, so the prefix cache never invalidates no matter how much you load - that's the main difference from "naive on-demand loading".</li>
+</ul>
+<p>Measured on the author's machine (67 tools):</p>
+<table>
+<thead>
+<tr>
+<th>Metric</th>
+<th>Result</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>Tool schemas per request</td>
+<td>67 down to 26 (after loading 7), 16,443 down to 6,342 tokens</td>
+</tr>
+<tr>
+<td>New-session startup</td>
+<td>~67% saved (the ~9KB/turn full skill catalog is gone, replaced by a tens-of-tokens name-only list in system)</td>
+</tr>
+<tr>
+<td>Loading tools</td>
+<td>0 cache invalidations</td>
+</tr>
+</tbody></table>
+<p>The more tools you have, the more you save; the mechanism is environment-agnostic. Design and experiment data are in <a href="https://github.com/wings1848/dsh-economizer/blob/HEAD/docs/tool-search-deferred-load.md">the docs</a>.</p>
+<h2>Installation</h2>
+<p>The repo itself is a complete preset directory - no install scripts. Two options, <strong>pick one</strong> (don't use both).</p>
+<p>Option A: per-session opt-in (recommended)</p>
+<pre><code>git clone https://github.com/wings1848/dsh-economizer ~/.dsh/.agent-presets/dsh-economizer
+</code></pre>
+<p>Launch dsh (<code>dsh web</code> or <code>dsh tui</code>), and in a new session pick <strong>省钱模式</strong> in the Agent preset picker. The choice is remembered, so future new sessions default to it. The directory name <code>dsh-economizer</code> is the preset's fixed id - don't rename it.</p>
+<p>Option B: global, one command</p>
+<pre><code>dsh plugin --profile web add https://github.com/wings1848/dsh-economizer
+</code></pre>
+<p>The repo declares <code>dsh.bundle</code>, so dsh automatically adds it to the web profile's bundle layer stack and rewrites the config - no manual editing. All web sessions get the savings.</p>
+<p>To verify the install (optional): run <code>await ctx.agentPresets.standingKeyFor('dsh-economizer')</code> inside dsh; a clean return means the preset is usable.</p>
+<p>To uninstall Option A, just remove the <code>~/.dsh/.agent-presets/dsh-economizer</code> directory. See <a href="https://github.com/wings1848/dsh-economizer/blob/HEAD/docs/installation.md">the installation doc</a> for details.</p>
+<h2>Usage</h2>
+<p>After installing, just chat normally - nothing special to do. The model sees the tool catalog and will search, load, and call tools on its own when needed. You can also steer it manually:</p>
+<pre><code>tool_search("browser automation")       # search deferred tools by capability; schemas injected
+tool_load(["mcp__chrome__click"])       # batch-load by exact name
+tool_load(["mcp__tavily-*"])            # wildcards work
+tool_load(scope="mcp:chrome-devtools")  # load a whole MCP server at once
+skill_search("obsidian")                # search skills
+skill_load("obsidian")                  # inject skill instructions
+</code></pre>
+<p>Search supports scope prefixes: <code>mcp:chrome</code>, <code>subagent:delegate</code>, <code>dsh:filesystem</code>. Each search returns at most 6 tools and at most 30 accumulate in total, so loading doesn't eat back the tokens you saved.</p>
+<h2>Architecture</h2>
+<p>The whole project is two source files: <code>src/deferred-load.mjs</code> (the plugin) and <code>src/matcher.mjs</code> (the search matcher, standalone module).</p>
+<pre><code>dsh tool registry (all tools, e.g. 67)
+        |  index rebuilt at boot and on tools/change
+        v
+┌──────────────────────────────────────────────────┐
+│ carried by EVERY request (the cache-stable core) │
+│   tools array: CORE(11) + GUARANTEED(8) full     │
+│   schemas, plus name-only stubs for deferred     │
+│   non-MCP tools                                  │
+│   system prompt: deferred-tool catalog; MCP      │
+│   folded to one line per server (not in array),  │
+│   plus a name-only skill catalog (tens of tokens)│
+└──────────────────────────────────────────────────┘
+        |  model needs a deferred tool
+        v
+tool_search("browser")  /  tool_load(scope="mcp:chrome")
+        |  matcher scores and picks tools; schemas are
+        |  appended to the conversation tail (agent.inject)
+        v
+┌──────────────────────────────────────────────────┐
+│ conversation tail gains one user message with the│
+│ full schemas; the tools array never changes      │
+│ -&gt; prefix cache stays valid; each tool injected  │
+│ exactly once, re-injected after compaction       │
+└──────────────────────────────────────────────────┘
+        |  next turn
+        v
+   model calls the tool by name; execution as usual
+</code></pre>
+<p>In short:</p>
+<ul>
+<li>At boot the plugin reads the tool registry once and computes the resident set: CORE (11) + GUARANTEED (8, things like <code>exit_plan_mode</code> that must never be deferred), plus name-only stubs for deferred non-MCP tools; MCP tools stay out of the array, folded into one catalog line per server. Registry changes trigger a rebuild - the tool list is never hardcoded. The skill catalog (names only, deterministically sorted, same source as <code>skill_search</code>) is computed lazily at the first assembly, <strong>per agent and with the agent scope</strong> (the skill registry is layered - an unscoped call only sees the global layer and would always come back empty), into a system constant section, so the model knows which skills exist - on a name match it runs <code>skill_search</code> for details, then <code>skill_load</code> to activate; skill changes trigger a rebuild.</li>
+<li>When <code>tool_search</code> / <code>tool_load</code> fire, the matcher scores and picks tools, and the schemas are appended to the conversation tail via <code>agent.inject</code>; the tools array doesn't move, the cache stays valid, and each tool is injected exactly once.</li>
+<li>After compaction, loaded tools and skills are re-injected automatically.</li>
+<li>Matcher v3: CJK-aware tokenization, substring/word-form matching, field weighting, cross-namespace de-duplication. Offline recall eval 32/32 (v2 was 19/32); blind test on 21 never-tuned tools: 18/18.</li>
+</ul>
+<h2>Notes</h2>
+<ul>
+<li>Pick one install option; using both double-registers <code>tool_search</code> / <code>skill_search</code>.</li>
+<li>This preset replaces the base preset's <code>dsh-tool-skill</code> (it provides equivalent <code>skill_search</code> / <code>skill_load</code>); don't mount it alongside liangshen's <code>tool-bootstrap.mjs</code> / <code>skill-search.mjs</code> - that would double-filter and double-register.</li>
+<li>Any error inside the plugin degrades to exposing all tools; a session can't be bricked. Deferred tools can always be called by name - a deliberate escape hatch.</li>
+<li>Host-side logic only, no platform APIs: identical behavior on Linux / macOS / Windows and across <code>dsh web</code> / <code>dsh tui</code>; multiple sessions sharing a process don't interfere.</li>
+</ul>
+<h2>Development</h2>
+<p>Zero dependencies, pure ESM, node &gt;= 18. All evals run offline; exit code 0 means pass:</p>
+<pre><code>npm run check     # syntax check
+npm test          # all three eval suites (the three below)
+node tests/eval-search.mjs           # recall@K: tools 32/32, skills 9/9
+node tests/eval-generalization.mjs   # generalization blind test 18/18 + compat regression 32/32
+node tests/eval-cache-stable.mjs     # cache-stability gate: determinism + keep-set + tools fingerprint + skill name-only catalog
+npm run test:compaction              # compaction re-injection gate
+</code></pre>
+<p>Read the ground rules in <a href="https://github.com/wings1848/dsh-economizer/blob/HEAD/AGENTS.md">AGENTS.md</a> before changing code. The three big ones: cache stability is the bottom line (never stuff schemas into the tools array); the deferred-tool list is never hardcoded; the matcher must not overfit the eval set - after changing matching rules, run the generalization blind test, and roll back if generalization and compatibility both drop. Eval fixtures come from real registry dumps; when adding matching rules, add cases in <code>tests/*.json</code> too.</p>
+<p>Layout:</p>
+<table>
+<thead>
+<tr>
+<th>Path</th>
+<th>What it is</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>src/deferred-load.mjs</code></td>
+<td>the plugin</td>
+</tr>
+<tr>
+<td><code>src/matcher.mjs</code></td>
+<td>matcher v3</td>
+</tr>
+<tr>
+<td><code>agent.cordis.yml</code> / <code>preset.yml</code></td>
+<td>preset composition and display name</td>
+</tr>
+<tr>
+<td><code>cordis.patch.yml</code></td>
+<td>patch for the bundle form</td>
+</tr>
+<tr>
+<td><code>tests/</code></td>
+<td>offline evals and fixtures</td>
+</tr>
+<tr>
+<td><code>scripts/extract.py</code></td>
+<td>per-step tool fingerprint + usage from real session logs</td>
+</tr>
+</tbody></table>
+<h2>Links</h2>
+<ul>
+<li>Repo: <a href="https://github.com/wings1848/dsh-economizer">https://github.com/wings1848/dsh-economizer</a></li>
+<li>Docs (<code>docs/</code>):<ul>
+<li><a href="https://github.com/wings1848/dsh-economizer/blob/HEAD/docs/tool-search-deferred-load.md">Design and mechanics</a>: full design, matcher evolution, measurements</li>
+<li><a href="https://github.com/wings1848/dsh-economizer/blob/HEAD/docs/search-matching.md">Search matching v3</a>: CJK / word-form / semantic layering + recall eval</li>
+<li><a href="https://github.com/wings1848/dsh-economizer/blob/HEAD/docs/optimization-cache-stable-loading.md">Cache-stable loading</a>: why injection-style loading keeps the cache</li>
+<li><a href="https://github.com/wings1848/dsh-economizer/blob/HEAD/docs/experiment-cache-hit.md">Cache-hit experiment</a>: old vs new mechanism, design + results</li>
+<li><a href="https://github.com/wings1848/dsh-economizer/blob/HEAD/docs/caching-and-skills.md">Caching and skills</a>: internals in plain language</li>
+<li><a href="https://github.com/wings1848/dsh-economizer/blob/HEAD/docs/installation.md">Installation</a> / <a href="https://github.com/wings1848/dsh-economizer/blob/HEAD/docs/configuration.md">Configuration</a> / <a href="https://github.com/wings1848/dsh-economizer/blob/HEAD/docs/architecture.md">Architecture</a> / <a href="https://github.com/wings1848/dsh-economizer/blob/HEAD/docs/troubleshooting.md">Troubleshooting</a> / <a href="https://github.com/wings1848/dsh-economizer/blob/HEAD/docs/compatibility.md">Compatibility</a></li>
+</ul>
+</li>
+<li><a href="https://github.com/wings1848/dsh-economizer/blob/HEAD/tests/README.md">tests/README.md</a>, <a href="https://github.com/wings1848/dsh-economizer/blob/HEAD/scripts/README.md">scripts/README.md</a>, <a href="https://github.com/wings1848/dsh-economizer/blob/HEAD/CHANGELOG.md">CHANGELOG.md</a></li>
+<li>Contributing: <a href="https://github.com/wings1848/dsh-economizer/blob/HEAD/CONTRIBUTING.md">CONTRIBUTING.md</a>; security: <a href="https://github.com/wings1848/dsh-economizer/blob/HEAD/SECURITY.md">SECURITY.md</a>; code of conduct: <a href="https://github.com/wings1848/dsh-economizer/blob/HEAD/CODE_OF_CONDUCT.md">CODE_OF_CONDUCT.md</a></li>
+</ul>
+<h2>Trends</h2>
+<p>Currently v0.1.0 (initial release). See <a href="https://github.com/wings1848/dsh-economizer/blob/HEAD/CHANGELOG.md">CHANGELOG.md</a> for history.</p>
+<p><a href="https://star-history.com/#wings1848/dsh-economizer&amp;Date"><img src="https://api.star-history.com/svg?repos=wings1848/dsh-economizer&amp;type=Date" alt="Star History Chart"></a></p>
+<h2>License</h2>
+<p><a href="https://github.com/wings1848/dsh-economizer/blob/HEAD/LICENSE">MIT</a> © 2026 wings</p>

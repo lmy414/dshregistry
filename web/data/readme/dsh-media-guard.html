@@ -1,0 +1,82 @@
+<h1>dsh-media-guard</h1>
+<p>Deterministic aggregate media budgets and safe request projections for <a href="https://github.com/deepseek-ai/deepseek-harness">DeepSeek Harness</a> (DSH).</p>
+<p><code>dsh-media-guard</code> keeps multimodal sessions usable when individually valid images become unsafe in aggregate. DSH admits images per message, then re-sends every historical image on every model call with no aggregate ceiling, no compression, and no image-capable compaction — so multi-turn image sessions accumulate until the provider rejects the request. Before every agent-loop model call this plugin inventories the request's image attachment references, compresses and deduplicates them by content address, and replaces media that still cannot fit the budget with factual text Evidence Notes. The durable session log and original attachment objects are never modified; successful compressed variants are added through DSH's immutable attachment store.</p>
+<p>This is the DSH port of <a href="https://github.com/spyfree/pi-media-guard">pi-media-guard</a>; the planner, fair-share math, evidence notes, and failure policy are shared line for line where the hosts allow.</p>
+<blockquote>
+<p><strong>Alpha:</strong> this line implements the ledger, planner, sharp-backed compression, budget-driven externalization, the <code>llm/stream</code> projection, and a local report UI. The GitHub repository is marketplace-discoverable through the <code>dsh-plugin</code> topic. The core request path is validated against <code>@deepseek-ai/dsh-*</code> 0.1.0-rc.6; the optional report route follows the rc.7 <code>webServer</code> seam. DSH itself is a developer preview and its APIs may still move.</p>
+</blockquote>
+<h2>How it works</h2>
+<ul>
+<li>Registers on the <code>llm/stream</code> waterfall and acts <strong>only on agent-loop-built requests</strong> (<code>isAgentLoopRequest</code>). Hand-built calls — vision bridges' VLM traffic, compaction, replay — pass through untouched, and so does the plugin's own projected re-dispatch, which terminates recursion.</li>
+<li>Accounting is <strong>zero-byte-cost</strong>: DSH image blocks carry content-addressed attachment references (<code>sha256:…</code>) with exact byte sizes and dimensions, so the ledger, dedup, and budget math never read image data. Only images selected for compression are read through <code>ctx.attachments</code>.</li>
+<li>Oversized images are constrained with this package's own sharp dependency, encoded as WebP, and saved back through <code>ctx.attachments.saveImage</code>. Variants are cached by source content address and target, so duplicates and later matching requests reuse the same stored ref.</li>
+<li>When the projection changes anything, a fresh request is dispatched via <code>ctx.llm.stream(...)</code> — the frozen loop-built request and the stored session are untouched; only the provider-bound view changes.</li>
+<li>If the projection itself fails, an intentionally simpler emergency path strips every image leaf. The guard never silently falls back to sending the oversized original.</li>
+</ul>
+<h2>Install</h2>
+<pre><code>dsh plugin --profile &lt;name&gt; add dsh-media-guard
+</code></pre>
+<p>Restart the profile afterwards. The bundle inserts a <code>media-guard</code> row; no configuration is required for the defaults.</p>
+<p>Installing straight from a git host (<code>dsh plugin --profile &lt;name&gt; add github:spyfree/dsh-media-guard</code>) builds <code>dist/</code> via the package's self-contained <code>prepare</code> script; pnpm ≥ 10 will ask you to allowlist that build in the profile's <code>pnpm-workspace.yaml</code> on first install, exactly as DSH's packaging guide describes.</p>
+<h2>Default behavior</h2>
+<ul>
+<li>Runs in <code>protect</code> mode before every agent-loop provider request.</li>
+<li>Applies a conservative default budget: 8 media blocks, 2 MiB serialized (Base64) / 1.5 MiB decoded aggregate, 512 KiB serialized per image.</li>
+<li>Preserves current-turn media before older media; user media before tool media.</li>
+<li>Deduplicates identical images by their content address; later copies become duplicate notes.</li>
+<li>Replaces overflow media leaves with deterministic Evidence Notes (hash, size, dimensions, origin, reason — no invented descriptions, no directives).</li>
+<li>Preserves message count, order, roles, ids, sources, and tool-call/result pairing.</li>
+<li>Emits a <code>media-guard/report</code> event after each guarded call and keeps a bounded, metadata-only in-memory history for the report UI; never logs or emits image bytes.</li>
+</ul>
+<p>The default budget is a safety policy, not a claim about any provider's maximum body size. Raise it per provider route with a <code>profiles</code> entry when your provider allows more.</p>
+<h2>Configuration</h2>
+<p>Override the plugin row from your profile's <code>cordis.patch.yml</code> with a flat
+patch entry targeting the row id (the same form DSH's own bundles use):</p>
+<pre><code>- id: media-guard
+  config:
+    mode: protect            # observe | optimize | protect
+    log: false               # true prints a one-line summary per projection
+    budget:
+      maxMediaBlocks: 8
+      maxSerializedMediaBytes: 2097152
+      maxDecodedMediaBytes: 1572864
+      maxSerializedBytesPerImage: 524288
+    profiles:                # keyed by the request's provider route id
+      my-vision-gateway:
+        maxSerializedMediaBytes: 12582912
+        maxDecodedMediaBytes: 9437184
+</code></pre>
+<p>A <code>profiles</code> entry is more specific than the top-level <code>budget</code>, so for the
+fields it declares it wins on its route even when both are set.</p>
+<p>Modes:</p>
+<ul>
+<li><code>observe</code>: inventory and report only;</li>
+<li><code>optimize</code>: compress but do not externalize;</li>
+<li><code>protect</code>: compress, then externalize overflow media (default).</li>
+</ul>
+<p><code>enabled: false</code> bypasses the guard entirely. Every config field is validated individually; an invalid value falls back to its protective default and is reported — a broken config can never widen a budget or switch the guard off.</p>
+<p>Unlike the Pi original there are no built-in provider profiles: DSH provider routes are deployment-defined, so every route gets the conservative default until you declare a profile for it.</p>
+<h2>Report UI</h2>
+<p>When the profile includes DSH's Web server (the normal <code>web</code> profile), open:</p>
+<pre><code>http://&lt;your-dsh-host&gt;:&lt;port&gt;/media-guard
+</code></pre>
+<p>The page shows process-lifetime totals and the 100 most recent guarded requests: pressure, image counts, serialized bytes, compression, externalization, and deduplication. It polls the read-only JSON endpoint at <code>/media-guard/api/reports</code> every two seconds. Both surfaces contain metadata only; report history is held in memory and resets when DSH restarts. In a headless profile the optional route is simply not registered, while the guard and <code>media-guard/report</code> event continue to work.</p>
+<h2>Marketplace discovery</h2>
+<p>The package declares its DSH bundle, server-plugin kind, optional Web-server peer, and privacy disclosure in <code>package.json</code>. The GitHub repository carries the <code>dsh-plugin</code> topic used by DSH marketplace scanners; after a push, topic-based marketplaces normally refresh it on their next indexing cycle. No install script is used—the official profile package flow builds and registers <code>cordis.patch.yml</code>.</p>
+<h2>Anonymous regression</h2>
+<p>The test suite reproduces the original four-image failure distribution:</p>
+<pre><code>1.82 MB + 0.74 MB + 1.21 MB + 2.80 MB = 6,567,972 Base64 bytes
+</code></pre>
+<p>Without a codec, <code>protect</code> brings the request under the default 2 MiB aggregate budget deterministically. The regression's deterministic codec keeps all four visual inputs available at 1,600,000 serialized bytes; the shipped sharp codec is separately tested against the same serialized-byte contract and always falls back to normal externalization when it cannot meet a target.</p>
+<h2>Development</h2>
+<p>Requires Node.js 22.19 or newer, matching DSH's own engines requirement.</p>
+<pre><code>npm install
+npm test
+npm run typecheck
+npm run lint
+npm run build
+</code></pre>
+<h2>Security and privacy</h2>
+<p>Plugins run with the user's full local permissions. Review code before installation. This plugin reads only compression candidates through DSH's verified attachment API, stores compressed variants through the same API, sends no telemetry, and never logs attachment contents, payloads, or credentials. Reports and diagnostics carry metadata only. Stored variants follow the attachment store's retention policy; the in-memory report history resets on restart.</p>
+<h2>License</h2>
+<p>MIT</p>

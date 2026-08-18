@@ -1,0 +1,131 @@
+<h1>dsh-hive</h1>
+<blockquote>
+<p>Turn DeepSeek Harness conversations into a hive: one conversation can send a task straight into another conversation, wake it up, and get the result back automatically — <strong>peer-to-peer conversations, not subagents.</strong></p>
+</blockquote>
+<p>This is a plugin for <a href="https://github.com/deepseek-ai/deepseek-harness">DeepSeek Harness</a> that exposes two model-facing tools:</p>
+<ul>
+<li><strong><code>list_sessions</code></strong> — list the conversations that are currently live in this process (id + status + cwd), so you can discover a target session id.</li>
+<li><strong><code>send_to_session</code></strong> — deliver a text message directly into another conversation and wake it. The target conversation starts a new turn immediately, in its own independent context.</li>
+</ul>
+<hr>
+<h2>Why not subagents?</h2>
+<p>DeepSeek Harness ships with a <code>subagent</code> system: a parent conversation forks a child agent that shares its context and dies when the task ends.</p>
+<p><code>dsh-hive</code> solves the opposite need: <strong>multiple independent, long-lived top-level conversations</strong> (each with its own context, tools, and history) that call each other directly, like colleagues.</p>
+<p>Typical flow: a "coordinator" conversation breaks work into subtasks and sends each one to a "worker" conversation via <code>send_to_session</code>. Each worker works in its own context — which can be long and messy without polluting the coordinator — and reports back only a short result summary when done. The coordinator wakes up automatically with the result and continues.</p>
+<hr>
+<h2>Features</h2>
+<ul>
+<li><strong>Wake on delivery</strong> — the target conversation starts a new turn the moment the message arrives.</li>
+<li><strong>Automatic result callback</strong> — when you send a task, the message automatically carries a "when done, send the result back to me" instruction (with your session id filled in). The receiver just follows it.</li>
+<li><strong>Task correlation</strong> — the callback instruction includes the first 40 characters of the task as a label; the receiver repeats that label in its reply, so the sender can tell which task each reply belongs to.</li>
+<li><strong>Send-and-yield</strong> — after a successful delivery the sender's current turn ends (<code>concludesTurn</code>), so it does not sit and wait for a reply it cannot see; the reply arrives as a new message in a later turn and wakes it.</li>
+<li><strong>No self-delivery</strong> — sending to your own session id is rejected with a clear error.</li>
+</ul>
+<hr>
+<h2>Installation</h2>
+<p>This is a DeepSeek Harness <strong>bundle</strong> (it declares <code>dsh.bundle</code> and ships a <code>cordis.patch.yml</code>), installed through <code>dsh plugin add</code> — the same workflow as the official "Package and install a plugin" tutorial. No manual editing of the harness checkout is required.</p>
+<blockquote>
+<p>This section is written so that <strong>another agent can perform the installation by following the steps literally</strong>.</p>
+</blockquote>
+<h3>Option A — install from the git repository</h3>
+<pre><code>dsh plugin --profile &lt;name&gt; add github:llluchy/dsh-hive
+</code></pre>
+<p>Details to be aware of when using the git source:</p>
+<ul>
+<li><p>A git install fetches <strong>sources</strong>, not built artifacts, so pnpm runs the package's <code>prepare</code> script (which transpiles <code>src/</code> into <code>lib/</code> with esbuild; every harness import is externalized and resolves at runtime from the installed harness — no sibling monorepo is assumed).</p>
+</li>
+<li><p><code>pnpm</code> ≥ 10 refuses to run a git dependency's build script until it is allowlisted. The first <code>add</code> points at the fix: copy the exact package key into the profile's <code>pnpm-workspace.yaml</code>, for example:</p>
+<pre><code>allowBuilds:
+  dsh-hive: true
+</code></pre>
+<p>then re-run the <code>add</code>. Treat this allowance as permission to execute the package's code at install time — only allow it if you trust the source, and pin a commit (<code>github:llluchy/dsh-hive#&lt;sha&gt;</code>).</p>
+</li>
+</ul>
+<h3>Option B — install prebuilt artifacts (no build permission needed)</h3>
+<p>Either publish to npm (with <code>lib/</code> built at publish time) and:</p>
+<pre><code>dsh plugin --profile &lt;name&gt; add dsh-hive
+</code></pre>
+<p>or ship a tarball:</p>
+<pre><code>pnpm pack            # produces dsh-hive-&lt;version&gt;.tgz
+dsh plugin --profile &lt;name&gt; add ./dsh-hive-&lt;version&gt;.tgz
+</code></pre>
+<p>The repository already ships a prebuilt <code>lib/index.js</code> and <code>lib/index.d.ts</code>, so the tarball installs without running any build.</p>
+<h3>Verify the layer</h3>
+<pre><code>dsh --profile &lt;name&gt; --dump-config
+</code></pre>
+<p>The output shows a <code>dsh-hive</code> layer containing:</p>
+<pre><code>- id: dsh-hive
+  name: dsh-hive
+</code></pre>
+<p>Then boot with <code>dsh --profile &lt;name&gt;</code> and, in any conversation, ask the agent to call <code>list_sessions</code> — it should return the live conversations.</p>
+<hr>
+<h2>Usage</h2>
+<h3>Send a task and get the result back (the main flow)</h3>
+<p>Tell the sender conversation:</p>
+<blockquote>
+<p>Call <code>list_sessions</code> to find the target conversation's id, then call <code>send_to_session</code> with that id and the task text.</p>
+</blockquote>
+<p>The sender delivers the task and ends its turn. The receiver wakes up, works in its own context, and — because the task message automatically carries the callback instruction — sends its result back with <code>send_to_session</code>. The sender is then woken by the reply in its next turn.</p>
+<h3>Send to several conversations at once</h3>
+<p>List the targets, then make several <code>send_to_session</code> calls in one planning round. All of them are delivered (the send-and-yield behaviour applies after the whole batch), and each reply arrives tagged with its own <code>完成的任务：…</code>-style task label.</p>
+<h3>Just notify, without expecting a reply</h3>
+<p>Pass <code>expectReply: false</code>. The message is delivered as-is, with no callback instruction appended. Use this when the message itself IS a reply (to avoid reply loops).</p>
+<hr>
+<h2>Tool reference</h2>
+<h3><code>list_sessions</code></h3>
+<p>Returns <code>{ ok, count, sessions: [{ id, status, cwd? }] }</code>.</p>
+<ul>
+<li>Only <strong>live</strong> conversations (loaded / running in this process) are listed. Cold conversations that were never opened are not listed, and cannot be targeted.</li>
+</ul>
+<h3><code>send_to_session</code></h3>
+<table>
+<thead>
+<tr>
+<th>Parameter</th>
+<th>Type</th>
+<th>Required</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>sessionId</code></td>
+<td>string</td>
+<td>yes</td>
+<td>Target conversation id (from <code>list_sessions</code>)</td>
+</tr>
+<tr>
+<td><code>message</code></td>
+<td>string</td>
+<td>yes</td>
+<td>The message body</td>
+</tr>
+<tr>
+<td><code>expectReply</code></td>
+<td>boolean</td>
+<td>no</td>
+<td>Whether to append the automatic callback instruction. Defaults to <code>true</code>. Set <code>false</code> when this message is itself a reply.</td>
+</tr>
+</tbody></table>
+<p>Returns <code>{ ok: true, deliveredTo, expectReply, senderId }</code> on success, or <code>{ ok: false, error }</code> with a descriptive message (empty fields, unknown session, or self-delivery).</p>
+<hr>
+<h2>How it works</h2>
+<pre><code>A: send_to_session(sessionId=B, message="task…")
+   └─ agents.get(B).followup(userMessage)   // deliver into B's next-turn inbox, wake B
+   └─ appends: "when done, send_to_session back to &lt;A&gt;, expectReply=false"
+   └─ concludesTurn                         // A's current turn ends (after the whole tool batch)
+
+B: wakes up, works in its own context
+   └─ send_to_session(sessionId=A, message="完成的任务：… result", expectReply=false)
+        └─ A wakes up in a new turn and sees the result
+</code></pre>
+<p>The underlying primitive is DeepSeek Harness's built-in <code>agents.get(id).followup(message)</code>. This plugin wraps it into model-callable tools and adds the callback convention on top.</p>
+<hr>
+<h2>Limitations</h2>
+<ol>
+<li><strong>Live-only targeting.</strong> <code>list_sessions</code> and <code>send_to_session</code> only see conversations that are currently live in the process. A conversation that has not been opened cannot be targeted. (Targeting cold sessions would require session-query + cold resume, which is intentionally out of scope.)</li>
+<li><strong>The callback is a soft convention.</strong> The receiver is instructed — not forced — to reply. It relies on the receiver following the instruction in the message (including setting <code>expectReply: false</code> on its reply). There is no hard state machine preventing reply loops.</li>
+<li><strong>No history or receipts.</strong> This plugin only delivers and wakes. It does not persist a message timeline, read receipts, or member rosters. A full group-chat layer (timeline, membership UI, persistence) is a separate concern.</li>
+</ol>
+<hr>
+<h2>License</h2>
+<p>MIT</p>

@@ -1,0 +1,155 @@
+<h1>dsh-reasoning-cn</h1>
+<p><a href="https://github.com/William123666/dsh-reasoning-cn/blob/HEAD/README.en.md">English</a></p>
+<p>让 <a href="https://github.com/deepseek-ai/deepseek-harness">DeepSeek Harness</a> 的思考过程（Web UI 中 Think 下拉框里的 reasoning 内容）尽量使用简体中文的插件。</p>
+<blockquote>
+<p>[!NOTE]
+这是一个非官方社区插件，与 DeepSeek 或 DeepSeek Harness 的维护方不存在隶属或背书关系。</p>
+</blockquote>
+<blockquote>
+<p>[!WARNING]
+翻译层会把完整的 reasoning 发送到你配置的 provider/model，并将成功的译文写入 session 日志、Web 回放以及后续模型上下文。reasoning 可能包含用户数据、工具返回内容、源代码、文件路径或意外的凭证。默认不启用翻译；只有在确认 provider 的数据保留政策、访问范围和费用后，才应显式设置 <code>translate: true</code>。</p>
+</blockquote>
+<p>采用两层设计：</p>
+<ol>
+<li><strong>引导层（steering）</strong>：在系统提示词中渲染一条 order-10 的语言指令段落，并在每个 turn 的第 1 步追加一条 <code>&lt;system-reminder&gt;</code> 用户消息重申该指令（压缩上下文后依然每 turn 生效）。模型配合时零成本、零延迟，原生用中文思考。</li>
+<li><strong>翻译层（translate）</strong>：挂接 <code>llm/stream</code> 瀑布的响应侧。模型思考是英文、日文或可识别的繁体中文（CJK 占比低于阈值，或命中日文/繁体特征）时，缓冲该 reasoning 块，调用廉价辅助模型（默认 <code>deepseek-official</code> 路由的 <code>deepseek-v4-flash</code>，非思考模式）整块翻译或转换为简体中文，再以翻译后的 delta 与重写过的 <code>block-end</code> 产出。共享汉字无法可靠区分简繁时会保守地保留原文。</li>
+</ol>
+<p>模型本身（DeepSeek、Claude 等）目前都没有"指定思考语言"的 API 参数，系统提示词对 agent 模式下的 reasoning 语言经常无效（见 <a href="https://github.com/deepseek-ai/DeepSeek-V3/issues/1240">DeepSeek-V3#1240</a>、<a href="https://github.com/anthropics/claude-code/issues/27051">claude-code#27051</a>）。引导层提高中文概率，翻译层兜底显示语言，两层互补。</p>
+<h2>行为细节</h2>
+<ul>
+<li><strong>失败降级（fail-open）</strong>：翻译调用失败、超时（<code>timeoutMs</code>）、非 <code>stop</code> 结束（包括 token 截断）或超过 <code>maxCharsPerBlock</code> 时，保留原始 reasoning 透传，内容不丢失；仅 warn 一行日志。用户中止（abort）会正常传播取消整个流。</li>
+<li><strong>流式体验</strong>：在 <code>maxCharsPerBlock</code> 以内，思考块结束并翻译完成后一次性显示；超过阈值时立即改为原文 delta 透传，不再累积整块内容。增量流式翻译是 v2 候选。</li>
+<li><strong>日志与回传一致性</strong>：翻译发生在 agent-loop 落日志之前，因此成功转换后的 session 日志、Web 回放、以及 DeepSeek 工具调用回合回传的 <code>reasoning_content</code> 都是简体中文；翻译降级时三者一致地保留原文。</li>
+<li><strong>防递归</strong>：插件自身的翻译请求经 WeakSet 标记，不会再被自己的转换器处理。</li>
+<li><strong>最终回答不受翻译层影响</strong>：text 块原样透传，回答语言由引导层负责。</li>
+<li><strong>成本</strong>：每个英文 reasoning 块一次 flash 非思考调用（输入≈思考长度，输出≈译文长度）。<code>verbose: true</code> 打印每次翻译的字符数与耗时。</li>
+</ul>
+<h2>安装与挂载</h2>
+<h3>方式一：源码 checkout 开发挂载</h3>
+<pre><code>cd ~/code/dsh-reasoning-cn
+npm ci &amp;&amp; npm run build
+
+# 从 harness checkout 启动 Web，附上 overlay：
+cd ~/code/deepseek-harness
+pnpm dsh web --patch /absolute/path/to/dsh-reasoning-cn/mount/dev.cordis.yml
+</code></pre>
+<p>将 <code>mount/dev.cordis.yml</code> 中的 <code>ABSOLUTE_PATH_TO_DSH_REASONING_CN</code> 替换为本地绝对路径。开发依赖使用 npm 上已发布并验证过的 DSH rc.7 包；若要联调 harness 源码，请使用单独的 overlay，不要把本地 <code>file:</code> 依赖提交到默认安装链路。</p>
+<h3>方式二：发布后安装</h3>
+<pre><code>dsh plugin --profile web add dsh-reasoning-cn
+</code></pre>
+<p>（包内 <code>cordis.patch.yml</code> 声明持久挂载行 <code>reasoning-cn</code>。）</p>
+<p>翻译默认关闭。需要启用时，在插件配置中设置 <code>translate: true</code>，并确认 <code>translateProvider</code> 和 <code>translateModel</code> 已配置且允许发送 reasoning。</p>
+<h2>兼容性</h2>
+<ul>
+<li>当前仅验证 <code>@deepseek-ai/cordis</code> <code>4.0.1</code> 及 DSH <code>0.1.0-rc.7</code> 套件，Node.js <code>22.19.0</code> 和当前 24.x。</li>
+<li>DeepSeek Harness 仍处于 Developer Preview，可能出现破坏性 API 变更；升级 DSH 前请先在测试环境运行 <code>npm run verify</code>，并在 issue 中附上版本信息。</li>
+<li>依赖 peer range 有意固定在已验证的 rc.7，兼容新版本后会在 changelog 中明确扩大范围。</li>
+</ul>
+<h2>配置</h2>
+<table>
+<thead>
+<tr>
+<th>字段</th>
+<th>默认值</th>
+<th>含义</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>steering</code></td>
+<td><code>both</code></td>
+<td><code>off</code> / <code>system-section</code> / <code>first-step-reminder</code> / <code>both</code>，引导层挂载位置</td>
+</tr>
+<tr>
+<td><code>translate</code></td>
+<td><code>false</code></td>
+<td>翻译层总开关；默认关闭以避免意外外发 reasoning</td>
+</tr>
+<tr>
+<td><code>translateProvider</code></td>
+<td><code>deepseek-official</code></td>
+<td>翻译调用的 provider 路由</td>
+</tr>
+<tr>
+<td><code>translateModel</code></td>
+<td><code>deepseek-v4-flash</code></td>
+<td>翻译模型（建议廉价非思考路由）</td>
+</tr>
+<tr>
+<td><code>translateThinkingOff</code></td>
+<td><code>true</code></td>
+<td>翻译调用是否请求 <code>reasoningEffort: 'off'</code></td>
+</tr>
+<tr>
+<td><code>cjkThreshold</code></td>
+<td><code>0.3</code></td>
+<td><code>[0, 1]</code>；未命中日文/繁体特征时，CJK 占比 ≥ 该值视为已是中文</td>
+</tr>
+<tr>
+<td><code>maxCharsPerBlock</code></td>
+<td><code>20000</code></td>
+<td>正整数；超长 reasoning 立即停止缓冲并原文透传</td>
+</tr>
+<tr>
+<td><code>timeoutMs</code></td>
+<td><code>30000</code></td>
+<td>正整数；单次翻译调用超时</td>
+</tr>
+<tr>
+<td><code>maxOutputTokens</code></td>
+<td><code>8192</code></td>
+<td>正整数；翻译调用 <code>maxTokens</code></td>
+</tr>
+<tr>
+<td><code>verbose</code></td>
+<td><code>false</code></td>
+<td>打印每次翻译的规模与耗时</td>
+</tr>
+</tbody></table>
+<p>以 DSH profile patch 管理插件配置时，挂载项应包含类似如下 <code>config</code>；请按自己的 provider/model 路由替换：</p>
+<pre><code>- insert:
+    - id: reasoning-cn
+      name: dsh-reasoning-cn
+      config:
+        steering: both
+        translate: true
+        translateProvider: your-provider
+        translateModel: your-translation-model
+        translateThinkingOff: true
+</code></pre>
+<h2>数据与语义边界</h2>
+<ul>
+<li>翻译调用使用完整 reasoning 作为输入，可能产生费用，并受 provider 的日志和保留策略约束；本插件不会替 provider 脱敏。</li>
+<li>翻译发生在 agent-loop 落日志之前，因此成功译文会改变 session 日志、Web 回放和后续模型上下文；当前版本没有“仅 UI 翻译、原文持久化”模式。</li>
+<li>输出会检查非空、结束原因、工具调用、长度扩张、代码围栏和中文内容；校验失败时保留原文。校验不能证明译文逐字准确，也不能完全阻止提示注入。</li>
+<li><code>translate: false</code> 只保留零成本的中文引导层，不会发送额外 LLM 请求。</li>
+</ul>
+<h2>已知限制（v1）</h2>
+<ul>
+<li>仅面向简体中文；日文和常见繁体特征会转换，但仅由简繁共享汉字组成的句子无法可靠判别。</li>
+<li>阈值内为整块延迟翻译；超阈值 reasoning 为原文实时透传。</li>
+<li>不记录英文原文（外部插件追加自定义 session 事件会影响上游构建读取日志）。</li>
+<li>不翻译最终回答。</li>
+</ul>
+<h2>开发</h2>
+<pre><code>npm run build      # tsc -&gt; lib/
+npm test           # vitest 单测
+npm run typecheck  # 含 tests 的严格类型检查
+npm run smoke      # 真实 Cordis 上下文端到端冒烟（需先 build）
+npm run package:check # 从 tarball 安装并导入包
+npm run verify     # 无凭证的完整本地验证
+</code></pre>
+<p>支持 Node.js 22.19+（CI 同时验证当前 LTS）。运行翻译层需要 DSH 的 provider 路由和对应模型权限。</p>
+<h3>真实 provider 验证（仅维护者手动执行）</h3>
+<p><code>npm run verify:real</code> 会向真实 provider 发送测试提示词和模型 reasoning，可能产生费用；它不会在 CI 中运行。先执行 <code>npm run build</code>，再显式提供路由和凭证环境变量：</p>
+<pre><code>VERIFY_PROVIDER=your-provider \
+VERIFY_API_KEY_ENV=YOUR_PROVIDER_API_KEY \
+VERIFY_BASE_URL=https://your-provider.example/v1 \
+VERIFY_API=openai-completions \
+VERIFY_MODEL=your-model \
+npm run verify:real
+</code></pre>
+<p>将实际凭证仅放在 shell 环境中，不要写入 <code>.env</code>、配置文件或提交记录。该检查关闭 steering、强制启用翻译，并要求至少一次辅助翻译请求及最终 reasoning 通过中文门槛。</p>
+<p>卸载：<code>dsh plugin --profile web remove dsh-reasoning-cn</code>。</p>
+<p>GitHub 仓库建议添加 <a href="https://github.com/topics/dsh-plugin"><code>dsh-plugin</code></a> topic，便于 Harness 社区发现。</p>
+<h2>License</h2>
+<p>MIT，见 <a href="https://github.com/William123666/dsh-reasoning-cn/blob/HEAD/LICENSE">LICENSE</a>。</p>

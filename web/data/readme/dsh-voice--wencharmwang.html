@@ -1,0 +1,125 @@
+<h1><code>dsh-voice</code></h1>
+<p>Voice input for <a href="https://github.com/deepseek-ai/deepseek-harness">DeepSeek Harness</a> (<code>dsh</code>).</p>
+<p>A single dual-face plugin that brings local, private speech-to-text to both the
+Web UI and the TUI:</p>
+<ul>
+<li><strong>Host half</strong> — a <code>ctx.stt</code> service backed by an ONNX Whisper model
+(<code>@huggingface/transformers</code> + <code>onnxruntime-node</code>), plus the HTTP routes the
+browser mic button posts to.</li>
+<li><strong>Browser half</strong> — a microphone button in the composer (<code>exports["./client"]</code>).</li>
+</ul>
+<p>No external binaries are required: the ONNX runtime ships as a prebuilt native
+addon per platform, and the model is a quantized Whisper ONNX downloaded from
+the Hugging Face Hub on first use. Microphone <em>recording</em> in the TUI still
+needs a system recorder (ffmpeg / sox / arecord); web voice records in the
+browser and needs nothing extra.</p>
+<h2>Install</h2>
+<p><code>dsh-voice</code> is a bundle you add to a <code>dsh</code> profile. From npm:</p>
+<pre><code>dsh plugin --profile web add dsh-voice
+</code></pre>
+<p>Or straight from this repository (pnpm runs the <code>prepare</code> build on install):</p>
+<pre><code>dsh plugin --profile web add github:wencharmwang/dsh-voice
+</code></pre>
+<blockquote>
+<p>pnpm ≥10 refuses to run a git dependency's <code>prepare</code> script until it is
+allowlisted. If the first <code>add</code> fails, copy the printed package key into the
+profile's <code>pnpm-workspace.yaml</code> under <code>allowBuilds</code> and re-run the add.</p>
+</blockquote>
+<p>The bundle declares its own <code>cordis.patch.yml</code>, so <code>dsh plugin add</code> both
+installs the package and activates the <code>voice</code> row. For a manual profile you
+can declare the row yourself in <code>~/.dsh/profiles/web/cordis.patch.yml</code>:</p>
+<pre><code>- insert:
+    - id: voice
+      name: dsh-voice
+</code></pre>
+<h2>Configuration</h2>
+<p>All fields are optional. Configure them either on the bundle row, or — once the
+<code>voice</code> row exists — by patching it by <code>id</code> in the profile's <code>cordis.patch.yml</code>:</p>
+<pre><code>- id: voice
+  config:
+    model: onnx-community/whisper-medium  # a Hugging Face Whisper ONNX id | a local dir
+    language: auto                       # 'auto' | 'zh' | 'en' | ...
+    dtype: q8                            # 'q8' | 'fp32' | 'q4'
+    dir: ''                              # model cache + recordings dir; empty = ~/.dsh/voice
+</code></pre>
+<p>The effective model is resolved in two layers:</p>
+<ol>
+<li><strong>Schema default</strong> — <code>onnx-community/whisper-medium</code> (q8, downloaded on first use).</li>
+<li><strong>cordis.patch.yml</strong> — the plugin's <code>model</code> config overrides the default per deployment.</li>
+</ol>
+<p>Switching models downloads the new one on first use after the switch; the
+superseded pipeline is disposed once no transcription is using it.</p>
+<h2>Service API (<code>ctx.stt</code>)</h2>
+<pre><code>interface SttService {
+  /** Readiness + effective model id, without loading or downloading anything. */
+  status(): { ready: boolean; preloading: boolean; model: string }
+  /** Ensure the effective model is downloaded and loaded. */
+  ensureModel(onProgress?: (done: number, total?: number) =&gt; void): Promise&lt;string&gt;
+  /** Transcribe audio input to text. */
+  transcribe(
+    input: string | Buffer | Float32Array,
+    options?: { language?: string; signal?: AbortSignal; format?: string },
+  ): Promise&lt;string&gt;
+  /** Record from the microphone to a WAV file (TUI only). */
+  startRecording(): { readonly path: string; stop(): Promise&lt;string&gt;; cancel(): Promise&lt;void&gt; }
+}
+</code></pre>
+<p><code>transcribe</code> accepts a <code>Float32Array</code> (16 kHz mono), a <code>Buffer</code> of PCM/WAV
+bytes, or a path to a WAV file. Use <code>format</code> to hint the byte layout:
+<code>pcm16</code> (default), <code>f32</code>, or <code>wav</code>.</p>
+<h2>HTTP routes (web)</h2>
+<table>
+<thead>
+<tr>
+<th>Route</th>
+<th>Method</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>/voice/transcribe</code></td>
+<td><code>POST</code></td>
+<td>Buffer the uploaded audio and return the transcript as <code>{ "text": "…" }</code>. Optional <code>?lang=&lt;iso&gt;</code> pins the language.</td>
+</tr>
+<tr>
+<td><code>/voice/status</code></td>
+<td><code>GET</code></td>
+<td><code>{ "ready": true }</code> when the model is loaded.</td>
+</tr>
+</tbody></table>
+<p>The browser mic button records, decodes to 16 kHz mono PCM in the browser, and
+<code>POST</code>s it as <code>audio/l16;rate=16000</code>.</p>
+<h2>Models</h2>
+<table>
+<thead>
+<tr>
+<th>id</th>
+<th>approx. size</th>
+<th>notes</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>onnx-community/whisper-small</code></td>
+<td>~250 MB</td>
+<td>lighter option</td>
+</tr>
+<tr>
+<td><code>onnx-community/whisper-medium</code></td>
+<td>~0.8 GB</td>
+<td>q8, the default</td>
+</tr>
+<tr>
+<td><code>onnx-community/whisper-large-v3</code></td>
+<td>~1.6 GB</td>
+<td></td>
+</tr>
+</tbody></table>
+<p>Models are cached under <code>~/.dsh/voice/models</code> after the first download.</p>
+<h2>Developing</h2>
+<p>This plugin is a self-contained bundle — it builds independently with
+<code>pnpm install &amp;&amp; pnpm run build</code> (no monorepo checkout required). The <code>prepare</code>
+script runs the same build on git/tarball installs. See
+<a href="https://github.com/wencharmwang/dsh-voice/blob/HEAD/PUBLISHING.md">PUBLISHING.md</a> for how to publish it to the <code>dsh-plugin</code>
+community.</p>
+<h2>License</h2>
+<p><a href="https://github.com/wencharmwang/dsh-voice/blob/HEAD/LICENSE">MIT</a></p>

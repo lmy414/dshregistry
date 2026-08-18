@@ -1,0 +1,157 @@
+<h1>dsh-package-manager</h1>
+<p><code>@dsh-ext/dsh-package-manager</code> 是 DSH 的插件包管理器。它只保留一条安装管线：
+把 dsh-bundle 插件安装为 profile 依赖，然后把它声明的 <code>dsh.bundle.patch</code>
+写入 profile 自己的 <code>cordis.patch.yml</code>。热挂载、热卸载、禁用/启用都不再碰
+Loader API，而是完全交给宿主启动时已经挂好的 <code>watchUserPatches</code>。</p>
+<blockquote>
+<p>One pipeline only: profile dependency install + a managed block in
+<code>cordis.patch.yml</code>. The host's own <code>watchUserPatches</code> diffs the root Include
+and hot-mounts/unmounts the rows. dsh-bundle plugins never need a restart.</p>
+</blockquote>
+<h2>为什么这样设计</h2>
+<p>DSH 的每个 profile 在 boot 时会把以下补丁层合成为一棵 Loader 树：</p>
+<pre><code>bundle 层（dsh.profile.bundles 顺序）
+-&gt; profile cordis.patch.yml
+-&gt; home cordis.patch.yml
+-&gt; --patch overlays
+</code></pre>
+<p><code>apps/cli/src/profile-boot.ts</code> 里的 <code>watchUserPatches</code> 监听 profile/home 两级
+<code>cordis.patch.yml</code>，每次文件变化都会重新解析该层，并调用 root Include 的
+<code>entry.update({ config: { ...config, patches } })</code>。Loader 随后按行 id 做增量
+diff——这就是官方热重载路径，新增行即挂载，删行即卸载，<code>disabled: true</code> 即禁用。</p>
+<p>因此本包<strong>不导入 <code>cordis-plugin-loader</code>、不创建 Include 子树、不重算 profile
+组合</strong>。安装 dsh-bundle 时只做两件事：</p>
+<ol>
+<li><code>pnpm add &lt;source&gt;</code>（或 <code>dsh plugin</code> 的等价 pnpm 路径），让包可以从
+profile 的 <code>node_modules</code> 解析；</li>
+<li>把该包的 <code>dsh.bundle.patch</code> 归一化后写进 profile <code>cordis.patch.yml</code> 的一个
+<strong>带标记的托管块</strong>：</li>
+</ol>
+<pre><code># 用户自己的补丁行保持原样
+- id: user-row
+  name: ./user-row.mjs
+
+# &gt;&gt;&gt; dsh-package-manager: "my-plugin"
+- insert:
+    - id: my-plugin-row
+      name: my-plugin
+      config:
+        token: !!js process.env.MY_TOKEN
+# &lt;&lt;&lt; dsh-package-manager: "my-plugin"
+</code></pre>
+<p>写块 = 热挂载；删块 = 热卸载；把块重写为“原补丁行 + <code>{ id, disabled: true }</code>”
+= 热禁用/启用。重启后托管块仍在用户层，所以插件照常启动，<strong>不需要把包名写进
+<code>dsh.profile.bundles</code></strong>——这也避免了 bundle 层和托管块双重组合同一批行。</p>
+<h2>功能</h2>
+<ul>
+<li><strong>dsh-bundle 单管线热装卸</strong>：安装为 profile 依赖 + 写入托管块；装/卸/开关
+都走官方 <code>watchUserPatches</code>，无需重启。</li>
+<li><strong>开关即禁用行</strong>：禁用保留依赖和 ledger 记录，只在托管块尾部增删
+<code>disabled</code> 补丁行。</li>
+<li><strong>检查更新</strong>：对 git 源插件执行 <code>git ls-remote</code>，有更新时自动同步
+mirror 并完成热更新。</li>
+<li><strong>无 bundle 插件仍可用 custom adapter</strong>：声明式 YAML adapter 执行任意
+安装/卸载步骤；这类插件没有 dsh-bundle 的热重载保证。</li>
+<li><strong>requirements 复原与同步</strong>：<code>deps.yaml</code> 按 id 做最小差集
+<code>install / keep / update / uninstall / disable / enable</code>。</li>
+<li><strong>本地运行插件发现</strong>：监听 Cordis <code>internal/plugin</code>（注册激活前）并遍历已存在 fiber，自动展示非系统本地插件。</li>
+<li><strong>CLI + Web + API</strong>：<code>dpm</code>、<code>/pm-api/*</code> 与程序化 API 共用同一 core。</li>
+<li><strong>装前校验</strong>：拒绝 <code>workspace:</code> 依赖、非 ESM、缺 <code>dsh.bundle.patch</code>、未构建
+入口的包，任何 profile 修改之前失败。</li>
+<li><strong>doctor</strong>：清理 ledger stale 记录、托管块残留与 profile pnpm 树。</li>
+</ul>
+<h2>快速开始</h2>
+<p>前提：已有 DSH profile（例如 <code>&lt;home&gt;/profiles/web</code>），其中还没有本包。</p>
+<pre><code>cd &lt;home&gt;/profiles/web
+pnpm add github:space-spacee-clamation/dsh-package-manager
+pnpm install
+</code></pre>
+<p>或直接编辑 <code>&lt;home&gt;/profiles/web/package.json</code>，只加依赖，<strong>不要加进
+<code>dsh.profile.bundles</code></strong>：</p>
+<pre><code>{
+  "dependencies": {
+    "@dsh-ext/dsh-package-manager": "github:space-spacee-clamation/dsh-package-manager"
+  }
+}
+</code></pre>
+<p>然后把包管理器自己迁入 profile <code>cordis.patch.yml</code> 托管块：</p>
+<pre><code>dpm self-managed --repo /path/to/dsh-package-manager --profile web
+</code></pre>
+<p>重启 DSH 后，包管理器由用户层托管块挂载。之后包管理器自己的源码/产物变化
+就可以通过官方 <code>watchUserPatches</code> 热更新。</p>
+<p>未发布到 profile 时，也可以直接执行 <code>node bin/dpm.mjs ...</code> 使用 CLI。</p>
+<h2>使用</h2>
+<pre><code>dpm state
+dpm install --profile web --source github:owner/repo --adapter auto --dry-run
+dpm install --profile web --source github:owner/repo --allow-build
+dpm uninstall --profile web --id repo
+dpm check-update --profile web --id repo
+dpm disable --profile web --id repo
+dpm enable --profile web --id repo
+dpm restore --file ./requirements/deps.yaml
+dpm sync --repo . --modes web,headless
+dpm doctor
+</code></pre>
+<p>Web 设置页的链接输入会创建 AI 会话并派发 <code>pm_install</code>。详细 API 与 adapter
+规范见 <code>docs/</code>。</p>
+<h2>目录</h2>
+<table>
+<thead>
+<tr>
+<th>路径</th>
+<th>含义</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>&lt;home&gt;/profiles/&lt;name&gt;/package.json</code></td>
+<td>profile 依赖真相（安装）</td>
+</tr>
+<tr>
+<td><code>&lt;home&gt;/profiles/&lt;name&gt;/cordis.patch.yml</code></td>
+<td>热装卸真相（本包只编辑其中的托管块）</td>
+</tr>
+<tr>
+<td><code>&lt;home&gt;/package-manager/ledger.json</code></td>
+<td>本包元数据：source/id/packageName/steps</td>
+</tr>
+<tr>
+<td><code>&lt;home&gt;/package-manager/runtime/*</code></td>
+<td>工作区历史、git 源缓存与 scratch</td>
+</tr>
+</tbody></table>
+<h2>文档</h2>
+<table>
+<thead>
+<tr>
+<th>文档</th>
+<th>内容</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><a href="https://github.com/space-spacee-clamation/dsh-package-manager/blob/HEAD/docs/usage.md">docs/usage.md</a></td>
+<td>设置页、CLI、Web API、程序化 API、source spec、requirements</td>
+</tr>
+<tr>
+<td><a href="https://github.com/space-spacee-clamation/dsh-package-manager/blob/HEAD/docs/adapter-spec.md">docs/adapter-spec.md</a></td>
+<td>custom adapter step 词汇表、占位符、逆操作</td>
+</tr>
+<tr>
+<td><a href="https://github.com/space-spacee-clamation/dsh-package-manager/blob/HEAD/docs/requirements-spec.md">docs/requirements-spec.md</a></td>
+<td><code>requirements/deps.yaml</code> 字段与校验</td>
+</tr>
+<tr>
+<td><a href="https://github.com/space-spacee-clamation/dsh-package-manager/blob/HEAD/docs/ai-tools.md">docs/ai-tools.md</a></td>
+<td>AI 安装流程与工具契约</td>
+</tr>
+<tr>
+<td><a href="https://github.com/space-spacee-clamation/dsh-package-manager/blob/HEAD/docs/development.md">docs/development.md</a></td>
+<td>构建、测试与本地开发</td>
+</tr>
+</tbody></table>
+<h2>UI 参考</h2>
+<p>设置页视觉样式参考
+<a href="https://github.com/Dannimations/Browser-extensions-manager-ui">Dannimations/Browser-extensions-manager-ui</a>
+（Frontend Mentor 的 Browser extensions manager UI challenge）：
+浅蓝渐变背景、白色卡片、中性描边、红/灰开关状态。交互与业务逻辑为本项目独立实现。</p>
+<h2>License</h2>
+<p><a href="https://github.com/space-spacee-clamation/dsh-package-manager/blob/HEAD/LICENSE">MIT</a>。</p>

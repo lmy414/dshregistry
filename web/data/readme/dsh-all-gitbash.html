@@ -1,0 +1,307 @@
+<h1>dsh-all-gitbash</h1>
+<p>DeepSeek Harness 插件：把 Windows 上 <strong>所有 pwsh 命令执行改道 Git for Windows bash</strong> ——
+模型<strong>从第一轮对话起就只有 <code>bash</code> 工具</strong>（<code>pwsh</code> 工具被直接禁用），实际执行的是
+Git for Windows bash（MSYS），不再写 PowerShell。</p>
+<blockquote>
+<p>姊妹插件：<a href="https://github.com/liceses/dsh-gitbash-preset">dsh-gitbash-preset</a>
+（极简模式的 bash → Git Bash 引导器）。两者可同时安装、互不冲突，详见
+<a href="#%E4%B8%8E-dsh-gitbash-preset-%E7%9A%84%E5%85%B3%E7%B3%BB">与 dsh-gitbash-preset 的关系</a>。</p>
+</blockquote>
+<h2>特性</h2>
+<ul>
+<li><strong>运行时改道，免重启</strong>：不改 composition、不碰 profile patch，注入即生效；热重载 / 卸载即净</li>
+<li><strong>模型侧原生 bash</strong>：注册官方形态的 <code>bash</code> 工具（完整沙箱升级 / 后台任务 / 终端卡片），
+<code>pwsh</code> 工具从模型工具面整体移除，bash 工具描述 / 提示词段落<strong>与 Linux 会话逐字对齐</strong>
+（无 pwsh / PowerShell / MSYS / 路径转换字样——模型获得与 Linux 原生 bash 完全相同的体验）</li>
+<li><strong>一键开关</strong>：Web 设置面板 General 页的滑块开关（DSH 风格），或 <code>~/.dsh/settings.yaml</code>
+的 <code>enabled</code> 字段，点一下整套改道装配 / 还原，往返无损、重启保持</li>
+<li><strong>命令翻译兼容层</strong>：剥离 PowerShell preamble、<code>$env:NAME</code> → <code>${NAME}</code>、<code>C:\...</code> → <code>/c/...</code>
+（模型偶尔写 PowerShell 习惯语法时不会炸）</li>
+<li><strong>诚实的沙箱门控</strong>：MSYS 在受限令牌沙箱内无法启动（signal pipe），受限模式快速失败并给
+单次升级指引——不绕过沙箱边界</li>
+<li><strong>零构建依赖</strong>：纯 JS（同 dsh-gitbash-preset 惯例），<code>src/</code> → <code>lib/</code> 拷贝即用，27 个单测</li>
+</ul>
+<h2>动机</h2>
+<p>模型写 bash 远比写 PowerShell 顺手（路径、管道、<code>$VAR</code>、条件判断的生态都是 POSIX 向的）。
+DSH 在 win32 上默认只挂 <code>pwsh-sandbox</code> + <code>tool-pwsh</code>（<code>dsh-base</code> 把 bash 栈按平台门控禁用），
+于是 AI 被迫写 PowerShell。与其做 PowerShell 语法翻译（治标），不如把执行器整个换成
+Git Bash（治本）：模型写 bash，命令跑 bash，且<strong>模型看到的命令工具信息与 Linux 会话完全一致</strong>。</p>
+<h2>工作原理</h2>
+<h3>数据流</h3>
+<pre><code>模型 ──bash 工具──► ctx.shell（SandboxPwshExecutor 实例）
+        （pwsh 工具已禁用）
+                              ▼
+                    argv() 被实例级替换（原型方法遮蔽）
+                              │
+                    ["&lt;git bash&gt;", "-c", 翻译后命令]
+                              │
+        前台 ──────────► subprocess.spawn ──► Git Bash (MSYS)
+        后台 ──jobs──►   （同一 argv 构造）
+        沙箱 ──confine──► ACL 受限令牌 runner ──► Git Bash（受限模式下门控拒绝）
+</code></pre>
+<h3>各环节</h3>
+<table>
+<thead>
+<tr>
+<th>环节</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>执行器改道</td>
+<td>把 <code>ctx.shell</code>（<code>@deepseek-ai/dsh-pwsh-sandbox</code> 实例）的 <code>argv()</code> 整体替换为 <code>"&lt;git bash&gt;" -c &lt;命令&gt;</code>。pwsh 执行器的 <code>confine()</code> 调 <code>this.argv(spec)</code>，因此<strong>前台 / 后台 / 沙箱链三条路径全部生效</strong></td>
+</tr>
+<tr>
+<td>bash 工具</td>
+<td>注册原生 <code>bash</code> 工具（win32 上官方 <code>tool-bash</code> 被禁用，名字空闲），定义镜像官方 <code>dsh-tool-bash</code>：沙箱升级、后台任务、终端卡片齐全，模型看到的是 bash 文档</td>
+</tr>
+<tr>
+<td>pwsh 工具</td>
+<td>tools registry 里全部层的 pwsh 定义（每个 agent 预设各一份）直接删除，官方 <code>tool:pwsh</code> 提示词 section 一并删除——模型工具面只剩 bash，且所有模型可见文本无 pwsh/Windows 字样；关开关 / 卸载时原样恢复</td>
+</tr>
+<tr>
+<td>提示词</td>
+<td><code>systemPrompt</code> 段落（order 120，位于工具段 105 之后）声明：命令工具 = Git Bash，写 POSIX bash</td>
+</tr>
+<tr>
+<td>PATH 垫片</td>
+<td>生成 <code>~/.dsh/dsh-all-gitbash/bin/{pwsh,powershell}</code> 脚本并前置 PATH —— git bash 会话内敲 <code>pwsh</code> 也进 git bash</td>
+</tr>
+<tr>
+<td>设置 API</td>
+<td>webServer 路由 <code>GET/POST /api/dsh-all-gitbash</code>：设置页开关行的读写通道（settings 命名空间不在 apiproxy 配置白名单内，故走插件自有通道，同 dsh-workspace-tree 模式）</td>
+</tr>
+</tbody></table>
+<h3>Git Bash 探测</h3>
+<p>显式 <code>bashPath</code> 配置 → <code>GIT_BASH</code> 环境变量 → 注册表 <code>HKLM\SOFTWARE\GitForWindows</code>
+（及其 WOW6432Node）→ 常规安装根（ProgramFiles / (x86) / LOCALAPPDATA）→
+PATH 逐目录扫描（<strong>跳过 WindowsApps 的 WSL Store 存根</strong>）→ 兜底裸 <code>bash</code>。</p>
+<blockquote>
+<p>注册表探针是关键：Git for Windows 默认只把 <code>cmd</code> 目录加进 PATH，<code>bin\bash.exe</code>
+常常不在 PATH 上（本机实测）。</p>
+</blockquote>
+<h3>命令翻译</h3>
+<p><strong>仅执行层生效，不进模型提示</strong>（描述/提示词不提及，模型写纯 bash 用不到）：</p>
+<ul>
+<li>剥离 <code>dsh-pwsh-local</code> 注入的 UTF-8 preamble（PowerShell 语句，bash 跑不了）；</li>
+<li><code>$env:NAME</code> → <code>${NAME}</code>；</li>
+<li><code>C:\...</code> → <code>/c/...</code>（驱动器反斜杠路径在 bash 里是字面量，会炸；整 token 转换含后续反斜杠）。</li>
+</ul>
+<h2>一键开关</h2>
+<p>插件把整套改道资源收进一个运行时开关（settings 命名空间 <code>dsh-all-gitbash</code>），
+两个入口等效，点一下即生效、重启后保持：</p>
+<ul>
+<li><strong>Web 设置面板 → General</strong>：「Git Bash 模式（dsh-all-gitbash）」滑块开关
+（DSH 风格，client 半区注入 <code>settings.general.item</code> 插槽，经 <code>/api/dsh-all-gitbash</code> 读写）；</li>
+<li><strong>settings 文件</strong>：<code>~/.dsh/settings.yaml</code> 里 <code>dsh-all-gitbash.enabled: false</code> 关闭。</li>
+</ul>
+<p><strong>效果</strong>：<code>enabled: true</code> = 所有命令走 Git Bash（argv 改道 + bash 工具 + 提示词</p>
+<ul>
+<li>PATH 垫片 + pwsh 工具禁用）；<code>enabled: false</code> = 完整还原为原装 pwsh
+（argv 还原、bash 工具注销、pwsh 工具恢复、PATH 垫片移除），开关往返无损。</li>
+</ul>
+<blockquote>
+<p>开关行需要<strong>刷新一次浏览器页面</strong>后出现（client bundle 随 boot 清单注入）。</p>
+</blockquote>
+<pre><code># ~/.dsh/settings.yaml
+dsh-all-gitbash:
+  enabled: true            # 总开关
+  sandboxGate: true        # 受限沙箱快速失败 + 升级指引
+  translateEnvVars: true   # $env:NAME → ${NAME}
+  translateDrivePaths: true # C:\... → /c/...
+</code></pre>
+<h2>与 dsh-gitbash-preset 的关系</h2>
+<p><a href="https://github.com/liceses/dsh-gitbash-preset">dsh-gitbash-preset</a> 是配套的姊妹插件：
+它解决「<strong>极简模式的 bash 指向谁</strong>」——把 DSH 极简模式（minimal preset）的 bash 工具
+引导到 Git for Windows bash（自动探测 shell 路径、按沙箱策略门控）；本插件解决
+「<strong>完整模式（web）下 pwsh 也变成 bash</strong>」并让模型工具面与 Linux 对齐。两者互补、
+<strong>可同时安装、互不冲突</strong>：</p>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>dsh-gitbash-preset</th>
+<th>dsh-all-gitbash</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>作用对象</td>
+<td>极简模式（minimal preset）的 bash 工具</td>
+<td>完整模式（web）的 pwsh 执行器 + 工具面</td>
+</tr>
+<tr>
+<td>形态</td>
+<td>agent preset 安装器（需重启装配）</td>
+<td>运行时注入/装配的宿主插件</td>
+</tr>
+<tr>
+<td>开关</td>
+<td>无（preset 常驻）</td>
+<td>一键开关（UI 滑块 / settings.yaml）</td>
+</tr>
+<tr>
+<td>安装</td>
+<td><code>dsh plugin --profile web add @icelily/dsh-gitbash-preset</code></td>
+<td><code>dev_inject_plugin</code> 或 <code>dsh plugin add</code></td>
+</tr>
+</tbody></table>
+<h3>兼容性说明</h3>
+<table>
+<thead>
+<tr>
+<th>关注点</th>
+<th>结论</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>bash 工具名</td>
+<td>minimal-gitbash 会话里 preset 的 bash 工具注册在会话 scoped 层，<strong>遮蔽</strong>本插件的全局 bash 工具——两边都是 Git Bash，模型看到哪个都是 bash，无重复/无冲突</td>
+</tr>
+<tr>
+<td>执行器</td>
+<td>preset 在会话 realm 内自供 <code>shell</code>（gitbash-executor），本插件改道的是宿主全局 pwsh 执行器——<strong>互不触碰</strong></td>
+</tr>
+<tr>
+<td>pwsh 工具删除</td>
+<td>minimal 会话本来就没有 pwsh 工具，本插件的删除逻辑找不到目标即空操作</td>
+</tr>
+<tr>
+<td>沙箱</td>
+<td>两者一致：MSYS 在受限令牌沙箱内无法启动，均门控到 <code>danger-full-access</code> 并给升级指引</td>
+</tr>
+<tr>
+<td>一键开关</td>
+<td>只影响本插件的 web 改道装配，对 minimal preset 会话无副作用</td>
+</tr>
+<tr>
+<td>PATH 垫片 / 设置 API</td>
+<td>两者各自独立，无交叉</td>
+</tr>
+</tbody></table>
+<p><strong>推荐用法</strong>：极简模式（minimal-gitbash preset）与完整模式（web + dsh-all-gitbash）
+按需选用；两个都装上，极简会话走 preset 的 bash，完整会话走本插件的 bash，行为一致。</p>
+<h2>安装</h2>
+<p>运行时注入（免重启）：</p>
+<pre><code># 1) 构建（零依赖，无需 DSH checkout）
+npm run build
+
+# 2) 用 dsh-super-injector 注入（会话内调用 dev 工具）
+dev_inject_plugin {"dir": ".../dsh-all-gitbash"}
+</code></pre>
+<p>持久安装（重启后由 profile bundles 装配）：</p>
+<pre><code>dsh plugin --profile web add @icelily/dsh-all-gitbash
+</code></pre>
+<p>卸载：<code>dev_uninject_plugin {"match": "dsh-all-gitbash"}</code>（argv 还原、bash 工具注销、
+pwsh 工具恢复、PATH 垫片移除）。</p>
+<h2>配置</h2>
+<table>
+<thead>
+<tr>
+<th>字段</th>
+<th>默认</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>enabled</code></td>
+<td><code>true</code></td>
+<td><strong>总开关</strong>：false = 完整还原为原装 pwsh（settings 面板 / <code>settings.yaml</code> 一键切换，运行时生效）</td>
+</tr>
+<tr>
+<td><code>bashPath</code></td>
+<td>自动探测</td>
+<td>显式 Git Bash 路径；缺省按 <code>GIT_BASH</code> env → 注册表 → 安装根 → PATH（跳过 WindowsApps WSL 存根）→ 兜底 <code>bash</code></td>
+</tr>
+<tr>
+<td><code>sandboxGate</code></td>
+<td><code>true</code></td>
+<td>受限沙箱下快速失败并给升级指引（MSYS 无法在受限令牌内启动）</td>
+</tr>
+<tr>
+<td><code>stripPreamble</code></td>
+<td><code>true</code></td>
+<td>剥离 dsh-pwsh-local 的 UTF-8 preamble</td>
+</tr>
+<tr>
+<td><code>translateEnvVars</code></td>
+<td><code>true</code></td>
+<td><code>$env:NAME</code> → <code>${NAME}</code></td>
+</tr>
+<tr>
+<td><code>translateDrivePaths</code></td>
+<td><code>true</code></td>
+<td><code>C:\...</code> → <code>/c/...</code></td>
+</tr>
+<tr>
+<td><code>registerBashTool</code></td>
+<td><code>true</code></td>
+<td>注册原生 <code>bash</code> 工具</td>
+</tr>
+<tr>
+<td><code>disablePwshTool</code></td>
+<td><code>true</code></td>
+<td>从模型工具面移除 <code>pwsh</code> 工具（只留 bash，避免先 pwsh 报错再换 bash）；false = 保留 pwsh（legacy 别名语义）</td>
+</tr>
+<tr>
+<td><code>pathShim</code></td>
+<td><code>true</code></td>
+<td>PATH 注入 <code>pwsh</code>/<code>powershell</code> → git bash 脚本垫片</td>
+</tr>
+<tr>
+<td><code>shimDir</code></td>
+<td><code>~/.dsh/dsh-all-gitbash/bin</code></td>
+<td>垫片目录</td>
+</tr>
+</tbody></table>
+<blockquote>
+<p>除 <code>bashPath</code>/<code>shimDir</code> 外，所有开关都可通过 settings 运行时切换（见「一键开关」）。</p>
+</blockquote>
+<h2>开发与测试</h2>
+<pre><code>npm run check   # 语法检查（src + lib，host + client）
+npm run test    # 25 个单元测试：翻译 / 探测 / 门控 / argv 改道 / 描述 patch / PATH 垫片 / toggle 周期
+npm run build   # src → lib（纯 JS，零构建依赖）
+</code></pre>
+<p>实测验证矩阵（本机）：</p>
+<ul>
+<li><code>bash</code> 工具输出 <code>MINGW64_NT-10.0-26100</code>（真实 MSYS）、<code>pwd</code> 为 <code>/d/...</code>；模型工具面无 <code>pwsh</code></li>
+<li><code>$env:USERPROFILE</code> → <code>C:\Users\ROG</code>；<code>cat C:\Windows\win.ini</code> 正常读（翻译生效）</li>
+<li>退出码透传 <code>[exit code: 3]</code>；后台任务正常（<code>bg-done</code> + MINGW64）</li>
+<li>一键开关往返：关闭 → pwsh 工具恢复（registry 4 层还原）、bash 注销、PATH 垫片移除；开启 → pwsh 再禁、全部恢复</li>
+<li>卸载即净：uninject 后 argv 还原、bash 工具注销、描述还原、垫片清除</li>
+</ul>
+<h2>FAQ</h2>
+<p><strong>对 AI 来说，all-gitbash 模式和 Linux 原生调用 bash 有区别吗？</strong></p>
+<p>语法层 100% 一致（都是 <code>bash -c</code>、POSIX 语义、同一套退出码/超时/后台契约），
+但从第一轮对话起模型能感知三处差异：</p>
+<ol>
+<li><strong>环境身份</strong>：<code>uname -s</code> 返回 <code>MINGW64_NT-10.0-26100</code>，<code>pwd</code> 是 <code>/d/...</code>，<code>$HOME</code> 是
+<code>/c/Users/...</code>；工具描述与提示词也声明这是 Git for Windows bash；</li>
+<li><strong>双路径心智（已收敛）</strong>：文件工具跑在 Node（Windows 路径 <code>D:\...</code>），bash 跑在
+MSYS（POSIX 路径 <code>/d/...</code>）——提示词已建议统一用 <code>盘符:/...</code> 正斜杠形式（两域
+交集语言：Node fs 与 MSYS bash 都直接接受），翻译垫片兜底反斜杠抄写；</li>
+<li><strong>沙箱门控</strong>：Linux 的 workspace-write 下 bash 照常执行（Landlock 限文件不拦 shell），
+而 MSYS 在受限令牌内无法启动，受限模式下每条命令都会快速失败并提示升级——想获得
+最接近 Linux 的体验，建议 Git Bash 会话默认 danger-full-access。</li>
+</ol>
+<p><strong>为什么不在设置面板自动出现，还要插件自带开关行？</strong></p>
+<p>DSH 的 apiproxy 只对白名单内的 settings 命名空间开放 Web 读写（官方设计：
+"a future registration does not become remotely readable or writable by default"），
+插件命名空间会被 describe 过滤、mutate 拒绝。因此插件自带 webServer 路由
+<code>/api/dsh-all-gitbash</code> 作为读写通道，设置页开关行走这个通道。</p>
+<p><strong>为什么不用官方「bash-restore 配方」（禁用 pwsh 栈、启用 bash 栈）？</strong></p>
+<p>dsh-base 文档的配方要求同时禁 <code>pwsh-sandbox</code>/<code>tool-pwsh</code> 并启用 <code>bash-sandbox</code>/<code>tool-bash</code>，
+是 composition 层改动、需重启，且 win32 上 bash 栈被禁的原因正是「bash 没有 Windows
+runner」——受限沙箱下 bash 同样起不来。本插件保留 pwsh 执行器（沙箱链完好），
+只把它的 argv 改道 Git Bash，运行时生效、可逆、可开关。</p>
+<p><strong>重启后开关状态？</strong></p>
+<p><code>settings.yaml</code> 持久化 <code>enabled</code>，重启后保持；开关行随 boot 清单注入，刷新页面即恢复。</p>
+<h2>发布</h2>
+<pre><code># 构建 + 打包
+npm run build &amp;&amp; npm pack
+
+# 发布 GitHub Release（dsh-super-injector 的 dev 工具）
+dev_release_plugin {"dir": ".../dsh-all-gitbash", "version": "0.1.0"}
+</code></pre>
+<p>版本历史见 <a href="https://github.com/liceses/dsh-all-gitbash/blob/HEAD/CHANGELOG.md">CHANGELOG.md</a>。</p>
+<h2>License</h2>
+<p>MIT</p>

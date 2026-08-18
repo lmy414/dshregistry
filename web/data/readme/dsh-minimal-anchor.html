@@ -1,0 +1,125 @@
+<h1>dsh-minimal-anchor</h1>
+<p><a href="https://github.com/rand0wn/dsh-minimal-anchor/actions/workflows/ci.yml"><img src="https://github.com/rand0wn/dsh-minimal-anchor/actions/workflows/ci.yml/badge.svg" alt="CI"></a></p>
+<p>A <a href="https://github.com/deepseek-ai/deepseek-harness">DeepSeek Harness</a> (<code>dsh</code>) plugin that shields turn 1 from tool-schema overload.</p>
+<h2>Why</h2>
+<p>A fresh <code>dsh</code> session hands the model the <em>entire</em> configured toolset — file
+edits, bash, subagents, jobs — on message one, even when the first message is
+just "look at this repo and tell me what's going on." A smaller, focused
+schema on that first turn keeps the model's early reasoning on exploration
+instead of premature action, without touching how any later turn behaves.</p>
+<p><code>dsh-minimal-anchor</code> hooks the harness's own prompt-assembly pipeline to:</p>
+<ol>
+<li><strong>Prune tools on turn 1 only</strong> — down to a configurable whitelist (default: <code>read</code>, <code>glob</code>, <code>grep</code>).</li>
+<li><strong>Prepend a short structural preamble</strong> on that same turn, framing the session as exploration-first.</li>
+<li><strong>Get out of the way from turn 2 onward</strong> — every later assembly for that session passes through completely untouched, full toolset restored.</li>
+</ol>
+<h2>Install</h2>
+<pre><code>dsh plugin --profile &lt;name&gt; add dsh-minimal-anchor
+</code></pre>
+<p>or from a local checkout:</p>
+<pre><code>dsh plugin --profile &lt;name&gt; add /path/to/dsh-minimal-anchor
+</code></pre>
+<p>This adds the package as a dependency of the profile, but does <strong>not</strong> by
+itself activate it — <code>dsh</code> only applies a package's <code>dsh.bundle</code> patch for
+packages listed in that profile's <code>dsh.profile.bundles</code>. Add the package
+name to that list in <code>profiles/&lt;name&gt;/package.json</code>:</p>
+<pre><code>{
+  "dsh": {
+    "profile": {
+      "bundles": [
+        "@deepseek-ai/dsh-base",
+        "@deepseek-ai/dsh-headless",
+        "dsh-minimal-anchor"
+      ]
+    }
+  }
+}
+</code></pre>
+<p>Confirm it composed with <code>dsh --profile &lt;name&gt; --dump-config</code> — you should
+see a <code>minimal-anchor</code> entry. (An equivalent alternative that skips the
+bundles list entirely: insert it directly in your own
+<code>profiles/&lt;name&gt;/cordis.patch.yml</code> — see <a href="#configuration">Configuration</a>.)</p>
+<h2>Usage</h2>
+<p>Nothing to invoke — it's a passive plugin. Boot your profile as usual
+(<code>dsh web</code>, <code>dsh --profile headless "..."</code>, etc.) and the first turn of every
+new session goes out with the pruned tool list and preamble automatically.</p>
+<h2>Configuration</h2>
+<pre><code># profiles/&lt;name&gt;/cordis.patch.yml
+- insert:
+    - id: minimal-anchor
+      name: 'dsh-minimal-anchor'
+      config:
+        whitelistedTools: [read, glob, grep]
+        enforcePreamble: true
+        customPreamble: 'Your own turn-1 framing text.'
+</code></pre>
+<table>
+<thead>
+<tr>
+<th>Field</th>
+<th>Default</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>whitelistedTools</code></td>
+<td><code>[read, glob, grep]</code></td>
+<td>Tool names kept on turn 1. Must match the exact registered tool names in your profile — check <code>dsh --profile &lt;name&gt; --dump-config</code> if unsure, names differ from plugin to plugin.</td>
+</tr>
+<tr>
+<td><code>enforcePreamble</code></td>
+<td><code>true</code></td>
+<td>Whether to prepend the structural preamble section on turn 1.</td>
+</tr>
+<tr>
+<td><code>customPreamble</code></td>
+<td>(built-in exploration-framing text)</td>
+<td>Preamble text, used only when <code>enforcePreamble</code> is <code>true</code>.</td>
+</tr>
+</tbody></table>
+<p>Extending rather than replacing the default whitelist? <code>DEFAULT_WHITELISTED_TOOLS</code>
+and <code>DEFAULT_PREAMBLE</code> are exported from the package if you're composing config
+in TypeScript rather than YAML.</p>
+<h2>How it works</h2>
+<p>Hooks the <code>system-prompt/assemble</code> waterfall from
+<a href="https://github.com/deepseek-ai/deepseek-harness/tree/master/packages/system-prompt"><code>@deepseek-ai/dsh-system-prompt</code></a>,
+which runs once per turn and produces the <code>PromptAssembly</code> (sections, tools,
+contexts) actually sent to the model. A <code>WeakSet</code> keyed on the assembly's
+scope tracks whether that scope has assembled before; the first time, it
+filters <code>assembly.tools</code> to the whitelist and unshifts the preamble section,
+then calls <code>next()</code> so every other listener in the waterfall still runs
+normally. Every later assembly for that scope short-circuits straight to
+<code>next()</code> — no mutation, no persisted per-session state beyond the WeakSet
+entry, which needs no explicit teardown since it dies with the scope object.</p>
+<p>There is no <code>agent/request</code> or per-message hook in the real harness — this
+plugin does not use one, unlike an earlier draft of this same idea that
+assumed events that don't exist in <code>dsh</code>.</p>
+<h2>Troubleshooting</h2>
+<p><strong>Turn 1's tool list came back empty.</strong> <code>whitelistedTools</code> matches on the
+exact registered tool name — these differ per harness install and per other
+plugins you have active. Check the real names with
+<code>dsh --profile &lt;name&gt; --dump-config</code>, or open the Trajectory tab in the web
+UI for a session and look at the Tools panel on "Initial System Prompt". An
+early draft of this plugin shipped with guessed names (<code>read_file</code>,
+<code>list_dir</code>, <code>search_files</code>) that don't exist in the real harness — the
+whitelist silently matched nothing and pruned every tool.</p>
+<p><strong>Plugin doesn't seem to load / no <code>minimal-anchor</code> entry in <code>--dump-config</code>.</strong>
+Being a listed <code>dependency</code> of the profile (e.g. after <code>dsh plugin add</code>) is
+not enough — the package also needs to be in that profile's
+<code>dsh.profile.bundles</code> list (see <a href="#install">Install</a>) before its <code>dsh.bundle</code>
+patch gets applied.</p>
+<p><strong>Loader crashes with <code>Cannot read properties of undefined (reading 'validate')</code>
+on a fork.</strong> A Cordis plugin's exported <code>Config</code> must be a schemastery
+schema (<code>z.object({...})</code>), not a plain object — the loader calls
+<code>.validate</code> on whatever <code>Config</code> exports.</p>
+<h2>Development</h2>
+<pre><code>npm install
+npm run typecheck
+npm test
+</code></pre>
+<p>Verified against a real local <code>dsh</code> boot (not just types): installed into a
+scratch profile, patched in, and run against a live model — the outbound
+request on turn 1 carried exactly the whitelisted tools and the preamble
+text, and turn 2 carried the full toolset with no preamble.</p>
+<h2>License</h2>
+<p>MIT</p>

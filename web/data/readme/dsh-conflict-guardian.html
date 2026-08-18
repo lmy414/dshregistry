@@ -1,0 +1,50 @@
+<h1>dsh-conflict-guardian</h1>
+<p>在 DeepSeek Harness（DSH）<strong>每次启动时检测插件冲突</strong>、自动停用或恢复冲突插件，并在 Web 界面弹出冲突报告，保证 DSH 稳定运行。</p>
+<p>插件激活（即每次 DSH 启动）即扫描一次加载器（loader）中的插件树，发现冲突立即处理，处理结果通过弹窗汇报——哪些插件冲突、在哪里冲突、做了什么处理。</p>
+<h2>功能</h2>
+<ul>
+<li><strong>重复挂载检测</strong>：同一模块以<strong>完全相同配置</strong>挂载多次视为真正重复，自动停用后加载的实例、保留第一份；同一模块不同配置（如 <code>tool-subagent</code> 的 spawn/fork 双实例）是合法的 Cordis 多实例模式，<strong>不会</strong>误判；</li>
+<li><strong>启动失败检测</strong>：激活时抛出错误的插件（fiber 处于 failed，错误信息常直接指明冲突，如 <code>service X has been registered at …</code>），自动停用并报告失败原因；</li>
+<li><strong>依赖缺失检测</strong>：因等待无人提供的注入服务而永远无法激活的插件（fiber 挂起），自动停用并列出缺失的服务名；</li>
+<li><strong>自动恢复</strong>：启用但没有运行实例的条目会自动尝试重新启动（覆盖误停、加载失败等场景），恢复成功会明确提示；</li>
+<li><strong>配置行 id 重复</strong>：静态扫描组合文件，发现同一文件内行 id 重复会给出警告（下次启动会导致加载器直接抛错），但<strong>不会修改你的配置文件</strong>；</li>
+<li><strong>界面弹窗</strong>：检测到冲突后，页面打开时自动弹出报告，逐条显示冲突详情与处理结果，可「重新检测」或「知道了」关闭。</li>
+</ul>
+<blockquote>
+<p>所有停用/恢复都是<strong>运行时</strong>操作，不修改任何 <code>cordis.yml</code>——重启后仍按原配置加载，扫描会再次运行，正好符合「每次启动都判断、有冲突就关停」的设计。</p>
+</blockquote>
+<h2>安装</h2>
+<p>与 DSH 插件包相同的分发方式（参考 <code>dsh-session-mover</code> / <code>dsh-omni-bridge</code>）：</p>
+<pre><code># 克隆到本地后，用 dsh 的 bundle patch 机制挂载
+npm pack            # 生成 dsh-conflict-guardian-0.1.0.tgz
+</code></pre>
+<p>或在 DSH 配置的插件列表中加入该包，<code>cordis.patch.yml</code> 已声明：</p>
+<pre><code>- insert:
+    - id: dsh-conflict-guardian
+      name: 'dsh-conflict-guardian'
+</code></pre>
+<p><code>lib/client.js</code> 是已打包的浏览器 bundle（<code>window.__ModuleLoader__.load</code> 形态，与 <code>dsh-omni-bridge</code> 相同）；宿主 <code>lib/index.js</code> 在 <code>webServer</code> 上注册 <code>POST /conflict-guardian/report</code> 与 <code>/conflict-guardian/rescan</code> 路由供客户端调用。若作为<strong>动态插件</strong>运行，宿主同样提供 <code>harness.handle('conflict-report' / 'conflict-rescan')</code> 配对，并额外注册模型可调用的 <code>conflict_check</code> 工具（两种方式都已内置，逻辑共用）。</p>
+<h2>使用</h2>
+<ol>
+<li>安装并挂载后，每次 DSH 启动时插件自动扫描加载器；</li>
+<li>发现冲突立即自动处理（停用冲突实例 / 恢复未运行实例），并生成报告；</li>
+<li>打开 DSH 页面时，若有冲突即弹出报告弹窗：标题、摘要、每条冲突的<strong>位置</strong>（插件模块 + 组合条目 + 配置文件）与<strong>处理结果</strong>；</li>
+<li>也可随时点「重新检测」获取最新状态；模型可通过 <code>conflict_check</code> 工具随时检查。</li>
+</ol>
+<h2>工作原理</h2>
+<ul>
+<li>通过 <code>ctx.get('loader')</code> 枚举加载器树中的真实插件条目（跳过 group/include 容器），读取每个条目的模块名、配置、启用状态与 fiber 状态（pending / active / failed）；</li>
+<li><strong>R1 重复挂载</strong>：按「模块名 + 配置签名（JSON）」分组，同组多于一份即真重复 → <code>entry._dispose()</code> 停用后加载实例（运行时停用，不写配置）；</li>
+<li><strong>R2 / R3 失败与挂起</strong>：failed 的 fiber 先 <code>await()</code> 取回原始错误；pending 的 fiber 列出 <code>fiber.inject</code> 中无人提供的服务名 → 停用；</li>
+<li><strong>R4 自动恢复</strong>：启用但无 fiber 的条目调用 <code>entry.refresh()</code> 重新启动，按恢复后 fiber 是否 active 判定成功与否；</li>
+<li><strong>R5 行 id 重复</strong>：读取每个组合文件（Include 树）的原始行，统计行 id 出现次数；</li>
+<li>报告通过 webServer 路由（静态安装）或 <code>harness.handle</code>（动态插件）提供给客户端弹窗。</li>
+</ul>
+<h2>限制</h2>
+<ul>
+<li>停用/恢复不持久化：重启后按原配置加载并再次检测（符合设计）；如需<strong>永久</strong>禁用某个冲突插件，请在组合文件中为该行设置 <code>disabled: true</code> 或删除多余行；</li>
+<li>冲突检测基于加载器运行时状态与组合文件静态分析，不解析插件源码内的服务注册（无法预判尚未加载时的服务冲突）；</li>
+<li>模型工具 <code>conflict_check</code> 仅在动态插件运行方式下注册（静态安装不引入额外依赖）。</li>
+</ul>
+<h2>许可</h2>
+<p><a href="https://github.com/baisama-cloud/dsh-conflict-guardian/blob/HEAD/LICENSE">MIT</a></p>

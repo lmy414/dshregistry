@@ -33,6 +33,17 @@ test('extractDetail: 评分/徽章/增长/仓库/描述', async () => {
   assert.ok(raw.description.includes('视觉识别'))
 })
 
+test('extractDetail: 千分位大数字(真站 ≥1000 格式 "2,438"/"+1,186")', () => {
+  const html = `<html><body>
+<h1>modlens<span title="综合评分">S<span class="opacity-80">85</span></span></h1>
+<div><div class="mt-1 text-xl font-bold tabular-nums">2,438<span class="ml-1.5 text-sm font-medium text-emerald-600">+<!-- -->1,186</span></div>
+<div class="text-[11px] text-muted-foreground">近 7 天增长</div></div>
+<script type="application/ld+json">{"@type":"SoftwareSourceCode","name":"modlens","codeRepository":"https://github.com/liustack/modlens"}</script>
+</body></html>`
+  const raw = extractDetail(html, 'https://dshfind.com/zh/plugins/liustack/modlens')
+  assert.deepEqual(raw.growth, { stars: 2438, weeklyGrowth: 1186 })
+})
+
 test('normalize: 网页文档契约,描述 ≤200 字', async () => {
   const html = await readFile(FIX, 'utf8')
   const doc = normalize(extractDetail(html, 'https://dshfind.com/zh/plugins/Acme/acme-vision'))

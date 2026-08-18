@@ -35,8 +35,8 @@ export function extractDetail(html, url) {
   })
   const growthLabel = $('div').filter((_, el) => $(el).text().trim() === '近 7 天增长').first()
   const growthVal = growthLabel.prev('div')
-  const stars = Number(growthVal.contents().filter((_, n) => n.type === 'text').text().trim()) || null
-  const weeklyGrowth = Number(growthVal.find('span').first().text().replace('+', '').trim()) || null
+  const stars = Number(growthVal.contents().filter((_, n) => n.type === 'text').text().replace(/,/g, '').trim()) || null
+  const weeklyGrowth = Number(growthVal.find('span').first().text().replace(/[+,]/g, '').trim()) || null
   return {
     url,
     name: ld?.name ?? seg[seg.length - 1] ?? null,

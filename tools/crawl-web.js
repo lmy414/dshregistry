@@ -67,7 +67,7 @@ async function crawlDshfind({ base, cacheDir, now, maxPages, minIntervalMs, webD
   await saveState(stateFile, state)
 }
 
-/** hub 流:官方 api/v1/plugins.json 条件请求(ETag),全量归一(JSON 便宜)。 */
+/** hub 流:hub(社区站)api/v1/plugins.json 条件请求(ETag),全量归一(JSON 便宜)。 */
 async function crawlDshhub({ base, cacheDir, now, webDocs }) {
   const stateFile = join(cacheDir, 'state-dshhub.json')
   const state = await loadState(stateFile)

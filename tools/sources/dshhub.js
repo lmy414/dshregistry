@@ -1,5 +1,5 @@
-/** DSH Hub 适配器:官方消费 API /api/v1/plugins.json(omdsh-ai-market/v1,纯 JSON,不经 Crawlee)。
- *  较旧 catalog.json 的优势:categories 数组、review/verification/registry 三态、官方 consumer 契约(usage 字段)。
+/** DSH Hub 适配器:hub(社区站,与 DeepSeek 官方无关)自家消费 API /api/v1/plugins.json(omdsh-ai-market/v1,纯 JSON,不经 Crawlee)。
+ *  较旧 catalog.json 的优势:categories 数组、review/verification/registry 三态、hub 自家 consumer 契约(usage 字段)。
  *  无每包页面锚点(projects.html 为 JS 容器),listedOn.url 统一用 LISTING_URL。 */
 export const SOURCE = 'dshhub'
 export const API_URL = 'https://hub.omdsh.dev/api/v1/plugins.json'

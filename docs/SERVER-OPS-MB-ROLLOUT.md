@@ -1,11 +1,11 @@
-# 服务器同步操作单:M-B 新版 UI + 12 类分类 + CI 修复上线(2026-08-18)
+# 服务器同步操作单:M-B 新版 UI + 12 类分类 + 上线整备(2026-08-18)
 
 > 给运维 AI 的执行指令。按编号顺序执行,每步核对"预期输出",不符合预期就停在该步并汇报,不要自行发挥。
 > 全程在 `/root/dshregistry` 下操作。预计耗时:10 分钟(不含爬虫全量;数据增量由后续例行同步自动完成)。
 
 ## 背景(让你知道在做什么,但不许改动方案)
 
-仓库主干的 `feat/m-a-search-index` 分支已包含:新版搜索主页/分类页/详情页/文档页/周边下载页(五页新 UI)、12 能力域分类(其他类占比从 48% 降到 22%)、hub 数据源切换与去重、CI 修复。**服务器需要:拉取最新 → 验证 → 恢复例行同步**。服务器继续运行在 `feat/m-a-search-index` 分支(工作流规则:服务器运行分支,数据提交落分支)。
+仓库主干的 `feat/m-a-search-index` 分支已包含:新版搜索主页/分类页/详情页/文档页/周边下载页(五页新 UI)、12 能力域分类(其他类占比 22%)、hub 数据源切换与同仓聚合去重、CI 修复、**上线前整备**(2026-08-18):品牌名统一 DSH-Registry、鲸鱼娘(蓝色大肥鱼)口径、透明度声明 14 项(含百度统计如实声明)、信任徽章改「维护活跃」(原社区认可)、聚合检索定位文案、分类页性能优化(懒加载 pages + Facet 防抖 + 每屏 50 条增量渲染)、友链移除 DeepSeek 官方。**服务器需要:拉取最新 → 验证 → 恢复例行同步**。服务器继续运行在 `feat/m-a-search-index` 分支(工作流规则:服务器运行分支,数据提交落分支)。
 
 ## Step 0 · 前置检查(全部通过才继续)
 
@@ -29,7 +29,7 @@ cd /root/dshregistry
 git fetch origin --prune
 git checkout -B feat/m-a-search-index origin/feat/m-a-search-index
 git pull --ff-only
-git rev-parse --short HEAD            # 预期: 5979a221 或更新
+git rev-parse --short HEAD            # 预期: 83b7feb7 或更新
 ```
 
 ## Step 2 · 安装依赖(版本敏感,必须执行)
@@ -50,7 +50,7 @@ cd /root/dshregistry
 node --test
 ```
 
-- 预期结尾:`# pass 95`、`# fail 0`。
+- 预期结尾:`# pass 96`、`# fail 0`。
 - 失败:贴出失败详情汇报,不要继续。
 
 ## Step 4 · 数据一致性校验(重点:12 类分类)
@@ -111,6 +111,7 @@ node -e "console.log('index title:', require('fs').readFileSync('web/index.html'
 ```
 
 - 预期:三个文件存在;index title 为「DSH-Registry · DSH 插件搜索」(或对应英文)。
+- **附加检查(上线整备)**:docs 页"关于本站"应含「服务透明度声明」14 项(第 5 项为"抓取与站点友好");信任三态说明第一项徽章为「维护活跃」;页面品牌名全部为 DSH-Registry(大小写驼峰,不含小写 dshregistry 展示文本)。
 
 ## Step 8 · 汇报格式(完成后按此回报)
 
@@ -120,6 +121,7 @@ pnpm: <版本>
 测试: pass <N> / fail 0
 数据校验: 分类数 <N> / 其他占比 <P>%
 冒烟: 四套 DOM SMOKE 结果
+整备检查: 透明度 14 项 / 维护活跃徽章 / DSH-Registry 品牌
 cron: <存在/已恢复>
 异常: 任何 WARN/ERROR 原文(没有就写"无")
 ```

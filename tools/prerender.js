@@ -58,45 +58,105 @@ function catLabel(cat) {
   return (CAT_LABELS[cat] || CAT_LABELS.other).join(' ')
 }
 
-/** 详情页: 模板 + 插件数据 → 静态 HTML */
+/** 详情页: 模板 + 插件数据 → 静态 HTML(以 web/plugin.html 的 `<!-- @key -->` 锚点注释为替换点) */
 function renderPluginPage(tpl, p, readmeHtml) {
   let html = tpl
   const slug = p.slug
   const desc = (p.description || '').slice(0, 150)
   const url = `${BASE}/p/${encodeURIComponent(slug)}.html`
+  const installSpec = p.installSpec || `github:${p.repo}`
   // head
-  html = html.replace('<title>DSH-Registry · 插件详情</title>', `<title>${esc(p.name)} · DSH-Registry</title>`)
-  html = html.replace(/<meta name="description" content="[^"]*">/, `<meta name="description" content="${esc(desc)}">`)
+  html = anchor(html, 'title', `${esc(p.name)} · DSH-Registry`)
+  html = anchor(html, 'meta-desc', esc(desc))
+  html = anchor(html, 'og-title', `${esc(p.name)} · DSH-Registry`)
+  html = anchor(html, 'og-desc', esc(desc))
+  html = anchor(html, 'twitter-title', `${esc(p.name)} · DSH-Registry`)
+  html = anchor(html, 'twitter-desc', esc(desc))
   html = html.split('https://dshregistry.xyz/plugin.html').join(url)   // canonical + hreflang×3 + og:url
-  html = html.replace(/<meta property="og:title" content="[^"]*">/, `<meta property="og:title" content="${esc(p.name)} · DSH-Registry">`)
-  html = html.replace(/<meta property="og:description" content="[^"]*">/, `<meta property="og:description" content="${esc(desc)}">`)
   // body
-  html = html.replace(/<h1 class="plugin-title">[^<]*<\/h1>/, `<h1 class="plugin-title">${esc(p.name)}</h1>`)
-  html = html.replace(/<span class="plugin-category">[^<]*<\/span>/, `<span class="plugin-category">${esc(catLabel(p.category))}</span>`)
-  html = html.replace(/<span class="trust-badge[^>]*>[\s\S]*?<\/span>/, badgeHtml(p))
-  html = html.replace(/<p class="plugin-desc">[^<]*<\/p>/, `<p class="plugin-desc">${esc(p.description || '')}</p>`)
-  html = html.replace(/<span class="plugin-stars">[^<]*<\/span>/, `<span class="plugin-stars">${p.stars}</span>`)
-  html = html.replace(/最近更新：[^<]*/, `最近更新：${esc(p.pushedAt || '')}`)
-  html = html.replace(/收录时间：[^<]*/, `收录时间：${esc(p.firstSeenAt || '')}`)
-  html = html.replace(/(<a href=")[^"]*(" target="_blank" rel="noopener" class="btn-primary")/, `$1${esc(p.githubUrl)}$2`)
-  html = html.replace(/(<a href=")[^"]*(" target="_blank" rel="noopener" class="btn-outline")/, `$1${esc(p.githubUrl)}$2`)
-  html = html.replace(/<div class="code-block">[^<]*<\/div>/, `<div class="code-block">dsh plugin --profile web add ${esc(p.installSpec || `github:${p.repo}`)}</div>`)
-  html = html.replace(/<span>通过基础检查[\s\S]*?<\/span>/, p.basicCheck
+  html = anchor(html, 'name', esc(p.name))
+  html = anchor(html, 'category', esc(catLabel(p.category)))
+  html = anchor(html, 'badge', badgeHtml(p))
+  html = anchor(html, 'desc', esc(p.description || ''))
+  html = anchor(html, 'stars', String(p.stars ?? 0))
+  html = anchor(html, 'updated', esc(p.pushedAt || ''))
+  html = anchor(html, 'firstSeen', esc(p.firstSeenAt || ''))
+  html = anchor(html, 'indexed', indexedOnHtml(p))
+  html = html.split('<!-- @github-url -->').join(esc(p.githubUrl))   // GitHub 查看按钮 + 风险区查看源码
+  html = anchor(html, 'install-cmd', `dsh plugin --profile web add ${esc(installSpec)}`)
+  html = anchor(html, 'check', p.basicCheck
     ? '<span>通过基础检查（包结构/元数据/README 存在）。<strong>不构成安全保证。</strong></span>'
     : '<span><strong>未通过基础检查</strong>（缺少包结构/元数据/README）。安装风险自负。</span>')
-  // 元信息表
-  html = html.replace(/<td>deepseek-dev<\/td>/, `<td>${esc(p.repo.split('/')[0])}</td>`)
-  html = html.replace(/<a href="https:\/\/github\.com\/deepseek-dev\/dsh-vision"[^>]*>deepseek-dev\/dsh-vision<\/a>/, `<a href="${esc(p.githubUrl)}" target="_blank" rel="noopener">${esc(p.repo)}</a>`)
-  html = html.replace(/<td><code>abc1234<\/code><\/td>/, `<td><code>${esc(p.latestCommit || '—')}</code></td>`)
-  html = html.replace(/<td>2026-08-13（3 天前）<\/td>/, `<td>${esc(p.pushedAt || '—')}（${esc(relativeTime(p.pushedAt))}）</td>`)
-  html = html.replace(/<td>2026-03-15<\/td>/, `<td>${esc(p.firstSeenAt || '—')}</td>`)
-  // README 区: 替换整个 desc-section 内容
+  html = anchor(html, 'warning', warningHtml(p))
+  // 元信息表: 整块替换(表外壳保留)
+  html = anchor(html, 'meta', metaRowsHtml(p))
+  // README 区: 注入清洗后的片段到 .readme-body 内;缺片段/无 readmeUrl 降级
   const readmeBody = readmeHtml !== null
-    ? `<div class="readme-body">${readmeHtml}</div>`
-    : `<div class="readme-body"><p>该插件未提供 README。</p></div>`
-  html = html.replace(/<section class="page-section desc-section">[\s\S]*?<\/section>/,
-    `<section class="page-section desc-section">\n      <h2 class="section-title">介绍</h2>\n      ${readmeBody}\n    </section>`)
+    ? readmeHtml
+    : `<p>${p.readmeUrl ? '该插件未提供 README。' : 'README 暂不可用'}</p>`
+  html = anchor(html, 'readme', readmeBody)
   return html
+}
+
+/**
+ * 锚点替换(web/plugin.html 的 `<!-- @key -->` 注释为替换点):
+ * - 单点形态 `<!-- @key -->` → 替换为 value;
+ * - 块形态 `<!-- @key-start -->…<!-- @key-end -->` → 整体(含两注释)替换为 value。
+ * 找不到锚点即抛错,防止模板与生成器不同步。
+ */
+function anchor(html, key, value) {
+  const single = `<!-- @${key} -->`
+  const startAnchor = `<!-- @${key}-start -->`
+  const endAnchor = `<!-- @${key}-end -->`
+  const s = html.indexOf(single)
+  if (s !== -1) return `${html.slice(0, s)}${value}${html.slice(s + single.length)}`
+  const s2 = html.indexOf(startAnchor)
+  if (s2 !== -1) {
+    const e = html.indexOf(endAnchor, s2)
+    if (e === -1) throw new Error(`[prerender] 模板缺少锚点 <!-- @${key}-end -->`)
+    return `${html.slice(0, s2)}${value}${html.slice(e + endAnchor.length)}`
+  }
+  throw new Error(`[prerender] 模板缺少锚点 <!-- @${key} -->`)
+}
+
+/** 收录于 chips: GitHub 恒有 + listedOn 各源外链(新窗口 rel="noopener");无 url 渲染纯文本。 */
+function indexedOnHtml(p) {
+  const tags = ['<span class="src-tag github">GitHub</span>']
+  for (const x of p.listedOn || []) {
+    if (!x || typeof x.source !== 'string') continue
+    const cls = x.source === 'dshhub' ? 'hub' : x.source
+    const srcName = x.source === 'dshfind' ? 'dshfind' : x.source === 'dshhub' ? 'DSH Hub' : x.source
+    if (typeof x.url === 'string' && x.url) {
+      tags.push(`<a class="src-tag ${esc(cls)}" href="${esc(x.url)}" target="_blank" rel="noopener">${esc(srcName)}</a>`)
+    } else {
+      tags.push(`<span class="src-tag ${esc(cls)}">${esc(srcName)}</span>`)
+    }
+  }
+  return tags.join('')
+}
+
+/** 信任状态差异化警示条(与 page-plugin.js renderWarningCallout 同文案;data-dom-id 保留供运行时修正)。 */
+function warningHtml(p) {
+  const state = p.state || 'unreviewed'
+  if (state === 'community') {
+    return '<div class="warning-callout vouched" data-dom-id="warning-callout"><strong>社区认可:</strong>该插件已通过社区信任门槛(stars/活跃度等),但<strong>仍未经过人工安全审计</strong>。插件将以你运行 DSH 的用户权限执行代码,建议安装前先查看源码自行评估。</div>'
+  }
+  return '<div class="warning-callout" data-dom-id="warning-callout"><strong>安装前必读:</strong>此插件未经人工安全审计。安装后将以你运行 DSH 的用户权限执行任意代码,可读写你的文件、访问网络。仅安装你信任的来源。</div>'
+}
+
+/** 元信息表行: 与 page-plugin.js renderMeta 对齐(作者/仓库/commit/更新/收录/许可/版本)。 */
+function metaRowsHtml(p) {
+  const author = (p.repo || '').split('/')[0]
+  const rows = [
+    ['作者', esc(author)],
+    ['GitHub 仓库', `<a href="${esc(p.githubUrl)}" target="_blank" rel="noopener">${esc(p.repo)}</a>`],
+    ['最新 commit', `<code>${esc(p.latestCommit || '—')}</code>`],
+    ['最近更新', `${esc(p.pushedAt || '—')}（${esc(relativeTime(p.pushedAt))}）`],
+    ['收录时间', esc(p.firstSeenAt || '—')],
+    ['许可证', esc(p.license || '—')],
+    ['版本', esc(p.version ? `v${p.version}` : '—')],
+  ]
+  return rows.map(([k, v]) => `<tr>\n          <th>${k}</th>\n          <td>${v}</td>\n        </tr>`).join('\n        ')
 }
 
 /** 精确替换 <div class="plugin-grid"> 整块(数 div 嵌套深度定位闭合,避免截断卡片)。 */

@@ -153,7 +153,9 @@ async function atomicWrite(file, content) {
 
 const plugins = JSON.parse(await readFile(PLUGINS_FILE, 'utf8'))
 const pluginTpl = await readFile(join(WEB, 'plugin.html'), 'utf8')
-const indexTpl = await readFile(join(WEB, 'index.html'), 'utf8')
+// 分类页模板从 tools/templates/index-legacy.html 读取(旧首页模板);
+// web/index.html 已被搜索主页设计稿替换,不再含分类页所需的 plugin-grid 结构。
+const indexTpl = await readFile(join(ROOT, 'tools', 'templates', 'index-legacy.html'), 'utf8')
 
 // 1) 详情页
 let n = 0

@@ -1,0 +1,215 @@
+<h1>dsh-code-runtime-container</h1>
+<p><a href="https://www.npmjs.com/package/dsh-code-runtime-container"><img src="https://img.shields.io/npm/v/dsh-code-runtime-container?color=4D6BFE" alt="npm"></a>
+<a href="https://github.com/tancheng33/dsh-code-runtime-container/blob/HEAD/LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue" alt="license"></a></p>
+<p>English | <a href="https://github.com/tancheng33/dsh-code-runtime-container/blob/HEAD/README.zh.md">中文</a></p>
+<p>A <strong>container-isolated backend</strong> for the <a href="https://github.com/deepseek-ai/deepseek-harness">DeepSeek Harness</a> code-execution seam (<code>ctx.codeRuntime</code>). Code Mode programs run in a fresh container with no network, a read-only root filesystem, every capability dropped, and kernel-enforced memory, CPU, and pid ceilings.</p>
+<h2>Why</h2>
+<p>The seam declares three well-known isolation substrates and ships one. From <code>@deepseek-ai/dsh-code-runtime</code>'s own README:</p>
+<blockquote>
+<p><strong>Only the worker-thread backend ships</strong> — <code>'process'</code>/<code>'container'</code> are declared well-known <code>isolation</code> values with no implementation; <strong>a hard security boundary awaits a container backend.</strong></p>
+</blockquote>
+<p>And the shipped backend is equally explicit about its posture:</p>
+<blockquote>
+<p><strong>Containment, not a security boundary</strong>: trust posture is bash-equivalent by design.</p>
+</blockquote>
+<p>That is a reasonable default — Code Mode programs are model-written code, and so is everything <code>bash</code> runs. But it means a <code>run_code</code> program executes <strong>inside the agent's own process</strong>, with the agent's network access, the agent's filesystem, and whatever the agent's environment holds. This backend is for deployments where that is not acceptable.</p>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>worker-thread (shipped)</th>
+<th>this backend</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>Substrate</td>
+<td>a <code>Worker</code> in the agent process</td>
+<td>a fresh container per run</td>
+</tr>
+<tr>
+<td>Network</td>
+<td>full agent network access</td>
+<td><code>--network=none</code></td>
+</tr>
+<tr>
+<td>Filesystem</td>
+<td>the whole host, as the agent user</td>
+<td>read-only rootfs, no host mount</td>
+</tr>
+<tr>
+<td>Privileges</td>
+<td>the agent's</td>
+<td><code>--cap-drop=ALL</code>, <code>no-new-privileges</code>, <code>nobody</code></td>
+</tr>
+<tr>
+<td>Runaway CPU</td>
+<td>measured busy-time budget</td>
+<td>kernel CPU quota + wall clock</td>
+</tr>
+<tr>
+<td>Runaway memory</td>
+<td>V8 heap cap</td>
+<td>cgroup memory limit → OOM kill</td>
+</tr>
+<tr>
+<td>Fork bomb</td>
+<td>—</td>
+<td><code>--pids-limit</code></td>
+</tr>
+<tr>
+<td>Cold start</td>
+<td>~milliseconds</td>
+<td>~200 ms</td>
+</tr>
+</tbody></table>
+<h2>Install</h2>
+<pre><code>dsh plugin --profile &lt;name&gt; add dsh-code-runtime-container
+</code></pre>
+<p>Requires a container engine on the host and the image available locally:</p>
+<pre><code>docker pull node:22-alpine
+</code></pre>
+<p>The bundle patch <strong>disables the worker-thread <code>code-runtime</code> row</strong> as it inserts this one: <code>ctx.codeRuntime</code> accepts exactly one implementation per context.</p>
+<p>No image build and no bind mount are needed — the in-container runner is passed to <code>node -e</code> on the command line, so the stock upstream image works as-is. <code>podman</code> and <code>nerdctl</code> work through <code>dockerPath</code>.</p>
+<h2>Configuration</h2>
+<p>Every default is the restrictive one; a backend whose point is isolation must not be safe only after configuration.</p>
+<table>
+<thead>
+<tr>
+<th>Key</th>
+<th>Default</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>dockerPath</code></td>
+<td><code>docker</code></td>
+<td>Container CLI. Anything argv-compatible with <code>docker run</code>.</td>
+</tr>
+<tr>
+<td><code>image</code></td>
+<td><code>node:22-alpine</code></td>
+<td>Needs a <code>node</code> on <code>PATH</code> and nothing else.</td>
+</tr>
+<tr>
+<td><code>network</code></td>
+<td><code>none</code></td>
+<td>Docker network mode. <strong>The main reason to use this backend.</strong></td>
+</tr>
+<tr>
+<td><code>memory</code></td>
+<td><code>512m</code></td>
+<td>Memory ceiling; an overrun is an OOM kill reported as <code>worker-exit</code>.</td>
+</tr>
+<tr>
+<td><code>cpus</code></td>
+<td><code>1</code></td>
+<td>Kernel-enforced CPU quota.</td>
+</tr>
+<tr>
+<td><code>pidsLimit</code></td>
+<td><code>128</code></td>
+<td>Process ceiling: a fork bomb hits it, not the host.</td>
+</tr>
+<tr>
+<td><code>user</code></td>
+<td><code>65534:65534</code></td>
+<td><code>nobody:nogroup</code>. Empty uses the image default.</td>
+</tr>
+<tr>
+<td><code>readOnlyRootfs</code></td>
+<td><code>true</code></td>
+<td>Read-only root, with a tmpfs at <code>/tmp</code>.</td>
+</tr>
+<tr>
+<td><code>tmpfsMb</code></td>
+<td><code>64</code></td>
+<td>Size of that tmpfs.</td>
+</tr>
+<tr>
+<td><code>workspacePath</code></td>
+<td><code>''</code></td>
+<td>Absolute host path to mount at <code>/workspace</code>. Empty mounts nothing.</td>
+</tr>
+<tr>
+<td><code>workspaceReadOnly</code></td>
+<td><code>true</code></td>
+<td>Mount the workspace read-only.</td>
+</tr>
+<tr>
+<td><code>extraArgs</code></td>
+<td><code>[]</code></td>
+<td>Extra <code>docker run</code> flags. <strong>An escape hatch that can weaken every default above.</strong></td>
+</tr>
+<tr>
+<td><code>maxWallMs</code></td>
+<td><code>120000</code></td>
+<td>Wall-clock ceiling for one run, including container start.</td>
+</tr>
+<tr>
+<td><code>maxOutputBytes</code></td>
+<td><code>4194304</code></td>
+<td>Combined cap on logs plus completion value.</td>
+</tr>
+</tbody></table>
+<p>Programs that must read project files need a mount:</p>
+<pre><code>- id: code-runtime-container
+  config:
+    workspacePath: /Users/me/projects/app
+    workspaceReadOnly: true
+    # …restate the rest; a patch replaces a row's whole config
+</code></pre>
+<h2>Threat model</h2>
+<p>The seam is explicit that <code>isolation</code> is <strong>"a label for deployments and diagnostics, not a security claim"</strong>. So here is the actual claim, stated narrowly.</p>
+<p><strong>What a program cannot do, verified by tests against a real container:</strong></p>
+<ul>
+<li>Reach the network (<code>fetch</code> fails; <code>--network=none</code>).</li>
+<li>Write to the root filesystem (<code>EROFS</code>).</li>
+<li>See any host path — <code>/workspace</code> does not exist unless you mount it.</li>
+<li>Run as root (<code>uid</code> is <code>65534</code>).</li>
+<li>Observe or affect another run: each run is a fresh container, and a global set in one run is gone in the next.</li>
+<li>Outlive its budget: a <code>while(true){}</code> is killed, and the container is killed by name — not merely the <code>docker run</code> client.</li>
+<li>Forge a result. Every control frame carries a per-run nonce delivered over stdin and held only in the runner's module scope — never on a global, never in <code>argv</code> or <code>env</code>, both of which the program can read. A program writing <code>{"t":"done","value":"FORGED"}</code> to stdout has that line accounted as <strong>output</strong>, not control.</li>
+<li>Corrupt the transport by patching intrinsics: <code>JSON.stringify</code> and <code>process.stdout.write</code> are captured before the program runs.</li>
+</ul>
+<p><strong>What this does NOT protect against:</strong></p>
+<ul>
+<li><strong>A kernel or container-runtime escape.</strong> This is a container, not a VM. A local privilege-escalation bug in the kernel, the runtime, or the engine defeats it. If your threat model includes that, use a VM-backed engine (<code>dockerPath</code> pointing at a Kata/Firecracker-compatible CLI) or an isolated host.</li>
+<li><strong>Whatever you mount.</strong> A read-write <code>workspacePath</code> is a real write path into your project. That is the point of the option, and it is the one setting that meaningfully widens the boundary.</li>
+<li><strong>Whatever <code>extraArgs</code> opens.</strong> It is passed to <code>docker run</code> verbatim; <code>--network=host</code> there undoes the headline property.</li>
+<li><strong>The bindings themselves.</strong> A program can call every host function the consumer exposed, as many times as its budget allows. Isolating the <em>program</em> does not narrow the <em>tools</em> — that is the tool-registry's gate, not this seam's. See <a href="https://github.com/tancheng33/dsh-egress-guard"><code>dsh-egress-guard</code></a> for the tool-call side.</li>
+<li><strong>Docker socket access from the agent.</strong> This plugin runs a docker client as the agent user. A user who can reach the Docker socket can generally reach root on the host; that is a property of your Docker setup, not of this plugin.</li>
+</ul>
+<h2>Semantics</h2>
+<p>The seam contract is honored as written:</p>
+<ul>
+<li><strong>Errors are result fields, not rejections.</strong> Every program outcome — exception, non-erasable TypeScript, timeout, abort, OOM, lossy completion, output overflow — resolves as <code>{ logs, error: { kind, message } }</code>. <code>run()</code> rejects <strong>only</strong> for contract misuse: a disposed runtime, or a binding namespace that violates the portable-identifier rules.</li>
+<li><strong>Portable identifiers are enforced from the seam's own exported sets</strong> (<code>PORTABLE_RESERVED_WORDS</code>, <code>RESERVED_BINDING_GLOBALS</code>, <code>RESERVED_ERROR_MEMBERS</code>, <code>DUNDER_MEMBER</code>), not restated here — so <code>lambda</code> is refused on this TypeScript backend exactly as it would be on a Python one, and a widening of the union reaches this backend with a dependency bump.</li>
+<li><strong>Binding members are own properties of a null-prototype object</strong>, so a function named <code>__proto__</code> or <code>constructor</code> is an ordinary member.</li>
+<li><strong>A declared <code>errorClass</code> is materialized in the program</strong>, so <code>e instanceof ToolCallError</code> works and the failed member name lands on the declared property.</li>
+<li><strong>Top-level <code>await</code> and <code>return</code> work.</strong> The program is wrapped, stripped, and sliced back out by byte offset (<code>mode: 'strip'</code> preserves positions), so a bare <code>return</code> is not a syntax error.</li>
+<li><strong>Erasable syntax only</strong>, matching the shipped backend: <code>enum</code> and namespaces are a program failure, not a silent transform.</li>
+<li><strong>Dispose to quiescence.</strong> Teardown marks the runtime unusable, kills every in-flight container, and awaits each exit.</li>
+</ul>
+<h3>How this differs from the worker backend</h3>
+<ul>
+<li><strong><code>computeMs</code> has no equivalent.</strong> The worker backend meters measured event-loop busy time to stop a hot loop hiding behind a pending dispatch. Across a container boundary that measurement is not available, so CPU is bounded by the kernel (<code>--cpus</code>) and elapsed time by <code>maxWallMs</code>. This is a genuine behavioral difference: a program that sleeps for a long time consumes wall budget here, where the worker backend would only charge it busy time.</li>
+<li><strong>Cold start is ~200 ms per run</strong>, against roughly a millisecond for a worker. Set against an LLM round trip this is small, but it is not free.</li>
+<li><strong><code>isolation</code> reports <code>'container'</code></strong>, which the seam treats as informational.</li>
+</ul>
+<h2>Tests</h2>
+<p>63 tests, 26 of which run against a <strong>real container engine</strong> — including every isolation claim above, both budget kinds, cancellation, substrate death, and the two hostile-program cases (a forged protocol frame and a replaced <code>JSON.stringify</code>).</p>
+<pre><code>npm test                                  # unit tests only
+
+docker pull node:22-alpine
+DSH_CONTAINER_TEST=1 npm test             # + live container suite
+</code></pre>
+<h2>Limitations</h2>
+<ul>
+<li><strong>TypeScript only.</strong> <code>language</code> is <code>'typescript'</code>. The seam declares <code>'python'</code> as the other well-known value and <code>dsh-tools</code> already ships a Python SDK renderer, but no Python backend exists yet — including this one.</li>
+<li><strong>One container per run, no pooling.</strong> That is what makes cross-run state unrepresentable; it is also where the ~200 ms goes.</li>
+<li><strong>No streaming logs.</strong> The seam's <code>run()</code> is one-shot: logs arrive on the resolved result. A killed program still shows what it printed before it died.</li>
+<li><strong>Image pulls are not managed.</strong> A missing image surfaces as a <code>worker-exit</code> failure naming the engine's output; pull it ahead of time.</li>
+<li><strong>No multiplexed stdio.</strong> The protocol shares the container's stdout with program output, disambiguated by the nonce. Program bytes are never lost — they become logs — but a program emitting gigabytes of output hits <code>maxOutputBytes</code> rather than a stream backpressure path.</li>
+</ul>
+<h2>License</h2>
+<p>MIT</p>

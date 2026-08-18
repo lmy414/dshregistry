@@ -1,0 +1,233 @@
+<h1>omdsh-remdev</h1>
+<p>English | <a href="https://github.com/omdsh-plugins/omdsh-remdev/blob/HEAD/README.zh.md">中文</a></p>
+<p>Remote development for the <a href="https://github.com/deepseek-ai/deepseek-harness">DeepSeek Harness</a> web GUI: attach a workspace to an SSH server, and its files, its terminal, and its agent all run there.</p>
+<h2>What it adds</h2>
+<table>
+<thead>
+<tr>
+<th>Surface</th>
+<th>Where it comes from</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>A <strong>Remote connect</strong> button at the trailing end of the sidebar's Workspaces bar</td>
+<td>An entry in <code>shell.overlay</code> that renders nothing at its own seat and portals into <code>[data-slot="sidebar.workspaces"]</code></td>
+</tr>
+<tr>
+<td>The Remote development window — servers, provisioning, the folder picker, the live log</td>
+<td><code>src/client/RemoteDialog.tsx</code>, over the <code>/omdsh-remdev</code> prefix route, fenced to the same trusted hosts as <code>/api</code></td>
+</tr>
+<tr>
+<td>A globe badge on every remote workspace row</td>
+<td>Portalled into <code>[role="treeitem"][aria-expanded]</code> and positioned from a measurement</td>
+</tr>
+<tr>
+<td>The <code>remdev</code> service — <code>remoteFor(cwd)</code></td>
+<td><code>ctx.reflect.provide</code>, the one question <a href="https://github.com/omdsh-plugins/omdsh-sidepanel"><code>omdsh-sidepanel</code></a> and <a href="https://github.com/omdsh-plugins/omdsh-codemode"><code>omdsh-codemode</code></a> ask before reading a file or starting a process</td>
+</tr>
+<tr>
+<td>A mounted project's skills (<code>.dsh/skills</code>, <code>.agents/skills</code>)</td>
+<td><code>src/remote-skills.ts</code>, a provider registered on the harness's own <code>skills</code> service that reads <code>SKILL.md</code> files back over SFTP</td>
+</tr>
+<tr>
+<td>A remote workspace that is an ordinary workspace</td>
+<td>A real mirror directory under <code>$DSH_HOME/remotes/&lt;server&gt;/&lt;project&gt;</code>, which is what <code>workspaces.create</code> was always asking for</td>
+</tr>
+<tr>
+<td>Conversations held on a server, listed and resumable here</td>
+<td>The session mirror, which copies the remote logs down and rewrites exactly one header field</td>
+</tr>
+<tr>
+<td>The <code>omdsh-remdev</code> settings namespace</td>
+<td><code>ctx.inject(['settings'])</code>, with the servers and their credentials in a hidden <code>role('secret')</code> store</td>
+</tr>
+<tr>
+<td>The <code>remdev.connect</code> shortcut command</td>
+<td>Registered with <code>ctx.shortcut</code> when a keybinding layer is composed; the default chord is <code>CmdOrCtrl+Shift+C</code> (⌥⌘C in a tab), decided by <code>omdsh-shortcuts</code>' document — see <code>src/client/shortcut.ts</code></td>
+</tr>
+</tbody></table>
+<p>A <strong>Remote connect</strong> button at the trailing end of the sidebar's Workspaces bar opens one window: describe a machine, connect to it, install the harness on it, pick a directory. What comes back is an ordinary workspace with a globe on its folder — the same rows, the same sessions, the same Code mode as a local project, on somebody else's computer. The same press is on the keyboard too: with <code>omdsh-shortcuts</code> composed, <code>⌘⇧C</code> (⌥⌘C in a browser tab) opens the window, and the button's tooltip names the chord.</p>
+<p>Nothing about local development changes. A composition without this plugin resolves no service; a workspace that is an ordinary directory resolves no mount. Both fall through the branch that was always there.</p>
+<h2>How a remote workspace is an ordinary workspace</h2>
+<p><code>workspaces.create</code> canonicalizes its argument with <code>realpath</code> and requires a directory to be there. That is not an obstacle to route around — it is the harness saying a workspace is a place on this machine — so this plugin gives it one: a real, empty <strong>mirror directory</strong> under <code>$DSH_HOME/remotes/&lt;server&gt;/&lt;project&gt;</code>, holding nothing but a <code>README.txt</code> that explains itself to whoever finds it.</p>
+<p>Everything downstream then works untouched. The session store groups by that directory, the registry accounts by it, the projections key on it, the usage roll-up sums by it. The only code that ever learns the directory is a stand-in is the code that was about to read a file or start a process in it, and it learns by asking one question:</p>
+<pre><code>const remote = ctx.get('remdev')?.remoteFor(cwd)
+const listing = remote === undefined
+  ? await listLevel(cwd, path)      // exactly as before
+  : await remote.list(path)         // the same listing, over SSH
+</code></pre>
+<p>That is the whole of the seam. <a href="https://github.com/omdsh-plugins/omdsh-sidepanel"><code>omdsh-sidepanel</code></a> and <a href="https://github.com/omdsh-plugins/omdsh-codemode"><code>omdsh-codemode</code></a> each gained one structural view of it and one branch; neither imports a value from this package, and neither knows what SSH is.</p>
+<h2>A mounted project's skills</h2>
+<p>The harness discovers skills from the session's <code>cwd</code>: its own filesystem provider walks <code>&lt;project&gt;/.dsh/skills</code> and <code>&lt;project&gt;/.agents/skills</code> through the LOCAL filesystem service. A remote workspace's <code>cwd</code> is its mirror directory — an empty local stand-in — so the server's project skills are invisible to an agent running here. This plugin registers a provider (<code>remdev</code>) on the harness's <code>skills</code> service to close exactly that gap: when the <code>cwd</code> resolves to a mount, it reads the two skill directories back over SFTP into the same catalog — directory bundles and flat Markdown skills alike, parsed with the harness's own frontmatter grammar (name, description, <code>whenToUse</code>, invocation policy, metadata).</p>
+<p>Four things are worth writing down:</p>
+<ul>
+<li><strong>It reads two fixed paths inside the mount.</strong> The fence is the same one the file browser uses; a skill can never reach anything outside the mounted directory, and an unreadable skill file is skipped with a log line rather than failing the rest.</li>
+<li><strong>A skill's <code>resourceBase</code> is <code>opaque</code>, not <code>directory</code>.</strong> The templates and scripts a skill references live on the server, where the local file tools cannot read them, so the model is told where they are and how to get there instead of a path its <code>read</code> tool would fail on. To use those resources, open the remote file panel or a remote terminal; a Code-mode agent already runs on the server and reads the same <code>.dsh/skills</code> locally there.</li>
+<li><strong>Remote changes are not watched.</strong> The catalog re-reads when the registry's cache invalidates — a changed mount table (attached or detached folders, edited servers) does that — so a skill added on the server appears on the next refresh, and the same goes for a skill file edited mid-session.</li>
+<li><strong>An unreachable server simply contributes no skills.</strong> The harness marks the observation incomplete and retries on a later boundary; user skills in the local <code>~/.dsh/skills</code> are unaffected.</li>
+</ul>
+<h2><code>.dsh-server</code></h2>
+<p>The layout is <code>.vscode-server</code>'s, for the reason VS Code chose it — a remote install has to survive a server having its own Node, the wrong one, none, or several:</p>
+<pre><code>&lt;dshHome&gt;/.dsh-server/
+  bin/dsh              the launcher every terminal actually runs
+  node/&lt;version&gt;/      a private Node, present only when the system one is unusable
+  tools/pnpm/&lt;v&gt;/      a private pnpm, present only when the system one is unusable
+  tools/bin/           shims for the above, on the launcher's PATH
+  cli/&lt;version&gt;/       npm prefix holding @deepseek-ai/dsh and its graph
+  data/                DSH_HOME for the remote harness: profiles, sessions, storages
+  install.log          the last provisioning run, for when somebody asks why
+</code></pre>
+<p><code>bin/dsh</code> is the whole contract with the rest of the plugin. Terminals run that path and nothing else, so which Node was chosen and which release was installed are decided once and repeated nowhere.</p>
+<p><strong>Two ways in.</strong> The server downloads Node and installs the package itself; failing that, this machine stages both and pushes them over SFTP. The fallback exists because the servers people most want this for — an internal cluster node, a machine behind a jump host — are exactly the ones with no route to nodejs.org. It moves ~100MB, so it is never the first choice and always the second.</p>
+<p><strong>pnpm is vendored too, for a reason worth writing down.</strong> <code>dsh plugin</code> is a thin forwarder: it spawns <code>pnpm</code> by name off PATH and cannot be pointed anywhere else. Node's own tarball ships <code>node</code>, <code>npm</code>, <code>npx</code> and <code>corepack</code> — and no pnpm. So the very servers this plugin vendors a Node onto are exactly the servers that then cannot be given a terminal application: <code>dsh: pnpm not found on PATH</code>, exit 127, and a Code profile left holding nothing but <code>dsh-base</code>. A pnpm goes under <code>tools/pnpm/&lt;version&gt;</code> by the same two routes as Node, with a shim at <code>tools/bin/pnpm</code> that the launcher puts on PATH.</p>
+<p>The install is an unpack, not an <code>npm install -g</code>, and both halves matter. pnpm publishes with no dependencies and its whole runtime in <code>dist/</code>, so untarring it <em>is</em> installing it — which keeps npm's ~500MB dependency-resolution heap off a small server, on a 1GB box that has already been watched to die of exactly that. And it lands under <code>.dsh-server</code> rather than in a global prefix, because <code>npm i -g</code> with a system Node writes into <code>/usr/lib/node_modules</code>: root's to give, nobody's to take back. Removing <code>.dsh-server</code> still removes everything. A server with a pnpm 9 or newer of its own keeps it and downloads nothing.</p>
+<p>The shim execs the chosen Node by absolute path rather than letting <code>#!/usr/bin/env node</code> resolve — otherwise a vendored pnpm ends up running on the very system Node that was too old to run the harness.</p>
+<p><strong>Everything is asked through a login shell — one that starts.</strong> <code>ssh host command</code> runs non-interactively and non-login, and on a real development server that is a different PATH from the one a person sees when they log in — nvm, conda, homebrew, and every <code>module load</code> system put their toolchain there. Measured through a plain sshd: <code>sh -c</code> finds no <code>node</code>, <code>sh -lc</code> finds it. Without the <code>-l</code>, a server with a perfectly good Node 22 is probed as having none and gets a second copy downloaded onto it.</p>
+<p>Which login shell is the part that bites. <code>/etc/profile</code> sources every <code>/etc/profile.d/*.sh</code> unconditionally, those files get written by people who tested them in bash, and <code>/bin/sh</code> on a Debian-family server is dash — where one <code>function foo() {}</code> is a <em>syntax error</em>, which POSIX says a non-interactive shell must exit on. Not a warning, not a skipped file: <code>sh -lc</code> exits 2 while sourcing the profile and the script never runs. So the shell is chosen on the server, by asking each candidate to start a login session and say nothing: <code>$SHELL</code> when it is a POSIX one, then <code>bash</code>, then <code>sh</code>, then plain <code>sh -c</code> with no login at all. The payload appears once in that command and runs once, so an <code>npm install</code> cannot be run twice by a fallback. A degraded PATH is worth strictly more than a connection that cannot be probed.</p>
+<p>The probe prints a marker line before its own output and the parser reads the fields after the last one, because a login shell runs the machine's profiles and profiles talk — a conda banner ahead of the answer would otherwise be read as the server's home directory.</p>
+<p><strong>Code mode needs a terminal application, and nobody should have to ask for one.</strong> The harness ships three profile bundles and none of them is an interactive terminal, so provisioning also creates a profile (<code>dsh-code</code> by default) composing <code>@deepseek-ai/dsh-base</code> with whatever <code>codeBundle</code> names — <code>@omdsh-plugins/omdsh-tui-app</code> unless you say otherwise — and installs it. There is no separate button for the terminal and no separate profile for it to live in: a server that has been set up has a terminal on it, or a reason it has none.</p>
+<p><strong>Which install runs is decided by where the package comes from.</strong> A terminal your registry carries is added with <code>dsh plugin add</code>, run THROUGH the launcher so it lands in the right <code>DSH_HOME</code>, on the right Node, and on the PATH the vendored pnpm shim is on. The default one is carried nowhere — omdsh-tui publishes nothing: no npm package, no releases, no tags — so it is installed the way its own README says to, as a checkout install: fetch the default branch's current head, install the dependencies, build, link both packages (<code>@omdsh-plugins/omdsh-tui</code> and <code>@omdsh-plugins/omdsh-tui-app</code>) into the Code profile, and then <em>prove</em> it — the profile must compose with the bundle's layer in <code>--dump-config</code>, and every module a loader row names must resolve from the profile directory, which is the check that catches a tree that dumps perfectly and dies at boot.</p>
+<p>The same two routes as everything else: a server with internet fetches and builds on its own; one without gets the source downloaded, installed and built <strong>on this machine</strong> — with pnpm's hoisted node linker, so the tree that goes up holds real files rather than symlinks into this machine's store — and the built tree pushed over SFTP. The checkout lives under <code>.dsh-server/tui/</code>, so removing <code>.dsh-server</code> removes it too.</p>
+<p><strong>A server that is missing its terminal is noticed by the thing that needs one.</strong> Opening a remote Code terminal asks the profile what it composes — one <code>cat</code> of its manifest, once per server per process — and a profile holding <code>dsh-base</code> and nothing else gets the terminal installed rather than a terminal started that would die at boot. The TERMINAL, not the server: provisioning resolves <code>dshVersion</code> first, so making a full run the repair would have opening a Code column silently upgrade the harness on that machine. That check is what the bundle ROWS are for: a profile whose creation succeeded and whose install then failed looks exactly like a finished one from the outside, and treating it as finished is what leaves the one machine that needs an install the one machine that never gets one.</p>
+<p><strong>What that costs is bounded on purpose.</strong> An automatic run installs only what is missing, so a server that already has its terminal never rebuilds one. A failed attempt is remembered as a failed attempt: the next terminal is refused with the reason rather than starting minutes of failing install all over again. And the failure never takes the rest down with it — files, shells and mirrored conversations do not need a terminal, so provisioning finishes and reports.</p>
+<p><strong>Pressing Install on a ready server is the update.</strong> It is the one run a person asked for, so it re-installs the terminal whether or not one is there: the checkout is replaced with the branch's current head, the profile re-linked, the verification re-made — and for a registry terminal, resolved again from your registry. That is why the button is worth pressing on a server that looks fine, and why it takes minutes when it does.</p>
+<h2>Conversations come home</h2>
+<p>A conversation held on a server is written by the harness running there. This plugin copies those logs down so the local app can list, search, title, and count them with no change to any of the code that does those things.</p>
+<p>The copy rewrites exactly one field of exactly one line: the header's working directory, which locally must name the mirror rather than the remote path — the workspace registry accounts a session by resolving that <code>cwd</code> with <code>realpath</code> and requiring a directory to be there. Everything else is byte-identical, including the session id, which is what makes the row clickable: opening it runs the remote launcher with <code>--session-id &lt;that id&gt;</code> and the remote harness continues the conversation it already has.</p>
+<p>Two details are load-bearing and both were found by running it rather than by reading:</p>
+<ul>
+<li>The file is written where the <strong>local</strong> backend says a session with that header belongs (<code>sessionPersistence.locate</code>), in the <strong>local</strong> backend's own encoding. Dropping a plain <code>.jsonl</code> into a store configured for zstd raises an encoding-mismatch error from <code>list</code>, which takes down the whole session list rather than the one session.</li>
+<li>A Zstandard session log's <strong>first frame must decode to exactly one line</strong>. Writing the whole log as one frame does not corrupt one session — <code>list</code> throws, the workspace registry fails to initialize, and the application stops booting.</li>
+</ul>
+<p>The mirror is one-way and is not a merge. The remote is the only writer; the local copy is replaced wholesale each time it changes, which is why nothing offers to edit it.</p>
+<h2>The log</h2>
+<p>Every server has one, and it lives on the <strong>host</strong> rather than in the browser.</p>
+<p>That is not an implementation detail — it is the difference between a pane that works and one that does not. A log held in the page is empty after a reload, empty in a second window, empty for anything that happened before the dialog was opened, and — because every line went into one list — mixed two servers' output together. The host is the party actually doing the work, it does it whether or not anybody is looking, and it outlives every browser that watches. So a dialog opened at any moment asks what has happened and gets the answer, including an install that started ten minutes ago in a window that has since been closed.</p>
+<p>It records the whole lifecycle, not just installs: connecting, connected, what the probe found, disconnections and why, every line of a provisioning run, folders attached and detached, conversations copied. Lines are stamped and levelled by the host, because the host is the party that knows when a thing happened and whether it went wrong — a browser that joined halfway through knows neither. A run that has been sitting on the same npm line for two minutes looks identical to a fast one until the clock beside it says otherwise.</p>
+<p>One bounded ring per server, 500 lines deep — a complete provisioning run fits, and the next one pushes the previous out, which is the right thing to keep. Nothing is persisted: a log describes what <em>this process</em> did, and a stored one would describe what some earlier process did, which is a different and much less useful claim.</p>
+<h2>Credentials</h2>
+<p><strong>Three ways to authenticate</strong>, chosen per server: the running <strong>ssh-agent</strong>, a <strong>private key</strong>, or a <strong>password</strong>.</p>
+<p>A private key comes from one of two places, and both exist because they answer different situations:</p>
+<ul>
+<li><strong>A key file on this machine</strong> — a path on whatever machine is running dsh. Right when the key is already there, which for a local install is the ordinary case, and the key never leaves the disk it was already on. A leading <code>~</code> is expanded, because that is how everybody writes the path to their key.</li>
+<li><strong>Paste the key</strong> — the key text itself, stored with the connection. The only route in when the key is <em>not</em> a file on the dsh host: a key somebody handed you, a key out of a password manager, or a browser on one machine driving a dsh host on another. A paste that lost its trailing newline still works — OpenSSH's writers add one and every parser expects it, so it is put back rather than reported as a malformed key.</li>
+</ul>
+<p>An encrypted key takes its passphrase in the same box a password would use. Both credential boxes are write-only: an existing one arrives at the browser as <code>hasSecret</code> / <code>hasPrivateKey</code> and nothing else, so <strong>leaving a box blank keeps what is stored and clearing it deliberately removes it</strong>. Neither ever travels back out of the host process — not through this plugin's own routes, which send a view with the credentials removed, and not through the settings wire either, because the <code>store</code> they live in is declared <code>role('secret')</code> and the settings service strips it from every description before it crosses to a browser. A key file is read from disk at dial time and lives in memory for exactly as long as the dial takes.</p>
+<p>Changing a credential drops the live connection rather than keeping one authenticated with the old one — the connection pool keys on a hash of the stored credentials, not on whether one exists.</p>
+<h3>Reaching the model from a server</h3>
+<p>A remote agent is a fresh login on another machine and inherits nothing, so the model credentials a local Code terminal takes for granted are simply absent there. The variables named in <code>forwardEnv</code> (<code>DEEPSEEK_API_KEY</code> and <code>DEEPSEEK_BASE_URL</code> by default) are read from this process when a terminal opens and <code>export</code>ed into the remote shell.</p>
+<p><code>export</code>, not <code>env KEY=value cmd</code>, and that is a security decision rather than a style one: an <code>env</code> prefix puts every value in the command's argv, where <code>ps</code> shows it to every other user on the box. The only argv that ever exists on the server is the launcher's own — a path, a profile name, and a session id, none of them secret.</p>
+<p>A server with its own credentials configured needs none of this; empty the list to send nothing.</p>
+<h2>The route it holds</h2>
+<p>One prefix route, <code>/omdsh-remdev</code>, registered on <code>ctx.webServer</code>. Every call the window makes rides it: the state read, saving and deleting a server, probing one, provisioning it, browsing its filesystem for the folder picker, attaching and detaching a folder, reading the log, asking for a sync — plus one server-sent events stream that carries state changes and new log lines to every open window.</p>
+<p><strong>It is fenced exactly as <code>/api</code> is, and for the same reason.</strong> Every request is checked against the harness's own <code>trustedHosts</code> before it is answered; anything else gets a 403 and nothing else. A route that stores SSH credentials and installs software on other people's machines must be exactly as reachable as the harness's own control plane and no more — and the fence is the harness's list rather than a second one written here, so a deployment that tightens <code>trustedHosts</code> tightens this with it.</p>
+<p>Everything but the state read is a POST, including the log read. A GET that installs software on a server is a GET that is reachable from a link, and a log naming somebody's servers is not a thing to leave in a URL.</p>
+<p>What crosses the route is a view with the credentials removed: the browser learns <code>hasSecret</code> and <code>hasPrivateKey</code> and never a byte of either.</p>
+<h2>Where the surfaces come from</h2>
+<p>The harness declares no slot inside the sidebar's workspace region — the whole region is one <code>single</code> slot that <code>ui-workspace</code> fills, and everything in it is that package's private composition. So both surfaces ride <code>shell.overlay</code>, render nothing at their own seat, and portal into anchors they find:</p>
+<ul>
+<li><strong><code>[data-slot="sidebar.workspaces"]</code></strong> — the slot renderer's published contract. Its single element child is the region root; the root's first child is the Workspaces bar, checked by height rather than assumed.</li>
+<li><strong><code>[role="treeitem"][aria-expanded]</code></strong> — a workspace row. Session rows are treeitems too and carry <code>aria-selected</code> instead; reading a label off one answers with its timestamp.</li>
+</ul>
+<p>Class names are not available to depend on even if that were wise: every class in that package is a hashed CSS-module name.</p>
+<p>The badge is portalled into the <strong>row</strong>, not into the folder icon, and positioned from a measurement. The row hides its folder and shows an expand chevron under <code>:hover</code> — so a badge living inside the folder would vanish under the pointer, which is exactly when its tooltip is being read.</p>
+<p><strong>When an anchor is missing, nothing renders.</strong> Not a fallback position, not a floating button in a corner. A button that appears in the wrong place is worse than a button that does not appear: one is a feature you cannot reach, the other is a feature that breaks the app around it.</p>
+<h2>Configuration</h2>
+<p>One settings namespace, <code>omdsh-remdev</code>. The servers and mounts live in a hidden <code>store</code> written by this plugin's own dialog — a list of objects the generic form refuses to draw, holding credentials no form should render. It is declared <code>role('secret')</code> as well as hidden, and the two do different jobs: hidden keeps it out of a form, the role keeps it off the wire. Everything else is a plain field the panel draws:</p>
+<table>
+<thead>
+<tr>
+<th>Field</th>
+<th>Default</th>
+<th>What it decides</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>dshVersion</code></td>
+<td><code>latest</code></td>
+<td>which harness release to install on a server</td>
+</tr>
+<tr>
+<td><code>nodeVersion</code></td>
+<td><code>v22.20.0</code></td>
+<td>which Node to install on a server whose own is older than 22</td>
+</tr>
+<tr>
+<td><code>pnpmVersion</code></td>
+<td><code>11.7.0</code></td>
+<td>which pnpm to install on a server that has none; the harness installs profile plugins with it</td>
+</tr>
+<tr>
+<td><code>allowUpload</code></td>
+<td><code>true</code></td>
+<td>whether a server with no internet may be set up by uploading from here</td>
+</tr>
+<tr>
+<td><code>syncIntervalSeconds</code></td>
+<td><code>60</code></td>
+<td>how often conversations are copied down; <code>0</code> switches the background copy off</td>
+</tr>
+<tr>
+<td><code>codeProfile</code></td>
+<td><code>dsh-code</code></td>
+<td>the profile a Code terminal boots on a server; the terminal application is installed into it</td>
+</tr>
+<tr>
+<td><code>codeBundle</code></td>
+<td><code>@omdsh-plugins/omdsh-tui-app</code></td>
+<td>the terminal application that profile composes; space-separated for an application that ships as more than one package</td>
+</tr>
+<tr>
+<td><code>tuiRepo</code></td>
+<td><code>https://github.com/omdsh-plugins/omdsh-tui.git</code></td>
+<td>the git repository the omdsh-tui terminal is installed from; point it at a mirror when servers cannot reach github.com</td>
+</tr>
+<tr>
+<td><code>forwardEnv</code></td>
+<td><code>DEEPSEEK_API_KEY</code>, <code>DEEPSEEK_BASE_URL</code></td>
+<td>environment copied from this machine onto a remote agent</td>
+</tr>
+</tbody></table>
+<p>Every field is <code>applies: 'live'</code>: an edit is adopted as it commits, and the next dial, provisioning run, terminal or sync uses it. Nothing here asks for a restart. The versions are read when a server is set up, so changing one re-provisions the next server rather than the ones already installed.</p>
+<h2>Install</h2>
+<pre><code>npx @omdsh-plugins/omdsh-plughub add omdsh-remdev
+</code></pre>
+<p>That is the <a href="https://github.com/omdsh-plugins/omdsh-plughub">plugin hub</a>'s
+installer with argv where the button was. It resolves this plugin from the
+collection's <a href="https://github.com/omdsh-plugins/registry">registry</a>, installs it
+from its GitHub repository, and writes the pnpm build-allowlist entry a bare
+<code>dsh plugin add github:…</code> would leave to you — the entry carries the commit pnpm
+resolved, so it can be copied out of a failure and never written down in
+advance.</p>
+<p><code>dsh plugin --profile web add @omdsh-plugins/omdsh-remdev</code> is <strong>not</strong> that command yet:
+this package is not on npm, and pnpm answers <code>ERR_PNPM_FETCH_404</code>. The same
+install is also a button, on this plugin's card in <strong>Settings → Plugins → Plugin
+hub</strong>, once the hub itself is in the profile.</p>
+<p>Or from a checkout:</p>
+<pre><code>pnpm install &amp;&amp; pnpm run build
+dsh plugin --profile web add "$PWD"
+</code></pre>
+<p>Remove it the same way:</p>
+<pre><code>dsh plugin --profile web remove @omdsh-plugins/omdsh-remdev
+</code></pre>
+<p>A remove takes the button, the window, the badges, the service and the route with it. The mirror directories under <code>$DSH_HOME/remotes</code> stay where they are, and so do the conversations already copied into them — they are ordinary directories and ordinary sessions, which is the whole point of the design.</p>
+<p><strong>Nothing here is a companion plugin's precondition, in either direction.</strong> <code>omdsh-sidepanel</code> and <code>omdsh-codemode</code> gain their remote branches automatically when this plugin is present, and neither requires it — each takes the lazy read rule 9 describes, <code>ctx.get('remdev')</code> at the moment a directory has to be resolved, and answers for itself when it comes back <code>undefined</code>.</p>
+<p>The reverse is the same trade, and it is worth saying what it costs. This plugin's own <code>inject</code> names only harness services (<code>webServer</code>, <code>webRuntime</code> from the web surface bundle; <code>slots</code>, <code>workspaces</code>, <code>locale</code> in the browser), so a profile with neither sibling installed boots and this plugin works: the button, the window, the mirror directories, the workspace rows, the badges, and the conversation mirror are all its own. What is missing is what those plugins draw — with no <code>omdsh-sidepanel</code> there is no file explorer for the remote tree to appear in, and with no <code>omdsh-codemode</code> there is no terminal to open on the server. The remote workspace is still a workspace, and its conversations still list, search, and resume.</p>
+<h2>Commands</h2>
+<pre><code>pnpm install
+pnpm run build       # tsc emits lib/types, tsdown bundles both halves
+pnpm run typecheck   # sources and tests
+pnpm run test        # vitest
+</code></pre>
+<h2>Known limitations</h2>
+<ul>
+<li><strong>The surfaces borrow their anchors, and a missing anchor renders nothing.</strong> Both the button and the badges portal into the sidebar's own DOM; a row shape the harness changes is a selector this package has to follow, and until it does, the feature is absent rather than misplaced.</li>
+<li><strong>The conversation mirror is one-way.</strong> The remote is the only writer and the local copy is replaced wholesale, so nothing here offers to edit a mirrored conversation, and a local edit would be overwritten on the next sync.</li>
+<li><strong>The remote skill catalog is not live.</strong> The server's <code>.dsh/skills</code> is re-read when the registry's cache invalidates — there is no file watching — so a freshly added skill appears after the next invalidation rather than immediately.</li>
+<li><strong>The log is 500 lines and does not survive the process.</strong> A provisioning run fits; a week of them does not, and a restart starts every ring empty on purpose.</li>
+<li><strong>A server that cannot be given a terminal gets no Code mode.</strong> Files, terminals and conversation sync all still work — the failure is logged and provisioning finishes — but opening a remote Code terminal on it is refused with the reason until an install somebody presses succeeds.</li>
+<li><strong>Installing omdsh-tui needs pnpm in one of the two places.</strong> On the server it is the vendored <code>tools/bin/pnpm</code> shim the provisioning run arranges; for the local-upload fallback it is this machine's own <code>pnpm</code>, or a pnpm fetched through <code>npx</code>, and a machine with neither reports that instead of guessing.</li>
+<li><strong>The omdsh-tui install is a whole build, not a file copy.</strong> The dependency install and the <code>tsdown</code> build run on whichever side fetches the source, so the first setup of a server takes minutes and pressing Install again takes the same minutes — which is what installing from source means. It is why an automatic run installs only what is missing, and why the update is a thing you ask for.</li>
+<li><strong>The server has to be POSIX.</strong> Every remote path is built with <code>node:path/posix</code> and every probe runs through a POSIX login shell, so a Windows server is not supported. A Windows machine running dsh <em>locally</em> is fine — reaching for posix explicitly is exactly what makes it fine.</li>
+<li><strong>A directory level is capped at 1000 entries.</strong> Past that the listing is returned marked truncated rather than paged.</li>
+</ul>

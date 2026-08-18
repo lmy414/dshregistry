@@ -1,0 +1,141 @@
+<h1>dsh-plugin-gate</h1>
+<p><code>dsh-plugin-gate</code> 是一个独立的 DSH 安装前门禁插件。它在安装插件之前静态物化并审查 npm、Git 或本地插件源，不修改 DSH 宿主源码，也不执行被审查插件的生命周期代码。</p>
+<p>实现有意复用两个上游的安全设计：</p>
+<ul>
+<li><strong>OpenAI Codex</strong>：npm <code>pack --ignore-scripts</code>、有界 tar 解包、package manifest/路径规则、不可变安装 pin。</li>
+<li><strong>Claude Code 插件市场</strong>：GitHub HTTPS host allowlist、commit SHA pin、marketplace invariant 检查、官方只读 policy reviewer prompt/schema。</li>
+</ul>
+<h2>能力对照</h2>
+<table>
+<thead>
+<tr>
+<th>门禁层</th>
+<th>来源</th>
+<th>本插件行为</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>npm 物化</td>
+<td>Codex <code>npm_source</code></td>
+<td>只 <code>npm pack --ignore-scripts</code>，要求精确版本，不安装依赖，不运行 scripts；记录 tarball SHA256</td>
+</tr>
+<tr>
+<td>npm tar 解包</td>
+<td>Codex <code>plugin_bundle_archive</code></td>
+<td>限制压缩/解压大小；拒绝绝对路径、<code>..</code>、盘符、symlink、hardlink、非常规类型；要求唯一 <code>package/</code> 根</td>
+</tr>
+<tr>
+<td>manifest/路径</td>
+<td>Codex manifest 规则</td>
+<td><code>package.json</code> 必须是常规文件且不超过 1 MiB；版本和 <code>dsh.bundle.patch</code> 路径受限；realpath 不允许逃逸插件根</td>
+</tr>
+<tr>
+<td>Git 物化</td>
+<td>Claude marketplace action</td>
+<td>仅允许 HTTPS GitHub/GitLab/Bitbucket 及其子域；必须 40 位 commit SHA；<code>fetch + checkout + rev-parse</code> 复验</td>
+</tr>
+<tr>
+<td>catalog invariant</td>
+<td>Claude I1-I11</td>
+<td>名称、描述、排序、去重、HTTPS、SHA、路径、隐藏 Unicode、shell 元字符；I7 是上游仓库流程约束，不适用于独立插件</td>
+</tr>
+<tr>
+<td>DSH manifest</td>
+<td>Claude I8 的 DSH 适配</td>
+<td>物化结果必须有有效 <code>package.json</code> 与 <code>cordis.patch.yml</code></td>
+</tr>
+<tr>
+<td>policy scan</td>
+<td>Claude official prompt/schema</td>
+<td>调用 <code>claude -p --bare</code>，只允许 <code>Read,Glob,Grep</code>，输出 schema 校验和脱敏；结果按内容 SHA 与 policy hash 缓存</td>
+</tr>
+<tr>
+<td>本地源</td>
+<td>DSH 适配</td>
+<td>先复制到私有 staging 快照；拒绝 symlink/非常规文件；扫描与 fingerprint 都作用于快照</td>
+</tr>
+</tbody></table>
+<p>补充边界：</p>
+<ul>
+<li>npm catalog 源必须提供精确 semver；直接 CLI 源同样拒绝 range/tag。</li>
+<li>npm、Git 和本地物化结果都会生成 payload 内容 SHA256；npm 的不可变安装 pin 另外记录 tarball SHA256。</li>
+<li>Git 子进程使用隔离环境，忽略用户/系统 Git config、credential helper 与 smudge filter，只保留 HTTPS 协议。</li>
+<li>tar 解包校验 header checksum、PAX record 结构、路径与 entry/size 上限；本地和 Git 快照复制同样有文件数与字节数上限。</li>
+</ul>
+<h2>安装</h2>
+<p><code>dsh-plugin-gate</code> is distributed from GitHub; it is not published to npm.</p>
+<p>For a mutable but convenient installation, use the release tag:</p>
+<pre><code>dsh plugin --profile web add github:youkongling/dsh-plugin-gate#v0.1.0
+</code></pre>
+<p>For a registry-free immutable installation, use the GitHub Release tarball:</p>
+<pre><code>dsh plugin --profile web add https://github.com/youkongling/dsh-plugin-gate/releases/download/v0.1.0/dsh-plugin-gate-0.1.0.tgz
+</code></pre>
+<p>For review-before-install, pin the exact 40-character commit SHA:</p>
+<pre><code>dsh plugin --profile web add "github:youkongling/dsh-plugin-gate#$(git ls-remote https://github.com/youkongling/dsh-plugin-gate.git HEAD | cut -f1)"
+</code></pre>
+<p>Restart the profile after installation.</p>
+<h2>使用</h2>
+<h3>独立 CLI</h3>
+<pre><code># 只跑确定性检查；适合本地开发
+./bin/dsh-plugin-gate.js /absolute/path/to/plugin --no-policy
+
+# npm 源必须精确到版本
+./bin/dsh-plugin-gate.js npm:&lt;package&gt;@&lt;exact-version&gt;
+
+# Git 源必须 pin 到 40 位 commit SHA
+./bin/dsh-plugin-gate.js 'git:https://github.com/&lt;owner&gt;/&lt;repo&gt;#&lt;40-char-sha&gt;'
+
+# 完整机器可读报告
+./bin/dsh-plugin-gate.js npm:&lt;package&gt;@&lt;exact-version&gt; --json
+</code></pre>
+<p>退出码：</p>
+<ul>
+<li><code>0</code>：通过门禁</li>
+<li><code>1</code>：门禁拒绝</li>
+<li><code>2</code>：CLI 参数错误或物化流程抛错</li>
+</ul>
+<p>也可以检查 Claude marketplace 兼容 catalog：</p>
+<pre><code>./bin/dsh-plugin-gate.js --catalog marketplace.json &lt;plugin-name&gt;
+</code></pre>
+<h3>DSH 插件</h3>
+<p>安装到指定 profile：</p>
+<pre><code>dsh plugin --profile web add /absolute/path/to/dsh-plugin-gate
+</code></pre>
+<p>安装后提供：</p>
+<ul>
+<li>斜杠命令：<code>/plugin-gate &lt;source-spec&gt;</code></li>
+<li>Tool：<code>plugin_gate</code></li>
+</ul>
+<p><code>plugin_gate</code> 返回结构化结果，即使目标插件未通过门禁，也会保留 <code>passes</code>、<code>findings</code>、<code>contentSha256</code>、<code>installPin</code> 与 policy 结果。</p>
+<h2>Policy 模式</h2>
+<ul>
+<li>默认：policy 结果强制生效。找不到 Claude CLI、超时、输出不合法或 verdict 为 false 都不能通过。</li>
+<li><code>--no-policy</code>：跳过 LLM policy，只执行确定性供应链与路径检查。</li>
+<li><code>enforcePolicy: false</code>：policy 结果仅作为 advisory，不影响确定性检查结论。</li>
+</ul>
+<p>policy verdict cache key 同时包含：</p>
+<ul>
+<li>目标内容身份（npm tarball SHA / Git commit / 本地内容 SHA）</li>
+<li>catalog source 对象</li>
+<li>官方 prompt、schema 与 DSH 附录的 hash</li>
+</ul>
+<p>因此 policy 或扫描对象变化会自动失效缓存。cache 默认保存 30 天。
+cache 文件以 <code>0600</code> 写入；结构不完整或时间非法的 entry 不会被信任。</p>
+<p>Reviewer 进程只继承白名单环境变量（<code>PATH</code>、<code>HOME</code>、语言变量和 Anthropic 认证变量），不会接收 DSH 的其他模型 key、云厂商凭据或 session secret。报告中的 key/token/password/secret 形态字符串会被脱敏。</p>
+<h2>威胁模型与边界</h2>
+<p>这个插件是安装前门禁，不是形式化安全证明：</p>
+<ol>
+<li>被审查插件的生命周期代码不会被执行；物化只使用 <code>npm pack</code>、Git、文件复制和 tar 解析。</li>
+<li>Policy reviewer 是 LLM 判断，可能被 prompt injection 误导；它不能替代确定性规则，也不是安全边界。</li>
+<li>npm registry、Git host 与 TLS 证书仍然是被信任的外部供应链环节。</li>
+<li>本插件审查 tarball/checkout 中的 payload，不递归安装或执行目标 package 声明的依赖；实际安装依赖仍需额外的锁定与审计策略。</li>
+<li>本地源会先做私有快照，避免“扫描路径”和“报告 fingerprint”指向不同内容；但无法防御操作系统级别的恶意并发篡改。</li>
+<li>Policy scan 需要 <code>claude</code> CLI 和有效认证；没有 reviewer 时按未通过处理。</li>
+<li>Git host 必须支持按 commit SHA 的 shallow fetch；不支持该能力的仓库会被安全拒绝。</li>
+</ol>
+<h2>开发与测试</h2>
+<pre><code>npm test
+</code></pre>
+<p>测试覆盖 tar 攻击样本、Claude invariant、manifest 逃逸、本地 symlink、policy schema/脱敏、cache 失效、DSH 入口注册与结构化输出。</p>
+<h2>License</h2>
+<p>Apache License 2.0。来源与衍生说明见 <code>NOTICE</code>；上游参考副本保留在 <code>assets/upstream/</code>。</p>

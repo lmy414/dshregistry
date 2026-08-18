@@ -1,0 +1,139 @@
+<h1>dsh-approve-for-me</h1>
+<p>中文说明见 <a href="https://github.com/shifan3/dsh-approve-for-me/blob/HEAD/README.zh.md">README.zh.md</a>。</p>
+<p>A <a href="https://github.com/deepseek-ai/deepseek-harness">DeepSeek Harness</a> (DSH) host plugin that adds an <strong>approve-for-me</strong> approval mode.</p>
+<p>When enabled, every approval request that reaches the DSH answerer chain is judged by an LLM safety reviewer against a summary of the prior conversation. The model answers <code>ALLOW</code> or <code>REJECT</code>. Destructive high-risk commands — <code>rm -r</code>, <code>rm -rf</code>, <code>drop table</code>, <code>drop database</code>, and friends — skip the model entirely and are sent to the normal interactive user prompt.</p>
+<blockquote>
+<p>The plugin does <strong>not</strong> add a new <code>approve-for-me</code> policy enum (that is hardcoded in the host package <code>dsh-user-approval</code>). It works inside the existing <code>ask</code> approval policy: the plugin's enabled state <em>is</em> the mode switch. The DSH approval audit events (<code>approval/asked</code> + <code>approval/decided</code>) are still recorded normally.</p>
+</blockquote>
+<h2>Behavior</h2>
+<ul>
+<li>Listens on <code>approval/request</code> with <code>prepend: true</code>, so it runs before the interactive (user-prompt) answerer.</li>
+<li>Extracts the concrete action text for the request:<ul>
+<li><code>command</code> from bash-family tool-call arguments,</li>
+<li>tool arguments JSON for other tools,</li>
+<li>or the request <code>reason</code> as a fallback.</li>
+</ul>
+</li>
+<li>If the action (or the request reason) matches a high-risk pattern → <code>next()</code>, i.e. the normal user approval prompt.</li>
+<li>Otherwise it sends the LLM:<ul>
+<li>the <strong>conversation summary</strong> (most recent ~12k chars of user messages, assistant tool activity, and tool calls),</li>
+<li>the <strong>requested action</strong> (tool name, reason, command/args).</li>
+</ul>
+</li>
+<li>The model must reply with exactly one word: <code>ALLOW</code> or <code>REJECT</code>.<ul>
+<li><code>ALLOW</code> → <code>allowed-once</code></li>
+<li><code>REJECT</code> → <code>rejected</code></li>
+<li>unparseable / timeout / model error / no model service → <code>next()</code> (falls back to asking the user; never silently allows, never silently rejects)</li>
+</ul>
+</li>
+</ul>
+<h2>High-risk patterns</h2>
+<p>The following are matched as exact patterns against the extracted action text (case-insensitive regex, no <code>g</code> flag):</p>
+<ul>
+<li><code>rm -r</code>, <code>rm -rf</code>, <code>rm -fr</code>, <code>rm -R</code>, <code>rm -rfv</code>, ... (any <code>rm</code> with an <code>r</code> flag)</li>
+<li><code>rm ... /</code> (recursive/force remove targeting the filesystem root)</li>
+<li><code>drop table</code>, <code>drop database</code>, <code>drop schema</code></li>
+<li><code>truncate table ...</code></li>
+<li><code>delete from ...</code></li>
+<li><code>mkfs</code>, <code>mkfs.ext4</code>, ...</li>
+<li><code>dd if=</code></li>
+<li><code>shred</code>, <code>wipefs</code></li>
+<li><code>git push -f</code> / <code>git push --force</code></li>
+<li><code>git reset --hard</code></li>
+<li><code>chmod -R 777</code>, <code>chown -R</code></li>
+<li>fork bomb <code>:(){ :|:&amp; };:</code></li>
+</ul>
+<h2>Install (static, survives restart)</h2>
+<h3>Option A: <code>dsh plugin add</code> (recommended)</h3>
+<p>The package declares <code>dsh.bundle.patch</code>, so <code>dsh plugin add</code> installs it and
+adds it to the profile's <code>dsh.profile.bundles</code> automatically — no manual
+patch editing.</p>
+<p>Clone the repo, then from the directory that contains it run:</p>
+<pre><code>git clone https://github.com/shifan3/dsh-approve-for-me.git
+dsh plugin --profile web add ./dsh-approve-for-me
+</code></pre>
+<p>Or by absolute path:</p>
+<pre><code>dsh plugin --profile web add /path/to/dsh-approve-for-me
+</code></pre>
+<p>Or, once it is published to npm:</p>
+<pre><code>dsh plugin --profile web add dsh-approve-for-me
+</code></pre>
+<p>Then restart <code>dsh web</code>. The command runs <code>pnpm add</code> inside
+<code>~/.dsh/profiles/web/</code>, then reconciles <code>dsh.profile.bundles</code> against the
+installed package. The row that activates the plugin lives in this repo's
+<code>cordis.patch.yml</code>.</p>
+<h3>Option B: manual home patch layer</h3>
+<p>If you prefer not to use <code>dsh plugin</code>, clone the repo into your DSH home and
+insert the row into <code>~/.dsh/cordis.patch.yml</code> yourself (applies to every
+profile):</p>
+<pre><code>mkdir -p ~/.dsh/plugins
+git clone https://github.com/shifan3/dsh-approve-for-me.git ~/.dsh/plugins/approve-for-me
+</code></pre>
+<p>Then create or extend <code>~/.dsh/cordis.patch.yml</code> with:</p>
+<pre><code>- insert:
+    - id: approve-for-me
+      name: '../../plugins/approve-for-me/lib/index.js'
+      config:
+        enabled: true
+        provider: deepseek-official
+        model: deepseek-v4-flash
+        maxTokens: 512
+        summaryMaxChars: 12000
+        timeoutMs: 60000
+</code></pre>
+<p>Then restart <code>dsh web</code>. The relative <code>name</code> resolves against each profile
+directory (<code>~/.dsh/profiles/&lt;name&gt;/</code>), so <code>../../plugins/...</code> reaches
+<code>~/.dsh/plugins/...</code> for the shipped <code>web</code>, <code>tui</code>, and <code>cc-tui</code> profiles.</p>
+<blockquote>
+<p>If you previously installed via Option B and then switch to Option A,
+remove the <code>approve-for-me</code> insert from <code>~/.dsh/cordis.patch.yml</code> first so
+the row is not defined twice.</p>
+</blockquote>
+<h3>Enable / disable / configure</h3>
+<ul>
+<li>Disable: set <code>enabled: false</code> in the row config and restart.<ul>
+<li>Option A: add an id-targeted override to the profile patch
+(<code>~/.dsh/profiles/web/cordis.patch.yml</code>):<pre><code>- id: approve-for-me
+  config:
+    enabled: false
+</code></pre>
+</li>
+<li>Option B: edit the insert block in <code>~/.dsh/cordis.patch.yml</code>.</li>
+</ul>
+</li>
+<li>Uninstall:<ul>
+<li>Option A: <code>dsh plugin --profile web remove dsh-approve-for-me</code>, then restart.</li>
+<li>Option B: remove the <code>insert</code> block (or the whole patch file), then restart.</li>
+</ul>
+</li>
+<li>Config keys (all optional):<ul>
+<li><code>enabled</code> (default <code>true</code>)</li>
+<li><code>provider</code> (default <code>deepseek-official</code>)</li>
+<li><code>model</code> (default <code>deepseek-v4-flash</code>)</li>
+<li><code>maxTokens</code> (default <code>512</code>)</li>
+<li><code>summaryMaxChars</code> (default <code>12000</code>)</li>
+<li><code>timeoutMs</code> (default <code>60000</code>)</li>
+<li><code>reasoningEffort</code> (default <code>off</code>; keep it <code>off</code> so the verdict is not consumed by reasoning tokens)</li>
+</ul>
+</li>
+</ul>
+<h2>Install (dynamic, per-run)</h2>
+<p>If you prefer not to write to <code>~/.dsh</code>, you can load <code>host-code.js</code> as a dynamic Cordis Host package (does not survive restart):</p>
+<ul>
+<li>Web UI: open the Cordis panel → new Plugin (id prefix such as <code>afm</code>) → paste <code>host-code.js</code> as the Host code → run.</li>
+<li>With <code>cordis_define</code> / <code>cordis_run</code>: read <code>host-code.js</code> and pass it as <code>code.host</code>.</li>
+</ul>
+<h2>Files</h2>
+<ul>
+<li><code>lib/index.js</code> — static host plugin (ESM, no runtime dependencies).</li>
+<li><code>host-code.js</code> — dynamic Cordis Host package variant (same logic, sandbox-safe subset).</li>
+<li><code>cordis.patch.yml</code> — bundle patch (declared via <code>dsh.bundle.patch</code>) that activates the plugin row.</li>
+</ul>
+<h2>Limitations</h2>
+<ul>
+<li>The dynamic variant runs in the DSH dynamic-host vm sandbox: no <code>setTimeout</code> / <code>AbortController</code>, so its timeout relies on the LLM adapter's <code>streamIdleTimeoutMs</code> (default 300s). The static variant uses a real <code>AbortSignal.timeout</code>.</li>
+<li>The session approval policy still displays as <code>ask</code>; the plugin is a prepended answerer, not a new policy enum.</li>
+<li>Only one approve-for-me answerer should be active: if you load both the static and the dynamic variant, the later-prepended one wins.</li>
+</ul>
+<h2>License</h2>
+<p>MIT</p>

@@ -37,9 +37,16 @@ window.fetch = async (url) => {
 // ---- 注入并执行脚本 ----
 const run = (src) => window.eval(src)
 const sharedSrc = await readFile(join(WEB, 'assets', 'shared.js'), 'utf8')
-const pageSrc = (await readFile(join(WEB, 'assets', 'page-search.js'), 'utf8')).replace(/\bexport\s+/g, '')
+// page-search.js 已共享化:纯函数在 search-core.js,本文件 import + re-export。
+// jsdom outside-only 下剥离 import/export 后,将 core + page 拼接为单次 eval
+// (同脚本作用域,函数引用才成立;strict-mode eval 的函数声明不跨 eval 泄漏)。
+const coreSrc = (await readFile(join(WEB, 'assets', 'search-core.js'), 'utf8')).replace(/\bexport\s+/g, '')
+const pageSrc = (await readFile(join(WEB, 'assets', 'page-search.js'), 'utf8'))
+  .replace(/import\s*\{[\s\S]*?\}\s*from\s*'\.\/search-core\.js'\s*/, '')
+  .replace(/export\s*\{[\s\S]*?\}\s*/, '')   // 剥掉 re-export 块(留在原地会变非法块语句)
+  .replace(/\bexport\s+/g, '')
 run(sharedSrc)
-run(pageSrc)
+run(`${coreSrc}\n${pageSrc}`)
 // jsdom 中 DOMContentLoaded 已提前触发,手动派发以启动 shared.js boot;默认强制 zh
 window.localStorage.setItem('dsh-lang', 'zh')
 window.document.dispatchEvent(new window.Event('DOMContentLoaded', { bubbles: true }))
@@ -62,7 +69,7 @@ assert(window.document.querySelectorAll('#lbStars .lb-item').length === 5, '星�
 assert(window.document.querySelectorAll('#lbGrowth .lb-item').length === 5, '增长榜 5 项')
 assert(window.document.getElementById('stat-plugins').textContent === '2439', '统计条插件数')
 assert(window.document.getElementById('stat-cats').textContent === '8', '统计条分类数')
-assert(window.document.querySelectorAll('#quickChips .chip').length === 8, '快速 chips 8 个')
+assert(window.document.querySelectorAll('#quickChips .chip').length === 12, '快速 chips 12 个')
 const scoreBadge = window.document.querySelector('#featuredList .score-badge')
 assert(!!scoreBadge && /^S 85$/.test(scoreBadge.textContent), `精选行 score-badge 格式 ("${scoreBadge?.textContent}")`)
 
@@ -97,7 +104,7 @@ const facets = {
   trust: window.document.querySelectorAll('#facetTrust .facet-item').length,
   stars: window.document.querySelectorAll('#facetStars .facet-item').length,
 }
-assert(facets.source === 3 && facets.category === 8 && facets.trust === 2 && facets.stars === 3, `facet 组(来源${facets.source}/分类${facets.category}/信任${facets.trust}/stars${facets.stars})`)
+assert(facets.source === 3 && facets.category === 12 && facets.trust === 2 && facets.stars === 3, `facet 组(来源${facets.source}/分类${facets.category}/信任${facets.trust}/stars${facets.stars})`)
 
 console.log('== facet 过滤 + 排序 ==')
 const markCount = window.document.querySelectorAll('#resultsList mark').length

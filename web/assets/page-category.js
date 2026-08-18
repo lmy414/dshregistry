@@ -1,31 +1,24 @@
 /**
- * DSH-Registry 搜索主页逻辑(M-B 第一个增量,增量 2 共享化后)。
+ * DSH-Registry 分类搜索页逻辑(M-B 增量 2)。
+ * 设计稿 category-zh-light.html 生产版:12 能力域 facet + 作者 facet(组内搜索/Top10+展开)
+ * + Stars 单选 + 统计行/精选卡/结果行(插件行 + 网页行)+ mark 高亮 + 安装展开 + 零结果态。
  *
- * 纯函数已提炼至 web/assets/search-core.js(搜索主页与分类页共用),本文件
- * re-export 保持 `import … from '../../web/assets/page-search.js'` 测试路径有效;
- * DOM 区保持不变:数据加载、联想、发现页渲染、结果视图、facet、安装命令、零结果态。
+ * 查询与过滤:顶部小号搜索框支持主页同款组合语法(cat:/author:/stars:/src:/score: + 裸词 AND);
+ * facet 与查询语法同状态 AND;URL 参数直达(category.html?cat=vision / ?q=xxx / ?author=x),
+ * 进入页面即应用并渲染,搜索后写回地址栏(replaceState)。
  *
- * 依赖 window.DSH.R(shared.js)提供:fetchJson/assertLocalUrl/escapeHtml/badgeHtml/
- * categoryLabel/relativeTime/t 等。本文件为 ESM(浏览器 <script type="module">,
- * 天然 defer;node 测试直接 import 纯函数)。
+ * 纯函数全部来自 web/assets/search-core.js(与搜索主页共享);本文件只做 DOM 绑定与页面区块。
+ * 依赖 window.DSHR(shared.js)提供 t/escapeHtml/badgeHtml/categoryLabel/relativeTime/loadData/
+ * assertLocalUrl/CATEGORIES/SVG_STAR 等。
  */
 'use strict'
 
-// ====================================================================
-// 纯函数 import + re-export(实现见 search-core.js;node 测试路径保持
-// page-search.js 不变,同时模块内 DOM 区可直接引用这些绑定)
-// ====================================================================
 import {
-  pluginSources, pageStars, featuredPlugins, authorLeaderboard, starsLeaderboard,
-  growthLeaderboard, parseQuery, applyFilters, applyPageFilters, pluginMatchesTerms,
-  pageMatchesTerms, relevanceScore, suggestForQuery, fmtNum, highlight,
+  pluginSources, pageStars, parseQuery, applyFilters, applyPageFilters,
+  pluginMatchesTerms, pageMatchesTerms, relevanceScore, suggestForQuery,
+  fmtNum, highlight, growthLeaderboard, authorCounts, topAuthors,
+  pickFeatured, displayUrl,
 } from './search-core.js'
-
-export {
-  pluginSources, pageStars, featuredPlugins, authorLeaderboard, starsLeaderboard,
-  growthLeaderboard, parseQuery, applyFilters, applyPageFilters, pluginMatchesTerms,
-  pageMatchesTerms, relevanceScore, suggestForQuery, fmtNum, highlight,
-}
 
 // ====================================================================
 // DOM 区(仅浏览器)
@@ -38,13 +31,13 @@ if (typeof document !== 'undefined' && typeof window !== 'undefined') {
       plugins: [],
       pages: [],
       search: null,          // search.json
-      meta: null,
       trending: null,
       maxStars: 1,
       docIdxOf: new Map(),   // slug → search.json docs 下标
       query: '',
       sort: 'relevance',
-      facets: { source: [], category: [], trust: [], stars: '' }, // '' = 不限
+      facets: { source: [], category: [], trust: [], author: [], stars: '' }, // stars '' = 不限
+      authorExpanded: false, // 作者 facet 是否展开全部
     }
     const SORTS = ['relevance', 'stars', 'updated']
 
@@ -111,6 +104,7 @@ if (typeof document !== 'undefined' && typeof window !== 'undefined') {
     function pageRowHtml(w, terms) {
       const stars = pageStars(w)
       const src = String(w.source || '')
+      const url = DSHR.escapeHtml(displayUrl(w.url))
       return `<div class="result-row result-page" data-kind="page">
   <div class="result-main">
     <div class="result-title-row">
@@ -122,143 +116,13 @@ if (typeof document !== 'undefined' && typeof window !== 'undefined') {
   </div>
   <div class="result-meta-row">
     ${stars != null ? `<span class="meta-item star-gold">${DSHR.SVG_STAR} ${fmtNum(stars)}</span>` : ''}
-    <span class="meta-item page-url">${DSHR.escapeHtml(w.url || '')}</span>
+    <span class="meta-item page-url">${url}</span>
     <span class="meta-tags">${srcTagsHtml([src])}</span>
   </div>
 </div>`
     }
 
-    // ---------- 发现页渲染 ----------
-    function renderStats() {
-      const m = state.meta
-      const set = (id, v) => { const el = document.getElementById(id); if (el) el.textContent = v }
-      if (m) {
-        set('stat-plugins', String(m.pluginCount ?? '—'))
-        set('stat-cats', String(m.categoryCount ?? '—'))
-        set('stat-updated', DSHR.relativeTime(m.updatedAt))
-      } else {
-        set('stat-plugins', '—'); set('stat-cats', '—'); set('stat-updated', '—')
-      }
-    }
-
-    function renderFeatured() {
-      const el = document.getElementById('featuredList')
-      if (!el) return
-      try {
-        const list = featuredPlugins(state.plugins, 8)
-        el.innerHTML = list.length ? list.map((p) => pluginRowHtml(p, [])).join('') : unavailableHtml()
-      } catch (e) {
-        console.error('[page-search] featured render failed', e)
-        el.innerHTML = unavailableHtml()
-      }
-    }
-
-    function lbItemHtml(rank, name, href, valueHtml, cls) {
-      return `<li class="lb-item${cls ? ` ${cls}` : ''}">
-  <span class="lb-rank">${rank}</span>
-  ${href ? `<a class="lb-name" href="${href}">${DSHR.escapeHtml(name)}</a>` : `<span class="lb-name">${DSHR.escapeHtml(name)}</span>`}
-  ${valueHtml}
-</li>`
-    }
-
-    function renderLeaderboards() {
-      // 作者榜
-      const authors = document.getElementById('lbAuthors')
-      if (authors) {
-        try {
-          const list = authorLeaderboard(state.plugins, 5)
-          authors.innerHTML = list.length
-            ? list.map(({ author, count }, i) => lbItemHtml(i + 1, author, '#', `<span class="lb-value">${DSHR.escapeHtml(DSHR.t('lb.plugin.count').replace('{n}', String(count)))}</span>`, `rank-${i + 1}`)).join('')
-            : unavailableHtml()
-        } catch (e) {
-          authors.innerHTML = unavailableHtml()
-        }
-      }
-      // 星数榜
-      const stars = document.getElementById('lbStars')
-      if (stars) {
-        try {
-          const list = starsLeaderboard(state.plugins, 5)
-          stars.innerHTML = list.length
-            ? list.map((p, i) => lbItemHtml(i + 1, p.name, `/p/${encodeURIComponent(p.slug)}.html`, `<span class="lb-value tabular">${fmtNum(p.stars)}</span>`, `rank-${i + 1}`)).join('')
-            : unavailableHtml()
-        } catch (e) {
-          stars.innerHTML = unavailableHtml()
-        }
-      }
-      // 24h 增长榜
-      const growth = document.getElementById('lbGrowth')
-      if (growth) {
-        try {
-          const list = growthLeaderboard(state.trending, 5)
-          growth.innerHTML = list.length
-            ? list.map((it, i) => lbItemHtml(i + 1, it.name || it.slug, it.slug ? `/p/${encodeURIComponent(it.slug)}.html` : '#', `<span class="lb-growth">+${Number(it.delta) || 0}</span>`, `rank-${i + 1}`)).join('')
-            : unavailableHtml()
-        } catch (e) {
-          growth.innerHTML = unavailableHtml()
-        }
-      }
-    }
-
-    // ---------- 快速 chips ----------
-    function renderQuickChips() {
-      const el = document.getElementById('quickChips')
-      if (!el) return
-      const cats = DSHR.CATEGORIES.filter((c) => c !== 'all')
-      el.innerHTML = cats.map((c) => `<button type="button" class="chip" data-cat="${DSHR.escapeHtml(c)}">${DSHR.escapeHtml(DSHR.categoryLabel(c))}</button>`).join('')
-      el.querySelectorAll('.chip').forEach((chip) => {
-        chip.addEventListener('click', () => {
-          const input = document.getElementById('searchInput')
-          if (input) input.value = `cat:${chip.dataset.cat}`
-          runSearch()
-        })
-      })
-    }
-
-    // ---------- 联想下拉 ----------
-    let suggestTimer = null
-    let suggestIndex = -1
-
-    function renderSuggestions(value) {
-      const box = document.getElementById('suggestBox')
-      const input = document.getElementById('searchInput')
-      if (!box || !input) return
-      const items = suggestForQuery(value, state.plugins, DSHR.CATEGORIES.map((k) => ({ key: k, label: DSHR.categoryLabel(k) })))
-      if (!value.trim() || !items.length) {
-        box.hidden = true
-        input.setAttribute('aria-expanded', 'false')
-        return
-      }
-      suggestIndex = -1
-      box.innerHTML = items.map((it, i) => {
-        const catLabel = it.type === 'plugin' ? DSHR.categoryLabel(it.cat) : it.sub
-        const catHtml = catLabel ? `<span class="suggest-cat">${DSHR.escapeHtml(catLabel)}</span>` : ''
-        return `<button type="button" class="suggest-item" data-index="${i}">${DSHR.escapeHtml(it.label)}${catHtml}</button>`
-      }).join('')
-      box.hidden = false
-      input.setAttribute('aria-expanded', 'true')
-      // 点击联想项
-      box.querySelectorAll('.suggest-item').forEach((btn) => {
-        btn.addEventListener('click', () => {
-          const it = items[Number(btn.dataset.index)]
-          if (!it) return
-          // 裸词联想项无 value(只有 label),维度项两者都有
-          input.value = it.value ?? it.label ?? ''
-          box.hidden = true
-          input.setAttribute('aria-expanded', 'false')
-          runSearch()
-        })
-      })
-    }
-
-    function hideSuggest() {
-      const box = document.getElementById('suggestBox')
-      const input = document.getElementById('searchInput')
-      if (box) box.hidden = true
-      if (input) input.setAttribute('aria-expanded', 'false')
-    }
-
-    // ---------- 结果视图 ----------
+    // ---------- facet 渲染 ----------
     function facetItem(label, count, checked, value, group) {
       const isRadio = group === 'stars'
       return `<label class="facet-item">
@@ -269,7 +133,7 @@ if (typeof document !== 'undefined' && typeof window !== 'undefined') {
 </label>`
     }
 
-    /** 计算各 facet 选项的计数:基于"查询+维度过滤后、facet 应用前"的候选集。 */
+    /** 各 facet 选项计数:基于"查询+维度过滤后、facet 应用前"的候选集(与搜索主页一致)。 */
     function facetCounts(plugs, pgs) {
       const counts = { source: {}, category: {}, trust: {}, stars: {} }
       const bump = (obj, k) => { obj[k] = (obj[k] || 0) + 1 }
@@ -307,8 +171,8 @@ if (typeof document !== 'undefined' && typeof window !== 'undefined') {
       }
       const trustEl = document.getElementById('facetTrust')
       if (trustEl) {
-        const opts = ['community', 'unreviewed']
-        trustEl.innerHTML = opts.map((t) => facetItem(DSHR.t(`badge.${t === 'community' ? 'vouched' : 'unreviewed'}`), counts.trust[t] || 0, f.trust.includes(t), t, 'trust')).join('')
+        const opts = ['community', 'unreviewed', 'flagged']
+        trustEl.innerHTML = opts.map((t) => facetItem(DSHR.t(`badge.${t === 'community' ? 'vouched' : t}`), counts.trust[t] || 0, f.trust.includes(t), t, 'trust')).join('')
       }
       const starsEl = document.getElementById('facetStars')
       if (starsEl) {
@@ -319,14 +183,39 @@ if (typeof document !== 'undefined' && typeof window !== 'undefined') {
         ]
         starsEl.innerHTML = items.join('')
       }
+      renderAuthorFacet(plugs, pgs)
     }
 
+    /** 作者 facet:组内搜索框过滤 + Top10(未展开)/全部(展开)。 */
+    function renderAuthorFacet(plugs, pgs) {
+      const listEl = document.getElementById('facetAuthorList')
+      if (!listEl) return
+      const searchInput = document.getElementById('facetAuthorSearch')
+      const filter = searchInput ? searchInput.value : ''
+      const counts = authorCounts(plugs, pgs)
+      const limit = state.authorExpanded ? Infinity : 10
+      const list = topAuthors(counts, filter, limit)
+      listEl.innerHTML = list.length
+        ? list.map(({ author, count }) => facetItem(author, count, state.facets.author.some((a) => String(author).toLowerCase().includes(a)), author, 'author')).join('')
+        : unavailableHtml(DSHR.t('unavailable'))
+      const moreEl = document.getElementById('facetAuthorMore')
+      if (moreEl) {
+        moreEl.hidden = !filter && counts.size <= 10
+        moreEl.textContent = state.authorExpanded ? DSHR.t('facet.author.less') : DSHR.t('facet.author.more')
+      }
+    }
+
+    // ---------- facet 应用 ----------
     function applyFacetsToPlugins(plugs) {
       const f = state.facets
       return plugs.filter((p) => {
         if (f.source.length && !f.source.some((s) => pluginSources(p).includes(s))) return false
         if (f.category.length && !f.category.includes(p.category || 'other')) return false
         if (f.trust.length && !f.trust.includes(p.state || 'unreviewed')) return false
+        if (f.author.length) {
+          const author = String((p.repo || '').split('/')[0] || '').toLowerCase()
+          if (!f.author.some((a) => author.includes(a))) return false
+        }
         if (f.stars && (p.stars || 0) < Number(f.stars)) return false
         return true
       })
@@ -338,12 +227,16 @@ if (typeof document !== 'undefined' && typeof window !== 'undefined') {
         if (f.source.length && !f.source.includes(w.source || '')) return false
         if (f.category.length) return false
         if (f.trust.length) return false
+        if (f.author.length) {
+          const author = String(w.author || '').toLowerCase()
+          if (!f.author.some((a) => author.includes(a))) return false
+        }
         if (f.stars && (pageStars(w) || 0) < Number(f.stars)) return false
         return true
       })
     }
 
-    /** 查询+维度过滤后的候选集(供 facet 计数与结果计算共用)。 */
+    /** 查询+维度过滤后的候选集(facet 计数与结果计算共用)。 */
     function queryCandidateSets() {
       const parsed = parseQuery(state.query)
       const plugs = applyFilters(state.plugins, parsed.filters)
@@ -353,15 +246,7 @@ if (typeof document !== 'undefined' && typeof window !== 'undefined') {
       return { plugs, pgs, parsed }
     }
 
-    function sortRows(rows) {
-      const by = {
-        relevance: (a, b) => b.score - a.score || starsOf(b) - starsOf(a),
-        stars: (a, b) => starsOf(b) - starsOf(a),
-        updated: (a, b) => updatedTs(b) - updatedTs(a),
-      }[state.sort] || ((a, b) => b.score - a.score)
-      return rows.sort(by)
-    }
-
+    // ---------- 结果计算 ----------
     function starsOf(r) {
       return r.kind === 'plugin' ? r.item.stars || 0 : pageStars(r.item) || 0
     }
@@ -369,6 +254,15 @@ if (typeof document !== 'undefined' && typeof window !== 'undefined') {
     function updatedTs(r) {
       if (r.kind === 'plugin') return new Date(r.item.pushedAt || 0).getTime()
       return 0
+    }
+
+    function sortRows(rows) {
+      const by = {
+        relevance: (a, b) => b.score - a.score || starsOf(b) - starsOf(a),
+        stars: (a, b) => starsOf(b) - starsOf(a),
+        updated: (a, b) => updatedTs(b) - updatedTs(a),
+      }[state.sort] || ((a, b) => b.score - a.score)
+      return rows.sort(by)
     }
 
     function buildRows(plugs, pgs, parsed) {
@@ -400,6 +294,7 @@ if (typeof document !== 'undefined' && typeof window !== 'undefined') {
       return sortRows(plugRows.concat(pageRows))
     }
 
+    // ---------- 渲染结果区 ----------
     function zeroStateHtml() {
       const popular = growthLeaderboard(state.trending, 5).map((it) => it.name || it.slug).filter(Boolean)
       return `<div class="zero-state">
@@ -413,18 +308,35 @@ if (typeof document !== 'undefined' && typeof window !== 'undefined') {
     function wireZeroChips() {
       document.querySelectorAll('#resultsList .chip[data-zero]').forEach((chip) => {
         chip.addEventListener('click', () => {
-          const input = document.getElementById('searchInput')
+          const input = document.getElementById('catSearchInput')
           if (input) input.value = chip.dataset.zero
           runSearch()
         })
       })
     }
 
-    /** 按当前 state.query + facets 计算并渲染结果区(不滚动、不切视图)。 */
+    /** 精选卡:从当前过滤结果中选 community && dshfind.grade 的相关度最高 1 个,无则不显示。 */
+    function renderFeatured(pluginRows) {
+      const card = document.getElementById('featuredCard')
+      const rowsEl = document.getElementById('featuredRows')
+      if (!card || !rowsEl) return
+      const pick = pickFeatured(pluginRows)
+      if (!pick) {
+        card.hidden = true
+        rowsEl.innerHTML = ''
+        return
+      }
+      rowsEl.innerHTML = pluginRowHtml(pick.item, parseQuery(state.query).terms)
+      card.hidden = false
+    }
+
+    /** 按当前 state.query + facets 计算并渲染结果区 + 精选卡 + facet 计数。 */
     function applyAndRender() {
       const parsed = parseQuery(state.query)
       const { plugs, pgs } = queryCandidateSets()
-      const rows = buildRows(applyFacetsToPlugins(plugs), applyFacetsToPages(pgs), parsed)
+      const plugRows = applyFacetsToPlugins(plugs)
+      const pageRows = applyFacetsToPages(pgs)
+      const rows = buildRows(plugRows, pageRows, parsed)
       const t0 = performance.now()
       const statsEl = document.getElementById('resultsStats')
       if (statsEl) {
@@ -432,6 +344,18 @@ if (typeof document !== 'undefined' && typeof window !== 'undefined') {
           .replace('{n}', `<strong>${String(rows.length)}</strong>`)
           .replace('{ms}', String(Math.round(performance.now() - t0)))
       }
+      renderFeatured(plugRows.map((p) => ({
+        kind: 'plugin',
+        item: p,
+        score: relevanceScore({
+          docIdx: state.docIdxOf.get(p.slug),
+          terms: parsed.terms,
+          index: state.search && state.search.index,
+          stars: p.stars,
+          maxStars: state.maxStars,
+          hasDshfindScore: !!((p.external && p.external.dshfind && p.external.dshfind.score != null)),
+        }),
+      })))
       const listEl = document.getElementById('resultsList')
       if (listEl) {
         listEl.innerHTML = rows.length
@@ -442,65 +366,95 @@ if (typeof document !== 'undefined' && typeof window !== 'undefined') {
       renderFacets()
     }
 
+    // ---------- 查询 / URL ----------
+    /** 从 URL 参数合成查询串(?q= / ?cat= / ?author=)。 */
+    function paramsToQuery() {
+      const params = new URLSearchParams(location.search)
+      const parts = []
+      const q = (params.get('q') || '').trim()
+      const cat = (params.get('cat') || '').trim().toLowerCase()
+      const author = (params.get('author') || '').trim().toLowerCase()
+      if (q) parts.push(q)
+      if (cat) parts.push(`cat:${cat}`)
+      if (author) parts.push(`author:${author}`)
+      return parts.join(' ')
+    }
+
+    /** 写回地址栏:cat/author 独立参数,其余维度与裸词并入 q;replaceState 不产生历史项。 */
+    function syncUrl() {
+      if (!history || !history.replaceState || typeof history.replaceState !== 'function') return
+      const parsed = parseQuery(state.query)
+      const url = new URL(location.href)
+      url.search = ''
+      const cat = parsed.filters.cat[0]
+      const author = parsed.filters.author[0]
+      if (cat) url.searchParams.set('cat', cat)
+      if (author) url.searchParams.set('author', author)
+      const rest = []
+      for (const tok of state.query.trim().split(/\s+/)) {
+        if (!tok) continue
+        const m = tok.match(/^(cat|author):(.*)$/)
+        if (m && m[2]) continue // 已抽取为独立参数
+        rest.push(tok)
+      }
+      if (rest.length) url.searchParams.set('q', rest.join(' '))
+      try {
+        history.replaceState(null, '', url.toString())
+      } catch (e) { /* 某些环境禁止修改地址,忽略 */ }
+    }
+
     function runSearch() {
-      const input = document.getElementById('searchInput')
+      const input = document.getElementById('catSearchInput')
       state.query = input ? input.value : ''
-      const discovery = document.getElementById('discoverySection')
-      const view = document.getElementById('resultsView')
-      if (discovery) discovery.hidden = true
-      if (view) view.hidden = false
       applyAndRender()
       hideSuggest()
-      if (view && typeof view.scrollIntoView === 'function') view.scrollIntoView({ behavior: 'smooth', block: 'start' })
+      syncUrl()
     }
 
-    function backToDiscovery() {
-      state.query = ''
-      const input = document.getElementById('searchInput')
-      if (input) input.value = ''
-      const discovery = document.getElementById('discoverySection')
-      const view = document.getElementById('resultsView')
-      if (discovery) discovery.hidden = false
-      if (view) view.hidden = true
-      window.scrollTo({ top: 0, behavior: 'smooth' })
-    }
+    // ---------- 联想下拉 ----------
+    let suggestTimer = null
+    let suggestIndex = -1
 
-    function readFacetsFromDom() {
-      state.facets = {
-        source: [...document.querySelectorAll('#facetSource input:checked')].map((el) => el.value),
-        category: [...document.querySelectorAll('#facetCategory input:checked')].map((el) => el.value),
-        trust: [...document.querySelectorAll('#facetTrust input:checked')].map((el) => el.value),
-        stars: (document.querySelector('#facetStars input:checked') || { value: '' }).value,
+    function renderSuggestions(value) {
+      const box = document.getElementById('catSuggestBox')
+      const input = document.getElementById('catSearchInput')
+      if (!box || !input) return
+      const items = suggestForQuery(value, state.plugins, DSHR.CATEGORIES.map((k) => ({ key: k, label: DSHR.categoryLabel(k) })))
+      if (!value.trim() || !items.length) {
+        box.hidden = true
+        input.setAttribute('aria-expanded', 'false')
+        return
       }
-    }
-
-    function wireFacets() {
-      ;['facetSource', 'facetCategory', 'facetTrust', 'facetStars'].forEach((id) => {
-        const el = document.getElementById(id)
-        if (!el) return
-        el.addEventListener('change', () => {
-          readFacetsFromDom()
+      suggestIndex = -1
+      box.innerHTML = items.map((it, i) => {
+        const catLabel = it.type === 'plugin' ? DSHR.categoryLabel(it.cat) : it.sub
+        const catHtml = catLabel ? `<span class="suggest-cat">${DSHR.escapeHtml(catLabel)}</span>` : ''
+        return `<button type="button" class="suggest-item" data-index="${i}">${DSHR.escapeHtml(it.label)}${catHtml}</button>`
+      }).join('')
+      box.hidden = false
+      input.setAttribute('aria-expanded', 'true')
+      box.querySelectorAll('.suggest-item').forEach((btn) => {
+        btn.addEventListener('click', () => {
+          const it = items[Number(btn.dataset.index)]
+          if (!it) return
+          input.value = it.value ?? it.label ?? ''
+          box.hidden = true
+          input.setAttribute('aria-expanded', 'false')
           runSearch()
         })
       })
     }
 
-    function wireInstallToggle() {
-      document.addEventListener('click', (e) => {
-        const btn = e.target.closest('.install-btn')
-        if (!btn) return
-        e.preventDefault()
-        const row = btn.closest('.result-row')
-        const cmd = row && row.querySelector('.install-cmd')
-        if (!cmd) return
-        const code = cmd.querySelector('code')
-        if (code) code.textContent = btn.dataset.install || ''
-        cmd.classList.toggle('hidden')
-      })
+    function hideSuggest() {
+      const box = document.getElementById('catSuggestBox')
+      const input = document.getElementById('catSearchInput')
+      if (box) box.hidden = true
+      if (input) input.setAttribute('aria-expanded', 'false')
     }
 
+    // ---------- 事件绑定 ----------
     function wireSearch() {
-      const input = document.getElementById('searchInput')
+      const input = document.getElementById('catSearchInput')
       if (!input) return
       input.addEventListener('input', () => {
         clearTimeout(suggestTimer)
@@ -509,13 +463,13 @@ if (typeof document !== 'undefined' && typeof window !== 'undefined') {
       input.addEventListener('keydown', (e) => {
         if (e.key === 'Enter') {
           e.preventDefault()
-          const box = document.getElementById('suggestBox')
+          const box = document.getElementById('catSuggestBox')
           const items = [...(box ? box.querySelectorAll('.suggest-item') : [])]
           const active = items.find((b) => b.classList.contains('active'))
           if (active) active.click()
           else runSearch()
         } else if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
-          const box = document.getElementById('suggestBox')
+          const box = document.getElementById('catSuggestBox')
           if (!box || box.hidden) return
           e.preventDefault()
           const items = [...box.querySelectorAll('.suggest-item')]
@@ -530,6 +484,66 @@ if (typeof document !== 'undefined' && typeof window !== 'undefined') {
         }
       })
       input.addEventListener('blur', () => setTimeout(hideSuggest, 150))
+    }
+
+    function readFacetsFromDom() {
+      state.facets = {
+        source: [...document.querySelectorAll('#facetSource input:checked')].map((el) => el.value),
+        category: [...document.querySelectorAll('#facetCategory input:checked')].map((el) => el.value),
+        trust: [...document.querySelectorAll('#facetTrust input:checked')].map((el) => el.value),
+        author: [...document.querySelectorAll('#facetAuthorList input:checked')].map((el) => el.value),
+        stars: (document.querySelector('#facetStars input:checked') || { value: '' }).value,
+      }
+    }
+
+    function wireFacets() {
+      ;['facetSource', 'facetCategory', 'facetTrust', 'facetAuthorList', 'facetStars'].forEach((id) => {
+        const el = document.getElementById(id)
+        if (!el) return
+        el.addEventListener('change', () => {
+          readFacetsFromDom()
+          runSearch()
+        })
+      })
+      const authorSearch = document.getElementById('facetAuthorSearch')
+      if (authorSearch) {
+        let timer = null
+        authorSearch.addEventListener('input', () => {
+          clearTimeout(timer)
+          timer = setTimeout(() => {
+            state.authorExpanded = false // 输入过滤时重置为 Top 列表
+            renderAuthorFacet(...candidatePlugsPages())
+          }, 150)
+        })
+      }
+      const more = document.getElementById('facetAuthorMore')
+      if (more) {
+        more.addEventListener('click', (e) => {
+          e.preventDefault()
+          state.authorExpanded = !state.authorExpanded
+          renderAuthorFacet(...candidatePlugsPages())
+        })
+      }
+    }
+
+    /** 供作者 facet 局部刷新用的候选集(不触碰结果区)。 */
+    function candidatePlugsPages() {
+      const { plugs, pgs } = queryCandidateSets()
+      return [applyFacetsToPlugins(plugs), applyFacetsToPages(pgs)]
+    }
+
+    function wireInstallToggle() {
+      document.addEventListener('click', (e) => {
+        const btn = e.target.closest('.install-btn')
+        if (!btn) return
+        e.preventDefault()
+        const row = btn.closest('.result-row')
+        const cmd = row && row.querySelector('.install-cmd')
+        if (!cmd) return
+        const code = cmd.querySelector('code')
+        if (code) code.textContent = btn.dataset.install || ''
+        cmd.classList.toggle('hidden')
+      })
     }
 
     function wireSort() {
@@ -554,33 +568,21 @@ if (typeof document !== 'undefined' && typeof window !== 'undefined') {
       select.value = state.sort
     }
 
-    const backBtn = document.getElementById('backDiscovery')
-    if (backBtn) backBtn.addEventListener('click', (e) => { e.preventDefault(); backToDiscovery() })
-
     function rerenderAll() {
-      renderStats()
-      renderFeatured()
-      renderLeaderboards()
-      renderQuickChips()
-      const input = document.getElementById('searchInput')
-      if (input) input.setAttribute('data-i18n-placeholder', '#search.heroPlaceholder')
+      const input = document.getElementById('catSearchInput')
+      if (input) input.setAttribute('data-i18n-placeholder', '#cat.search.placeholder')
       const select = document.getElementById('sortSelect')
       if (select) populateSortOptions(select)
-      const view = document.getElementById('resultsView')
-      if (view && !view.hidden) {
-        state.query = input ? input.value : ''
-        applyAndRender()
-      }
+      applyAndRender()
     }
 
     // ---------- 启动 ----------
     async function boot() {
       try {
-        const [plugins, meta] = await DSHR.loadData()
+        const [plugins] = await DSHR.loadData()
         state.plugins = plugins
-        state.meta = meta
       } catch (e) {
-        console.error('[page-search] plugins/meta load failed', e)
+        console.error('[page-category] plugins load failed', e)
       }
       try {
         state.search = await fetchLocal('/data/search.json')
@@ -589,37 +591,31 @@ if (typeof document !== 'undefined' && typeof window !== 'undefined') {
           if (d.type === 'plugin' && !state.docIdxOf.has(d.slug)) state.docIdxOf.set(d.slug, i)
         }
       } catch (e) {
-        console.error('[page-search] search.json load failed', e)
+        console.error('[page-category] search.json load failed', e)
       }
       try {
         state.pages = (await fetchLocal('/data/pages.json')).pages || []
       } catch (e) {
-        console.error('[page-search] pages.json load failed', e)
+        console.error('[page-category] pages.json load failed', e)
       }
       try {
         state.trending = await fetchLocal('/data/trending.json')
       } catch (e) {
-        console.error('[page-search] trending.json load failed', e)
+        console.error('[page-category] trending.json load failed', e)
       }
       state.maxStars = Math.max(1, ...state.plugins.map((p) => p.stars || 0))
       wireSearch()
       wireFacets()
       wireSort()
       wireInstallToggle()
-      renderStats()
-      renderFeatured()
-      renderLeaderboards()
-      renderQuickChips()
-      // URL ?q= 直接进入结果视图(SearchAction 兼容)
-      const q = new URLSearchParams(location.search).get('q')
-      if (q) {
-        const input = document.getElementById('searchInput')
-        if (input) input.value = q
-        runSearch()
-      }
+      // URL 参数直达:进入页面即应用过滤并渲染,写回地址栏
+      const q = paramsToQuery()
+      const input = document.getElementById('catSearchInput')
+      if (input) input.value = q
+      runSearch()
     }
 
-    DSHR.onReady(() => boot().catch((e) => console.error('[page-search] boot failed', e)))
+    DSHR.onReady(() => boot().catch((e) => console.error('[page-category] boot failed', e)))
     DSHR.onLangChange(() => rerenderAll())
   })()
 }

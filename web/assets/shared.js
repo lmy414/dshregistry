@@ -95,12 +95,15 @@
     }
     return url
   }
-  /** 数据路由白名单: 只允许 4 个固定数据模式;参数仅作文件名片段并经 encodeURIComponent 消毒。 */
+  /** 数据路由白名单: 只允许固定数据模式;参数仅作文件名片段并经 encodeURIComponent 消毒。 */
   const DATA_ROUTES = {
     plugins: () => '/data/plugins.json',
     meta: () => '/data/meta.json',
     plugin: (slug) => `/data/plugin/${encodeURIComponent(slug)}.json`,
     'by-cat': (cat) => `/data/by-cat/${encodeURIComponent(cat)}.json`,
+    search: () => '/data/search.json',
+    pages: () => '/data/pages.json',
+    trending: () => '/data/trending.json',
   }
   function fetchJson(key, arg) {
     const build = DATA_ROUTES[key]

@@ -41,14 +41,7 @@ if (typeof document !== 'undefined' && typeof window !== 'undefined') {
     }
     const SORTS = ['relevance', 'stars', 'updated']
 
-    /** 站内 fetch + assertLocalUrl 校验(search.json/pages.json/trending.json 不在 shared.js 白名单)。 */
-    function fetchLocal(path) {
-      const url = DSHR.assertLocalUrl(path)
-      return fetch(url).then((res) => {
-        if (!res.ok) throw new Error(`${url}: HTTP ${res.status}`)
-        return res.json()
-      })
-    }
+    /** 站内数据一律走 shared.js 白名单路由(DSHR.fetchJson),本文件不做任何 URL 构造。 */
 
     function unavailableHtml(text) {
       return `<div class="unavailable-row">${DSHR.escapeHtml(text || DSHR.t('unavailable'))}</div>`
@@ -585,7 +578,7 @@ if (typeof document !== 'undefined' && typeof window !== 'undefined') {
         console.error('[page-category] plugins load failed', e)
       }
       try {
-        state.search = await fetchLocal('/data/search.json')
+        state.search = await DSHR.fetchJson('search')
         for (let i = 0; i < (state.search.docs || []).length; i++) {
           const d = state.search.docs[i]
           if (d.type === 'plugin' && !state.docIdxOf.has(d.slug)) state.docIdxOf.set(d.slug, i)
@@ -594,12 +587,12 @@ if (typeof document !== 'undefined' && typeof window !== 'undefined') {
         console.error('[page-category] search.json load failed', e)
       }
       try {
-        state.pages = (await fetchLocal('/data/pages.json')).pages || []
+        state.pages = (await DSHR.fetchJson('pages')).pages || []
       } catch (e) {
         console.error('[page-category] pages.json load failed', e)
       }
       try {
-        state.trending = await fetchLocal('/data/trending.json')
+        state.trending = await DSHR.fetchJson('trending')
       } catch (e) {
         console.error('[page-category] trending.json load failed', e)
       }

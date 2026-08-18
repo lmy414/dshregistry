@@ -13,7 +13,7 @@ const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..')
 const PLUGINS_FILE = join(ROOT, 'web', 'data', 'plugins.json')
 const PLUGIN_DIR = join(ROOT, 'web', 'data', 'plugin')
 const BYCAT_DIR = join(ROOT, 'web', 'data', 'by-cat')
-const CATS = ['tool', 'vision', 'dashboard', 'bridge', 'launcher', 'mcp', 'skill', 'other']
+const CATS = ['tool', 'vision', 'dashboard', 'bridge', 'launcher', 'mcp', 'skill', 'memory', 'security', 'media', 'integration', 'other']
 
 const plugins = JSON.parse(await readFile(PLUGINS_FILE, 'utf8'))
 

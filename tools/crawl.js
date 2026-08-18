@@ -20,6 +20,7 @@
  */
 
 import { execFile, execSync } from 'node:child_process'
+import { readFileSync } from 'node:fs'
 import { mkdir, readFile, rename, rm, writeFile, readdir } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -40,6 +41,7 @@ const DATA_DIR = join(ROOT, 'web', 'data')
 const README_DIR = join(DATA_DIR, 'readme')
 const SEEDS_FILE = join(ROOT, 'config', 'seeds.json')
 const FLAGS_FILE = join(ROOT, 'config', 'flags.json')
+const CATEGORY_OVERRIDES_FILE = join(ROOT, 'config', 'categories.json')
 const PLUGINS_FILE = join(DATA_DIR, 'plugins.json')
 const PKG_CACHE_FILE = join(ROOT, 'tools', '.cache', 'pkg.json')   // 初筛/补全缓存(pushedAt 校验),重跑秒过
 const README_CACHE_DIR = join(ROOT, 'tools', '.cache', 'readme')   // README 原文缓存(同名文件按仓库隔离)
@@ -222,17 +224,51 @@ async function searchIncremental(seen, maxNew) {
 
 // ---------------------------------------------------------------- 元数据提取
 
-const VALID_CATEGORIES = ['tool', 'vision', 'dashboard', 'bridge', 'launcher', 'mcp', 'skill', 'other']
+// ---------------------------------------------------------------- 分类体系(12 能力域)
+
+const VALID_CATEGORIES = ['tool', 'vision', 'dashboard', 'bridge', 'launcher', 'mcp', 'skill', 'memory', 'security', 'media', 'integration', 'other']
+/**
+ * 关键词表(按优先级顺序,先命中先得)。匹配对象:full_name + description + topics,大小写不敏感(includes 语义)。
+ * 四类新能力域(memory/security/media/integration)为站长新增;bridge 与 integration 的区分:
+ * bridge = 协议/环境桥接(wsl、协议转换),integration = SaaS/IM/通知等第三方对接。
+ */
 const CATEGORY_KEYWORDS = [
   ['vision', ['vision', 'image', 'ocr', 'screenshot', '视觉', '图片', '截图']],
-  ['dashboard', ['dashboard', 'stats', 'usage', '统计', '看板', '面板']],
   ['bridge', ['bridge', 'wsl', '桥接']],
-  ['launcher', ['launcher', '启动器', '启动']],
   ['mcp', ['mcp']],
+  ['dashboard', ['dashboard', 'stats', 'usage', '统计', '看板', '面板', 'balance', 'billing', 'cost', 'quota', '余额', '配额', 'status', '状态', 'monitor', '监控']],
+  ['launcher', ['launcher', '启动器', '启动']],
   ['skill', ['skill', 'agent', 'workflow', '技能', '工作流']],
-  ['tool', ['tool', 'util', '工具']],
+  ['memory', ['memory', 'memories', '记忆', '会话记忆', '长期记忆', '知识库', 'knowledge', 'knowledgebase', 'knowledge-base', 'recall', 'remember', 'vector', '向量', 'embedding', 'persistent memory']],
+  ['security', ['security', 'secure', 'sandbox', 'guard', 'egress', 'audit', 'permission', '权限', '安全', '沙箱', '审计', 'allowlist', 'denylist', '隔离', 'secret', 'vault']],
+  ['media', ['media', 'video', 'audio', 'ffmpeg', 'tts', 'asr', 'voice', 'speech', '语音', '视频', '音频', '音视频', '媒体', '音乐', 'music', '图像生成', '文生图']],
+  ['integration', ['webhook', 'slack', 'discord', 'notion', 'feishu', 'lark', 'telegram', 'email', 'notify', 'notification', '通知', '飞书', '钉钉', '企业微信', 'wecom', 'gmail', 'outlook', 'whatsapp', 'oauth', 'provider', 'integration', 'integrat', 'bot', '机器人']],
+  ['tool', ['tool', 'util', '工具', 'terminal', 'markdown', 'archive', 'prompt', '提示词', 'search', '搜索', 'session', '会话', 'shortcut', '快捷键', 'manager', '管理', 'backup', '备份', 'export', '导出', 'import', '导入', 'sync', '同步', 'cron', 'scheduler', '定时']],
 ]
-function inferCategory(pkg, repo) {
+
+/** 人工覆盖表(config/categories.json,`{ "owner/repo": "category" }`):懒加载 + 内存缓存;读不到=空表。 */
+let categoryOverrides = null
+export function loadCategoryOverrides() {
+  if (categoryOverrides !== null) return categoryOverrides
+  try {
+    const parsed = JSON.parse(readFileSync(CATEGORY_OVERRIDES_FILE, 'utf8'))
+    categoryOverrides = parsed && typeof parsed === 'object' ? parsed : {}
+  } catch {
+    categoryOverrides = {}
+  }
+  return categoryOverrides
+}
+
+/**
+ * 分类判定优先级:人工覆盖表 > pkg.dsh.registry.category 声明(非法值忽略) > 关键词 > other。
+ * overrides 缺省时读 config/categories.json;测试可显式传入,保持调用方签名兼容。
+ */
+export function inferCategory(pkg, repo, overrides) {
+  const ov = overrides ?? loadCategoryOverrides()
+  if (ov && Object.prototype.hasOwnProperty.call(ov, repo.full_name)) {
+    const v = ov[repo.full_name]
+    if (typeof v === 'string' && VALID_CATEGORIES.includes(v)) return v
+  }
   const declared = pkg?.dsh?.registry?.category
   if (typeof declared === 'string' && VALID_CATEGORIES.includes(declared)) return declared
   const hay = `${repo.full_name} ${repo.description ?? ''} ${(repo.topics ?? []).join(' ')}`.toLowerCase()

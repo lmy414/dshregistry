@@ -20,11 +20,12 @@ const P_DIR = join(WEB, 'p')
 const C_DIR = join(WEB, 'c')
 const BASE = 'https://dshregistry.xyz'
 
-const CATS = ['tool', 'vision', 'dashboard', 'bridge', 'launcher', 'mcp', 'skill', 'other']
+const CATS = ['tool', 'vision', 'dashboard', 'bridge', 'launcher', 'mcp', 'skill', 'memory', 'security', 'media', 'integration', 'other']
 const CAT_LABELS = {
   tool: ['工具', 'Tools'], vision: ['视觉', 'Vision'], dashboard: ['看板', 'Dashboard'],
   bridge: ['桥接', 'Bridge'], launcher: ['启动器', 'Launcher'], mcp: ['MCP', 'MCP'],
-  skill: ['技能', 'Skills'], other: ['其他', 'Other'],
+  skill: ['技能', 'Skills'], memory: ['记忆', 'Memory'], security: ['安全', 'Security'],
+  media: ['媒体', 'Media'], integration: ['集成', 'Integration'], other: ['其他', 'Other'],
 }
 const BADGE_TEXT = { unreviewed: ['未审计', 'Unreviewed'], vouched: ['社区认可', 'Community-Vouched'], flagged: ['有风险报告', 'Flagged'] }
 const BADGE_CLASS = { unreviewed: 'unreviewed', community: 'vouched', flagged: 'flagged' }

@@ -22,8 +22,8 @@ const urls = []
 // 静态页面
 urls.push({ loc: `${BASE}/`, prio: '1.0', freq: 'daily' })
 urls.push({ loc: `${BASE}/about.html`, prio: '0.5', freq: 'monthly' })
-// P1-9: 8 个分类独立页
-const CATS = ['tool', 'vision', 'dashboard', 'bridge', 'launcher', 'mcp', 'skill', 'other']
+// P1-9: 12 个分类独立页
+const CATS = ['tool', 'vision', 'dashboard', 'bridge', 'launcher', 'mcp', 'skill', 'memory', 'security', 'media', 'integration', 'other']
 for (const c of CATS) {
   urls.push({ loc: `${BASE}/c/${c}.html`, prio: '0.6', freq: 'weekly' })
 }

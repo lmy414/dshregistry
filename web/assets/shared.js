@@ -138,7 +138,7 @@
   }
 
   /** 分类键 → 当前语言标签。 */
-  const CATEGORIES = ['all', 'tool', 'vision', 'dashboard', 'bridge', 'launcher', 'mcp', 'skill', 'other']
+  const CATEGORIES = ['all', 'tool', 'vision', 'dashboard', 'bridge', 'launcher', 'mcp', 'skill', 'memory', 'security', 'media', 'integration', 'other']
   function categoryLabel(cat) {
     return t(`cat.${cat}`)
   }

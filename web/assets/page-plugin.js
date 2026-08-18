@@ -236,8 +236,8 @@
   /** 相关推荐: 延迟加载分类子集 (小文件), 不阻塞首屏 */
   async function loadRelated() {
     try {
-      // 分类白名单: 只允许固定 8 类(与爬虫 VALID_CATEGORIES 一致), 未知分类回退 other
-      const CAT_WHITELIST = ['tool', 'vision', 'dashboard', 'bridge', 'launcher', 'mcp', 'skill', 'other']
+      // 分类白名单: 只允许固定 12 类(与爬虫 VALID_CATEGORIES 一致), 未知分类回退 other
+      const CAT_WHITELIST = ['tool', 'vision', 'dashboard', 'bridge', 'launcher', 'mcp', 'skill', 'memory', 'security', 'media', 'integration', 'other']
       const cat = CAT_WHITELIST.includes(plugin.category) ? plugin.category : 'other'
       const list = await DSHR.fetchJson('by-cat', cat)
       const related = list.filter((p) => p.slug !== plugin.slug).slice(0, 4)

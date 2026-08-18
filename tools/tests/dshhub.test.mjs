@@ -1,7 +1,7 @@
 // tools/tests/dshhub.test.mjs
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { parseCatalog, normalizeEntry } from '../sources/dshhub.js'
+import { parseCatalog, normalizeEntry, dedupeEntries } from '../sources/dshhub.js'
 
 // 官方 api/v1/plugins.json(omdsh-ai-market/v1)形态
 const SAMPLE = JSON.stringify({
@@ -35,4 +35,21 @@ test('normalizeEntry: 契约 + 缺字段容忍', () => {
   assert.equal(a.external.dshhub.registry, 'ineligible')
   assert.equal(b.repoUrl, null); assert.equal(b.author, null)
   assert.ok(b.description.length <= 200)
+})
+
+test('dedupeEntries: 同 repo 多条目只留主类型一条;无仓库条目不聚合', () => {
+  const docs = [
+    { type: 'page', source: 'dshhub', url: 'u', name: '玩具箱本体', repoUrl: 'https://github.com/omdsh-dev/toybox', external: { dshhub: { id: 'toybox', kind: 'toolkit' } } },
+    { type: 'page', source: 'dshhub', url: 'u', name: '老黄历 MCP', repoUrl: 'https://github.com/omdsh-dev/toybox', external: { dshhub: { id: 'almanac-mcp', kind: 'mcp' } } },
+    { type: 'page', source: 'dshhub', url: 'u', name: 'Bug 驯兽师', repoUrl: 'https://github.com/omdsh-dev/toybox', external: { dshhub: { id: 'bug-tamer', kind: 'skill' } } },
+    { type: 'page', source: 'dshhub', url: 'u', name: '独立插件', repoUrl: 'https://github.com/fishquito7/dsh-skill-viewer', external: { dshhub: { id: 'skill-viewer', kind: 'skill' } } },
+    { type: 'page', source: 'dshhub', url: 'u', name: '无仓库条目', repoUrl: null, external: { dshhub: { id: 'norepo', kind: 'ui' } } },
+  ]
+  const out = dedupeEntries(docs)
+  assert.equal(out.length, 3, '8→3: 玩具箱合并为 1,独立仓库保留,无仓库保留')
+  const toy = out.find((d) => d.external.dshhub.id === 'toybox')
+  assert.ok(toy, '保留主类型(toolkit)条目')
+  assert.equal(out.filter((d) => d.repoUrl?.includes('toybox')).length, 1)
+  assert.ok(out.some((d) => d.external.dshhub.id === 'skill-viewer'))
+  assert.ok(out.some((d) => d.external.dshhub.id === 'norepo'))
 })

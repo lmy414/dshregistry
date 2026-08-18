@@ -76,7 +76,10 @@ async function crawlDshhub({ base, cacheDir, now, webDocs }) {
   const res = await fetchText(`${base}${dshhub.API_PATH}`, { headers: etag ? { 'If-None-Match': etag } : {}, ...(assert ? { assert } : {}) })
   if (res.status === 304) { console.log('[crawl-web] dshhub: 304 未变化,跳过'); return }
   if (!res.text) throw new Error('[crawl-web] dshhub api 拉取失败')
-  for (const entry of dshhub.parseCatalog(res.text)) webDocs.push(dshhub.normalizeEntry(entry))
+  const hubDocs = []
+  for (const entry of dshhub.parseCatalog(res.text)) hubDocs.push(dshhub.normalizeEntry(entry))
+  // 同仓库多条目聚合:一个仓库只留一条页面文档(去掉 toybox 式子能力散件)
+  webDocs.push(...dshhub.dedupeEntries(hubDocs))
   noteChecked(state, 'catalog', { now: Date.parse(now), changed: true, hash: res.etag ?? hashOf(res.text) })
   await saveState(stateFile, state)
   console.log(`[crawl-web] dshhub: 归一 ${webDocs.length} 文档`)

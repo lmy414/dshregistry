@@ -41,3 +41,29 @@ export function normalizeEntry(e) {
     },
   }
 }
+
+/** 同仓库多条目聚合去重:hub 会把一个仓库的多个子能力(如 toybox 的多个 MCP/skill 演示件)
+ *  拆成多条页面文档,而本站以"仓库"为单位收录。按 repoUrl 分组,每组只保留一条:
+ *  优先级 kind 主类型(extension > toolkit > ui > adapter > channel > manager > skill > mcp),
+ *  同 kind 保留第一条。无 repoUrl 的条目不参与聚合(原样保留)。 */
+export function dedupeEntries(docs) {
+  const KIND_RANK = { extension: 0, toolkit: 1, ui: 2, adapter: 3, channel: 4, manager: 5, skill: 6, mcp: 7 }
+  const byRepo = new Map()
+  for (const d of docs) {
+    if (!d.repoUrl) { byRepo.set(`__solo__${d.external?.dshhub?.id ?? d.name}`, d); continue }
+    const group = byRepo.get(d.repoUrl)
+    if (!group) { byRepo.set(d.repoUrl, [d]); continue }
+    group.push(d)
+  }
+  const out = []
+  for (const group of byRepo.values()) {
+    if (!Array.isArray(group)) { out.push(group); continue }
+    group.sort((a, b) => {
+      const ra = KIND_RANK[a.external?.dshhub?.kind] ?? 99
+      const rb = KIND_RANK[b.external?.dshhub?.kind] ?? 99
+      return ra - rb
+    })
+    out.push(group[0])
+  }
+  return out
+}

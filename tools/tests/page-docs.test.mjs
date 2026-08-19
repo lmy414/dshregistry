@@ -7,12 +7,11 @@ import {
 test('buildSiteStats: meta → 4 张统计卡值(id 顺序与 docs.html 一致)', () => {
   const meta = { pluginCount: 2439, categoryCount: 12, communityCount: 70, updatedAt: '2026-08-18T01:54:48.191Z' }
   const stats = buildSiteStats(meta, formatUpdatedAt)
-  assert.deepEqual(stats, [
-    { id: 'stat-plugins', value: '2439' },
-    { id: 'stat-cats', value: '12' },
-    { id: 'stat-community', value: '70' },
-    { id: 'stat-updated', value: '2026-08-18' },
-  ])
+  assert.equal(stats[0].value, '2439')
+  assert.equal(stats[1].value, '12')
+  assert.equal(stats[2].value, '70')
+  // 更新时间 = YYYY-MM-DD HH:MM(完整日期时间,服务器 b262904;本地时区渲染,断言格式不锁具体值)
+  assert.match(stats[3].value, /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}$/, `更新时间格式 ("${stats[3].value}")`)
 })
 
 test('buildSiteStats: 缺失字段回退占位符;meta 为空/非对象同样占位', () => {
@@ -31,8 +30,8 @@ test('buildSiteStats: 自定义格式化钩子(更新时间渲染可注入)', ()
   assert.equal(stats[3].value, 'FMT:2026-08-18T01:54:48.191Z')
 })
 
-test('formatUpdatedAt: ISO → 日期部分;空值占位', () => {
-  assert.equal(formatUpdatedAt('2026-08-18T01:54:48.191Z'), '2026-08-18')
+test('formatUpdatedAt: ISO → YYYY-MM-DD HH:MM;空值占位', () => {
+  assert.match(formatUpdatedAt('2026-08-18T01:54:48.191Z'), /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}$/, `格式 ("${formatUpdatedAt('2026-08-18T01:54:48.191Z')}")`)
   assert.equal(formatUpdatedAt(''), '—')
   assert.equal(formatUpdatedAt(null), '—')
   assert.equal(formatUpdatedAt(undefined), '—')

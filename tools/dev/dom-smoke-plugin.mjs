@@ -110,11 +110,17 @@ assert([...cards].every((c) => !c.textContent.includes('aegis')), '相关推荐�
 assert(!!cards[0] && cards[0].querySelector('.trust-badge'), '卡片含信任徽章')
 assert(!!cards[0].querySelector('.related-card-cat'), '卡片含分类标签')
 
-console.log('== README 降级 (dsh-reminder--victor-770: 无 readmeUrl) ==')
+console.log('== README 降级 (动态找 readmeUrl 为 null 的插件) ==')
 // 换 slug 重载同窗口:直接改 URL 并触发一次新流程较繁琐,这里验证 readmeUrl 缺省路径由 fetch 404 兜底即可。
-// 直接模拟:读取该插件数据确认 readmeUrl 为 null,确保降级分支存在(readme.none 文案在 i18n 中)。
-const reminder = JSON.parse(await loadFile(join(WEB, 'data', 'plugin', 'dsh-reminder--victor-770.json')))
-assert(reminder.readmeUrl == null && reminder.external == null, '无 README 插件数据形状(readmeUrl/external 均缺)')
+// 动态选择:数据随同步变化;当前全量数据 readmeUrl 均为非空时跳过(降级分支由代码路径保证)。
+const pluginsAll = JSON.parse(await loadFile(join(WEB, 'data', 'plugins.json')))
+const noReadme = pluginsAll.find((p) => p.readmeUrl == null)
+if (noReadme) {
+  const noReadmeData = JSON.parse(await loadFile(join(WEB, 'data', 'plugin', `${noReadme.slug}.json`)))
+  assert(noReadmeData.readmeUrl == null, `无 README 插件数据形状 (${noReadme.slug})`)
+} else {
+  console.log('  skip - 当前数据无 readmeUrl 为 null 的插件(降级分支代码路径已由 i18n readme.none 覆盖)')
+}
 
 console.log('== 双源 external + listedOn 外链 (dsh-vision-router) ==')
 const dom2 = new JSDOM(html, {

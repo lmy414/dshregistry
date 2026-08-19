@@ -92,7 +92,7 @@ const metaCount = JSON.parse(await loadFile(join(WEB, 'data', 'meta.json')))
 assert(dd.getElementById('stat-plugins').textContent === String(metaCount.pluginCount), `插件数 (页面 "${dd.getElementById('stat-plugins').textContent}" vs meta "${metaCount.pluginCount}")`)
 assert(dd.getElementById('stat-cats').textContent === String(metaCount.categoryCount), `分类数 (页面 "${dd.getElementById('stat-cats').textContent}" vs meta "${metaCount.categoryCount}")`)
 assert(dd.getElementById('stat-community').textContent === String(metaCount.communityCount), `社区认可数 (页面 "${dd.getElementById('stat-community').textContent}" vs meta "${metaCount.communityCount}")`)
-assert(/^\d{4}-\d{2}-\d{2}$/.test(dd.getElementById('stat-updated').textContent), `更新时间 YYYY-MM-DD ("${dd.getElementById('stat-updated').textContent}")`)
+assert(/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}$/.test(dd.getElementById('stat-updated').textContent), `更新时间 YYYY-MM-DD HH:MM ("${dd.getElementById('stat-updated').textContent}")`)
 
 console.log('== 文档页:服务透明度声明(14 项) ==')
 const trans = dd.querySelectorAll('#transparency .transparency-item')

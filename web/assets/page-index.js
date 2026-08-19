@@ -31,7 +31,12 @@
       stars: (a, b) => b.stars - a.stars,
       firstSeen: (a, b) => new Date(b.firstSeenAt) - new Date(a.firstSeenAt),
     }[state.sort]
-    return [...list].sort(by)
+    // 精选插件优先显示
+    return [...list].sort((a, b) => {
+      if (a.featured && !b.featured) return -1
+      if (!a.featured && b.featured) return 1
+      return by(a, b)
+    })
   }
 
   // P1-9: 分类页可分享 URL (/c/tool.html) — 绝对路径, 任意层级页面可跳转

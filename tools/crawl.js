@@ -82,6 +82,7 @@ export function mergeOldRecord(old, fresh) {
   const out = preserveCrossSource(old, fresh)
   out.type = 'plugin'
   out.source = fresh.source ?? old.source ?? 'github-topic'
+  out.featured = fresh.featured ?? old.featured ?? false
   return out
 }
 
@@ -378,6 +379,8 @@ async function main() {
   // 0) 读取人工输入 + 旧索引(firstSeenAt 继承)+ 收集缓存(兼作"已收录清单")
   const seeds = JSON.parse(await readFile(SEEDS_FILE, 'utf8').catch(() => '[]'))
   const flags = JSON.parse(await readFile(FLAGS_FILE, 'utf8').catch(() => '{}'))
+  const featuredConfig = JSON.parse(await readFile('config/featured.json', 'utf8').catch(() => '{}'))
+  const featuredList = featuredConfig.featured || []
   const oldIndex = JSON.parse(await readFile(PLUGINS_FILE, 'utf8').catch(() => '[]'))
   const firstSeenMap = new Map(oldIndex.map((p) => [p.slug, p.firstSeenAt]))
   const pkgCache = JSON.parse(await readFile(PKG_CACHE_FILE, 'utf8').catch(() => '{}'))
@@ -502,6 +505,7 @@ async function main() {
     const slug = slugOf(repo.full_name)
     const firstSeenAt = firstSeenMap.get(slug) ?? today
     const flagged = flags[slug]?.state === 'flagged'
+    const featured = featuredList.includes(slug) || flags[slug]?.featured === true
     const nearCommunity = repo.stargazers_count >= 20 || repo.forks_count >= 5
     let authorCreatedAt = null
     let releaseAssetUrl = null
@@ -542,6 +546,7 @@ async function main() {
       authorCreatedAt,   // 旧记录合并时重算信任状态要用
       state,
       stateReasons: reasons,
+      featured,
       basicCheck: true,   // 收录即通过:dsh.bundle.patch 声明 + README 均为硬性收录条件
       type: 'plugin',
       source: sourceOf(repo),

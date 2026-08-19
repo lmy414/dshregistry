@@ -328,13 +328,9 @@ export function topAuthors(counts, filter = '', limit = 10) {
  * 无候选返回 null。
  */
 export function pickFeatured(pluginRows) {
-  const cands = pluginRows.filter((r) => {
-    const p = r && r.item
-    const g = p && p.external && p.external.dshfind
-    return !!(p && p.state === 'community' && g && g.grade)
-  })
-  if (!cands.length) return null
-  return cands.reduce((best, r) => (r.score > best.score ? r : best))
+  // 站长手动精选: 优先使用 featured 字段
+  const featured = pluginRows.find(r => r.item && r.item.featured)
+  return featured || null
 }
 
 /** 网页行源站 URL 展示:去协议、去尾部斜杠。 */

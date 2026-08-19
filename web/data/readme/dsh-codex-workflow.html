@@ -1,0 +1,121 @@
+<h1>dsh-codex-workflow</h1>
+<p>DeepSeek Harness plugin that gives Codex read-only planning/review roles while DSH remains the sole executor. Two flows share the same workflow engine:</p>
+<ul>
+<li><strong>Codex-led bridge (preferred)</strong> — the Codex task that produced the plan sends it to the exact live DSH session through a durable SQLite bridge; DSH implements it, and the plugin validates the source task read-only and starts a separately owned Reviewer task whose verdict returns to the original DSH session for repair or sign-off.</li>
+<li><strong>DSH-led tools (legacy, still supported)</strong> — the DSH agent drives <code>codex_workflow_start</code> / <code>codex_workflow_review</code> as before.</li>
+</ul>
+<p>No browser is opened or controlled anywhere in the product path; no network listener, MCP, hooks, or skills are involved. Browser clicking is a development-only workaround and is not part of the plugin.</p>
+<h2>Requirements</h2>
+<ul>
+<li>DeepSeek Harness <code>0.1.0-rc.6</code></li>
+<li>Node.js <code>^22.19.0</code> or <code>&gt;=24</code></li>
+<li>Codex CLI with a valid ChatGPT login and App Server support (verified by <code>pnpm doctor</code>)</li>
+</ul>
+<h2>Install</h2>
+<pre><code>dsh plugin --profile web add dsh-codex-workflow
+</code></pre>
+<p>Restart the DSH web profile after installation. For source installs during
+development, pass the local project directory to the same command.</p>
+<h2>Build and verify</h2>
+<pre><code>pnpm install
+pnpm verify
+pnpm doctor
+</code></pre>
+<h2>Codex-led flow (preferred)</h2>
+<p>From the Codex task that owns the plan, dispatch it to the live DSH session:</p>
+<pre><code># 1. Find the live DSH session for this workspace
+dsh-codex-workflow sessions --cwd $PWD --json
+
+# 2. Dispatch the plan (payload enters through stdin, never arguments)
+$payload = '{"task":"实现搜索功能","planMarkdown":"&lt;proposed_plan&gt;…&lt;/proposed_plan&gt;","assumptions":[]}'
+$payload | dsh-codex-workflow dispatch --cwd $PWD --codex-thread $env:CODEX_THREAD_ID --stdin
+</code></pre>
+<p>The bridge resolves the exact session (explicit <code>--dsh-session</code> wins; otherwise the cwd must match exactly one live session, and ambiguity fails loudly). DSH receives the plan as a plugin relay message and implements it. When done, DSH calls <code>codex_workflow_submit</code>; the plugin treats the <strong>exact stored Codex task id</strong> as an immutable source, validates it read-only, and asks its managed App Server to create a fresh durable Reviewer task:</p>
+<pre><code>source Codex task --thread/read(includeTurns:false)--&gt; validated
+then thread/start --&gt; dedicated Reviewer task --turn/start(outputSchema)--&gt; verdict
+</code></pre>
+<p>The source task is never resumed or written by the plugin, so Codex Desktop may keep it open — and may even be its active writer — without causing a thread-store writer conflict. The first review persists the fresh Reviewer task id; every later repair review resumes that same Reviewer task. The Reviewer is forced to the workflow cwd with <code>read-only</code>, network disabled, and <code>approvalPolicy: never</code> at creation and on every review turn.</p>
+<h3>How the verdict comes back (automatic path)</h3>
+<p><code>codex_workflow_submit</code> returns as soon as the submission and evidence are durably stored and marks that successful tool result as terminal for the current DSH turn. The Reviewer then runs in a manager-owned background task, so the DSH session becomes idle without another model step and ending the tool call cannot cancel the review. The Reviewer stays read-only and answers <strong>as its final message</strong> with a structured JSON verdict matching the enforced output schema. The DSH plugin process (outside the Codex sandbox) receives the App Server turn result, validates it, durably stages it in the workflow record, and enqueues it as a <code>submit_verdict</code> bridge command with a deterministic per-submission request id. The bridge runtime then applies the verdict and relays the outcome to the original DSH session. The Reviewer never writes the bridge queue itself and never invokes the CLI.</p>
+<p>No periodic progress messages are injected while a review is running; <code>codex_workflow_status</code> is the on-demand progress view. Busy and rate-limit conditions remain silent background retries. Invalid source tasks, missing verdicts and terminal App Server failures are persisted as an idempotent <code>submission_notice</code> and wake the original DSH session exactly once, including after a plugin restart.</p>
+<p>A passing verdict tells DSH to report once and end the turn without calling <code>memory</code>, status, todo, shell, or workflow tools. If the terminal relay still leaves that exact agent activity running, a lifecycle guard cancels only the active turn after <code>terminalRelayTimeoutMs</code> while preserving queued inbox work. The guard disarms as soon as that activity reaches idle, so it cannot cancel a later user turn, and plugin teardown aborts and awaits all pending guards.</p>
+<p>After a completed Planner or Reviewer operation, the managed App Server exits after a short idle grace period (5 seconds by default). The countdown starts only when no RPC, running turn, turn waiter, or pending clarification remains, so long reviews and user-input pauses stay safe while completed Reviewer tasks quickly release their writer lock and become readable in Codex Desktop.</p>
+<p><code>dsh-codex-workflow respond</code> is a <strong>manual/compat fallback only</strong> — for operators who want to type a verdict in by hand instead of letting the automatic path collect it, or to re-drive a verdict after the automatic pipeline was interrupted:</p>
+<pre><code>$verdict = '{"verdict":"pass","findings":[],"testGaps":[],"summary":"ok"}'
+$verdict | dsh-codex-workflow respond --workflow &lt;workflowId&gt; --codex-thread $env:CODEX_THREAD_ID --submission &lt;submissionId&gt; --stdin
+dsh-codex-workflow status --request &lt;requestId&gt; --json
+</code></pre>
+<p><code>--submission &lt;uuid&gt;</code> (optional in <code>respond</code>) pins the verdict to the exact submission the review answered; without it the legacy behavior applies only when the workflow has no active submission. Every <code>respond</code> is validated, idempotent per request id, and replayed safely — it never bypasses the evidence-fingerprint check (a verdict whose workspace changed since review is refused).</p>
+<p>The verdict is applied in the original DSH session with the same blocking/non-blocking/no-change/max-cycle policy as the DSH-led flow: blocking findings return DSH to <code>fixing</code> (then re-<code>submit</code>), only non-blocking findings stop at <code>waiting_review_decision</code> for the user, and <code>pass</code> completes the workflow. If the workspace changed between submission and verdict, the verdict is refused and DSH is asked to re-<code>submit</code> for a fresh review — an old verdict can never pass changed code.</p>
+<h3>CODEX_THREAD_ID</h3>
+<p>The bridge never invents the source task id. <code>dispatch</code>/<code>respond</code> default <code>--codex-thread</code> from <code>CODEX_THREAD_ID</code> and fail with a paste-ready explanation when it is absent. On the first review the callback validates the persisted source id read-only, persists the fresh Reviewer id it starts, and reuses only that Reviewer on later cycles.</p>
+<h2>DSH-led flow (legacy, compatible)</h2>
+<p>In a DSH conversation:</p>
+<pre><code>让 Codex 先规划这个改动，我来执行，完成后再让 Codex 审查。
+</code></pre>
+<p>Tools: <code>codex_workflow_start</code>, <code>codex_workflow_continue</code>, <code>codex_workflow_review</code>, <code>codex_workflow_review_only</code>, <code>codex_workflow_submit</code>, <code>codex_workflow_decide</code>, <code>codex_workflow_status</code>, <code>codex_workflow_cancel</code>.</p>
+<h2>State machine</h2>
+<pre><code>planning -&gt; waiting_input -&gt; executing -&gt; reviewing -&gt; fixing -&gt; passed
+executing/fixing -&gt; codex_workflow_submit (returns immediately) -&gt; queued -&gt; sending -&gt; retrying -&gt; verdict_ready -&gt; received -&gt; applied -&gt; delivered
+                                                             `-&gt; failed (invalid thread, no verdict, invalid identity/schema)
+first sending: read-only source validation -&gt; fresh durable Reviewer; later sending: resume same Reviewer
+verdict_ready: verdict staged in the record; enqueue pending (crash-recoverable)
+received:      verdict command queued for application
+applied:       outcome persisted (pass | fixing | waiting_review_decision | blocked | refused-if-changed)
+delivered:     outcome relayed to the original DSH session
+cancelled: terminal — no queue retry, no late verdict, no message may resurrect it
+</code></pre>
+<p><code>cancelled</code> is terminal under the bridge too: queued callbacks stop retrying, late verdicts receive an idempotent <code>cancelled</code> receipt and never wake DSH, and duplicate queue files or restarts cannot duplicate turns. While a submission is active, turn-stopping does not ask DSH to submit it again.</p>
+<h2>Failure recovery</h2>
+<ul>
+<li>All multi-step coordination state (leases, the bridge queue, workflow records) lives in one SQLite database per storage directory (<code>coord.sqlite</code>), shared by every DSH process and the CLI. Every invariant runs in a single <code>BEGIN IMMEDIATE</code> transaction; a killed process at ANY point rolls back cleanly and <code>PRAGMA integrity_check</code> stays clean.</li>
+<li><strong>Journal mode is rollback journal (DELETE), deliberately NOT WAL.</strong> SQLite versions &lt;= 3.51.2 (the runtime bundled with Node 24.14.0) have a WAL-reset bug (fixed 2026-03-13, released as 3.51.3) that can corrupt the WAL under the concurrent writers/checkpoints this plugin creates. <code>synchronous=FULL</code> + a busy timeout keep the rollback journal safe for multiple connections. <code>pnpm doctor</code> reports the runtime SQLite version, the actual <code>journal_mode</code> and runs an integrity check; the coordination database is refused on UNC/network paths.</li>
+<li>Fencing is by a MONOTONIC claim generation plus a random owner token: every ack/retry/dead-letter/renew is a conditional UPDATE on <code>status='processing' AND claim_epoch=? AND claim_owner=?</code>. The epoch is NEVER reset (release only clears owner/until), so a stale owner can never re-match a newer claim, and an owner that lost its lease kills its own callback child and stops writing state.</li>
+<li>Powers and deliveries are fenced and re-validated at every step:<ul>
+<li><strong>session-scoped leases</strong> make workflow creation (and submission creation) atomic across processes — two overlapping DSH processes dispatching/submitting for the same session/request produce exactly one workflow/submission.</li>
+<li><strong>verdicts are staged durably</strong> (full command, identical requestId/createdAt/commandHash) and the first apply only moves <code>received -&gt; applied</code>; conflicting request ids are always rejected; the staged identity survives until applied.</li>
+<li><strong>delivery is prepare -&gt; relay -&gt; commit</strong>: the workspace fingerprint is recomputed before the relay, and <code>delivered</code> is written (in a fenced CAS) only after the relay lands. Invalidated passes are reported as void, never as passed; a cancel or new submission that wins before commit never gets marked delivered.</li>
+</ul>
+</li>
+<li>Dispatch delivery is exactly-once under crash replay: <code>bridgeRequestId</code> prevents duplicate workflows and the deterministic relay message id (persisted in the session's <code>agent/inbox/spliced</code> events) prevents duplicate followups.</li>
+<li>A missing live session retries forever with capped backoff (never a dead letter) for verdicts, and the fingerprint re-check runs on every retry so a stale pass is invalidated even after a long offline stretch.</li>
+<li>Reviewer App Server calls bind the exact DSH workspace cwd directly, so it may be a Git repository, a non-Git directory, or a workspace containing nested repositories. The Reviewer remains <code>read-only</code>, network-disabled, and approval-free.</li>
+<li>The originating Codex task may remain open in Desktop — even as its active writer: <code>thread/read</code> metadata validation of the source is never blocked by it, and the fresh Reviewer never competes for its writer lock. Busy/rate-limited App Server operations stay durably <code>retrying</code>; each recovery round makes up to <code>callbackMaxAttempts</code> attempts with exponential backoff, then yields until <code>submissionRetryAt</code>, including across DSH restarts. Invalid task ids, missing/invalid verdicts, and explicit App Server failures remain terminal with their diagnostic preserved.</li>
+<li>Cancellation interrupts the exact persisted Reviewer turn. Submission leases and task/turn ids prevent a stale owner from interrupting or applying a newer review; the DSH workflow and its evidence always remain visible via <code>codex_workflow_status</code>.</li>
+</ul>
+<h2>Storage</h2>
+<p>Workflow records, leases, the bridge queue and the <strong>live-session registry all live in ONE SQLite database</strong>: <code>$DSH_HOME/storages/dsh-codex-workflow/coord.sqlite</code>. The only state on disk outside it is <code>bridge/review-schema.json</code> (the enforced verdict schema) and, briefly, the legacy file-queue source directories that are <strong>imported once on first init</strong> (receipts, retry semantics and attempts preserved). <code>bridge/sessions.json</code> is gone — live sessions are rows in <code>coord.sqlite</code> (<code>live_sessions</code>) with per-owner leases, so multi-process runtimes merge instead of last-writer-wins and a crashed runtime's sessions expire via TTL. Records never contain login tokens. Old JSON workflow records are imported lazily with <code>origin: "dsh"</code> and keep their behavior.</p>
+<h2>Operations CLI</h2>
+<p><code>dsh-codex-workflow</code> is also the audit/ops surface (all commands support <code>--json</code>):</p>
+<ul>
+<li><code>workflows [--cwd] [--dsh-session] [--phase]</code> — list workflow summaries (never payloads).</li>
+<li><code>show --workflow &lt;id&gt;</code> — plugin version plus one workflow's source/Reviewer task ids, stage, submission/callback state, review cycle, last error and evidence summary.</li>
+<li><code>queue [--status &lt;status&gt;]</code> — queue/receipt/dead-letter rows with attempts, next retry and last error (never command payloads).</li>
+<li><code>retry --request &lt;id&gt;</code> — requeue a <code>dead-letter</code> request or a legacy imported <code>failed</code> row; idempotent, and refuses active or completed rows. A cancelled receipt is stored on a completed <code>done</code> row and is never retried.</li>
+<li><code>prune [--older-than &lt;ms&gt;] [--commit]</code> — dry-run by default; <code>--commit</code> removes only <strong>terminal</strong> receipts and passed/cancelled workflows older than the retention window. Active workflows, undelivered verdicts and failed/blocked diagnostics are never candidates.</li>
+<li><code>help</code> — usage.</li>
+</ul>
+<p>Run <code>pnpm doctor</code> (full: needs Codex CLI + login) or <code>pnpm doctor:offline</code> (CI-safe: skips only the codex/login checks, marks them SKIPPED, still checks SQLite/storage/local paths/build, <code>--json</code> for machines).</p>
+<h2>Release check</h2>
+<p><code>pnpm release:check</code> is a repeatable offline gate: <code>typecheck</code> + full test suite + <code>build</code> + offline doctor (<code>--json</code>, must pass) + a <strong>pack audit</strong> (temporary tarball is always cleaned) that asserts the package ships only the <code>files</code> whitelist — no tests/fixtures, <code>coord.sqlite</code>, DSH_HOME paths, credentials or temp/review leftovers. CI (<code>.github/workflows/ci.yml</code>) runs the same matrix on Windows with Corepack-pinned pnpm 10 and a frozen lockfile.</p>
+<h2>Configuration</h2>
+<p>Defaults in <code>cordis.patch.yml</code>:</p>
+<ul>
+<li><code>codexCommand</code>: <code>codex</code></li>
+<li><code>plannerModel</code> / <code>reviewerModel</code>: empty means the current Codex default</li>
+<li><code>plannerEffort</code> / <code>reviewerEffort</code>: <code>high</code></li>
+<li><code>maxReviewCycles</code>: <code>3</code> (1–10)</li>
+<li><code>maxNoChangeReviewRounds</code>: <code>1</code> (1–10)</li>
+<li><code>reviewDiffMaxBytes</code>: <code>65536</code> (1 KiB–1 MiB)</li>
+<li><code>bridgePollMs</code>: <code>1000</code> (200 ms–60 s)</li>
+<li><code>bridgeMaxPayloadBytes</code>: <code>1048576</code> (64 KiB–16 MiB)</li>
+<li><code>callbackTimeoutMs</code>: <code>600000</code> (10 s–30 min)</li>
+<li><code>callbackMaxAttempts</code>: <code>3</code> (1–10 attempts per persistent recovery round)</li>
+<li><code>callbackRetryBaseMs</code>: <code>2000</code> (200 ms–5 min)</li>
+<li><code>turnTimeoutMs</code>: <code>600000</code></li>
+<li><code>idleProcessMs</code>: <code>5000</code> (starts only after all App Server work is idle)</li>
+<li><code>terminalRelayTimeoutMs</code>: <code>60000</code> (0 disables; maximum 10 minutes; cancels only a stuck terminal pass relay and preserves inbox work)</li>
+</ul>
+<p>State lives in <code>$DSH_HOME/storages/dsh-codex-workflow/coord.sqlite</code> (queue + leases + workflows + live sessions); <code>bridge/review-schema.json</code> holds the enforced verdict schema. Records never contain login tokens.</p>
+<h2>License</h2>
+<p>MIT</p>

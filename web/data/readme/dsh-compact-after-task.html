@@ -1,0 +1,151 @@
+<h1>dsh-compact-after-task</h1>
+<p>A <a href="https://github.com/deepseek-ai/deepseek-harness">DSH</a> (Cordis) plugin that <strong>auto-compacts a conversation after the current task finishes</strong>, whenever context pressure crosses a threshold you set (default <strong>50%</strong> of the routed model's context window). Install it and stop manually clicking "compress" — and stop letting the context (and the bill) grow unchecked.</p>
+<p>The switch and the threshold are adjustable directly in <strong>Settings → Plugins</strong> (toggle + slider); changes apply <strong>immediately, no restart needed</strong>.</p>
+<h2>The problem it solves</h2>
+<p>In a long conversation the model re-receives the <strong>entire history on every turn</strong>. As the conversation grows, this bites harder and harder:</p>
+<ul>
+<li><strong>No compaction → exploding cost.</strong> The bigger the context, the more tokens each turn re-sends. Even with a provider KV cache (cheaper than fresh input, still not free), the history is re-transmitted and re-billed every single turn. Rolling from tens of thousands to hundreds of thousands of tokens quietly multiplies per-turn cost — <strong>the longer you talk, the more each reply costs, without you noticing.</strong></li>
+<li><strong>Manual compaction is tedious and easy to forget.</strong> <code>/compact</code> or the UI compress button works, but you have to remember to use it — and people only remember once things are already slow and expensive, after several huge turns have been paid for.</li>
+<li><strong>The built-in auto-compaction is a late, mid-task safety net.</strong> <code>dsh-compaction-basic</code> only fires at <strong>80%</strong> of the context window, and only at a step boundary <em>while a task is running</em> — by then you've already paid for several enormous requests, and the compaction interrupts work in progress.</li>
+<li><strong>Slower responses.</strong> Longer prefixes mean more processing per request and a noticeably sluggish feel.</li>
+</ul>
+<p>This plugin automates the "remember to compress" chore: <strong>after each task finishes (the agent returns to idle) it checks the pressure and compacts at your chosen threshold</strong> — dealing with cost <em>before</em> it hurts, not after.</p>
+<h2>How it relates to the built-in compaction (complementary, not a replacement)</h2>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>Built-in <code>dsh-compaction-basic</code></th>
+<th>This plugin</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>When</td>
+<td>At each step boundary (<code>agent/pre-step</code>), mid-task</td>
+<td>After the task fully finishes (agent returns to idle)</td>
+</tr>
+<tr>
+<td>Threshold</td>
+<td><code>thresholdRatio</code> 0.8 (fixed)</td>
+<td><code>thresholdRatio</code> user-set, default 0.5</td>
+</tr>
+<tr>
+<td>Role</td>
+<td>Last-resort mid-task safety net</td>
+<td>Routine "slim down between tasks"</td>
+</tr>
+</tbody></table>
+<p>The compaction itself is identical to <code>/compact</code>: it calls <code>ctx.compaction.compactNow()</code>, produces one <code>&lt;compacted-summary&gt;</code> checkpoint, and the conversation UI shows the usual "compacted N history items" card.</p>
+<h2>Requirements</h2>
+<ul>
+<li>DSH Desktop / DSH profile with the base bundle (<code>dsh-base</code>), which provides <code>dsh-compaction-basic</code>, <code>dsh-token-meter</code>, <code>dsh-agent</code> and <code>dsh-llm</code>.</li>
+<li><strong>Core auto-compaction works on any version.</strong> The <strong>settings-page card (toggle + slider) needs DSH ≥ <code>0.1.0-rc.7</code></strong> (released 2026-08-17): since rc.7 the Host serves every registered settings namespace to the browser automatically, so a third-party plugin's settings card works out of the box — this is the <a href="https://github.com/deepseek-ai/deepseek-harness/blob/master/docs/cookbook/adding-a-settings-card.md">official mechanism</a>. On rc.6 and earlier the namespace list was hardcoded and a third-party namespace was refused (<code>settings-not-exposed</code>) — <strong>upgrade</strong>, or apply the two-line patch below only if you cannot upgrade.</li>
+<li><strong>On rc.7+ this plugin reaches the compaction service via <code>agentPresets.serviceFor()</code>, not <code>inject: ["compaction"]</code>.</strong> Since rc.7 introduced agent presets, the <code>compaction</code> service is no longer provided on the host plane — each session's preset (<code>standard</code>/<code>cordis</code>/…) mounts it inside an <code>isolate</code> realm, so a host-plane plugin that <code>inject</code>s <code>compaction</code> pends forever (<code>waiting for service: compaction</code>). This plugin instead calls the official read API <code>ctx.agentPresets.serviceFor(agent, "compaction")</code> when the agent goes idle (that API exists precisely for callers whose request is <em>about</em> a session but arrives from outside it); on rc.6 and earlier it falls back to <code>ctx.get("compaction")</code>.</li>
+<li><strong>For the settings card to appear, the package <code>exports</code> must expose <code>"./package.json": "./package.json"</code>.</strong> <code>dsh-client-modules</code> discovers client bundles by resolving <code>&lt;package&gt;/package.json</code> to read the <code>dsh.client</code> metadata; if a package declares <code>exports</code> without that key, the lookup throws <code>ERR_PACKAGE_PATH_NOT_EXPORTED</code> and the package is silently cached as "not a client package" — the host half runs fine but the settings card never shows. All official packages ship this line in <code>exports</code>.</li>
+</ul>
+<h2>Install</h2>
+<p>Two ways — pick <strong>one</strong> (do not mix them: the loader rejects a duplicate entry id).</p>
+<h3>A. Standard: plugin market / <code>dsh plugin add</code> (recommended)</h3>
+<p>The package ships a <code>dsh.bundle.patch</code> pointing at its own <code>cordis.patch.yml</code>, so it is a <strong>first-class bundle</strong>: installing it via the market or the CLI adds it to the profile's <code>dsh.profile.bundles</code>, and on the next boot the loader applies the package's own patch layer automatically — <strong>no manual editing needed</strong>.</p>
+<pre><code># from npm (after publishing) — or from GitHub directly:
+dsh plugin --profile desktop add @xiaobanli/dsh-compact-after-task
+dsh plugin --profile desktop add github:xiaoliang2/dsh-compact-after-task
+</code></pre>
+<p>Or, in the desktop app, open <strong>Settings → Plugin Market</strong> and one-click install. Restart DSH Desktop, done.</p>
+<h3>B. Manual, profile-local (no market, no publishing)</h3>
+<ol>
+<li><p>Copy this package into the profile and make it resolvable from the profile's <code>node_modules</code> (same way <code>dshmarket</code> is installed):</p>
+<pre><code># from the DSH home, e.g. C:\Users\you\.dsh\profiles\desktop
+Copy-Item -Recurse &lt;path-to&gt;\dsh-compact-after-task .\plugins\dsh-compact-after-task
+New-Item -ItemType Junction -Path .\node_modules\@xiaobanli\dsh-compact-after-task -Target .\plugins\dsh-compact-after-task
+</code></pre>
+</li>
+<li><p>Add the plugin row to the profile's <code>cordis.patch.yml</code> (your user patch layer, applied after every bundle layer):</p>
+<pre><code>- insert:
+    - id: compact-after-task
+      name: '@xiaobanli/dsh-compact-after-task'
+      config:
+        enabled: true
+        thresholdRatio: 0.5
+</code></pre>
+</li>
+<li><p>Declare the dependency in the profile's <code>package.json</code> so a later <code>pnpm install</code> does not prune it:</p>
+<pre><code>"dependencies": {
+  "@xiaobanli/dsh-compact-after-task": "file:plugins/dsh-compact-after-task"
+}
+</code></pre>
+</li>
+<li><p><strong>Restart DSH Desktop</strong> for the profile change to take effect.</p>
+</li>
+</ol>
+<blockquote>
+<p>If you already installed it manually (method B), uninstall/remove it before installing via the market, otherwise the same entry id <code>compact-after-task</code> is inserted twice and the loader refuses to boot.</p>
+</blockquote>
+<h3>Only on DSH ≤ 0.1.0-rc.6 (if you cannot upgrade)</h3>
+<p>Before rc.7 the Host exposed only a hardcoded namespace whitelist, so the settings card cannot read/write until you add this plugin's namespace to it (two files in the app install, under <code>resources\app.asar.unpacked\node_modules\@deepseek-ai\dsh-host-apiproxy</code>):</p>
+<ul>
+<li><code>lib/index.js</code> — in <code>const WEB_SETTINGS_NAMESPACES = [ ... ]</code> (~line 888) add <code>"compact-after-task",</code></li>
+<li><code>lib/types/api-proxy.js</code> — in the single-line <code>const WEB_SETTINGS_NAMESPACES = [...]</code> (~line 50) add <code>"compact-after-task"</code></li>
+</ul>
+<p>Then restart. Note DSH updates overwrite these files, so re-apply after each update. On rc.7+ this patch is unnecessary and these files no longer exist.</p>
+<h2>Configuration</h2>
+<table>
+<thead>
+<tr>
+<th>Key</th>
+<th>Type</th>
+<th>Default</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>enabled</code></td>
+<td>boolean</td>
+<td><code>true</code></td>
+<td>Master switch.</td>
+</tr>
+<tr>
+<td><code>thresholdRatio</code></td>
+<td>number (0.05–1)</td>
+<td><code>0.5</code></td>
+<td>Compress when pressure reaches this fraction of the routed model's context window (<code>0.5</code> = 50%).</td>
+</tr>
+<tr>
+<td><code>onlyRoots</code></td>
+<td>boolean</td>
+<td><code>false</code></td>
+<td>Only compress top-level conversation agents (skip background subagents).</td>
+</tr>
+</tbody></table>
+<h3>Adjust from the settings page (toggle + slider)</h3>
+<p>After install, an <strong>Auto-compact</strong> card appears under <strong>Settings → Plugins → Configurable plugins</strong>:</p>
+<ul>
+<li><strong>Toggle</strong>: auto-compact after each task finishes;</li>
+<li><strong>Slider</strong>: auto-compact threshold (5%–100%, 5% steps).</li>
+</ul>
+<p>Releasing the slider saves immediately; the <code>settings/updated</code> event applies it live, <strong>no restart needed</strong>. The value persists in the settings document and takes precedence over the loader config in <code>cordis.patch.yml</code> (which acts as the default/base layer).</p>
+<h3>Picking a threshold</h3>
+<p>Set it from "the max per-turn re-send you can tolerate ÷ the model's context window":</p>
+<ul>
+<li>DeepSeek's default 1M window: <strong>0.3–0.6 is the sweet spot</strong>; 0.5 is a conservative default.</li>
+<li>Want each turn to re-send ≤ 400K tokens → 0.4; ≤ 250K → 0.25.</li>
+<li>Don't go ≥ 0.8: the built-in compaction already fires at 0.8 at a step boundary, so a higher threshold here is meaningless.</li>
+<li>Small-window models (128K/64K): raise to 0.6–0.8, or you'll squeeze out useful working context.</li>
+<li>Too low (below ~0.1) means compressing after every small task, and the summary swallows details that were still useful.</li>
+</ul>
+<p>Tune by feel after a couple of long tasks: compressing after every little task / summaries getting coarse → raise it; still re-sending hundreds of thousands of tokens per turn → lower it. Edit <code>thresholdRatio</code> in <code>cordis.patch.yml</code> and restart.</p>
+<h2>Behavior details</h2>
+<ul>
+<li>Listens to the <code>agent/status</code> event and acts only on the <strong><code>idle</code></strong> transition — i.e. the current task's drive has fully drained. This is the "compress after finishing the current task" moment; it never interrupts a running task.</li>
+<li>Uses the same pressure measurement as the built-in engine: <code>tokenMeter.measure(session).totalTokens</code> vs <code>contextWindow × thresholdRatio</code> (context window resolved via <code>llm.resolveModelInfo</code>).</li>
+<li>Compaction is a single <code>ctx.compaction.compactNow(agent, signal)</code> call — the same operation <code>/compact</code> runs; <code>compactNow</code> reserves next-turn admission, so queued messages are correctly deferred until the compaction finishes. On rc.7+ <code>ctx.compaction</code> is the instance returned by <code>agentPresets.serviceFor(agent, "compaction")</code>; the operation is unchanged.</li>
+<li>Expected failures are silent: <code>busy</code> (agent busy / a compaction already running) and <code>cancelled</code> are skipped; anything else is logged as a warning without disturbing agent lifecycle events.</li>
+<li>If the agent's preset mounts no compaction group (e.g. <code>minimal</code>), <code>serviceFor</code> returns <code>undefined</code> and that agent is skipped.</li>
+</ul>
+<h2>Test</h2>
+<pre><code>npm install
+node test-compact-after-task.mjs
+</code></pre>
+<p>The unit test stubs the services and covers: idle + above threshold compacts, below threshold does not, <code>running</code> does not, <code>busy</code> is silent, <code>disabled</code> does nothing, <code>onlyRoots</code> filters subagents.</p>
+<h2>License</h2>
+<p><a href="https://github.com/xiaoliang2/dsh-compact-after-task/blob/HEAD/LICENSE">MIT</a></p>

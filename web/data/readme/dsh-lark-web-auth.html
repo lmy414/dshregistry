@@ -1,0 +1,111 @@
+<h1>dsh-lark-web-auth</h1>
+<blockquote>
+<p>DeepSeek Harness × 飞书登录 · 多用户 Web GUI 隔离</p>
+</blockquote>
+<p>给 <a href="https://github.com/deepseek-ai/deepseek-harness">DeepSeek Harness</a> Web GUI 加上飞书 OAuth 登录，让企业内部员工从公网访问，每人只能看到自己的对话。与 <a href="https://github.com/amlyczz/dsh-lark-link">dsh-lark-link</a> 完美配合：飞书 bot 里聊过的对话，登录网页后自动看到。</p>
+<h2>它做什么</h2>
+<ul>
+<li><strong>飞书 OAuth 登录</strong> — 未登录用户访问网页时自动跳转飞书授权，回调后写 httpOnly cookie。</li>
+<li><strong>Session 隔离</strong> — 每个 <code>session_id</code> 归属一个 <code>open_id</code>；用户只能看到、访问、修改自己的 session。非 owner 请求统一返回 404，不泄露存在性。</li>
+<li><strong>存量数据自动归属</strong> — 首次启动时扫描 <code>dm:*</code> 前缀的 session（<code>dsh-lark-link</code> 创建的），通过飞书 API 反查 <code>chat_id → open_id</code>，写入归属表。</li>
+<li><strong>登录态持久化</strong> — SQLite 存储，进程重启不掉线。</li>
+<li><strong>零前端源码修改</strong> — 通过 <code>webServer.tapIndex()</code> 注入小 UI（登录跳转 + 右上角用户菜单），不动 harness 前端源码。</li>
+</ul>
+<h2>安装</h2>
+<pre><code>dsh plugin --profile web add dsh-lark-web-auth
+</code></pre>
+<h2>配置</h2>
+<p>必需环境变量：</p>
+<table>
+<thead>
+<tr>
+<th>变量</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>LARK_WEB_APP_ID</code></td>
+<td>飞书自建应用 App ID（可复用 dsh-lark-link 的）</td>
+</tr>
+<tr>
+<td><code>LARK_WEB_APP_SECRET</code></td>
+<td>飞书自建应用 App Secret</td>
+</tr>
+<tr>
+<td><code>LARK_WEB_BASE_URL</code></td>
+<td>公网访问的 URL，如 <code>https://web.yourdomain.com</code></td>
+</tr>
+<tr>
+<td><code>LARK_WEB_COOKIE_SECRET</code></td>
+<td>32+ 字节随机串，用于 cookie 签名。旋转会踢下所有用户</td>
+</tr>
+</tbody></table>
+<p>可选：</p>
+<table>
+<thead>
+<tr>
+<th>变量</th>
+<th>默认</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>LARK_WEB_AUTH_ENABLED</code></td>
+<td><code>true</code></td>
+<td>设为 <code>false</code> 可临时禁用</td>
+</tr>
+<tr>
+<td><code>LARK_WEB_DB_PATH</code></td>
+<td><code>~/.dsh/lark-web-auth.sqlite</code></td>
+<td>SQLite 文件路径</td>
+</tr>
+<tr>
+<td><code>LARK_WEB_DOMAIN</code></td>
+<td><code>feishu</code></td>
+<td><code>feishu</code>（国内） 或 <code>lark</code>（海外）</td>
+</tr>
+</tbody></table>
+<h2>飞书开放平台设置</h2>
+<ol>
+<li>登录 <a href="https://open.feishu.cn/app">飞书开放平台</a>，进入自建应用（或新建一个）。</li>
+<li><strong>凭证与基础信息</strong> → 记下 <code>App ID</code> / <code>App Secret</code>。</li>
+<li><strong>添加应用能力</strong> → 「网页」→ 主页地址填 <code>https://web.yourdomain.com</code>。</li>
+<li><strong>安全设置</strong> → 重定向 URL 填 <code>https://web.yourdomain.com/auth/lark/callback</code>。</li>
+<li><strong>权限管理</strong> → 开通 <code>contact:user.base:readonly</code>（拿 open_id 和昵称）。</li>
+<li>发版申请审批 → 通过后本插件即可使用。</li>
+</ol>
+<h2>部署（Caddy 示例）</h2>
+<pre><code>web.yourdomain.com {
+    reverse_proxy localhost:3080
+}
+</code></pre>
+<p>启动：</p>
+<pre><code>export LARK_WEB_APP_ID=cli_xxxxx
+export LARK_WEB_APP_SECRET=xxxxx
+export LARK_WEB_BASE_URL=https://web.yourdomain.com
+export LARK_WEB_COOKIE_SECRET=$(openssl rand -base64 32)
+dsh --profile web
+</code></pre>
+<h2>加载顺序</h2>
+<p><strong>此插件必须在 <code>api-remotes</code> 之后加载</strong>——它用 <code>ctx.inject(['typert'])</code> 覆盖 typert lookup，晚注册者生效。<code>cordis.patch.yml</code> 里默认已经用 <code>insert:</code> 尾部追加。</p>
+<h2>与 dsh-lark-link 的关系</h2>
+<ul>
+<li>无依赖，可以独立用（仅 web 端登录，不与飞书 bot 交互）。</li>
+<li>一起用时：<code>dsh-lark-link</code> 把飞书 P2P chat 变成一个 harness session（key = <code>dm:${chat_id}</code>），本插件把该 session 归属到用户 open_id，登录后网页可见。</li>
+</ul>
+<h2>数据隔离怎么保证</h2>
+<ul>
+<li><strong>HTTP 层</strong>：所有 <code>/api/*</code> 请求先过 middleware 校验 cookie，未登录返 401。</li>
+<li><strong>RPC 层</strong>：typert 的 <code>agent</code> / <code>session</code> lookup 被包一层，请求上下文里的 <code>openId</code> 必须等于 <code>session_owner</code> 表里的记录，否则抛 <code>session-not-found</code>。</li>
+<li><strong>列表层</strong>：<code>session.list</code> API 返回值过滤只保留 owner 匹配的项。</li>
+<li><strong>新对话</strong>：监听 <code>session/created</code> 事件，把 request context 的 <code>openId</code> 写入 <code>session_owner</code>；<code>dm:*</code> 前缀的 lark-link 会话按 chat_id 反查 open_id。</li>
+</ul>
+<h2>Known Limitations</h2>
+<ul>
+<li>单机 SQLite 存储，不支持多实例部署（100 人以内足够）。</li>
+<li>存量数据回填是尽力而为——如果飞书 API 反查 <code>chat_id → open_id</code> 失败（如飞书返回 403），那条 session 保留无 owner 状态，任何人都看不到，需要手动分配（未来加 CLI）。</li>
+<li>不支持团队/群组 session 共享，一个 session 只能属于一个人。</li>
+<li>未做审计日志（谁看了谁的 session）；100 人规模够用，更大规模需要增强。</li>
+</ul>
+<h2>License</h2>
+<p>MIT</p>

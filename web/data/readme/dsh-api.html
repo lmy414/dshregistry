@@ -1,0 +1,200 @@
+<h1>dsh-api — HTTP control-plane plugin for DeepSeek Harness</h1>
+<p><code>dsh-api</code> is a first-party plugin for <a href="https://www.npmjs.com/package/@deepseek-ai/dsh">DeepSeek Harness (dsh)</a> that
+exposes dsh's own internal capabilities on the loopback HTTP socket dsh is
+already listening on. Any process on the same machine — a desktop wrapper,
+a browser extension, a CLI, an editor integration — can drive dsh through
+one uniform entry point, instead of reaching into its in-process services
+directly.</p>
+<ul>
+<li>Route prefix (default): <strong><code>/dsh-api</code></strong></li>
+<li>Binds only where dsh already binds (127.0.0.1)</li>
+<li>Zero runtime dependencies beyond Node itself</li>
+</ul>
+<h2>Install</h2>
+<pre><code># From GitHub (any dsh profile):
+dsh plugin --profile web add github:lilming123/dsh-api
+
+# From npm (once published):
+dsh plugin --profile web add dsh-api
+</code></pre>
+<p><code>dsh plugin</code> is a thin pnpm wrapper. Both forms drop the package into
+<code>$DSH_HOME/profiles/&lt;profile&gt;/node_modules/</code> and register <code>dsh-api</code> in the
+profile's bundle list — the next <code>dsh web</code> picks it up automatically, no
+<code>--patch</code> flag needed.</p>
+<p>The desktop app <a href="https://github.com/lilming123/dsh-desktop"><code>dsh-desktop</code></a> detects an already-installed
+<code>dsh-api</code> and skips its bundled fallback; you only need to install this
+plugin manually if you drive dsh directly.</p>
+<h2>Endpoints</h2>
+<p>Two layers, mounted under the same <code>/dsh-api</code> prefix:</p>
+<h3>1. Native (always available once the plugin is loaded)</h3>
+<table>
+<thead>
+<tr>
+<th>Method</th>
+<th>Path</th>
+<th>Purpose</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>GET</td>
+<td><code>/dsh-api/health</code></td>
+<td>Liveness + basic identity (dsh port, cwd, companion?)</td>
+</tr>
+<tr>
+<td>GET</td>
+<td><code>/dsh-api/language</code></td>
+<td>Read <code>locale.preference</code></td>
+</tr>
+<tr>
+<td>POST</td>
+<td><code>/dsh-api/language</code></td>
+<td>Write <code>locale.preference</code> (<code>{ "language": "zh"|"en" }</code>)</td>
+</tr>
+<tr>
+<td>GET</td>
+<td><code>/dsh-api/workspace/list</code></td>
+<td>List every workspace known to <code>workspaceRegistry</code></td>
+</tr>
+<tr>
+<td>GET</td>
+<td><code>/dsh-api/workspace/current</code></td>
+<td>Current cwd + companion snapshot (if registered)</td>
+</tr>
+<tr>
+<td>POST</td>
+<td><code>/dsh-api/workspace/create</code></td>
+<td><code>{ path, title? }</code> — register a new workspace entry</td>
+</tr>
+<tr>
+<td>GET</td>
+<td><code>/dsh-api/events</code></td>
+<td>Server-Sent Events stream (see below)</td>
+</tr>
+</tbody></table>
+<h3>2. Companion-bridged (needs a registered companion process)</h3>
+<p>A "companion" is any local process that writes
+<code>$DSH_HOME/dsh-api-companion.json</code> with <code>{ port, token, pid, ... }</code> and
+serves the <code>/companion/*</code> protocol. These routes are 503 when no companion
+is registered; the native routes above keep working regardless.</p>
+<table>
+<thead>
+<tr>
+<th>Method</th>
+<th>Path</th>
+<th>Purpose</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>GET</td>
+<td><code>/dsh-api/companion/state</code></td>
+<td>Companion state snapshot</td>
+</tr>
+<tr>
+<td>POST</td>
+<td><code>/dsh-api/workspace/open</code></td>
+<td>Switch dsh cwd (restarts dsh under the companion)</td>
+</tr>
+<tr>
+<td>POST</td>
+<td><code>/dsh-api/input/paste</code></td>
+<td><code>{ text }</code> — inject text into the dsh UI</td>
+</tr>
+<tr>
+<td>POST</td>
+<td><code>/dsh-api/window/show</code></td>
+<td>Focus the host window</td>
+</tr>
+<tr>
+<td>POST</td>
+<td><code>/dsh-api/window/reload</code></td>
+<td>Reload the host window</td>
+</tr>
+<tr>
+<td>POST</td>
+<td><code>/dsh-api/app/quit</code></td>
+<td>Quit the host app</td>
+</tr>
+</tbody></table>
+<h3><code>/dsh-api/events</code> (Server-Sent Events)</h3>
+<p>Long-lived HTTP GET producing named SSE frames:</p>
+<pre><code>event: ready
+data: {"timestamp":1730000000000}
+
+event: agent-idle
+data: {"sessionId":"…","title":"…","previousStatus":"running","timestamp":…}
+
+event: approval-needed
+data: {"sessionId":"…","kind":"…","summary":"…","timestamp":…}
+
+event: heartbeat
+data: {"timestamp":…}
+</code></pre>
+<ul>
+<li><code>agent-idle</code> fires when any <code>agent/status</code> event transitions <code>running → idle</code>.</li>
+<li><code>approval-needed</code> is a <strong>read-only bypass</strong> of dsh's <code>approval/request</code>
+waterfall — the plugin observes the request, broadcasts a summary, and
+passes control back to the real answerer chain unchanged.</li>
+<li><code>heartbeat</code> is emitted every 25 seconds so proxies don't idle-kill the
+connection.</li>
+<li>On dsh shutdown, subscribers receive a <code>server-stopping</code> event before the
+socket closes.</li>
+</ul>
+<h2>Security</h2>
+<ul>
+<li>dsh binds <code>127.0.0.1</code> only; this plugin reuses that socket.</li>
+<li>Mutating requests validate <code>Origin</code>: no <code>Origin</code> header (CLI) and
+loopback origins are allowed; anything else is <code>403</code>.</li>
+<li>Companion-bridged routes forward the discovery-file token in
+<code>x-dsh-api-companion-token</code>; the companion is expected to reject
+mismatches.</li>
+</ul>
+<h2>Configuration</h2>
+<p>The plugin exposes two knobs, both settable in the loader entry's
+<code>config: { ... }</code>:</p>
+<table>
+<thead>
+<tr>
+<th>Key</th>
+<th>Default</th>
+<th>Purpose</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>basePath</code></td>
+<td><code>/dsh-api</code></td>
+<td>HTTP route prefix</td>
+</tr>
+<tr>
+<td><code>companionFile</code></td>
+<td><code>$DSH_HOME/dsh-api-companion.json</code></td>
+<td>Companion discovery file to read on demand</td>
+</tr>
+</tbody></table>
+<p>Example (<code>$DSH_HOME/profiles/web/cordis.patch.yml</code>):</p>
+<pre><code>- id: dsh-api
+  config:
+    basePath: /control
+</code></pre>
+<h2>Development</h2>
+<p><code>dsh-api</code> is a plain-ESM plugin — no build step. Clone the repo, drop the
+file into a dsh profile, and start dsh with <code>--patch</code>:</p>
+<pre><code>git clone https://github.com/lilming123/dsh-api.git
+cd dsh-api
+
+# One-time: expose to a profile as a live-edit checkout
+mkdir -p "$DSH_HOME/profiles/web/dsh-api-dev"
+ln -sf "$PWD/index.mjs" "$DSH_HOME/profiles/web/dsh-api-dev/index.mjs"
+cat &gt; /tmp/dsh-api-dev.patch.yml &lt;&lt;'YML'
+- insert:
+    - id: dsh-api-dev
+      name: ./dsh-api-dev/index.mjs
+YML
+
+dsh web --patch /tmp/dsh-api-dev.patch.yml --port 3181
+
+# In another shell:
+curl http://127.0.0.1:3181/dsh-api/health
+curl -N http://127.0.0.1:3181/dsh-api/events
+</code></pre>
+<h2>License</h2>
+<p>MIT © 2026 lilming123</p>

@@ -1,0 +1,110 @@
+<h1>dsh-plugin-heartbeat</h1>
+<blockquote>
+<p>A heartbeat plugin for <a href="https://github.com/deepseek-ai/deepseek-harness">DeepSeek Harness</a>: wakes the agent on a configurable interval so it proactively reports progress, risks, and blockers — or just checks in.</p>
+</blockquote>
+<p>DeepSeek Harness 的「心跳」插件：给 agent 装一个定时唤醒的闹钟，让它<strong>主动</strong>开口 —— 汇报进展、风险、卡点，或者没事贫两句。类似 OpenClaw 的心跳模式。</p>
+<h2>怎么工作</h2>
+<ul>
+<li>Host 平面的 Cordis 插件，监听 <code>agent/created</code>，给每个 <strong>root agent</strong>（子 agent 跳过）挂一个独立定时器。</li>
+<li>每次心跳通过 <code>agent.followup()</code> 注入一条合成 user 消息（<code>source.kind === 'plugin'</code>）：<ul>
+<li><strong>agent 空闲</strong> → 立即开新一轮，主动说话；</li>
+<li><strong>agent 忙</strong> → 消息排队，当前轮结束立刻处理 —— <strong>不打断、不丢失</strong>；</li>
+<li>连续忙时多拍心跳 → 只保留一条待处理（<code>inbox.replace</code> 原地替换，不堆积）。</li>
+</ul>
+</li>
+<li><strong>退避间隔（v0.4.0）</strong>：初始 10 分钟；无人回复则下一拍 20 分钟、再下一拍 30 分钟（<code>[base, 2×base, 3×base]</code> 自动推导，可 <code>backoffSeconds</code> 显式覆盖）。冷场越久，吵得越稀。</li>
+<li><strong>硬停保证（v0.4.0，token 保护）</strong>：连续 <code>pauseAfterMissed</code>（默认 3）拍没有真人回复 → <strong>拆掉定时器彻底停止</strong>，绝不再投递；只有你的下一条消息能复活它，并从初始 10 分钟档<strong>重新计时</strong>。聊天活跃时每次你说话都会重置相位——心跳只在真正的冷场后才开口。</li>
+<li><strong>轻量唤醒（v0.4.0）</strong>：投递前先请宿主的 compaction 服务把长历史压成 checkpoint 摘要（<code>compactBeforeBeat</code>，默认开，失败不影响投递），注入的指令明确「不调工具、不复盘历史、≤5 句」——每拍消耗的上下文尽量小。</li>
+<li><strong>每小时封顶（可选）</strong>：<code>maxBeatsPerHour</code>（默认 0=关）给任何 60 分钟窗口设心跳上限，防「断续回复反复重置退避」的极端烧法。</li>
+<li>注入的消息在对话流里渲染为一条折叠的 context 小行，不是整块用户气泡。</li>
+</ul>
+<h2>安装</h2>
+<pre><code>dsh plugin --profile &lt;profile&gt; add dsh-plugin-heartbeat
+</code></pre>
+<p>（包内置 <code>dsh.bundle</code> manifest，<code>dsh plugin add</code> 会把它自动挂进 profile 的 bundles 层；dsh-market 里的一键安装同此通道。）</p>
+<p>重启 DSH 后生效。之后在 <strong>设置 → 心跳 Heartbeat</strong> 面板里随时改频率、开关与暂停阈值，保存即热应用（无需重启）。</p>
+<blockquote>
+<p>⚠️ <strong>不要</strong>再往 profile 的 <code>cordis.patch.yml</code> 里手写 <code>- insert: {id: dsh-heartbeat, ...}</code>：
+那会与 bundle manifest 的自动挂载产生两条同名 entry，整个 profile 会以
+<code>duplicate loader entry id "dsh-heartbeat"</code> 启动失败（2026-08-18 实机事故，
+当时撞的是 memory 插件的同名条目）。运行期配置走 <code>&lt;dshHome&gt;/heartbeat.json</code>；
+覆盖 composition 键（如 <code>prompt</code>）用<strong>不带 insert 的 id 覆盖条目</strong>，见下。</p>
+</blockquote>
+<h2>配置</h2>
+<table>
+<thead>
+<tr>
+<th>键</th>
+<th>默认</th>
+<th>含义</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>enabled</code></td>
+<td><code>true</code></td>
+<td>总开关（用户层存在 <code>&lt;dshHome&gt;/heartbeat.json</code>）</td>
+</tr>
+<tr>
+<td><code>intervalSeconds</code></td>
+<td><code>600</code></td>
+<td>初始心跳周期（钳制在 30–86400 秒）；退避后续档自动 ×2、×3</td>
+</tr>
+<tr>
+<td><code>pauseAfterMissed</code></td>
+<td><code>3</code></td>
+<td>硬停阈值：连续 N 拍无真人回复 → 拆定时器彻底停止；用户下一条消息复活并回初始档重新计时。<code>0</code> = 关闭</td>
+</tr>
+<tr>
+<td><code>backoffSeconds</code></td>
+<td>未设</td>
+<td>显式退避档位数组（如 <code>[600, 900, 1800]</code>，仅 composition）</td>
+</tr>
+<tr>
+<td><code>compactBeforeBeat</code></td>
+<td><code>true</code></td>
+<td>投递前先压缩历史为 checkpoint 摘要（仅 composition，无 compaction 服务时自动跳过）</td>
+</tr>
+<tr>
+<td><code>maxBeatsPerHour</code></td>
+<td><code>0</code></td>
+<td>每 60 分钟滑动窗口的心跳上限（<code>0</code>=关闭，仅 composition）</td>
+</tr>
+<tr>
+<td><code>prompt</code></td>
+<td>内置</td>
+<td>每拍投递的指令模板，<code>{{time}}</code> 会替换为当前时间（仅 composition 配置）</td>
+</tr>
+<tr>
+<td><code>configFile</code></td>
+<td><code>&lt;dshHome&gt;/heartbeat.json</code></td>
+<td>用户配置文件路径（<code>enabled</code> / <code>intervalSeconds</code> / <code>pauseAfterMissed</code>）</td>
+</tr>
+</tbody></table>
+<p>自定义心跳提示词（composition 配置，<strong>不带 <code>insert</code></strong>，避免与 bundle 层重复）：</p>
+<pre><code>- id: dsh-heartbeat
+  config:
+    prompt: |
+      【心跳】当前时间 {{time}}。看一眼最近的对话和待办：
+      有进展说进展、有风险说风险；都没有就一句话带过。
+      总长不超过 5 句，中文。
+</code></pre>
+<blockquote>
+<p>为什么不用 settings 面板的通用 namespace？DSH 的 settings wire 只服务一张
+硬编码白名单（<code>WEB_SETTINGS_NAMESPACES</code>），插件无法把自有 namespace 暴露给
+浏览器写入。本插件因此在 host 自建了 <code>GET/POST /api/heartbeat/config</code>
+路由，设置面板里的「心跳 Heartbeat」区块直连该路由，写入即热应用。</p>
+</blockquote>
+<h2>开发</h2>
+<pre><code>node --test test/runtime.test.mjs
+</code></pre>
+<h2>已知边界</h2>
+<ul>
+<li>心跳只在 DSH 进程活着时存在（app 关了就停）。</li>
+<li>每个会话（root agent）各自一条定时器，互不干扰；子 agent 不挂心跳。</li>
+<li>心跳<strong>不打断</strong>正在跑的任务；任务结束后它会立刻补一句。</li>
+<li>心跳是「汇报」不是「新任务」：默认提示词要求它别自作主张开新活。</li>
+<li>硬停前已排队的一条心跳（agent 忙时）会在当前轮结束时被消费——此后绝无新拍。</li>
+<li>与 dsh-plugin-memory 互相独立、零依赖；两者同时安装时消息在同一个 inbox 队列里排队，不冲突。</li>
+</ul>
+<h2>License</h2>
+<p>MIT</p>

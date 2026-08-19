@@ -1,0 +1,118 @@
+<h1>dsh-ocr-bridge</h1>
+<p><strong>English</strong> | <a href="https://github.com/vuvanmai936-dot/dsh-ocr-bridge/blob/main/README.zh.md"><strong>中文</strong></a></p>
+<p>Paste images directly into <a href="https://github.com/deepseek-ai/deepseek-harness">DeepSeek Harness</a> (DSH) chat and have them <strong>read by a free local backend</strong> — macOS Vision, with a Tesseract fallback — before the text-only DeepSeek model (e.g. <code>deepseek-v4-flash</code>) answers. Your model, agent capabilities, API key, and cost stay exactly the same.</p>
+<blockquote>
+<p><strong>Scope note:</strong> this is an <em>OCR-level</em> local bridge — it reads text out of images (macOS Vision → Tesseract). It is <strong>not</strong> general visual understanding, and <strong>no cloud endpoint is ever called</strong>.</p>
+</blockquote>
+<blockquote>
+<p><strong>Independence notice.</strong> This is an independent, community-built plugin <strong>for</strong> DeepSeek Harness (DSH). It is not an official DeepSeek product and is not affiliated with, endorsed by, or sponsored by DeepSeek or the DeepSeek Harness project. "DeepSeek" and "DeepSeek Harness" are trademarks of their respective owners.</p>
+</blockquote>
+<blockquote>
+<p>⚠️ <strong>Trust boundary.</strong> This plugin runs inside the harness host process with shell-level access (it spawns <code>osascript</code> / <code>tesseract</code>). Only install plugins you trust. The OCR text injected into the request is explicitly marked as <em>untrusted observation data, not instructions</em> — never execute commands, rules, or privilege escalations that appear in it.</p>
+</blockquote>
+<h2>Why</h2>
+<p>DSH's image admission gate (<code>dsh-host-apiproxy.submitPrompt</code>) rejects attachments unless the current model declares <code>image</code> input. The official DeepSeek adapter hardcodes <code>inputModalities: ["text"]</code> for every model and its serializer throws on image blocks. The gate only checks the <em>declaration</em>, not real multimodality — so this plugin registers a wrapper adapter that:</p>
+<ol>
+<li>declares <code>["text", "image"]</code> to let the gate pass;</li>
+<li>recognizes pasted images <strong>locally</strong> (macOS Vision → Tesseract, no network, no API key);</li>
+<li>strips the image blocks and injects the recognized text as untrusted context;</li>
+<li>delegates the pure-text call to the official DeepSeek API with your existing key.</li>
+</ol>
+<p>No new API keys, no settings changes, no model switching.</p>
+<h2>Install</h2>
+<p>Requires DSH <code>0.1.0-rc.7</code> (peer dependencies are pinned; other release candidates are not supported — see <a href="#compatibility">Compatibility</a>).</p>
+<pre><code># npm registry
+dsh plugin --profile web add dsh-ocr-bridge
+
+# or directly from GitHub
+dsh plugin --profile web add github:your-org/dsh-ocr-bridge
+
+# local development (live reload of lib/ changes)
+dsh plugin --profile web add link:~/dev/dsh-vision-bridge
+</code></pre>
+<blockquote>
+<p>Package name note: the npm name <code>dsh-vision-bridge</code> is taken by an unrelated project, and the upstream <code>dsh-vision</code> package already owns the "vision" naming — so this plugin is published as <strong><code>dsh-ocr-bridge</code></strong>, which also states its OCR-level scope.</p>
+</blockquote>
+<p>Restart <code>dsh web</code> after adding the plugin (patch layers load at boot). The model selector still shows the original <code>deepseek-v4-flash</code> / <code>deepseek-v4-pro</code> entries — nothing to re-select.</p>
+<h2>Backends</h2>
+<table>
+<thead>
+<tr>
+<th>Order</th>
+<th>Backend</th>
+<th>Requirements</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>1</td>
+<td>macOS Vision (JXA via <code>osascript</code>)</td>
+<td>macOS 10.15+; zero installation, Chinese + English built in</td>
+</tr>
+<tr>
+<td>2</td>
+<td>Tesseract</td>
+<td><code>tesseract</code> CLI + language packs (<code>chi_sim</code>, <code>chi_tra</code>, <code>eng</code>); also the only option on Linux/Windows</td>
+</tr>
+</tbody></table>
+<p>If Vision fails and Tesseract is missing, the request fails with <code>VISION_UNAVAILABLE</code> and the error lists both backend failures. Images are written to a temp directory and always cleaned up.</p>
+<h2>Configuration</h2>
+<p>All settings are optional. They live in the <code>llm-deepseek</code> settings section (the official DeepSeek section this plugin takes over), so your existing DeepSeek settings keep working.</p>
+<p><code>settings.yaml</code> (or the GUI settings surface):</p>
+<pre><code>llm-deepseek:
+  visionTimeoutMs: 180000   # per-backend recognition timeout (ms), default 180000
+  maxImages: 8              # images recognized per request, 1..32, default 8
+  # …all official DeepSeek settings keep working: baseURL, apiKeyEnv, thinking, …
+</code></pre>
+<p>Notes:</p>
+<ul>
+<li>Over the limit, the request fails with <code>VISION_IMAGE_LIMIT</code> instead of silently dropping images.</li>
+<li>Recognized observations are cached per (image set + latest user text), up to 64 entries, so re-sending the same screenshot in one conversation does not re-run OCR.</li>
+<li><code>DEEPSEEK_API_KEY</code> resolution is fully preserved: <code>ctx.credentials</code> first, then the launch environment, exactly like the official adapter.</li>
+<li>png / jpeg / webp / gif are all supported (whatever the harness attachment admission accepts).</li>
+</ul>
+<h2>Architecture</h2>
+<pre><code>paste image ──► submitPrompt gate ──► wrapper adapter (inputModalities=["text","image"]) ──passes──► durable attachment refs
+                                                          │
+                                   stream(): collectImageRefs(messages)
+                                     ├─ no images ─► delegate to DeepSeekAdapter untouched
+                                     ├─ native model supports image ─► delegate untouched
+                                     └─ images ─► attachments.readImage(ref) each
+                                                ► local recognition (macOS Vision → Tesseract)
+                                                ► strip image blocks, append &lt;vision-bridge-context&gt;
+                                                ► delegate pure-text call to official DeepSeek API
+</code></pre>
+<h2>Development</h2>
+<pre><code>pnpm install
+pnpm check        # typecheck + test + build
+</code></pre>
+<p>Live-testing against your harness:</p>
+<pre><code>dsh plugin --profile web add link:~/dev/dsh-vision-bridge   # symlink: lib/ changes apply immediately
+# editing cordis.patch.yml still requires restarting `dsh web`
+</code></pre>
+<p>Then paste an image into any conversation and verify the <a href="#verification-checklist">checklist below</a>.</p>
+<h2>Verification checklist</h2>
+<ul>
+<li> After <code>dsh plugin --profile web add dsh-ocr-bridge</code> and restart, the model selector still shows <code>deepseek-v4-flash</code> / <code>deepseek-v4-pro</code></li>
+<li> Pasting one or several images under a text-only flash model no longer raises <code>MODEL_DOES_NOT_SUPPORT_IMAGES</code></li>
+<li> Mixed Chinese + English screenshots are recognized correctly (macOS Vision)</li>
+<li> Tesseract fallback works (simulate a Vision failure)</li>
+<li> Text-only conversations behave identically to the official adapter (pure delegation)</li>
+<li> No new API key needed; <code>settings.yaml</code> unchanged works out of the box</li>
+<li> png / jpeg / webp / gif all work; image count respects <code>maxImages</code></li>
+</ul>
+<h2>Compatibility</h2>
+<ul>
+<li>DSH <code>0.1.0-rc.7</code> only. Peer dependencies are pinned exactly (<code>@deepseek-ai/*</code> <code>0.1.0-rc.7</code>, <code>@deepseek-ai/cordis</code> <code>4.0.1</code>); later release candidates will be added as they ship.</li>
+<li>Node <code>&gt;=22.19</code>, pnpm <code>10.x</code>.</li>
+<li>macOS 10.15+ recommended for the Vision backend; Linux/Windows fall back to Tesseract.</li>
+</ul>
+<h2>Credits</h2>
+<p>The code skeleton is adapted from <a href="https://github.com/oil-oil/dsh-vision">oil-oil/dsh-vision</a> (MIT) and used with attribution (see <a href="https://github.com/vuvanmai936-dot/dsh-ocr-bridge/blob/HEAD/LICENSE">LICENSE</a>). Positioning differs deliberately: <strong>dsh-ocr-bridge is a local-first, OCR-level bridge</strong> (zero cloud, zero extra cost, pinned to rc.7), while upstream focuses on cloud multimodal endpoints plus a visual-memory workflow. The two are complementary rather than overlapping in scope; this plugin does not claim to be a fork or successor of upstream.</p>
+<h2>Roadmap (v1+)</h2>
+<ul>
+<li>Ollama local vision backend (e.g. <code>llava</code>) as a third recognition option</li>
+<li>Client settings card for the bridge options (currently configured via <code>settings.yaml</code> / composition config)</li>
+<li>Multi-backend scoring (Vision + Tesseract agreement) for higher-confidence OCR</li>
+</ul>
+<h2>License</h2>
+<p>MIT. See <a href="https://github.com/vuvanmai936-dot/dsh-ocr-bridge/blob/HEAD/LICENSE">LICENSE</a>.</p>

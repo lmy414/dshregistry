@@ -1,0 +1,211 @@
+<h1>dsh-rtk-filter</h1>
+<blockquote>
+<p>A <a href="https://github.com/deepseek-ai/deepseek-harness">DeepSeek Harness</a> (DSH) plugin that pipes oversized command output through the <a href="https://github.com/rtk-ai/rtk">rtk</a> CLI and hands the model RTK's condensed text instead of the raw output — a <code>tools/post-execute</code> result transformer that slashes token/context usage.</p>
+</blockquote>
+<p>一个 DeepSeek Harness（DSH）插件：执行命令时自动调用系统命令 <code>rtk</code> 过滤输出。
+当 <code>bash</code> / <code>job_output</code> 等工具返回超过阈值的纯文本结果时，插件把原始输出通过
+stdin 管道交给 <code>rtk</code>，把 RTK 精简后的文本作为大模型最终看到的内容，从而显著减少
+上下文占用。</p>
+<h2>安装 / Installation</h2>
+<p>仓库已包含编译产物（<code>lib/</code>），<strong>clone 后无需构建即可挂载</strong>。</p>
+<h3>方式一：GitHub 安装（推荐）</h3>
+<pre><code># 1) 用 dsh CLI 直接安装（需要本机装有 gh 或可访问 GitHub）
+dsh plugin --profile web add github:Aeternus123/dsh-rtk-filter
+
+# 2) 或在 profile 的 node_modules 放符号链接/拷贝 + patch 挂载（见下方示例）
+</code></pre>
+<h3>方式二：npm 安装（发布后）</h3>
+<pre><code>dsh plugin --profile web add dsh-rtk-filter
+# 或
+npm install dsh-rtk-filter
+</code></pre>
+<h3>方式三：本地挂载（开发）</h3>
+<pre><code>mkdir -p ~/.dsh/profiles/web/node_modules
+ln -s /path/to/dsh-rtk-filter ~/.dsh/profiles/web/node_modules/dsh-rtk-filter
+</code></pre>
+<p>无论哪种方式，最后在 profile 的 <code>cordis.patch.yml</code> 里挂载插件（包内自带 <code>cordis.patch.yml</code>，用
+<code>dsh plugin add</code> 安装时自动生效；手动挂载时追加）：</p>
+<pre><code>- insert:
+    - id: rtk-filter
+      name: 'dsh-rtk-filter'
+      config:
+        command: /opt/homebrew/bin/rtk   # rtk 绝对路径（或裸名 rtk，插件自动探测候选目录）
+        args: ['pipe']                    # stdin 进、stdout 出
+        minBytes: 2048
+</code></pre>
+<p><strong>前置条件</strong>：系统装有 <a href="https://github.com/rtk-ai/rtk">rtk</a>（如 <code>brew install rtk</code>）；未安装时插件静默降级，不影响任何命令。</p>
+<h2>开发 / Development</h2>
+<pre><code>npm install          # 安装 @deepseek-ai/* dev 依赖（node_modules 用于测试）
+npm run build        # tsc → lib/
+npm test             # 单元 + 集成测试（tests/bin/rtk 为 stub；装了真实 rtk 会额外跑 e2e）
+npm run typecheck
+</code></pre>
+<h2>核心思路：注入点在哪里（调研结论）</h2>
+<blockquote>
+<p>关键探索点：命令输出在返回大模型之前，如何拦截并修改？</p>
+</blockquote>
+<p>在 DSH 的架构里，<strong>命令执行的真正入口是 <code>ctx.shell</code> 服务（Service）</strong>，模型侧的
+<code>bash</code> 工具只是它的一个 Consumer。输出回传模型前，最贴近的、官方文档化的扩展点是：</p>
+<ul>
+<li><strong><code>tools/post-execute</code> 瀑布事件</strong>（<code>@deepseek-ai/dsh-tools</code> 注册表提供）——
+每个工具调用在 dispatch 完成后、<strong>lossless 物化之前</strong>经过这个 waterfall，
+监听者可以返回 <code>{ kind: 'accept', content: [...] }</code> 替换模型看到的内容。
+这正是「输出在返回给大模型之前」的拦截点。官方同款范例：<ul>
+<li><code>@deepseek-ai/dsh-spill-policy</code>（spill 策略插件，把超大文本结果替换为预览+落盘定位）</li>
+<li><code>@deepseek-ai/dsh-hooks-*</code>（Claude Code / Codex 钩子桥）</li>
+<li><code>@deepseek-ai/dsh-repeat-tool-reminder</code>（重复工具提醒）</li>
+</ul>
+</li>
+</ul>
+<p>为什么不选其他方向：</p>
+<ul>
+<li><strong><code>ctx.shell.run()</code> 服务包装</strong>：能拿到原始 stdout/stderr，但属于服务层侵入，而且
+后台任务（<code>run_in_background</code>）的输出走的是另一条路径（<code>job_output</code> 工具），
+服务层包装覆盖不全。</li>
+<li><strong>会话投影（Projection，如 dsh-trail-plugin 的做法）</strong>：投影单元监听的是<strong>会话
+事件</strong>（用于日志、回放、统计），事件在物化之后才发出，<strong>改不了</strong>模型已经拿到
+的内容——它是「记录者」，不是「拦截者」。</li>
+</ul>
+<p>结论：<strong><code>tools/post-execute</code> 瀑布是唯一既能改内容、又覆盖前台/后台命令输出、且被
+官方文档列为扩展点的位置。</strong> 插件在该瀑布上以 <code>prepend: true</code> 注册，先
+<code>await next()</code> 让下游监听者（如钩子桥）定型结果，再对最终内容做 RTK 精简。</p>
+<h2>工作原理</h2>
+<ol>
+<li>工具结果（如 <code>bash</code> 的前台渲染文本）进入 <code>tools/post-execute</code> 瀑布；</li>
+<li>插件过滤条件：<code>accept</code> 决策、非失败结果、工具名在配置列表中、内容为纯文本、
+字节数 ≥ <code>minBytes</code>；</li>
+<li><strong>拆出末尾的状态标记</strong>（<code>[exit code: N]</code>、<code>[killed by signal: …]</code>、
+<code>[timed out after Nms]</code>、<code>[sandbox: …]</code>、<code>[status: …]</code>），只把正文喂给 rtk——
+大模型的退出码契约在精简后依然成立；</li>
+<li><code>spawn(command, args, { detached: true })</code> 把正文写入 rtk 的 stdin，捕获 stdout；</li>
+<li>用 RTK 输出替换内容：<code>精简正文 + [rtk: output condensed …] 提示 + 原状态标记</code>；</li>
+<li>任何失败（rtk 缺失、非零退出、超时、调用方取消、输出为空、输出无变化）都
+<strong>保留原始输出</strong>，绝不把成功调用变成 <code>isError</code>。</li>
+</ol>
+<h2>安装与挂载（以 web 界面 profile 为例）</h2>
+<p>DSH 的插件挂在 profile 目录：包放进 <code>~/.dsh/profiles/&lt;profile&gt;/node_modules</code>，
+并在 <code>cordis.patch.yml</code> 里 <code>insert</code> 一行。</p>
+<pre><code># 1) 让 profile 的解析器能看到本包（本地开发用符号链接即可）
+mkdir -p ~/.dsh/profiles/web/node_modules
+ln -s /Users/mac/work/dsh-rtk-filter ~/.dsh/profiles/web/node_modules/dsh-rtk-filter
+
+# 2) 在 ~/.dsh/profiles/web/cordis.patch.yml 中追加：
+#    - insert:
+#        - id: rtk-filter
+#          name: 'dsh-rtk-filter'
+#          config:
+#            command: /opt/homebrew/bin/rtk   # rtk 绝对路径（推荐，见下节）
+#            args: ['pipe']                    # stdin 进、stdout 出
+#            minBytes: 2048
+
+# 3) 重启应用（或等待 HMR 对 patch 的热重载生效）
+</code></pre>
+<blockquote>
+<p>安装包自带 <code>cordis.patch.yml</code>（dsh.bundle.patch），若通过
+<code>dsh plugin --profile web add</code> 或 pnpm 安装发布版，insert 会自动生效。</p>
+</blockquote>
+<h2>为什么终端有 rtk，插件却找不到？</h2>
+<p>DSH 的 bash 工具是 <code>bash -c</code> 非登录 shell，<strong>不读取 <code>~/.zshrc</code> / <code>~/.bashrc</code></strong>；
+GUI 应用从 Finder 启动时继承的是 launchd 的最小 PATH（通常只有
+<code>/usr/bin:/bin:/usr/sbin:/sbin</code> 外加应用自带 node）。所以 Homebrew 装的
+<code>/opt/homebrew/bin/rtk</code>、Rustup 装的 <code>~/.cargo/bin/rtk</code> 在你的终端里能用，
+但在 DSH 进程里 <code>which rtk</code> 找不到。</p>
+<p>对策（插件已内置三重保障）：</p>
+<ol>
+<li><strong>绝对路径</strong>：挂载配置里 <code>command: /opt/homebrew/bin/rtk</code>（推荐，最直接）；</li>
+<li><strong>候选目录自动探测</strong>：<code>command</code> 写裸名（如 <code>rtk</code>）时，插件会依次探测
+<code>~/.cargo/bin</code>、<code>/opt/homebrew/bin</code>、<code>/usr/local/bin</code>、<code>/opt/local/bin</code>、
+<code>~/.local/bin</code>，命中即用（<code>resolveRtkPath</code>，成功结果会缓存）；</li>
+<li><strong>静默降级</strong>：都找不到则保留原始输出，命令照常执行。</li>
+</ol>
+<h2>配置项</h2>
+<table>
+<thead>
+<tr>
+<th>配置</th>
+<th>类型</th>
+<th>默认</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>enabled</code></td>
+<td>boolean</td>
+<td><code>true</code></td>
+<td>总开关；<code>false</code> 时插件完全空转（不注册任何监听器）</td>
+</tr>
+<tr>
+<td><code>command</code></td>
+<td>string</td>
+<td><code>'rtk'</code></td>
+<td>rtk 可执行文件；裸名先走 PATH，再自动探测候选目录（Homebrew/Rustup 等），或直接写绝对路径</td>
+</tr>
+<tr>
+<td><code>args</code></td>
+<td>string[]</td>
+<td><code>[]</code></td>
+<td>透传给 rtk 的附加参数；通用推荐 <code>['pipe']</code>（见下节）</td>
+</tr>
+<tr>
+<td><code>tools</code></td>
+<td>string[]</td>
+<td><code>['bash', 'job_output']</code></td>
+<td>需要过滤的工具名；可加 <code>run_code</code>、<code>pwsh</code> 等</td>
+</tr>
+<tr>
+<td><code>minBytes</code></td>
+<td>number</td>
+<td><code>2048</code></td>
+<td>低于此字节数的输出直接放行（避免每条命令都付 RTK 延迟）</td>
+</tr>
+<tr>
+<td><code>timeoutMs</code></td>
+<td>number</td>
+<td><code>15000</code></td>
+<td>rtk 超时；超时则 SIGKILL 整个进程组并保留原始输出</td>
+</tr>
+<tr>
+<td><code>notice</code></td>
+<td>boolean</td>
+<td><code>true</code></td>
+<td>替换文本中追加 <code>[rtk: output condensed N → M bytes]</code> 提示行</td>
+</tr>
+</tbody></table>
+<h2>RTK 契约与 <code>pipe</code> 模式</h2>
+<p>插件与 rtk 的约定只有一条：<strong>stdin 进原始文本，stdout 出精简文本</strong>（退出码为 0）。
+rtk 需要子命令，对应本插件的子命令是 <strong><code>pipe</code></strong>（Unix pipe 模式）：</p>
+<pre><code>config:
+  command: /opt/homebrew/bin/rtk
+  args: ['pipe']           # 通用：stdin → stdout
+</code></pre>
+<p><strong>重要：<code>rtk pipe</code> 只有输入匹配 <code>-f</code> 指定的 filter 时才会真正压缩</strong>，不匹配的
+输入原样透传（插件检测到输出无变化时不会追加任何 notice）。常见的 filter 见
+<code>rtk pipe --help</code>（如 <code>cargo-test</code>、<code>pytest</code>、<code>grep</code>、<code>find</code>、<code>git-log</code>）。
+例如以 cargo 测试输出为主的工作流：</p>
+<pre><code>config:
+  command: /opt/homebrew/bin/rtk
+  args: ['pipe', '-f', 'cargo-test']
+</code></pre>
+<p>测试套件里的 <code>tests/e2e-real-rtk.mjs</code> 用真实 rtk 验证了 <code>-f cargo-test</code>
+场景：30 行重复通过用例被压成失败摘要，<code>[exit code: N]</code> 标记原样保留。</p>
+<h2>测试</h2>
+<pre><code># 使用应用自带 node 运行（stub rtk 位于 tests/bin/rtk）
+/Applications/DeepSeek\ Harness.app/Contents/Resources/dsh/node/bin/node --test tests/rtk-filter.test.mjs
+# 或
+npm test
+</code></pre>
+<p>测试用真实 <code>@deepseek-ai/cordis</code> + <code>@deepseek-ai/dsh-tools</code> 注册表驱动
+<code>ctx.tools.execute</code>，覆盖：禁用空转、正文精简+标记保留、job_output 状态行保留、
+minBytes 放行、非列表工具放行、rtk 缺失/非零退出/超时/无变化/调用取消的全部降级路径、
+value 替换决策透传，以及纯函数的单元用例。</p>
+<h2>设计取舍</h2>
+<ul>
+<li><strong>只改模型看到的投影（content），绝不动工具的 canonical value</strong>——程序的完整
+结果（如后台 job 的原始输出）不受影响，会话日志里仍可通过 spill 等机制追溯；</li>
+<li><strong>失败必须静默降级</strong>：RTK 是外部依赖，任何故障都不允许把一条本应成功的命令
+变成报错；每个不同的失败原因只 warn 一次；</li>
+<li><strong>进程组击杀</strong>：rtk 若又拉起子进程，超时/取消时必须 <code>process.kill(-pid)</code>
+整组击杀，否则孙进程会握住管道让 <code>close</code> 事件迟迟不触发（测试曾因此从 61s 降到 0.6s）；</li>
+<li>标记拆分是保守的：只有<strong>紧贴末尾的连续标记行</strong>才算状态块，正文里恰好形似
+<code>[exit code: 1]</code> 的普通输出不会被误拆。</li>
+</ul>

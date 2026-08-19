@@ -1,0 +1,231 @@
+<h1>dsh-llm-qodersdk</h1>
+<blockquote>
+<p><strong>中文</strong> | <a href="https://github.com/JiamingZang/dsh-llm-qodersdk/blob/HEAD/README.en.md">English</a></p>
+</blockquote>
+<p>将 DeepSeek Harness 的 LLM 接缝（<code>ctx.llm</code>）路由到本机 <strong>Qoder CLI</strong> 的适配器插件（<code>@jiamingzang/dsh-llm-qoder</code>），基于 <a href="https://www.npmjs.com/package/@qoder-ai/qoder-agent-sdk"><code>@qoder-ai/qoder-agent-sdk</code></a>。</p>
+<p>它注册 <code>qoder</code> / <code>qoder-byok</code> 两个 provider 路由，让 harness 的模型请求复用本机 <code>qodercli</code> 的登录态——<strong>无需任何凭据或设置项</strong>。模型与账号自定义模型都从 qodercli 实时拉取。</p>
+<h2>特性</h2>
+<ul>
+<li><strong>无配置接入</strong>：完全复用本机 <code>qodercli</code> 登录态，不需要 API key 或 settings 段。</li>
+<li><strong>双路由</strong>：<code>qoder</code> 广告账号内置模型；<code>qoder-byok</code> 只广告账号自定义模型（各自独立路由）。</li>
+<li><strong>长驻会话</strong>：每个宿主 session id 对应一个 warm 内层 <code>query()</code> 子进程，对话延续、工具轮次都发生在会话内部；<code>maxSessions</code> 上限内按插入序 LRU 淘汰。</li>
+<li><strong>工具桥接</strong>：宿主工具通过进程内 MCP server（<code>dsh-host</code>）暴露给内层模型；qodercli 一次执行一个调用、宿主一次回传整轮结果，二者通过 callId 配对（120s 内未回传则超时取消）。</li>
+<li><strong>模型目录</strong>：实时从 CLI 拉取可用模型（含账号自定义模型），TTL 缓存 + 并发共享 + 超时保护，失败回退静态目录；另提供 <code>deepseek-v4-flash</code> → <code>dfmodel</code>、<code>deepseek-v4-pro</code> → <code>dmodel</code> 别名。</li>
+<li><strong>思考强度与上下文窗口</strong>：<code>resolveModel</code> 上报 CLI 的 reasoning efforts、默认档位与 <code>availableContextWindows</code> / <code>defaultContextWindow</code>，模型选择器可直接切换；所选值随每次请求下发。</li>
+<li><strong>旁路请求</strong>：标题生成、compaction 等 side-channel 请求走冷启动一次性调用，不占用 warm 会话。</li>
+<li><strong>溢出可恢复</strong>：内层模型因上下文超限失败时（如 <code>maximum context length ... you requested N tokens</code>），按 dsh-llm 的 <code>isContextWindowExceededError</code> 分类为 <code>CONTEXT_WINDOW_EXCEEDED</code> 上报，harness 的溢出自动恢复（配合 <code>compaction-basic</code>）可以接管而不是让轮次直接报废。</li>
+</ul>
+<h2>适配原理</h2>
+<p>这一节说明本插件把 harness 的 LLM 接缝映射到 qodercli 时，<strong>每一层是怎么适配的、为什么这么设计</strong>。</p>
+<h3>1. LLM 接缝适配（<code>ctx.llm</code> → qodercli）</h3>
+<p>harness 通过 <code>ctx.llm.registerAdapter(['qoder', 'qoder-byok'], adapter)</code> 注册 <code>QoderAdapter</code>，实现 harness 的 <code>LlmAdapter</code> 契约：</p>
+<table>
+<thead>
+<tr>
+<th>harness 接缝</th>
+<th>本插件实现</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>providerInfo(provider)</code></td>
+<td>返回 <code>qoder</code>（Qoder CLI）/ <code>qoder-byok</code>（Qoder 自定义）的展示名</td>
+</tr>
+<tr>
+<td><code>listModels(provider)</code></td>
+<td>实时拉取 qodercli 模型目录，按 provider 过滤（<code>qoder</code> 出内置、<code>qoder-byok</code> 出账号自定义 <code>source === 'user'</code>）</td>
+</tr>
+<tr>
+<td><code>resolveModel(provider, model)</code></td>
+<td>从 live catalog / 静态表解析模型元数据（上下文窗口、思考档位、输出上限）</td>
+</tr>
+<tr>
+<td><code>stream(options)</code></td>
+<td>把一次 <code>GenerateOptions</code> 转成 qodercli 的 <code>query()</code> 调用并流式回传 <code>StreamChunk</code></td>
+</tr>
+</tbody></table>
+<p>适配的核心是 <strong><code>stream()</code> 的分流</strong>：</p>
+<ul>
+<li><strong>warm 会话路径</strong>（有 <code>sessionId</code> 且无 <code>purpose</code>）：复用或新建一个内层 <code>query()</code> 子进程，增量喂入新消息，工具通过 MCP 往返。</li>
+<li><strong>side-channel 路径</strong>（无 <code>sessionId</code>，或带 <code>purpose</code>，如标题生成、compaction 摘要）：走 <code>coldStream()</code> 一次性调用，不占 warm 会话。<strong>该路径复用主会话的模型</strong>（<code>resolveQoderModelId(options.model)</code>），保证 dsh 记录的调用目标与实际执行的模型一致。</li>
+</ul>
+<h3>2. 会话模型适配</h3>
+<ul>
+<li><strong>一宿主会话对应一 warm qodercli 会话</strong>：<code>QoderSessionManager</code> 以宿主 <code>sessionId</code> 为键维护 <code>query()</code> 子进程，超出 <code>maxSessions</code> 按插入序 LRU 淘汰。</li>
+<li><strong>增量 feed</strong>：宿主每次请求携带完整消息列表，插件通过 <code>planContinuation</code> 对比上一次，只把新用户轮次与改写消息渲染成纯文本 feed；工具结果不进入文本 feed（走 MCP）。</li>
+<li><strong>重建检测</strong>：当宿主 surface 被改写（例如 compaction 折叠了历史）导致消息数变少或结构变化，<code>planContinuation</code> 返回 <code>rebuild: true</code>，插件 dispose 旧 warm 会话并按新 surface 冷启动。<strong>这保证了 dsh 侧的压缩与 qodercli 内部缓存不会产生双份状态</strong>。</li>
+<li><strong>模型切换</strong>：<code>setModel</code> 把 <code>reasoningEffort</code> / <code>contextWindow</code> 作为 model-policy 参数传给内层会话。</li>
+</ul>
+<h3>3. 工具桥接适配（MCP）</h3>
+<p>宿主工具不直接发给 qodercli，而是通过<strong>进程内 MCP server</strong>（<code>dsh-host</code>）：</p>
+<ol>
+<li><code>ensureTools()</code> 把宿主 <code>ToolSchema</code> 转成 zod shape 注册到 MCP server；</li>
+<li>qodercli 的 <code>canUseTool</code> 允许 <code>mcp__dsh-host__*</code> 前缀的工具，并记录 tool-use id；</li>
+<li>MCP handler <strong>park</strong> 在一个 promise 上，等待宿主在下一轮请求里 <code>deliverToolResults()</code> 回传结果；</li>
+<li>结果按 <code>callId ↔ toolUseId</code> 配对投递；超时（<code>TOOL_RESULT_TIMEOUT_MS</code>）则返回错误让 qodercli 恢复。</li>
+</ol>
+<p>这样宿主工具调用是<strong>宿主侧的普通工具轮次</strong>，qodercli 只看到 MCP 工具被"执行了一次"。</p>
+<h3>4. 模型目录适配</h3>
+<ul>
+<li><strong>实时目录</strong>：<code>QoderModelCatalog</code> 向 qodercli 发 <code>get_models</code> 控制请求，TTL 缓存（默认 300s）、并发共享、超时回退静态表。</li>
+<li><strong>静态回退</strong>：<code>QODER_MODELS</code> 内置捕获的模型表（含 <code>deepseek-v4-flash</code> / <code>deepseek-v4-pro</code> 别名），CLI 不可达时使用。</li>
+<li><strong>provider 分组</strong>：<code>listModels</code> 按 <code>source</code> 字段分流——内置模型进 <code>qoder</code>，账号自定义模型（<code>source === 'user'</code>）进 <code>qoder-byok</code>，无需任何手动配置，全部从 qodercli 实时拉取。</li>
+</ul>
+<h3>5. 上下文窗口与压缩阈值的适配</h3>
+<p>qodercli 的 live catalog 对每个模型同时上报<strong>上限</strong>与<strong>实际窗口</strong>：</p>
+<pre><code>maxInputTokens: 1000000          ← 模型上限（1M）
+availableContextWindows: [200000, 400000, 1000000]
+defaultContextWindow: 200000     ← 请求实际使用的窗口
+</code></pre>
+<p>harness 的 compaction 引擎用 <code>resolveModel().context.contextWindow</code> 计算自动压缩阈值（<code>thresholdTokens = 0.8 × contextWindow</code>，compaction-basic 默认 <code>thresholdRatio: 0.8</code>），UI 上下文环也以它为分母。因此 <code>contextWindow</code> 必须反映<strong>请求实际使用的窗口</strong>，而不是模型上限：</p>
+<pre><code>contextWindow: live.defaultContextWindow ?? live.maxInputTokens ?? DEFAULT_CONTEXT_WINDOW
+</code></pre>
+<ul>
+<li>取 <code>defaultContextWindow</code>（实际窗口，如 200K）→ 阈值 = 160K，与 provider 真实能力对齐；</li>
+<li><code>maxInputTokens</code>（上限，如 1M）只保留在 <code>availableContextWindows</code> 里供选择器切换；</li>
+<li>若误用上限，阈值会被放大（如 800K），压缩永远不会在 provider 拒绝前触发。</li>
+</ul>
+<h3>6. 上下文占用计量的适配</h3>
+<p>qodercli 的流事件 <code>usage</code> 帧（<code>input_tokens</code> / <code>output_tokens</code>）默认全零（无 metering 数据），因此无法直接上报真实用量。harness 的 <code>contextPressure</code> 投影以最近一次请求的 <code>inputTokens</code> 为分子（<code>pressureTokens</code>）驱动 UI 环与压缩判断。</p>
+<p>适配方式：<strong>在插件侧按 harness 前端 token-meter 相同的口径估算每次请求的输入</strong>。</p>
+<p><code>adapter.stream()</code> 每次请求调用 <code>session.recordRequestInput(system, messages)</code>，用 <code>renderInitialFeed(system, messages)</code> 渲染完整会话（系统提示 + 全部消息），按 <code>rendered.length / 4</code> 估算 token —— 与 harness <code>estimate.ts</code> 的 <code>CHARS_PER_TOKEN = 4</code> 同口径。<code>usage()</code> 优先返回该估算值：</p>
+<pre><code>if (this.estimatedInputTokens !== undefined &amp;&amp; this.estimatedInputTokens &gt; 0) {
+  return { inputTokens: this.estimatedInputTokens, ... }
+}
+</code></pre>
+<p>这样 UI 上下文环、自动压缩阈值与插件上报值<strong>使用同一套估算口径</strong>，占用显示与压缩行为一致，不会出现"UI 显示 2% 而实际已接近上限"的割裂。</p>
+<h3>7. 错误分类适配</h3>
+<p>qodercli 把上下文超限、配额不足等拒绝统一报成 generic per-turn error（<code>error_during_execution</code>）。harness 的 overflow recovery 依赖错误码 <code>CONTEXT_WINDOW_EXCEEDED</code> 才会触发（prune + compact + retry）。因此插件用 dsh-llm 的共享分类器把 qodercli 的报错文本映射成 harness 可路由的错误码：</p>
+<pre><code>function classifyTurnError(detail: string): string {
+  if (isContextWindowExceededError(detail)) return CONTEXT_WINDOW_EXCEEDED_CODE
+  if (isQuotaExceededError(detail)) return QUOTA_EXCEEDED_CODE
+  return 'BACKEND_TURN_ERROR'
+}
+</code></pre>
+<p>这样 provider 的上下文超限能触发 harness 的自动恢复，配额不足能正确展示，而不是当作普通后端错误死掉。</p>
+<h3>8. 压缩职责分工（dsh vs qoder）</h3>
+<ul>
+<li><strong>压缩由 dsh（harness compaction-basic）执行</strong>：决定压缩范围、保留比例（默认 <code>retainRatio: 0.16</code> 保留最近 16%）、调用 LLM 生成 checkpoint、改写会话 surface。</li>
+<li><strong>qoder 插件只充当 LLM 后端</strong>：把 dsh 的消息喂给 qodercli、取回回复。压缩摘要请求通过 side-channel 走 <code>coldStream()</code>，并复用主会话模型（见第 1 节），保证 dsh 记录的摘要目标与实际执行一致。</li>
+<li><strong>无冲突保证</strong>：dsh 压缩改写 surface 后，插件 <code>planContinuation</code> 检测到消息结构变化（<code>rebuild: true</code>），主动重建 warm 会话。qodercli 内部缓存随 dsh 压缩被作废，<strong>不存在"两边各压一遍"</strong>。</li>
+<li>摘要生成默认走主会话路由；需要绕开特定 provider 配额时，可在 <code>cordis.patch.yml</code> 给 compaction-basic 配置 <code>summarizationProvider</code> / <code>summarizationModel</code> 指向其它有额度的模型。</li>
+</ul>
+<h2>安装</h2>
+<p>前置条件：本机已安装并登录 qodercli（<code>qodercli --version</code> 可运行）。插件完全复用 qodercli 登录态，不需要 API key 或 settings 段。</p>
+<h3>从发布包引入</h3>
+<ol>
+<li><p>获取插件包：从本仓库 Releases 下载最新的 <code>jiamingzang-dsh-llm-qoder-&lt;version&gt;.tgz</code>（或在仓库根目录 <code>pnpm pack</code> 自行生成）；</p>
+</li>
+<li><p>添加到目标 profile：</p>
+<pre><code>dsh plugin --profile &lt;profile&gt; add jiamingzang-dsh-llm-qoder-&lt;version&gt;.tgz
+</code></pre>
+</li>
+<li><p><strong>首次安装需批准构建脚本</strong>：<code>@qoder-ai/qoder-agent-sdk</code> 带 postinstall（下载 worker runtime），pnpm 11+ 默认拦截并报 <code>ERR_PNPM_IGNORED_BUILDS</code>。dsh 会把待批准 key 写入 profile 的 <code>pnpm-workspace.yaml</code> 占位（<code>allowBuilds</code> 下 <code>'@qoder-ai/qoder-agent-sdk': set this to true or false</code>），把值改为 <code>true</code> 后重跑上面的 add 命令即完成安装——这是 dsh 对任何带 postinstall 依赖的标准 fail-loud 流程；</p>
+</li>
+<li><p>验证：<code>dsh --profile &lt;profile&gt; --dump-config | grep llm-qoder</code> 应出现插件条目；重启服务后模型选择器出现 <code>qoder</code> / <code>qoder-byok</code>。</p>
+</li>
+</ol>
+<h3>手动挂载（可选）</h3>
+<p>不经过 plugin 命令时，可在 cordis.yml 或 patch 层直接声明（插件 package.json 也声明了 <code>dsh.bundle</code>，plugin add 后会自动进 profile 的 bundles）：</p>
+<pre><code>- id: llm-qoder
+  name: '@jiamingzang/dsh-llm-qoder'
+</code></pre>
+<h3>使用与排障</h3>
+<ul>
+<li>在对话框模型选择器或 Models 设置页选择 <code>qoder</code>（账号内置）或 <code>qoder-byok</code>（账号自定义）下的模型；上下文窗口与思考档位可在模型面板切换。</li>
+<li><strong>看不到自定义模型或窗口调节消失</strong>：多为 qodercli 自动升级窗口期或账号配额用尽（服务端把模型标 <code>isEnabled: false</code>）导致 live 目录拉取失败，插件回退静态目录。拉取失败不缓存，CLI 恢复后自动回来，无需重启服务。</li>
+</ul>
+<h2>配置</h2>
+<table>
+<thead>
+<tr>
+<th>字段</th>
+<th>类型</th>
+<th>默认</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>maxSessions</code></td>
+<td>number</td>
+<td><code>8</code></td>
+<td>同时保持 warm 的内层 qodercli 会话上限（超出按插入序 LRU 淘汰）</td>
+</tr>
+<tr>
+<td><code>modelCacheTtlSeconds</code></td>
+<td>number</td>
+<td><code>300</code></td>
+<td>CLI 模型目录的缓存保鲜秒数</td>
+</tr>
+</tbody></table>
+<h2>上下文管理与压缩</h2>
+<p>warm 内层会话会累积整段宿主历史：首轮喂入全量历史（<code>renderInitialFeed</code>），之后每轮只喂增量（新用户消息、原位刷新）。内层上下文因此随对话增长，模型有硬上限（如 1048576 tokens）。</p>
+<ul>
+<li><p><strong>溢出自动恢复</strong>：内层模型报上下文超限时，插件上报 <code>CONTEXT_WINDOW_EXCEEDED</code>。harness 的溢出恢复（<code>dsh-compaction-basic</code> 的 <code>agent/request-error</code> 处理器）会压缩宿主历史并重试；压缩后宿主历史变短，下个请求插件检测到历史回退，自动重建内层会话、冷喂压缩后的历史。</p>
+</li>
+<li><p><strong>前提</strong>：部署里必须加载 <code>dsh-compaction-basic</code>（<code>auto</code> 默认 <code>true</code>）和 <code>dsh-token-meter</code>。没装压缩插件时，超限轮次仍会失败——只能新开会话或手动压缩。</p>
+</li>
+<li><p><strong>建议把压力阈值调低</strong>：默认 <code>thresholdRatio</code> 0.8 × 模型 contextWindow（1048576 → 约 838k）可能偏晚，尤其宿主侧 token 估算与内层真实用量有偏差时。建议调低到 0.6，让压力压缩远早于溢出触发：</p>
+<pre><code>- id: compaction-basic
+  config:
+    auto: true
+    thresholdRatio: 0.6
+    retainRatio: 0.16
+</code></pre>
+<p>也可用 <code>modelPolicies</code> 给 <code>qoder</code> 路由单独配置。</p>
+</li>
+<li><p><strong>手动压缩</strong>：加载 <code>dsh-command-compact</code> 后，对话中输入 <code>/compact</code> 立即压缩一次。</p>
+</li>
+<li><p><strong>已超限的会话</strong>：历史已经超过模型上限时，"继续"只会带着更长历史重试失败；先 <code>/compact</code> 压缩（或调低阈值后等压力压缩触发），否则新开会话。</p>
+</li>
+</ul>
+<h2>源码结构</h2>
+<table>
+<thead>
+<tr>
+<th>文件</th>
+<th>职责</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>src/index.ts</code></td>
+<td>插件入口：<code>ctx.llm.registerAdapter(['qoder', 'qoder-byok'], adapter)</code></td>
+</tr>
+<tr>
+<td><code>src/adapter.ts</code></td>
+<td><code>QoderAdapter</code>：模型列表/解析/流式生成，warm 会话管理、续轮规划、side-channel 模型传递、请求输入估算</td>
+</tr>
+<tr>
+<td><code>src/session.ts</code></td>
+<td><code>QoderSession</code>：内层 <code>query()</code> 子进程、MCP 工具桥、SDK 流事件 → harness <code>StreamChunk</code>、usage 上报（真实输入估算 + 错误分类）</td>
+</tr>
+<tr>
+<td><code>src/models.ts</code></td>
+<td>实时模型目录拉取（TTL 缓存、并发共享、超时、静态回退）</td>
+</tr>
+<tr>
+<td><code>src/catalog.ts</code></td>
+<td>静态模型表与 <code>deepseek-v4-*</code> 别名</td>
+</tr>
+<tr>
+<td><code>src/render.ts</code></td>
+<td>宿主消息 → 内层纯文本 feed；身份覆盖</td>
+</tr>
+<tr>
+<td><code>src/jsonschema.ts</code></td>
+<td>dsh <code>ToolSchema.parameters</code> → zod shape（MCP 工具注册用）</td>
+</tr>
+</tbody></table>
+<h2>开发与构建</h2>
+<p>本仓库只存源码（<code>src/</code>）与测试（<code>tests/</code>）；构建产物 <code>lib/</code>（<code>lib/index.js</code> + <code>lib/types/*.d.ts</code>）被 <code>.gitignore</code> 忽略，由构建脚本按需生成。</p>
+<pre><code>pnpm install
+pnpm test        # vitest 单元测试
+pnpm run build   # tsc 产出 lib/types/*.d.ts，tsdown 产出 lib/index.js
+pnpm pack        # 生成 jiamingzang-dsh-llm-qoder-&lt;version&gt;.tgz
+pnpm publish     # prepublishOnly 自动先构建
+</code></pre>
+<p>构建配置已就位（<code>tsconfig.json</code> + <code>tsdown.config.ts</code>），peer 依赖 <code>@deepseek-ai/dsh-llm</code> 和 <code>@deepseek-ai/cordis</code> 保持 external。</p>
+<blockquote>
+<p><strong>版本说明</strong>：peer 依赖 <code>@deepseek-ai/dsh-llm@^0.1.0-rc.5</code> 已可从公共 npm 解析（当前最新为 <code>0.1.0-rc.6</code>），本仓库可直接 <code>pnpm install &amp;&amp; pnpm run build</code>。若需与 DeepSeek Harness 主仓库内的本地版本（<code>0.1.0-rc.5</code>）完全对齐，可在主仓库 <code>plugins/llm-qoder/</code> 目录内构建（由仓库根 <code>tsc</code> + <code>tsdown</code> 产出 <code>lib/</code>）。</p>
+</blockquote>
+<h2>License</h2>
+<p><a href="https://github.com/JiamingZang/dsh-llm-qodersdk/blob/HEAD/LICENSE">MIT</a> © 2026 dsh-llm-qodersdk contributors</p>

@@ -1,0 +1,89 @@
+<h1>🚀 dsh-subagent-codex</h1>
+<blockquote>
+<p>让 DeepSeek Harness 里的 agent，把活儿丢给真正的 OpenAI Codex 去干。</p>
+</blockquote>
+<p><a href="https://github.com/mjylfz/dsh-subagent-codex/blob/HEAD/README_EN.md">English</a> | 中文</p>
+<hr>
+<h2>一句话说清楚</h2>
+<p>这是一个 DSH 插件。装上它，你的 DSH 会话里会多一个 <code>subagent_codex</code> 工具——你（或你的主 agent）把任务扔给它，它就在你本机的 <strong>Codex CLI</strong> 里独立跑一遍，再把结果拿回来。任务在 Codex 自己的环境里执行，用的是 Codex 的模型和工具链，跟 DSH 主对话完全隔离。</p>
+<p><strong>简单说：DSH 负责统筹，Codex 负责干活。</strong></p>
+<h2>什么时候用它？</h2>
+<p>举几个真实场景（都是有点分量的活儿，Codex 很擅长）：</p>
+<ul>
+<li><strong>技术选型调研</strong>：<code>让 codex 调研一下：数据分析这块我们用 ClickHouse 还是继续用 Postgres？对比查询性能、运维成本、和现有技术栈的契合度，最后给出推荐和理由</code> —— Codex 自己上网查资料、横向对比、结合你的场景给结论，回来直接能拿去跟团队讨论。</li>
+<li><strong>跨模块改造</strong>：<code>让 codex 把用户认证从 JWT 迁移到 OAuth2：改鉴权中间件、补数据库迁移脚本、写单元测试和集成测试，全部跑通后整理一份提交说明</code> —— Codex 在你当前工作目录里动手改代码、跑测试、交付整套改动，你只负责 review。</li>
+<li><strong>独立安全审查</strong>：<code>开个 codex 子 agent 对最近这次提交做安全审查：重点找 SQL 注入、鉴权绕过、敏感信息泄露，给出修复建议，按严重程度排序输出报告</code> —— 一个和你视角完全不同的"外部专家"，专门负责挑刺，避免自说自话。</li>
+</ul>
+<p><strong>什么时候不适合用它</strong>：任务需要在 DSH 内部完成时（比如要调用 DSH 的记忆、会话历史、其他 DSH 工具）——那种活儿留给普通 <code>subagent</code>。</p>
+<h2>快速开始</h2>
+<h3>1. 前提</h3>
+<ul>
+<li>已安装 <a href="https://github.com/openai/codex">Codex CLI</a> 并登录（<code>~/.codex/auth.json</code> 存在）。</li>
+<li>已安装 DeepSeek Harness。</li>
+</ul>
+<h3>2. 安装</h3>
+<pre><code># 通过 dsh 插件命令安装（dsh.bundle 声明会自动把插件加进 bundle 栈）
+dsh plugin --profile web add dsh-subagent-codex
+# 或本地 tgz 安装
+dsh plugin --profile web add file:/path/to/dsh-subagent-codex-0.1.1.tgz
+</code></pre>
+<h3>3. 重启，开聊</h3>
+<p>重启 DSH 后新开一个会话，直接说：</p>
+<pre><code>让 codex 调研一下大语言模型推理加速的最新论文进展，整理成一篇带对比的综述
+让 codex 子 agent 做 XX
+</code></pre>
+<p>工具名是 <code>subagent_codex</code>，每次调用 = 启动一次独立的 Codex CLI 任务。</p>
+<h2>配置</h2>
+<p>插件在配置树里注册两行：</p>
+<table>
+<thead>
+<tr>
+<th>id</th>
+<th>作用</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>subagent-codex</code></td>
+<td>codex provider 插件行</td>
+</tr>
+<tr>
+<td><code>tool-subagent-codex-enabled</code></td>
+<td><code>subagent_codex</code> 工具行（one-shot）</td>
+</tr>
+</tbody></table>
+<p>provider 行支持的配置项：</p>
+<pre><code>- id: subagent-codex
+  name: 'dsh-subagent-codex'
+  config:
+    command: codex            # codex CLI 可执行文件（PATH 名或绝对路径）
+    cwd: /path/to/workdir     # 可选，子任务工作目录（缺省继承父会话 workspace）
+    model: o3                 # 可选，指定模型（codex exec -m）
+    sandbox: workspace-write  # 可选：read-only | workspace-write | danger-full-access
+    timeoutMs: 600000         # 单次任务超时（毫秒）
+    maxOutputChars: 40000     # 返回给委派方的输出上限
+</code></pre>
+<h2>工作原理（技术细节）</h2>
+<ul>
+<li>插件实现 DSH 的 <strong>SubagentProvider</strong> 接口（<code>@deepseek-ai/dsh-subagent</code> 的 out-of-process 契约），注册名为 <code>codex</code> 的 provider。</li>
+<li>因为是外部进程，provider <strong>不声明任何 start 能力</strong>（<code>NO_START_CAPABILITIES</code>）：外部 CLI 无法强制执行 <code>outputSchema</code> / <code>maxDepth</code> / <code>toolFilter</code> / <code>persona</code>。</li>
+<li>每次委派 <code>spawn</code> 一次 <code>codex exec --json --skip-git-repo-check &lt;prompt&gt;</code>，解析 JSONL 事件流，取最后一条 <code>agent_message</code> 文本作为最终输出。</li>
+<li>支持取消（AbortSignal → SIGKILL）、超时、输出截断。结果永远 resolve（正常 / 中止 / 失败都解析为终态），不会把异常抛给主对话。</li>
+</ul>
+<h3>可追溯性：每次运行都有完整记录</h3>
+<p>插件<strong>不带 <code>--ephemeral</code></strong>，所以每次调用 Codex 都会把完整会话写到磁盘：</p>
+<pre><code>~/.codex/sessions/&lt;YYYY&gt;/&lt;MM&gt;/&lt;DD&gt;/rollout-&lt;timestamp&gt;-&lt;session-id&gt;.jsonl
+</code></pre>
+<p>这个文件里是这次任务的完整对话（输入、Codex 的中间过程、最终输出）。你可以：</p>
+<ul>
+<li>用 <code>codex resume</code> 找回这个会话继续聊；</li>
+<li>需要长期归档时执行 <code>codex archive &lt;session-id&gt;</code>，会移入 <code>~/.codex/archived_sessions/</code>。</li>
+</ul>
+<h2>常见问题</h2>
+<p><strong>Q: 为什么 DSH 侧边栏看不到 codex 子 agent 的运行记录？</strong>
+A: 设计如此。DSH 的侧边栏子 agent 树只显示 DSH 内部子 agent（有 DSH 会话）。Codex 是外部进程 provider，运行时不创建 DSH 会话，所以 GUI 里不显示。想看运行过程，去上面说的 <code>~/.codex/sessions/</code> 目录。</p>
+<p><strong>Q: 需要装 Codex 的桌面 app 吗？</strong>
+A: 不需要。插件直接调用 <code>codex</code> CLI。桌面 app 装不装都不影响。</p>
+<p><strong>Q: 会消耗我的 OpenAI 额度吗？</strong>
+A: 会。每次调用都用你 <code>~/.codex</code> 登录的账号跑 Codex，消耗的是 Codex 的 token 额度。</p>
+<h2>License</h2>
+<p>MIT</p>

@@ -1,0 +1,213 @@
+<h1>dsh-skill-indexer</h1>
+<blockquote>
+<p><strong>让 agent 用一句话找到对的技能。</strong> 把本机所有 <code>SKILL.md</code> 统一建成两级（大类 → 技能）召回索引，让任意 agent 用一句话意图就能召回到正确技能。纯本地、只读源目录、宿主无关（WorkBuddy / DSH 双宿主技能树都能扫）。</p>
+</blockquote>
+<p>A DSH host bundle plugin that builds a two-level (category → skill) recall index over every local <code>SKILL.md</code> and routes a natural-language intent to the best-matching skills — read-only against the source trees, zero third-party runtime deps.</p>
+<blockquote>
+<p>本文档是 <strong>skill-indexer PRD（v1.1，2026-08-19）</strong> 的 TypeScript 重写版：PRD 原为 Python 3 零依赖 CLI，按用户要求全量重写为 DSH Cordis 插件。源 PRD 为本地规格文档，见文末「参考」。</p>
+</blockquote>
+<h2>为什么需要它</h2>
+<p>技能越装越多，「我记得有这样一个 skill」就越来越难。翻目录、猜名字、逐个打开
+SKILL.md —— 都是纯浪费。这个插件把技能库变成可检索的索引：agent 输入一句意图，
+命中大类 → 类内排序 → 低置信回退，一步到位；全程离线、只读、确定性。</p>
+<hr>
+<h2>是什么</h2>
+<ul>
+<li><strong>离线</strong>：启动时（或 <code>/skill-index scan</code>）扫描 <code>~/.workbuddy/skills</code> 与 <code>$DSH_HOME/skills</code>，解析 frontmatter，抽取触发词/关键词，归纳大类，产出 <code>skills-index.json</code>（哈希增量，未变技能保留 usage 统计）。</li>
+<li><strong>在线</strong>：<code>skill_index</code> 工具 / <code>/skill-index query</code> 对一句话意图做<strong>两级路由</strong>——L1 大类打分（关键词覆盖 × IDF）命中大类，L2 类内技能排序；低置信回退全库 flat top-k；未命中明确告知。</li>
+<li><strong>三态</strong>：<code>hit</code>（命中）/ <code>low</code>（低置信回退）/ <code>miss</code>（未命中）。</li>
+</ul>
+<h2>安装（启用）</h2>
+<blockquote>
+<p>本仓库只发布、不随发布启用。要在某台机器启用：</p>
+</blockquote>
+<pre><code>dsh plugin --profile web add github:NattoCB/dsh-skill-indexer
+</code></pre>
+<p>或手工把 <code>cordis.patch.yml</code> 的 <code>insert</code> 行合并进目标 profile 的 patch，并 <code>pnpm install</code>。</p>
+<h2>快速上手</h2>
+<p>安装后，host 启动即自动建索引。手动控制：</p>
+<pre><code>/skill-index scan                     # 重建索引（无变更时提示 "no changes"）
+/skill-index query 把这周的ETF拉出来画个图   # 意图召回
+/skill-index categories               # 打印大类表
+</code></pre>
+<p>agent 侧可直接调用模型工具：</p>
+<pre><code>skill_index(query="把这个PDF转成markdown")
+</code></pre>
+<h2>两级路由原理</h2>
+<ul>
+<li><strong>匹配原语</strong>：子串匹配（<code>w in q</code>，英文小写化去标点、中文直接子串）——<strong>不是</strong> token 集合交集。短查询「把这周的ETF拉出来画个图」靠 <code>etf</code> 一词即命中。</li>
+<li><strong>L1 大类打分</strong>：<code>score(c,q) = Σ idf(w)·pos_weight(w)</code>，只用<strong>大类固定关键词表</strong>（不并入类下技能关键词，避免大类词表膨胀通吃）。<code>idf=ln((N+1)/(df+1))+1</code>，<code>pos_weight=1/(1+start/10)</code>。</li>
+<li><strong>L2 技能打分</strong>：技能词表 = keywords ∪ triggers ∪ name；trigger 命中 ×1.5。</li>
+<li><strong>归一化</strong>：<code>score / max(1, K)</code>，K = 查询去重英文词数 + 中文连续串片段数。</li>
+<li><strong>三态判定</strong>：<code>max_c ≥ θ1</code> → hit；<code>θ2 ≤ max_c &lt; θ1</code> 或 Top-3 内 ≥2 分相差 &lt;0.1 → low；<code>max_c &lt; θ2</code> → miss。默认 <code>θ1=0.35</code>、<code>θ2=0.12</code>（PRD 标注为初始猜测值，应在目标语料上网格标定）。</li>
+<li><strong>确定性</strong>：全流程无随机数、不直接遍历 Set 输出、同输入字节级一致（除 <code>generated_at</code>）。</li>
+</ul>
+<h2>配置项（<code>cordis.patch.yml</code>）</h2>
+<pre><code>- insert:
+    - id: skill-indexer
+      name: 'dsh-skill-indexer'
+      inject: [tools, commands]
+      config:
+        roots: []          # 缺省 = ~/.workbuddy/skills + $DSH_HOME/skills；可传路径数组或 [{path,type}]
+        theta1: 0.35       # 命中阈值
+        theta2: 0.12       # 未命中阈值
+        dataDir: ''        # 索引/usage.log 输出目录，缺省 $DSH_HOME/skill-indexer
+        categoriesYaml: '' # 可选 categories.yaml（人工大类覆盖，优先级最高）
+</code></pre>
+<p><code>categories.yaml</code> 格式：</p>
+<pre><code>overrides:
+  git-finish-work: ["git-workflow", "delivery"]
+  pdf-to-markdown: docs
+</code></pre>
+<h2>目录结构</h2>
+<pre><code>src/
+  index.js     # 插件入口：apply + skill_index 工具 + /skill-index 命令
+  scanner.js   # 目录扫描 + 手写 YAML 子集 frontmatter 解析
+  extract.js   # 触发词/关键词抽取
+  classify.js  # 大类归纳（内置词表 + categories.yaml 覆盖）
+  indexer.js   # 索引构建、哈希增量、JSON 读写
+  score.js     # 打分（覆盖度 × IDF）
+  router.js    # 两级路由三态判定
+  output.js    # 注入文本模板渲染
+  overrides.js # categories.yaml 解析
+test/          # node:test 单测 + fixtures
+scripts/       # demo_query.mjs 一键演示
+</code></pre>
+<h2>数据模型（<code>skills-index.json</code>）</h2>
+<p>索引是 UTF-8、无 ASCII 转义、2 空格缩进的 JSON（<code>generated_at</code> 为 ISO 时间戳）：</p>
+<pre><code>{
+  "version": 1,
+  "generated_at": "2026-08-19T00:00:00.000Z",
+  "roots": [{ "path": "/…/skills", "type": "workbuddy", "count": 77 }],
+  "categories": [
+    { "id": "finance", "name": "金融数据", "desc": "…", "keywords": ["etf", "…"], "skills": ["etf-filter"] }
+  ],
+  "skills": [
+    {
+      "id": "etf-filter",
+      "root": "/…/skills",
+      "path": "/…/skills/etf-filter/SKILL.md",
+      "name": "etf-filter",
+      "description": "…",
+      "one_liner": "…",
+      "triggers": ["…"],
+      "keywords": ["…"],
+      "categories": ["finance"],
+      "deps": [],
+      "hash": "sha256…",
+      "usage_count": 0,
+      "last_used": null
+    }
+  ],
+  "warnings": []
+}
+</code></pre>
+<ul>
+<li><code>id</code> 规则：唯一名 → <code>id = name</code>；跨 root 重名 → <code>id = name@type</code>（如 <code>pdf-to-markdown@dsh</code>）。<code>categories[].skills</code> 与 <code>skills[].id</code> 引用闭合。</li>
+<li>增量：<code>scan</code> 按 <code>hash</code> 对比，未变技能保留 <code>usage_count</code>/<code>last_used</code>；无变更时命令提示 "(no changes)"。</li>
+</ul>
+<h2>验收结果</h2>
+<table>
+<thead>
+<tr>
+<th>项</th>
+<th>结果</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>单元测试 <code>npm test</code></td>
+<td>28/28 通过</td>
+</tr>
+<tr>
+<td>A1 扫描</td>
+<td>默认 roots 扫描成功，索引 skill 数与目录实际一致；warnings 为 0 或逐条可解释</td>
+</tr>
+<tr>
+<td>A2 warnings</td>
+<td>0（block scalar 全量解析，见「与 PRD 的差异」）</td>
+</tr>
+<tr>
+<td>A3 增量</td>
+<td>连续 scan 无变更提示 "(no changes)"；索引除 <code>generated_at</code> 外字节一致</td>
+</tr>
+<tr>
+<td>A4 哈希增量</td>
+<td>单测覆盖：未变技能保留 <code>usage_count</code>/<code>last_used</code></td>
+</tr>
+<tr>
+<td>A5 通用 ≤15%</td>
+<td>取决于语料：内置词表是 PRD 的 MVP 覆盖，未覆盖领域可用 <code>categories.yaml</code> / <code>CATEGORIES</code> 常量增补</td>
+</tr>
+<tr>
+<td>B1/B2 召回</td>
+<td>三态判定（hit/low/miss）与注入文本验证通过；PRD 10 条目标技能需在 PRD 原始语料上标定（目标技能随语料而定）</td>
+</tr>
+<tr>
+<td>B3 未命中</td>
+<td>「帮我订个外卖」→ miss ✓</td>
+</tr>
+<tr>
+<td>B4 JSON 结构</td>
+<td><code>state</code>/<code>intent</code>/<code>categories</code>/<code>hits</code>/<code>text</code> ✓</td>
+</tr>
+<tr>
+<td>B5 注入文本</td>
+<td>模板一致（大类表 + 命中类 + 技能明细）✓</td>
+</tr>
+<tr>
+<td>C1 零依赖</td>
+<td>仅 node 内置 + <code>@deepseek-ai/dsh-tools</code>（defineTool）</td>
+</tr>
+<tr>
+<td>C4 只读</td>
+<td>不写技能源目录，产物只落 <code>dataDir</code></td>
+</tr>
+</tbody></table>
+<h2>三条硬约束</h2>
+<ol>
+<li><strong>只读源目录</strong>：不修改/移动/删除 <code>~/.workbuddy/skills</code>、<code>~/.dsh/skills</code> 下任何文件；索引与 <code>usage.log</code> 只写 <code>dataDir</code>。无 <code>--write-frontmatter</code> 类回写能力。</li>
+<li><strong>零第三方运行时依赖</strong>：核心（scan/parse/extract/classify/index/route）只用 <code>node:fs/path/crypto</code>；唯一外部包是宿主自带的 <code>@deepseek-ai/dsh-tools</code>。</li>
+<li><strong>不部署、不常驻</strong>：无常驻进程、无 HTTP 服务、无 UI、无 embedding/GraphRAG（对应 PRD 非目标）。</li>
+</ol>
+<h2>与 PRD 的差异</h2>
+<table>
+<thead>
+<tr>
+<th>PRD</th>
+<th>本实现</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>Python 3 零依赖 CLI</td>
+<td>TypeScript 重写为 DSH Cordis 插件（<code>apply(ctx)</code> + 工具/命令），逻辑与数据模型不变</td>
+</tr>
+<tr>
+<td>block scalar「取首个非空缩进行 + 告警」</td>
+<td><strong>全量解析</strong>连续缩进行（<code>|</code> 按换行、<code>&gt;</code> 折叠）。大量技能用多行 <code>description: |</code>，截断会丢描述与触发词，故改为全量且不告警</td>
+</tr>
+<tr>
+<td>大类内置词表（10 类）</td>
+<td>原样保留，<code>categories.yaml</code> 覆盖 + <code>CATEGORIES</code> 常量可扩展</td>
+</tr>
+<tr>
+<td>M3 usage 统计排序 / M4 serve / M5 embedding</td>
+<td>未实现（PRD 标注「交付即 M1+M2」）；<code>usage_count</code>/<code>last_used</code> 字段与回填已实现，排序启用留待 M3</td>
+</tr>
+</tbody></table>
+<h2>已知限制</h2>
+<ul>
+<li>中文关键词抽取按 PRD「连续中文串（按标点/英文/数字断开）」实现，长串会把短词粘住（如「当面对高杠杆」粘住「高杠杆」），短查询召回偏弱。改进方向：在 CJK 串内做 2–8 字重叠滑窗（未实现，以保持与 PRD 一致）。</li>
+<li>内置大类词表是 MVP，覆盖随语料变化；跨机部署前建议在目标语料上做 <code>θ1/θ2</code> 网格标定并增补词表。</li>
+</ul>
+<h2>开发 / 测试</h2>
+<pre><code>npm test          # node --test "test/**/*.test.js"
+npm run demo      # 扫描默认 roots 并路由几条示例意图（可传自定义查询）
+</code></pre>
+<p>fixtures 位于 <code>test/fixtures/</code>（workbuddy + dsh 两个 root，含跨 root 同名 skill 与 block scalar / 嵌套 metadata 边界）。</p>
+<h2>参考 / Reference</h2>
+<ul>
+<li><strong>skill-indexer PRD v1.1</strong>（2026-08-19）——本插件的源规格文档，含两级索引、三态回退、哈希增量与验收标准（A1–A5 / B1–B5 / C1–C4）。为本地文档，未公开发布。</li>
+<li><strong>文献调研</strong>（PRD §1.1 提及，仅作设计决策依据，非依赖）：Graph-of-Skills、SRA / Progressive Disclosure、SkillReason、SkillFlow、Hi-RAG。本实现只取其中的轻量思想（两级分层 + 三态回退），用零依赖规则落地，未照搬上述论文的方法（embedding / 训练 / 图构建均明确不做）。</li>
+</ul>
+<hr>
+<p><strong>试一下:</strong> 装好后对 agent 说 <code>skill_index(query="把这个PDF转成markdown")</code>，或直接跑 <code>/skill-index query 把这周的ETF拉出来画个图</code>。索引或召回不准?提 issue 或按「已知限制」里的方向改进。</p>

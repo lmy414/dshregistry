@@ -1,0 +1,153 @@
+<h1>@deepseek-ai/dsh-plugin-memory</h1>
+<p>English | <a href="https://github.com/NattoCB/dsh-plugin-memory/blob/HEAD/README.zh.md">中文</a></p>
+<blockquote>
+<p><strong>Stop starting every session from zero.</strong> Give your <a href="https://github.com/deepseek-ai/deepseek-harness">DeepSeek Harness</a> (DSH) agent a persistent <strong>five-layer memory</strong> — profile, project context, daily log, and recallable topics — so it remembers you between sessions, not just inside one.</p>
+</blockquote>
+<h2>The problem</h2>
+<p>An agent without memory is a brilliant stranger: every new session it re-learns who you are, what you are working on, and what you decided last week. Prompt stuffing and hand-written notes do not scale — they bloat context, drift out of date, and never get cleaned up.</p>
+<h2>The insight</h2>
+<p>Memory is not one bucket, it is <strong>five layers with different lifetimes and owners</strong> — from a user-owned identity file (L0) down to per-day append-only logs (L3). Each layer gets its own write path, truncation budget, and injection rule, so cold-start context stays cheap while long-term facts actually accumulate.</p>
+<h2>What it does</h2>
+<table>
+<thead>
+<tr>
+<th>Layer</th>
+<th>Where</th>
+<th>Purpose</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong>L0</strong> Global identity</td>
+<td><code>~/.dsh/AGENTS.md</code> (existing)</td>
+<td>Long-term identity &amp; rules — owned by the user, not this plugin.</td>
+</tr>
+<tr>
+<td><strong>L1</strong> User profile</td>
+<td><code>~/.dsh/memory/profile.md</code></td>
+<td>Four fixed sections (工作背景 / 个人背景 / 当前关注 / 近期动态), Version-N rotation with <code>.bak</code>.</td>
+</tr>
+<tr>
+<td><strong>L2</strong> Project semantic</td>
+<td><code>&lt;cwd&gt;/.dsh/memory/MEMORY.md</code> + topic files</td>
+<td>Index + topic-file split; injected at session start.</td>
+</tr>
+<tr>
+<td><strong>L3</strong> Daily memory</td>
+<td><code>&lt;cwd&gt;/.dsh/memory/YYYY-MM-DD.md</code></td>
+<td>One dated file, appended line-by-line, never merged.</td>
+</tr>
+<tr>
+<td><strong>L4</strong> Method assets</td>
+<td>skills (existing)</td>
+<td>Out of scope; skills already live in DSH.</td>
+</tr>
+</tbody></table>
+<p>Six mechanisms, in priority order from the spec:</p>
+<ol>
+<li><strong>Index + topic split (L2).</strong> <code>MEMORY.md</code> is always an index of one-line pointers (≤150 chars each); detailed notes live in <code>&lt;topic&gt;.md</code>. Controls single-file bloat, stays searchable and truncatable.</li>
+<li><strong>Truncation budget.</strong> The booted index is hard-clamped to 200 lines / 40 000 chars, so cold-start context stays cheap.</li>
+<li><strong>Relevance injection.</strong> On each step, the latest user query selects relevant topic files (LLM ranking when <code>llm</code> is configured, keyword fallback otherwise) and appends them as a <code>&lt;system-reminder data-role="memory"&gt;</code> block. Within a session, already-surfaced files are de-duplicated.</li>
+<li><strong>Auto-extraction.</strong> When a session goes idle, a debounced, best-effort pass sends the recent transcript to the LLM and writes new topic files + index lines. It never overwrites existing memories and degrades silently if the model is unavailable.</li>
+<li><strong>Profile rotation (L1).</strong> <code>memory_profile</code> merges new facts into the four sections and rotates the version, keeping <code>.bak</code>.</li>
+<li><strong>Agent tools.</strong> Six model-callable tools let the agent save, recall, search, and forget memories directly.</li>
+</ol>
+<h2>Quick start</h2>
+<pre><code>dsh plugin --profile web add github:NattoCB/dsh-plugin-memory
+</code></pre>
+<p>Restart <code>dsh web</code>, and the plugin bootstraps <code>~/.dsh/memory/</code> and <code>&lt;cwd&gt;/.dsh/memory/</code> on first use. No <code>llm</code> route? The plugin still provides index+topics, entry injection, keyword relevance, the agent tools, and profile rotation — only LLM-based extraction and LLM relevance ranking are disabled.</p>
+<h2>How it works</h2>
+<p>The plugin registers on two cordis seams, mirroring first-party plugins (<code>dsh-time-context</code>, <code>dsh-tool-todo</code>):</p>
+<ul>
+<li><strong><code>agents</code></strong> — an <code>agent/pre-step</code> listener (prepended, like <code>dsh-time-context</code>) that injects the entry instruction and relevant memories into the request history as plugin-sourced <code>user</code> messages.</li>
+<li><strong><code>tools</code></strong> — six tools registered via <code>defineTool</code> from <code>@deepseek-ai/dsh-tools</code>.</li>
+</ul>
+<p>Memory is written with Node's <code>fs/promises</code> directly to the memory roots — <strong>not</strong> through the agent sandbox — because the memory directory is intended persistence, not self-modification. The <code>Instruction Poisoning</code> boundary still applies: memory files are data the agent reads back, never permission grants.</p>
+<pre><code>src/
+  paths.js    DSH_HOME / global / project memory root resolution
+  store.js    MemoryStore, DailyMemory (L3), ProfileMemory (L1 rotation)
+  inject.js   entry instruction, relevance reminder, keyword scoring, truncation
+  llm.js      one-shot completion over the harness `llm` service (silent fallback)
+  index.js    plugin entry: pre-step injection, tools, idle auto-extraction
+</code></pre>
+<h2>Configuration</h2>
+<p>Deploy via a DSH plugin entry (see <code>package.json</code> <code>exports</code>):</p>
+<pre><code>- id: memory
+  name: '@deepseek-ai/dsh-plugin-memory'
+  config:
+    enableEntryInjection: true     # prepend the how-to-save + index block each session
+    enableRelevance: true          # append relevant topic files per step (data-role=memory)
+    enableExtraction: true         # idle-time LLM auto-extraction
+    maxRelevant: 5                 # max files surfaced per step
+    relevanceTopK: 8               # max candidates the LLM selector may pick from
+    relevanceBudgetChars: 2000     # per-topic char cap fed to relevance/selector
+    extractionDebounceMs: 60000    # idle debounce before a pass runs
+    extractionLookback: 40         # recent events scanned for a pass
+    llm:                           # optional; omit provider/model to use keyword-only relevance + no extraction
+      provider: deepseek
+      model: deepseek-chat
+      maxTokens: 1024
+</code></pre>
+<h2>Tools the agent can call</h2>
+<table>
+<thead>
+<tr>
+<th>Tool</th>
+<th>Scope</th>
+<th>Effect</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>memory_write</code></td>
+<td>global/project</td>
+<td>Write/overwrite a topic file; optionally add an index line.</td>
+</tr>
+<tr>
+<td><code>memory_read</code></td>
+<td>global/project</td>
+<td>Read a topic file or <code>MEMORY</code> index.</td>
+</tr>
+<tr>
+<td><code>memory_search</code></td>
+<td>global/project/both</td>
+<td>Keyword search topic files.</td>
+</tr>
+<tr>
+<td><code>memory_daily</code></td>
+<td>cwd</td>
+<td>Append a dated line to <code>&lt;cwd&gt;/.dsh/memory/YYYY-MM-DD.md</code>.</td>
+</tr>
+<tr>
+<td><code>memory_forget</code></td>
+<td>global/project</td>
+<td>Delete a topic file and its index pointer.</td>
+</tr>
+<tr>
+<td><code>memory_profile</code></td>
+<td>global</td>
+<td>Read or merge-and-rotate the single-user profile.</td>
+</tr>
+</tbody></table>
+<h2>Data layout (created on first use)</h2>
+<pre><code>~/.dsh/memory/
+  MEMORY.md        # global index (≤200 lines / 40K chars)
+  profile.md       # L1 profile (Version N)
+  profile.md.bak   # previous version
+  &lt;topic&gt;.md       # topic files
+&lt;cwd&gt;/.dsh/memory/
+  MEMORY.md        # project index
+  YYYY-MM-DD.md    # daily memory
+  &lt;topic&gt;.md       # project topic files
+</code></pre>
+<h2>The story</h2>
+<p>This plugin grew out of the memory model of an older harness (WorkBuddy): a user-level profile, project-level semantic memory, and daily logs — plus a decision kernel that says <em>mechanism beats willpower</em> (P0). DSH had none of it, so sessions kept starting from zero. This plugin ports that proven design to DSH's plugin seams and adds the missing pieces (relevance injection, truncation budgets, idle auto-extraction) that make it actually usable.</p>
+<h2>Differences from the reference spec</h2>
+<ul>
+<li><strong>No <code>&lt;uid&gt;</code> layer.</strong> DSH has one user; the profile is <code>~/.dsh/memory/profile.md</code>, not <code>&lt;uid&gt;_memory.md</code>.</li>
+<li><strong>No HTTP API / GUI panel.</strong> This is a pure harness plugin; GUI integration is the host's concern.</li>
+<li><strong>Extraction is debounced + LLM-driven</strong>, not a separate subagent process. The original two-turn <code>NO_EXTRACTION_NEEDED</code> subagent design is preserved in spirit (best-effort, silent degradation) but runs inline on idle to avoid spawning nested agents.</li>
+<li><strong>Relevance uses the harness <code>llm</code> service</strong> when available, degrading to deterministic keyword scoring otherwise.</li>
+</ul>
+<h2>License</h2>
+<p>MIT.</p>
+<hr>
+<p><strong>Try it:</strong> install with one line, restart, and tell your agent something worth remembering — then check <code>~/.dsh/memory/</code> a session later. Found a gap in the model? <a href="https://github.com/NattoCB/dsh-plugin-memory/issues">Open an issue</a> or send a PR.</p>

@@ -1,0 +1,95 @@
+<h1>dsh-plugin-sandbox-escalation-fix</h1>
+<p>让 <a href="https://github.com/deepseek-ai/deepseek-harness">DeepSeek Harness</a> 忽略不高于 Session 当前权限的无效 <code>sandbox_permissions</code> 请求，避免模型在已经拥有更高或相同权限时反复触发 <code>not strictly wider</code> 错误，同时保留 DSH 原有的提权审批和非法参数校验。</p>
+<p><img src="https://raw.githubusercontent.com/inmny/dsh-sandbox-escalation-fix/HEAD/assets/teaser.png" alt="DSH 重复请求同级沙箱权限"></p>
+<h2>使用方法</h2>
+<p>插件安装到 profile 后，会在 Host 侧修复 <code>bash</code>、<code>pwsh</code>、<code>write</code> 和 <code>edit</code> 中多余或过时的提权参数。<code>standard</code>、<code>code</code>、<code>cordis</code>、<code>minimal</code> 以及自定义 preset 中可见的对应工具共用这一修复，不需要额外配置。</p>
+<p>插件针对以下错误：</p>
+<pre><code>Error: sandbox escalation to "danger-full-access" is not strictly wider than
+this call's current "danger-full-access" mode
+</code></pre>
+<p>同样覆盖当前已经是 <code>danger-full-access</code>，但模型仍附加 <code>sandbox_permissions: "workspace-write"</code> 的过时请求：</p>
+<p><img src="https://raw.githubusercontent.com/inmny/dsh-sandbox-escalation-fix/HEAD/assets/teaser_add.png" alt="DSH 在 danger-full-access 下重复请求 workspace-write"></p>
+<p>对于确实需要升级的请求，如果模型遗漏 <code>justification</code>，或只提供空字符串和空白字符，插件会自动填入 <code>"Empty justification"</code>：</p>
+<p><img src="https://raw.githubusercontent.com/inmny/dsh-sandbox-escalation-fix/HEAD/assets/teaser_justification.png" alt="DSH 缺少非空 justification"></p>
+<p>安装后，如果模型请求的权限不比 Session 当前权限更高，插件就忽略这个无效的提权请求，并使用当前 Session 权限正常执行工具。真正更宽的请求仍进入 DSH 审批流程；缺失或空白的理由会使用上述 fallback，合法的非空理由保持不变。<code>read-only</code>、未知 target 或非字符串 justification 等非法值仍由 DSH 拒绝。</p>
+<p>插件只作为 bundle layer 安装到目标 profile，不修改 DSH 安装目录。</p>
+<h2>安装或更新</h2>
+<p>从 npm 安装固定版本到 Web profile：</p>
+<pre><code>dsh plugin --profile web add dsh-plugin-sandbox-escalation-fix@0.1.1
+</code></pre>
+<p>更新现有安装时使用同一条命令。安装完成后重启 <code>dsh web</code>，让 Host 加载新插件，然后新建会话。</p>
+<p>安装最新版时可以省略版本号：</p>
+<pre><code>dsh plugin --profile web add dsh-plugin-sandbox-escalation-fix
+</code></pre>
+<p>开发本地版本时传入 checkout 路径：</p>
+<pre><code>dsh plugin --profile web add C:\path\to\dsh-sandbox-escalation-fix
+</code></pre>
+<p>移除插件：</p>
+<pre><code>dsh plugin --profile web remove dsh-plugin-sandbox-escalation-fix
+</code></pre>
+<h2>权限语义</h2>
+<table>
+<thead>
+<tr>
+<th>当前 mode</th>
+<th>请求的 <code>sandbox_permissions</code></th>
+<th>处理结果</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>read-only</code></td>
+<td><code>workspace-write</code></td>
+<td>保持参数，继续走原有审批</td>
+</tr>
+<tr>
+<td><code>read-only</code></td>
+<td><code>danger-full-access</code></td>
+<td>保持参数，继续走原有审批</td>
+</tr>
+<tr>
+<td><code>workspace-write</code></td>
+<td><code>workspace-write</code></td>
+<td>删除冗余参数，按普通调用执行</td>
+</tr>
+<tr>
+<td><code>workspace-write</code></td>
+<td><code>danger-full-access</code></td>
+<td>保持参数，继续走原有审批</td>
+</tr>
+<tr>
+<td><code>danger-full-access</code></td>
+<td><code>danger-full-access</code></td>
+<td>删除冗余参数，按普通调用执行</td>
+</tr>
+<tr>
+<td><code>danger-full-access</code></td>
+<td><code>workspace-write</code></td>
+<td>删除过时参数，按普通调用执行</td>
+</tr>
+</tbody></table>
+<p><code>approval: never</code> 表示审批请求自动拒绝，不表示自动授予权限。本插件只让不高于当前权限的无效请求不再误入审批路径，不会放行真正的提权请求。</p>
+<h2>工作原理</h2>
+<p>DSH <code>0.1.0-rc.6</code> 的公开 <code>tools/pre-execute</code> Waterfall 接收到的参数已经深度冻结，不能在该扩展点修改。插件因此包装目标 <code>ToolDefinition.execute</code>，在调用原实现前完成最小参数正规化：</p>
+<pre><code>model tool call
+  -&gt; resolve current per-session sandbox policy
+  -&gt; ignore escalation targets no higher than the current mode or fill a missing reason
+  -&gt; original DSH tool validation and execution
+</code></pre>
+<p>插件监听工具和 Agent 生命周期，因此可以处理全局定义、preset scoped shadow、后创建 Agent 和工具 HMR。工具替换或 Agent 销毁后，已经不可见的包装会被恢复并释放；插件卸载后，即使旧包装被其他插件重新挂回，也只会惰性透传参数。</p>
+<h2>平台支持</h2>
+<p>运行时要求：</p>
+<ul>
+<li>Node.js 24 或更高版本</li>
+<li>DSH <code>0.1.0-rc.6</code></li>
+<li>DSH 支持的 Host 平台</li>
+</ul>
+<p>这是针对 DSH <code>0.1.0-rc.6</code> <code>ToolDefinition</code> 结构的兼容插件。升级 DSH 后应先运行测试并检查上游是否已经原生接受这类无效提权 no-op；上游修复后可以移除此插件。</p>
+<h2>开发</h2>
+<p>安装依赖并运行完整验证：</p>
+<pre><code>pnpm install
+pnpm test
+pnpm run pack:check
+</code></pre>
+<p>测试覆盖同级与过时低级参数正规化、真正升级保留、缺失理由 fallback、非法 target 拒绝、全局和 scoped 工具、不同 Session mode、启动回滚、动态不兼容定义、Agent 生命周期、HMR 清理以及卸载恢复。</p>
+<h2>License</h2>
+<p>MIT</p>

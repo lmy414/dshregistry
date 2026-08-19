@@ -1,0 +1,95 @@
+<h1>dsh-rw</h1>
+<p>Remote-SSH-style workspaces for <a href="https://github.com/deepseek-ai/deepseek-harness">DeepSeek Harness</a> (DSH).</p>
+<p>Pick an SSH host and a remote directory — that directory becomes a native DSH workspace, and the agent works <strong>directly on the remote filesystem</strong> through <code>rw_*</code> tools (SFTP/exec over a persistent ssh2 pool). No mirror, no sync: the remote is the single source of truth.</p>
+<p>Think of it as the workspace counterpart of an SSH ops toolbox: instead of "run one command over there", the agent gets a persistent remote project root it can read, edit, build, and test in — like VS Code Remote-SSH, but for your agent.</p>
+<h2>Features</h2>
+<ul>
+<li><strong>Remote directory as a native workspace</strong> — a centered picker modal fills the DSH "Add workspace" flow: 本机 (local) tab with the OS folder chooser, 远程 (remote) tab with a host dropdown, <code>/</code>-prefilled path input, and level-by-level autocomplete.</li>
+<li><strong>Hosts come from <code>~/.ssh/config</code></strong> — zero configuration: your existing aliases show up automatically (re-read on file change, no restart). Password-auth hosts can be added in the picker (stored locally, file mode <code>0600</code>).</li>
+<li><strong>Real workspace confinement</strong> — every <code>rw_*</code> file path is confined to the picked workspace root: <code>../</code>, absolute paths outside the root, and symlink escapes (<code>SYMLINK_ESCAPE</code> via remote <code>realpath</code>) are rejected with structured errors.</li>
+<li><strong>SSH host key verification</strong> — verifies against <code>~/.ssh/known_hosts</code> by default (<code>accept-new</code>: first-seen keys are recorded), with <code>strict</code> and an explicit <code>off</code> policy. A changed host key is refused, never silently accepted.</li>
+<li><strong>Structured errors</strong> — connection refused / auth failed / timeout / no such path / permission denied / outside workspace / host key problems are distinct error codes, so the agent can react correctly.</li>
+<li><strong>Placeholder, not a copy</strong> — the local directory DSH registers is an empty placeholder (<code>.dsh-rw-meta.json</code> records the <code>user@host:path</code> origin). It never holds remote file contents, so there is nothing to sync and no conflicts.</li>
+</ul>
+<h2>Install</h2>
+<pre><code>dsh plugin --profile web add dsh-rw
+
+# from a local checkout (development)
+dsh plugin --profile web add /path/to/dsh-rw
+</code></pre>
+<p>Restart <code>dsh web</code> afterwards. The plugin activates on boot; the "Add workspace" flow gains the two-tab picker.</p>
+<h2>Quick start</h2>
+<ol>
+<li><strong>Pick a workspace</strong> — sidebar / conversation <strong>Add workspace</strong> → 远程 tab → choose a host (from <code>~/.ssh/config</code>, or <strong>+ 添加主机</strong> for password auth) → browse or type a remote path → 设为远程工作区.</li>
+<li><strong>Work with the agent</strong> — the system prompt announces the current <code>user@host:/path</code>; the agent uses the <code>rw_*</code> tools:<ul>
+<li><code>rw_list_dir</code> / <code>rw_read_file</code> / <code>rw_write_file</code> / <code>rw_mkdir</code> / <code>rw_move</code> / <code>rw_delete</code> — file operations (workspace-confined)</li>
+<li><code>rw_exec</code> — run shell commands with the workspace root as cwd (build, test, grep, …)</li>
+<li><code>rw_hosts</code> / <code>rw_connect</code> / <code>rw_pick_workspace</code> / <code>rw_info</code> / <code>rw_disconnect</code> — host &amp; session management</li>
+</ul>
+</li>
+</ol>
+<h2>Configuration</h2>
+<p>Plugin config keys (defaults shown):</p>
+<table>
+<thead>
+<tr>
+<th>Key</th>
+<th>Default</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>hostKeyPolicy</code></td>
+<td><code>'accept-new'</code></td>
+<td><code>'accept-new'</code> learns first-seen keys into known_hosts; <code>'strict'</code> refuses unknown; <code>'off'</code> disables verification (explicitly)</td>
+</tr>
+<tr>
+<td><code>knownHostsPath</code></td>
+<td><code>~/.ssh/known_hosts</code></td>
+<td>known_hosts file used for verification</td>
+</tr>
+<tr>
+<td><code>commandTimeoutMs</code></td>
+<td><code>30000</code></td>
+<td>per remote command timeout</td>
+</tr>
+<tr>
+<td><code>connectTimeoutMs</code></td>
+<td><code>15000</code></td>
+<td>SSH handshake timeout</td>
+</tr>
+<tr>
+<td><code>maxOutputChars</code></td>
+<td><code>200000</code></td>
+<td>cap on collected stdout/stderr per call</td>
+</tr>
+</tbody></table>
+<h2>Security model</h2>
+<ul>
+<li><strong>Workspace confinement</strong> — file tools resolve every path against the workspace root and verify the <em>real</em> path (following symlinks) stays inside. Writes validate the nearest existing ancestor.</li>
+<li><strong>Host key verification</strong> as described above; host key changes abort the connection with <code>HOSTKEY_CHANGED</code>.</li>
+<li><strong>Loopback-only HTTP routes</strong> — <code>/api/dsh-rw/*</code> refuses non-loopback callers.</li>
+<li><strong>Secrets</strong> — passwords/passphrases are stored plaintext in <code>~/.dsh/dsh-rw.json</code> (mode <code>0600</code>, same trust model as <code>dsh-ssh</code>); they never appear in tool output, API responses, or error messages. Private keys are only read by ssh2 at connect time.</li>
+<li><strong>Scope</strong> — giving the plugin a host's credentials lets the agent run shell commands as that user on that host. Only connect hosts you trust. <code>rw_delete</code> performs real remote deletion.</li>
+</ul>
+<h2>Relationship to <code>@linxin666/dsh-ssh</code></h2>
+<p>Complementary, not a replacement. <code>dsh-ssh</code> is an ops toolbox (web terminal, port-forward tunnels, SFTP transfer GUI, cluster exec, ProxyJump). dsh-rw is the workspace layer (persistent remote project root for the agent). They coexist: different tool names (<code>ssh_*</code> vs <code>rw_*</code>), different routes, separate connection pools.</p>
+<h2>Known limitations</h2>
+<ul>
+<li>No ProxyJump / jump-host chains (single-hop only).</li>
+<li><code>rw_exec</code> is one-shot, no interactive PTY.</li>
+<li>File reads are text-oriented (line paging) with a 2 MB cap; large binary transfers are out of scope.</li>
+<li>The DSH file tree shows the empty placeholder directory, not remote files — remote browsing happens through the picker or the agent.</li>
+</ul>
+<h2>Development</h2>
+<pre><code>pnpm install
+pnpm build        # tsc (host) + esbuild wrapper (client)
+pnpm test         # vitest, 285 tests — all SSH/SFTP mocked
+pnpm typecheck
+</code></pre>
+<p>Real-host acceptance (opt-in, creates and cleans a temp dir on the target):</p>
+<pre><code>ssh &lt;alias&gt; 'mktemp -d /tmp/dsh-rw-acceptance.XXXXXX'   # then seed test data
+node scripts/acceptance.mjs &lt;alias&gt; /tmp/dsh-rw-acceptance.XXXXXX
+</code></pre>
+<h2>License</h2>
+<p>MIT</p>

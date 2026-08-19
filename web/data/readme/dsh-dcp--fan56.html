@@ -1,0 +1,224 @@
+<h1>dsh-dcp</h1>
+<p>dsh（DeepSeek Harness）的确定性压缩后端：<strong>上下文压缩不调 LLM</strong>，开箱即用。</p>
+<blockquote>
+<p><strong>简体中文</strong> · <a href="https://github.com/fan56/dsh-dcp/blob/HEAD/README.en.md">English</a></p>
+</blockquote>
+<h2>为什么做</h2>
+<p>dsh 默认的压缩（<code>compaction-basic</code>）每次压缩都要让模型把旧对话<strong>重新总结一遍</strong>——费 token、慢、结果还不稳定。我们参考 opencode 社区的 <a href="https://github.com/Opencode-DCP/opencode-dynamic-context-pruning">opencode-dcp</a>（去重、清错、"技术摘要代替散文"），做了一个纯代码版本：</p>
+<ul>
+<li><strong>零 LLM 调用</strong>：压缩本身不消耗任何额外 token</li>
+<li><strong>输出稳定</strong>：相同对话永远得到相同摘要</li>
+<li><strong>中文友好</strong>：用户原话/路径/命令/报错逐字保留，按 CJK 真实密度计价</li>
+<li><strong>继承官方全部安全机制</strong>：触发、保留尾巴、事务锁、tool-pairing 边界都复用 dsh 官方实现（只替换"摘要"这一环）</li>
+</ul>
+<h2>效果</h2>
+<h3>与官方默认压缩的对比</h3>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>官方 compaction-basic</th>
+<th>dsh-dcp</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>摘要方式</td>
+<td>每次调 LLM 重写</td>
+<td>确定性代码抽取</td>
+</tr>
+<tr>
+<td>每次压缩的模型调用</td>
+<td>1 次</td>
+<td><strong>0 次</strong></td>
+</tr>
+<tr>
+<td>输出稳定性</td>
+<td>同对话多次可能不同</td>
+<td>相同输入永远相同</td>
+</tr>
+<tr>
+<td>摘要内容</td>
+<td>语义归纳</td>
+<td>逐字保硬信息（路径/命令/报错/待办/用户原话）</td>
+</tr>
+<tr>
+<td>中文</td>
+<td>依赖模型转写</td>
+<td>原样保留 + CJK 计价</td>
+</tr>
+<tr>
+<td>触发/保留/溢出/安全</td>
+<td>官方</td>
+<td><strong>继承官方，完全相同</strong></td>
+</tr>
+<tr>
+<td>检查点格式</td>
+<td>官方</td>
+<td>兼容（可互相合并）</td>
+</tr>
+</tbody></table>
+<p>设计上还吸收了 <a href="https://github.com/Opencode-DCP/opencode-dynamic-context-pruning">opencode-dcp</a> 的思路（去重、清错、<code>/dcp</code> 命令、技术摘要），但按 dsh 的压缩接口重新实现——它服务于 opencode，dsh-dcp 服务于 dsh。</p>
+<h3>CJK 适配</h3>
+<p>内容逐字保留、不做英文转写；token 计价按 CJK 真实密度（中/日/韩/全角约 2 字符/token），不沿用宿主"4 字符/token"对中文的低估——中文会话的摘要预算反映真实成本，不会被饿死，信息更密集。</p>
+<h3>真实 dsh 会话实测</h3>
+<p>一段约 8 万 token 的历史压成约 700 token（<strong>~100x</strong>），全程零 LLM 调用；缓存命中率几乎不变（压缩后总会有一个"冷请求"，任何后端都一样）。</p>
+<p>真实会话里压缩出的检查点（中文内容逐字保留）：</p>
+<pre><code>## Primary Request and Intent
+- 帮我把登录页的重定向 bug 修掉
+
+## Files and Code
+- /app/src/auth/login.ts — W×1 R×1
+
+## Errors and Fixes
+- bash: FAIL src/auth.test.ts
+
+## Pending Jobs
+- add regression test
+
+## Critical Context
+- dsh-dcp 确定性压缩了 12 条消息 / 8 次工具调用（未调用 LLM 摘要）
+</code></pre>
+<h2>Not in scope</h2>
+<ul>
+<li><strong>不做语义归纳</strong>：不"理解"代码，只保留"出现过的事实"。需要深度语义摘要的场景，请继续用官方 <code>compaction-basic</code></li>
+<li><strong>dsh 已经有的我们不重复做</strong>：<ul>
+<li>工具结果剪枝（<code>compaction-tool-result-pruner</code>，确定性按大小剪）</li>
+<li>触发策略、保留尾巴、溢出恢复（直接继承官方；本插件仅新增轮数触发，见上）</li>
+<li><code>/compact</code> 命令、UI 检查点卡片（dsh 自带）</li>
+</ul>
+</li>
+</ul>
+<h2>安装</h2>
+<p><strong>推荐：配合我们的 dsh-tui-pi 用</strong>（tui 已依赖 dsh-dcp）：</p>
+<pre><code>npm i @aiwayds/dsh-tui-pi
+dsh plugin add @aiwayds/dsh-dcp     # 激活 dcp，bundle 自动挂载
+</code></pre>
+<p><strong>独立使用</strong>：</p>
+<pre><code>npm i @aiwayds/dsh-dcp
+npx dsh-dcp-setup                   # 安全脚本：带日期备份 → 只追加 → 幂等判断，不碰你已有的配置
+</code></pre>
+<blockquote>
+<p>dsh-dcp 挂在 dsh 的压缩接口上，只对挂载了它的 profile 生效。web profile 没挂 tui，继续用官方压缩，不受影响。</p>
+</blockquote>
+<h2>/dcp 命令</h2>
+<table>
+<thead>
+<tr>
+<th>命令</th>
+<th>作用</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>/dcp</code></td>
+<td>状态：配置、压缩次数、省下的 token</td>
+</tr>
+<tr>
+<td><code>/dcp compact</code></td>
+<td>立即压缩（零 LLM）</td>
+</tr>
+<tr>
+<td><code>/dcp set &lt;k&gt; &lt;v&gt;</code></td>
+<td>会话内调参，并提示如何持久化</td>
+</tr>
+</tbody></table>
+<p>可调键：<code>dedup</code>、<code>purgeErrors</code>、<code>maxItems</code>、<code>maxItemChars</code>、<code>maxSummaryTokens</code>、<code>language</code>、<code>tokenEstimate</code>、<code>thresholdRatio</code>、<code>roundInterval</code>、<code>notice</code>。</p>
+<h2>触发条件</h2>
+<table>
+<thead>
+<tr>
+<th>触发</th>
+<th>时机</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>压力触发</td>
+<td>每步请求前</td>
+<td>token ≥ <code>thresholdRatio</code>（默认 0.7）× 上下文窗口，继承官方</td>
+</tr>
+<tr>
+<td>溢出恢复</td>
+<td>模型报 context 超限时</td>
+<td>继承官方</td>
+</tr>
+<tr>
+<td><strong>轮数触发</strong></td>
+<td>会话每完成 <code>roundInterval</code> 轮</td>
+<td>本插件新增；一轮 = 一次正常完成的 turn。<strong>默认 50</strong>：第 50 轮触发第一次，之后每 50 轮一次（100、150……）；任何一次压缩（含压力触发）都会重置轮数时钟。到达轮数后的第一个空闲点触发（阈值之下也压）。<code>0</code> 关闭；需保持 <code>auto: true</code>（默认开）</td>
+</tr>
+<tr>
+<td>手动</td>
+<td><code>/dcp compact</code>、<code>/compact</code></td>
+<td>随时可用</td>
+</tr>
+</tbody></table>
+<ul>
+<li><strong>subagent 同样生效</strong>：进程内 subagent（含 continuable 子代理）走同一套事件分发，压力/溢出/轮数触发对子会话独立计数、独立触发。</li>
+<li><strong>压缩可见性</strong>：每次压缩成功后，会话里追加一行 <code>dcp: 已压缩 N 条历史（约 X tokens，触发方式）</code> 通知行（前端渲染为折叠行）。注意该行也会作为上下文随请求发给模型（每次压缩约 15–25 tokens），且 <strong>0.4.0 起默认开启</strong>；<code>notice: false</code> 可关闭。<code>/dcp</code> 的 stats 持续累计（压力触发的多次 region 提交各计一次）。</li>
+</ul>
+<h2>配置</h2>
+<p>全部可选，默认即用：</p>
+<table>
+<thead>
+<tr>
+<th>键</th>
+<th>默认</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>thresholdRatio</code></td>
+<td>0.7</td>
+<td>压力触发阈值；中文场景建议 0.7</td>
+</tr>
+<tr>
+<td><code>roundInterval</code></td>
+<td>50</td>
+<td>每 N 轮触发一次压缩（0 关闭）。默认 50：50、100、150……每次压缩后重数</td>
+</tr>
+<tr>
+<td><code>notice</code></td>
+<td><code>true</code></td>
+<td>压缩后在会话中追加一行通知</td>
+</tr>
+<tr>
+<td><code>language</code></td>
+<td><code>zh</code></td>
+<td>摘要语言；<code>zh</code> 额外识别中文报错和"待办："</td>
+</tr>
+<tr>
+<td><code>tokenEstimate</code></td>
+<td><code>cjk</code></td>
+<td>CJK（中/日/韩/全角）按 ~2 字符/token 计价；<code>ascii</code> 与宿主一致</td>
+</tr>
+<tr>
+<td><code>dedup</code></td>
+<td><code>true</code></td>
+<td>标注重复工具调用</td>
+</tr>
+<tr>
+<td><code>purgeErrors</code></td>
+<td><code>true</code></td>
+<td>旧报错折叠成一条提示</td>
+</tr>
+<tr>
+<td><code>maxItems</code> / <code>maxItemChars</code></td>
+<td>10 / 200</td>
+<td>摘要密度</td>
+</tr>
+<tr>
+<td><code>maxSummaryTokens</code></td>
+<td>2048</td>
+<td>摘要 token 预算</td>
+</tr>
+</tbody></table>
+<h2>设计参考</h2>
+<ul>
+<li><a href="https://github.com/Opencode-DCP/opencode-dynamic-context-pruning">Opencode-DCP/opencode-dynamic-context-pruning</a></li>
+<li>dsh 官方 compaction 接口：<code>docs/subsystems/compaction.md</code>（deepseek-harness）</li>
+</ul>
+<h2>开发</h2>
+<pre><code>npm install &amp;&amp; npm test     # 61 个用例：抽取/压缩/命令/配置/触发/安装脚本
+</code></pre>
+<h2>License</h2>
+<p>MIT</p>

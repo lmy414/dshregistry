@@ -1,0 +1,186 @@
+<h1>RiskProof</h1>
+<p><strong>Provenance-aware execution security for DeepSeek Harness.</strong></p>
+<p>Track where tool inputs came from. Detect risky cross-tool data flows. Stop sensitive side effects before execution.</p>
+<p><a href="https://github.com/onlyqzq/dsh-riskproof/blob/HEAD/README.md">English</a> · <a href="https://github.com/onlyqzq/dsh-riskproof/blob/HEAD/README.zh-CN.md">简体中文</a></p>
+<hr>
+<h2>What RiskProof answers</h2>
+<p>Most tool-permission plugins answer one question: <em>is this tool allowed?</em></p>
+<p>RiskProof answers a different one:</p>
+<blockquote>
+<p><strong>Where did the data in this tool call come from, what did it flow through, and where is it about to go?</strong></p>
+</blockquote>
+<p>A single tool call is usually safe. The composition is not.</p>
+<pre><code>web_fetch          ← UNTRUSTED_WEB
+   │
+database_query     ← CUSTOMER_DATA
+   │
+send_email         ← external destination
+   │
+RiskProof → DENY   (evidence-backed, before the side effect)
+</code></pre>
+<h2>Why RiskProof</h2>
+<table>
+<thead>
+<tr>
+<th>Permission rules</th>
+<th>RiskProof</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>Is this tool allowed?</td>
+<td>Where did this data come from?</td>
+</tr>
+<tr>
+<td>Single call</td>
+<td>Cross-tool flow</td>
+</tr>
+<tr>
+<td>Tool name</td>
+<td>Provenance + taint</td>
+</tr>
+<tr>
+<td>Static rule</td>
+<td>Stateful attack chain</td>
+</tr>
+<tr>
+<td>Permission decision</td>
+<td>Evidence-backed execution decision</td>
+</tr>
+</tbody></table>
+<p>RiskProof is a layer over the DSH Tool Runtime, not another Agent Runtime. It never re-implements tool dispatch, approval, or lifecycle — it observes and decides.</p>
+<h2>Quick Start</h2>
+<pre><code># add the plugin to a DSH profile
+dsh plugin --profile &lt;profile&gt; add dsh-riskproof
+</code></pre>
+<p>Minimal <code>cordis.patch.yml</code> (the schema defaults are already safe):</p>
+<pre><code>- insert:
+    - id: riskproof
+      name: dsh-riskproof
+</code></pre>
+<p>Then use DSH normally. RiskProof silently tracks security context and only asks or blocks when a risky cross-tool flow appears.</p>
+<p>To tune it:</p>
+<pre><code>- insert:
+    - id: riskproof
+      name: dsh-riskproof
+      config:
+        mode: enforce            # enforce | observe
+        policy:
+          sensitiveExternalAction: deny
+          untrustedPrivateAccess: ask
+        classification:
+          overrides:
+            gmail_send: [EXTERNAL_ACTION]
+            company_db: [PRIVATE_ACCESS]
+</code></pre>
+<p>See <a href="https://github.com/onlyqzq/dsh-riskproof/blob/HEAD/docs/configuration.md">docs/configuration.md</a> for the full reference.</p>
+<h2>See it work</h2>
+<pre><code>sequenceDiagram
+    participant A as Agent
+    participant T as DSH ToolRuntime
+    participant R as RiskProof
+
+    A-&gt;&gt;T: web_fetch(url)
+    T-&gt;&gt;R: tools/pre-execute
+    R--&gt;&gt;T: allow (EXTERNAL_INGESTION recorded)
+    T--&gt;&gt;A: untrusted content
+
+    A-&gt;&gt;T: database_query(sql)
+    T-&gt;&gt;R: tools/pre-execute
+    R--&gt;&gt;T: allow (PRIVATE_ACCESS recorded, CUSTOMER_DATA tagged)
+    T--&gt;&gt;A: CUST-8842 balance 125000
+
+    A-&gt;&gt;T: send_email(to=external, body=CUST-8842…)
+    T-&gt;&gt;R: tools/pre-execute
+    R--&gt;&gt;T: DENY — ingestion + private access + sensitive data + external action
+    T--&gt;&gt;A: Error: &lt;reason&gt;
+</code></pre>
+<p>The same flow is reproduced as a deterministic regression test in <a href="https://github.com/onlyqzq/dsh-riskproof/blob/HEAD/tests/security/attack-chain.test.ts">tests/security/attack-chain.test.ts</a>.</p>
+<p>Try it locally with no model or profile — a real DSH ToolRuntime pipeline with three mock tools:</p>
+<pre><code>npm run demo
+</code></pre>
+<p>See <a href="https://github.com/onlyqzq/dsh-riskproof/blob/HEAD/demo/README.md">demo/README.md</a>.</p>
+<h2>Features</h2>
+<h3>Track data origin</h3>
+<p>Know where tool inputs came from. RiskProof maps arguments back to the tool results that produced them.</p>
+<h3>Follow sensitive data</h3>
+<p>Carry security labels — <code>UNTRUSTED_WEB</code>, <code>CUSTOMER_DATA</code>, <code>PII</code>, <code>SECRET</code>, … — across tool calls, additively.</p>
+<h3>Detect attack chains</h3>
+<p>Identify the <code>EXTERNAL_INGESTION → PRIVATE_ACCESS → EXTERNAL_ACTION</code> pattern that single-tool checks miss.</p>
+<h3>Stop before execution</h3>
+<p>Block or ask <em>before</em> the side effect runs, through the native <code>tools/pre-execute</code> gate.</p>
+<h3>Explain every decision</h3>
+<p>Generate structured, privacy-preserving security evidence for every decision.</p>
+<h2>How it works</h2>
+<p>RiskProof hooks the native DSH tool pipeline:</p>
+<pre><code>tools/pre-execute
+    │  capability classification
+    │  argument provenance mapping
+    │  taint analysis
+    │  toolchain state (EIT → PAT → NAT)
+    │  deterministic policy evaluation
+    ▼
+allow / ask / deny   (monotonic with other plugins)
+    │
+tools/result
+    │  update ContextTracker
+    │  update Toolchain state
+    ▼  record execution evidence
+</code></pre>
+<ul>
+<li><strong>Classification</strong> is deterministic (tool name + description + schema), configurable, and never uses an LLM.</li>
+<li><strong>Provenance</strong> uses exact and bounded substring matching over a per-session context index.</li>
+<li><strong>Taint</strong> is additive; ordinary tool output can never remove a label.</li>
+<li><strong>Decisions</strong> are deterministic, explainable, and testable.</li>
+</ul>
+<p>See <a href="https://github.com/onlyqzq/dsh-riskproof/blob/HEAD/docs/architecture.md">docs/architecture.md</a>.</p>
+<h2>Security boundaries</h2>
+<p>RiskProof protects <strong>supported observable tool-call flows</strong> through DSH:</p>
+<ul>
+<li>DSH tool calls through the supported <code>tools/pre-execute</code> / <code>tools/result</code> paths</li>
+<li>supported observable provenance (exact / bounded substring matching)</li>
+<li>configured sensitive flows and cross-tool attack patterns</li>
+</ul>
+<p>RiskProof does <strong>not</strong> replace:</p>
+<ul>
+<li>OS sandbox / process isolation</li>
+<li>network firewall / SSRF protection</li>
+<li>endpoint security / malware scanning</li>
+<li>credential vaults</li>
+<li>full semantic DLP</li>
+</ul>
+<p>See <a href="https://github.com/onlyqzq/dsh-riskproof/blob/HEAD/docs/security-model.md">docs/security-model.md</a> for the complete threat model and known limitations.</p>
+<h2>Documentation</h2>
+<ul>
+<li><a href="https://github.com/onlyqzq/dsh-riskproof/blob/HEAD/docs/architecture.md">Architecture</a></li>
+<li><a href="https://github.com/onlyqzq/dsh-riskproof/blob/HEAD/docs/security-model.md">Security model</a></li>
+<li><a href="https://github.com/onlyqzq/dsh-riskproof/blob/HEAD/docs/provenance.md">Provenance &amp; taint</a></li>
+<li><a href="https://github.com/onlyqzq/dsh-riskproof/blob/HEAD/docs/toolchain.md">Toolchain model</a></li>
+<li><a href="https://github.com/onlyqzq/dsh-riskproof/blob/HEAD/docs/configuration.md">Configuration</a></li>
+<li><a href="https://github.com/onlyqzq/dsh-riskproof/blob/HEAD/docs/development.md">Development</a></li>
+<li><a href="https://github.com/onlyqzq/dsh-riskproof/blob/HEAD/docs/migration-from-riskproof.md">Migrating from RiskProof (MCP)</a></li>
+</ul>
+<h2>Roadmap</h2>
+<h3>v0.1 (current)</h3>
+<ul>
+<li>DSH-native runtime (<code>tools/pre-execute</code>, <code>tools/result</code>)</li>
+<li>Provenance + taint tracking</li>
+<li>Cross-tool EIT → PAT → NAT detection</li>
+<li>Privacy-preserving proof</li>
+</ul>
+<h3>v0.2</h3>
+<ul>
+<li>Tool identity continuity</li>
+<li>Task-aware policy</li>
+<li>Execution receipts</li>
+</ul>
+<h3>v0.3</h3>
+<ul>
+<li>Output-side information-flow control</li>
+<li>Trusted declassification</li>
+</ul>
+<h2>Contributing</h2>
+<p>Issues, rule submissions, tool-capability mappings, and false-positive reports are welcome. See <a href="https://github.com/onlyqzq/dsh-riskproof/blob/HEAD/CONTRIBUTING.md">CONTRIBUTING.md</a>.</p>
+<h2>Security reporting</h2>
+<p>Please report vulnerabilities privately. See <a href="https://github.com/onlyqzq/dsh-riskproof/blob/HEAD/SECURITY.md">SECURITY.md</a>.</p>
+<h2>License</h2>
+<p><a href="https://github.com/onlyqzq/dsh-riskproof/blob/HEAD/LICENSE">Apache-2.0</a></p>

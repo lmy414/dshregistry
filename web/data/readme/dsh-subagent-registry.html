@@ -1,0 +1,141 @@
+<h1>dsh-subagent-registry</h1>
+<p>Register locally-defined custom agents (<code>~/.dsh/agents/*.md</code>) as callable
+subagents in <a href="https://github.com/deepseek-ai/dsh">dsh</a>: the main conversation
+can invoke any of them by name through the <code>use_agent</code> tool, and each runs as
+a real dsh subagent with its own persona (system prompt).</p>
+<p><strong>中文简介</strong>：把 <code>~/.dsh/agents/*.md</code> 定义的自定义 agent（frontmatter 元数据 +
+markdown 正文作为 persona）注册成 dsh 可按名调用的 subagent。主对话通过
+<code>use_agent</code> 工具点名调用；每个自定义 agent 以独立 subagent 运行，拥有自己
+的 system prompt，跑在 dsh 自带的 <code>spawn</code> provider 上，不需要 patch dsh 本体。</p>
+<h2>How it works</h2>
+<ul>
+<li><strong>One file per agent</strong>: <code>&lt;agents-dir&gt;/&lt;name&gt;.md</code> — a loose <code>key: value</code>
+frontmatter block (<code>name</code>, <code>description</code>, <code>model</code>, <code>deep</code>, <code>display_name</code>,
+…) followed by a markdown body that is used <strong>verbatim</strong> as the child's
+persona (system prompt).</li>
+<li><strong>One tool</strong>: at session startup the plugin registers <code>use_agent</code>
+(configurable <code>toolName</code>). The tool's static description carries the roster
+— every agent name plus its sanitized description — so the main model can
+pick an agent by name.</li>
+<li><strong>At call time</strong> the target file is re-read and parsed; the body becomes the
+child's <code>persona</code>, the frontmatter <code>model</code> (<code>provider/model</code> route) is split
+into <code>agentOptions</code>, and the child is started through the already-assembled
+<code>spawn</code> subagent provider (the same single-instance realm dsh uses for its
+native subagent tool). The result is returned to the parent conversation.</li>
+</ul>
+<h2>Installation</h2>
+<p>Option A — add this checkout as a dsh plugin (tui profile):</p>
+<pre><code>dsh plugin --profile tui add ~/github/dsh-subagent-registry
+</code></pre>
+<p>Option B — npm dependency: <code>npm i dsh-subagent-registry</code>, then load the plugin
+under the stable id <code>dsh-subagent-registry</code> in your profile's config, or mount
+it through a bundle patch (see <code>cordis.patch.yml</code> in this repo for the pattern).</p>
+<h2>Configuration</h2>
+<table>
+<thead>
+<tr>
+<th>Config field</th>
+<th>Default</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>agentsDir</code></td>
+<td><code>~/.dsh/agents</code></td>
+<td>Directory holding <code>&lt;name&gt;.md</code> agent definitions.</td>
+</tr>
+<tr>
+<td><code>provider</code></td>
+<td><code>spawn</code></td>
+<td>Subagent provider the child runs through (reuses dsh-base's <code>spawn</code>).</td>
+</tr>
+<tr>
+<td><code>toolName</code></td>
+<td><code>use_agent</code></td>
+<td>Name of the registered tool.</td>
+</tr>
+<tr>
+<td><code>leafDenyTools</code></td>
+<td><code>[]</code> (computed default)</td>
+<td>Explicit tool-deny list installed on <code>deep: 0</code> (leaf) children. Empty = computed default (every agent-spawning tool in the dsh base distribution plus <code>toolName</code>).</td>
+</tr>
+</tbody></table>
+<h2><code>deep</code> semantics</h2>
+<p><code>deep</code> is the agent's spawn-depth budget, declared in the frontmatter:</p>
+<table>
+<thead>
+<tr>
+<th><code>deep</code></th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>0</code></td>
+<td><strong>Leaf</strong>: the agent runs normally but can never start a subagent.</td>
+</tr>
+<tr>
+<td><code>&gt;= 1</code></td>
+<td>May start subagents. <strong>Default when the key is absent: <code>1</code>.</strong></td>
+</tr>
+</tbody></table>
+<p>Implementation, at <code>use_agent</code> execute time:</p>
+<ul>
+<li><strong><code>deep: 0</code></strong> — the start request carries <code>toolFilter: { deny: [...] }</code> and
+<strong>no <code>maxDepth</code></strong>. The in-process <code>spawn</code> driver applies the filter as a
+scoped <code>tools.restrict()</code> in the child's creation window, so the named tools
+vanish from the child's tool prompt <em>and</em> refuse to execute — the child keeps
+its full non-spawn tool set but has zero spawn capability. Passing
+<code>maxDepth: 0</code> (the old behavior) would have rejected the child's own start,
+since the child's absolute depth is always ≥ 1. Default deny list:
+<code>subagent</code>, <code>subagent_fork</code>, <code>workflow</code>, <code>ralph</code>, plus this plugin's own
+tool name (<code>use_agent</code> by default; a customized <code>toolName</code> is denied
+automatically). <code>send_message</code> / <code>interrupt_agent</code> / <code>list_agents</code> only
+address already-running children and cannot spawn, so they stay visible.
+Override with <code>leafDenyTools</code> when your deployment's tool set differs.</li>
+<li><strong><code>deep &gt;= 1</code></strong> — no <code>toolFilter</code>; <code>maxDepth</code> is set to the child's absolute
+depth <strong>plus</strong> <code>deep</code> — a <em>relative</em> budget. Start can never be blocked by
+the depth check (<code>childDepth ≤ childDepth + deep</code> always holds), while the
+"deep = how many generations of subagents I may open" reading is preserved.
+Each subsequent delegation level enforces its own per-request caps (the
+native subagent tool defaults to <code>maxDepth: 3</code>), which acts as the outer
+recursion backstop.</li>
+</ul>
+<h2>Usage example</h2>
+<p>Define <code>~/.dsh/agents/workhorse.md</code>:</p>
+<pre><code>---
+name: workhorse
+display_name: 牛马狗
+description: "牛马狗：干活的主力……"
+model: opencode-go/deepseek-v4-flash
+deep: 0
+---
+You are 牛马狗，干活的主力。……（这里写完整的 system prompt）
+</code></pre>
+<p>Then ask in a conversation:</p>
+<blockquote>
+<p>用 workhorse 把今天的发布清单整理成表格</p>
+</blockquote>
+<p>The main model calls <code>use_agent(agent: "workhorse", prompt: "…")</code>, the child
+runs with the file body as its persona, and its result comes back into the
+conversation.</p>
+<h2>Known limitations</h2>
+<ul>
+<li><code>deep</code> is a <strong>per-agent</strong> relative budget enforced at each <code>use_agent</code> call;
+it does not re-arm deeper descendants. Real recursion is additionally bounded
+by every spawning tool's own <code>maxDepth</code> (native subagent tools default to
+<code>maxDepth: 3</code>) as the outer backstop.</li>
+<li>Continuable / background follow-up conversations with a custom agent
+(<code>send_message</code>-style resumption) are <strong>v2</strong>; today every <code>use_agent</code> run is
+one-shot.</li>
+<li><code>tools.restrict()</code> validates the deny list against globally registered tool
+names and throws on unknown names — the default list only names tools the
+stock dsh base distribution always registers; non-stock deployments should
+tune <code>leafDenyTools</code>.</li>
+</ul>
+<h2>Development</h2>
+<pre><code>npm run check    # tsc --noEmit -p tsconfig.json
+npm run build    # tsc -p tsconfig.json -&gt; lib/
+npm test         # node test/deep-semantics.test.mjs (no LLM)
+</code></pre>
+<h2>License</h2>
+<p>MIT</p>

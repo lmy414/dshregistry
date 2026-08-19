@@ -1,0 +1,152 @@
+<h1>@dong-victor/dsh-opencodego-usage</h1>
+<p>查看<strong>链接的 opencode Go 套餐余额</strong>的 DSH Web GUI 插件：侧边栏「Go 余额」入口 + 中央列面板，展示 <code>rolling / weekly / monthly</code> 三档用量百分比、状态徽章、重置时间与实时倒计时；同时提供 agent 工具 <code>opencode_go_balance</code> 与系统提示词声明，让助手也能直接回答「opencode Go 套餐还剩多少」。</p>
+<p>完全复用 DSH 已有的 LLM 接线（<code>llm-pi-ai</code> 的 <code>opencode-go</code> 路由设置 + credentials 服务），<strong>无需再配一把密钥</strong>——默认密钥引用就是官方 opencode 模型专用的 <code>OPENCODE_GO_API_KEY</code>，绝不复用 <code>llm-deepseek</code> 的 <code>DEEPSEEK_API_KEY</code>。</p>
+<h2>数据来源</h2>
+<p>官方端点（OpenAI 兼容网关的用量接口）：</p>
+<pre><code>GET https://opencode.ai/zen/go/v1/usage
+Authorization: Bearer &lt;key&gt;
+</code></pre>
+<p>响应：</p>
+<pre><code>{
+  "usage": {
+    "rolling": { "status": "ok", "percent": 1,  "resetsAt": "2026-08-14T06:44:12.569Z" },
+    "weekly":  { "status": "ok", "percent": 12, "resetsAt": "2026-08-17T00:00:00.569Z" },
+    "monthly": { "status": "ok", "percent": 35, "resetsAt": "2026-08-30T02:03:31.569Z" }
+  }
+}
+</code></pre>
+<ul>
+<li><code>percent</code> = 该窗口已使用的百分比（<code>100 - percent</code> 即剩余额度）；</li>
+<li><code>status</code> = <code>ok</code>（正常）或其它（如超额时提示注意）；</li>
+<li><code>resetsAt</code> = 该窗口重置时间（ISO），面板显示本地时间 + 每秒跳动的倒计时。</li>
+</ul>
+<blockquote>
+<p>无密钥 / 无效密钥 → HTTP 401；本插件把 401/403 转成可读错误「密钥缺失、过期或无 Go 套餐权限」。
+其它路径（<code>/zen/go/v1/subscription</code>、<code>/api/usage</code> 等）均为 404，<code>/zen/go/v1/usage</code> 是唯一可用余额端点（已实测验证）。</p>
+</blockquote>
+<h2>架构</h2>
+<p>双面插件（同 dsh-ssh 模式），零构建依赖、纯 JS、即装即用。运行时唯一的外部依赖是 <code>@deepseek-ai/dsh-tools</code>（工具注册契约，peer 依赖 <code>^0.1.0-rc.6</code>，与 dsh-ssh 等官方插件声明一致）——由 DSH 宿主按官方版本提供，插件不自带固定旧版副本、不随包维护：</p>
+<pre><code>dsh-opencodego-usage/
+├── package.json          # dsh.bundle.patch + dsh.client 声明（exports["./client"]）+ dsh-tools peer 依赖
+├── cordis.patch.yml      # 向 web profile 行列插入 {id: opencode-go}
+├── lib/
+│   ├── index.js          # 宿主半面（ESM）：余额服务 + 路由 + 工具 + 提示词
+│   └── client.js         # 浏览器半面（手写 CJS bundle，零外部 require）
+└── test/                 # host-boot + client-smoke 两套回归测试
+</code></pre>
+<h3>宿主半面 <code>lib/index.js</code></h3>
+<table>
+<thead>
+<tr>
+<th>能力</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>GET /api/dsh-opencode-go/balance</code></td>
+<td>回环防护（仅本机/同源），<code>?refresh=1</code> 绕过缓存；返回 <code>{ok, fetchedAt, cached, source, usage?, error?}</code></td>
+</tr>
+<tr>
+<td>密钥/端点解析</td>
+<td>默认取 <code>settings.get('llm-pi-ai')</code> 的 <code>providers.opencode-go</code> 路由 <code>baseURL</code>（取 origin）与 <code>apiKeyEnv</code>（即 <code>OPENCODE_GO_API_KEY</code>），回退到插件自带默认 <code>https://opencode.ai</code> / <code>OPENCODE_GO_API_KEY</code>；credentials 服务 <code>resolve(ref)</code>，<code>process.env</code> 兜底；绝不继承 <code>llm-deepseek.apiKeyEnv</code>（其 schema 默认是 <code>DEEPSEEK_API_KEY</code>）；可用插件 config 覆盖</td>
+</tr>
+<tr>
+<td>缓存</td>
+<td>内存 30s TTL（可配 <code>cacheTtlMs</code>），缓存命中不触发上游请求</td>
+</tr>
+<tr>
+<td>工具</td>
+<td><code>opencode_go_balance</code>（dsh-tools <code>defineTool</code>，结构化 schema + markdown render）</td>
+</tr>
+<tr>
+<td>提示词</td>
+<td><code>plugin:dsh-opencode-go</code> 段（order 150），声明能力与限制</td>
+</tr>
+</tbody></table>
+<p>插件 config（在 patch 入口的 <code>config</code> 字段配置，均可选）：</p>
+<pre><code>- insert:
+    - id: opencode-go
+      name: '@dong-victor/dsh-opencodego-usage'
+      config:
+        enabled: true          # 总开关
+        announceToAgent: true  # 是否向 agent 声明
+        # apiBaseUrl: 'https://opencode.ai'      # 覆盖端点（默认取 opencode-go 路由 baseURL 的 origin，再回退插件默认）
+        # apiKeyEnv: 'OPENCODE_GO_API_KEY'          # 覆盖凭据引用（默认同左，永不取 llm-deepseek 的 DEEPSEEK_API_KEY）
+        # cacheTtlMs: 30000
+        # timeoutMs: 15000
+</code></pre>
+<h3>浏览器半面 <code>lib/client.js</code></h3>
+<ul>
+<li>侧边栏入口：DOM 级注入（MutationObserver 自愈，React 重渲染后同帧复位），<strong>余额直接显示在侧边栏、无需点击</strong>——头部（图标 + 「Go 余额」）+ 三行明细（5小时 / 周 / 余额），每行含进度条（&gt;60% 变黄、≥90% 变红）、已用百分比、重置时间（24h 内显示 HH:mm，否则 MM/DD HH:mm），60s 自动刷新（宿主 30s 缓存兜底）；悬停 tooltip 显示完整明细；</li>
+<li>点击条目打开中央列面板：<code>[data-pane="conversation"]</code> 内绝对定位容器（<strong>不透明背景</strong>，避免对话文本透底）+ <code>&lt;html data-dsh-opencode-go-active&gt;</code> 控制显隐，与 SSH / 任务看板面板互斥（跨插件 <code>dsh-panel-activate</code> 事件协调）；</li>
+<li>三张用量卡：进度条（&gt;60% 变黄、≥90% 变红）、状态徽章、已用/剩余百分比、重置时间 + 每秒倒计时；</li>
+<li>刷新按钮（<code>?refresh=1</code>）、关闭按钮、错误横幅、端点/密钥元信息（密钥只显示掩码 <code>sk-yAE…eLEj</code>）；</li>
+<li>样式全部走 dsh <code>--dsw-*</code> 主题 token，跟随皮肤明暗；中英双语（<code>document.lang</code> 自动切换）。</li>
+</ul>
+<h2>安装</h2>
+<pre><code># 在插件目录（本包）外执行，把本地链接装进 web profile 并加入 bundle 层
+dsh plugin --profile web add link:C:\Users\dongz\.dsh\workspace\dsh-opencodego-usage
+</code></pre>
+<ul>
+<li><code>dsh plugin</code> 会向 <code>~/.dsh/profiles/web</code> 跑 <code>pnpm add link:&lt;绝对路径&gt;</code>，然后把声明了 <code>dsh.bundle</code> 的包名写进 <code>dsh.profile.bundles</code>；</li>
+<li><strong>重启 <code>dsh web</code></strong> 使新的 bundle 层生效（浏览器刷新不够——宿主 loader 在启动时读 bundle 层；<code>/plugins/&lt;id&gt;/client.js</code> 是启动后按需加载的）。</li>
+<li>卸载：<code>dsh plugin --profile web remove @dong-victor/dsh-opencodego-usage</code>，再重启。</li>
+</ul>
+<h2>开源发布与命令行安装</h2>
+<p>包已按 npm 发布标准整理（<code>files</code> 只含 <code>lib/</code>、<code>cordis.patch.yml</code>、<code>README.md</code>、<code>LICENSE</code>，无 node_modules/lockfile；<code>npm pack --dry-run</code> 已核对）。发布后任何机器都能：</p>
+<pre><code># 安装（会加入 dsh.profile.bundles，重启 dsh web 生效）
+dsh plugin --profile web add @dong-victor/dsh-opencodego-usage
+
+# 卸载
+dsh plugin --profile web remove @dong-victor/dsh-opencodego-usage
+</code></pre>
+<p>发布步骤（一次性）：</p>
+<pre><code># 1) 推送到 GitHub（仓库名建议与包名一致）
+cd dsh-opencodego-usage
+git remote add origin git@github.com:&lt;你的账号&gt;/dsh-opencodego-usage.git
+git push -u origin main
+
+# 2) 发布到 npm 官方源（注意：scope @dong-victor 必须是你自己的 npm 用户名/org；
+#    本机 registry 若配了 npmmirror 镜像，发布必须显式走官方源）
+npm login --registry=https://registry.npmjs.org     # 账号必须是 dong-victor
+npm publish --access public --registry=https://registry.npmjs.org
+
+# 之后每次改代码：npm version patch &amp;&amp; npm publish --registry=https://registry.npmjs.org
+</code></pre>
+<p>安装侧注意事项：</p>
+<ul>
+<li><strong>registry</strong>：本机 pnpm/npm 若指向 npmmirror 镜像，新包同步有延迟；想立即安装可在 <code>dsh plugin</code> 命令后追加 pnpm 参数：<code>dsh plugin --profile web add @dong-victor/dsh-opencodego-usage --registry=https://registry.npmjs.org</code>。</li>
+<li><strong>依赖随宿主</strong>：<code>@deepseek-ai/dsh-tools</code> 声明为 peer 依赖（<code>^0.1.0-rc.6</code>，同官方插件），运行时解析到 DSH 宿主安装的官方版本，插件不随包维护固定旧版；本地开发/测试时 npm 会自动装上该 peer。</li>
+<li><strong><code>dsh.bundle</code> 自动接线</strong>：安装后 <code>dsh plugin</code> 自动把包名写入 <code>dsh.profile.bundles</code>（reconcile 机制），无需手动改 profile；<code>remove</code> 会自动移除。</li>
+<li><strong>版本升级</strong>：<code>dsh plugin --profile web update</code>（pnpm update）拉取新版本，重启生效。</li>
+<li>已验证（tarball 等价流程）：临时 profile 上 <code>add file:&lt;tgz&gt;</code> → 依赖安装 + bundles 自动加入 + <code>import()</code> 解析正常 + <code>remove</code> 干净卸载。</li>
+</ul>
+<h2>前置条件</h2>
+<ul>
+<li>密钥通过 <code>OPENCODE_GO_API_KEY</code> 凭据引用提供：已通过 credentials 服务保存（<code>~/.dsh/.credentials.yaml</code>，Web「模型」设置页写入），或由启动环境导出；该 key 享有 opencode Go 套餐、是官方 opencode 模型专用密钥（不是 <code>DEEPSEEK_API_KEY</code>）。</li>
+<li>端点默认 <code>https://opencode.ai</code>；若 <code>llm-pi-ai</code> 的 <code>opencode-go</code> 路由配置了 <code>baseURL</code>，则取其 origin。</li>
+</ul>
+<h2>安全与限制</h2>
+<ul>
+<li>余额查询是只读操作；路由带 loopback/same-origin 防护；</li>
+<li>密钥仅在本机用于请求上游，响应中只回传掩码 <code>keyHint</code>；</li>
+<li>依赖 opencode 官方端点可用性与套餐有效性；网络不可达/密钥失效时面板显示错误横幅，agent 工具返回 <code>ok:false + error</code>；</li>
+<li>上游用量数据是分档百分比，无余额数值（官方端点不提供），面板按「已用/剩余 % + 重置时间」呈现。</li>
+</ul>
+<h2>开发者自测</h2>
+<p>插件对 <code>@deepseek-ai/dsh-tools</code> 只声明 peer 依赖（<code>^0.1.0-rc.6</code>），npm 安装时自动带上官方版本，测试只需 jsdom：</p>
+<pre><code>cd dsh-opencodego-usage
+npm install            # 首次（装 jsdom；dsh-tools peer 依赖自动带上）
+npm test               # 两套测试：
+                       #  host-boot.test.mjs    模拟 loader 调 apply()：路由/工具/提示词注册、
+                       #                         工具 schema 编译、execute/render/dispose（12 项断言）
+                       #  client-smoke.test.mjs jsdom DOM 冒烟：注册/挂载/渲染/倒计时/刷新/错误/销毁（28 项断言）
+
+# 宿主逻辑（真实请求，需要可用密钥；密钥默认走 credentials 服务 / 环境变量）
+node -e "import('./lib/index.js').then(async m =&gt; {
+  const s = await m.resolveSource({ get(){return undefined} }, {});
+  console.log(s);
+  const svc = new m.BalanceService({ getSource: () =&gt; m.resolveSource({ get(){return undefined} }, {}) });
+  console.log(await svc.get({ refresh: true }));
+})"
+</code></pre>

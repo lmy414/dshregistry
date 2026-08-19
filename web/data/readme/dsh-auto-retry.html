@@ -1,0 +1,95 @@
+<h1>dsh-auto-retry</h1>
+<p>DSH 的有界后备恢复插件。它不会替换官方 <code>@deepseek-ai/dsh-llm-retry</code>，而是在官方提供方策略不再重试后接手。</p>
+<p>它解决的是一类容易混淆的问题：中转方把可恢复的瞬时 429 标成 <code>QUOTA</code>，或者模型请求“正常结束”但没有可见输出。插件只在有明确证据时接手，并把重试次数、总等待时间和自动续行次数全部限制在配置预算内。</p>
+<h2>安装</h2>
+<p>从 GitHub 安装到 Web profile：</p>
+<pre><code>dsh plugin --profile web add "github:Windsland52/dsh-auto-retry#main"
+</code></pre>
+<p>安装器会把包含 <code>dsh.bundle.patch</code> 的依赖加入 profile bundle。GitHub 安装会通过包的 <code>prepare</code> 脚本构建 <code>lib/</code>；如果 pnpm 提示阻止构建脚本，按提示把该包加入 profile 的 <code>pnpm-workspace.yaml</code> <code>allowBuilds</code> 后重新执行安装。</p>
+<p>安装后重启 DSH。配置写在 profile 自己的 <code>cordis.patch.yml</code>，不要直接修改 <code>node_modules</code> 里的 bundle 文件。</p>
+<h2>默认行为</h2>
+<ul>
+<li>额外重试 <code>RATE_LIMIT</code>、HTTP 429、<code>EMPTY_RESPONSE</code>、<code>STREAM_CLOSED</code>。</li>
+<li>中转方把瞬时 429 误标成 <code>QUOTA</code> 时，只在错误详情包含 <code>rate_limit_exceeded</code>、<code>rate limit</code>、<code>allocated quota exceeded</code> 等特征时重试；真正的余额/credits 耗尽不会重试。</li>
+<li>最多额外重试 8 次，总等待时间不超过 15 分钟。</li>
+<li>优先使用提供方的 <code>Retry-After</code>，否则使用带抖动的指数退避（1.5 秒至 60 秒）。</li>
+<li>正常结束但没有可见文本/工具调用时，自动续行。</li>
+<li><code>max-tokens</code> 截断时自动续行。</li>
+<li>每个 turn 最多自动续行 2 次，避免空响应死循环。</li>
+<li><code>AUTH</code>、<code>QUOTA</code>、上下文超限、无效请求和用户取消不会被默认重试。</li>
+</ul>
+<h2>配置</h2>
+<pre><code>- id: dsh-auto-retry
+  name: '@dsh-external/dsh-auto-retry'
+  config:
+    # 空数组表示所有 provider；也可以只写 [scnet]
+    providers: []
+    retryCodes:
+      - RATE_LIMIT
+      - EMPTY_RESPONSE
+      - STREAM_CLOSED
+    retryQuota: true
+    quotaRetryPatterns:
+      - rate_limit_exceeded
+      - rate limit
+      - too many requests
+      - allocated quota exceeded
+      - temporarily unavailable
+    maxRetries: 8
+    maxElapsedMs: 900000
+    initialDelayMs: 1500
+    maxDelayMs: 60000
+    jitterRatio: 0.2
+    maxAutoContinuations: 2
+    continueOnMaxTokens: true
+</code></pre>
+<p>每次后备重试都会复用 DSH 已有的 <code>llm/retry</code> 和 <code>llm/retry-started</code> 持久事件，因此会话重放和现有重试状态 UI 仍能理解它。内部自动续行使用 <code>plugin</code> 来源的 user message，不会伪装成人类输入。</p>
+<h2>和其他插件的边界</h2>
+<table>
+<thead>
+<tr>
+<th>插件</th>
+<th>主要职责</th>
+<th>是否覆盖本插件的核心场景</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>官方 <code>@deepseek-ai/dsh-llm-retry</code></td>
+<td>provider 自己声明的请求错误重试策略</td>
+<td>它先处理；本插件只在它放弃后接手</td>
+</tr>
+<tr>
+<td><a href="https://github.com/911218sky/dsh-llm-bounded-retry"><code>dsh-llm-bounded-retry</code></a></td>
+<td>对结构化 LLM 请求错误统一做有界重试</td>
+<td>不处理静默成功响应、max-tokens 续行或 relay <code>QUOTA</code> 识别；不要和本插件同时接管同一 profile 的请求重试</td>
+</tr>
+<tr>
+<td><a href="https://github.com/ggykx123/dsh-retry-override"><code>dsh-retry-override</code></a></td>
+<td>覆盖指定 provider 的 retry policy</td>
+<td>不处理输出续行；适合需要按 provider 改策略的用户</td>
+</tr>
+<tr>
+<td><a href="https://github.com/Frog755/dsh-client-auto-retry"><code>dsh-client-auto-retry</code></a></td>
+<td>Web 客户端监听 <code>turn/end</code> 后发送“继续”</td>
+<td>和本插件的 max-tokens/错误续行有重叠，不建议同时启用</td>
+</tr>
+<tr>
+<td><a href="https://github.com/cyanseek/dsh-autofix"><code>dsh-autofix</code></a></td>
+<td>工具调用错误的单次恢复动作</td>
+<td>不处理模型请求或模型输出</td>
+</tr>
+</tbody></table>
+<p>本插件的定位是 <strong>Host 侧、provider-aware 的后备恢复</strong>：保留官方重试优先级，专门补齐中转方瞬时限流误报、空可见输出和输出截断这三个缺口，而不是再提供一个无限重试器。</p>
+<h2>兼容性</h2>
+<ul>
+<li>已针对 DSH <code>0.1.0-rc.7</code> 的 Web profile 验证。</li>
+<li>插件不切换模型或 provider，不修改请求内容，也不把自动续行伪装成人类消息。</li>
+<li>同一个 profile 只应有一个插件负责 <code>agent/request-error</code> 的全局重试预算；需要使用其他重试策略时，应按 provider 划分责任范围。</li>
+</ul>
+<h2>GitHub 发布</h2>
+<p>发布仓库后建议添加 <code>dsh</code> GitHub topic，方便社区目录发现。当前 package 保留了 <code>private: true</code>，表示只支持 GitHub 源码安装；如果以后要发布到 npm，需要删除该字段并改用正式的 npm 发布流程。</p>
+<h2>开发</h2>
+<pre><code>npm install
+npm test
+npm pack --dry-run
+</code></pre>

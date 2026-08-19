@@ -1,0 +1,76 @@
+<h1>dsh-plugin-8r</h1>
+<p>8R 规则本地判定插件，用于 <a href="https://github.com/deepseek-ai/DeepSeek-Harness">DeepSeek Harness</a>（DSH）。</p>
+<p><strong>用户说话触发了 8R 时，AI 的回复自动带上加粗前缀</strong>：</p>
+<blockquote>
+<p><strong>诶！「早八」</strong></p>
+<p>（正文从这里开始……）</p>
+</blockquote>
+<p>判定完全在本地完成，<strong>模型全程不知情</strong>：不打断思考、不污染上下文、不占 token，
+性能开销可忽略。</p>
+<h2>安装</h2>
+<p>在 DSH 的 profile 目录中执行（例如 web profile）：</p>
+<pre><code>dsh plugin --profile web add https://github.com/SensenMeng/dsh-plugin-8r
+</code></pre>
+<p><code>dsh plugin add</code> 会安装依赖并把 bundle 写进 <code>dsh.profile.bundles</code>（可手动核对
+<code>~/.dsh/profiles/web/package.json</code>）。<strong>重启 DSH 后生效</strong>。</p>
+<p>验证是否生效：发一句触发句，例如 <code>早八</code>，回复开头应出现 <code>**诶！「早八」**</code>。
+诊断接口：<code>http://127.0.0.1:3081/8r-status</code>（事件计数器与 pending 状态）。</p>
+<h2>工作原理</h2>
+<pre><code>用户消息 ──&gt; agent/pre-step（判定主通道，必然可达）
+                │  内嵌 JS 判定器 judge(text)（与 Python 参考实现逐字等价）
+                ▼  命中（should_e=true）→ pending 武装
+AI 回复流 ──&gt; llm/stream（全局瀑布）
+                ▼  条件：sessionId 匹配 + 流内最后一条人类文本匹配
+           text-delta 与 block-end 双注入点（产出新 chunk 对象，兼容冻结块）
+                ▼
+       chunk.text = '**诶！「前五…后五」**\n\n' + chunk.text   ← 机械拼接，模型不知道
+</code></pre>
+<p>关键契约（全部经运行时源码确认）：</p>
+<ul>
+<li><code>llm/stream</code> 瀑布能到达会话级动态插件与 profile 插件；<code>GenerateOptions.sessionId</code>
+与会话 id 对应（<code>Agent.id === session.id</code> 是运行时不变量）。</li>
+<li>判定主通道是 <code>agent/pre-step</code>（该瀑布必然可达）；<code>agent/inbox/inserted</code> 与
+<code>session/event 'user/message'</code> 作备份通道。注意 <code>session/event</code> 的 <code>user/message</code>
+在 <code>agent/pre-step</code> <strong>之后</strong>才触发（消息入日志时发射），因此 <code>setPending</code> 不得
+重置 <code>armed</code>，否则会把 pre-step 刚武装的状态清掉（v5 修复）。</li>
+<li>适配器在流末尾补发的 <code>block-end</code> 携带其内部攒的<strong>原始完整文本</strong>（不含注入前缀），
+<code>BlockAssembler</code> 以它为最终内容（first-close-wins）——因此注入点必须同时覆盖
+<code>text-delta</code> 与 <code>block-end</code>，且 block-end 分支不能被 <code>!prefixed</code> 外层守卫跳过，
+否则前缀会「闪现后消失」（v6 修复）。</li>
+<li>多步回合（带工具调用）时：第一个带正文的流注入；一次命中后 <code>applied=true</code>，
+同回合后续流不再重复注入；失败重试会重新注入。</li>
+<li>只对主会话生效：子代理消息（<code>source=model</code>）不判定，子代理流的 sessionId 天然排除。</li>
+</ul>
+<h2>8R 规则（v2.3 简述）</h2>
+<p>核心是<strong>末位辈分单位裁决</strong>：输入合法且去尾部标点非空时，从整句话最右端向左扫描，
+忽略普通字符与标点，遇到的最后一个辈分单位（王位 λ）就是唯一裁决单位。</p>
+<ul>
+<li>高辈分 <strong>D</strong>（die / ba / fu / ye 四系及数字 8）→ <strong>诶</strong></li>
+<li>低辈分 <strong>E</strong>（er / zi / sun 三系及 2 / r / R）→ <strong>不诶</strong></li>
+<li>复合低辈分 token <strong>几把 / 曼巴</strong> 与 E 同级 → 不诶</li>
+<li>没有辈分单位 → 不诶</li>
+</ul>
+<p>完整规则与 Python 参考判定器见 <a href="https://github.com/SensenMeng/8Rworld">8Rworld</a>。</p>
+<h2>验证</h2>
+<pre><code>npm test        # 或 node test/verify.js
+</code></pre>
+<ul>
+<li>86 条黄金用例全部通过（用例随仓库分发于 <code>test/data/8r_strict_cases.json</code>）</li>
+<li>内嵌判定器与此前 29564 条模糊用例的 Python 参考输出逐字段一致</li>
+</ul>
+<h2>目录结构</h2>
+<pre><code>index.js             插件本体（判定逻辑内嵌，无第三方依赖）
+cordis.patch.yml     bundle 挂载补丁（`dsh plugin add` 自动应用）
+test/judge.cjs        独立判定器副本（CommonJS，供验证）
+test/verify.js       黄金用例验证脚本
+test/data/           规则数据与用例（D/E 字集、86 条黄金用例）
+</code></pre>
+<h2>已知边界</h2>
+<ul>
+<li>前缀会写进会话记录（流注入），刷新后仍在；是机械文本，模型与它无关。</li>
+<li>会话压缩（compaction）改写历史后可能匹配不到原文 → 不注入（罕见）。</li>
+<li>判定对象是用户消息全文（多文本块拼接）；附件/图片块不参与。</li>
+<li>动态定义（<code>cordis_define</code>）不跨进程重启；profile 安装则随 DSH 常驻。</li>
+</ul>
+<h2>许可</h2>
+<p><a href="https://github.com/SensenMeng/dsh-plugin-8r/blob/HEAD/LICENSE">MIT</a> © SensenMeng</p>

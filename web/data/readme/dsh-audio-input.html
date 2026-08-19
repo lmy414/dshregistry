@@ -1,0 +1,246 @@
+<h1>dsh-audio-input</h1>
+<p><strong>Speak into the DeepSeek Harness Web GUI.</strong> A DSH web plugin that adds a
+microphone button to the message composer. Dictation uses the <strong>native Apple
+Speech framework</strong> (SFSpeechRecognizer) running as a small helper process on
+the Mac whose microphone you use — no cloud API key, no audio leaves the
+machine.</p>
+<h2>How it works</h2>
+<ul>
+<li><strong>Browser half</strong> — the mic button and the live-transcript strip
+(conversation.input.right / conversation.input.dock). Click to start,
+click again to stop; the final transcript is inserted into the composer
+draft, ready for you to press send.</li>
+<li><strong>Server half</strong> — a cordis plugin that exposes small JSON routes on the
+web server and relays dictation control and transcripts between the
+browser and the helper process.</li>
+<li><strong>Helper process</strong> — dsh-audio-speech, a ~130 KB native binary built from
+native/SpeechCapture.swift. It captures the microphone with AVAudioEngine
+and recognizes speech with SFSpeechRecognizer on the machine it runs on.</li>
+</ul>
+<p>Two modes:</p>
+<table>
+<thead>
+<tr>
+<th>Mode</th>
+<th>Helper runs on</th>
+<th>Use when</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong>local</strong></td>
+<td>the dsh server Mac</td>
+<td>you are sitting at the server Mac</td>
+</tr>
+<tr>
+<td><strong>remote</strong></td>
+<td>another Mac on the network</td>
+<td>you access the GUI from another Mac — mic + recognition happen there, only text travels</td>
+</tr>
+</tbody></table>
+<p>The browser automatically uses <strong>remote mode when a helper is connected</strong>,
+otherwise local mode.</p>
+<h2>Requirements</h2>
+<ul>
+<li>dsh server: macOS, the Web profile (dsh web)</li>
+<li>Remote client machine: any OS with a browser — the mic button works from
+anywhere. <strong>Remote dictation additionally needs macOS on the client</strong> (the
+helper is a Mac binary); the one-time helper setup below is done on that
+Mac.</li>
+<li>Xcode Command Line Tools are needed <strong>only</strong> to rebuild the helper from
+source — the repo ships the compiled binary.</li>
+</ul>
+<hr>
+<h2>Setup — Server side</h2>
+<p>Run these on the <strong>server Mac</strong>, once.</p>
+<h3>1. Install the plugin</h3>
+<p>From the plugin checkout (after cloning):</p>
+<pre><code>dsh plugin --profile web add link:/path/to/dsh-audio-input
+</code></pre>
+<p>This installs the package into ~/.dsh/profiles/web, appends it to the
+profile's bundle layers, and its cordis.patch.yml inserts the audio-input
+host row. (A GitHub install without a local checkout also works:
+<code>dsh plugin --profile web add git+ssh://git@github.com/&lt;you&gt;/dsh-audio-input.git</code>
+— the built lib/ and native/bin/ artifacts are committed, so no build step
+runs on install.)</p>
+<h3>2. Configure the remote token</h3>
+<p>Edit ~/.dsh/profiles/web/cordis.patch.yml and add an <strong>id-targeted config
+patch</strong> (the audio-input row already exists — do <strong>not</strong> use <code>- insert:</code>,
+which would create a broken duplicate):</p>
+<pre><code># dsh-audio-input: sets the shared secret for the remote helper.
+- id: audio-input
+  config:
+    remoteToken: 'choose-any-secret-string'
+</code></pre>
+<p>The token is a password you invent — it must match exactly on the remote
+helper (see below). Leaving it unset disables remote dictation entirely.</p>
+<h3>3. Restart</h3>
+<p>Stop dsh web (Ctrl-C in its terminal), then start it again the same way.</p>
+<p>Restarting is required after installing the plugin, after config changes,
+and after updating the plugin.</p>
+<h3>4. Verify (optional but recommended)</h3>
+<pre><code># token-gated route — the bearer value must match your config
+curl -H 'Authorization: Bearer choose-any-secret-string' http://127.0.0.1:3080/audio-input/remote/commands
+# expected: {"ok":true,"command":null}
+</code></pre>
+<hr>
+<h2>Setup — Remote side</h2>
+<p>Run these on the <strong>remote Mac</strong> (the one you dictate at), once. The only
+thing you need is the server's address — e.g. 192.168.0.101 (find it on the
+server with <code>ipconfig getifaddr en0</code>, or in the URL line printed when
+<code>dsh web</code> starts).</p>
+<h3>1. Download the helper straight from the server</h3>
+<p>The server serves the compiled binary — no file-transfer tooling needed:</p>
+<pre><code>curl -o ~/dsh-audio-speech http://&lt;SERVER-IP&gt;:3080/audio-input/helper
+chmod +x ~/dsh-audio-speech
+</code></pre>
+<p><strong>Verify it is the binary, not a web page</strong> (the GUI answers unknown paths
+with HTML, which produces a confusing "syntax error" when run):</p>
+<pre><code>file ~/dsh-audio-speech
+# must print: Mach-O 64-bit executable arm64
+# if it prints something about HTML/text, the download was wrong — retry
+</code></pre>
+<blockquote>
+<p>Alternative without the server: copy native/bin/dsh-audio-speech from the
+plugin repo, or build it there with <code>pnpm build:native</code> (requires Xcode
+Command Line Tools). Apple-silicon (arm64) only.</p>
+</blockquote>
+<h3>2. Run the helper</h3>
+<pre><code>~/dsh-audio-speech --remote http://&lt;SERVER-IP&gt;:3080 --token 'choose-any-secret-string'
+</code></pre>
+<ul>
+<li>Replace  with the server's real address and the token with the
+exact value from step 2 on the server. <strong>Do not keep the angle brackets</strong> —
+<code>&lt;</code> and <code>&gt;</code> are shell redirection operators.</li>
+<li>The helper polls the server for start/stop commands every 0.5 s and stays
+alive across dictation sessions. Keep its terminal window open (or use
+<code>nohup ~/dsh-audio-speech ... &amp;</code>); closing it disables remote dictation.</li>
+</ul>
+<h3>3. First-use permissions (on the remote Mac)</h3>
+<p>macOS asks once for <strong>Speech Recognition</strong> and <strong>Microphone</strong> access,
+attributed to the app that launched the helper (Terminal, iTerm, SSH, ...):</p>
+<ul>
+<li>System Settings → Privacy &amp; Security → <strong>Speech Recognition</strong> → allow</li>
+<li>System Settings → Privacy &amp; Security → <strong>Microphone</strong> → allow</li>
+</ul>
+<p>If the helper was launched over SSH (no GUI prompt), it reports
+<code>speech-permission-pending</code> — grant both permissions in System Settings on
+the remote Mac, then simply click the mic button again (the helper keeps
+running and retries).</p>
+<hr>
+<h2>Daily use</h2>
+<ol>
+<li>Click the <strong>mic button</strong> at the right end of the composer tool row.</li>
+<li>Speak — partials appear live in the strip above the composer.</li>
+<li>Click the mic button <strong>again</strong> to stop; the final transcript is inserted
+into the composer draft.</li>
+<li>Review, press <strong>send</strong>.</li>
+</ol>
+<p>Tips:</p>
+<ul>
+<li>One dictation at a time; switching sessions while recording keeps the
+button in other sessions disabled until it finishes.</li>
+<li>The strip above the composer shows errors (permissions, helper offline,
+...) instead of failing silently.</li>
+</ul>
+<h2>Configuration reference</h2>
+<p>Set these under <code>- id: audio-input</code> + <code>config:</code> in the profile's
+cordis.patch.yml (all optional):</p>
+<table>
+<thead>
+<tr>
+<th>Key</th>
+<th>Default</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>locale</td>
+<td>'en-US'</td>
+<td>BCP 47 recognizer locale, e.g. 'zh-CN', 'de-DE'</td>
+</tr>
+<tr>
+<td>onDevice</td>
+<td>false</td>
+<td>true forces on-device recognition (fully offline; narrower language support)</td>
+</tr>
+<tr>
+<td>remoteToken</td>
+<td>''</td>
+<td>Shared secret for the remote helper. Empty = remote dictation disabled</td>
+</tr>
+</tbody></table>
+<h2>Troubleshooting</h2>
+<table>
+<thead>
+<tr>
+<th>Symptom</th>
+<th>Cause / fix</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>line 1: syntax error ... '&lt;!doctype html&gt;'</code> when running the helper</td>
+<td>The downloaded file is the web GUI's HTML. Re-fetch with the exact /audio-input/helper URL and check with <code>file</code> (see Remote side, step 1).</td>
+</tr>
+<tr>
+<td>Mic click shows <code>remote-offline</code></td>
+<td>No helper is connected. Start the helper on the remote Mac (--remote + matching --token), or check it did not exit.</td>
+</tr>
+<tr>
+<td><code>unauthorized</code> / dictation never starts</td>
+<td>Token mismatch. Compare the helper's --token with remoteToken in the profile patch — they must be identical; restart <code>dsh web</code> after changing the patch.</td>
+</tr>
+<tr>
+<td><code>speech-permission-pending</code></td>
+<td>Permission prompt never appeared (SSH/agent launch). Grant Speech Recognition + Microphone in System Settings on that Mac, then click the mic again.</td>
+</tr>
+<tr>
+<td><code>speech-permission-denied</code> / <code>mic-permission-denied</code></td>
+<td>Permissions were denied. Allow them in System Settings → Privacy &amp; Security, then retry.</td>
+</tr>
+<tr>
+<td>Second mic click reports <code>dictation already in phase recording</code></td>
+<td>Outdated client bundle — update the plugin and <strong>restart <code>dsh web</code></strong> (the restart loads the new browser bundle).</td>
+</tr>
+<tr>
+<td>Stop click seems to hang for ~8 s</td>
+<td>The remote helper did not answer the stop command (it may have died). Restart the helper; check its terminal for errors.</td>
+</tr>
+<tr>
+<td>Local mode: mic opens on the wrong machine</td>
+<td>Local mode uses the server Mac's mic. Prefer remote mode (start the helper on your Mac) whenever you are not at the server.</td>
+</tr>
+</tbody></table>
+<h2>Security notes</h2>
+<ul>
+<li><code>remoteToken</code> is the only fence between the two machines and the rest of
+your LAN. Anyone with the token can start dictation and inject
+transcripts; anyone <em>without</em> it gets <code>401</code>. Treat it like a password (a
+random string is best: <code>openssl rand -hex 16</code>).</li>
+<li>The token sits in the helper's command line and in the profile patch — do
+not reuse a valuable password for it.</li>
+<li>The remote endpoints only exist when <code>remoteToken</code> is non-empty; the
+default (empty) rejects every remote request.</li>
+</ul>
+<h2>Build from source</h2>
+<pre><code>pnpm build          # tsdown: lib/index.js (server half) + lib/client.js (browser half)
+pnpm build:native   # swiftc: native/bin/dsh-audio-speech (macOS SDK required)
+pnpm typecheck      # tsc --noEmit
+node scripts/smoke-host.mjs   # end-to-end smoke test (routes + helper)
+</code></pre>
+<p>lib/ and native/bin/ are committed so installs from GitHub work without a
+build step; rebuild after source changes.</p>
+<h2>Debugging</h2>
+<pre><code># every route answers directly — no browser needed:
+curl -s -X POST http://127.0.0.1:3080/audio-input/status
+curl -s -X POST http://127.0.0.1:3080/audio-input/start -H 'content-type: application/json' -d '{}'
+curl -s -X POST http://127.0.0.1:3080/audio-input/stop
+curl -s -o ~/x http://127.0.0.1:3080/audio-input/helper   # the binary
+# remote helper traffic (token required):
+curl -s -H 'Authorization: Bearer &lt;token&gt;' http://127.0.0.1:3080/audio-input/remote/commands
+curl -s -X POST -H 'Authorization: Bearer &lt;token&gt;' -H 'content-type: application/json' \
+  -d '{"type":"error","code":"probe","message":"hi"}' http://127.0.0.1:3080/audio-input/remote/events
+</code></pre>
+<p>Override the helper binary the server spawns (local mode) with
+<code>DSH_AUDIO_SPEECH_BIN=/path/to/binary</code> on the <code>dsh web</code> process.</p>
+<h2>License</h2>
+<p>MIT</p>

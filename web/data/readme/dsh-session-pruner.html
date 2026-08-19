@@ -1,0 +1,170 @@
+<h1>dsh-session-pruner</h1>
+<p><strong>DSH session lifecycle management plugin</strong> — full-type session lifecycle management: one-shot subagents archived on completion, continuable subagents and main sessions archived when idle, a capacity cap, and projection-cache cleanup. Prevents session-library accumulation stalls at the source.</p>
+<blockquote>
+<p>Every session type has a defined destination: finished one-shot subagents are archived automatically, idle continuable subagents / main sessions are archived, and overflow is recycled by priority. <strong>Archive first (recoverable), delete after expiry</strong> — the GUI syncs within 30s, fully panel-configured with hot reload.</p>
+</blockquote>
+<p><a href="https://github.com/mrzhangkris/dsh-session-pruner/blob/HEAD/README.zh-CN.md">简体中文</a> · <a href="https://github.com/mrzhangkris/dsh-session-pruner/blob/HEAD/LICENSE">Apache-2.0</a> · <a href="https://www.npmjs.com/package/dsh-session-pruner">npm</a></p>
+<h2>Why</h2>
+<p>DSH (DeepSeek Harness) caches a full projection of every session in <code>session_projcache.json</code> (token stats, context pressure, ...), and the storage backend rewrites the whole file atomically on <strong>every</strong> write. When the session library accumulates thousands of subagent sessions:</p>
+<ul>
+<li>The cache balloons past 100MB and each checkpoint fully re-serializes → main process CPU 250%+</li>
+<li>The single-threaded event loop is saturated → <strong>every session load stalls, even <code>GET /</code> times out</strong></li>
+</ul>
+<p>Managing session lifecycle (this plugin) is the root fix: no session accumulation → no cache rows → no stalls.</p>
+<h2>Features: full-type lifecycle</h2>
+<table>
+<thead>
+<tr>
+<th>Session type</th>
+<th>Trigger</th>
+<th>Action</th>
+<th>Default</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong>one-shot subagent</strong></td>
+<td>log contains <code>session/end-seed</code> (finished)</td>
+<td>archive/delete at next scan</td>
+<td>3min interval</td>
+</tr>
+<tr>
+<td><strong>continuable subagent</strong></td>
+<td>idle over N days</td>
+<td>archive (recoverable)</td>
+<td>off (0 days)</td>
+</tr>
+<tr>
+<td><strong>main session</strong></td>
+<td>idle over N days</td>
+<td>archive (recoverable)</td>
+<td>off (0 days)</td>
+</tr>
+<tr>
+<td><strong>any type</strong></td>
+<td>total exceeds capacity cap</td>
+<td>recycle by <code>one-shot → continuable → main</code> + oldest</td>
+<td>400</td>
+</tr>
+<tr>
+<td><strong>archive directory</strong></td>
+<td>kept over N hours</td>
+<td>physically deleted</td>
+<td>24 hours</td>
+</tr>
+</tbody></table>
+<h3>Archive mechanism (recoverable)</h3>
+<p>Cleaned sessions are <strong>moved to <code>~/.dsh/sessions-archive/</code></strong> first (workspace/session-id structure preserved) — they disappear from the GUI immediately (the list only reads the sessions directory), but the files remain and can be restored manually:</p>
+<pre><code># Restore: mv back into the sessions directory
+mv ~/.dsh/sessions-archive/&lt;workspace&gt;/&lt;session-id&gt; ~/.dsh/sessions/&lt;workspace&gt;/
+</code></pre>
+<p>A "delete directly" mode (no archive, irreversible) is also available.</p>
+<h3>Safety (double protection)</h3>
+<ul>
+<li><strong>Running sessions are never touched</strong>: logs without <code>session/end-seed</code> are never cleaned (checked in both the one-shot path and the capacity cap)</li>
+<li><strong>live protection</strong>: sessions still held in the in-memory session store (open/loading) are skipped</li>
+<li>Main sessions do not participate in capacity recycling by default (configurable)</li>
+<li>Per-action failure isolation: every action is try/catch wrapped</li>
+</ul>
+<h2>How it works</h2>
+<pre><code>scan (scheduled, default 3min)
+  ├─ pruneArchive: physically delete expired archive sessions
+  ├─ iterate ~/.dsh/sessions/*/ decompress log (system zstd, multi-frame)
+  │     ├─ origin: main | subagent       (session header)
+  │     ├─ mode: one-shot | continuable  (subagent/descriptor event)
+  │     └─ ended: contains session/end-seed
+  ├─ one-shot + ended ──→ archive (archiveMode)
+  ├─ continuable/main idle N days ──→ archive
+  ├─ total &gt; cap ──→ recycle by priority + oldest (skip running/live)
+  └─ each archive also: purge projcache row + workspace accounting
+</code></pre>
+<p>GUI sync: the client calls <code>sessions.refreshList()</code> every <code>uiRefreshSeconds</code> seconds, so cleaned sessions disappear from the sidebar automatically — no page reload needed.</p>
+<h2>Install</h2>
+<h3>From npm (recommended)</h3>
+<pre><code>dsh plugin --profile web add dsh-session-pruner
+</code></pre>
+<h3>From source (development)</h3>
+<pre><code>dsh plugin --profile web add /path/to/dsh-session-pruner
+</code></pre>
+<p>Restart dsh web after install (<code>launchctl kickstart -k gui/$(id -u)/com.deepseek.dsh-web</code>).</p>
+<h2>Configuration (settings panel, hot reload)</h2>
+<p>After install, open <strong>Settings → Plugins → 会话生命周期管理</strong> card. All 8 options save with hot reload (no restart):</p>
+<table>
+<thead>
+<tr>
+<th>Field</th>
+<th>Default</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>Scan interval (min)</td>
+<td>3</td>
+<td>cleanup loop period</td>
+</tr>
+<tr>
+<td>Capacity cap (sessions)</td>
+<td>400</td>
+<td>recycle by priority + oldest when exceeded</td>
+</tr>
+<tr>
+<td>UI refresh interval (s)</td>
+<td>30</td>
+<td>GUI session list refresh period</td>
+</tr>
+<tr>
+<td>Archive retention (hours)</td>
+<td>24</td>
+<td>physical delete after retention</td>
+</tr>
+<tr>
+<td>Archive mode</td>
+<td>archive</td>
+<td>archive (recoverable) / delete directly (irreversible)</td>
+</tr>
+<tr>
+<td>Continuable idle archive (days)</td>
+<td>0</td>
+<td>archive after N idle days, 0 = off</td>
+</tr>
+<tr>
+<td>Main idle archive (days)</td>
+<td>0</td>
+<td>archive after N idle days, 0 = off</td>
+</tr>
+<tr>
+<td>Clean main on overflow</td>
+<td>off</td>
+<td>main participates in capacity recycling</td>
+</tr>
+</tbody></table>
+<p>Env vars (fallback, panel wins): <code>DSH_SESSION_LIFECYCLE_INTERVAL_MS</code> / <code>_MAX</code> / <code>_CLEAN_MAIN</code> / <code>_ARCHIVE_HOURS</code> / <code>_ARCHIVE_MODE</code> / <code>_CONTINUABLE_IDLE_DAYS</code> / <code>_MAIN_IDLE_DAYS</code>.</p>
+<h2>Logs</h2>
+<p>Output in guard <code>server-*.out.log</code>:</p>
+<pre><code>[session-lifecycle] armed: interval=3min cap=100 cleanMain=false
+[session-lifecycle] hot-reloaded: interval=3min cap=100 ... contIdle=1d mainIdle=2d
+[session-lifecycle] archived a1b2c3d4 (subagent/one-shot) one-shot done cache=true
+[session-lifecycle] archive pruned: 2 expired
+</code></pre>
+<p><code>cache=true/false</code> tells whether the projection cache row was purged along with the session.</p>
+<h2>Tests</h2>
+<pre><code>node test/dry-run.js   # read-only full-library scan, verify classification (no deletion)
+node test/e2e.js       # create a fake one-shot session, verify the real cleanup path
+</code></pre>
+<h2>Implementation notes</h2>
+<ul>
+<li><strong>Multi-frame zstd</strong>: DSH session logs are concatenated zstd frames (append writes); Node <code>zlib</code> decodes a single frame only, so the plugin shells out to the system <code>zstd</code> CLI (<code>brew install zstd</code> on macOS)</li>
+<li><strong>Cache row purge</strong>: <code>storageDomain.get('session_projcache').table('sessions').delete(id)</code> — the official write chain (atomic persistence + in-memory sync)</li>
+<li><strong>Workspace accounting</strong>: the session id is removed from the workspace domain on archive, keeping the data source consistent with disk</li>
+<li><strong>Zero npm deps</strong>: plain Node built-ins + cordis runtime injection</li>
+<li><strong>Panel + hot reload</strong>: <code>installSettingsSection</code> + hand-written client card (<code>__ModuleLoader__</code> bundle), <code>onChange</code> re-schedules the timer instantly</li>
+</ul>
+<h2>Developer guide</h2>
+<p><a href="https://github.com/mrzhangkris/dsh-session-pruner/blob/HEAD/docs/DEVELOPMENT-GUIDE.md"><code>docs/DEVELOPMENT-GUIDE.md</code></a> — DSH plugin development practice guide (architecture, Host/Client, settings panel, deployment ops, 10 pitfalls with fixes), the foundation for future plugin work.</p>
+<h2>Known limits</h2>
+<ul>
+<li>A finished one-shot subagent survives at most one scan interval</li>
+<li>Requires the system <code>zstd</code> CLI</li>
+<li>The root fix lives upstream: projcache stale-session eviction / incremental storage writes, see <a href="https://github.com/deepseek-ai/deepseek-harness/discussions/1550">deepseek-harness Discussion #1550</a></li>
+</ul>
+<h2>License</h2>
+<p><a href="https://github.com/mrzhangkris/dsh-session-pruner/blob/HEAD/LICENSE">Apache-2.0</a></p>

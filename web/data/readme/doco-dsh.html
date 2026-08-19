@@ -1,0 +1,147 @@
+<h1>doco-dsh</h1>
+<p>Doco 知识库的 <strong>DeepSeek Harness（dsh）原生插件</strong>。用 6 个工具把 Agent 接到你的 Doco 知识库上：块级寻址、按 token 预算精读、乐观并发写入草稿、来源引用，全部复用 <a href="https://www.npmjs.com/package/doco-agent-cli"><code>doco-agent-cli</code></a> 的 <code>DocoClient</code>（HTTP / ETag / Token 逻辑不复制）。</p>
+<p>默认<strong>只读</strong>；写入走 dsh 原生审批 + scope 门禁，绝不静默提交。</p>
+<h2>能力</h2>
+<table>
+<thead>
+<tr>
+<th>工具</th>
+<th>读/写</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>doco_status</code></td>
+<td>读</td>
+<td>连接自检：当前用户、scope、API 地址、读写能力</td>
+</tr>
+<tr>
+<td><code>doco_list_knowledge_bases</code></td>
+<td>读</td>
+<td>列出可见知识库（选 <code>knowledge_base_id</code>）</td>
+</tr>
+<tr>
+<td><code>doco_search</code></td>
+<td>读</td>
+<td>Search v2 全文搜索，带完整性证明（<code>projection.complete</code> / <code>freshness</code>）</td>
+</tr>
+<tr>
+<td><code>doco_outline</code></td>
+<td>读</td>
+<td>文档结构大纲（稳定 <code>block_id</code> + heading path），先规划再精读</td>
+</tr>
+<tr>
+<td><code>doco_read</code></td>
+<td>读</td>
+<td>按 token 预算局部读取正文（<code>around</code> / <code>cursor</code> 续读）</td>
+</tr>
+<tr>
+<td><code>doco_save_draft</code></td>
+<td>写</td>
+<td>把 Agent 产出存成<strong>新草稿</strong>（<code>preview</code> → 确认 → <code>commit</code>）</td>
+</tr>
+</tbody></table>
+<p>回答里的事实命中有来源引用（<code>document_uri</code> / <code>web_url</code>）；<code>doco_search</code> 返回 <code>complete=false</code> 或 <code>freshness=stale</code> 时，插件会显式标注「结果不完整」，禁止 Agent 据此断言「知识库里没有」。</p>
+<h2>安装</h2>
+<p><code>doco-dsh</code> 依赖：</p>
+<ul>
+<li><code>doco-agent-cli@^0.1.3</code>（npm 运行时依赖）；</li>
+<li><code>@deepseek-ai/dsh-tools</code> / <code>@deepseek-ai/cordis</code>（<strong>peer dep</strong>，由宿主 dsh 提供，本插件不捆绑）。</li>
+</ul>
+<p>装包并自动挂载（推荐）——本包声明了 <code>dsh.bundle.patch</code>，<code>dsh plugin add</code> 装完即自动挂进 profile 层栈：</p>
+<pre><code>dsh plugin --profile &lt;name&gt; add doco-dsh
+</code></pre>
+<p>手动挂载（备选）两步：</p>
+<pre><code>pnpm add doco-dsh   # 或 npm i doco-dsh，装到 dsh 项目里供 composition 解析
+</code></pre>
+<p>再在 dsh 的 Composition YAML（如 <code>agent.cordis.yml</code>）里追加一条——<code>name</code> 既可用 npm 包名，也可用本地相对路径：</p>
+<pre><code># 挂到你的 composition（追加一条）
+- id: doco
+  name: 'doco-dsh'
+</code></pre>
+<p>（最简形式也可只写 <code>- name: 'doco-dsh'</code>。挂载语法细节见 dsh 教程《07 · Into the Harness》。）</p>
+<p>挂载完成后，<code>apply</code> 会：</p>
+<ol>
+<li>解析配置（见下）；</li>
+<li>注册 6 个工具（命名带 <code>doco_</code> 前缀，可配 <code>DOCO_DSH_TOOL_PREFIX</code> 覆盖）；</li>
+<li>注入系统提示词分段（仅规则，不注入内容/Token）；</li>
+<li>注册 <code>/doco</code> 命令。</li>
+</ol>
+<blockquote>
+<p>配置走环境变量与 <code>doco-agent-cli</code> 的 <code>loadConfig()</code>（见下方「配置」），不通过 YAML <code>config:</code> 块。</p>
+</blockquote>
+<p>若 <code>@deepseek-ai/dsh-tools</code> 缺失或版本不兼容，插件会在加载期抛稳定错误码 <code>doco_dsh_incompatible</code>（不静默降级）。</p>
+<h2>授权（设备登录流）</h2>
+<pre><code>/doco connect                     # 默认 read_only
+/doco connect --access read_write # 需要写入时选 read_write
+</code></pre>
+<p>命令会打开系统浏览器完成设备授权，Token 写入 <code>~/.config/doco/config.json</code>（<code>0600</code>），并自动重载插件状态。</p>
+<pre><code>/doco status / disconnect / set-kb &lt;kb_id&gt;
+</code></pre>
+<p>Token 只走 POST 请求体与浏览器；<strong>绝不进入工具结果、日志、错误栈或提交</strong>。</p>
+<h2>配置</h2>
+<p>优先级（高 → 低）：dsh 启动参数 &gt; <code>doco-agent-cli</code> 的 <code>loadConfig()</code>（<code>~/.config/doco/config.json</code> + <code>DOCO_BASE_URL</code>/<code>DOCO_TOKEN</code>）&gt; 插件级环境变量 &gt; 内置默认。</p>
+<table>
+<thead>
+<tr>
+<th>环境变量</th>
+<th>默认</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>DOCO_API_BASE_URL</code></td>
+<td><code>https://api.doco.page/api/v1</code></td>
+<td>API 地址（仅 http/https）</td>
+</tr>
+<tr>
+<td><code>DOCO_API_TOKEN</code></td>
+<td>—</td>
+<td>令牌（也可用 <code>doco-agent-cli</code> 登录）</td>
+</tr>
+<tr>
+<td><code>DOCO_DEFAULT_KB</code></td>
+<td>—</td>
+<td>默认知识库 id</td>
+</tr>
+<tr>
+<td><code>DOCO_WEB_ORIGIN</code></td>
+<td><code>https://doco.page</code></td>
+<td>引用链接的 Web 源</td>
+</tr>
+<tr>
+<td><code>DOCO_READ_MAX_TOKENS</code></td>
+<td><code>4000</code></td>
+<td><code>doco_read</code> 默认预算（64–50000）</td>
+</tr>
+<tr>
+<td><code>DOCO_READ_CONTEXT_BEFORE</code> / <code>AFTER</code></td>
+<td><code>2</code> / <code>4</code></td>
+<td>上下文块默认（0–100）</td>
+</tr>
+<tr>
+<td><code>DOCO_DSH_TOOL_PREFIX</code></td>
+<td><code>doco</code></td>
+<td>工具名前缀</td>
+</tr>
+<tr>
+<td><code>DOCO_DSH_ALLOW_WRITES</code></td>
+<td><code>false</code></td>
+<td>写入总开关（仍受 scope + 用户确认双重门禁）</td>
+</tr>
+</tbody></table>
+<h2>写入安全（三层）</h2>
+<ol>
+<li><strong>同步 guard</strong>：<code>DOCO_DSH_ALLOW_WRITES</code> 未开启时，任何 <code>commit</code> 被单调拒绝（<code>doco_write_not_confirmed</code>）。</li>
+<li><strong>pre-execute 审批</strong>：commit 前校验 <code>documents:write</code> scope，随后 <code>ask</code> 用户确认（dsh 原生审批）。</li>
+<li><strong>execute 防御</strong>：即使被直接顶层调用，<code>doco_save_draft</code> 也再校验 scope 并返回稳定错误码。</li>
+</ol>
+<p><code>doco_save_draft</code> 只 <strong>创建新草稿</strong>：不删除、不移动、不整篇覆盖；用唯一 <code>Idempotency-Key</code>，冲突即返回 <code>doco_version_conflict</code>，从不强覆盖。</p>
+<h2>与 Doco MCP 的关系</h2>
+<p><code>doco-agent-cli</code> 自带一套 29 工具的 MCP server。本插件复用同一 <code>DocoClient</code>，并在读/搜索工具上采用<strong>同名前缀</strong>：若二者被同时加载，<code>registerTools</code> 检测到重名会<strong>跳过而非覆盖</strong>，避免同一个知识库以两套名字重复注册、重复消耗上下文。<strong>推荐二选一</strong>（原生插件更省一跳 RPC 且能用上 dsh 原生写入审批；MCP 更通用）。详见 <a href="https://github.com/songofhawk/doco-dsh/blob/HEAD/docs/adr-001-native-vs-mcp.md">docs/adr-001-native-vs-mcp.md</a>。</p>
+<h2>错误契约</h2>
+<p>工具失败「返回而非抛出」结构化错误值 <code>{ kind:'doco_error', code, message, next_step }</code>，让模型能读到 <code>next_step</code> 自行纠偏。稳定错误码见 <code>src/errors.js</code>（如 <code>doco_auth_required</code>、<code>doco_insufficient_scope</code>、<code>doco_rate_limited</code>、<code>doco_version_conflict</code>、<code>doco_read_cursor_stale</code>）。</p>
+<h2>开发</h2>
+<pre><code>pnpm install
+pnpm test          # 68 个测试：单测 + 真实 dsh-tools/cordis 冒烟 + 装配集成
+</code></pre>

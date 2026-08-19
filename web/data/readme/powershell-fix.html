@@ -1,0 +1,143 @@
+<h1>powershell-fix</h1>
+<p>A <strong>host-layer plugin</strong> for <a href="https://github.com/deepseek-ai/deepseek-harness">DeepSeek Harness</a> (DSH) that detects and <strong>auto-fixes Windows PowerShell command syntax mistakes</strong> before they burn a tool-call round-trip — then executes the corrected command through the host shell seam, under the <strong>normal sandbox/approval policy</strong>.</p>
+<p>AI agents (and humans) frequently paste bash-flavored commands into a Windows terminal. This plugin gives the agent one tool — <code>powershell_fix</code> — that checks, repairs, and runs such commands safely.</p>
+<h2>What it fixes</h2>
+<p><strong>Line hygiene (the most frequent real-world breakage)</strong></p>
+<table>
+<thead>
+<tr>
+<th>problem</th>
+<th>fix</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>CRLF / stray <code>\r</code> from copy-paste</td>
+<td>normalized to LF</td>
+</tr>
+<tr>
+<td>pasted shell prompts (<code>PS C:\&gt; </code>, <code>C:\&gt; </code>, <code>$ </code> on every line)</td>
+<td>stripped</td>
+</tr>
+<tr>
+<td>trailing whitespace after a continuation char (invisible breakage)</td>
+<td>removed</td>
+</tr>
+<tr>
+<td>bash <code>\</code> line continuation</td>
+<td>PowerShell backtick</td>
+</tr>
+<tr>
+<td>missing continuation before a <code>-Parameter</code> line</td>
+<td>backtick inserted</td>
+</tr>
+<tr>
+<td>dangling backtick before an empty line</td>
+<td>removed</td>
+</tr>
+<tr>
+<td>unbalanced quotes</td>
+<td>warned (never blindly rewritten)</td>
+</tr>
+</tbody></table>
+<p><strong>bash → PowerShell semantics</strong></p>
+<table>
+<thead>
+<tr>
+<th>bash</th>
+<th>PowerShell</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>export NAME=value</code></td>
+<td><code>$env:NAME='value'</code> (same-command <code>$NAME</code> refs rewritten to <code>$env:NAME</code>)</td>
+</tr>
+<tr>
+<td><code>unset NAME</code></td>
+<td><code>if (Test-Path Env:NAME) { Remove-Item Env:NAME }</code> (guarded; inline-in-chain supported)</td>
+</tr>
+<tr>
+<td><code>&gt; /dev/null</code>, <code>2&gt; /dev/null</code>, <code>&amp;&gt; /dev/null</code></td>
+<td><code>&gt; $null</code>, <code>2&gt; $null</code>, <code>*&gt; $null</code></td>
+</tr>
+<tr>
+<td><code>a &amp;&amp; b</code> / `a</td>
+<td></td>
+</tr>
+<tr>
+<td><code>ls -la path</code></td>
+<td><code>Get-ChildItem path -Force</code></td>
+</tr>
+<tr>
+<td><code>rm -rf x</code></td>
+<td><code>Remove-Item x -Recurse -Force</code></td>
+</tr>
+<tr>
+<td><code>mkdir -p a/b/c</code></td>
+<td><code>New-Item -ItemType Directory -Force …</code></td>
+</tr>
+<tr>
+<td><code>touch f</code></td>
+<td>timestamp update or <code>New-Item -ItemType File</code></td>
+</tr>
+<tr>
+<td><code>grep [-r] [-v] pat f…</code></td>
+<td><code>Select-String</code> (recursion via <code>Get-ChildItem -Recurse</code>)</td>
+</tr>
+<tr>
+<td><code>which x</code> / <code>command -v x</code></td>
+<td><code>(Get-Command x -ErrorAction SilentlyContinue).Source</code></td>
+</tr>
+<tr>
+<td><code>head -n N f</code> / <code>tail -n N f</code> / <code>tail -f f</code></td>
+<td><code>Get-Content -TotalCount N</code> / <code>-Tail N</code> / <code>-Wait</code></td>
+</tr>
+<tr>
+<td><code>sed</code>, <code>awk</code>, <code>chmod</code>, bare <code>$PATH</code>-style env refs</td>
+<td>warned with PowerShell equivalents (never blindly rewritten)</td>
+</tr>
+</tbody></table>
+<p>Correct PowerShell passes through <strong>unchanged</strong> (no-op guarantee, covered by regression tests). The fixer is idempotent: <code>fix(fix(x)) === fix(x)</code>.</p>
+<h2>Safety</h2>
+<ul>
+<li>Execution goes through the host <code>ctx.shell</code> seam — <strong>the same sandbox, approval, and timeout policy as the built-in pwsh tool</strong>. This plugin adds no privilege.</li>
+<li>A built-in execution gate refuses to auto-execute semantically destructive commands even after fixing them: root-target recursive deletes (<code>rm -rf /</code>, <code>Remove-Item C:\ -Recurse</code>), <code>Format-Volume</code>, <code>Clear-Disk</code>, <code>Set-ExecutionPolicy</code>, <code>del /s|/q</code>, and environment/system persistence writes (<code>setx</code>, <code>[Environment]::Set*</code>, <code>New-ItemProperty</code>, <code>Set-ItemProperty</code>, <code>reg add</code>).</li>
+<li><code>execute: false</code> (or <code>autoExecute: false</code> config) gives a dry-run: fix only, no execution.</li>
+</ul>
+<h2>Install (host layer — available to every session)</h2>
+<p>The package declares <code>dsh.bundle.patch</code>, so installing it into a profile adds it to the profile's layer stack automatically — no agent-preset line needed:</p>
+<pre><code>dsh plugin --profile web add file:/path/to/powershell-fix
+</code></pre>
+<p>Reconciling notices the <code>dsh.bundle</code> declaration and appends <code>powershell-fix</code> to <code>dsh.profile.bundles</code>; the bundled <code>cordis.patch.yml</code> inserts the plugin row at the host layer. Restart the harness, and <strong>every session</strong> on that profile gets:</p>
+<ul>
+<li>tool <code>powershell_fix</code></li>
+<li>a system-prompt section teaching native PowerShell syntax and when to call the tool</li>
+</ul>
+<blockquote>
+<p>Note: <code>pnpm</code> file: dependencies copy <code>lib/*.js</code> — after editing the source, delete <code>node_modules/powershell-fix</code> in the profile and re-run the <code>add</code> command ("Already up to date" is misleading).</p>
+</blockquote>
+<h2>Tool contract</h2>
+<pre><code>// powershell_fix({ command, shell?, execute?, description? })
+{
+  "ok": true,
+  "platform": "win32",
+  "shell": "powershell51",          // auto-detected engine: pwsh | powershell51
+  "original": "export A=1 &amp;&amp; echo $A",
+  "fixed": "$env:A='1'; if ($?) { echo $env:A }",
+  "changed": true,
+  "fixes": [{ "rule": "ENV_EXPORT", "notes": ["…"] }],
+  "warnings": [{ "rule": "BARE_VAR", "note": "…" }],
+  "execution": { "mode": "auto", "exitCode": 0, "stdout": "…", "stderr": "…" }
+  // execution.mode: auto | dry-run | skipped-dangerous | aborted
+}
+</code></pre>
+<p>Config (cordis row / <code>dsh.bundle</code> defaults): <code>autoExecute</code> (default <code>true</code>), <code>timeoutMs</code> (default <code>60000</code>).</p>
+<h2>Development</h2>
+<p>Zero runtime dependencies (engine is pure JS); peer deps <code>@deepseek-ai/dsh-tools</code> and <code>@deepseek-ai/schemastery</code> resolve from the host.</p>
+<pre><code>node --test                          # unit tests (engine, 57 assertions)
+node acceptance/mount_check.mjs &lt;profile_web_dir&gt;   # mount + live-path check
+node acceptance/real_pwsh_e2e.mjs    # fixed commands executed by the real engine
+</code></pre>
+<h2>中文说明</h2>
+<p>DSH host 层插件:在 Windows 终端上自动检测并修复 PowerShell 命令语法错误(bash 语法、续行符错误、粘贴带入的提示符与 CRLF),修复后经宿主 shell 缝隙执行——沙箱/审批策略与内置 pwsh 工具完全一致,危险命令只修复不执行。声明 <code>dsh.bundle.patch</code>,装入 profile 即对所有会话生效,无需改任何 preset。</p>
+<h2>License</h2>
+<p>MIT</p>

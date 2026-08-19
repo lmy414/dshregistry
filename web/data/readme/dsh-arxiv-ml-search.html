@@ -1,0 +1,210 @@
+<h1>dsh-arxiv-ml-search</h1>
+<p>A DeepSeek Harness plugin that searches arXiv for machine-learning papers, so
+the agent checks claims against the published record instead of its own memory.</p>
+<p>Two tools plus a skill that tells the model how to use them:</p>
+<ul>
+<li><strong><code>arxiv_search</code></strong> — keywords, authors, categories, date ranges, sorting and
+paging. Returns truncated abstracts so a ten-result search stays cheap.</li>
+<li><strong><code>arxiv_get</code></strong> — full metadata and complete abstracts for specific ids, with
+optional segmenting (<code>max_chars</code> + <code>segment</code>) for paging through long text.</li>
+<li><strong><code>SKILL.md</code></strong> — the claim-checking procedure: restate the claim, run 2-3
+orthogonal queries, read the shortlist properly, report a verdict with ids,
+and never assert anything the returned text does not say.</li>
+</ul>
+<h2>What the skill actually changes</h2>
+<p>The two tools are always in the toolset, so the model <em>can</em> reach arXiv without
+the skill. What the skill adds is knowing how to search — and that turns out to
+be most of the value. Measured on one prompt, run twice in the same workspace,
+once with the skill loaded and once without:</p>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>skill not loaded</th>
+<th>skill loaded</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>synonym sets (<code>any_of</code>)</td>
+<td>0</td>
+<td>11 distinct, across 36 calls</td>
+</tr>
+<tr>
+<td>category narrowing (<code>ml_only</code>)</td>
+<td>9</td>
+<td>36</td>
+</tr>
+<tr>
+<td>relaxed matches reported to the user</td>
+<td>—</td>
+<td>4</td>
+</tr>
+</tbody></table>
+<p>Without it the model still searches, just blindly: one phrasing per concept, no
+narrowing, and no obligation to say when a match was approximate rather than
+exact. With it, the answer names which abstracts were actually read and flags
+where the evidence is thin.</p>
+<h3>It loads without being asked for papers</h3>
+<p>The skill is meant to fire on any ML question, not only on "find me papers".
+Ask a plain engineering question —</p>
+<blockquote>
+<p>My RL agent gets a set of state features but the reward never makes it rely
+on some of them. How do I increase a specific feature's influence?</p>
+</blockquote>
+<p>— and the model loads the skill and answers from real work: potential-based
+reward shaping, curiosity, auxiliary tasks, each with an arXiv id it fetched
+rather than recalled.</p>
+<p>Getting that to happen took a specific fix. The skill catalog the model reads
+carries <strong>name and description only</strong> — <code>whenToUse</code> never reaches it, and the
+description is truncated past 500 characters — so that one string is the entire
+routing signal. An earlier one-liner about "searching arXiv for papers" got
+skipped on advice-shaped questions, with the model reasoning "no skill needed,
+it's a general question", and then using the tools without any of the rules
+above. The description now claims those questions explicitly. Routing is still
+a model judgement rather than a guarantee: if the skill gets skipped, the
+description is the thing to edit.</p>
+<p>No Python and no build step. The arXiv API is a plain HTTP GET returning Atom
+XML, so <code>lib/atom.js</code> parses exactly the fields we use, and the only thing the
+plugin needs from the harness is <code>@deepseek-ai/dsh-tools</code>.</p>
+<p><strong>That must stay a peer dependency, never a regular one.</strong> dsh writes
+<code>autoInstallPeers: false</code> into every profile's <code>pnpm-workspace.yaml</code> on purpose:
+the harness owns <code>dsh-tools</code>, and a plugin that declares it under
+<code>dependencies</code> makes pnpm install a <em>second copy</em> into the profile.
+<code>TOOL_RUNTIME_SCHEDULER</code> inside that package is a module-local <code>Symbol()</code>, so
+two copies mean two different symbols, and the whole tool registry breaks — not
+just this plugin's tools. The symptom is every tool call in the session, built-in
+ones included, failing with:</p>
+<pre><code>Cannot read properties of undefined (reading 'prepare')
+</code></pre>
+<p>Verified working on dsh <code>0.1.0-rc.8</code>, in both the headless and web profiles.</p>
+<h2>Install</h2>
+<p>Two lines: add the package to the profile you use, then start it. Nothing to
+download by hand and no build step.</p>
+<pre><code>dsh plugin --profile web add dsh-arxiv-ml-search
+</code></pre>
+<p>Without a global dsh install, the same through npx:</p>
+<pre><code>npx @deepseek-ai/dsh dsh plugin --profile web add dsh-arxiv-ml-search
+npx @deepseek-ai/dsh web
+</code></pre>
+<p>Ask a question and the tools are simply there — no flags, no mention of the
+plugin:</p>
+<blockquote>
+<p>Do any papers show RLHF hurting calibration? Cite ids.</p>
+</blockquote>
+<p>Any other profile works the same way; swap <code>web</code> for <code>headless</code> and it answers
+one task on the command line and exits:</p>
+<pre><code>dsh plugin --profile headless add dsh-arxiv-ml-search
+dsh --profile headless "Do any papers show RLHF hurting calibration? Cite ids."
+</code></pre>
+<h3>Installing an unpublished build</h3>
+<p>Only needed when you are working on the plugin itself. <code>dsh plugin add</code> is a
+thin wrapper over pnpm, so it takes a directory, a tarball or a git URL wherever
+a package name would go:</p>
+<pre><code>dsh plugin --profile web add ../dsh-arxiv-ml-search          # a working copy
+dsh plugin --profile web add ./dsh-arxiv-ml-search-0.1.0.tgz  # a local pack
+</code></pre>
+<p>Installing from the registry needs none of this.</p>
+<h3>If the plugin does not show up</h3>
+<p>Loading needs the package listed in <code>dsh.profile.bundles</code>
+(<code>~/.dsh/profiles/&lt;name&gt;/package.json</code>), not just in <code>dependencies</code>. Normally
+<code>dsh plugin add</code> appends it for you: after pnpm succeeds it walks the
+dependencies and adds every package that declares <code>dsh.bundle</code>.</p>
+<p>The catch is that the reconcile step only runs when pnpm exits <strong>zero</strong>. An
+unrelated blocked build script elsewhere in the profile — <code>ERR_PNPM_IGNORED_BUILDS</code>
+is the usual one — aborts the command first, so the package installs but never
+joins the layer stack and the plugin stays silently inert. Check the manifest
+after installing and add the entry by hand if it is missing:</p>
+<pre><code>"dsh": { "profile": { "bundles": [ "...", "dsh-arxiv-ml-search" ] } }
+</code></pre>
+<p>Confirm what actually composes, without booting anything:</p>
+<pre><code>dsh --profile web --dump-config
+</code></pre>
+<h2>Develop</h2>
+<pre><code>pnpm install                      # needed once: tests/plugin.test.js loads index.js
+node --test                       # unit tests, offline, against saved feeds
+node scripts/smoke.mjs "rlhf"     # live check against the real API
+node scripts/smoke.mjs --refresh-fixtures
+</code></pre>
+<p>Dev-load without installing, via <code>dev.cordis.yml</code> in this directory:</p>
+<pre><code>- insert:
+    - id: dsh-arxiv-ml-search
+      name: file:///C:/absolute/path/to/dsh-arxiv-ml-search/index.js
+
+dsh --profile headless --patch ./dev.cordis.yml "Do any papers show RLHF hurting calibration?"
+</code></pre>
+<p>Two things bite here:</p>
+<ul>
+<li>The path must be <strong>absolute</strong>; a relative one resolves against the harness
+installation, not your working directory.</li>
+<li>On Windows it must additionally be a <strong><code>file://</code> URL</strong>. A bare <code>C:/...</code> makes
+the ESM loader fail with <code>ERR_UNSUPPORTED_ESM_URL_SCHEME</code> (<code>Received protocol 'c:'</code>), because it reads the drive letter as a URL scheme.</li>
+</ul>
+<p>Check the overlay composes into the tree before booting anything:</p>
+<pre><code>dsh --profile headless --patch ./dev.cordis.yml --dump-config
+</code></pre>
+<p>Use the overlay for iterating on the source; use a real install (above) for
+anything you actually want to keep.</p>
+<h2>Layout</h2>
+<pre><code>index.js          host plugin: tool + skill registration only
+lib/query.js      builds search_query and request URLs
+lib/atom.js       Atom feed -&gt; paper records
+lib/segment.js    truncation and segmentation (text budget)
+lib/format.js     paper records -&gt; tool output and chat rendering
+lib/http.js       fetch: User-Agent, rate limit, timeout, one retry
+lib/arxiv.js      orchestration, testable with an injected fetch
+tests/            node:test suites; fixtures are real captured feeds
+</code></pre>
+<p>Every deterministic step lives in <code>lib/</code> so the tests run without the harness
+and without the network. <code>lib/http.js</code> is the only impure module, and it takes
+<code>fetchImpl</code> as an option for exactly that reason.</p>
+<h2>Config</h2>
+<p>Set in the profile entry for this plugin:</p>
+<table>
+<thead>
+<tr>
+<th>key</th>
+<th>default</th>
+<th>meaning</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>categories</code></td>
+<td>the ML set</td>
+<td>categories used by <code>ml_only</code></td>
+</tr>
+<tr>
+<td><code>abstractChars</code></td>
+<td>350</td>
+<td>abstract budget per search result</td>
+</tr>
+<tr>
+<td><code>limit</code></td>
+<td>10</td>
+<td>default page size</td>
+</tr>
+<tr>
+<td><code>contact</code></td>
+<td>—</td>
+<td>contact address added to the User-Agent</td>
+</tr>
+<tr>
+<td><code>timeoutMs</code></td>
+<td>20000</td>
+<td>per-request timeout</td>
+</tr>
+</tbody></table>
+<h2>Notes on the arXiv API</h2>
+<ul>
+<li>Requests are spaced at least three seconds apart and carry an identifying
+User-Agent, as arXiv asks of API clients. The limiter is process-wide.</li>
+<li>Search covers metadata and abstracts, not full text. A claim that turns on
+experimental detail needs the paper itself — the skill says so explicitly.</li>
+<li>arXiv is preprints. Absence of a result is not evidence of absence.</li>
+</ul>
+<h2>Query syntax</h2>
+<p>Plain text becomes a phrase clause. Anything containing a field prefix or a
+boolean operator is passed through to the API unchanged:</p>
+<pre><code>abs:"reward hacking" ANDNOT abs:"reinforcement learning from human feedback"
+(ti:"scaling laws" OR ti:"scaling law") AND cat:cs.LG
+</code></pre>
+<p>Generated with <a href="https://github.com/ciceroyang/dsh-plugin-starter">dsh-plugin-starter</a>.</p>

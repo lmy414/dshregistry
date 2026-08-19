@@ -1,0 +1,153 @@
+<h1>dsh-auto-review</h1>
+<p><strong>English</strong> | <a href="https://github.com/accpowered/dsh-auto-review/blob/HEAD/README.zh.md">简体中文</a></p>
+<p>LLM auto-review approval answerer for <a href="https://github.com/deepseek-ai/deepseek-harness">DeepSeek Harness</a>: when a session's approval policy is <code>'auto'</code>, sandbox escalations beyond workspace-write (<code>sandbox_permissions: "danger-full-access"</code> + justification) are decided <strong>without a human prompt</strong> — a human is asked only when the reviewer is unsure, and every error path fails closed.</p>
+<p>Two decision layers, in order:</p>
+<ol>
+<li><strong>Deterministic filter</strong> — hardline (always-deny) + deny/allow regex rules over a normalized command (<code>~</code>/<code>$HOME</code> expansion, comment stripping, whitespace collapse, macOS private-path folding). A hardline or deny match rejects immediately; an allow match grants immediately; neither runs the LLM. Deterministic denials are FINAL — operator policy is never appealed.</li>
+<li><strong>Clean-context LLM safety review</strong> — the gray zone goes to a small reviewer model with a fixed constant system prompt, <code>temperature: 0</code>, a single-word verdict (<code>ALLOW</code> / <code>DENY</code> / <code>UNSURE</code>), and a tight output cap. The user message carries ONLY the tool name, the justification, and the XML-wrapped command — never the conversation.</li>
+</ol>
+<p><strong>Appeal mode</strong> (<code>context: 'appeal-user-prompts'</code>, the default): an LLM-voiced <code>DENY</code> is re-judged ONCE with the session's genuine user prompts attached as intent evidence — extracted deterministically (never LLM-summarized) from <code>user/message</code> events whose source kind is exactly <code>'user'</code>. Appeals can only RELAX a denial, never tighten an allowance: they reduce false positives; they are not a detection upgrade.</p>
+<p>The answerer registers with <code>{ prepend: true }</code> on <code>approval/request</code>, so it runs before any human/machine channel, and delegates with <code>next()</code> whenever the effective policy is not <code>'auto'</code> or the request carries no action. The reviewer is defense-in-depth against an honest-but-wrong model, never a sandbox-widening mechanism: workspace-write remains the boundary until a grant lands. An optional consecutive-denial <strong>circuit breaker</strong> (<code>denialBreakerThreshold</code>) short-circuits retry loops before any further LLM cost.</p>
+<h2>⚠ Requires a patched harness core</h2>
+<p>This plugin <strong>cannot run on stock upstream deepseek-harness</strong>. It needs three patched-core surfaces, shipped in <a href="https://github.com/accpowered/dsh-auto-review/blob/HEAD/core-patches/">core-patches/</a> as two git patches with a rebase guide (authored against upstream base commit <code>47f943859b</code>, merge PR #2519):</p>
+<ul>
+<li><code>0001-approval-auto-policy-and-escalation-action.patch</code> — the <code>'auto'</code> approval policy, <code>ApprovalRequest.action</code>, <code>ApprovalService.effectivePolicyFor</code>, and the tool/sandbox/permission-presets wiring that carries the escalation action.</li>
+<li><code>0002-llm-auto-review-request-purpose.patch</code> — the <code>'auto-review'</code> LLM request purpose.</li>
+</ul>
+<p>Apply them with <code>git am</code> (or <code>git apply</code>) <strong>in order</strong> after syncing upstream; if upstream conflicts, resolve and regenerate — see <a href="https://github.com/accpowered/dsh-auto-review/blob/HEAD/core-patches/README.md">core-patches/README.md</a>.</p>
+<p><strong>On vanilla upstream the plugin is deliberately inert:</strong> the policy gate never resolves to <code>'auto'</code>, so every escalation lazily delegates (<code>next()</code>) to the normal human answerers. Nothing breaks, nothing is auto-decided — but you get no auto-review until the patched core is in place.</p>
+<h2>Install</h2>
+<p>Prerequisites: a patched harness build (above), and the profile's permission presets must include the <code>auto-review</code> preset (<code>sandbox: workspace-write</code> + <code>approval: auto</code>) — patch 0001 adds it to the harness's <code>permission-presets</code> package.</p>
+<p>From GitHub (builds on install via its <code>prepare</code> script; pnpm will ask you to allow the build once):</p>
+<pre><code>dsh plugin --profile web add github:accpowered/dsh-auto-review
+</code></pre>
+<p>If pnpm prints an <code>allowBuilds</code> prompt, add the printed key under <code>allowBuilds</code> in the profile's <code>pnpm-workspace.yaml</code> and re-run the <code>add</code> — this is install-time code execution permission, so only allow sources you trust (pinning a commit, <code>github:accpowered/dsh-auto-review#&lt;sha&gt;</code>, is recommended).</p>
+<p>From a local checkout:</p>
+<pre><code>dsh plugin --profile web add ./dsh-auto-review
+</code></pre>
+<p>Restart <code>dsh web</code> (or your profile). The bundle patch (<a href="https://github.com/accpowered/dsh-auto-review/blob/HEAD/cordis.patch.yml">cordis.patch.yml</a>) inserts one host row with a default reviewer route (<code>deepseek-official</code> / <code>deepseek-v4-flash</code>). To use a different reviewer, restate the row in your profile's <code>cordis.patch.yml</code> — <code>provider</code> and <code>model</code> are required and a patch replaces the row's whole config:</p>
+<pre><code>- id: auto-review
+  name: dsh-auto-review
+  config:
+    provider: my-provider      # any registered LLM route
+    model: my-small-model
+</code></pre>
+<h2>Configuration</h2>
+<p>All knobs (composition = the cordis.patch.yml row config; user = live override through the <code>auto-review</code> settings namespace):</p>
+<table>
+<thead>
+<tr>
+<th>Key</th>
+<th>Default</th>
+<th>Composition</th>
+<th>User-overridable</th>
+<th>Purpose</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>provider</code></td>
+<td>— (required)</td>
+<td>✓</td>
+<td>✓</td>
+<td>Reviewer route (a registered provider)</td>
+</tr>
+<tr>
+<td><code>model</code></td>
+<td>— (required)</td>
+<td>✓</td>
+<td>✓</td>
+<td>Reviewer model id on that route</td>
+</tr>
+<tr>
+<td><code>hardline</code></td>
+<td>shipped list</td>
+<td>✓</td>
+<td>—</td>
+<td>Always-denied regex patterns; never bypassed while policy is <code>auto</code></td>
+</tr>
+<tr>
+<td><code>deny</code></td>
+<td>shipped list</td>
+<td>✓</td>
+<td>✓</td>
+<td>Configurable deny regex patterns</td>
+</tr>
+<tr>
+<td><code>allow</code></td>
+<td>shipped list</td>
+<td>✓</td>
+<td>✓</td>
+<td>Configurable allow regex patterns (conservative, side-effect-free only)</td>
+</tr>
+<tr>
+<td><code>maxTokens</code></td>
+<td><code>512</code></td>
+<td>✓</td>
+<td>—</td>
+<td>Reviewer output-token cap (single-word verdict + headroom)</td>
+</tr>
+<tr>
+<td><code>timeoutMs</code></td>
+<td><code>15000</code></td>
+<td>✓</td>
+<td>—</td>
+<td>End-to-end reviewer deadline (ms)</td>
+</tr>
+<tr>
+<td><code>onError</code></td>
+<td><code>deny</code></td>
+<td>✓</td>
+<td>✓</td>
+<td>Reviewer-failure fallback: <code>deny</code> (fail closed) or <code>ask</code> (human)</td>
+</tr>
+<tr>
+<td><code>onUnsure</code></td>
+<td><code>ask</code></td>
+<td>✓</td>
+<td>✓</td>
+<td>UNSURE-verdict fallback: <code>ask</code> (human) or <code>deny</code></td>
+</tr>
+<tr>
+<td><code>denialBreakerThreshold</code></td>
+<td><code>0</code> (off)</td>
+<td>✓</td>
+<td>✓</td>
+<td>Consecutive-denial circuit breaker</td>
+</tr>
+<tr>
+<td><code>context</code></td>
+<td><code>appeal-user-prompts</code></td>
+<td>✓</td>
+<td>✓</td>
+<td><code>appeal-user-prompts</code> or <code>minimal</code> (command alone, v1 behavior)</td>
+</tr>
+<tr>
+<td><code>appealMaxPrompts</code></td>
+<td><code>0</code> (unbounded)</td>
+<td>✓</td>
+<td>✓</td>
+<td>Appeal budget: newest user prompts attached (first prompt exempt)</td>
+</tr>
+<tr>
+<td><code>appealMaxChars</code></td>
+<td><code>0</code> (unbounded)</td>
+<td>✓</td>
+<td>✓</td>
+<td>Appeal budget: total user-prompt characters attached</td>
+</tr>
+</tbody></table>
+<p><code>hardline</code>, <code>maxTokens</code>, and <code>timeoutMs</code> are composition-only by design. The shipped filter defaults are documented in <code>src/index.ts</code> (<code>DEFAULT_HARDLINE_PATTERNS</code> / <code>DEFAULT_DENY_PATTERNS</code> / <code>DEFAULT_ALLOW_PATTERNS</code>).</p>
+<h2>Live user-layer overrides</h2>
+<p>User-tunable keys live in the <strong><code>auto-review</code> settings namespace</strong> (registered through <code>installSettingsSection</code>; the namespace name stays <code>auto-review</code> so existing user settings documents keep applying). The composition entry is the base layer; a committed user-layer change re-resolves and recompiles the rule patterns on the very next decision — no restart. A write carrying an invalid regex is refused at the settings seam, so a bad pattern can never reach the compiled filter.</p>
+<h2>Uninstall</h2>
+<pre><code>dsh plugin --profile web remove dsh-auto-review
+</code></pre>
+<p>The answerer and the settings section detach with the plugin fiber. Log-only <code>auto-review/decision</code> events already on session logs are left untouched, and sessions on the <code>auto-review</code> preset fall back to the human answerers.</p>
+<h2>Development</h2>
+<pre><code>pnpm install
+pnpm build       # tsc declarations (lib/types) + tsdown (lib/index.js)
+pnpm test        # vitest: filter/verdict/appeal flows, settings lifecycle (local approval stub)
+</code></pre>
+<p>Layout: <code>src/index.ts</code> (the whole plugin — answerer, config schema, settings section, exported pure functions), <code>tests/auto-review.spec.ts</code> + <code>tests/stubs.ts</code> (the stub replicates the patched ApprovalService's dispatch semantics; the npm rc.1 package predates the <code>'auto'</code> policy), <code>core-patches/</code> (the two required core patches + rebase guide).</p>
+<h2>License</h2>
+<p>MIT</p>

@@ -1,0 +1,201 @@
+<h1>dsh-feishu</h1>
+<p><strong><a href="https://github.com/0x0101010/dsh-feishu/blob/HEAD/README.zh-CN.md">中文</a></strong> | English</p>
+<p>A Feishu (Lark) long-connection channel plugin for <a href="https://github.com/deepseek-ai/deepseek-harness">DeepSeek Harness (dsh)</a>: bridges a dsh agent to a Feishu bot, so you can dispatch tasks, receive results, and approve permissions right in chat.</p>
+<p><strong>Zero npm dependencies</strong> — built on Node &gt;= 22's native <code>WebSocket</code> plus a hand-written protobuf Frame codec (field numbers match the official <code>oapi-sdk-go</code> WS module). The whole plugin is a single <code>index.js</code>.</p>
+<h2>Features</h2>
+<ul>
+<li><strong>WebSocket long connection</strong>: uses Feishu's official WebSocket callback (<code>callback/ws/endpoint</code>) — no public IP, no port forwarding, no callback server needed</li>
+<li><strong>One agent per chat</strong>: each conversation gets an isolated context; idle sessions are recycled automatically (default 30 min)</li>
+<li><strong>Approvals as interactive cards</strong>: dsh approval requests become Feishu card buttons (✅ allow / ❌ deny); click or reply <code>y</code>/<code>n</code>; the card updates in place once handled</li>
+<li><strong>Mid-turn steering</strong>: send a message while a task is running and it's injected into the current turn at the next step boundary — no interruption; <code>/stop</code> is the hard interrupt</li>
+<li><strong>Mode switching</strong>: <code>/mode</code> switches agent presets (minimal / standard / PTC / creative), orthogonal to permission presets</li>
+<li><strong>Command bridge</strong>: all dsh built-in commands (<code>/permission</code> <code>/plan</code> <code>/compact</code> <code>/goal</code> <code>/export</code> …) work in chat</li>
+<li>Auto-reconnect (5s after close), heartbeat keepalive, event ack (prevents Feishu redelivery), seq-based dedup after resume</li>
+</ul>
+<h2>Requirements</h2>
+<ul>
+<li>Node &gt;= 22 (native WebSocket; developed on 23)</li>
+<li>A working dsh deployment (<code>npx @deepseek-ai/dsh</code>)</li>
+<li>A Feishu Open Platform app (a self-built enterprise app is fine) with:<ul>
+<li><strong>Events &amp; Callbacks</strong> → long-connection (WebSocket) mode</li>
+<li><strong>Bot</strong> capability enabled</li>
+<li>Scopes: <code>im:message</code> (send/receive), etc.</li>
+</ul>
+</li>
+</ul>
+<h2>Install</h2>
+<pre><code>npx @deepseek-ai/dsh plugin --profile feishu add /path/to/dsh-feishu
+</code></pre>
+<p>Credentials never go into config files — they come from environment variables (put them in the profile's <code>.env</code>, or global <code>~/.dsh/.env</code>):</p>
+<pre><code>FEISHU_APP_ID=cli_xxxxxxxx
+FEISHU_APP_SECRET=xxxxxxxx
+# optional: agent working directory
+DSH_FEISHU_CWD=/your/workspace
+</code></pre>
+<p>Verify the composed config and start:</p>
+<pre><code>npx @deepseek-ai/dsh --profile feishu --dump-config   # verify
+npx @deepseek-ai/dsh --profile feishu                  # start
+</code></pre>
+<h2>Configuration (<code>cordis.patch.yml</code>)</h2>
+<table>
+<thead>
+<tr>
+<th>Key</th>
+<th>Default</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>appId</code></td>
+<td>required</td>
+<td>Feishu App ID (<code>FEISHU_APP_ID</code>)</td>
+</tr>
+<tr>
+<td><code>appSecret</code></td>
+<td>required</td>
+<td>Feishu App Secret (<code>FEISHU_APP_SECRET</code>)</td>
+</tr>
+<tr>
+<td><code>domain</code></td>
+<td><code>https://open.feishu.cn</code></td>
+<td>API domain; use <code>https://open.larksuite.com</code> for the international version</td>
+</tr>
+<tr>
+<td><code>cwd</code></td>
+<td><code>process.cwd()</code></td>
+<td>Agent working directory</td>
+</tr>
+<tr>
+<td><code>allowUsers</code></td>
+<td><code>[]</code></td>
+<td>open_id allowlist; <strong>empty = no restriction</strong> — set this in production</td>
+</tr>
+<tr>
+<td><code>allowChats</code></td>
+<td><code>[]</code></td>
+<td>chat_id allowlist; empty = no restriction</td>
+</tr>
+<tr>
+<td><code>sessionTimeoutMs</code></td>
+<td><code>1800000</code></td>
+<td>Idle session recycle timeout</td>
+</tr>
+<tr>
+<td><code>defaultMode</code></td>
+<td><code>standard</code></td>
+<td>Default agent preset for new sessions</td>
+</tr>
+<tr>
+<td><code>modeAliases</code></td>
+<td>see patch</td>
+<td>Mode aliases (defaults include Chinese aliases)</td>
+</tr>
+</tbody></table>
+<blockquote>
+<p>Security note: when <code>allowUsers</code>/<code>allowChats</code> are empty, <strong>anyone who can talk to the bot</strong> can drive your agent (executing tasks on your machine). Configure them before sharing publicly.</p>
+</blockquote>
+<h2>Slash commands</h2>
+<h3>Native commands (handled by this plugin)</h3>
+<table>
+<thead>
+<tr>
+<th>Command</th>
+<th>Args</th>
+<th>Behavior</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>/new</code></td>
+<td>—</td>
+<td>Dispose the current session: context cleared, agent destroyed, next message gets a brand-new agent. Use after <code>/mode</code> on a session with history, or to start a fresh task.</td>
+</tr>
+<tr>
+<td><code>/mode</code></td>
+<td>—</td>
+<td>List all agent presets with descriptions and mark the current one (<code>✅</code>). Also shows whether any preset is broken (e.g. <code>code</code> needs a host runtime not present in the base bundle).</td>
+</tr>
+<tr>
+<td><code>/mode &lt;preset&gt;</code></td>
+<td>id or alias</td>
+<td>Switch the chat's agent preset: <code>minimal</code> (极简) / <code>standard</code> (标准) / <code>code</code> (ptc) / <code>cordis</code> (创造). <strong>Blank session</strong> → takes effect immediately. <strong>Session with history</strong> → the choice is recorded (<code>📌</code>) and applies after <code>/new</code> (presets lock at agent creation). Unknown names list the valid ids.</td>
+</tr>
+<tr>
+<td><code>/status</code></td>
+<td>—</td>
+<td>Current model (provider/model), active mode, chat id, agent status (<code>running</code>/<code>idle</code>), minutes since last activity, idle-recycle countdown, pending-approval indicator.</td>
+</tr>
+<tr>
+<td><code>/stop</code></td>
+<td>—</td>
+<td>Hard-interrupt the running turn: cancels in-flight work <strong>and clears any queued inputs</strong>. If nothing is running, replies "agent idle".</td>
+</tr>
+<tr>
+<td><code>/help</code></td>
+<td>—</td>
+<td>Built-in help text.</td>
+</tr>
+</tbody></table>
+<h3>Approval answers (not slash commands)</h3>
+<p>When an approval card is pending, a bare <code>y</code> = allow, <code>n</code> = deny (case-insensitive). Clicking the card buttons does the same; the card is updated in place either way.</p>
+<h3>Bridged dsh commands</h3>
+<p>Everything else starting with <code>/</code> is forwarded to dsh's command service, so <strong>all built-in commands work in chat</strong>. Common ones:</p>
+<table>
+<thead>
+<tr>
+<th>Command</th>
+<th>Behavior</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>/permission</code></td>
+<td>Show the current permission preset</td>
+</tr>
+<tr>
+<td><code>/permission &lt;preset&gt;</code></td>
+<td>Switch: <code>read-only</code> (files read-only, no approval needed) / <code>workspace-write</code> (workspace writable, out-of-bounds needs approval — default) / <code>danger-full-access</code> (full access, no approval)</td>
+</tr>
+<tr>
+<td><code>/plan</code></td>
+<td>Toggle plan mode: agent plans first, executes after you approve</td>
+</tr>
+<tr>
+<td><code>/compact</code></td>
+<td>Compress session history to reclaim context</td>
+</tr>
+<tr>
+<td><code>/goal</code></td>
+<td>Set/view a long-running task goal</td>
+</tr>
+<tr>
+<td><code>/export</code></td>
+<td>Export the session log</td>
+</tr>
+<tr>
+<td><code>/feedback</code></td>
+<td>Record feedback</td>
+</tr>
+</tbody></table>
+<p>Unknown commands reply with the full list of what's available.</p>
+<h3>Plain messages (no slash)</h3>
+<ul>
+<li><strong>Task running</strong> → the message is <em>steered</em> into the current turn: acknowledged with <code>📌</code>, takes effect at the next step boundary, task keeps running. Use <code>/stop</code> to abort instead.</li>
+<li><strong>Agent idle</strong> → starts a new turn as usual.</li>
+</ul>
+<p>In group chats, @mention the bot to trigger any of the above.</p>
+<h2>Development</h2>
+<pre><code>node test.mjs    # offline unit tests: protobuf codec roundtrip + config validation
+node debug.mjs   # debug frame encoding bytes
+</code></pre>
+<p><code>test.mjs</code> extracts the pure-function blocks from <code>index.js</code> and roundtrips them — no dsh startup, no real credentials needed.</p>
+<h2>Protocol notes</h2>
+<p>Feishu WebSocket long-connection protocol (from <code>larksuite/oapi-sdk-go</code> v3 ws module):</p>
+<ol>
+<li><code>POST /callback/ws/endpoint</code> (body carries AppID/AppSecret) returns a WS URL + PingInterval</li>
+<li>Binary frames = protobuf Frame: <code>1=SeqID 2=LogID 3=service 4=method(0 control/1 data) 5=headers 8=payload</code></li>
+<li>Heartbeat: send <code>method=0 + headers[{type:ping}]</code> every PingInterval</li>
+<li>Data frames have header <code>type=event</code>; payload is event JSON (core: <code>im.message.receive_v1</code>)</li>
+<li><strong>Every event must be acked</strong> (original headers + <code>biz_rt</code> + <code>{"code":200}</code>) or Feishu will redeliver</li>
+</ol>
+<p>The codec is hand-written at the top of <code>index.js</code> (<code>encodeFrame</code>/<code>decodeFrame</code>) — no protobufjs dependency.</p>
+<h2>License</h2>
+<p>MIT</p>

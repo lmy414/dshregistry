@@ -1,0 +1,263 @@
+<h1>toolshrink</h1>
+<p><strong>Cut large agent tool output by what it means, not by where it was cut.</strong></p>
+<p>I use Claude Code every day, and I always wanted to intervene in how it manages
+context. In the early days you could edit the session JSONL directly. Then that
+door closed.</p>
+<p>When DeepSeek open-sourced Harness, where everything is a plugin, I looked
+inside. Tool output there is cut by size: keep the head, keep the tail, drop
+the middle. I read Codex and pi, and they do the same. None of them look at
+what the text contains.</p>
+<p>That fails in a predictable way. Your test suite prints 5,000 passing lines and
+3 failures in the middle. A size cut keeps the passes and throws away the
+failures. The model reads it, believes the run, and answers wrong.</p>
+<p>So I built the shrinker I always wished Claude Code had. It reads the output
+first, recognizes its shape, and keeps the part that carries the information:</p>
+<pre><code>input: a vitest run, 31,958 chars, 805 lines, budget 2,000 chars
+
+head+tail cut:   1,904 chars   the model learns: the summary
+toolshrink:        255 chars   the model learns: which test failed,
+                               why, at which line, and the summary
+</code></pre>
+<p>Everything removed is counted in a marker the model can read, and the complete
+original is saved to disk with a locator. Nothing is lost silently.</p>
+<h2>The cuts</h2>
+<p>Each cut recognizes one shape of text. The first one that recognizes the input
+runs. When none does, the size fallback runs, so the result always fits the
+budget.</p>
+<table>
+<thead>
+<tr>
+<th>Cut</th>
+<th>Recognizes</th>
+<th>Keeps</th>
+<th>Drops</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>diff</code></td>
+<td>git diff, patches</td>
+<td>changed lines, file and hunk headers, 1 context line each side</td>
+<td>unchanged context</td>
+</tr>
+<tr>
+<td><code>json</code></td>
+<td>one JSON value</td>
+<td>the structure, 3 samples per long array, 5 keys per wide object, counts</td>
+<td>repeated records</td>
+</tr>
+<tr>
+<td><code>tests</code></td>
+<td>vitest, jest, pytest, cargo test, go test</td>
+<td>failures with their explanation, the summary</td>
+<td>passing tests</td>
+</tr>
+<tr>
+<td><code>build</code></td>
+<td>tsc, cargo, gcc, webpack, esbuild</td>
+<td>errors and warnings with their code frame, the summary</td>
+<td>build progress</td>
+</tr>
+<tr>
+<td><code>stacktrace</code></td>
+<td>node, Python, Java, Ruby traces</td>
+<td>the message and frames in YOUR code</td>
+<td>dependency frames, counted</td>
+</tr>
+<tr>
+<td><code>log</code></td>
+<td>timestamped logs</td>
+<td>errors and warnings with the lines before them, the ending</td>
+<td>routine lines</td>
+</tr>
+<tr>
+<td><code>tree</code></td>
+<td>find, ls -R, file listings</td>
+<td>the structure, 8 entries per directory, counts</td>
+<td>crowded directories</td>
+</tr>
+<tr>
+<td><code>repeat</code></td>
+<td>retry storms, progress spam</td>
+<td>2 samples per run plus "2,998 similar lines omitted"</td>
+<td>consecutive near-identical lines</td>
+</tr>
+<tr>
+<td><code>lint</code></td>
+<td>eslint, ruff, clippy</td>
+<td>each rule with its count and example locations, worst files</td>
+<td>repeated occurrences of the same rule</td>
+</tr>
+<tr>
+<td><code>install</code></td>
+<td>npm, pip, pnpm, cargo</td>
+<td>the summary, versions, deprecations, vulnerabilities, errors</td>
+<td>fetch and download progress</td>
+</tr>
+<tr>
+<td><code>csv</code></td>
+<td>CSV, TSV, pipe tables</td>
+<td>header, 5 rows from the start, 2 from the end, row and column counts</td>
+<td>the rows between</td>
+</tr>
+<tr>
+<td><code>gitlog</code></td>
+<td>git log, both formats</td>
+<td>the 15 newest commits, the total, the authors with counts</td>
+<td>older commits</td>
+</tr>
+<tr>
+<td><code>size</code></td>
+<td>everything (fallback)</td>
+<td>bash: the end · grep/read: the start · unknown: both ends</td>
+<td>the rest, counted</td>
+</tr>
+</tbody></table>
+<p>Thirteen cuts ship today. Each one is a plain file with a shared interface, so
+adding your own is one file, not a fork.</p>
+<p>Every cut follows four rules, taken from the three agents I read:</p>
+<ul>
+<li>never return a partial line (from pi)</li>
+<li>never split a UTF-16 surrogate pair (from DeepSeek Harness)</li>
+<li>say exactly how much was removed: <code>... 15,903 characters, 401 lines omitted ...</code> (from Codex)</li>
+<li>a second pass changes nothing</li>
+</ul>
+<h2>Use it with DeepSeek Harness</h2>
+<p>One command:</p>
+<pre><code>dsh plugin --profile web add github:unclecode/toolshrink
+</code></pre>
+<p>That is the whole install. The package carries a <code>dsh.bundle</code> manifest, so
+the plugin mounts with a 50,000-character default budget on the next start.
+Change the budget from your own layer, <code>~/.dsh/cordis.patch.yml</code>:</p>
+<pre><code>- id: toolshrink
+  config:
+    maxChars: 20000
+    log: /tmp/toolshrink.log
+</code></pre>
+<p>Hacking on it instead? Clone, <code>npm install &amp;&amp; npm run build</code>, and mount the
+adapter file by path with an insert row (see Adapter config below).</p>
+<h3>Adapter config</h3>
+<pre><code>- insert:
+    - id: toolshrink
+      name: /path/to/toolshrink/adapters/harness/toolshrink.mjs
+      config:
+        maxChars: 50000        # cut above this many characters (default 50000)
+        maxLines: 2000         # or above this many lines (default 2000)
+        maxLineChars: 0        # cap single long lines, 0 = off (default 0)
+        disable: [json]        # skip named cuts (default none)
+        spillDir: ~/.dsh-toolshrink   # where full originals go
+        log: /tmp/toolshrink.log      # one line per cut, omit for silence
+</code></pre>
+<p>The log line format: <code>bash  64151 -&gt; 2942 via tree+size</code>.</p>
+<h2>Use it as a library</h2>
+<pre><code>import { shrink, FileSpillStore } from 'toolshrink'
+
+const out = shrink(bigText, { tool: 'bash', command: 'npm test' }, {
+  budget: { maxChars: 20_000 },
+  spill: new FileSpillStore({ dir: '/tmp/spills' }),  // optional
+})
+
+out.content   // the text to give the model
+out.reduced   // false when the input already fit
+out.strategy  // "tests", "diff+size", "size:tail", "none", ...
+out.note      // one human-readable line about what happened
+out.stats     // inputChars, outputChars, keptLines, droppedLines, ...
+</code></pre>
+<p>The <code>hint</code> (second argument) is optional and improves routing: <code>tool</code> picks the
+size direction, <code>command</code> helps detect test runs and diffs, <code>path</code> helps detect
+JSON and logs.</p>
+<h2>Write your own cut</h2>
+<p>A cut is one file that default-exports three members. The file name is the cut
+name.</p>
+<pre><code>// mycut.mjs
+export default {
+  name: 'mycut',
+  // Cheap and certain. When unsure, return false: a wrong match is worse
+  // than the size fallback.
+  detect(text, hint) {
+    return hint.command?.startsWith('kubectl') ?? false
+  },
+  // Return null to decline after a closer look; the next cut then tries.
+  reduce(text, hint, budget) {
+    const content = text.slice(0, budget.maxChars) // your real logic here
+    return {
+      content,
+      reduced: true,
+      strategy: 'mycut',
+      note: 'kept the part I know matters',
+      stats: {
+        inputChars: text.length, inputLines: 0,
+        outputChars: content.length, outputLines: 0,
+      },
+    }
+  },
+}
+</code></pre>
+<p>Use it:</p>
+<pre><code>import { shrink, loadReducers } from 'toolshrink'
+
+const mine = await loadReducers('/path/to/my-cuts')   // reads the directory
+shrink(text, hint, { extra: mine })                    // tried BEFORE built-ins
+</code></pre>
+<p>Or control the built-ins: <code>{ only: ['tests', 'diff'] }</code> restricts and orders,
+<code>{ disable: ['json'] }</code> skips.</p>
+<h2>Spill: nothing is lost</h2>
+<p>With a spill store, the complete original is saved before any cut, and the cut
+text ends with:</p>
+<pre><code>[full output saved as spill:bash-d63d2aebb643: directories sampled to 8 entries each]
+</code></pre>
+<p><code>store.load('spill:bash-d63d2aebb643')</code> returns the original, byte for byte.
+Files are cleaned after 24 hours. The store is an interface; the default writes
+files, a host can plug its own storage.</p>
+<h2>What I saw in live use</h2>
+<p>With a 3,000-character budget, the agent got a 60,000-character <code>find</code> result
+cut down to its head. Its reply began: <em>"The output was truncated. Let me get a
+count by directory"</em> - it saw the omission marker, re-queried with aggregation,
+and answered correctly from 4,000 total characters instead of 60,000.</p>
+<p>That is the design working: an honest marker turns a cut from silent data loss
+into a signal the model acts on. This is the intervention I always wanted, and
+now it is a YAML row.</p>
+<h2>TODO: cuts I want next</h2>
+<p>Each of these is one file with the same interface. Pick one and send a pull
+request.</p>
+<table>
+<thead>
+<tr>
+<th>Cut</th>
+<th>Recognizes</th>
+<th>Would keep</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>semantic</code></td>
+<td>anything, given the agent's current goal</td>
+<td>the chunks most relevant to the goal. Two stages: lexical scoring (BM25, no model needed), then optional embedding scoring for meaning beyond shared words</td>
+</tr>
+<tr>
+<td><code>sql</code></td>
+<td>query results, EXPLAIN plans</td>
+<td>the plan's expensive nodes, sampled result rows</td>
+</tr>
+<tr>
+<td><code>docker</code></td>
+<td>build and compose output</td>
+<td>the failing layer, the final image, dropped build chatter</td>
+</tr>
+</tbody></table>
+<p>The <code>semantic</code> cut is the interesting one: every cut above decides by SHAPE,
+this one would decide by RELEVANCE. It needs one extra input, a query for what
+the agent is working on right now, which the host adapter can pass through the
+<code>hint</code>.</p>
+<h2>Adapters for other agents</h2>
+<p>The library knows nothing about any agent. The Harness adapter is 70 lines:
+catch the result event, call <code>shrink</code>, return the replacement.</p>
+<ul>
+<li><strong>pi</strong> (<code>earendil-works/pi</code>) has an extension API with tool-result access.</li>
+<li><strong>Codex</strong> (<code>openai/codex</code>) has a plugin system in <code>codex-rs/core-plugins</code>.</li>
+</ul>
+<p>Both adapters are open work. If you write one, a pull request is welcome.</p>
+<h2>License</h2>
+<p>MIT. Use it, change it, no need to ask.</p>
+<p>Built by <a href="https://x.com/unclecode">@unclecode</a>, author of
+<a href="https://github.com/unclecode/crawl4ai">Crawl4AI</a>
+<a href="https://github.com/unclecode/crawl4ai"><img src="https://img.shields.io/github/stars/unclecode/crawl4ai?style=social" alt="Crawl4AI stars"></a>.
+Follow me on X for what I build next: <a href="https://x.com/unclecode">x.com/unclecode</a>.</p>

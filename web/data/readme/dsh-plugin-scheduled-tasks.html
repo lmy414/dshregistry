@@ -1,0 +1,294 @@
+<h1>dsh-plugin-scheduled-tasks</h1>
+<p>给 <a href="https://github.com/deepseek-ai/deepseek-harness">DeepSeek Harness</a> 的定时任务插件。</p>
+<p>到点自动<strong>新建一个会话</strong>并发起一轮对话——「每天九点帮我看一下 CI」这类事情不必有人守着。侧边栏底部有入口，可以增删改任务、暂停/启用、立即运行，并查看运行历史。</p>
+<ul>
+<li><strong>三种触发规则</strong>：每天 / 每周几 / 固定间隔（最短 5 分钟），按 IANA 时区计算，正确处理夏令时跳变</li>
+<li><strong>无人值守权限</strong>：附带一个「限定在工作区内、且不会停下来征求批准」的权限预设——dsh 出厂预设里没有这个组合</li>
+<li><strong>完成通知</strong>：Bark / 企业微信群机器人 / ntfy / Server酱 / Telegram / 飞书 / 钉钉，或任意 webhook</li>
+<li><strong>模型可以自己排任务</strong>：<code>scheduled_task_*</code> 工具在每个会话里都能用</li>
+<li><strong>点通知直接跳进那次会话</strong>，运行历史里也能点开</li>
+<li><strong>一条命令装完即用</strong>：<code>dsh plugin --profile web add github:Jeff1573/dsh-plugin-scheduled-tasks</code>，插件自带 bundle patch，不用手改配置</li>
+<li><strong>可以放到反向代理后面</strong>（TLS + 密码）从任何设备访问，见 <a href="https://github.com/Jeff1573/dsh-plugin-scheduled-tasks/blob/HEAD/docs/reverse-proxy.md">反向代理部署</a></li>
+</ul>
+
+
+<h2>安装</h2>
+<p>前提：已经用得上 <code>dsh</code>（<code>npx @deepseek-ai/dsh web</code> 或全局安装）。</p>
+<h3>一条命令（推荐）</h3>
+<pre><code>dsh plugin --profile web add github:Jeff1573/dsh-plugin-scheduled-tasks
+</code></pre>
+<p>然后重启 <code>dsh web</code> 即可——<strong>不需要手改任何配置文件</strong>。</p>
+<p><code>dsh plugin</code> 把参数转发给 profile 目录里的 pnpm，装完再按已安装状态调和 <code>dsh.profile.bundles</code>：凡是 manifest 里声明了 <code>dsh.bundle.patch</code> 的依赖都会自动加入层栈。本插件带着自己的 <code>cordis.patch.yml</code>，把注册自己那一行放在里面，所以装上就生效。</p>
+<p>想跟某个分支或 tag，在后面加 <code>#</code>：</p>
+<pre><code>dsh plugin --profile web add github:Jeff1573/dsh-plugin-scheduled-tasks#main
+</code></pre>
+<p>几点说明：</p>
+<ul>
+<li><strong>pnpm 必须在 PATH 上</strong>。<code>dsh plugin</code> 只是个 pnpm 转发器，找不到 pnpm 会直接以 127 退出并提示；<code>npm i -g pnpm</code> 即可。</li>
+<li>profile 不存在时会自动初始化，不用先手工建。</li>
+<li><strong>本插件不发布到 npm registry</strong>，只从 git 安装。所以升级也走 git：<code>dsh plugin --profile web update dsh-plugin-scheduled-tasks</code>。</li>
+<li>本插件<strong>没有 <code>prepare</code> 脚本</strong>，<code>lib/</code> 下的构建产物直接提交进仓库，所以 git 安装不需要任何构建步骤，也不会撞上 pnpm 的构建拦截。（其他需要在安装时构建的 git 插件会被 pnpm 拦下，那时 <code>dsh</code> 会提示你把它打印的 key 加到 profile 的 <code>pnpm-workspace.yaml</code> 的 <code>allowBuilds</code> 下再重跑。）</li>
+</ul>
+<h3>手工安装（没有 pnpm 时）</h3>
+<p><strong>仓库必须克隆到 <code>~/.dsh/profiles/</code> 目录树里面。</strong> Node 会把 symlink 解析到真实路径再向上查找 <code>node_modules</code>，只有位于 profiles 树内才能共享 harness 那一份 <code>@deepseek-ai/*</code> 单例；放在别处会加载到重复实例，插件起不来。</p>
+<pre><code>mkdir -p ~/.dsh/profiles/plugins
+git clone https://github.com/Jeff1573/dsh-plugin-scheduled-tasks.git \
+          ~/.dsh/profiles/plugins/scheduled-tasks
+
+mkdir -p ~/.dsh/profiles/web/node_modules
+ln -sfn ~/.dsh/profiles/plugins/scheduled-tasks \
+        ~/.dsh/profiles/web/node_modules/dsh-plugin-scheduled-tasks
+</code></pre>
+<p>然后手工做 <code>dsh plugin</code> 本来会替你做的那件事：把包名加进 <code>~/.dsh/profiles/web/package.json</code> 的 <code>dsh.profile.bundles</code>（<strong>追加在官方 bundle 之后</strong>，层的顺序就是数组顺序）：</p>
+<pre><code>{
+  "dsh": {
+    "profile": {
+      "bundles": [
+        "@deepseek-ai/dsh-base",
+        "@deepseek-ai/dsh-web-app",
+        "dsh-plugin-scheduled-tasks"
+      ]
+    }
+  }
+}
+</code></pre>
+<p>插件自带的 patch 层会接手注册，所以<strong>不要</strong>再往 <code>cordis.patch.yml</code> 里写 <code>insert</code>——两处都写会让插件在合成树里出现两次，而 <code>--dump-config</code> 不会报这个错。</p>
+<h3>（建议）无人值守权限预设</h3>
+<p>理由见下文<a href="#%E6%97%A0%E4%BA%BA%E5%80%BC%E5%AE%88%E7%9A%84%E6%9D%83%E9%99%90">无人值守的权限</a>。这一项<strong>不由插件自带</strong>：patch 的 config 是整体替换，插件擅自重述 <code>permission</code> 那一行会覆盖掉别的层定义的预设，而放宽部署的权限表属于运维决策，不该由某个插件的安装动作代劳。</p>
+<p>所以这一段要你自己加到 <code>~/.dsh/profiles/web/cordis.patch.yml</code>——注意出厂那三个必须原样重述：</p>
+<pre><code>- id: permission
+  name: '@deepseek-ai/dsh-permission-presets'
+  config:
+    presets:
+      read-only:
+        sandbox: read-only
+        approval: ask
+      workspace-write:
+        sandbox: workspace-write
+        approval: ask
+      danger-full-access:
+        sandbox: danger-full-access
+        approval: never
+      scheduled:
+        sandbox: workspace-write
+        approval: never
+        name: 定时任务
+        description: 限定在工作区内，且不会停下来征求批准——供无人值守的定时运行使用。
+</code></pre>
+<h3>确认与重启</h3>
+<pre><code>dsh --profile web --dump-config | grep -A1 scheduled-tasks
+</code></pre>
+<p>只读、不 boot。应当<strong>恰好输出一条</strong> <code>id: scheduled-tasks</code>；输出两条说明既进了 bundle 层又留着手写的 <code>insert</code>，去掉后者。确认无误后重启 <code>dsh web</code>——插件集合变更需要重启，包元数据缓存不过期。</p>
+<h3>从早期的手工安装迁移</h3>
+<p>0.1.0 之前本插件不带 bundle patch，装法是往 profile 的 <code>cordis.patch.yml</code> 里手写一行 <code>insert</code>。现在插件会自注册，那一行<strong>必须删掉</strong>，否则插件加载两次（两套定时器、两个侧边栏入口）。</p>
+<p>把 <code>cordis.patch.yml</code> 里这一段删除：</p>
+<pre><code>- insert:
+    - id: scheduled-tasks
+      name: 'dsh-plugin-scheduled-tasks'
+</code></pre>
+<p><code>permission</code> 那一段（如果加过）保留不动。然后按上面的「确认与重启」核对只剩一条。</p>
+<h3>卸载</h3>
+<pre><code>dsh plugin --profile web remove dsh-plugin-scheduled-tasks
+</code></pre>
+<p><code>dsh plugin</code> 的调和是双向的：依赖没了，它也会从 <code>dsh.profile.bundles</code> 里退出。手工安装的话，把包名从 <code>bundles</code> 里删掉、移除 symlink 即可。两种方式都需要重启。</p>
+<p>任务数据留在 <code>~/.dsh/storages/scheduled_tasks.json</code>，删掉该文件即彻底清除；webhook 地址在 <code>~/.dsh/.credentials.yaml</code> 的 <code>SCHEDULED_TASKS_NOTIFY_URL</code>。</p>
+<h2>使用</h2>
+<p>重启后侧边栏底部会出现「定时任务」入口，点开就是面板。</p>
+<h3>建第一个任务</h3>
+<p>面板右下角「新建任务」。必填只有三项：</p>
+<table>
+<thead>
+<tr>
+<th>字段</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong>触发时间</strong></td>
+<td>「每天」/「每周」/「间隔」三选一。前两者填时:分，按表单下方显示的时区计算；「间隔」填分钟数（≥5）</td>
+</tr>
+<tr>
+<td><strong>任务名称</strong></td>
+<td>列表和通知里显示的名字</td>
+</tr>
+<tr>
+<td><strong>你希望 dsh 做什么？</strong></td>
+<td>到点后新建一个会话，把这段内容作为第一条消息发出</td>
+</tr>
+</tbody></table>
+<p>点「创建」即生效，列表里每行会显示下一次触发时间。</p>
+<h3>高级选项</h3>
+<p>同一个表单里展开「高级选项」：</p>
+<ul>
+<li><strong>工作目录</strong> —— 留空则用默认 cwd</li>
+<li><strong>权限预设</strong> —— 无人值守<strong>建议选 <code>scheduled</code></strong>；留空跟随全局默认，而全局默认通常是会发问的，定时运行会卡住直到超时</li>
+<li><strong>Agent 预设</strong> —— 留空跟随全局默认</li>
+<li><strong>运行超时</strong> —— 默认 30 分钟，到点 <code>agent.cancel()</code> 并记为「超时」</li>
+<li><strong>失败后 5 分钟自动重试一次</strong> —— 只重试一次，不串联</li>
+<li><strong>进程重启后，若已错过触发则补跑一次</strong> —— 默认关闭</li>
+<li><strong>完成后通知</strong> / <strong>附带模型回复摘要</strong> —— 可覆盖全局设置</li>
+</ul>
+<h3>运行与查看</h3>
+<p>列表每行有「立即运行 / 编辑 / 暂停 / 删除」：</p>
+<ul>
+<li><strong>立即运行</strong> 会等到会话创建完成就跳进那个对话，可以看着它流式生成</li>
+<li><strong>定时触发</strong> 的会话会在生成过程中自己出现在侧边栏，但不会抢占你正在看的界面</li>
+<li><strong>历史 N</strong> 展开该任务的运行记录，每条都能点开对应会话；状态分 成功 / 失败 / 超时 / 已中断</li>
+<li>入口上带红点表示最近有失败</li>
+</ul>
+<p>编辑复用新建表单，只是标题变成「编辑自动化任务」。编辑正在运行中的任务不会打断那一次运行，它跑完后按新记录重排。</p>
+<h3>完成通知</h3>
+<p>面板里「通知设置」，勾选「启用完成通知」后选通道：</p>
+<table>
+<thead>
+<tr>
+<th>通道</th>
+<th>怎么填</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong>Bark（iOS 推送）</strong></td>
+<td>地址填 App 给的 <code>https://api.day.app/&lt;KEY&gt;</code>，自架的 Bark 服务器同样可以</td>
+</tr>
+<tr>
+<td><strong>企业微信群机器人</strong></td>
+<td>群里添加「群机器人」，把它给的 Webhook 地址粘进来。官方接口、无需 OAuth，但个人用要先注册企业才能建群</td>
+</tr>
+<tr>
+<td><strong>自定义模板</strong></td>
+<td>地址填服务端点，下面粘贴它要的 JSON body，用 <code>{{占位符}}</code> 取值。界面里有 ntfy / Server酱 / Telegram / 飞书 / 钉钉的现成模板可一键套用</td>
+</tr>
+<tr>
+<td><strong>自定义 JSON webhook</strong></td>
+<td>固定结构 <code>{source, task, taskId, status, at, host, sessionId, detail?, reply?}</code>，发给你自己写的接收端</td>
+</tr>
+</tbody></table>
+<p>可用占位符：<code>task</code> <code>taskId</code> <code>status</code> <code>statusText</code> <code>at</code> <code>atIso</code> <code>host</code> <code>sessionId</code> <code>detail</code> <code>reply</code>。</p>
+<p>其余几项：</p>
+<ul>
+<li><strong>默认时机</strong> —— 「每次运行结束都通知」或「仅失败或超时时通知」，单个任务可在自己的高级选项里覆盖为 <code>always</code> / <code>failure</code> / <code>never</code>。</li>
+<li><strong>Web 界面地址（可选）</strong> —— 填了之后推送会带上 <code>&lt;base&gt;/?dsst-session=&lt;id&gt;</code>，点通知直接跳到那次运行的会话。<strong>地址必须是收通知的设备能访问到的</strong>（内网 IP、内网穿透域名等），<code>127.0.0.1</code> 只在本机有效。</li>
+<li><strong>默认附带模型回复摘要</strong> —— 默认关闭，开启后只发前 200 字。通知本身必然要把任务名、时间、状态、主机名发出这台机器；回复内容属于额外外发，所以做成显式开关。</li>
+<li><strong>发送测试通知</strong> —— 会立刻向已保存的地址真实发送一条消息。</li>
+</ul>
+<p>几条约束：</p>
+<ul>
+<li><strong>地址即密钥</strong>。企业微信把 robot key 放在 query string 里，所以 URL 整体当凭据处理：存 <code>ctx.credentials</code> 的 <code>SCHEDULED_TASKS_NOTIFY_URL</code>（落在 <code>~/.dsh/.credentials.yaml</code>，权限 600），不进任务表，也<strong>永不回传给浏览器</strong>——前端只拿到「是否已配置」和 origin。表单里留空表示「保持不变」。</li>
+<li>公网必须 <code>https</code>；明文 <code>http</code> 只允许发往本机或内网（127/10/192.168/172.16-31、<code>localhost</code>、<code>*.local</code>），这样自架的 Bark/ntfy 在局域网里能直接用，而带 key 的地址永远不会明文走公网。</li>
+<li>通知失败<strong>不会</strong>把成功的运行记成失败：投递错误写在该次运行记录的 <code>notifyError</code> 上，仅此而已。</li>
+<li>企业微信群机器人有频率限制（每分钟约 20 条），高频间隔任务请酌情用「仅失败时通知」。</li>
+<li><strong>个人微信没有官方发送接口。</strong> 网上看着能用的那些库走的是逆向出来的网页/桌面协议，违反服务条款且会导致封号，所以这里不提供这种渠道。想在微信里收，走企业微信（可转发到个人微信）或 Server酱 一类的服务号中转（用「自定义模板」通道）。纯个人用其实 Bark / ntfy 更顺手，而且可以自架。</li>
+</ul>
+<h3>在对话里排任务</h3>
+<p><code>scheduled_task_list</code> / <code>scheduled_task_create</code> / <code>scheduled_task_delete</code> 注册在根 context 上，所以每个会话都能用。「每天九点帮我看一下 CI」可以在对话里直接说，不必打开面板。</p>
+<p><code>scheduled_task_create</code> 的参数：<code>name</code>、<code>prompt</code>、<code>kind</code>（<code>daily</code> / <code>weekly</code> / <code>interval</code>）、<code>hour</code>、<code>minute</code>、<code>weekdays</code>（0=周日）、<code>minutes</code>（≥5）、<code>timeZone</code>、<code>cwd</code>、权限预设。</p>
+<p>注意定时任务跑起来的会话同样能看到这三个工具，也就是说一个定时任务可以再排新的定时任务。</p>
+<h2>设计与实现</h2>
+<h3>为什么不用 <code>@deepseek-ai/dsh-schedule</code></h3>
+<p><code>dsh-schedule</code> 是 <em>session-local reminder</em>：只能在一个<strong>已经活着</strong>的会话里给它自己的 agent 排后续消息（<code>deliveryMode</code> 是写死的 <code>'session-local'</code>），冷会话不触发，也不支持日历/cron 语义。本插件要的是「无人值守、到点新建会话」，两者不是同一件事，所以自己拥有触发器并调用 <code>ctx.agents.create()</code>。</p>
+<h3>组成</h3>
+<table>
+<thead>
+<tr>
+<th>文件</th>
+<th>作用</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>lib/index.js</code></td>
+<td>Host 半边：持久化、定时、建会话跑一轮、RPC</td>
+</tr>
+<tr>
+<td><code>lib/clock.js</code></td>
+<td>时区日历计算（纯函数，可脱离 harness 运行）</td>
+</tr>
+<tr>
+<td><code>src/client/</code></td>
+<td>浏览器半边源码（React + slot 注册）</td>
+</tr>
+<tr>
+<td><code>lib/client.js</code></td>
+<td>构建产物，由 <code>build.mjs</code> 生成</td>
+</tr>
+<tr>
+<td><code>build.mjs</code></td>
+<td>复刻官方 <code>clientBundle()</code> 的输出契约</td>
+</tr>
+<tr>
+<td><code>cordis.patch.yml</code></td>
+<td>bundle patch 层：<code>dsh.bundle.patch</code> 指向它，装上即自注册</td>
+</tr>
+</tbody></table>
+<h3>执行链路</h3>
+<p>沿用 <code>dsh-headless</code> 的 run 链，并补上 Web 场景所需的两步（参考 <code>dsh-host-apiproxy</code>）：</p>
+<pre><code>ctx.agents.withoutInitiator(() =&gt; ctx.agents.create({ sessionId, meta:{cwd, agentPreset}, agentOptions, setup }))
+  → agent.whenIdle()
+  → agent.followup(createUserMessage(...))
+  → agent.whenIdle()
+  → ctx.sessions.flush(agent.session)
+  → workspace.attachSession(sessionId)     // 让会话出现在侧边栏
+  → handle.dispose()                        // 日志已落盘，用户点开走 resume
+</code></pre>
+<p><code>withoutInitiator</code> 是必须的：定时唤醒不属于任何 agent，否则会误继承当时恰好活着的那一个。</p>
+<h3>无人值守的权限</h3>
+<p>这是本插件最要紧的一处设计。</p>
+<p>dsh 出厂的权限预设只有 <code>read-only</code>(ask) / <code>workspace-write</code>(ask) / <code>danger-full-access</code>(never)——<strong>没有「受限但不发问」的组合</strong>。定时任务要么卡在没人回答的审批上，要么开全权限。</p>
+<p>所以安装步骤 3 里额外定义了一个 <code>scheduled</code> 预设：<code>sandbox: workspace-write</code> + <code>approval: never</code>，即限定在工作区根目录与 <code>/tmp</code>，且不停下来问人。</p>
+<p>应用方式是建完 agent、发 prompt <strong>之前</strong>调用 <code>ctx.permissionPresets.set(agent.session, preset)</code>——第一个工具调用就必须已经在这个界限内。会话日志里能看到两段：先是用户默认被 pin 下来，然后切到任务自己的预设。</p>
+<p>即便如此，配了会发问的预设仍可能卡住，所以每个任务都有<strong>运行超时</strong>（默认 30 分钟），到点 <code>agent.cancel()</code> 并把这次记为 <code>timeout</code>。没有超时的话，卡住的任务会永远占着 <code>running</code>，之后每一次到期都被跳过。</p>
+<h3>定时</h3>
+<p><code>ctx.timeout</code> 只用于「睡到下一个检查点」。超过 Node 定时器上限（约 24.8 天）的等待分段进行，<strong>每次唤醒都重读墙钟</strong>再决定是否真的到点——所以主机休眠或系统时钟被步进都不会漏触发或重复触发。</p>
+<p>日历计算在 <code>lib/clock.js</code>，三种触发规则：</p>
+<ul>
+<li><code>daily</code> / <code>weekly</code>：给定 <code>{hour, minute, timeZone}</code>（weekly 另加 <code>weekdays</code>，0=周日）求下一个严格晚于 <code>now</code> 的时刻。DST 春季跳变里不存在的钟点（例如 America/New_York 的 02:30）落到跳变后的第一个瞬间；秋季重叠取较早的那次。</li>
+<li><code>interval</code>：<strong>锚定在任务创建时刻</strong>，而不是上一次唤醒。09:02 创建、周期 15 分，就永远落在 :02/:17/:32/:47，任何一次运行拖多久都不会让相位漂移。错过的周期直接坍缩，不会堆积补跑。</li>
+</ul>
+<p><code>previousOccurrence()</code> 支撑「补跑」：进程重启时，若某任务上一次应触发的时刻已过且没有对应的运行记录，就补跑一次（latest-only，沿用 <code>dsh-schedule</code> 的先例）。默认关闭——无人值守的任务在启动时突然自己跑起来，应该是一个选择而不是一个意外。</p>
+<h3>存储</h3>
+<p><code>ctx.storageDomain</code>，domain 名 <code>scheduled_tasks</code>，落在 <code>$DSH_HOME/storages/scheduled_tasks.json</code>。
+注意存储层的 <code>UNIT_NAME_RE</code> 是 <code>/^[a-z][a-z0-9_]*$/</code> —— 下划线，不能用中划线。</p>
+<h3>前后端通信</h3>
+<p><code>ctx.connection.rpc</code>，通道 <code>/rpc-scheduled-tasks</code>，<code>authority: 'trusted-host'</code>。</p>
+<p><strong>不能用 <code>loopback</code></strong>：loopback 通道的可信列表是写死的空表，只接受 loopback 的 Host 头，套在反向代理后面 Host 是域名，每个调用都会 403。<code>trusted-host</code> 是出厂 <code>/api</code> 通道用的同一道围栏——由部署方用 <code>dsh web --trusted-host &lt;domain&gt;</code> 声明自己的 authority，跨站/来源检查照旧生效。
+endpoint 在 <strong>URL 路径</strong>里，body 是 <code>{type:'client-request', rpcId, method, payload}</code>：</p>
+<pre><code>curl -sX POST http://127.0.0.1:3080/rpc-scheduled-tasks/list \
+  -H 'content-type: application/json' \
+  -d '{"type":"client-request","rpcId":"1","method":"list","payload":{}}'
+</code></pre>
+<p>endpoint：<code>list</code> / <code>create</code> / <code>update</code> / <code>delete</code> / <code>toggle</code> / <code>runNow</code> / <code>notifyGet</code> / <code>notifySet</code> / <code>notifyTest</code>。<code>list</code> 顺带返回 <code>permissionPresets</code> / <code>agentPresets</code> 目录和 <code>failureCount</code>，前端据此渲染下拉框与入口红点。</p>
+<p><code>update</code> 只移动表单里的六个字段（名称、指令、时/分、时区、工作目录）；<code>enabled</code>、<code>createdAt</code> 和运行记录属于任务自身的生命周期，不随编辑变化。改完必定重排定时器——编辑很可能挪动了触发时刻，旧的等待一定是过期的。</p>
+<p>第三方插件无法注册自己的 Host→Client 推送事件（<code>API_REMOTE_FORWARDED_EVENTS</code> 是写死的白名单，里面没有任何 session / workspace 事件），所以面板打开时 5 秒轮询、关闭时 30 秒轮询。</p>
+<p><strong>对话的即时呈现</strong>：定时运行的会话完全在宿主侧创建，浏览器不会收到任何通知——不做处理的话，新会话要刷新页面才看得见。两条路径分别处理：</p>
+<ul>
+<li><strong>「立即运行」</strong>：<code>runNow</code> 端点会等到会话<strong>创建完成</strong>（而不是整轮跑完）才返回 <code>startedSessionId</code>，前端拿到后立刻刷新会话列表并跳进那个对话。这是用户手势，抢占当前视图是合理的。</li>
+<li><strong>定时触发</strong>：<code>list</code> 里带有 <code>activeRuns</code>（进行中的运行及其会话 id），轮询发现新条目就刷新侧边栏——对话在<strong>生成过程中</strong>就会出现在列表里，但不会抢占你正在看的界面；任务跑完的那次轮询会再刷一次。<code>refresh()</code> <strong>不在</strong> feature 包可用的公开契约上（上游把它留在具体类上），因此是<strong>探测调用</strong>而非直接依赖：将来某个版本移除它，面板照常工作，侧边栏退回到「刷新页面才更新」。运行记录也可以点击，走公开的 <code>sessions.open(id)</code> 直接跳过去。</li>
+</ul>
+<h3>通知的实现</h3>
+<p>引擎就是一次 webhook POST，各渠道只是 body 模板——把插件绑死在某家的消息 API 上，对方一改就废，而「模板 + URL」能扛过去。</p>
+<p>插值发生在<strong>解析后的 JSON 树</strong>上，不是对模板文本做字符串替换——所以模型回复里带引号或换行也不会撑破 body。模板在保存时就要求能 <code>JSON.parse</code> 且顶层是对象。</p>
+<p>「附带模型回复摘要」是<strong>三态而不是布尔</strong>：任务记录里那个字段总是被显式写入，布尔值就永远不会「缺省」，全局开关会变成死代码——早期版本正是这个 bug。存量的布尔值按「未选择」读，即跟随全局。</p>
+<h3>UI</h3>
+<p>注册在 <code>sidebar.footer.action</code>（<code>kind: 'list'</code>，additive，不会顶掉任何现有占位者）。组件来自 <code>@deepseek-ai/dsh-client-ui-primitives</code>；该包没有 Select 和 TimePicker，所以「每天」目前是固定文案，时间用原生 <code>&lt;input type="time"&gt;</code>。颜色只用 <code>--dsw-alias-*</code> 语义 token。</p>
+<p>编辑表单按任务自己的时区回填（不采用当前浏览器的时区，否则从另一台机器改个提示词就会悄悄挪动触发时刻）。</p>
+<h2>开发</h2>
+<pre><code>npm install             # 只装 esbuild（peerDependencies 由 harness 提供，别装到本地）
+node build.mjs          # 重建 lib/client.js
+</code></pre>
+<p>⚠️ 装依赖务必用 <code>npm install --omit=peer</code>（或就是 <code>npm install</code>，因为 peer 都在 <code>peerDependencies</code> 里）。如果 <code>@deepseek-ai/*</code> 被装进本包的 <code>node_modules</code>，插件会拿到与 harness 不同的模块实例，服务注入会失效。</p>
+<p><code>lib/client.js</code> <strong>有意提交进仓库</strong>：客户端模块注册表是直接从磁盘读这个文件的，没有它就是 404，克隆下来必须能直接用。<code>.map</code> 则被忽略。</p>
+<p>客户端有 HMR：产物 hash 变化会被 host 轮询到并推给浏览器，刷新页面即可。<strong>host 半边没有 HMR</strong>（web 组合里被上游显式禁用），改 <code>lib/index.js</code> 要重启 <code>dsh web</code>。</p>
+<p><code>lib/clock.js</code> 是纯函数，可以直接 <code>node --input-type=module -e "import {nextFireAt} from './lib/clock.js'; ..."</code> 验证。</p>
+<h2>已知限制</h2>
+<ul>
+<li><strong>无人值守的权限</strong>：<code>scheduled</code> 预设不发问，但它在工作区内是可写的——定时任务会真实改文件、跑命令。要更严就选 <code>read-only</code>，代价是任何写操作都会卡在审批上直到超时。</li>
+<li>自动重试只有一次，且不串联：结构性失败不会变成无限重跑。</li>
+<li>通知只有一个全局目标地址和一个模板，不能按任务分发到不同的群/设备。</li>
+<li>没有通知的重发或队列：一次 POST 失败就只记录，不重试。</li>
+<li>触发规则支持每天 / 每周几 / 固定间隔，<strong>没有 cron 表达式</strong>——全仓库没有 cron 解析器，要支持得自己引库。</li>
+<li>间隔最短 5 分钟。</li>
+<li>补跑是 latest-only 且默认关闭：错过 5 次也只补 1 次。</li>
+<li>同一任务的上一次运行未结束时，新的到期会被跳过（不排队）。</li>
+<li>面板只在打开时轮询，关闭后不刷新。</li>
+</ul>
+<h2>License</h2>
+<p>MIT</p>

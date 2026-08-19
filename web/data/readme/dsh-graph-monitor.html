@@ -1,0 +1,462 @@
+<h1>dsh-graph-monitor</h1>
+<p>一个 <a href="https://github.com/deepseek-ai">DSH (DeepSeek Harness)</a> 插件：使用 LangGraph 风格的 <strong>GRAPH 工作流</strong>（节点 + 边 + 条件路由 + 并行分支 + 结构化 State），执行时每个环节实时点亮。拓扑动画风格参考 <a href="https://github.com/ShenSeanChen/Waku-agent">Waku-agent</a> 的 dashboard（<code>http://localhost:7777/#graph</code>）。</p>
+<ul>
+<li><strong>GRAPH 可视化</strong>：分层拓扑图（<code>START</code> → 节点 → <code>END</code>，每个深度一列），SVG 渲染，与引擎实际执行的拓扑完全一致（防漂移：图 <em>就是</em> workflow）。</li>
+<li><strong>实时动画</strong>（Waku 风格 <code>hot</code>/<code>live</code> 闪烁）：当前节点紫色脉动、完成节点绿色、失败节点红色、行进边琥珀色高亮。</li>
+<li><strong>自定义 workflows</strong>：设置 → Graph Monitor，JSON 编辑器（节点 / 边 / 条件路由 / fn 处理器），校验后保存并持久化到 <code>~/.dsh/graph-monitor/workflows/*.json</code>，保存/删除后列表实时刷新。</li>
+<li><strong>点击节点看详情</strong>：状态 / 耗时 / 输入 / 输出 / 错误。</li>
+<li><strong>对话集成</strong>：<ul>
+<li><code>/workflow</code>（不带参数）列出现有工作流；</li>
+<li><code>/workflow &lt;workflow-id&gt; &lt;输入…&gt;</code> 直接在对话中运行并实时可视化 node/edge；</li>
+<li>模型工具 <code>graph_monitor_run</code> —— 用自然语言（如「跑一下售后工作流」）触发运行。</li>
+</ul>
+</li>
+<li><strong>运行历史</strong>：每次运行可回看，含最终输出。</li>
+<li><strong>健壮轮询</strong>：单调游标 + 截断安全事件日志（超过 2000 条后增量推送依然正确）。</li>
+</ul>
+<blockquote>
+<p>说明：节点执行支持两种后端 —— <code>nodeExecutor: simulated</code>（默认，固定延迟 + 模板输出，不真正调用模型/工具）与 <code>nodeExecutor: real</code>（<code>fn</code> / <code>tool</code> / <code>agent</code> / <code>llm</code> 节点绑定 DSH 真实能力，能力缺失自动回退模拟）。详见下方「执行后端」。</p>
+</blockquote>
+<hr>
+<h2>目录结构</h2>
+<pre><code>dsh-graph-monitor/
+├── lib/index.js          # 宿主半面：GRAPH 引擎 + HTTP API（/graph-monitor/*）
+├── lib/chat.js           # 对话集成：/workflow 命令 + graph_monitor_run 工具 + 系统提示
+├── lib/client.js         # 客户端半面：监视器页签 + 聊天内嵌卡片 + 设置编辑器
+├── test/engine.test.mjs  # 引擎单测（可独立运行，stub Cordis ctx）
+├── package.json
+├── cordis.patch.yml      # bundle 补丁（nodeDelayMs / llmDelayMs / keepRuns）
+├── LICENSE               # MIT
+└── README.md
+</code></pre>
+<hr>
+<h2>依赖</h2>
+<ul>
+<li><strong>DeepSeek Harness 运行时</strong>：<code>@deepseek-ai/*</code> 服务（<code>sessions</code> / <code>webServer</code> / <code>tools</code> / <code>commands</code> / <code>systemPrompt</code> 等），以 <code>peerDependencies</code> 声明。</li>
+<li><strong>Node.js ≥ 18</strong>（ESM）。</li>
+</ul>
+<hr>
+<h2>安装</h2>
+<p>插件运行在 DSH 的 loopback web server 上，客户端通过普通 <code>fetch()</code> 访问同源 API。二选一：</p>
+<h3>方式一：desktop profile 手动布放</h3>
+<pre><code>$dst = "$env:USERPROFILE\.dsh\profiles\desktop\node_modules\graph-monitor"
+New-Item -ItemType Directory -Path "$dst\lib" -Force | Out-Null
+Copy-Item "package.json" "$dst\"
+Copy-Item "README.md" "$dst\"
+Copy-Item "cordis.patch.yml" "$dst\"
+Copy-Item "lib\index.js" "$dst\lib\"
+Copy-Item "lib\chat.js" "$dst\lib\"
+Copy-Item "lib\client.js" "$dst\lib\"
+</code></pre>
+<p>然后在 <code>~\.dsh\profiles\desktop\cordis.patch.yml</code> 的 <code>insert:</code> 列表追加：</p>
+<pre><code>    - id: graph-monitor
+      name: 'graph-monitor'
+      config:
+        nodeDelayMs: 750
+        llmDelayMs: 950
+        keepRuns: 20
+        nodeExecutor: real   # "simulated"（默认固定延迟）| "real"（绑定 DSH 真实能力，缺失回退模拟）
+</code></pre>
+<h3>方式二：bundle 引用</h3>
+<p>在 profile 的 <code>package.json</code> 里把 <code>graph-monitor</code> 加入 <code>dsh.profile.bundles</code>（依赖其已存在于共享层 <code>~\.dsh\profiles\node_modules</code>）：</p>
+<pre><code>"dsh": { "profile": { "bundles": ["@deepseek-ai/dsh-base", "@deepseek-ai/dsh-web-app", "graph-monitor"] } }
+</code></pre>
+<p><strong>安装完成后必须重启 DSH Desktop</strong>，旧会话的工具面在会话创建时固化，需<strong>新建会话</strong>才生效。</p>
+<hr>
+<h2>使用手册</h2>
+<h3>1. 对话命令 <code>/workflow</code></h3>
+<p>在聊天输入框直接输入：</p>
+<table>
+<thead>
+<tr>
+<th>输入</th>
+<th>效果</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>/workflow</code></td>
+<td>列出所有可用工作流（id + 名称 + 描述 + 节点/边数）</td>
+</tr>
+<tr>
+<td><code>/workflow &lt;id&gt; &lt;输入…&gt;</code></td>
+<td>运行指定工作流，结果以实时卡片形式显示在聊天流中</td>
+</tr>
+<tr>
+<td>自然语言</td>
+<td>模型根据系统提示自动调用 <code>graph_monitor_run</code> 工具</td>
+</tr>
+</tbody></table>
+<p>示例：</p>
+<pre><code>/workflow
+/workflow text-pipeline hello world
+</code></pre>
+<h3>2. Graph Monitor 页签</h3>
+<p>任意会话右侧切到 <strong>Graph Monitor</strong> 页签：</p>
+<ol>
+<li>下拉框选择 workflow；</li>
+<li>输入框填写运行输入，点「运行」；</li>
+<li>节点逐个点亮（运行中紫、完成绿、失败红，行进边琥珀高亮）；</li>
+<li>点击任意节点查看执行详情；</li>
+<li>拖动平移画布，<code>Ctrl + 滚轮</code> 缩放；</li>
+<li>「运行历史」回看任意一次运行。</li>
+</ol>
+<h3>3. 设置编辑器</h3>
+<p>设置 → Graph Monitor：</p>
+<ol>
+<li>「新建 workflow」或「编辑」；</li>
+<li>编辑 JSON（节点 / 边 / 条件路由 / fn 处理器）；</li>
+<li>「校验」确认合法；</li>
+<li>「保存」后立即生效并持久化到 <code>~/.dsh/graph-monitor/workflows/</code>。</li>
+</ol>
+<hr>
+<h2>GRAPH 词汇表</h2>
+<h3>节点类型（kind）</h3>
+<table>
+<thead>
+<tr>
+<th>kind</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>llm</code></td>
+<td>LLM 推理步骤（模拟延迟）</td>
+</tr>
+<tr>
+<td><code>agent</code></td>
+<td>Agent 循环（规划 + 执行）</td>
+</tr>
+<tr>
+<td><code>tool</code></td>
+<td>工具调用（<code>real</code> 模式下 <code>tool</code> 名 + <code>arguments</code> 调用真实工具）</td>
+</tr>
+<tr>
+<td><code>fn</code></td>
+<td>命名处理器函数（目录白名单，绝不 <code>eval</code>）；<code>real</code> 模式可改用内联 JS <code>code</code></td>
+</tr>
+<tr>
+<td><code>echo</code></td>
+<td>透传</td>
+</tr>
+<tr>
+<td><code>sleep</code></td>
+<td>暂停（用于动画节奏）</td>
+</tr>
+<tr>
+<td><code>parallel</code></td>
+<td>并行扇出到多个下游分支</td>
+</tr>
+<tr>
+<td><code>merge</code></td>
+<td>汇合并行分支后继续</td>
+</tr>
+<tr>
+<td><code>gate</code></td>
+<td>条件放行/拦截：谓词为真透传到 <code>pass</code>，否则走 <code>fail</code>（无 <code>fail</code> 则 run 以 <code>blocked</code> 结束）</td>
+</tr>
+<tr>
+<td><code>switch</code></td>
+<td>多选一分支：按 <code>cases</code> 顺序第一个命中走对应 <code>to</code>，<code>default</code> 兜底（恰好一条）</td>
+</tr>
+<tr>
+<td><code>subgraph</code></td>
+<td>组合子工作流：把已固化套路封装成可复用新原语（<code>graph</code> 嵌套执行）</td>
+</tr>
+<tr>
+<td><code>loop</code></td>
+<td>迭代子图：<code>while</code> 谓词为真时反复执行，<code>maxIterations</code> 硬上限</td>
+</tr>
+<tr>
+<td><code>retry</code></td>
+<td>失败重试子图：内嵌输出以 <code>ERROR</code> 开头即重试，至多 <code>maxAttempts</code> 次</td>
+</tr>
+<tr>
+<td><code>timeout</code></td>
+<td>时间预算子图：<code>ms</code> 预算内完成透传，超时输出 <code>ERROR: timeout...</code></td>
+</tr>
+</tbody></table>
+<h3>fn 处理器目录</h3>
+<p><strong>基础文本</strong>：<code>uppercase</code> · <code>lowercase</code> · <code>reverse</code> · <code>wordCount</code> · <code>charCount</code> · <code>trim</code> · <code>slugify</code> · <code>titleCase</code></p>
+<p><strong>客服话术</strong>（售前/售后 canned answers）：<code>productAnswer</code> · <code>returnAnswer</code> · <code>warrantyAnswer</code> · <code>repairAnswer</code> · <code>orderAnswer</code> · <code>logisticsAnswer</code> · <code>handoff</code></p>
+<p><strong>天气</strong>（高德 Web 服务 API）：<code>weatherCity</code>（解析城市）· <code>amapWeather</code>（实时 + 预报；需配置 <code>AMAP_KEY</code> 环境变量或 <code>~/.dsh/graph-monitor/amap-key.txt</code>）</p>
+<p>在 <code>real</code> 模式下，<code>fn</code> 节点还可改用内联 JS <code>code</code> 字段（优先于 <code>handler</code> 目录）。</p>
+<h3>条件路由（router）</h3>
+<table>
+<thead>
+<tr>
+<th>router</th>
+<th>判定</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>always</code> / <code>otherwise</code></td>
+<td>恒真 / 默认兜底</td>
+</tr>
+<tr>
+<td><code>nonEmpty</code></td>
+<td>输出非空</td>
+</tr>
+<tr>
+<td><code>containsYes</code> / <code>containsNo</code></td>
+<td>输出含 yes/是/true · no/否/false</td>
+</tr>
+<tr>
+<td><code>isShort</code> / <code>isLong</code></td>
+<td>输出 ≤ 40 字符 · &gt; 40 字符</td>
+</tr>
+<tr>
+<td><code>mentionsCode</code></td>
+<td>输出提及 code/代码</td>
+</tr>
+<tr>
+<td><code>human</code> / <code>presales</code> / <code>aftersales</code></td>
+<td>客服意图：人工 / 售前咨询 / 售后问题</td>
+</tr>
+<tr>
+<td><code>returnRequest</code> / <code>warranty</code> / <code>repair</code> / <code>order</code> / <code>logistics</code></td>
+<td>客服细分：退货退款 / 质保保修 / 维修故障 / 下单支付 / 物流</td>
+</tr>
+<tr>
+<td><code>isError</code></td>
+<td>输出以 <code>ERROR</code> 开头（用于失败分支）</td>
+</tr>
+</tbody></table>
+<h3>内联谓词（<code>source: "code"</code>）</h3>
+<p>除命名目录 <code>router</code> 外，<code>gate</code> / <code>switch</code> / <code>loop</code> 的谓词（<code>condition</code> / <code>when</code> / <code>while</code>）还支持<strong>内联 JavaScript</strong>。内联代码经 DSH <code>codeRuntime</code> 执行（<strong>绝不 <code>eval</code></strong>），运行时可用 <code>graph.input()</code> 取上游输入、<code>graph.stateGet(key)</code> 读结构化 State，返回值转为布尔；异常 / 空 / 无 codeRuntime 一律按「拦截 / 不命中」处理，不升级为运行失败。</p>
+<pre><code>{ "kind": "gate", "condition": { "source": "code", "code": "return (await graph.input()).includes('approved')" } }
+</code></pre>
+<h3>workflow JSON 形状</h3>
+<pre><code>{
+  "id": "my-workflow",
+  "name": "My workflow",
+  "description": "描述",
+  "entry": "start-node",
+  "nodes": [{ "id": "start-node", "kind": "llm", "label": "开始", "description": "第一步" }],
+  "edges": [
+    { "src": "START", "dst": "start-node", "label": "start" },
+    { "src": "start-node", "dst": "END", "label": "done" }
+  ]
+}
+</code></pre>
+<p>条件边示例：<code>{ "src": "a", "dst": "b", "conditional": true, "router": "containsYes", "label": "简单" }</code></p>
+<hr>
+<h2>内置 workflows</h2>
+<table>
+<thead>
+<tr>
+<th>workflow id</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>research-triage</code></td>
+<td>分类请求：简单走小模型快路径，复杂走完整 agent 循环 + 工具</td>
+</tr>
+<tr>
+<td><code>text-pipeline</code></td>
+<td>确定性数据管道：normalize → transform → measure → 长短分流</td>
+</tr>
+<tr>
+<td><code>customer-agent</code></td>
+<td>客服：理解 →（已知→直接回答 | 未知→搜索工具→升级）→ 关闭</td>
+</tr>
+<tr>
+<td><code>parallel-demo</code></td>
+<td>并行分支：fanout → sentiment/entities 并行 → merge → summarize（演示 <code>parallel</code>/<code>merge</code> 与 <code>reads</code>/<code>writesTo</code> 结构化 State）</td>
+</tr>
+</tbody></table>
+<p>（可通过设置编辑器自行扩展现有或新建 workflow。）</p>
+<hr>
+<h2>控制流原语（可进化工作流引擎）</h2>
+<p>插件已从「固定 DAG 可视化」演进为<strong>可进化工作流引擎</strong>：除线性 <code>llm</code> / <code>agent</code> / <code>tool</code> / <code>fn</code> 节点外，新增六类<strong>控制流原语</strong>，用 <code>graph</code> 字段嵌套子工作流（子图节点会各自点亮、各自产生事件）：</p>
+<table>
+<thead>
+<tr>
+<th>原语</th>
+<th>关键字段</th>
+<th>语义</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>gate</code></td>
+<td><code>condition</code> / <code>pass</code> / <code>fail</code></td>
+<td>谓词真 → 透传到 <code>pass</code>；假 → 走 <code>fail</code>，无 <code>fail</code> 则 run 以 <code>status:"blocked"</code> 结束（非失败、非继续）</td>
+</tr>
+<tr>
+<td><code>switch</code></td>
+<td><code>cases[].when/to</code> / <code>default</code></td>
+<td>按 <code>cases</code> 顺序取第一个命中的 <code>to</code>，<code>default</code> 必填保证「恰好一条」</td>
+</tr>
+<tr>
+<td><code>subgraph</code></td>
+<td><code>graph</code></td>
+<td>组合子图，把已固化套路封装成可复用新原语</td>
+</tr>
+<tr>
+<td><code>loop</code></td>
+<td><code>while</code> / <code>maxIterations</code> / <code>graph</code></td>
+<td>每轮以子图最终 state 为输入迭代，<code>while</code> 为假退出</td>
+</tr>
+<tr>
+<td><code>retry</code></td>
+<td><code>maxAttempts</code> / <code>graph</code></td>
+<td>子图输出以 <code>ERROR</code> 开头即重跑，成功即透传</td>
+</tr>
+<tr>
+<td><code>timeout</code></td>
+<td><code>ms</code> / <code>graph</code></td>
+<td>预算内完成透传，超时输出 <code>ERROR: timeout after {ms}ms</code></td>
+</tr>
+</tbody></table>
+<pre><code>{
+  "id": "lp1",
+  "kind": "loop",
+  "label": "直到收敛",
+  "while": { "source": "code", "code": "return (await graph.input()) !== 'done'" },
+  "maxIterations": 10,
+  "graph": {
+    "entry": "step",
+    "nodes": [{ "id": "step", "kind": "fn", "code": "return 'done';" }],
+    "edges": [{ "src": "START", "dst": "step" }, { "src": "step", "dst": "END" }]
+  }
+}
+</code></pre>
+<h3>模型驱动的编排（mutation ops）</h3>
+<p><code>llm</code> / <code>agent</code> 节点可设 <code>emitOps: true</code>，让模型<strong>直接决定编排</strong>——通过结构化输出产出图编辑指令 <code>ops</code> 数组，引擎先整体校验、后原子应用，并以 <code>graph/mutate</code> 事件反馈结果（含失败原因）：</p>
+<pre><code>{ "ops": [
+  { "op": "addNode",  "node": { "id": "x", "kind": "fn", "code": "return 'hi';" } },
+  { "op": "addEdge",  "edge": { "src": "a", "dst": "x" } },
+  { "op": "rewire",   "edge": { "src": "a", "dst": "x" } },
+  { "op": "setEntry", "nodeId": "x" },
+  { "op": "skip",     "nodeId": "y" }
+] }
+</code></pre>
+<blockquote>
+<p>完整契约（每个原语的输入 / 输出 / 事件 / 边界情形，以及 ops 载荷 schema 与校验不变量）见 <a href="https://github.com/asakumizy/dsh-graph-monitor/blob/HEAD/docs/primitive-contract.md">docs/primitive-contract.md</a>。</p>
+</blockquote>
+<hr>
+<h2>执行后端（nodeExecutor）</h2>
+<p><code>nodeExecutor</code> 配置键控制节点执行后端：</p>
+<table>
+<thead>
+<tr>
+<th>值</th>
+<th>行为</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>simulated</code>（默认）</td>
+<td>固定延迟 + 模板输出，纯可视化演示，不调用任何真实能力</td>
+</tr>
+<tr>
+<td><code>real</code></td>
+<td><code>fn</code> / <code>tool</code> / <code>agent</code> / <code>llm</code> 节点绑定 DSH 真实能力；能力缺失或执行出错时自动回退到模拟，不会中断运行</td>
+</tr>
+</tbody></table>
+<p><code>real</code> 模式下的节点映射：</p>
+<ul>
+<li><strong><code>fn</code></strong> —— 可写内联 JS <code>code</code> 字段，通过 <code>codeRuntime.run</code> 执行；运行时可用 <code>input()</code> 取上游输入、<code>stateGet(key)</code> / <code>stateSet(key, value)</code> 读写结构化 State。无 <code>code</code> 时回退到目录 <code>handler</code>。</li>
+<li><strong><code>tool</code></strong> —— 写 <code>tool</code>（工具名）+ <code>arguments</code>（对象），调用 <code>tools.execute()</code>。</li>
+<li><strong><code>agent</code></strong> —— 运行 execContext 携带父 Agent 时经 <code>subagents.start()</code> 委派给子代理。</li>
+<li><strong><code>llm</code></strong> —— 经 <code>llm.stream()</code> 调用模型流式推理。</li>
+</ul>
+<blockquote>
+<p>提示：<code>fn</code>/<code>tool</code> 的真实路径无需运行 execContext，从设置页「运行」即可触发；<code>llm</code>/<code>agent</code> 的真实路径依赖 execContext（通常经对话 <code>/workflow</code> 指令或 <code>graph_monitor_run</code> 工具触发）。</p>
+</blockquote>
+<hr>
+<h2>配置项</h2>
+<table>
+<thead>
+<tr>
+<th>配置键</th>
+<th>默认值</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>nodeDelayMs</code></td>
+<td><code>750</code></td>
+<td>普通节点模拟执行延迟（动画节奏）</td>
+</tr>
+<tr>
+<td><code>llmDelayMs</code></td>
+<td><code>950</code></td>
+<td>llm / agent / tool 节点模拟延迟</td>
+</tr>
+<tr>
+<td><code>keepRuns</code></td>
+<td><code>20</code></td>
+<td>保留的已完成运行记录数（LRU 淘汰）</td>
+</tr>
+<tr>
+<td><code>nodeExecutor</code></td>
+<td><code>simulated</code></td>
+<td>执行后端：<code>simulated</code>（模拟）| <code>real</code>（绑定 DSH 真实能力，缺失回退模拟）</td>
+</tr>
+</tbody></table>
+<hr>
+<h2>HTTP API</h2>
+<p>插件在 DSH 的 loopback web server 上注册以下接口（与 web app / 桌面壳同源）：</p>
+<table>
+<thead>
+<tr>
+<th>方法</th>
+<th>路径</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>GET</td>
+<td><code>/graph-monitor/workflows</code></td>
+<td>workflow 列表 + 编辑器目录</td>
+</tr>
+<tr>
+<td>PUT</td>
+<td><code>/graph-monitor/workflows</code></td>
+<td>校验并持久化 workflow</td>
+</tr>
+<tr>
+<td>POST</td>
+<td><code>/graph-monitor/validate</code></td>
+<td>只校验不保存</td>
+</tr>
+<tr>
+<td>POST</td>
+<td><code>/graph-monitor/workflows/:id/run</code></td>
+<td>启动运行（<code>{input, sessionId}</code>）</td>
+</tr>
+<tr>
+<td>GET</td>
+<td><code>/graph-monitor/state?cursor=N</code></td>
+<td>增量实时事件日志（游标轮询）</td>
+</tr>
+<tr>
+<td>GET</td>
+<td><code>/graph-monitor/runs/:runId</code></td>
+<td>完整运行记录（含每个节点详情）</td>
+</tr>
+<tr>
+<td>DELETE</td>
+<td><code>/graph-monitor/workflows/:id</code></td>
+<td>删除自定义 workflow</td>
+</tr>
+</tbody></table>
+<hr>
+<h2>测试</h2>
+<p>引擎单测用 stub Cordis ctx，不依赖真实 DSH 服务，但需要 <code>@deepseek-ai/*</code> 依赖可解析（通常在 DSH 的共享层 <code>~/.dsh/profiles/node_modules</code> 内运行）：</p>
+<pre><code># 在 DSH 共享层 node_modules 内运行（以便解析 @deepseek-ai 依赖）
+node "$env:USERPROFILE\.dsh\profiles\node_modules\graph-monitor\test\engine.test.mjs"
+</code></pre>
+<p>覆盖：内置 workflow 种子、HTTP 列表 / 运行 / 状态游标、自定义 workflow 保存/校验/删除、fn 处理器、持久化、会话事件。</p>
+<hr>
+<h2>已知限制</h2>
+<ul>
+<li><code>nodeExecutor: real</code> 依赖 DSH 真实能力（codeRuntime / tools / subagents / llm），对应能力缺失或执行出错时该节点回退到模拟。</li>
+<li><code>llm</code> / <code>agent</code> 的真实路径依赖运行 execContext（经对话 <code>/workflow</code> 指令或 <code>graph_monitor_run</code> 工具触发）；从设置页「运行」的无 execContext 运行只会走 <code>fn</code>(code)/<code>tool</code> 的真实路径，<code>llm</code>/<code>agent</code> 回退模拟。</li>
+<li><code>fn</code> 的内联 <code>code</code> 仅在 <code>real</code> 模式执行；<code>simulated</code> 模式走 <code>handler</code> 目录（<code>code</code> 被忽略）。</li>
+<li>插件改动需重启 DSH Desktop；旧会话的工具面在会话创建时固化。</li>
+<li>运行记录与事件日志在内存中（LRU 上限 keepRuns / 2000 条事件），重启即清空。</li>
+</ul>
+<hr>
+<h2>License</h2>
+<p><a href="https://github.com/asakumizy/dsh-graph-monitor/blob/HEAD/LICENSE">MIT</a></p>

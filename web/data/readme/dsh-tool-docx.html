@@ -1,0 +1,174 @@
+<h1>dsh-tool-docx</h1>
+<p>English | <a href="https://github.com/BroBFG/dsh-tool-docx/blob/HEAD/README.zh.md">中文</a> | <a href="https://github.com/BroBFG/dsh-tool-docx/blob/HEAD/README.ru.md">Русский</a></p>
+<p>Model-facing Microsoft Word (<code>.docx</code>) tools for <a href="https://github.com/deepseek-ai/deepseek-harness">DeepSeek Harness</a>: <code>docx_read</code> extracts a document as Markdown or structured JSON blocks, <code>docx_create</code> generates a new <code>.docx</code> from Markdown, and <code>docx_edit</code> replaces a document's content from Markdown while preserving its title/author/created properties. <code>.docx</code> is a ZIP of XML parts, so every tool reads the whole package through the bounded <code>ctx.fs.readBytes</code> primitive and writes packages through the plugin's <code>fsBinary</code> binary write service (or a host <code>ctx.fs</code> that provides <code>writeBytes</code> natively) — the same atomic, sandbox-fenced mutations the text tools use, without ever replacing the host's own filesystem.</p>
+<p>This repository is the <strong>standalone distribution</strong> of the plugin. The plugin is <strong>original work written for DeepSeek Harness</strong> — an independent plugin developed by this project, initially in a local <code>deepseek-harness</code> checkout (the harness is its runtime target), not a copy of a plugin from the shared repository. It plugs into the harness's <code>tools</code>, <code>fs</code>, and <code>systemPrompt</code> services, and it builds and tests on its own against the published <code>@deepseek-ai/*</code> packages, so it can be installed into any harness checkout.</p>
+<h2>Requirements</h2>
+<ul>
+<li>A DeepSeek Harness host (the <code>0.1.0-rc.7</code> line) whose filesystem seam provides the <strong>read</strong> primitive <code>fs.readBytes</code> — published in <code>@deepseek-ai/dsh-fs</code> since <code>0.1.0-rc.7</code>. The <strong>write</strong> side (<code>writeBytes</code>) is not in any published <code>dsh-fs</code> release, so the bundle mounts the plugin's <a href="#binary-fs-providers">binary fs providers</a>: a separate <code>fsBinary</code> service that implements <code>writeBytes</code> (fenced for sandboxed hosts) without touching <code>ctx.fs</code>. Without any binary writer — no <code>fsBinary</code> service and no native <code>ctx.fs.writeBytes</code> — <code>docx_read</code> still works, while <code>docx_create</code>/<code>docx_edit</code> fail with a typed <code>DOCX_HOST_FS_UNSUPPORTED</code> error naming the fix.</li>
+<li>The harness provides the peer services (the <code>0.1.0-rc.7</code> line): <code>cordis</code>, <code>dsh-tools</code>, <code>dsh-fs</code>, <code>dsh-llm</code>, <code>dsh-sandbox</code>, <code>dsh-sandbox-policy</code>, <code>dsh-system-prompt</code>, <code>dsh-invariants</code>, <code>dsh-user-approval</code>, <code>dsh-session</code>.</li>
+</ul>
+<h2>Installation</h2>
+<p>The official install path is the harness's own plugin manager — one command installs the package into the profile, and the profile launcher activates the bundle's <a href="https://github.com/BroBFG/dsh-tool-docx/blob/HEAD/cordis.patch.yml"><code>cordis.patch.yml</code></a> layer automatically (the package declares <code>dsh.bundle.patch</code>):</p>
+<pre><code>dsh plugin --profile web add github:BroBFG/dsh-tool-docx#v0.5.0
+</code></pre>
+<p><code>dsh plugin</code> runs pnpm inside the profile directory and reconciles <code>dsh.profile.bundles</code> against the installed state, so nothing else is needed — no <code>allowBuilds</code> entries (the package ships its built <code>lib/</code> and has no build scripts), no manual <code>cordis.patch.yml</code> editing, no <code>--patch</code> overlays. Restart the harness afterwards.</p>
+<ul>
+<li><strong>Update:</strong> <code>dsh plugin --profile web update dsh-tool-docx</code>, or re-run <code>add</code> with the new tag.</li>
+<li><strong>Remove:</strong> <code>dsh plugin --profile web remove dsh-tool-docx</code>.</li>
+<li><strong>Local development:</strong> <code>dsh plugin --profile web add ../dsh-tool-docx</code> (relative specs are anchored to the directory you invoke from) or <code>dsh plugin --profile web add link:../dsh-tool-docx</code>.</li>
+</ul>
+<blockquote>
+<p>npm publication is planned but not yet available; the package ships under the standalone name <code>dsh-tool-docx</code> (the <code>dsh-tool-*</code> ecosystem convention), independent of the <code>@deepseek-ai</code> scope.</p>
+</blockquote>
+<h2>Tools</h2>
+<table>
+<thead>
+<tr>
+<th>Tool</th>
+<th>Purpose</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>docx_read(file_path, format?, max_chars?)</code></td>
+<td>Extract document body as Markdown (default) or structured JSON blocks plus <code>docProps</code>. Emits <code>fs/observed</code>.</td>
+</tr>
+<tr>
+<td><code>docx_create(file_path, markdown, title?, author?)</code></td>
+<td>Generate a new <code>.docx</code> from Markdown. Guarded <code>createIfAbsent</code>: an existing file is never blindly overwritten.</td>
+</tr>
+<tr>
+<td><code>docx_edit(file_path, markdown)</code></td>
+<td>Read the current document (validating it is a docx), preserve <code>docProps</code>, regenerate the body from the full Markdown, and write back with a version guard (<code>DOCX_STALE</code> on a concurrent change).</td>
+</tr>
+</tbody></table>
+<p>All three resolve relative paths against the calling agent's session cwd, dispatch the <code>fs/write-intent</code> waterfall before mutating (the observation-policy plugin may supply its own intent), and record <code>fs/observed</code> on completion — so the sandbox fence, escalation fields, and read-before-write policy apply to docx mutations exactly as they do to <code>write</code>/<code>edit</code>.</p>
+<h2>Config</h2>
+<table>
+<thead>
+<tr>
+<th>Field</th>
+<th>Default</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>maxDocxBytes</code></td>
+<td>64 MiB</td>
+<td>Inclusive byte cap on a whole <code>.docx</code> file (read + ZIP expansion).</td>
+</tr>
+<tr>
+<td><code>maxMarkdownChars</code></td>
+<td>1 000 000</td>
+<td>Inclusive character cap on the Markdown input to create/edit.</td>
+</tr>
+<tr>
+<td><code>maxReadChars</code></td>
+<td>200 000</td>
+<td>Inclusive character cap on the Markdown returned by <code>docx_read</code>.</td>
+</tr>
+</tbody></table>
+<h2>Binary fs providers</h2>
+<p>The base bundle's <code>fs-sandbox</code> row keeps providing <code>ctx.fs</code> <strong>unchanged</strong>. The bundle patch adds the docx tools plus one of the binary providers, which register the binary <code>writeBytes</code> primitive as a <strong>separate <code>fsBinary</code> service</strong> — the host filesystem is never replaced, so this plugin cannot break the harness boot; at worst, without the provider, the mutating tools report <code>DOCX_HOST_FS_UNSUPPORTED</code>:</p>
+<ul>
+<li><p><strong><code>dsh-tool-docx/fs-binary-sandbox-plugin</code></strong> (mounted by the bundle; recommended for sandboxed hosts) — registers <code>fsBinary.writeBytes</code> fenced by the <strong>same per-call policy</strong> as every sandbox mutation: <code>workspace-write</code> containment, <code>read-only</code> denial, <code>danger-full-access</code> passthrough, <code>FS_SANDBOX_DENIED</code> on refusal (mapped to <code>DOCX_SANDBOX_DENIED</code> at the tool layer).</p>
+</li>
+<li><p><strong><code>dsh-tool-docx/fs-binary-local-plugin</code></strong> — registers <code>fsBinary.writeBytes</code> <strong>unfenced</strong>, for minimal contexts (tests, headless scripts) or hosts that fence above the provider. To mount it instead of the sandboxed one, override the bundle row in your profile <code>cordis.patch.yml</code>:</p>
+<pre><code>- id: fs-binary-sandbox
+  disabled: true
+- insert:
+    - id: fs-binary-local
+      name: dsh-tool-docx/fs-binary-local-plugin
+</code></pre>
+</li>
+</ul>
+<p>Both use the same probe → intent-guard (<code>createIfAbsent</code> / <code>replaceIfVersion</code>) → atomic-publish flow as the harness seam: a private owner-only staging directory, fsync, then atomic publication (a hard-link no-replace primitive for <code>createIfAbsent</code>), with per-target serialization. The first version omits the harness's Win32 DACL-preservation ceremony — a replacement inherits the owner-only ACL of the staged temp file.</p>
+<p>For hosts that deliberately want the full backend mounted <strong>as <code>ctx.fs</code></strong> (replacing <code>fs-sandbox</code>), the package also ships the provider classes <code>dsh-tool-docx/fs-binary-sandbox</code> and <code>dsh-tool-docx/fs-binary-local</code>; the replace-the-row recipe still applies:</p>
+<pre><code>- id: fs-sandbox
+  disabled: true
+- insert:
+    - id: fs-binary-sandbox
+      name: dsh-tool-docx/fs-binary-sandbox
+    - id: tool-docx
+      name: dsh-tool-docx
+</code></pre>
+<h2>Design notes</h2>
+<ul>
+<li><strong>Extraction</strong> (<code>src/docx/extract.ts</code>) walks <code>word/document.xml</code> with <code>fast-xml-parser</code>: headings (<code>Heading1</code>–<code>Heading6</code>, <code>Title</code>), bold/italic/strike runs, nested lists through <code>word/numbering.xml</code> (bullet vs decimal), pipe tables (merged cells approximate), external hyperlinks through <code>word/_rels/document.xml.rels</code>, and embedded images as counted placeholders. Unsupported constructs degrade to warnings, never failures.</li>
+<li><strong>Generation</strong> (<code>src/docx/generate.ts</code>) renders the block model with the <code>docx</code> library: ATX headings, styled inline runs, 9-level bullet/numbered numbering, pipe tables, and <code>[text](url)</code> external hyperlinks. <code>parseMarkdown</code> (src/markdown.ts) accepts the subset the extractor emits, so read → edit → write round trips are stable.</li>
+<li><strong>Caps are enforced at the seam, not in the tool</strong> — the whole-file byte cap flows into <code>ctx.fs.readBytes</code> (<code>FS_TOO_LARGE</code> maps to <code>DOCX_TOO_LARGE</code>), and the ZIP reader applies the same cap to the uncompressed total, so a compressed bomb cannot expand without limit.</li>
+<li><strong>Sandbox parity</strong> — <code>src/sandbox.ts</code> mirrors <code>dsh-tool-fs</code>'s escalation API (<code>sandbox_permissions</code>/<code>justification</code> advertised only under a confining backend, denial marker mapping); extracting a shared controller is deferred (see below).</li>
+<li><strong>Host filesystem contract</strong> — <code>src/fs-binary.ts</code> declares the binary contract the tools need and resolves the writer at call time: the plugin's <code>fsBinary</code> service when mounted, else a host <code>ctx.fs</code> that natively provides <code>writeBytes</code>. Without any binary writer it raises <code>DOCX_HOST_FS_UNSUPPORTED</code> with a pointer to the fix instead of a cryptic <code>fs.writeBytes is not a function</code>; <code>docx_read</code> needs only the published <code>ctx.fs.readBytes</code>.</li>
+</ul>
+<h2>Model Experience</h2>
+<h3>System prompt</h3>
+<h4>What the model sees</h4>
+<p>The <code>tool:docx-read</code> section below is registered once at plugin apply:</p>
+<h5>The docx guidance section</h5>
+<pre><code>MS Word .docx files are binary (ZIP+XML) and the read tool cannot read them. Use docx_read to extract a document as Markdown (default) or structured JSON blocks, docx_create to generate a new .docx from Markdown, and docx_edit to replace a document's content from Markdown while preserving its title/author/created properties. Legacy .doc is not supported — convert it to .docx first.
+</code></pre>
+<h4>Token effect</h4>
+<p>Fixed guidance cost per request while the plugin is mounted; the section is unaffected by scoped tool restrictions.</p>
+<h4>KV Cache effect</h4>
+<p>Prefix-stable while the guidance text is unchanged. Plugin lifecycle or a text change may invalidate reuse from the first changed prompt section.</p>
+<h3>Tool schemas</h3>
+<h4>What the model sees</h4>
+<p>The generated <code>docx_read</code>, <code>docx_create</code>, and <code>docx_edit</code> schemas — parameters and canonical outputs as summarized in the <a href="#tools">Tools</a> table. The byte/character caps are deployment settings, not model arguments; the escalation fields appear only under a confining filesystem backend.</p>
+<h4>Token effect</h4>
+<p>Fixed schema cost per request for each mounted tool; config disablement removes schemas and guidance together, while a scoped restriction removes only the schema.</p>
+<h4>KV Cache effect</h4>
+<p>Prefix-stable while definitions and visibility are unchanged. Config enablement, plugin lifecycle, or scoped restrictions may invalidate reuse from the first changed schema token.</p>
+<h3>Read result</h3>
+<h4>What the model sees</h4>
+<p>A successful <code>docx_read</code> renders the extracted Markdown (or pretty-printed JSON blocks). Truncation appends <code>\n… (truncated)</code>; failures are typed messages such as <code>file not found: &lt;path&gt;</code>, <code>the document is encrypted (password-protected); decryption is not supported</code>, or the legacy hint <code>legacy .doc format is not supported — convert the document to .docx first</code>.</p>
+<h4>Token effect</h4>
+<p>Data-dependent results are capped by <code>maxReadChars</code> (or the call's <code>max_chars</code>) and resent until compaction.</p>
+<h4>KV Cache effect</h4>
+<p>Append-only; newly visible content follows the reusable request prefix and does not invalidate existing KV-cache entries.</p>
+<h3>Create/Edit result</h3>
+<h4>What the model sees</h4>
+<p>A successful create/edit renders a short <code>&lt;path&gt;</code>/<code>&lt;type&gt;docx&lt;/type&gt;</code> envelope with the byte size — never the document body. Warnings about approximations (images, merged cells, code blocks) are carried in the canonical <code>warnings</code> array and rendered as plain text.</p>
+<h4>Token effect</h4>
+<p>Only the retained call arguments (including the full Markdown input) and the short result add tokens; the generated package bytes never enter the session log.</p>
+<h4>KV Cache effect</h4>
+<p>Append-only; newly visible content follows the reusable request prefix and does not invalidate existing KV-cache entries.</p>
+<h3>Argument errors</h3>
+<h4>What the model sees</h4>
+<p>Blank <code>file_path</code> becomes <code>Error: file_path must be a non-empty string</code>; markdown over the input cap becomes <code>Error: markdown exceeds the &lt;n&gt;-character limit</code>.</p>
+<h4>Token effect</h4>
+<p>Only the failing call adds these retained tokens.</p>
+<h4>KV Cache effect</h4>
+<p>Append-only; newly visible content follows the reusable request prefix and does not invalidate existing KV-cache entries.</p>
+<h2>Known Limitations and Deferred Work</h2>
+<ul>
+<li><strong>Legacy <code>.doc</code> (OLE) is unsupported</strong> — binary OLE needs LibreOffice or Word COM conversion; the tools fail with <code>DOCX_LEGACY_DOC</code> and a hint to convert to <code>.docx</code> first.</li>
+<li><strong>Images are not extracted or embedded</strong> — <code>docx_read</code> counts images and emits placeholders; <code>docx_create</code>/<code>docx_edit</code> drop image syntax with a warning. Extracting image bytes and embedding them on generate is deferred.</li>
+<li><strong>Round-trip regenerates the document</strong> — styles, page setup, headers/footers, and section breaks are not preserved; an edit rebuilds the body with default styles, keeping only title/author/created. Layout fidelity is not a goal of the round trip.</li>
+<li><strong>Merged table cells approximate</strong> — <code>gridSpan</code>/<code>vMerge</code> degrade to plain pipe-table cells with a warning; footnotes, endnotes, text boxes, and page breaks are dropped (warnings included).</li>
+<li><strong>The sandbox controller duplicates <code>dsh-tool-fs</code></strong> — extracting a shared <code>FsSandboxController</code> is deferred; the two copies must be kept in sync until then.</li>
+<li><strong>Markdown input subset</strong> — blockquotes, horizontal rules, nested fences, and images are not represented; they degrade to paragraphs with a warning (fenced code becomes code-styled paragraphs).</li>
+</ul>
+<h2>Development</h2>
+<pre><code>pnpm install
+pnpm typecheck   # tsc over src/
+pnpm build       # tsc → lib/types + tsdown → lib/index.js, lib/invariant.js
+pnpm test        # vitest: unit conversion tests + consumer tests over a fake fs
+pnpm pack        # produce the npm tarball (files: lib/index.js, lib/invariant.js, lib/types/**/*.d.ts)
+</code></pre>
+<p>Layout:</p>
+<ul>
+<li><code>src/docx/</code> — ZIP/XML extraction and <code>docx</code>-library generation;</li>
+<li><code>src/tools/</code> — the three tool registrations;</li>
+<li><code>src/fs-binary.ts</code> — the binary filesystem contract and the call-time writer resolver (<code>fsBinary</code> service or native <code>ctx.fs.writeBytes</code>);</li>
+<li><code>src/fs-binary-local.ts</code>, <code>src/fs-binary-sandbox.ts</code>, <code>src/fsio-bytes.ts</code>, <code>src/path-contains.ts</code> — the binary fs provider classes and the atomic writer + containment helpers;</li>
+<li><code>src/fs-binary-sandbox-plugin.ts</code>, <code>src/fs-binary-local-plugin.ts</code> — the namespace plugins that register the <code>fsBinary</code> service (the bundle's default mount);</li>
+<li><code>tests/</code> — conversion round-trip tests, provider tests, and consumer tests against the published <code>ToolRuntime</code> service (exported since <code>dsh-tools@0.1.0-rc.7</code>).</li>
+</ul>
+<h2>Relationship to deepseek-harness</h2>
+<p>This plugin is an <strong>original, independent project written for DeepSeek Harness</strong> — it plugs into the harness's public services (<code>tools</code>, <code>fs</code>, <code>systemPrompt</code>) and is developed in a local <code>deepseek-harness</code> checkout for testing against the harness. It is not a copy of a plugin from the shared <code>deepseek-harness</code> repository and is not part of it; this repository is the canonical distribution. Two implementation notes:</p>
+<ol>
+<li><code>src/fs-binary.ts</code> (host contract + writer resolver) — the binary <code>readBytes</code>/<code>writeBytes</code> contract is part of this plugin's design. <code>readBytes</code> is published in the harness's <code>dsh-fs</code> release line since <code>0.1.0-rc.7</code>; <code>writeBytes</code> is not, so the <a href="#binary-fs-providers">binary fs providers</a> ship it as a separate <code>fsBinary</code> service instead of patching the host;</li>
+<li><code>tests/</code> runs against the published <code>ToolRuntime</code> service (exported since <code>dsh-tools@0.1.0-rc.7</code>), so the consumer tests exercise the real registry pipeline rather than a local double.</li>
+</ol>
+<p>The plugin is developed and maintained entirely in this repository against the published <code>@deepseek-ai/*</code> packages; the harness checkout is only a runtime target used for integration verification, and carries no copy of this plugin.</p>
+<h2>License</h2>
+<p>MIT © 2026 BroBFG. Portions of <code>src/sandbox.ts</code>, the atomic-write pattern in <code>src/fsio-bytes.ts</code>, and the containment logic in <code>src/path-contains.ts</code> are derived from <a href="https://github.com/deepseek-ai/deepseek-harness">deepseek-harness</a> (MIT, Copyright (c) 2026 DeepSeek) — see <a href="https://github.com/BroBFG/dsh-tool-docx/blob/HEAD/LICENSE">LICENSE</a>.</p>

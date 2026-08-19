@@ -1,0 +1,322 @@
+<h1>dsh-dev-crew</h1>
+<p>一个 DeepSeek Harness 插件：按职责把工作分派给绑定了不同模型的子代理。</p>
+<p>需求整理与评审交给强模型，批量实现交给低成本模型，全部在同一个会话内完成。</p>
+<h2>安装</h2>
+<p>需要 dsh <strong>0.1.0-rc.7 或更新</strong>。本插件对 dsh 自带（in-box）的包一律不作依赖声明 —— 它们由 <code>~/.dsh/profiles/node_modules</code> 提供，声明反而会装出第二份实例（见 <a href="https://github.com/ivanon/dsh-dev-crew/blob/HEAD/docs/notes/2026-08-19-implementation-outcome.md">notes §2.6</a>）。代价是这条版本下界只能写在文档里：装在更旧的宿主上会在挂载子代理工具时失败，而不是在安装时被拒。</p>
+<p>发布前（尚未上架 npm），请用本地路径安装：</p>
+<pre><code>dsh plugin --profile &lt;你的 profile&gt; add &lt;本仓库绝对路径&gt;
+</code></pre>
+<p>发布后可改为按包名安装：</p>
+<pre><code>dsh plugin --profile &lt;你的 profile&gt; add dsh-dev-crew
+</code></pre>
+<h2>配置</h2>
+<p>组合了 web app 的部署可以<strong>全程在界面里配置</strong>，不必写 YAML：设置页的 Dev Crew
+区块列出三个内置角色，每个可勾选启用、从下拉菜单选 provider、从模型目录选或手填
+model，另有收敛轮数上限与纪律 gate 开关。provider 下拉的选项来自宿主的活路由与
+已声明未激活路由；选「自定义…」可填一个宿主尚不认识的路由名（先填后配）。model
+用可输入的建议列表而非固定下拉：模型目录是建议性的，不在目录里的 id 仍然合法，
+未激活的 provider 也拉不到目录。</p>
+<p>界面配不出来的三样，仍需 YAML：<strong>同一角色的第二个模型</strong>（多模型角色，见下文工具
+命名规则）、<strong>非内置 id 的新角色</strong>、<strong><code>persona</code> 与 <code>toolFilter</code></strong>。</p>
+<p>下面是 YAML 形式。在 profile 的 <code>cordis.patch.yml</code> 中配置角色，每个角色可绑定一个
+或多个模型，每个模型对应一个独立的委派工具。</p>
+<pre><code>- id: dsh-dev-crew
+  config:
+    roles:
+      - id: implementer
+        enabled: true
+        models:
+          - alias: default
+            provider: kimi-coding
+            model: k3
+      - id: reviewer
+        enabled: true
+        models:
+          - alias: ds
+            provider: deepseek-official
+            model: deepseek-v4-flash
+          - alias: kimi
+            provider: kimi-coding
+            model: k3
+</code></pre>
+<p>工具名规则：单模型角色为 <code>subagent_&lt;角色名&gt;</code>，多模型角色为
+<code>subagent_&lt;角色名&gt;_&lt;alias&gt;</code>。上面的配置会挂出 <code>subagent_implementer</code>、
+<code>subagent_reviewer_ds</code>、<code>subagent_reviewer_kimi</code> 三个工具。</p>
+<p><code>provider</code> 必须是 Models 设置页中已就绪的路由。未配置或不存在的路由不会挂载
+工具；插件会通过 <code>ctx.logger</code> 记录一行说明原因的警告，但该警告在当前 headless
+一次性执行模式下不会打印到终端（见「已知限制」）。</p>
+<p>内置三个角色 <code>implementer</code> / <code>reviewer</code> / <code>researcher</code>，各自带有写好的 persona
+与工具范围，默认全部停用 —— 因为路由取决于你自己配置了哪些 provider。</p>
+<p>用这三个 id 时只需写 <code>id</code> + <code>models</code> + <code>enabled</code>：未提供的 <code>persona</code> 与
+<code>toolFilter</code> 由插件按 id 用内置模板填充。显式写出则以你的值为准，且是整体替换
+而非与内置值合并 —— 自己写 <code>toolFilter</code> 就要把想保留的 <code>deny</code> 项一并列出。非内
+置 id 不做填充。</p>
+<p>无论是否填充，每个角色的子代理都看不到本插件挂出的其他委派工具：插件会把本次实
+际挂上的其他 <code>subagent_*</code> 工具名追加进该角色的 <code>deny</code>，避免子代理沿角色链继续
+向下分派。</p>
+<p>两个角色用同一个 <code>id</code>（或同一角色内两个模型用同一个 <code>alias</code>）会推出重名工具，插
+件在挂载前直接报错，不会挂上一个卸不掉的实例。</p>
+<p>配置支持热更新：宿主组合了 <code>settings</code> 服务时，本插件会在 <code>dsh-dev-crew</code>
+命名空间下注册用户设置文档，<code>roles</code> 等字段的变更会即时同步到已挂载的工具集，
+无需重新加载插件。未组合 <code>settings</code> 服务的部署（例如 headless）不受影响，继续
+使用 profile 里的入口配置。</p>
+<p><code>gate.enabled</code> 是例外：它只在插件挂载时决定是否注册纪律 guard，中途通过设置
+页开关不会生效，需要重新加载插件才能应用。<code>gate.plansDir</code> 不受此限制，热更新
+后立即生效。</p>
+<h2>内嵌方法论 skill</h2>
+<p>插件随包分发四份 skill，正文在构建时内嵌（<code>npm run build:skills</code>），不依赖用户侧
+的项目/用户 skill 目录：</p>
+<table>
+<thead>
+<tr>
+<th>skill</th>
+<th>用途</th>
+<th>触发方式</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>crew</code></td>
+<td>端到端开发流水线：需求讨论 → 预检门 → 写规格/计划 → 逐任务实现 → 三轮评审收敛 → 落盘报告。规格讨论是流水线里唯一的人工环节。</td>
+<td>对人：说"走 crew 流程" / 提到开发流水线；对模型：调用 <code>skill</code> 工具，<code>name</code> 传 <code>crew</code></td>
+</tr>
+<tr>
+<td><code>crew-brainstorm</code></td>
+<td>把一个模糊需求讨论成可实施的规格文档</td>
+<td>单独使用：需求不清楚、想先讨论出规格；也是 <code>crew</code> 流水线第 1 步内部调用的对象</td>
+</tr>
+<tr>
+<td><code>crew-plan</code></td>
+<td>把一份规格文档拆成可逐任务执行的实施计划</td>
+<td>单独使用：已有规格、要拆成可分派的任务；也是 <code>crew</code> 流水线第 4 步内部调用的对象</td>
+</tr>
+<tr>
+<td><code>crew-converge</code></td>
+<td>评审收敛协议：并行起多个 reviewer、分类阻塞/非阻塞项、修复复审、到轮次上限转遗留清单</td>
+<td><strong>只对模型可见</strong>（<code>invocation: { modelInvocable: true, userInvocable: false }</code>），人不能单独触发 —— 它是 <code>crew</code> 内部在三处评审环节（规格/计划/代码）调用的机制，独立唤起没有意义</td>
+</tr>
+</tbody></table>
+<h3>子代理结果如何回到编排者</h3>
+<p>这一点决定整条流水线能不能跑通。委派工具立刻返回的是<strong>子代理 id，不是结果</strong>。结果
+有两条通道，<strong>主通道是运行时自动送达的结算通知</strong>：</p>
+<pre><code>Background subagent &lt;id&gt; finished and will do no further work unless you send it more.
+Its closing message:
+&lt;子代理最后一条消息的全文&gt;
+</code></pre>
+<p>开场白按结束方式分几种，<strong>只有 <code>finished</code> 表示做完了</strong>（其余是 <code>was stopped before it finished</code>、<code>ran out of room before it finished</code>、<code>declined the task</code>、
+<code>failed before it finished</code>，以及无输出时的 <code>It left no closing message.</code>）。编排者
+从这一行判断成败，不看内容像不像完整的。</p>
+<p><strong>只有子代理的最后一条消息会被带回</strong>（<code>ActivationTerminal.output</code> 的定义是 "the
+epoch's final assistant content"），中间轮次的内容留在它自己的 transcript 里，编排者
+看不到。因此内置 persona 都要求那条消息承载该带回的内容、不要以「完成了」这类空话结
+尾——implementer 与 researcher 放完整结论，reviewer 放<strong>摘要</strong>（全文写进它自己落盘的
+评审文件，见下）。<code>tests/config.test.ts</code> 有回归测试保护这几条。</p>
+<p>第二条通道是 <code>report</code> 工具：子代理可在<strong>任何时刻</strong>主动送内容（前缀
+<code>Background subagent &lt;id&gt; reported:</code>），不受「只有最后一条」限制。它适合中途报告，
+或结论较长时确保送达；但<strong>收到 <code>reported:</code> 不代表子代理做完了</strong>——做完的判据只有结算
+通知。</p>
+<p>两种消息都会<strong>开启编排者的新一轮</strong>（结算通知走 <code>followup()</code> 唤醒 idle 的父代理，父
+代理正忙时并入下一个 step 批次；<code>report</code> 的 <code>reportDelivery</code> 默认 <code>wakeup</code>）。因此
+编排者派完子代理就该<strong>结束当轮</strong>，不能在同一轮里轮询——通知不可能在那一轮内到达，只
+会撞上宿主的重复调用告警。<code>job_output</code> / <code>job_list</code> / <code>job_kill</code> 是 <strong>shell 后台作业</strong>
+的工具，与子代理无关，拿子代理 id 调它们必然失败。</p>
+<p><code>crew-converge</code> 的 <code>userInvocable: false</code> 只影响 Web host 的命令面板（该过滤逻辑
+<code>isUserInvocable</code> 仅被 <code>@deepseek-ai/dsh-host-apiproxy</code> 消费，用来给客户端命令面
+板供数据）；headless 部署没有交互式命令面，这条隔离在源码/组装层面即可确认，无需
+也无法在 headless 下用一次真实的 <code>/</code> 命令列表点验。</p>
+<h2><code>crew_init</code> 与 <code>/crew-init</code></h2>
+<p>创建流程产物目录（默认 <code>docs/specs</code>、<code>docs/plans</code>、<code>docs/reviews</code>、<code>docs/reports</code>，
+实际以 <code>artifactDirs</code> 配置为准）。两个入口调用同一段逻辑：</p>
+<ul>
+<li>工具 <code>crew_init</code>：模型可调用，无参数，返回 <code>{ created, skipped }</code>。</li>
+<li>命令 <code>/crew-init</code>：注册在可选的 <code>commands</code> 服务下，走
+<code>ctx.inject(['commands'], cctx =&gt; {...})</code>（而不是一次性的 <code>ctx.get('commands')</code>
+快照，理由见「HTTP API 与配置界面」一节对同一模式的说明），供人在支持命令面的
+宿主（Web host）里直接触发；headless 部署即使组合了 <code>@deepseek-ai/dsh-commands</code>
+服务，也没有交互式命令输入面去敲这个命令。</li>
+</ul>
+<p><strong>幂等</strong>：已存在的目录原样跳过、不覆盖任何已有文件；目录解析基准是
+<code>process.cwd()</code>（见「已知限制」）。</p>
+<h3>产物命名与轮次</h3>
+<p>规格、计划、评审意见三类产物的文件名都带评审轮次后缀 <code>_r&lt;N&gt;</code>：</p>
+<table>
+<thead>
+<tr>
+<th>目录</th>
+<th>文件名</th>
+<th>产出者</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>docs/specs</code></td>
+<td><code>YYYY-MM-DD-&lt;topic&gt;_r1.md</code></td>
+<td>编排者（<code>crew-brainstorm</code>）</td>
+</tr>
+<tr>
+<td><code>docs/plans</code></td>
+<td><code>YYYY-MM-DD-&lt;topic&gt;_r1.md</code></td>
+<td>编排者（<code>crew-plan</code>）</td>
+</tr>
+<tr>
+<td><code>docs/reviews</code></td>
+<td><code>YYYY-MM-DD-&lt;topic&gt;-&lt;spec|plan|code&gt;_r&lt;N&gt;-&lt;reviewer 工具名&gt;.md</code></td>
+<td><strong>reviewer 自己</strong>（每环节每轮每 reviewer 一份）</td>
+</tr>
+<tr>
+<td><code>docs/reports</code></td>
+<td><code>YYYY-MM-DD-&lt;topic&gt;-report.md</code></td>
+<td>编排者（第 8 步，只一份）</td>
+</tr>
+</tbody></table>
+<p><strong>每一轮修复另存新版本，不原地改</strong>：第 N 轮评审的对象是 <code>_rN</code>，修复后写成
+<code>_r&lt;N+1&gt;</code>，旧版本原样保留。这样每轮的输入输出都可追溯，复审者能对比两版差异，最终
+报告也能指明结论是第几轮达成的。代码不适用这条——代码的版本由 git 提交承担。</p>
+<p>分派实施时给 implementer 的计划路径必须是<strong>收敛后的最终版本</strong>。纪律 gate 只校验路径
+落在 plans 目录内，不会发现你传的是哪一版。</p>
+<p><strong>评审意见由 reviewer 自己落盘。</strong> 编排者在 prompt 里给出它该写的文件的完整路径（一个
+reviewer 一份，路径撞车会让后写的覆盖先写的），reviewer 用 <code>write</code> 写全文，并把<strong>摘要</strong>
+放在它最后一条消息里：文件路径、几条阻塞项、每条一句话。编排者据摘要判断收敛，需要细
+节时才读文件——这样意见全文既不受「只有最后一条消息会被带回」的限制，也不占编排者上
+下文。</p>
+<p>分类之后，编排者在每份文件末尾追加自己的判断：哪些判为阻塞、<strong>驳回的意见及理由</strong>（这
+一节只能由它写，reviewer 不知道自己被驳回了）、本轮是否收敛。</p>
+<p>reviewer 因此需要写权限，<code>toolFilter.deny</code> 里没有 <code>write</code>。<strong>这道纪律没有工具级强制</strong>：
+<code>write</code> 的语义是 create or fully replace，能覆盖任何文件，而 <code>bash</code> 本来也在范围内。
+「只写给定的那个文件、绝不碰评审对象」完全靠 persona 约定，加上 <code>crew-converge</code> 要求编
+排者核对文件确实被创建。<code>edit</code> 仍被拒——局部修改已有文件与写一份新报告无关。</p>
+<p>reviewer 若始终不落盘，编排者退回用摘要自己转录一份，并在文件里注明是转录——一份没写
+下来的评审等于没评审，但也不值得为落盘失败中止整条流水线。</p>
+<h2>纪律 gate：调用 implementer 前必须给出 plan 路径</h2>
+<p><code>gate.enabled</code>（默认 <code>true</code>）开启时，<code>ctx.tools.guard()</code> 拦截所有
+<code>subagent_implementer</code> / <code>subagent_implementer_&lt;alias&gt;</code> 工具调用：prompt 里必须能
+解析出一个<strong>真实存在、类型为普通文件、且落在 <code>gate.plansDir</code>（默认 <code>docs/plans</code>）
+之内</strong>的路径，五步判据（候选提取 → resolve 规范化 → 围栏前缀检查 → 存在性/文件
+类型 → realpath 二次围栏检查，防符号链接逃逸）见 <code>src/gate.ts</code>。不满足则拒绝，
+拒绝理由会原样回给模型，指导它先把计划文件写出来。</p>
+<p><strong>围栏基准是发起调用的会话自己的工作目录</strong>（<code>execution.agent.session.header.cwd</code>，
+宿主在会话创建时校验为绝对路径），不是 dsh 进程的启动目录 —— 所以 <code>dsh web</code> 一个
+长驻进程可以服务多个项目，无需为每个项目重开。会话未携带 cwd 时才回退到
+<code>process.cwd()</code>。拒绝理由里会写出解析出的围栏绝对路径与它的基准来源，配置错位
+因此可诊断，而不是让模型反复重试一个正确的路径。</p>
+<p>候选路径提取会跳过 ASCII 的反引号/单双引号/圆括号/空白，<strong>也跳过中文全角标点</strong>
+（弯引号 <code>“”‘’</code>、CJK 符号与标点如 <code>：（）。、「」『』【】〔〕《》</code>、以及其他全角/
+半角字符），所以协调者模型用自然中文转述任务时，即使路径紧邻这些标点书写（例如
+"计划文件：docs/plans/x.md"、"docs/plans/x.md（相对当前工作区根目录）"）也能被
+正确识别；<code>tests/gate.test.ts</code> 有对应用例覆盖，包括确认排除全角标点不会连带放宽
+路径穿越/符号链接逃逸的围栏检查。</p>
+<p><strong>关闭方式</strong>：把 <code>gate.enabled</code> 设为 <code>false</code>。注意这个开关只在插件挂载时读取一次
+（见「已知限制」），中途通过设置页或 <code>settings.update</code> 改它不会立即生效，需要重
+新加载插件。<code>gate.plansDir</code> 没有这个限制，热更新后立即生效。</p>
+<h2>HTTP API 与配置界面</h2>
+<p>宿主组合了 <code>@deepseek-ai/dsh-host-webserver</code>（即 <code>ctx.get('webServer')</code> 非空，通常
+是 Web host，headless 部署没有这一层）时，插件在 <code>/crew/api</code> 前缀下注册五条路由。
+只读查询用 GET，配置读写用 POST：</p>
+<table>
+<thead>
+<tr>
+<th>路由</th>
+<th>方法</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>/crew/api/health</code></td>
+<td>GET</td>
+<td>返回 <code>{ mounted, skipped }</code>：已挂载的委派工具名与被跳过的路由及原因，补上 headless 下 <code>logger.warn</code> 不可见的可观测性缺口</td>
+</tr>
+<tr>
+<td><code>/crew/api/providers</code></td>
+<td>GET</td>
+<td>返回 <code>{ live, configurable }</code>：宿主的活路由与已声明未激活路由，供界面渲染 provider 下拉</td>
+</tr>
+<tr>
+<td><code>/crew/api/models?provider=&lt;name&gt;</code></td>
+<td>GET</td>
+<td>返回 <code>{ models }</code>：该 provider 广告的模型 id。未注册的路由在宿主侧会抛错，这里折叠成空数组——模型目录是建议性的，空目录不代表 provider 不可用。缺 <code>provider</code> 参数答 400 <code>MISSING_PROVIDER</code></td>
+</tr>
+<tr>
+<td><code>/crew/api/settings.get</code></td>
+<td>POST</td>
+<td>返回 <code>{ config, revision }</code>：脱敏后的当前配置与 revision</td>
+</tr>
+<tr>
+<td><code>/crew/api/settings.update</code></td>
+<td>POST</td>
+<td>body 为 <code>{ config, expectedRevision }</code>，走 <code>settings.update()</code> 的 merge-then-validate；revision 冲突返回 409 <code>REVISION_CONFLICT</code></td>
+</tr>
+</tbody></table>
+<p>三条路由都要求 Host 头精确匹配回环地址（<code>localhost</code> / <code>127.0.0.1</code> / <code>[::1]</code> /
+<code>::1</code>）或部署显式配置的 <code>trustedHosts</code>（当前插件把它硬编码为空数组，尚无 schema
+与界面绑定），不匹配一律 403 <code>UNTRUSTED_HOST</code>。<strong>这只是主机名白名单，不是 CSRF
+防护</strong>：Host 头检查挡不住浏览器页面向 <code>localhost</code> 发起的跨站 POST，当前定位是
+「仅面向本地信任环境」，请勿在暴露给不受信任网络的部署上依赖它。</p>
+<p>配套的客户端配置界面（<code>src/client/CrewSection.tsx</code>，通过 <code>dsh.client.inject</code> 挂进
+<code>settings.section</code>）走同一套 HTTP API 读写配置、展示角色列表与健康状态。</p>
+<p><strong>这两条能力都需要 Web host</strong>：在 headless 部署下（例如本仓库用于验收的
+<code>crewtest</code> profile），组合树里没有 <code>webServer</code> 服务，三条路由与配置界面都不存在
+——这是 headless 部署形态本身的限制，不是 bug。</p>
+<p>在组合了 Web host 的部署下，路由注册走的是 <code>ctx.inject(['webServer'], hctx =&gt; { hctx.effect(() =&gt; registerCrewApi(hctx, {...})) })</code>（<code>registerCrewSettings</code> 对
+<code>settings</code> 服务同理）：<code>ctx.inject</code> 会新建一个只在 <code>webServer</code> 服务就绪后才执行
+的子插件，服务缺失或还没轮到时子插件停在 <code>PENDING</code>、主插件不受影响，服务就绪后
+自动执行——不依赖 <code>webServer</code>/<code>settings</code> 是否已经在 <code>apply()</code> 执行的那一刻存在。
+<code>webServer</code>/<code>settings</code> 都<strong>没有</strong>写进主插件顶层的 <code>inject</code> 数组，因为那样会让
+整个插件在 headless（不组合这两个服务）下永久 <code>PENDING</code>。</p>
+<p>已在新建的 <code>crewtestweb</code> profile（<code>['@deepseek-ai/dsh-base', '@deepseek-ai/dsh-web-app', 'dsh-dev-crew']</code>）上端到端实测通过，包括
+<code>settings.update</code> 的写入 + revision 递增 + 回读一致：</p>
+<pre><code>$ curl -s localhost:3099/crew/api/health
+{"ok":true,"value":{"mounted":["subagent_implementer"],"skipped":[]}}
+$ curl -s -X POST localhost:3099/crew/api/settings.get
+{"ok":true,"value":{"config":{...},"revision":0}}
+$ curl -s -H 'Host: evil.com' localhost:3099/crew/api/health
+{"ok":false,"error":{"code":"UNTRUSTED_HOST","message":"request rejected by the plugin trust fence"}}
+</code></pre>
+<p>（第三条正确返回 403。）连续重启该 profile 三次复测，三条路由每次都正确注册，
+排除了偶发时序窗口的可能。</p>
+<p>客户端配置界面（<code>CrewSection.tsx</code>）的实际浏览器渲染（三态健康显示、保存失败时
+表单不丢内容等）未做人工可视化验证，只验证了它依赖的 HTTP API 契约；见「已知
+限制」。</p>
+<h2>已知限制</h2>
+<ul>
+<li>角色的启停会改变工具集，使全部会话的模型缓存前缀失效，下一轮请求需重新预填充。</li>
+<li>子代理后端固定为 <code>spawn</code>（干净上下文）。不提供 fork：fork 的前缀复用收益会被
+continuable 子代理装入请求头部的内容抵消。</li>
+<li>路由不可用时对应的 <code>subagent_&lt;role&gt;</code> 工具不会挂载，插件会调用
+<code>ctx.logger().warn()</code> 记录原因，但在 <code>dsh --profile &lt;name&gt; "&lt;task&gt;"</code> 这类
+headless 一次性执行模式下，该日志当前不会打印到终端（宿主未接控制台输出
+exporter，消息只留在 cordis 的内存日志缓冲区）。判断路由是否生效，请以对应
+<code>subagent_&lt;role&gt;</code> 工具是否出现在工具列表中为准，而非等待一行警告文本。</li>
+<li><strong><code>gate.enabled</code> 是启动期开关</strong>：只在插件挂载时决定是否注册纪律 guard，中途
+通过设置页或 HTTP API 改它不会生效，需要重新加载插件才能应用。<code>gate.plansDir</code>
+不受此限制。</li>
+<li><strong><code>crew_init</code> 的解析基准仍是 <code>process.cwd()</code></strong>。gate 围栏已改为会话自己的工作
+目录（<code>SessionHeader.cwd</code>），但 <code>crew_init</code> 尚未跟进，所以在 <code>dsh web</code> 这类长驻
+进程里它仍按<strong>进程启动目录</strong>建目录，可能不是当前会话所在的项目。手动跑
+<code>/crew-init</code> 前请确认启动目录，或直接让流水线的预检门去建（同样受此限制）。</li>
+<li><strong>大小写不敏感文件系统上的围栏比较</strong>。<code>startsWith</code> 前缀比较在 macOS/Windows 上，
+<code>realpathSync</code> 返回的大小写可能与配置值不一致。当前未处理。</li>
+<li><strong><code>trustedHosts</code> 有字段但无 schema 与界面绑定</strong>，企业内网部署暂时只能走默认的
+loopback 白名单。</li>
+<li><strong>HTTP API 与配置界面依赖 Web host</strong>：<code>webServer</code> 服务未组合时（例如 headless
+部署）两者都不存在，路由注册子插件（<code>ctx.inject(['webServer'], ...)</code>）永久停在
+<code>PENDING</code>，主插件不受影响，但不会有任何报错或提示——判断这两条能力是否可用，
+请以 <code>GET /crew/api/health</code> 是否有响应为准。</li>
+<li><strong>客户端配置界面只做过部分浏览器级验证</strong>：五条路由的请求/响应、403 拒绝、
+revision 冲突都有自动化覆盖，健康态显示与保存落盘已在真实浏览器里确认（那次
+确认本身发现了保存后健康态不刷新的缺陷，见 issue #1）。仍未在浏览器里走过的：
+保存失败时表单是否保留输入、KV 缓存失效提示、provider 下拉与 model 建议列表的
+实际渲染。这一层没有自动化验收。</li>
+<li><strong>界面的表达力窄于 YAML</strong>：能启停角色、选 provider、选或填 model、改收敛轮数与
+gate 开关，但配不出同一角色的第二个模型、非内置 id 的新角色、以及 <code>persona</code> 与
+<code>toolFilter</code>。后两者界面从不提交，所以用户层留空、最终值落回组合层配置或按角色
+id 填充的内置模板。</li>
+<li><strong><code>toolFilter</code> 表达不了路径级权限，也表达不了「只读 bash」</strong>。reviewer 需要 <code>write</code>
+才能落盘自己的评审文件，而 <code>write</code> 的语义是 create or fully replace——它能覆盖任何
+文件，包括正在评审的产物；<code>bash</code> 也一直在范围内。「只写给定的那个评审文件」完全靠
+persona 约定与编排者的事后核对，没有任何强制。researcher 不需要落盘，仍拒 <code>write</code>。</li>
+<li><strong><code>toolFilter</code> 里的工具名是对宿主的外部引用，没有任何机器校验</strong>。宿主的
+<code>tools.restrict()</code> 对未知名字<strong>抛错而非忽略</strong>，所以一个拼错或不存在的名字会让
+整个角色在委派时失败。内置模板的名字有回归测试兜底（<code>tests/config.test.ts</code>），
+但用户在 YAML 里自己写的没有——改动前请用真实宿主确认名字存在。</li>
+<li>同仓库并发跑两轮流水线未支持。</li>
+</ul>
+<h2>许可</h2>
+<p>MIT</p>

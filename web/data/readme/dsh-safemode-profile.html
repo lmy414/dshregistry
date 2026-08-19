@@ -1,0 +1,221 @@
+<h1>dsh-safemode-profile</h1>
+<blockquote>
+<p><a href="https://github.com/jinsiyu/dsh-safemode-profile/blob/HEAD/README.en.md">English</a></p>
+</blockquote>
+<p><strong>唯一职责：让 <code>dsh --profile safemode</code> 永远是干净的——启动即强制还原，
+运行期持续守护，任何时刻都只含白名单核心 bundle。</strong></p>
+<pre><code>dsh --profile safemode        # 零第三方插件启动（建议: dsh --profile safemode --port 3081）
+</code></pre>
+<h2>它做什么（两个阶段）</h2>
+<h3>1. 启动时：强制还原（不管 profile 有没有、改没改过）</h3>
+<p>DSH 每次启动加载本插件行时，无条件把 <code>$DSH_HOME/profiles/safemode/</code>
+写回白名单模板：</p>
+<table>
+<thead>
+<tr>
+<th>文件</th>
+<th>强制内容</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>package.json</code></td>
+<td><code>dsh.profile.bundles</code> = 白名单（默认 <code>@deepseek-ai/dsh-base</code> + <code>@deepseek-ai/dsh-web-app</code>），<code>dependencies</code> 清空</td>
+</tr>
+<tr>
+<td><code>cordis.patch.yml</code></td>
+<td>空用户 patch 层（<code>[]</code> 模板）</td>
+</tr>
+<tr>
+<td><code>pnpm-workspace.yaml</code></td>
+<td>与官方 profile 相同的 pnpm 设置</td>
+</tr>
+</tbody></table>
+<p>与模板一致时不动（避免自触发死循环），不一致一律重写。</p>
+<h3>2. 运行期：持续守护（平时检查）</h3>
+<p>插件行存活期间双通道监控 profile 是否被改动：</p>
+<ul>
+<li><strong>fs.watch 实时监听</strong>：<code>package.json</code> / <code>cordis.patch.yml</code> / <code>pnpm-workspace.yaml</code>
+任何变更 → 防抖 300ms → 立即还原；</li>
+<li><strong>30s 轮询兜底</strong>：<code>detectDrift()</code> 全量比对（覆盖 watch 不可靠的挂载场景、
+文件被外部整体替换的场景）。</li>
+</ul>
+<p>发现漂移（bundle 被加/删、patch 层被写入内容、dependencies 被加东西）→
+自动还原，并记录 warn 日志：<code>safemode profile was modified (...); restored to whitelist template</code>。</p>
+<h2>触发机制（无构建脚本，一次装好）</h2>
+<p><strong>本包没有 postinstall / 任何构建脚本</strong>——pnpm 永远不会拦截它，
+<code>dsh plugin add</code> 一次成功、退出码 0、reconcile 正常执行，不需要
+<code>approve-builds</code> / <code>allowBuilds</code> 配置。</p>
+<p>全部工作由<strong>插件行</strong>（<code>lib/index.js</code> → <code>lib/guard.js</code>）承担：
+DSH 每次启动加载本插件时强制还原一次，并进入常驻守护。</p>
+<p>另附手动工具（可选）：<code>node scripts/ensure-safemode.mjs</code> 立即强制还原
+一次（不想重启 DSH 或排障时用）。</p>
+<h2>安装</h2>
+<p>前置：已安装 DSH（<code>@deepseek-ai/dsh</code>）与 Node.js（≥18）。</p>
+<p><strong>方式 A（推荐，npm 一条命令）</strong> — 本插件已发布到 npm 并声明 <code>dsh.bundle</code> manifest，直接用官方插件命令安装：</p>
+<pre><code>dsh plugin --profile web add dsh-safemode-profile
+</code></pre>
+<p><strong>方式 B（GitHub 直装）</strong> — 从源码仓库直接安装（显式指定默认分支 <code>main</code>，npm 与 pnpm 均兼容）：</p>
+<pre><code>dsh plugin --profile web add github:jinsiyu/dsh-safemode-profile#main
+</code></pre>
+<p><strong>方式 C（本地打包/未发布）</strong> — 本地构建 tgz 安装：</p>
+<pre><code># 在插件目录打包
+npm pack                          # → dsh-safemode-profile-0.3.5.tgz
+
+# 安装进目标 profile（例如 web）
+dsh plugin --profile web add .\dsh-safemode-profile-0.3.5.tgz
+</code></pre>
+<p>装完重启 DSH，插件行生效后 safemode 进入"强制还原 + 常驻守护"状态。
+启动时插件会打印一行简短横幅（守护状态、启动命令、白名单、仓库链接）。</p>
+<h2>自定义白名单</h2>
+<p>白名单是<strong>唯一的</strong>定制入口，请通过环境变量设置（<strong>不要</strong>手动改 safemode
+profile 文件——任何改动都会被守护逻辑还原）：</p>
+<pre><code># 只想留纯 CLI（无 GUI）
+$env:DSH_SAFEMODE_BUNDLES = "@deepseek-ai/dsh-base"
+</code></pre>
+<p><code>dsh</code> 启动时继承该环境变量即生效（本插件读取 <code>process.env</code>，守护与还原
+都用同一个白名单）。</p>
+<h2>加固建议：把 safemode 的三个受管文件设为只读</h2>
+<p><strong>推荐</strong>将 <code>~/.dsh/profiles/safemode/</code> 下三个受管文件设为只读，从文件
+系统层面阻止 <code>dsh plugin --profile safemode add &lt;包&gt;</code> 向 safemode 安装
+任何插件（pnpm 写这些文件失败 → 安装报错、插件进不去；DSH 启动不受
+影响，它只读这些文件、只写 cordis.yml）：</p>
+<ul>
+<li><code>package.json</code>（dependencies + bundles，安装的必经关卡）</li>
+<li><code>cordis.patch.yml</code>（用户 patch 层）</li>
+<li><code>pnpm-workspace.yaml</code>（pnpm 管理文件）</li>
+</ul>
+<blockquote>
+<p>⚠️ <strong>不要锁整个目录</strong>：DSH 每次启动都会<strong>重写</strong> <code>cordis.yml</code>
+（<code>prepareProfile</code> 无条件 writeFileSync），目录或其内文件被锁成只读
+会导致 safemode 启动失败（实测 exit 1）。Windows 的
+<code>attrib +R &lt;目录&gt; /S</code> 会递归锁住所有文件（含 cordis.yml），<strong>不要用</strong>。</p>
+</blockquote>
+<pre><code># Windows：只锁三个文件（不要 /S 递归）
+attrib +R "$env:USERPROFILE\.dsh\profiles\safemode\package.json" `
+         "$env:USERPROFILE\.dsh\profiles\safemode\cordis.patch.yml" `
+         "$env:USERPROFILE\.dsh\profiles\safemode\pnpm-workspace.yaml"
+
+# POSIX：三个文件设为 444（目录仍需可读可执行，不能被锁）
+chmod 444 ~/.dsh/profiles/safemode/package.json \
+          ~/.dsh/profiles/safemode/cordis.patch.yml \
+          ~/.dsh/profiles/safemode/pnpm-workspace.yaml
+</code></pre>
+<p>解除锁定：</p>
+<pre><code>attrib -R "$env:USERPROFILE\.dsh\profiles\safemode\package.json" `
+         "$env:USERPROFILE\.dsh\profiles\safemode\cordis.patch.yml" `
+         "$env:USERPROFILE\.dsh\profiles\safemode\pnpm-workspace.yaml"  # Windows
+chmod 644 ~/.dsh/profiles/safemode/package.json \
+          ~/.dsh/profiles/safemode/cordis.patch.yml \
+          ~/.dsh/profiles/safemode/pnpm-workspace.yaml                 # POSIX
+</code></pre>
+<p>注意：</p>
+<ul>
+<li><strong>先让插件创建/还原 profile，再锁定</strong>——锁定前内容必须与白名单模板
+一致（守护启动时检测到 drift 才写文件；一致则完全不碰，锁定与之共存
+无冲突）。若锁定后发现 drift，守护还原会因只读失败并记 warn——这正是
+锁定的预期行为：锁住 = 不该有漂移。</li>
+<li>锁定后要改白名单需先解锁再操作；本插件的守护逻辑不受影响（它读
+package.json 检测漂移，一致则不写）。</li>
+</ul>
+<h3>更深的防护：ACL（Windows）与 chattr +i（Linux）</h3>
+<p>上面 <code>attrib +R</code> / <code>chmod 444</code> 属于"<strong>基础只读</strong>"，两个平台语义不同，且
+都不能阻止<strong>删除</strong>文件（删除取决于父目录权限，root 更是无视一切权限位）。
+以下两种是"<strong>强锁</strong>"，按需选择：</p>
+<h4>Windows：ACL 拒绝（icacls）——可精确到"写"与"删"</h4>
+<pre><code># 拒绝当前用户对三个文件的写入（W=写数据）
+icacls "$env:USERPROFILE\.dsh\profiles\safemode\package.json" /deny "$env:USERNAME:(W)"
+icacls "$env:USERPROFILE\.dsh\profiles\safemode\cordis.patch.yml" /deny "$env:USERNAME:(W)"
+icacls "$env:USERPROFILE\.dsh\profiles\safemode\pnpm-workspace.yaml" /deny "$env:USERNAME:(W)"
+
+# 更进一步：连删除也拒绝（DE=删除；WD=写数据/创建文件）
+icacls "...\package.json" /deny "$env:USERNAME:(WD,DE)"
+</code></pre>
+<p>解除（删除该用户的 deny 条目）：</p>
+<pre><code>icacls "...\package.json" /remove:d "$env:USERNAME"
+</code></pre>
+<p>要点：</p>
+<ul>
+<li><code>(W)</code> 挡内容修改，<code>(DE)</code> 挡删除，<code>(WD)</code> 挡写+创建——比 attrib 更精确，
+可以只挡写入、保留"管理员能删"的余地；</li>
+<li><strong>仍挡不住管理员</strong>：Administrators / SYSTEM 默认有完全控制（F），
+管理员可以夺回所有权或清除 deny。要连管理员一起挡，需对
+<code>BUILTIN\Administrators</code> 也加 deny，但管理员仍能通过"取得所有权"绕开；</li>
+<li>icacls 需要对该文件有修改 ACL 的权限（文件所有者默认有）。</li>
+</ul>
+<h4>Linux：immutable 属性（chattr +i）——root 也动不了</h4>
+<pre><code># 加锁：文件不可修改、不可删除、不可改名（包括 root）
+sudo chattr +i ~/.dsh/profiles/safemode/package.json \
+              ~/.dsh/profiles/safemode/cordis.patch.yml \
+              ~/.dsh/profiles/safemode/pnpm-workspace.yaml
+
+# 查看
+lsattr ~/.dsh/profiles/safemode/package.json     # 输出含 i 即已锁定
+
+# 解锁
+sudo chattr -i ~/.dsh/profiles/safemode/package.json \
+              ~/.dsh/profiles/safemode/cordis.patch.yml \
+              ~/.dsh/profiles/safemode/pnpm-workspace.yaml
+</code></pre>
+<p>要点：</p>
+<ul>
+<li><code>+i</code>（immutable）是最强锁：<strong>任何人（含 root）都不能改、删、改名</strong>，
+必须先 <code>-i</code> 才能操作——比 chmod/ACL 都硬；</li>
+<li>需要 <code>sudo</code>（root 权限）执行，且文件系统要支持该属性（ext4/xfs 支持；
+某些网络/容器文件系统不支持）；</li>
+<li><strong>对 safemode 有副作用</strong>：文件被删后守护插件本可自动重建
+（detectDrift 发现 missing → force 还原），<code>+i</code> 会连守护的重建也挡住；
+升级插件、改白名单也都要先 <code>-i</code>。所以建议只在"完全不想被任何人动"
+的场景使用，日常用基础只读（attrib/chmod 444）即可。</li>
+</ul>
+<h4>三级防护对比</h4>
+<table>
+<thead>
+<tr>
+<th>方案</th>
+<th>挡内容修改</th>
+<th>挡删除</th>
+<th>挡 root</th>
+<th>需要权限</th>
+<th>对守护自愈的影响</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>attrib +R</code> / <code>chmod 444</code>（基础只读）</td>
+<td>✅ 普通用户</td>
+<td>❌</td>
+<td>❌</td>
+<td>无</td>
+<td>无（守护一致则不写）</td>
+</tr>
+<tr>
+<td>icacls deny（ACL）</td>
+<td>✅</td>
+<td>✅（加 DE）</td>
+<td>❌（管理员可绕）</td>
+<td>文件所有者</td>
+<td>无</td>
+</tr>
+<tr>
+<td><code>chattr +i</code>（immutable）</td>
+<td>✅</td>
+<td>✅</td>
+<td>✅</td>
+<td>sudo</td>
+<td>⚠️ 挡住守护重建，需先 <code>-i</code></td>
+</tr>
+</tbody></table>
+<p>建议：<strong>日常用基础只读即可</strong>（pnpm 以普通用户运行，444 已完全拦截安装）；
+要防误删再加 ACL <code>(DE)</code>；只有"这台机器上的任何账号（含 root）都不能动
+safemode 配置"才算刚需 chattr +i。</p>
+<h2>注意</h2>
+<ul>
+<li><strong>端口</strong>：safemode 也带 webServer，默认 3080。与 web profile 同时跑会
+冲突（<code>EADDRINUSE</code> 导致启动失败），用 <code>--port</code> 错开：
+<code>dsh --profile safemode --port 3081</code>。</li>
+<li><strong>会话/凭据不隔离</strong>：sessions、settings.yaml、.env 是 home 级共享，
+safemode 隔离的只有插件。</li>
+<li><strong>home patch 串层</strong>：<code>~/.dsh/cordis.patch.yml</code> 对每个 profile 生效，
+别往里面挂插件（守护逻辑只盯 safemode 自己的目录，管不到 home patch）。</li>
+<li><strong>cordis.yml 勿手改</strong>：DSH 每次启动自动重写，要改改 cordis.patch.yml
+——但 safemode 的 patch 层会被本插件还原为空，定制请走白名单环境变量。</li>
+</ul>

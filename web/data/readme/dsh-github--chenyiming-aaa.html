@@ -1,0 +1,196 @@
+<h1>dsh-github — DeepSeek Harness 的 GitHub 集成插件</h1>
+<p>对标 opencode 的 GitHub MCP server：<strong>一次配置认证，长期可用</strong>。模型在对话中直接调用
+<code>github_*</code> 工具完成建仓、推送、提 PR、管 issue、搜索代码等 GitHub 事务，<strong>不再每次操作
+都要求临时授权</strong>。</p>
+<ul>
+<li>零依赖（只用 Node 22+ 内置 <code>fetch</code>），45 个工具，全部走 GitHub REST API v3</li>
+<li>认证持久化：<code>GITHUB_TOKEN</code>（环境变量 / DSH credentials 服务）或 OAuth Device Flow
+（浏览器授权一次，token 自动写入 <code>$DSH_HOME/.credentials.yaml</code>，重启 DSH 依然有效）</li>
+<li>审批策略：读操作 + 常规写操作直接放行；删除仓库/文件/分支、force push、合并 PR、
+关闭 issue/PR 保留审批门</li>
+<li>安全：token 只进 <code>Authorization</code> 请求头，绝不落日志；错误信息与工具输出做防御性脱敏</li>
+</ul>
+<h2>快速开始</h2>
+<h3>1. 安装插件（web + desktop 两个 profile）</h3>
+<pre><code>powershell -ExecutionPolicy Bypass -File .\install.ps1
+# 只装一个 profile：powershell -ExecutionPolicy Bypass -File .\install.ps1 -Profiles desktop
+</code></pre>
+<p>安装脚本会：</p>
+<ol>
+<li>把插件包复制到 <code>%USERPROFILE%\.dsh\profiles\node_modules\dsh-github\</code></li>
+<li>在 <code>web</code> 与 <code>desktop</code> 两个 profile 的 <code>cordis.patch.yml</code> 追加注册条目（幂等）</li>
+</ol>
+<p><strong>重启 DSH Desktop</strong>（或重载 web profile）后生效。</p>
+<h3>2. 配置认证（二选一，均持久生效）</h3>
+<p><strong>方式 A — Personal Access Token（推荐先试这个）</strong></p>
+<pre><code># 1) 在 GitHub → Settings → Developer settings → Personal access tokens 生成
+#    （需要 repo、read:org、user 权限）
+# 2a) 环境变量（最简单）
+setx GITHUB_TOKEN "ghp_xxx"        # 新开的终端/重启 DSH 后生效
+# 2b) 或写入 DSH credentials（$DSH_HOME/.credentials.yaml，密码学托管、不落日志）
+#     DSH 设置页 → 凭据 → 新增 GITHUB_TOKEN → 粘贴 token
+</code></pre>
+<p><strong>方式 B — OAuth Device Flow（浏览器授权一次）</strong></p>
+<ol>
+<li>在 GitHub 创建一个 OAuth App（Settings → Developer settings → OAuth Apps），
+Authorization callback URL 填任意合法 URL（如 <code>https://github.com</code>）</li>
+<li>把 Client ID 填入插件配置（两个 profile 的 <code>cordis.patch.yml</code>）：</li>
+</ol>
+<pre><code>- insert:
+    - id: github
+      name: dsh-github
+      config:
+        tokenRef: GITHUB_TOKEN
+        approvalGate: true
+        timeoutMs: 30000
+        oauthClientId: Ov23liXXXXXXXX
+        oauthClientSecretRef: GITHUB_OAUTH_CLIENT_SECRET   # 推荐：凭据引用
+        # 或直接内联（不推荐明文）：oauthClientSecret: xxxx
+</code></pre>
+<ol>
+<li>设置 Client Secret 凭据：DSH 设置页新增 <code>GITHUB_OAUTH_CLIENT_SECRET</code>
+（或环境变量 <code>GITHUB_OAUTH_CLIENT_SECRET</code>）。GitHub 的 device flow 换取 token
+必须携带 client secret。</li>
+<li>重启 DSH，新会话中对模型说「<strong>用 github_auth_login 登录 GitHub</strong>」，
+浏览器打开返回的网址、输入用户码，授权一次即可；token 自动持久化，之后长期可用。</li>
+</ol>
+<blockquote>
+<p>GitHub device-flow 的 access token 长期有效、没有 refresh token 机制；
+若失效（表现为 401），调用 <code>github_auth_logout</code> 清除后重新登录即可。</p>
+</blockquote>
+<h3>3. 验证</h3>
+<p>新会话中让模型执行：</p>
+<ul>
+<li><code>github_get_me</code> —— 应返回当前 GitHub 用户（等价 opencode 的 get_me）</li>
+<li><code>github_auth_status</code> —— 认证来源与有效性</li>
+</ul>
+<h2>常用流程示例</h2>
+<p><strong>一键上传项目</strong>（建仓 → 推送 → 开 PR 全流程，常规操作无审批弹窗）：</p>
+<pre><code>github_upload_project(repo: "my-app", description: "我的应用",
+  files: [{path: "README.md", content: "# my-app"}, {path: "src/main.js", content: "..."}],
+  create_pull_request: true)
+</code></pre>
+<p><strong>手把手流程</strong>（等价 opencode push 多文件的体验）：</p>
+<pre><code>1. github_create_repository(name: "my-app", private: true)
+2. github_create_branch(owner, repo, branch: "feature/init")
+3. github_push_files(owner, repo, branch: "feature/init", message: "init", files: [...])
+4. github_create_pull_request(owner, repo, title: "init", head: "feature/init", base: "main")
+5. github_merge_pull_request(owner, repo, pull_number: 1, merge_method: "squash")  # 🔒 需审批
+</code></pre>
+<h2>工具清单</h2>
+<p>见 <a href="https://github.com/ChenYiming-aaa/dsh-github/blob/HEAD/TOOLS.md">TOOLS.md</a>（45 个工具分 9 类，含危险操作清单）。</p>
+<h2>审批门规则</h2>
+<table>
+<thead>
+<tr>
+<th>操作</th>
+<th>工具/参数</th>
+<th>审批</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>删除仓库</td>
+<td><code>github_delete_repository</code></td>
+<td>🔒</td>
+</tr>
+<tr>
+<td>删除文件</td>
+<td><code>github_delete_file</code></td>
+<td>🔒</td>
+</tr>
+<tr>
+<td>删除分支</td>
+<td><code>github_delete_branch</code></td>
+<td>🔒</td>
+</tr>
+<tr>
+<td>force push</td>
+<td><code>github_push_files</code> + <code>force: true</code></td>
+<td>🔒</td>
+</tr>
+<tr>
+<td>合并 PR</td>
+<td><code>github_merge_pull_request</code></td>
+<td>🔒</td>
+</tr>
+<tr>
+<td>关闭 issue / 关闭 PR</td>
+<td><code>github_update_issue</code> / <code>github_update_pull_request</code> + <code>state: closed</code></td>
+<td>🔒</td>
+</tr>
+<tr>
+<td>其余读/写</td>
+<td>—</td>
+<td>✅ 直接放行</td>
+</tr>
+</tbody></table>
+<p>审批通过 <code>tools/pre-execute</code> → <code>ctx.approval</code> 实现（与 DSH 内置 <code>dsh-user-approval</code>
+一致）：<code>allowed-once</code> 才放行，拒绝/取消/无审批通道一律 fail closed。
+<code>config.approvalGate: false</code> 可关闭审批门（不推荐）。</p>
+<h2>配置项</h2>
+<table>
+<thead>
+<tr>
+<th>配置</th>
+<th>默认</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>tokenRef</code></td>
+<td><code>GITHUB_TOKEN</code></td>
+<td>PAT 凭据引用名（env / credentials 键名）</td>
+</tr>
+<tr>
+<td><code>oauthClientId</code></td>
+<td>—</td>
+<td>GitHub OAuth App Client ID（Device Flow）</td>
+</tr>
+<tr>
+<td><code>oauthClientSecret</code></td>
+<td>—</td>
+<td>Client Secret（直接内联，不推荐）</td>
+</tr>
+<tr>
+<td><code>oauthClientSecretRef</code></td>
+<td><code>GITHUB_OAUTH_CLIENT_SECRET</code></td>
+<td>Client Secret 凭据引用（推荐）</td>
+</tr>
+<tr>
+<td><code>oauthScope</code></td>
+<td><code>repo,read:org,user</code></td>
+<td>Device Flow 申请的 scope</td>
+</tr>
+<tr>
+<td><code>approvalGate</code></td>
+<td><code>true</code></td>
+<td>危险操作审批门开关</td>
+</tr>
+<tr>
+<td><code>timeoutMs</code></td>
+<td><code>30000</code></td>
+<td>GitHub 请求超时</td>
+</tr>
+</tbody></table>
+<h2>开发与测试</h2>
+<pre><code>node tests/run-all.mjs    # 需要本机安装 DSH Desktop（loader 引用其 dsh-tools）
+</code></pre>
+<p>测试覆盖：</p>
+<ul>
+<li><code>validate-tools.mjs</code> — 45 个工具经 DSH 真实 dsh-tools 的 schema 编译/校验、render 健壮性</li>
+<li><code>validate-apply.mjs</code> — apply() 生命周期 + 审批门行为（危险→ask、常规→放行）</li>
+<li><code>approval-gate.mjs</code> — 危险操作分类单测</li>
+<li><code>redaction.mjs</code> — 验收：token 不出现在日志/错误/工具输出</li>
+<li><code>push-upload.mjs</code> — 内存版 GitHub API 上的多文件推送与一键上传流程（建仓→推送→开 PR）</li>
+</ul>
+<h2>架构</h2>
+<pre><code>index.js                插件入口：apply() 注册审批门 + systemPrompt 引导 + 45 个工具
+lib/client.js           GitHub REST 客户端（fetch、错误映射、token 脱敏）
+lib/auth.js             PAT/credentials 解析 + OAuth Device Flow 状态机
+lib/approval.js         危险操作分类 + tools/pre-execute 审批门
+lib/push.js             共享推送实现（blob→tree→commit→ref）
+lib/format.js           输出渲染 / presentCall 辅助
+lib/tools/*.js          分域工具定义（auth/repos/issues/pulls/commits/search/releases/orgs/workflow）
+</code></pre>
+<h2>许可</h2>
+<p>MIT</p>

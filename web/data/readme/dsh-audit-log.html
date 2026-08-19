@@ -1,0 +1,149 @@
+<h1>dsh-audit-log</h1>
+<blockquote>
+<p><strong>Who mutated my data flow?</strong> — Runtime data-flow audit log for DeepSeek Harness plugins, with per-plugin, per-fiber attribution.</p>
+</blockquote>
+<p><strong>English</strong> | <a href="https://github.com/ssdyg4444-sys/dsh-audit-log/blob/HEAD/README.zh-CN.md">简体中文</a></p>
+<p><code>dsh-audit-log</code> answers the question every plugin ecosystem eventually asks: when a field in your session data
+disappears or gets rewritten, <strong>which plugin did it, in what order, and what exactly changed</strong>?</p>
+<p>It is a read-only observer: it never blocks, never rewrites, and never stores payload values — only structural
+fingerprints (types, keys, lengths). Secrets never enter the log.</p>
+<h2>Why</h2>
+<p>Cordis (the framework under DeepSeek Harness) shares the same <code>args</code> array across every listener of a
+<code>waterfall</code> dispatch, and the <code>internal/get</code> / <code>internal/set</code> interception points are public. Any plugin can
+silently rewrite data flowing through the system. With hundreds of plugins, "which plugin washed out my
+field" is otherwise nearly impossible to answer.</p>
+<p><code>dsh-audit-log</code> makes it answerable:</p>
+<ul>
+<li><strong>Dispatch-level diff</strong> — every audited dispatch snapshots argument shapes before and after, and records
+the mutations in between.</li>
+<li><strong>Per-listener window attribution</strong> — each listener is wrapped at registration; mutations are attributed
+to the exact plugin + fiber that performed them (<code>confidence: "window"</code>), not a heuristic.</li>
+</ul>
+<h2>Install</h2>
+<pre><code># into your web profile
+cd ~/.dsh/profiles/web
+pnpm add dsh-audit-log
+</code></pre>
+<p>Then add <code>dsh-audit-log</code> to <code>dsh.profile.bundles</code> in <code>package.json</code> (or use <code>dsh plugin --profile web add dsh-audit-log</code>),
+and restart your dsh instance.</p>
+<p>The plugin registers <code>ctx.auditLog</code> and starts recording immediately. No configuration required for basic use.</p>
+<h2>Usage</h2>
+<p>Query the audit trail from any plugin:</p>
+<pre><code>const records = await ctx.auditLog.query({
+  events: ['message/send'],
+  mutationsOnly: true,   // only dispatches that changed something
+  fromSeq: 100,
+  limit: 50,
+})
+
+// Each mutation carries exact attribution (when attribute_by_window is on):
+//   { listenerIndex, package, fiber, confidence: 'window' }
+const culprit = records[0].mutations[0].attribution?.package
+
+// Raw per-listener windows:
+const windows = ctx.auditLog.queryWindows({ event: 'message/send' })
+</code></pre>
+<h3>Record shape</h3>
+<pre><code>{
+  "v": 1, "ts": "2026-08-19T08:00:00.000Z", "seq": 42,
+  "mode": "waterfall", "event": "message/send",
+  "listeners": [{ "order": 0, "package": "my-plugin", "fiber": 3 }],
+  "before": [ { "type": "object", "keys": ["content"] } ],
+  "after":  [ { "type": "object", "keys": ["content"] } ],
+  "mutations": [{
+    "argIndex": 0, "path": "arg[0].content",
+    "kind": "replace", "beforeLength": 56, "afterLength": 36,
+    "attribution": { "listenerIndex": 1, "package": "spam-filter", "fiber": 7, "confidence": "window" }
+  }]
+}
+</code></pre>
+<h2>Configuration</h2>
+<p>Via the profile patch layer (<code>cordis.patch.yml</code>), or <code>$DSH_HOME/settings.yaml</code> namespace <code>audit-log</code>:</p>
+<table>
+<thead>
+<tr>
+<th>Field</th>
+<th>Default</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>enabled</code></td>
+<td><code>true</code></td>
+<td>Global switch</td>
+</tr>
+<tr>
+<td><code>capacity</code></td>
+<td><code>10000</code></td>
+<td>Ring-buffer size (oldest dropped first)</td>
+</tr>
+<tr>
+<td><code>mutations_only</code></td>
+<td><code>false</code></td>
+<td>Only keep dispatches that mutated something</td>
+</tr>
+<tr>
+<td><code>attribute_by_window</code></td>
+<td><code>true</code></td>
+<td>Per-listener attribution (wrap listeners)</td>
+</tr>
+<tr>
+<td><code>package_allowlist</code></td>
+<td><code>[]</code></td>
+<td>Regex sources; empty audits all packages</td>
+</tr>
+<tr>
+<td><code>package_blocklist</code></td>
+<td><code>[]</code></td>
+<td>Regex sources; excludes after allowlist</td>
+</tr>
+<tr>
+<td><code>events</code></td>
+<td><code>[]</code></td>
+<td>Exact event names to audit; empty audits all</td>
+</tr>
+<tr>
+<td><code>event_allowlist</code></td>
+<td><code>[]</code></td>
+<td>Regex sources for event names</td>
+</tr>
+</tbody></table>
+<pre><code>- id: audit-log
+  config:
+    events: ["message/send", "before/*"]
+    package_blocklist: ["my-noisy-plugin"]
+</code></pre>
+<h2>How it works</h2>
+<pre><code>dispatch → internal/dispatch (prepend) → fingerprint(args) → listeners run → fingerprint(args) → diff → store
+</code></pre>
+<ol>
+<li><strong>Dispatch-level diff (P0/P1)</strong> — Cordis emits <code>internal/dispatch</code> synchronously <em>before</em> public listeners
+run. The service mounts that one hook (<code>prepend: true, global: true</code>), snapshots argument shapes, lets the
+dispatch proceed, then diffs and stores. Shape-only fingerprints (<code>maxDepth 3</code>, <code>maxKeys 20</code>) keep the
+overhead negligible and payload values out of the log.</li>
+<li><strong>Per-listener window attribution (P2)</strong> — intercepts <code>internal/listener</code> (bail) at registration time and
+wraps every non-internal listener. Each wrapped call snapshots the shared args before and after <em>that
+listener</em>, so mutations are attributed to the exact plugin + fiber (<code>confidence: "window"</code>).
+Framework-internal events are never wrapped — no recursion, no self-noise.</li>
+</ol>
+<h2>Limitations</h2>
+<ul>
+<li><strong>Shape-only fingerprints</strong>: equal-length string swaps (<code>'by-c'</code> → <code>'by-d'</code>) and in-place number edits are
+invisible to the diff. This is a deliberate privacy/cost trade-off; a value-aware <code>deep</code> mode is future work.</li>
+<li><strong>Sync-path timing</strong>: the microtask resume is exact for synchronous <code>emit</code>; for async listeners in
+<code>serial</code>/<code>parallel</code>/<code>waterfall</code>, the per-listener window wrapper (P2) covers the gap precisely, while the
+dispatch-level diff remains a coarse overview.</li>
+</ul>
+<h2>Relationship to other plugins</h2>
+<p>Observability tools in the ecosystem come in layers: some show <em>what plugins put into the model prompt</em>
+(context layer), while <code>dsh-audit-log</code> shows <em>what plugins changed in the event data flow</em> (runtime data
+layer). They are complementary — install both.</p>
+<h2>Development</h2>
+<pre><code>npx @dsh-io/dsh-dev check    # validate manifest, YAML, build
+npx @dsh-io/dsh-dev dev      # run under dsh web with file watching
+</code></pre>
+<p>Tests (no framework needed):</p>
+<pre><code>node --test tests/
+</code></pre>
+<h2>License</h2>
+<p>MIT</p>

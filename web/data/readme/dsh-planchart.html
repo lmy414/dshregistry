@@ -1,0 +1,199 @@
+<h1>dsh-planchart</h1>
+<p><a href="#%E4%B8%AD%E6%96%87%E8%AF%B4%E6%98%8E">中文</a></p>
+<p>A DeepSeek Harness (<code>dsh</code>) plugin that gives the agent a <strong>display surface</strong> for
+project planning. The model calls one tool with the whole plan; the browser
+renders it in two places:</p>
+<ul>
+<li><strong>the steps</strong> — a panel docked to the right edge of the frame, with phases,
+status marks and per-step detail;</li>
+<li><strong>the framework</strong> — a "PlanChart" tab beside Chat and Trajectory, holding an
+auto-laid-out architecture diagram that downloads as <strong>SVG or PNG</strong>.</li>
+</ul>
+<p>Talking to the agent again updates both: every <code>planchart_set</code> call replaces the
+whole chart, so "mark step 3 done" or "add a cache layer" is an ordinary
+follow-up message.</p>
+<p><img src="https://raw.githubusercontent.com/SmileBuild/dsh-planchart/HEAD/assets/screenshot-1.png" alt="The PlanChart tab: the framework diagram in the centre, the steps panel on the right"></p>
+<p><img src="https://raw.githubusercontent.com/SmileBuild/dsh-planchart/HEAD/assets/screenshot-2.png" alt="A framework diagram exported with the PNG button"></p>
+<h2>Install</h2>
+<pre><code>dsh plugin --profile web add ./dsh-PlanChart
+</code></pre>
+<p>Then restart the profile (<code>dsh web</code>) <strong>and hard-reload the browser tab</strong>. The
+plugin declares <code>dsh.bundle.patch</code>, so the installer adds it to the profile's
+bundle stack automatically; its browser half is discovered through <code>dsh.client</code>
+and served at <code>/plugins/dsh-planchart/client.js</code>.</p>
+<blockquote>
+<p>The reload is not optional. The client plugin table arrives as
+<code>window.__DSH_BOOT__</code>, injected into <code>index.html</code> <strong>at page load</strong>. A tab that
+was already open when you restarted keeps its old manifest and will never fetch
+the new bundle — the tools run, the chart is stored, and the browser shows
+nothing. This is true of every dsh client plugin, not just this one.</p>
+</blockquote>
+<p>To remove it: <code>dsh plugin --profile web remove dsh-planchart</code>.</p>
+<h2>Tools</h2>
+<table>
+<thead>
+<tr>
+<th>Tool</th>
+<th>What it does</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>planchart_set</code></td>
+<td>Publish the whole chart: <code>title</code>, optional <code>summary</code>, <code>steps[]</code>, and a <code>framework</code> graph. Replaces the previous chart wholesale.</td>
+</tr>
+<tr>
+<td><code>planchart_get</code></td>
+<td>Read back the chart currently displayed, as text — for revising a chart the model no longer has in context.</td>
+</tr>
+</tbody></table>
+<p>There is also a <code>/planchart</code> slash command that prints the current chart.</p>
+<h3>Step shape</h3>
+<pre><code>{ "id": "…",            // optional; derived from the title when omitted
+  "title": "Build recipe CRUD",
+  "status": "pending",  // pending | active | done | blocked
+  "detail": "create, edit, publish",   // optional
+  "phase": "Build" }                   // optional; consecutive steps group under it
+</code></pre>
+<h3>Framework shape</h3>
+<pre><code>{ "direction": "TB",                       // TB (default) or LR
+  "groups": [{ "id": "…", "label": "Client" }],
+  "nodes":  [{ "id": "…", "label": "Web app", "kind": "entry",
+               "note": "React + Vite", "group": "client" }],
+  "edges":  [{ "from": "web-app", "to": "api-gateway",
+               "label": "HTTPS", "dashed": false }] }
+</code></pre>
+<p><code>kind</code> is an accent only: <code>default</code>, <code>entry</code>, <code>core</code>, <code>store</code>, <code>external</code>,
+<code>output</code>. Ids may be omitted everywhere — one is derived from the label (CJK
+labels keep their characters), which is what edges then reference.</p>
+<h3>Layout</h3>
+<p>Two modes, chosen from the data:</p>
+<ul>
+<li><strong>Bands</strong> — when every node names a declared group, the groups become the rows
+(or columns under <code>LR</code>) and each is drawn as a labelled band. This is the
+natural reading of a layered architecture.</li>
+<li><strong>Layered DAG</strong> — otherwise the edges decide the ranks (longest path), ordered
+by one barycenter sweep.</li>
+</ul>
+<p>Both then run the same priority placement so a child sits under its parents
+rather than under the middle of its row, and edges between siblings in one rank
+duck through a reserved lane below it instead of cutting across the boxes.</p>
+<h2>How the chart reaches the browser</h2>
+<p>The chart rides <strong><code>tool/result.meta</code></strong> — the documented tool-private, replayable
+payload channel — and a <code>planchart</code> <strong>session projection</strong> folds it back out:</p>
+<pre><code>planchart_set.execute → output.presentationMeta → tool/result.meta (durable log)
+                                                          ↓
+                                        projection `planchart` (apply/view)
+                                                          ↓
+                                  session/projection push frame → useProjection
+</code></pre>
+<p><strong>Why not a session event of its own.</strong> An out-of-repo event type is absent from
+this build's <code>KNOWN_SESSION_EVENT_TYPES</code>, and <code>Session.append</code> offers no way to
+mark an event <code>ignorable</code>. Writing <code>planchart/write</code> would therefore make every
+session that used the plugin <strong>permanently unloadable</strong> after a restart — the
+persistence read path refuses a log containing an unknown, non-ignorable type.
+Riding <code>meta</code> on an ordinary <code>tool/result</code> adds no vocabulary at all, and replays
+identically.</p>
+<p>Consequences worth knowing:</p>
+<ul>
+<li>The chart survives restart, resume and fork, because it is derived from the log.</li>
+<li>Unlike the todo list it is <strong>not</strong> cleared by the next turn: a published chart
+is the standing shape of the project.</li>
+<li><code>presentationMeta</code> is computed for top-level calls only, so a chart published
+from inside a subagent does not reach the panels.</li>
+</ul>
+<h2>Both halves</h2>
+<ul>
+<li><strong>Host</strong> (<code>lib/index.js</code>) — the two tools, the projection unit, the system
+prompt section, the <code>/planchart</code> command. Optional seams (<code>sessionProjections</code>,
+<code>systemPrompt</code>, <code>commands</code>) are taken through <code>ctx.inject</code>, so a headless
+composition without them still gets the tools.</li>
+<li><strong>Browser</strong> (<code>lib/client.js</code>) — hand-authored in the lazy-CJS bundle form the
+client module loader expects (<code>window.__ModuleLoader__.load({ id, factory })</code>),
+so there is <strong>no build step</strong>. It registers into <code>conversation.view</code> (the tab)
+and <code>shell.overlay</code> (the steps panel).</li>
+</ul>
+<p>The diagram is drawn with presentational attributes and literal colours — no CSS
+classes, no <code>var(--dsw-*)</code> — so serializing the live <code>&lt;svg&gt;</code> yields a file that
+renders standalone once downloaded. It follows the app's light/dark theme by
+watching <code>data-ds-dark-theme</code> on <code>&lt;body&gt;</code>.</p>
+<h3>Why the steps panel floats</h3>
+<p><code>ui-layout</code> offers four root seats: <code>sidebar</code>, <code>conversation</code>, <code>details</code> and
+<code>shell.overlay</code>. The right-hand <code>details</code> column is a <strong>single</strong> slot already
+occupied by ui-conversation's DetailsPanel, and registering there would replace
+it and take the tool-details seat with it. <code>shell.overlay</code> is the documented
+additive seat for a frame-wide surface, so the steps panel lives there: docked
+right, collapsible to an edge tab, and remembered in <code>localStorage</code>. Being
+root-scoped it gets no <code>useProjection</code>, so it reads the same per-key observable
+through <code>ctx.sessions.binding(id).session.projections.faceOf('planchart')</code>.</p>
+<h2>Config</h2>
+<pre><code>- insert:
+    - id: planchart
+      name: dsh-planchart
+      config:
+        promptSection: true   # false keeps the tools but stops advertising them
+</code></pre>
+<h2>Tests</h2>
+<pre><code>npm test                     # host half: registration, the durable round trip, validation
+node test/render-preview.mjs # renders the browser half with real React → test/preview.{html,svg}
+</code></pre>
+<p><code>render-preview.mjs</code> loads <code>lib/client.js</code> through a stub of the client module
+loader and server-renders both seats, asserting that every node and edge is drawn
+and that no box escapes the canvas.</p>
+<h2>Limitations</h2>
+<ul>
+<li>Charts are per session; there is no cross-session library.</li>
+<li>The steps panel floats over the conversation rather than shrinking it (see
+above); collapse it to the edge tab when it is in the way.</li>
+<li>Diagram layout is deterministic but not optimal — heavy graphs (dozens of
+nodes with many cross-rank edges) will still cross.</li>
+<li>Caps: 60 steps, 80 nodes, 200 edges, 12 groups. Oversized input is rejected
+loudly rather than truncated.</li>
+</ul>
+<hr>
+<h2>中文说明</h2>
+<p><code>dsh-planchart</code> 给 agent 增加一块<strong>项目规划的展示面板</strong>。模型用一个工具发送完整的
+规划，浏览器分两处渲染：</p>
+<ul>
+<li><strong>步骤</strong> —— 停靠在窗口右侧的面板，带阶段分组、状态标记和每步说明；</li>
+<li><strong>框架</strong> —— Chat / Trajectory 旁边的 "PlanChart" 标签页，自动排版的架构图，可以
+<strong>下载 SVG 或 PNG</strong>。</li>
+</ul>
+<p>继续对话即可修改：每次 <code>planchart_set</code> 都整体替换当前的图，所以"把第三步标记完成"
+或"加一层缓存"就是一句普通的后续消息。</p>
+<h3>安装</h3>
+<pre><code>dsh plugin --profile web add ./dsh-PlanChart
+</code></pre>
+<p>然后重启 profile（<code>dsh web</code>），并且<strong>硬刷新浏览器页面</strong>。插件声明了
+<code>dsh.bundle.patch</code>，安装器会自动把它加入 profile 的 bundle 列表；浏览器半边通过
+<code>dsh.client</code> 被发现，served 在 <code>/plugins/dsh-planchart/client.js</code>。</p>
+<blockquote>
+<p>刷新这一步不能省。客户端插件表是 <code>window.__DSH_BOOT__</code>，在<strong>页面加载时</strong>注入
+<code>index.html</code>。重启前就开着的标签页会一直用旧的清单，永远不会去取新 bundle ——
+结果是工具照常执行、图也存下来了，但界面上什么都不显示。这对所有 dsh 客户端
+插件都成立，不只是这个插件。</p>
+</blockquote>
+<p>卸载：<code>dsh plugin --profile web remove dsh-planchart</code>。</p>
+<h3>工具</h3>
+<ul>
+<li><code>planchart_set</code> —— 发布整张图：<code>title</code>、可选 <code>summary</code>、<code>steps[]</code>、<code>framework</code> 图。</li>
+<li><code>planchart_get</code> —— 把当前显示的图读回成文本，供模型在上下文丢失后再修改。</li>
+<li><code>/planchart</code> —— 斜杠命令，打印当前的图。</li>
+</ul>
+<p>节点和步骤的 <code>id</code> 都可以省略，会从标题/标签推导（中文标签保留原字符），边再引用它。</p>
+<h3>数据怎么到浏览器</h3>
+<p>图挂在 <strong><code>tool/result.meta</code></strong>（工具私有、可重放的载荷通道）上，由 <code>planchart</code>
+<strong>session projection</strong> 折叠出来，再通过 <code>session/projection</code> 推给浏览器。</p>
+<p><strong>为什么不自定义 session 事件类型</strong>：本次构建的 <code>KNOWN_SESSION_EVENT_TYPES</code> 不包含
+仓库外的事件类型，而 <code>Session.append</code> 没有提供把事件标记为 <code>ignorable</code> 的入口。写入
+<code>planchart/write</code> 会让<strong>用过该插件的每个 session 在重启后永久无法加载</strong>——持久化读取
+路径会拒绝含有未知且非 ignorable 类型的日志。挂在普通 <code>tool/result</code> 的 <code>meta</code> 上不
+新增任何事件词汇，重放结果完全一致。</p>
+<p>因此：图能跨重启、resume 和 fork 保留；与 todo 列表不同，它<strong>不会</strong>在下一轮被清空；
+<code>presentationMeta</code> 只对顶层调用计算，所以子 agent 里发布的图不会出现在面板上。</p>
+<h3>已知限制</h3>
+<ul>
+<li>图按 session 保存，没有跨 session 的图库。</li>
+<li>步骤面板浮在对话之上，不会挤压中间栏；挡路时可以折叠成右侧边缘的小标签。</li>
+<li>排版是确定性的但不是最优的，节点很多且跨层边很密时仍会有交叉。</li>
+<li>上限：60 步、80 节点、200 条边、12 个分组，超出会直接报错而不是截断。</li>
+</ul>

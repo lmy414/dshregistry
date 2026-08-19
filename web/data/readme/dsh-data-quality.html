@@ -1,0 +1,255 @@
+<h1>dsh-data-quality</h1>
+<p><strong>Deterministic data profiling, cleaning, and verification for DeepSeek Harness.</strong></p>
+<p>All computation is plain TypeScript in the harness process — the model never does the math. A <code>ctx.dataQuality</code> capability seam (Service Definition / local Provider / tool Consumers) exposes three model tools plus a frozen cross-plugin citation-checking contract.</p>
+<p><a href="https://github.com/PerryLink/dsh-data-quality/blob/HEAD/README.md">English</a> · <a href="https://github.com/PerryLink/dsh-data-quality/blob/HEAD/README.zh.md">简体中文</a> · <a href="https://github.com/PerryLink/dsh-data-quality/blob/HEAD/README.es.md">Español</a> · <a href="https://github.com/PerryLink/dsh-data-quality/blob/HEAD/README.pt.md">Português</a> · <a href="https://github.com/PerryLink/dsh-data-quality/blob/HEAD/README.hi.md">हिन्दी</a></p>
+<h2>Compatibility</h2>
+<table>
+<thead>
+<tr>
+<th>Component</th>
+<th>Version</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>DeepSeek Harness</td>
+<td><code>0.1.0-rc.6</code> (peer dependencies pinned)</td>
+</tr>
+<tr>
+<td>Node.js</td>
+<td><code>^22.19.0 || &gt;=24.0.0</code></td>
+</tr>
+<tr>
+<td>Package manager</td>
+<td><code>pnpm@11.7.0</code></td>
+</tr>
+<tr>
+<td>Platform</td>
+<td>Windows / macOS / Linux (host-only plugin)</td>
+</tr>
+</tbody></table>
+<h2>What you get</h2>
+<ul>
+<li><strong><code>ctx.dataQuality</code> service</strong> — a Cordis service other plugins may optionally consume (<code>inject = ['dataQuality']</code>). Besides the three dataset operations behind the tools, it implements the frozen <code>verifyCitations(request)</code> contract: verify that numbers/strings cited in a document match a dataset snapshot, with relative-tolerance numeric comparison and <code>verified</code> / <code>mismatch</code> / <code>not-found</code> / <code>unverifiable</code> statuses.</li>
+<li><strong><code>data_profile</code> tool</strong> — dataset profiling: row/column counts, inferred column types (number/date/boolean/string/empty/mixed), missing rates, unique counts, numeric distributions (min/max/mean/median/p25/p75), IQR outlier counts, mixed-type suspicion notes, and full-table duplicate-row counts. Optional deterministic systematic sampling for large files.</li>
+<li><strong><code>data_clean</code> tool</strong> — ordered declarative cleaning rules: <code>dedupe</code> (by column group), <code>fill-missing</code> (constant/mean/median/forward), <code>coerce-type</code> (number/date/boolean; failures counted and set to missing), <code>normalize-unit</code> (e.g. 万/亿 suffixes to base units), <code>trim</code>, <code>map-values</code> (enum mapping). Returns a per-rule audit log plus a bounded preview; writes the cleaned dataset only when <code>outputPath</code> is given, and never overwrites the source.</li>
+<li><strong><code>data_verify</code> tool</strong> — declarative verification rules: <code>not-null</code>, <code>unique</code>, <code>range</code>, <code>regex</code>, <code>enum</code>, <code>cross-column</code> (e.g. <code>startDate &lt; endDate</code>), <code>freshness</code> (date column within N days of a reference date). Per-rule pass/fail with capped failing-row evidence; an overall failure is a normal <code>passed: false</code> result, not a tool error.</li>
+<li><strong>Durable reports</strong> — every profile/clean/verify/citation run persists to the <code>data_quality</code> storage domain (JSON backend), keyed by run timestamp plus a dataset-path fingerprint; the key is returned as <code>reportKey</code> in tool results.</li>
+<li><strong>Session events</strong> — on hosts that can carry them safely, runs append <code>data-quality/profile</code> / <code>data-quality/clean</code> / <code>data-quality/verify</code> events (with the <code>ignorable</code> marker where supported). On 0.1.0-rc.6 the append is skipped by design — the storage-domain report is always the durable copy (see "Known limitations").</li>
+</ul>
+<h2>Quick start</h2>
+<h3>npm channel</h3>
+<pre><code>dsh plugin --profile web add dsh-data-quality
+</code></pre>
+<h3>Tarball channel (no build permission needed)</h3>
+<pre><code>pnpm pack                                  # produces dsh-data-quality-&lt;version&gt;.tgz
+dsh plugin --profile web add ./dsh-data-quality-&lt;version&gt;.tgz
+</code></pre>
+<h3>Git channel</h3>
+<pre><code>dsh plugin --profile web add github:YOUR_ORG/dsh-data-quality#&lt;commit-sha&gt;
+</code></pre>
+<p>The first <code>add</code> fails because pnpm blocks the package's <code>prepare</code> build; copy the exact key pnpm printed into the profile's <code>pnpm-workspace.yaml</code> and re-run:</p>
+<pre><code>allowBuilds:
+  'dsh-data-quality': true
+</code></pre>
+<p>Restart the profile after installing (bundles activate on restart). Then ask the agent, in a workspace containing a CSV:</p>
+<blockquote>
+<p>Profile <code>holdings.csv</code>, then clean it by trimming whitespace, deduplicating on <code>fund_code</code>, and normalizing the <code>holding_value</code> column's 万/亿 units; finally verify <code>fund_code</code> is unique and not null.</p>
+</blockquote>
+<h2>Install &amp; uninstall</h2>
+<pre><code>dsh plugin --profile web add dsh-data-quality      # install (npm) — or the forms above
+dsh plugin --profile web remove dsh-data-quality   # uninstall
+</code></pre>
+<h2>Configuration</h2>
+<p>All keys are optional (defaults shown); invalid values fail loudly at load. Every key is settable from <code>cordis.yml</code> (the bundle ships <code>cordis.patch.yml</code> with the same defaults).</p>
+<table>
+<thead>
+<tr>
+<th>Key</th>
+<th>Default</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>enabled</code></td>
+<td><code>true</code></td>
+<td>Master switch; <code>false</code> mounts nothing at all.</td>
+</tr>
+<tr>
+<td><code>maxRows</code></td>
+<td><code>200000</code></td>
+<td>Hard row cap per dataset load; larger inputs reject loudly (use the tool's <code>sample</code> parameter).</td>
+</tr>
+<tr>
+<td><code>maxFileSizeMB</code></td>
+<td><code>64</code></td>
+<td>Hard file-size cap in MiB per dataset load.</td>
+</tr>
+<tr>
+<td><code>defaultTolerance</code></td>
+<td><code>1e-9</code></td>
+<td>Default relative tolerance for numeric citation comparison when a citation omits <code>tolerance</code>.</td>
+</tr>
+<tr>
+<td><code>evidenceRowLimit</code></td>
+<td><code>20</code></td>
+<td>Cap on failing-row evidence (verify) and preview rows (clean) in one result.</td>
+</tr>
+<tr>
+<td><code>allowedExtensions</code></td>
+<td><code>['.csv', '.tsv', '.json', '.jsonl']</code></td>
+<td>Extensions accepted as datasets.</td>
+</tr>
+<tr>
+<td><code>workspaceRoot</code></td>
+<td><code>""</code></td>
+<td>Absolute root for SERVICE-level calls (e.g. <code>verifyCitations</code>) that carry no session workspace; empty = the harness process launch directory. Tool calls always use the session's workspace cwd.</td>
+</tr>
+<tr>
+<td><code>storeReports</code></td>
+<td><code>true</code></td>
+<td>Persist run reports to the <code>data_quality</code> storage domain and return <code>reportKey</code>.</td>
+</tr>
+</tbody></table>
+<h2>Tools &amp; surfaces</h2>
+<h3><code>data_profile({ path, sample? })</code></h3>
+<p>Profiles a workspace dataset. <code>path</code> is workspace-relative (<code>.csv</code>/<code>.tsv</code>/<code>.json</code>/<code>.jsonl</code>; JSON must be an array of flat objects). <code>sample</code> takes every <code>ceil(N/sample)</code>-th row for the column cards (deterministic; row counts stay exact). Returns the structured report; renders a human-readable per-column summary.</p>
+<h3><code>data_clean({ path, rules, outputPath? })</code></h3>
+<p>Applies <code>rules</code> in array order, each seeing the previous rule's output. Rule reference:</p>
+<table>
+<thead>
+<tr>
+<th>Rule</th>
+<th>Extra fields</th>
+<th>Semantics</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>dedupe</code></td>
+<td><code>columns?</code></td>
+<td>Remove rows whose key-column values duplicate an earlier row (first kept; all columns when omitted).</td>
+</tr>
+<tr>
+<td><code>fill-missing</code></td>
+<td><code>column</code>, <code>strategy</code>, <code>value?</code></td>
+<td>Fill missing cells: <code>constant</code> (needs <code>value</code>), <code>mean</code>/<code>median</code> (numeric columns), <code>forward</code> (previous non-missing).</td>
+</tr>
+<tr>
+<td><code>coerce-type</code></td>
+<td><code>column</code>, <code>to</code></td>
+<td>Coerce to <code>number</code>/<code>date</code> (ISO)/<code>boolean</code>; failures become missing and are counted in the log.</td>
+</tr>
+<tr>
+<td><code>normalize-unit</code></td>
+<td><code>column</code>, <code>factors</code></td>
+<td>Strip a unit suffix and multiply (<code>{"万": 10000, "亿": 100000000}</code>); plain numerics convert too.</td>
+</tr>
+<tr>
+<td><code>trim</code></td>
+<td><code>columns?</code></td>
+<td>Trim whitespace of string cells (all columns when omitted).</td>
+</tr>
+<tr>
+<td><code>map-values</code></td>
+<td><code>column</code>, <code>map</code>, <code>else?</code></td>
+<td>Exact-match mapping; unmapped values stay (<code>keep</code>, default) or become <code>missing</code>.</td>
+</tr>
+</tbody></table>
+<p>The source file is <strong>never</strong> overwritten. With <code>outputPath</code> the cleaned dataset is written there (workspace-confined, format by extension); without it the run is preview-only.</p>
+<h3><code>data_verify({ path, rules })</code></h3>
+<p>Evaluates verification rules. Rule reference:</p>
+<table>
+<thead>
+<tr>
+<th>Rule</th>
+<th>Extra fields</th>
+<th>Semantics</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>not-null</code></td>
+<td><code>column</code></td>
+<td>Fail missing cells (null/empty/whitespace).</td>
+</tr>
+<tr>
+<td><code>unique</code></td>
+<td><code>columns</code></td>
+<td>Fail every row whose key combination repeats (missing participates).</td>
+</tr>
+<tr>
+<td><code>range</code></td>
+<td><code>column</code>, <code>min?</code>, <code>max?</code></td>
+<td>Fail missing/unparseable cells and values outside the inclusive bounds (at least one bound required).</td>
+</tr>
+<tr>
+<td><code>regex</code></td>
+<td><code>column</code>, <code>pattern</code>, <code>flags?</code></td>
+<td>Fail missing or non-matching cells (full JS regex).</td>
+</tr>
+<tr>
+<td><code>enum</code></td>
+<td><code>column</code>, <code>values</code></td>
+<td>Fail cells whose trimmed text is not listed.</td>
+</tr>
+<tr>
+<td><code>cross-column</code></td>
+<td><code>left</code>, <code>op</code>, <code>rightColumn?</code>, <code>value?</code></td>
+<td>Compare per row: numeric when both sides parse, dates compare as epochs, strings only for <code>==</code>/<code>!=</code> (exactly one of <code>rightColumn</code>/<code>value</code>).</td>
+</tr>
+<tr>
+<td><code>freshness</code></td>
+<td><code>column</code>, <code>maxAgeDays</code>, <code>asOf?</code></td>
+<td>Fail dates older than <code>maxAgeDays</code> before <code>asOf</code> (default: now); unparseable/missing fails.</td>
+</tr>
+</tbody></table>
+<p>A missing cell fails every rule that reads it. Evidence is capped at <code>evidenceRowLimit</code> failing rows per rule.</p>
+<h3><code>ctx.dataQuality</code> (for other plugins)</h3>
+<pre><code>const result = await ctx.dataQuality.verifyCitations({
+  dataset: 'holdings.csv',          // resolved against workspaceRoot
+  citations: [
+    { id: 'c1', path: 'rows[3].nav', value: 1.234, tolerance: 0.01 },
+    { id: 'c2', path: 'summary.annualReturn', value: '12.34%' },
+  ],
+})
+// result.results[i] = { id, status: 'verified' | 'mismatch' | 'not-found' | 'unverifiable', actual?, note? }
+</code></pre>
+<p>Locators walk the dataset document: CSV/TSV load as <code>{ columns, rows }</code> (so <code>rows[3].nav</code> resolves), JSON is the parsed value, JSONL the array of parsed lines. Numbers compare with relative tolerance (<code>|a-b| &lt;= tolerance * max(|a|, |b|)</code>); a CSV string cell that parses numerically compares as a number; strings compare exactly; incomparable type pairs are <code>unverifiable</code>. The service also exposes <code>profileDataset</code> / <code>cleanDataset</code> / <code>verifyDataset</code> (the same operations the tools call).</p>
+<h2>Permissions &amp; data</h2>
+<ul>
+<li><strong>Reads</strong> workspace dataset files (allowlisted extensions only).</li>
+<li><strong>Writes</strong> only: the <code>data_clean</code> output file (explicit <code>outputPath</code>, workspace-confined, never the input) and reports in the <code>data_quality</code> storage domain under the harness data directory.</li>
+<li><strong>No network, no credentials, no external processes</strong> — all parsing and statistics are in-process TypeScript.</li>
+<li>Reports may contain sample cell values from your datasets (bounded by <code>evidenceRowLimit</code> and display truncation); the session log records tool arguments and results as usual.</li>
+</ul>
+<h2>Security boundaries</h2>
+<ul>
+<li><strong>Path confinement</strong> — dataset and output paths must resolve inside the session workspace (<code>verifyCitations</code> uses <code>workspaceRoot</code>); <code>..</code> escapes and outside absolute paths reject, and both sides are normalized before comparison (Windows slash-safe).</li>
+<li><strong>Bounded work</strong> — <code>maxRows</code> / <code>maxFileSizeMB</code> guards reject oversized inputs loudly; abort signals cancel long loads mid-stream.</li>
+<li><strong>No overwrite</strong> — <code>data_clean</code> refuses an <code>outputPath</code> equal to the input path.</li>
+<li><strong>Deterministic computation</strong> — same input, same output; the only clock is the one injected for <code>freshness</code> defaults and report timestamps.</li>
+</ul>
+<h2>Known limitations</h2>
+<ul>
+<li><strong>Session events are adaptive.</strong> 0.1.0-rc.6 has no plugin session-event registration surface and its <code>Session.append</code> cannot stamp the <code>ignorable</code> marker, so appending an unknown <code>data-quality/*</code> type would make the session log unreadable on restore. The plugin therefore appends only when the host knows the vocabulary or supports the <code>ignorable</code> append flag; on rc.6 the storage-domain report is the durable record.</li>
+<li><strong>CSV dialect</strong> — comma/tab with RFC-4180 quoting, header row required, blank lines skipped, no delimiter auto-detection or comment lines.</li>
+<li><strong>Type parsing is strict</strong> — numbers have no thousands separators; dates are <code>YYYY-MM-DD</code> / <code>YYYY/MM/DD</code> / ISO-like datetimes (UTC); booleans are <code>true/false/yes/no/1/0</code>. Everything else profiles as <code>string</code>/<code>mixed</code> — clean it with <code>coerce-type</code> when intended.</li>
+<li><strong>JSON must be tabular for the tools</strong> (array of flat objects); <code>verifyCitations</code> walks arbitrary JSON documents.</li>
+<li><strong>No ML anomaly detection, no PII masking, no databases, no SQL</strong> — rule-based suspicion notes only.</li>
+</ul>
+<h2>Development</h2>
+<pre><code>pnpm install
+pnpm run typecheck &amp;&amp; pnpm run typecheck:ci &amp;&amp; pnpm test &amp;&amp; pnpm run build
+pnpm run verify:self-contained &amp;&amp; pnpm run verify:artifacts &amp;&amp; pnpm run verify:readme-sync &amp;&amp; pnpm pack
+</code></pre>
+<ul>
+<li>Tests run vitest against the REAL <code>Context</code>/<code>Session</code>/<code>ToolRuntime</code>/storage domain from the 0.1.0-rc.6 peers (no hand-written service mocks) plus pure engine specs; every clean/verify rule has positive and negative cases, and <code>verifyCitations</code> covers all four statuses.</li>
+<li><code>scripts/loader-runner.mjs</code> boots the real Loader composition and executes the profile → clean → verify chain against <code>fixtures/</code> without an API key.</li>
+<li>Release: <code>node scripts/release.mjs &lt;x.y.z&gt;</code> (never pushes; the tag triggers <code>release.yml</code>).</li>
+</ul>
+<h2>Topics</h2>
+<p><code>dsh</code> · <code>dsh-plugin</code> · <code>deepseek-harness</code> · <code>cordis</code> · <code>data-quality</code> · <code>data-cleaning</code> · <code>data-profiling</code> · <code>data-verification</code></p>
+<h2>Contributors</h2>
+<p>Maintained by the dsh-data-quality contributors. Issues and pull requests are welcome once the repository is public.</p>
+<h2>PerryLink DSH Plugin Family</h2>
+<p>This plugin follows the shared DSH family engineering conventions: bundle-manifest packaging (<code>dsh.bundle</code> + <code>cordis.patch.yml</code>), five-language READMEs gated by a sync check, fail-loud Schemastery configuration, real-service vitest coverage, and a three-workflow CI/compat/release chain.</p>
+<h2>License</h2>
+<p>Apache-2.0 — see <a href="https://github.com/PerryLink/dsh-data-quality/blob/HEAD/LICENSE">LICENSE</a> and <a href="https://github.com/PerryLink/dsh-data-quality/blob/HEAD/THIRD_PARTY_NOTICES.md">THIRD_PARTY_NOTICES.md</a>.</p>

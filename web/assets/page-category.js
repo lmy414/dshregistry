@@ -17,7 +17,7 @@ import {
   pluginSources, pageStars, parseQuery, applyFilters, applyPageFilters,
   pluginMatchesTerms, pageMatchesTerms, relevanceScore, suggestForQuery,
   fmtNum, highlight, growthLeaderboard, authorCounts, topAuthors,
-  pickFeatured, displayUrl,
+  pickFeatured, displayUrl, pinFeatured,
 } from './search-core.js'
 
 // ====================================================================
@@ -39,6 +39,7 @@ if (typeof document !== 'undefined' && typeof window !== 'undefined') {
       facets: { source: [], category: [], trust: [], author: [], stars: '' }, // stars '' = 不限
       authorExpanded: false, // 作者 facet 是否展开全部
       visible: 50,           // 结果区每屏渲染条数(增量渲染,避免大结果集一次渲染卡顿)
+      featuredSlugs: [],     // 站长精选 slug 列表(搜索命中置顶)
     }
     const PAGE_SIZE = 50
     const SORTS = ['relevance', 'stars', 'updated']
@@ -69,7 +70,7 @@ if (typeof document !== 'undefined' && typeof window !== 'undefined') {
       return srcs.map((s) => `<span class="src-tag">${DSHR.escapeHtml(DSHR.t(`src.${s}`))}</span>`).join('')
     }
 
-    function pluginRowHtml(p, terms) {
+    function pluginRowHtml(p, terms, featured) {
       const author = String((p.repo || '').split('/')[0] || '')
       const installSpec = p.installSpec || `github:${p.repo}`
       const cmd = `dsh plugin --profile web add ${installSpec}`
@@ -78,6 +79,7 @@ if (typeof document !== 'undefined' && typeof window !== 'undefined') {
   <div class="result-main">
     <div class="result-title-row">
       <a class="result-title" href="${url}">${highlight(DSHR.escapeHtml(p.name || ''), terms)}</a>
+      ${featured ? `<span class="featured-label">${DSHR.escapeHtml(DSHR.t('featured.label'))}</span>` : ''}
       <span class="result-cat-tag">${DSHR.escapeHtml(DSHR.categoryLabel(p.category))}</span>
       <span class="result-by">${DSHR.escapeHtml(DSHR.t('result.by').replace('{a}', author))}</span>
       ${scoreBadgeHtml(p)}${chipHtml(p)}${DSHR.badgeHtml(p.state, p.stateReasons)}
@@ -331,7 +333,10 @@ if (typeof document !== 'undefined' && typeof window !== 'undefined') {
       const { plugs, pgs } = queryCandidateSets()
       const plugRows = applyFacetsToPlugins(plugs)
       const pageRows = applyFacetsToPages(pgs)
-      const rows = buildRows(plugRows, pageRows, parsed)
+      let rows = buildRows(plugRows, pageRows, parsed)
+      // 站长精选置顶:有查询词时命中精选的插件排最前(组内保持原排序)
+      const featuredSet = new Set(state.featuredSlugs)
+      if (state.query.trim()) rows = pinFeatured(rows, state.featuredSlugs)
       const t0 = performance.now()
       const statsEl = document.getElementById('resultsStats')
       if (statsEl) {
@@ -358,7 +363,7 @@ if (typeof document !== 'undefined' && typeof window !== 'undefined') {
           wireZeroChips()
         } else {
           const shown = rows.slice(0, state.visible)
-          listEl.innerHTML = shown.map((r) => r.kind === 'plugin' ? pluginRowHtml(r.item, parsed.terms) : pageRowHtml(r.item, parsed.terms)).join('')
+          listEl.innerHTML = shown.map((r) => r.kind === 'plugin' ? pluginRowHtml(r.item, parsed.terms, featuredSet.has(r.item.slug)) : pageRowHtml(r.item, parsed.terms)).join('')
           // 增量渲染:结果超出当前可见数 → 底部"加载更多"
           if (rows.length > state.visible) {
             const more = document.createElement('button')
@@ -630,7 +635,20 @@ if (typeof document !== 'undefined' && typeof window !== 'undefined') {
       if (input) input.value = q
       runSearch()
       loadSearchIndex()   // 后台补全相关度数据,不阻塞首屏
+      loadFeatured()      // 后台加载站长精选 slug(搜索命中置顶),不阻塞首屏
       loadTrending()      // 零结果态的热门推荐
+    }
+
+    /** 站长精选 slug:加载后若有查询词,重渲染以应用置顶。 */
+    async function loadFeatured() {
+      try {
+        const d = await DSHR.fetchJson('featured')
+        state.featuredSlugs = Array.isArray(d && d.featured) ? d.featured : []
+        if (state.query) runSearch()
+      } catch (e) {
+        console.error('[page-category] featured.json load failed', e)
+        state.featuredSlugs = []
+      }
     }
 
     async function loadSearchIndex() {

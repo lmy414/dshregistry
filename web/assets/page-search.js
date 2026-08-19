@@ -16,13 +16,13 @@
 // page-search.js 不变,同时模块内 DOM 区可直接引用这些绑定)
 // ====================================================================
 import {
-  pluginSources, pageStars, featuredPlugins, authorLeaderboard, starsLeaderboard,
+  pluginSources, pageStars, featuredPlugins, pinFeatured, authorLeaderboard, starsLeaderboard,
   growthLeaderboard, parseQuery, applyFilters, applyPageFilters, pluginMatchesTerms,
   pageMatchesTerms, relevanceScore, suggestForQuery, fmtNum, highlight,
 } from './search-core.js'
 
 export {
-  pluginSources, pageStars, featuredPlugins, authorLeaderboard, starsLeaderboard,
+  pluginSources, pageStars, featuredPlugins, pinFeatured, authorLeaderboard, starsLeaderboard,
   growthLeaderboard, parseQuery, applyFilters, applyPageFilters, pluginMatchesTerms,
   pageMatchesTerms, relevanceScore, suggestForQuery, fmtNum, highlight,
 }
@@ -44,6 +44,7 @@ if (typeof document !== 'undefined' && typeof window !== 'undefined') {
       docIdxOf: new Map(),   // slug → search.json docs 下标
       query: '',
       sort: 'relevance',
+      featuredSlugs: [],        // 站长精选 slug 列表(config/featured.json → web/data/featured.json)
       facets: { source: [], category: [], trust: [], stars: '' }, // '' = 不限
     }
     const SORTS = ['relevance', 'stars', 'updated']
@@ -74,7 +75,7 @@ if (typeof document !== 'undefined' && typeof window !== 'undefined') {
       return srcs.map((s) => `<span class="src-tag">${DSHR.escapeHtml(DSHR.t(`src.${s}`))}</span>`).join('')
     }
 
-    function pluginRowHtml(p, terms) {
+    function pluginRowHtml(p, terms, featured) {
       const author = String((p.repo || '').split('/')[0] || '')
       const installSpec = p.installSpec || `github:${p.repo}`
       const cmd = `dsh plugin --profile web add ${installSpec}`
@@ -83,6 +84,7 @@ if (typeof document !== 'undefined' && typeof window !== 'undefined') {
   <div class="result-main">
     <div class="result-title-row">
       <a class="result-title" href="${url}">${highlight(DSHR.escapeHtml(p.name || ''), terms)}</a>
+      ${featured ? `<span class="featured-label">${DSHR.escapeHtml(DSHR.t('featured.label'))}</span>` : ''}
       <span class="result-cat-tag">${DSHR.escapeHtml(DSHR.categoryLabel(p.category))}</span>
       <span class="result-by">${DSHR.escapeHtml(DSHR.t('result.by').replace('{a}', author))}</span>
       ${scoreBadgeHtml(p)}${chipHtml(p)}${DSHR.badgeHtml(p.state, p.stateReasons)}
@@ -134,22 +136,51 @@ if (typeof document !== 'undefined' && typeof window !== 'undefined') {
       }
     }
 
-    function renderFeatured() {
-      const el = document.getElementById('featuredList')
-      if (!el) return
+    /** 站长精选卡:读 /data/featured.json(slug 列表)→ 按 stars 降序渲染榜单卡;空则隐藏整卡。 */
+    async function loadFeatured() {
       try {
-        const list = featuredPlugins(state.plugins, 8)
-        el.innerHTML = list.length ? list.map((p) => pluginRowHtml(p, [])).join('') : unavailableHtml()
+        const d = await DSHR.fetchJson('featured')
+        state.featuredSlugs = Array.isArray(d && d.featured) ? d.featured : []
       } catch (e) {
-        console.error('[page-search] featured render failed', e)
+        console.error('[page-search] featured.json load failed', e)
+        state.featuredSlugs = []
+      }
+      renderFeaturedBoard()
+    }
+
+    function renderFeaturedBoard() {
+      const card = document.getElementById('featuredBoard')
+      const el = document.getElementById('lbFeatured')
+      if (!card || !el) return
+      try {
+        const list = featuredPlugins(state.plugins, state.featuredSlugs)
+        if (!list.length) {
+          card.hidden = true
+          el.innerHTML = ''
+          return
+        }
+        card.hidden = false
+        el.innerHTML = list.map((p, i) => {
+          const author = String((p.repo || '').split('/')[0] || '')
+          return lbItemHtml(
+            i + 1,
+            p.name,
+            `/p/${encodeURIComponent(p.slug)}.html`,
+            `<span class="lb-value tabular">${fmtNum(p.stars)}</span>`,
+            `rank-${i + 1}`,
+            `by ${author}`,
+          )
+        }).join('')
+      } catch (e) {
+        console.error('[page-search] featured board render failed', e)
         el.innerHTML = unavailableHtml()
       }
     }
 
-    function lbItemHtml(rank, name, href, valueHtml, cls) {
+    function lbItemHtml(rank, name, href, valueHtml, cls, sub) {
       return `<li class="lb-item${cls ? ` ${cls}` : ''}">
   <span class="lb-rank">${rank}</span>
-  ${href ? `<a class="lb-name" href="${href}">${DSHR.escapeHtml(name)}</a>` : `<span class="lb-name">${DSHR.escapeHtml(name)}</span>`}
+  ${href ? `<a class="lb-name" href="${href}">${DSHR.escapeHtml(name)}${sub ? `<span class="lb-sub">${DSHR.escapeHtml(sub)}</span>` : ''}</a>` : `<span class="lb-name">${DSHR.escapeHtml(name)}${sub ? `<span class="lb-sub">${DSHR.escapeHtml(sub)}</span>` : ''}</span>`}
   ${valueHtml}
 </li>`
     }
@@ -410,7 +441,10 @@ if (typeof document !== 'undefined' && typeof window !== 'undefined') {
     function applyAndRender() {
       const parsed = parseQuery(state.query)
       const { plugs, pgs } = queryCandidateSets()
-      const rows = buildRows(applyFacetsToPlugins(plugs), applyFacetsToPages(pgs), parsed)
+      let rows = buildRows(applyFacetsToPlugins(plugs), applyFacetsToPages(pgs), parsed)
+      // 站长精选置顶:有查询词时命中精选的插件排最前(组内保持原排序)
+      const featuredSet = new Set(state.featuredSlugs)
+      rows = state.query.trim() ? pinFeatured(rows, state.featuredSlugs) : rows
       const t0 = performance.now()
       const statsEl = document.getElementById('resultsStats')
       if (statsEl) {
@@ -421,7 +455,7 @@ if (typeof document !== 'undefined' && typeof window !== 'undefined') {
       const listEl = document.getElementById('resultsList')
       if (listEl) {
         listEl.innerHTML = rows.length
-          ? rows.map((r) => r.kind === 'plugin' ? pluginRowHtml(r.item, parsed.terms) : pageRowHtml(r.item, parsed.terms)).join('')
+          ? rows.map((r) => r.kind === 'plugin' ? pluginRowHtml(r.item, parsed.terms, featuredSet.has(r.item.slug)) : pageRowHtml(r.item, parsed.terms)).join('')
           : zeroStateHtml()
         wireZeroChips()
       }
@@ -545,7 +579,7 @@ if (typeof document !== 'undefined' && typeof window !== 'undefined') {
 
     function rerenderAll() {
       renderStats()
-      renderFeatured()
+      renderFeaturedBoard()
       renderLeaderboards()
       renderQuickChips()
       const input = document.getElementById('searchInput')
@@ -593,9 +627,10 @@ if (typeof document !== 'undefined' && typeof window !== 'undefined') {
       wireSort()
       wireInstallToggle()
       renderStats()
-      renderFeatured()
+      renderFeaturedBoard()
       renderLeaderboards()
       renderQuickChips()
+      loadFeatured()
       // URL ?q= 直接进入结果视图(SearchAction 兼容)
       const q = new URLSearchParams(location.search).get('q')
       if (q) {

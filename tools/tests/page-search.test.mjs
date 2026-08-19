@@ -1,7 +1,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import {
-  featuredPlugins, authorLeaderboard, starsLeaderboard, growthLeaderboard,
+  featuredPlugins, pinFeatured, authorLeaderboard, starsLeaderboard, growthLeaderboard,
   parseQuery, applyFilters, applyPageFilters, pluginMatchesTerms, pageMatchesTerms,
   relevanceScore, suggestForQuery, fmtNum, pluginSources, pageStars,
 } from '../../web/assets/page-search.js'
@@ -12,9 +12,26 @@ const plugs = [
   { slug: 'c', name: 'gamma', repo: 'omdsh/gamma', category: 'tool', state: 'community', stars: 50 },
 ]
 
-test('featuredPlugins: community 按 stars 降序取前 n', () => {
-  assert.deepEqual(featuredPlugins(plugs, 2).map((p) => p.slug), ['a', 'c'])
-  assert.equal(featuredPlugins(plugs, 8).length, 2)
+test('featuredPlugins: 站长指定 slug 列表,按 stars 降序;空列表/未知 slug 处理', () => {
+  // slugs 顺序无关,输出按 stars 降序
+  assert.deepEqual(featuredPlugins(plugs, ['c', 'a']).map((p) => p.slug), ['a', 'c'])
+  assert.deepEqual(featuredPlugins(plugs, ['c']).map((p) => p.slug), ['c'])
+  assert.deepEqual(featuredPlugins(plugs, ['unknown-slug']), [], '未知 slug 跳过')
+  assert.deepEqual(featuredPlugins(plugs, []), [], '空列表返回空')
+  assert.deepEqual(featuredPlugins(plugs, null), [], 'null 返回空')
+})
+
+test('pinFeatured: 有精选命中时置顶,未命中原序不变', () => {
+  const rows = [
+    { kind: 'plugin', item: { slug: 'x' } },
+    { kind: 'plugin', item: { slug: 'c' } },
+    { kind: 'page', item: { name: 'w' } },
+  ]
+  const pinned = pinFeatured(rows, ['c'])
+  assert.equal(pinned[0].item.slug, 'c', '命中精选置顶')
+  assert.equal(pinned.length, 3)
+  assert.deepEqual(pinFeatured(rows, ['nope']), rows, '未命中保持原序')
+  assert.deepEqual(pinFeatured(rows, []), rows, '空列表保持原序')
 })
 
 test('authorLeaderboard / starsLeaderboard / growthLeaderboard', () => {

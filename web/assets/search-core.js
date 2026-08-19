@@ -34,12 +34,25 @@ export function pageStars(w) {
 // 榜单(搜索主页精选/三榜)
 // ====================================================================
 
-/** 精选社区插件:state==='community',按 stars 降序取前 n。 */
-export function featuredPlugins(plugins, n = 8) {
-  return plugins
-    .filter((p) => p.state === 'community')
+/** 站长精选:按 config/featured.json 的 slug 取插件,按 stars 降序(站长指定 + 星高在前)。
+ *  找不到的 slug 跳过;slug 列表为空 → 空数组(主页隐藏精选卡)。 */
+export function featuredPlugins(plugins, featuredSlugs = []) {
+  if (!Array.isArray(featuredSlugs) || featuredSlugs.length === 0) return []
+  const bySlug = new Map(plugins.map((p) => [p.slug, p]))
+  return featuredSlugs
+    .map((s) => bySlug.get(s))
+    .filter(Boolean)
     .sort((a, b) => b.stars - a.stars)
-    .slice(0, n)
+}
+
+/** 搜索置顶:有查询词时,命中站长精选的插件排最前(组内保持原序)。 */
+export function pinFeatured(rows, featuredSlugs) {
+  if (!Array.isArray(featuredSlugs) || featuredSlugs.length === 0) return rows
+  const set = new Set(featuredSlugs)
+  const pinned = rows.filter((r) => r.kind === 'plugin' && set.has(r.item.slug))
+  if (!pinned.length) return rows
+  const rest = rows.filter((r) => !(r.kind === 'plugin' && set.has(r.item.slug)))
+  return [...pinned, ...rest]
 }
 
 /** 作者榜:按收录数(repo owner)降序取前 n。 */

@@ -62,8 +62,13 @@ await new Promise((resolve, reject) => {
 await sleep(300)
 
 console.log('== 发现页 ==')
-assert(window.document.querySelectorAll('#featuredList .result-row').length === 8, '精选 8 行')
-assert(window.document.querySelector('#featuredList .result-title')?.textContent === '@liustack/modlens', '精选第一名 modlens')
+// 站长精选卡:featured.json 指定,按 stars 降序(modlens 1997 > dsh-tui 1318 > aegis 1050)
+const featuredData = JSON.parse(await readFile(join(WEB, 'data', 'featured.json'), 'utf8'))
+const featuredItems = window.document.querySelectorAll('#lbFeatured .lb-item')
+assert(featuredItems.length === featuredData.featured.length, `站长精选卡 ${featuredItems.length} 项 (= featured.json ${featuredData.featured.length})`)
+const featuredNames = [...featuredItems].map((li) => li.querySelector('.lb-name')?.textContent)
+assert(featuredNames[0].includes('modlens'), `站长精选按 stars 降序,首位 modlens (实际 ${featuredNames[0]})`)
+assert(featuredItems[0].querySelector('.lb-sub')?.textContent.includes('liustack'), '站长精选卡含作者小字')
 assert(window.document.querySelectorAll('#lbAuthors .lb-item').length === 5, '作者榜 5 项')
 assert(window.document.querySelectorAll('#lbStars .lb-item').length === 5, '星数榜 5 项')
 assert(window.document.querySelectorAll('#lbGrowth .lb-item').length === 5, '增长榜 5 项')
@@ -71,8 +76,6 @@ const metaCount = JSON.parse(await readFile(join(WEB, 'data', 'meta.json'), 'utf
 assert(window.document.getElementById('stat-plugins').textContent === String(metaCount.pluginCount), `统计条插件数 (页面 "${window.document.getElementById('stat-plugins').textContent}" vs meta "${metaCount.pluginCount}")`)
 assert(window.document.getElementById('stat-cats').textContent === String(metaCount.categoryCount), `统计条分类数 (页面 "${window.document.getElementById('stat-cats').textContent}" vs meta "${metaCount.categoryCount}")`)
 assert(window.document.querySelectorAll('#quickChips .chip').length === 12, '快速 chips 12 个')
-const scoreBadge = window.document.querySelector('#featuredList .score-badge')
-assert(!!scoreBadge && /^S 85$/.test(scoreBadge.textContent), `精选行 score-badge 格式 ("${scoreBadge?.textContent}")`)
 
 console.log('== 联想 ==')
 const input = window.document.getElementById('searchInput')
@@ -99,6 +102,11 @@ const stats = window.document.getElementById('resultsStats').textContent
 assert(/找到 \d+ 个结果 · 用时 \d+ ms/.test(stats), `统计行格式 ("${stats}")`)
 const resRows = window.document.querySelectorAll('#resultsList .result-row')
 assert(resRows.length > 0, '结果行渲染')
+// 站长精选置顶:搜索 vision 时 featured 的 modlens 应排第一并带"★"标签
+const firstTitle = window.document.querySelector('#resultsList .result-title')?.textContent || ''
+assert(firstTitle.includes('modlens'), `命中站长精选置顶,首位 modlens (实际 "${firstTitle}")`)
+const featuredTag = window.document.querySelector('#resultsList .featured-label')
+assert(!!featuredTag && featuredTag.textContent.includes('精选'), `置顶行带"★ 站长精选"标签 ("${featuredTag?.textContent}")`)
 const facets = {
   source: window.document.querySelectorAll('#facetSource .facet-item').length,
   category: window.document.querySelectorAll('#facetCategory .facet-item').length,

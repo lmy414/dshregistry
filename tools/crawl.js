@@ -621,6 +621,10 @@ async function main() {
 
   // 8) 产物落盘(原子写)
   await atomicWrite(PLUGINS_FILE, JSON.stringify(merged, null, 2) + '\n')
+  // 站长精选:config/featured.json(人工维护源)同步为站点数据,供前端 /data/featured.json 读取
+  await atomicWrite(join(DATA_DIR, 'featured.json'), JSON.stringify(
+    JSON.parse(await readFile(join(ROOT, 'config', 'featured.json'), 'utf8').catch(() => '{"featured":[]}')),
+    null, 2) + '\n')
   const blocked = merged.filter((r) => r.state === 'flagged').map((r) => r.slug)
   await atomicWrite(join(DATA_DIR, 'blocklist.json'), JSON.stringify({ blocked, updatedAt: new Date().toISOString() }, null, 2) + '\n')
   await atomicWrite(join(DATA_DIR, 'meta.json'), JSON.stringify({

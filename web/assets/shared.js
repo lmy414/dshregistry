@@ -104,6 +104,7 @@
     search: () => '/data/search.json',
     pages: () => '/data/pages.json',
     trending: () => '/data/trending.json',
+    featured: () => '/data/featured.json',
   }
   function fetchJson(key, arg) {
     const build = DATA_ROUTES[key]

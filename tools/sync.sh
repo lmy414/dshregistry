@@ -130,4 +130,28 @@ else
   log "无数据变更，跳过提交"
 fi
 
+# 4) 成功通知: 发送简要报告到飞书 (每次执行都通知)
+notify_success() {
+  local mode="${1:-增量}"
+  local branch="$2"
+  local changes="$3"
+  local plugins=$(node -e "console.log(JSON.parse(require('fs').readFileSync('web/data/plugins.json','utf8')).length)" 2>/dev/null || echo "N/A")
+  local categories=$(node -e "const p=JSON.parse(require('fs').readFileSync('web/data/plugins.json','utf8'));console.log(Object.keys(p.reduce((a,x)=>{a[x.category]=1;return a},{})).length)" 2>/dev/null || echo "N/A")
+  local listed=$(node -e "console.log(JSON.parse(require('fs').readFileSync('web/data/plugins.json','utf8')).filter(p=>p.listedOn?.length).length)" 2>/dev/null || echo "N/A")
+  
+  local msg="✅ dshregistry 同步完成
+模式: $mode
+分支: $branch
+插件: $plugins ($categories 分类, $listed 带 listedOn)
+变更: $changes
+时间: $(date '+%Y-%m-%d %H:%M:%S')"
+  
+  export PATH="/root/.hermes/bin:$PATH"
+  timeout 30 hermes send --to feishu:"${FEISHU_CHAT_ID:-oc_8b9d4bdf8c49af3d4c1cfd614fddd3cf}" "$msg" 2>/dev/null \
+    || echo "[$(date '+%Y-%m-%d %H:%M:%S')] 通知发送失败" >> "$LOG_FILE"
+}
+
 log "=== 同步完成 ==="
+
+# 发送成功通知
+notify_success "${1:-增量}" "$BRANCH" "${CHANGE_INFO:-无变更}"

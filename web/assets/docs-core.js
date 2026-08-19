@@ -27,10 +27,12 @@ export function buildSiteStats(meta, fmt) {
   ]
 }
 
-/** 更新时间展示:ISO → "YYYY-MM-DD" 日期部分,双语通用。 */
+/** 更新时间展示:ISO → "YYYY-MM-DD HH:MM" 日期时间,双语通用。 */
 export function formatUpdatedAt(iso) {
   if (!iso) return '—'
-  return String(iso).slice(0, 10)
+  const d = new Date(iso)
+  const pad = (n) => String(n).padStart(2, '0')
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`
 }
 
 /** 数据 API 端点清单(与 web/data/ 实际产物一一对应;slug/cat 为占位)。 */

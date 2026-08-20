@@ -1,0 +1,176 @@
+<h1>dsh-tool-cassette</h1>
+<p><a href="https://github.com/Lem0nTea2002/dsh-tool-cassette/actions/workflows/ci.yml"><img src="https://github.com/Lem0nTea2002/dsh-tool-cassette/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+<a href="https://www.npmjs.com/package/dsh-tool-cassette"><img src="https://img.shields.io/npm/v/dsh-tool-cassette" alt="npm"></a>
+<a href="https://github.com/Lem0nTea2002/dsh-tool-cassette/blob/HEAD/LICENSE"><img src="https://img.shields.io/npm/l/dsh-tool-cassette" alt="license"></a></p>
+<p>给 Agent 的工具调用开启“飞行模式”：一次录下规范结果，随后在 DeepSeek Harness 中离线、精确地回放；回放期间，被选工具的真实正文调用次数为零。</p>
+<blockquote>
+<p><strong>非官方社区插件。</strong> 本项目由社区成员独立开发和维护，与 DeepSeek 官方无隶属关系，也未获得官方审核或背书。</p>
+</blockquote>
+<p>当前版本为 <code>0.1.0</code>，兼容边界固定在 DeepSeek Harness <code>0.1.0-rc.8</code>。</p>
+<h2>它解决什么问题</h2>
+<p>Agent 测试常同时依赖模型与外部工具。官方 <code>dsh-llm-replay</code> 可以回放模型流，HTTP、MCP、数据库、Python、Go、Java 等工具正文仍会真实执行。<code>dsh-tool-cassette</code> 补上工具边界：录制真实工具的规范结果，随后在无网络、无服务和正文 tripwire 环境中回放。</p>
+<pre><code>Record
+Agent -&gt; tools/execute -&gt; 真实 HTTP / MCP / DB / 本地程序
+                         -&gt; DSH 规范 value/error -&gt; cassette
+
+Replay
+Agent -&gt; tools/execute -&gt; cassette 精确命中 -&gt; 当前 schema / renderer / post policy
+                         真实工具正文调用 = 0
+</code></pre>
+<p><img src="https://raw.githubusercontent.com/Lem0nTea2002/dsh-tool-cassette/HEAD/assets/offline-demo.gif" alt="关闭本地服务后的离线回放演示"></p>
+<p>演示先启动纯本地 HTTP 工具并录制一次，再关闭服务进行回放。最终证据固定为：录制阶段工具正文与网络请求各 <code>1</code> 次；回放阶段两者均为 <code>0</code>；结果完全一致；记录全部消费。演示不调用模型或付费 API。</p>
+<p>录制阶段先缓存 <code>tools/post-execute</code> 的输入边界，再用 rc.8 的最终 <code>tools/result</code> 快照核对调用。一般结果保存后置策略处理前的规范 <code>value/error</code> 与 <code>additionalContexts</code>；后置阶段触发取消时保存 DSH 最终取消结果。回放时仍需注册同名工具，保存的成功 <code>value</code> 会重新经过当前输出 schema、renderer、presentation meta 和后置策略。</p>
+<h2>快速开始</h2>
+<p>前置条件：已安装 pnpm。本插件固定兼容 DeepSeek Harness <code>0.1.0-rc.8</code>；该版本当前位于 npm <code>next</code> 标签。安装插件与运行该 profile 时请持续使用同一 rc.8 CLI：</p>
+<pre><code>pnpm dlx --package @deepseek-ai/dsh@0.1.0-rc.8 dsh plugin --profile headless add dsh-tool-cassette
+</code></pre>
+<p>从源码构建并安装本地包：</p>
+<pre><code>pnpm install
+pnpm run demo
+pnpm pack
+pnpm dlx --package @deepseek-ai/dsh@0.1.0-rc.8 dsh plugin --profile headless add .\dsh-tool-cassette-0.1.0.tgz
+</code></pre>
+<p>安装包会通过 <code>cordis.patch.yml</code> 注入默认禁用的 <code>tool-cassette</code> 条目。在 profile 的 <code>cordis.patch.yml</code> 中覆盖该条目，明确启用并填写模式、文件和叶子工具范围：</p>
+<pre><code>- id: tool-cassette
+  name: dsh-tool-cassette
+  disabled: false
+  config:
+    mode: record
+    file: .dsh-cassettes/weather.tool-cassette.jsonl
+    include:
+      - weather_lookup
+      - mcp_*_read
+</code></pre>
+<p>完成一次录制后，将 <code>mode</code> 改为 <code>replay</code> 并保持同一调用轨迹：</p>
+<pre><code>config:
+  mode: replay
+  file: .dsh-cassettes/weather.tool-cassette.jsonl
+  include:
+    - weather_lookup
+    - mcp_*_read
+</code></pre>
+<p>相对路径基于 DSH 进程工作目录解析。<code>include</code> 必须非空，支持精确名称和 <code>*</code> 通配符。空范围、空路径和重复模式都会在插件启动时失败。</p>
+<h2>配置</h2>
+<pre><code>interface Config {
+  mode: 'record' | 'replay'
+  file: string
+  include: string[]
+}
+</code></pre>
+<table>
+<thead>
+<tr>
+<th>字段</th>
+<th>含义</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>mode</code></td>
+<td><code>record</code> 执行真实工具并写制品；<code>replay</code> 精确命中并跳过正文</td>
+</tr>
+<tr>
+<td><code>file</code></td>
+<td>正式 cassette 文件；录制期间使用同路径加 <code>.partial</code> 后缀</td>
+</tr>
+<tr>
+<td><code>include</code></td>
+<td>显式选择叶子工具；<code>*</code> 匹配任意长度字符</td>
+</tr>
+</tbody></table>
+<h2>严格匹配与失败关闭</h2>
+<p>每次调用使用以下信息匹配：</p>
+<ul>
+<li>工具在调用树中的结构路径；</li>
+<li>工具名称；</li>
+<li>递归排序对象键后的无损 JSON 参数；</li>
+<li>按调用开始顺序分配的 ordinal。</li>
+</ul>
+<p>对象键顺序变化可以命中。数组顺序、参数值、调用顺序或结构路径变化会立即产生 <code>CASSETTE_MISMATCH</code>。第一次偏差会使回放器进入 poisoned 状态，后续选中工具持续失败，真实正文保持不执行。错误诊断只显示工具、路径、ordinal 和参数指纹。</p>
+<p>每个被选调用都必须经过 cassette 的 <code>tools/execute</code> 监听器，并在最终 <code>tools/result</code> 中完成核对。更高优先级的包装器发生短路、结果缺失或轨迹绕过时，录制保留 partial，回放进入 poisoned 状态。</p>
+<p>被选调用若在 DSH 的 <code>pre-execute</code> 或 guard 阶段被拒绝，也会按未进入 cassette 的轨迹失败关闭。录制与回放时，当前权限策略必须允许 <code>include</code> 中实际发生的调用进入 <code>tools/execute</code>。</p>
+<p><code>tools/result</code> 是 DSH 的只读观察事件。若更高优先级的插件同时短路 <code>tools/execute</code> 与 <code>tools/post-execute</code>，当前调用可能已经返回该插件的结果；cassette 会在最终观察点阻止录制发布或 poison 回放，并将进程退出码设为非零。</p>
+<h2>制品协议与完整性</h2>
+<p>cassette 是版本化 NDJSON。每帧包含连续 <code>seq</code>、前一帧哈希和本帧 SHA-256，最后一帧为 <code>complete</code>。</p>
+<p>哈希链用于发现传输损坏、截断和普通篡改。它不包含数字签名，因此无法证明面对能够重写全部帧及哈希的攻击者时仍保持真实性；需要跨信任边界分发时，应由制品库另行提供签名或不可变存储。</p>
+<p>Record 使用以下发布步骤：</p>
+<ol>
+<li>独占创建 <code>&lt;file&gt;.partial</code>；</li>
+<li>串行追加 <code>header</code>、<code>call/start</code>、<code>call/result</code>；</li>
+<li>每帧同步到磁盘；</li>
+<li>全部调用完成后写 <code>complete</code>；</li>
+<li>关闭文件，以 create-only 原子发布正式文件，再删除 partial。</li>
+</ol>
+<p>正式文件或 partial 已存在时，录制器拒绝启动。执行中失效、待完成调用、<code>concludesTurn</code>、多个 Agent、选中复合工具及其子工具都会保留 partial，供排查使用。</p>
+<h2>CLI</h2>
+<pre><code>dsh-tool-cassette verify .dsh-cassettes/weather.tool-cassette.jsonl
+dsh-tool-cassette inspect .dsh-cassettes/weather.tool-cassette.jsonl
+</code></pre>
+<p><code>verify</code> 完整验证协议、帧配对、连续 ordinal、哈希链和完成尾帧，并用退出码表达结果。<code>inspect</code> 只显示协议版本、工具数、调用数、完整性和消费说明，不显示工具名、参数或结果正文。校验失败只输出结构性原因，不回显原始行或绝对路径。</p>
+<p>回放消费状态只存在于当前进程。所有记录消费完毕时卸载成功；poison、额外调用或未消费记录会让 headless/CI 进程退出码变为 <code>1</code>，同时由 Cordis 记录关闭错误。</p>
+<h2>安全说明</h2>
+<p>V1 为了精确回放，会原样保存规范化后的参数、成功 <code>value</code>、失败信息、渲染内容和附加上下文。cassette 应按密钥或测试数据库快照的安全等级处理：</p>
+<ul>
+<li>默认 <code>.gitignore</code> 排除 cassette 与 partial；</li>
+<li>只在隔离的本地或 CI 工作目录录制；</li>
+<li>分享前人工检查全部内容；</li>
+<li>录制结束后关闭不再需要的真实凭据；</li>
+<li>参数指纹没有盐，低熵参数仍可能被猜测。</li>
+</ul>
+<p>V1 不提供自动脱敏、加密、签名或远端制品库。</p>
+<h2>V1 边界</h2>
+<p>支持：</p>
+<ul>
+<li>单 Agent、单场景；</li>
+<li>显式选择的叶子工具；</li>
+<li>成功、结构化失败和 <code>additionalContexts</code>；</li>
+<li>并发调用按开始 ordinal 配对，完成顺序可以相反；</li>
+<li>调用前取消不消费记录。</li>
+<li>回放调用命中 cassette 后即消费对应记录；随后发生的 post 阶段取消不回滚消费位置。</li>
+</ul>
+<p>明确拒绝或留待后续版本：</p>
+<ul>
+<li>多 Agent 与并发 subagent；</li>
+<li>同时选择复合工具及其子工具；</li>
+<li><code>concludesTurn: true</code>；</li>
+<li>模糊匹配、参数忽略规则和自动更新 fixture；</li>
+<li>延迟、hang、流式输出和取消时序仿真；</li>
+<li>UI、云端制品库、benchmark DSL 与模型 judge。</li>
+</ul>
+<p>LLM 流回放由官方 <code>dsh-llm-replay</code> 负责。本插件只承诺被选工具正文边界的确定性回放。</p>
+<h2>相邻项目</h2>
+<table>
+<thead>
+<tr>
+<th>项目</th>
+<th>边界</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><a href="https://github.com/deepseek-ai/deepseek-harness/tree/master/packages/test-support/llm-replay">dsh-llm-replay</a></td>
+<td>回放模型流</td>
+</tr>
+<tr>
+<td><a href="https://github.com/Linxiushen/dsh-subagent-cassette">dsh-subagent-cassette</a></td>
+<td>回放 one-shot subagent provider</td>
+</tr>
+<tr>
+<td><a href="https://github.com/WHY-Daydream/dsh-tool-idempotency">dsh-tool-idempotency</a></td>
+<td>在线调用去重与并发 join</td>
+</tr>
+<tr>
+<td><code>dsh-tool-cassette</code></td>
+<td>保存工具规范 value/error，离线跳过真实工具正文</td>
+</tr>
+</tbody></table>
+<h2>开发与验收</h2>
+<pre><code>pnpm install --frozen-lockfile
+pnpm run lint
+pnpm run typecheck
+pnpm run test:coverage
+pnpm run build
+pnpm run demo
+pnpm run test:tarball
+</code></pre>
+<p>测试只使用本地假工具与本地 HTTP 服务，模型调用和付费 API 调用均为零。CI 矩阵配置为 Ubuntu、Windows、Node 22.19 与 Node 24。</p>
+<h2>许可证</h2>
+<p><a href="https://github.com/Lem0nTea2002/dsh-tool-cassette/blob/HEAD/LICENSE">MIT</a></p>

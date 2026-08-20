@@ -1,0 +1,560 @@
+<h1>dsh-http-debug</h1>
+<p><a href="https://github.com/JohnXu22786/net-debug/actions/workflows/ci.yml"><img src="https://github.com/JohnXu22786/net-debug/actions/workflows/ci.yml/badge.svg" alt="CI"></a></p>
+<p>HTTP network debugging toolset for DeepSeek Harness (<code>dsh</code>).</p>
+<blockquote>
+<p><strong>中文文档：<a href="https://github.com/JohnXu22786/net-debug/blob/HEAD/README.zh.md">README.zh.md</a></strong></p>
+</blockquote>
+<p><code>dsh-http-debug</code> is a <strong>bundle</strong> (a distributable plugin) that adds a general-purpose
+HTTP client to dsh — with <strong>SSRF / private-network protection</strong>, per-session
+<strong>request history with replay</strong>, response <strong>inspection</strong>, and a zero-dependency
+<strong>CLI</strong>. It deliberately focuses on <em>raw HTTP semantics</em> (method, headers, body,
+status, timing, size) rather than page extraction: <code>web_fetch</code>/<code>web_search</code> turn
+documents into markdown; this plugin gives you the actual exchange.</p>
+<pre><code>Everything is a plugin — everything here is a plugin.
+</code></pre>
+<blockquote>
+<p>This project is an original implementation. It follows the dsh bundle
+specification (a npm package whose <code>package.json</code> declares a <code>dsh.bundle</code>
+patch, ships a <code>cordis.patch.yml</code>, and exposes a plugin entry module), but it
+is written from scratch and shares no code with any existing plugin.</p>
+</blockquote>
+<hr>
+<h2>Table of contents</h2>
+<ul>
+<li><a href="#features">Features</a></li>
+<li><a href="#installation-into-dsh">Installation into dsh</a></li>
+<li><a href="#model-facing-tools">Model-facing tools</a></li>
+<li><a href="#configuration">Configuration</a></li>
+<li><a href="#ssrf-protection">SSRF protection</a></li>
+<li><a href="#response-semantics">Response semantics</a></li>
+<li><a href="#history">History</a></li>
+<li><a href="#cli">CLI</a></li>
+<li><a href="#programmatic-api">Programmatic API</a></li>
+<li><a href="#examples">Examples</a></li>
+<li><a href="#development">Development</a></li>
+<li><a href="#license">License</a></li>
+</ul>
+<hr>
+<h2>Features</h2>
+<ol>
+<li><strong>General HTTP client</strong><ul>
+<li><code>method</code> / <code>headers</code> / <code>body</code> (UTF-8 text or Base64 binary) / <code>timeout</code> /
+redirect policy (<code>follow_redirects</code>, <code>max_redirects</code>).</li>
+<li>Structured response: <code>status</code>, <code>statusText</code>, <code>headers</code>, body (UTF-8 text
+or Base64), timing, and captured size.</li>
+</ul>
+</li>
+<li><strong>SSRF / private-network protection</strong> (secure by default)<ul>
+<li>Blocks loopback, RFC 1918 private, CGNAT, link-local, multicast, and other
+reserved IPv4/IPv6 ranges — including hosts that <em>resolve</em> to them and
+<strong>every redirect hop</strong>.</li>
+<li>Whitelist (hosts, <code>*.wildcards</code>, IP literals, CIDRs) and config toggles.</li>
+</ul>
+</li>
+<li><strong>Request history</strong> — an in-memory ring buffer keeps every request/response
+pair (with timing and size); entries can be listed, inspected, and <strong>replayed</strong>.</li>
+<li><strong>WAF-friendly</strong> — optional sane default <code>User-Agent</code> / <code>Referer</code>.</li>
+<li><strong>Response inspection</strong> — JSON validation, optional HAR 1.2 export, and a
+hard body-size cap so oversized responses never blow up the prompt/context.</li>
+<li><strong>Tooling</strong> — three dsh tools (<code>http_request</code>, <code>http_history</code>, <code>http_rules</code>)
+plus a standalone CLI with the same engine.</li>
+</ol>
+<hr>
+<h2>Installation into dsh</h2>
+<p>The package self-describes as a bundle:</p>
+<pre><code>// package.json (this package)
+{
+  "dsh": { "bundle": { "patch": "./cordis.patch.yml" } }
+}
+</code></pre>
+<p><code>cordis.patch.yml</code> inserts one configuration row that mounts this package on
+<code>ctx</code>. The plugin entry module (<code>lib/index.js</code>) exports <code>name</code>, <code>inject: ['tools']</code>
+and <code>apply(ctx)</code> and registers the three tools on <code>ctx.tools</code>.</p>
+<h3>Route A — add the bundle to a profile (recommended)</h3>
+<p>dsh manages a profile's out-of-tree plugins through <code>dsh plugin</code>, which
+forwards to the package manager inside the profile directory:</p>
+<pre><code>dsh plugin --profile &lt;name&gt; add dsh-http-debug
+</code></pre>
+<p>or straight from this repository:</p>
+<pre><code>dsh plugin --profile &lt;name&gt; add github:JohnXu22786/net-debug
+</code></pre>
+<p>(The profile is auto-initialized from its shipped template on first use; a
+custom name must be created via <code>dsh plugin</code> first.) The bundle's
+<code>cordis.patch.yml</code> is then applied as part of the profile composition.</p>
+<p>For a manual/offline setup, edit the profile's manifest
+(<code>package.json</code> → <code>dsh.profile.bundles</code>) and add <code>dsh-http-debug</code> to the
+bundles list, and ensure the package is installed where the Loader can resolve
+it.</p>
+<h3>Route B — patch a profile's <code>cordis.patch.yml</code> manually</h3>
+<p>Add this to your profile's <code>cordis.patch.yml</code> (a bare <code>name</code> resolves through
+the Loader; make sure the package is installed where dsh can import it):</p>
+<pre><code>- insert:
+  - id: http-debug
+    name: 'dsh-http-debug'
+</code></pre>
+<p>To tune configuration for one profile, restate the fields you keep (a patch
+replaces the row's <em>whole</em> <code>config</code>):</p>
+<pre><code>- insert:
+  - id: http-debug
+    name: 'dsh-http-debug'
+    config:
+      ssrf:
+        enabled: true
+        blockPrivate: true
+        blockLoopback: true
+        blockLinkLocal: true
+        blockReserved: true
+        whitelist:
+          - 'localhost'
+          - '127.0.0.1'
+      client:
+        timeoutMs: 30000
+        maxRedirects: 10
+        maxBodyBytes: 131072
+        wafHeaders: true
+        userAgent: 'Mozilla/5.0 (compatible; dsh-http-debug/1.0.0)'
+        referer: ''
+      history:
+        maxEntries: 200
+      har:
+        enabled: false
+</code></pre>
+<h3>Verify the integration</h3>
+<p>Boot dsh and ask it which tools it has, or inspect the registry directly:</p>
+<ul>
+<li>Ask the model: <em>"which HTTP tools do you have?"</em></li>
+<li>Or in a REPL/agent: <code>ctx.tools.schemas()</code> should include <code>http_request</code>,
+<code>http_history</code>, and <code>http_rules</code>.</li>
+</ul>
+<blockquote>
+<p><code>dsh</code> is in developer preview and its internals move fast. If the exact
+profile mechanisms (<code>dsh.profile.bundles</code>, <code>loadProfile</code>) changed in your
+version, Route B (a hand-written <code>cordis.patch.yml</code> row) continues to work as
+long as the Loader can import the package.</p>
+</blockquote>
+<hr>
+<h2>Model-facing tools</h2>
+<p>All three tools are registered on <code>ctx.tools</code> and become available to agents
+automatically.</p>
+<h3><code>http_request</code></h3>
+<p>Perform (or replay) one HTTP exchange.</p>
+<table>
+<thead>
+<tr>
+<th>Parameter</th>
+<th>Type</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>url</code></td>
+<td>string</td>
+<td>Absolute <code>http(s)</code> URL. Omit when replaying via <code>history_id</code>.</td>
+</tr>
+<tr>
+<td><code>history_id</code></td>
+<td>string</td>
+<td>Replay a stored request; <code>url</code>/<code>method</code>/<code>headers</code>/<code>body</code> are ignored.</td>
+</tr>
+<tr>
+<td><code>method</code></td>
+<td>enum</td>
+<td><code>GET</code> (default), <code>POST</code>, <code>PUT</code>, <code>PATCH</code>, <code>DELETE</code>, <code>HEAD</code>, <code>OPTIONS</code>.</td>
+</tr>
+<tr>
+<td><code>headers</code></td>
+<td>object</td>
+<td>Request headers (name → value).</td>
+</tr>
+<tr>
+<td><code>body</code></td>
+<td>string</td>
+<td>UTF-8 request body. Mutually exclusive with <code>body_base64</code>.</td>
+</tr>
+<tr>
+<td><code>body_base64</code></td>
+<td>string</td>
+<td>Base64 request body. Mutually exclusive with <code>body</code>.</td>
+</tr>
+<tr>
+<td><code>timeout_ms</code></td>
+<td>number</td>
+<td>Per-request timeout (default from config, 30000).</td>
+</tr>
+<tr>
+<td><code>follow_redirects</code></td>
+<td>boolean</td>
+<td>Follow 3xx (default <code>true</code>); every hop is SSRF-checked.</td>
+</tr>
+<tr>
+<td><code>max_redirects</code></td>
+<td>number</td>
+<td>Redirect cap (default from config, 10).</td>
+</tr>
+<tr>
+<td><code>max_body_bytes</code></td>
+<td>number</td>
+<td>Captured-body cap (default from config, 131072).</td>
+</tr>
+<tr>
+<td><code>validate_json</code></td>
+<td>boolean</td>
+<td>Validate a JSON-looking body and report validity.</td>
+</tr>
+<tr>
+<td><code>include_har</code></td>
+<td>boolean</td>
+<td>Attach a HAR 1.2 document for this exchange.</td>
+</tr>
+<tr>
+<td><code>bypass_ssrf</code></td>
+<td>boolean</td>
+<td><strong>Danger</strong>: disable SSRF checks for this one request.</td>
+</tr>
+<tr>
+<td><code>waf_headers</code></td>
+<td>boolean</td>
+<td>Add default <code>User-Agent</code> / optional <code>Referer</code> when absent (default from config).</td>
+</tr>
+</tbody></table>
+<p>Returns a structured object (see <a href="#response-semantics">Response semantics</a>);
+transport failures (timeout, network, SSRF block, too many redirects) raise
+errors with a machine-readable <code>code</code>.</p>
+<h3><code>http_history</code></h3>
+<table>
+<thead>
+<tr>
+<th>Parameter</th>
+<th>Type</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>action</code></td>
+<td>enum (required)</td>
+<td><code>list</code> (newest-first summaries), <code>get</code> (full entry), <code>clear</code>, <code>stats</code>.</td>
+</tr>
+<tr>
+<td><code>id</code></td>
+<td>string</td>
+<td>History id (required when <code>action</code> is <code>get</code>).</td>
+</tr>
+</tbody></table>
+<h3><code>http_rules</code></h3>
+<table>
+<thead>
+<tr>
+<th>Parameter</th>
+<th>Type</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>action</code></td>
+<td>enum (required)</td>
+<td><code>list</code>, <code>add</code>, <code>remove</code>, <code>clear</code>.</td>
+</tr>
+<tr>
+<td><code>rule</code></td>
+<td>string</td>
+<td>A whitelist rule (hostname, <code>*.wildcard</code>, IP literal, or CIDR).</td>
+</tr>
+</tbody></table>
+<p>Runtime rules last only for the current session; for a durable whitelist set
+<code>ssrf.whitelist</code> in the plugin config.</p>
+<hr>
+<h2>Configuration</h2>
+<p>All fields are optional; defaults are the safe ones.</p>
+<table>
+<thead>
+<tr>
+<th>Key</th>
+<th>Default</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>ssrf.enabled</code></td>
+<td><code>true</code></td>
+<td>Master switch for all IP/DNS checks.</td>
+</tr>
+<tr>
+<td><code>ssrf.blockPrivate</code></td>
+<td><code>true</code></td>
+<td>Block <code>10/8</code>, <code>172.16/12</code>, <code>192.168/16</code>, CGNAT <code>100.64/10</code>, ULA <code>fc00::/7</code>.</td>
+</tr>
+<tr>
+<td><code>ssrf.blockLoopback</code></td>
+<td><code>true</code></td>
+<td>Block <code>127.0.0.0/8</code> and <code>::1</code>.</td>
+</tr>
+<tr>
+<td><code>ssrf.blockLinkLocal</code></td>
+<td><code>true</code></td>
+<td>Block <code>169.254/16</code> and <code>fe80::/10</code> (covers cloud metadata).</td>
+</tr>
+<tr>
+<td><code>ssrf.blockReserved</code></td>
+<td><code>true</code></td>
+<td>Block the remaining special-use ranges (documentation, multicast, broadcast, benchmarking, NAT64/6to4 prefixes, …).</td>
+</tr>
+<tr>
+<td><code>ssrf.whitelist</code></td>
+<td><code>[]</code></td>
+<td>Hosts / <code>*.wildcards</code> / IPs / CIDRs that always pass.</td>
+</tr>
+<tr>
+<td><code>client.timeoutMs</code></td>
+<td><code>30000</code></td>
+<td>Per-request timeout in ms.</td>
+</tr>
+<tr>
+<td><code>client.maxRedirects</code></td>
+<td><code>10</code></td>
+<td>Redirect cap.</td>
+</tr>
+<tr>
+<td><code>client.maxBodyBytes</code></td>
+<td><code>131072</code></td>
+<td>Captured body bytes; larger bodies are truncated.</td>
+</tr>
+<tr>
+<td><code>client.wafHeaders</code></td>
+<td><code>true</code></td>
+<td>Add sane default <code>User-Agent</code> (and <code>Referer</code> if configured) when the caller doesn't send one.</td>
+</tr>
+<tr>
+<td><code>client.userAgent</code></td>
+<td>a Chrome UA</td>
+<td>Default <code>User-Agent</code>.</td>
+</tr>
+<tr>
+<td><code>client.referer</code></td>
+<td><code>''</code></td>
+<td>Default <code>Referer</code>; empty means none.</td>
+</tr>
+<tr>
+<td><code>history.maxEntries</code></td>
+<td><code>200</code></td>
+<td>Ring-buffer capacity.</td>
+</tr>
+<tr>
+<td><code>har.enabled</code></td>
+<td><code>false</code></td>
+<td>Attach HAR to every response by default.</td>
+</tr>
+</tbody></table>
+<hr>
+<h2>SSRF protection</h2>
+<p>The guard verifies a target <strong>before</strong> the request and <strong>before every redirect
+hop</strong>. For each hop it:</p>
+<ol>
+<li>Parses the URL (<code>http</code>/<code>https</code> only).</li>
+<li>If the host is an IP literal (IPv4, IPv6, IPv4-mapped <code>::ffff:a.b.c.d</code>, or
+the deprecated IPv4-compatible <code>::a.b.c.d</code>), classifies it directly.</li>
+<li>Otherwise resolves <strong>all</strong> A/AAAA records (<code>node:dns</code>, injectable) and blocks
+if <strong>any</strong> resolves to a disallowed address. DNS errors refuse the request.</li>
+<li>Consults the whitelist first for hostnames, and skips whitelisted resolved
+addresses while scanning.</li>
+</ol>
+<p>Compact numeric hosts that <code>curl</code>-style tools accept are also caught:
+<code>2130706433</code> (decimal) and <code>0x7f000001</code> (hex) map to <code>127.0.0.1</code> and are
+refused.</p>
+<h3>Whitelist rule forms</h3>
+<table>
+<thead>
+<tr>
+<th>Form</th>
+<th>Example</th>
+<th>Matches</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>hostname</td>
+<td><code>api.example.com</code></td>
+<td>that exact host</td>
+</tr>
+<tr>
+<td>hostname</td>
+<td><code>localhost</code></td>
+<td>a single-label host</td>
+</tr>
+<tr>
+<td>wildcard</td>
+<td><code>*.example.com</code></td>
+<td><code>example.com</code> and every sub-domain</td>
+</tr>
+<tr>
+<td>IP literal</td>
+<td><code>127.0.0.1</code>, <code>::1</code></td>
+<td>that address</td>
+</tr>
+<tr>
+<td>CIDR</td>
+<td><code>10.42.0.0/16</code>, <code>fd00::/8</code></td>
+<td>the range (for literal hosts and for hosts <em>resolving</em> inside it)</td>
+</tr>
+</tbody></table>
+<h3>Security notes (read before deploying)</h3>
+<ul>
+<li><strong>Secure by default.</strong> In production leave all four <code>block*</code> switches on.</li>
+<li><strong><code>bypass_ssrf</code> (tool parameter, <code>--allow-private</code> in the CLI) is an explicit
+escape hatch.</strong> Only use it for trusted targets; it disables, for that
+request, the private/loopback/link-local/reserved checks.</li>
+<li><strong>Disabling <code>ssrf.enabled</code> turns off all protection</strong> (including DNS refusal).</li>
+<li>The whitelist is an <em>allowlist for hop targets</em>, not a free pass for
+redirects that leave it: every hop is evaluated against the current rules.</li>
+<li>This guard is a strong safety net, not a sandbox. Pair it with your fetch
+policy, network egress controls, and sandboxing for hostile content.</li>
+<li><strong>DNS-rebinding note.</strong> The guard and the actual connection resolve the
+hostname separately, so a hostile name server could in principle answer the
+guard with a public address and the connection with a private one. For
+adversarial deployments, combine this guard with egress controls or a
+sandbox so the final connection cannot reach internal networks even if the
+DNS race is won.</li>
+</ul>
+<hr>
+<h2>Response semantics</h2>
+<p>A successful exchange returns an object like:</p>
+<pre><code>{
+  "ok": true,                 // 2xx
+  "status": 200,
+  "statusText": "OK",
+  "httpVersion": "HTTP/1.x",
+  "method": "GET",
+  "url": "https://…",
+  "headers": { "content-type": "application/json" },
+  "contentType": "application/json",
+  "body": "…",                // UTF-8 text, or Base64 when binary
+  "bodyEncoding": "utf8",     // "utf8" | "base64" | "none"
+  "bodySizeBytes": 512,       // bytes captured (after any cap)
+  "bodyTruncated": false,     // true when the body was capped
+  "durationMs": 1234,
+  "redirected": false,
+  "redirects": [],
+  "json": { "valid": true },  // only when validate_json
+  "har": { "log": { … } },    // only when include_har
+  "historyId": "h7"
+}
+</code></pre>
+<ul>
+<li><strong>Body encoding</strong>: textual Content-Types (plus untyped bodies that sniff as
+clean UTF-8) are decoded to text; everything else is Base64. Multi-byte
+characters are never cut mid-sequence.</li>
+<li><strong>Truncation</strong> caps captured bytes at <code>maxBodyBytes</code> (per-call or config) and
+flags <code>bodyTruncated</code>; the amount actually captured is <code>bodySizeBytes</code>. This
+is the primary guard against context explosion.</li>
+<li><strong>4xx/5xx are real responses</strong>, returned with <code>ok: false</code>. Only transport
+failures (invalid URL, SSRF block, DNS failure, timeout, network error, too
+many redirects, abort) raise errors, each with a stable <code>code</code>.</li>
+<li><strong>HAR</strong> output is a standard HAR 1.2 <code>log</code> document with one entry
+(<code>buildHarLog</code>).</li>
+</ul>
+<h3>Error codes</h3>
+<p><code>INVALID_URL</code> · <code>UNSUPPORTED_PROTOCOL</code> · <code>SSRF_BLOCKED</code> · <code>DNS_FAILED</code> ·
+<code>TIMEOUT</code> · <code>ABORTED</code> · <code>NETWORK_ERROR</code> · <code>TOO_MANY_REDIRECTS</code> ·
+<code>HISTORY_NOT_FOUND</code> · <code>INVALID_RULE</code> · <code>INVALID_BODY</code></p>
+<h3>CLI exit codes</h3>
+<p>The CLI maps results and failures onto a small, stable set of process exit
+codes, so it can be composed in scripts:</p>
+<ul>
+<li><code>0</code> — the exchange completed (any HTTP status, including 4xx/5xx, is a
+completed exchange).</li>
+<li><code>2</code> — usage error: bad flags, an invalid <code>--rule</code>, an <code>INVALID_URL</code>, or an
+<code>UNSUPPORTED_PROTOCOL</code>.</li>
+<li><code>3</code> — the request was refused or failed: <code>SSRF_BLOCKED</code>, <code>DNS_FAILED</code>,
+<code>TIMEOUT</code>, <code>TOO_MANY_REDIRECTS</code>, <code>NETWORK_ERROR</code>, or the HAR file could not
+be written.</li>
+</ul>
+<hr>
+<h2>History</h2>
+<p>A per-session ring buffer (capacity <code>history.maxEntries</code>) records every
+<code>http_request</code>: its request snapshot, response (already capped), timing, size,
+and any error. <code>http_history</code> lists/get/clears entries; <code>http_request</code> replays
+one via <code>history_id</code> and records a brand-new attempt — including a fresh SSRF
+check on every hop.</p>
+<hr>
+<h2>CLI</h2>
+<p>A zero-dependency CLI front-end for the same engine, with the same SSRF
+protection:</p>
+<pre><code>npm link   # or: node lib/cli.js …  or: npx tsx src/cli.ts …
+
+dsh-http-debug &lt;url&gt; [options]
+  -X, --method &lt;m&gt;          HTTP method
+  -H, --header &lt;n:v&gt;        header (repeatable; also accepts n=v)
+  -d, --data &lt;body&gt;         UTF-8 body
+      --data-base64 &lt;b64&gt;   base64 body
+      --data-file &lt;path&gt;    body from a text file
+      --data-binary &lt;path&gt;  body from a file, verbatim
+      --timeout &lt;ms&gt;        timeout in ms (0 = no timeout; default 30000)
+  -F/--follow | -N/--no-follow
+      --max-redirects &lt;n&gt;   --max-body-bytes &lt;n&gt;
+      --validate-json       --har &lt;file&gt;
+      --json                print the full structured result as JSON (default)
+      --raw                 print only the body
+      --allow-private       bypass SSRF for this request (unsafe)
+      --rule &lt;rule&gt;         add a runtime whitelist rule (repeatable)
+      --no-waf
+      --ssrf-enabled        enable SSRF blocking (default)
+      --ssrf-disabled       disable all SSRF protection (unsafe)
+      --config-file &lt;path&gt;  JSON config file (flags override it)
+  -v, --version             print the version
+  -h, --help                print this help
+</code></pre>
+<p>All flags map onto the same <code>HttpDebug</code> service the tools use.</p>
+<hr>
+<h2>Programmatic API</h2>
+<p>The core is dependency-free and exported for embedding elsewhere:</p>
+<pre><code>import { HttpDebug } from 'dsh-http-debug';
+
+const http = new HttpDebug({
+  config: { ssrf: { whitelist: ['127.0.0.1'] } },
+});
+
+const response = await http.request({ url: 'http://127.0.0.1:3000/', validateJson: true });
+console.log(response.status, response.body, response.historyId);
+
+http.rulesAdd('10.0.0.0/8');      // runtime whitelist
+await http.request({ historyId: 'h1' }); // replay
+</code></pre>
+<p>Exports: <code>HttpDebug</code>, <code>HttpClient</code>, <code>SsrfGuard</code>, <code>HistoryStore</code>, <code>RuleStore</code>,
+<code>buildHarLog</code>, the config/response types, and <code>HttpDebugError</code> (with <code>code</code>).</p>
+<hr>
+<h2>Examples</h2>
+<ul>
+<li><code>examples/usage.mjs</code> — calling the core from a plain Node script.</li>
+<li><code>examples/dsh-integration.mjs</code> — mounts the bundle into a real Cordis
+<code>Context</code> + <code>ToolRegistry</code> and runs <code>http_request</code> through the real pipeline.</li>
+<li><code>examples/generate-examples.mjs</code> — spins up a local server and writes
+<code>examples/response.example.json</code> and <code>examples/har.example.har</code>.</li>
+<li><code>examples/response.example.json</code>, <code>examples/har.example.har</code> — generated
+sample artifacts.</li>
+</ul>
+<p>Generate them yourself with:</p>
+<pre><code>npm run build
+npm run generate-examples
+</code></pre>
+<hr>
+<h2>Development</h2>
+<pre><code>npm install       # dev deps: typescript, tsx, @types/node + dsh peer types
+npm run build     # tsc -&gt; lib/ (ESM, .d.ts)
+npm run typecheck
+npm test          # builds first, then `node --test` on the compiled lib
+npm run cli -- &lt;url&gt; …   # run the CLI from source via tsx
+</code></pre>
+<p>The test runner needs Node ≥ 23.6 (or the 22.18 LTS release), where native
+TypeScript type stripping is enabled by default so <code>node --test</code> can run the
+test files directly. The <strong>shipped runtime</strong> (the compiled <code>lib/</code>) runs on
+Node 18+.</p>
+<p>Tests cover: IPv4/IPv6 classification across every category family, the SSRF
+guard (literals, DNS-resolved hosts, IPv4-mapped/compatible addresses, compact
+numeric hosts, redirect hops, whitelist/toggles/bypass, DNS failures), redirect
+chasing and method downgrades, body truncation, base64 binary bodies, timeouts,
+network errors, JSON validation, HAR structure, history ring-buffer eviction
+and replay, the tool definitions, and the plugin entry.</p>
+<p>Compatibility: Node ≥ 18 (uses the built-in <code>fetch</code>). The only runtime
+dependencies are the dsh peer packages (<code>@deepseek-ai/cordis</code>,
+<code>@deepseek-ai/dsh-tools</code>) provided by the host at load time.</p>
+<hr>
+<h2>License</h2>
+<p><a href="https://github.com/JohnXu22786/net-debug/blob/HEAD/LICENSE">MIT</a> — © 2026 dsh-http-debug contributors.</p>

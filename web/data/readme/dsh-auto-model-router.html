@@ -1,0 +1,350 @@
+<h1>dsh-auto-model-router</h1>
+<p>A hybrid auto model-router plugin for <a href="https://github.com/deepseek-ai/deepseek-harness">DeepSeek Harness</a> (DSH). Routes each agent request through <strong>four capability levels (L0–L3)</strong> with three user-facing routing modes: a zero-latency <strong>heuristic lock</strong> (text-width thresholds), a <strong>fixed-level</strong> mode, and <strong>fully-auto</strong> mode (keyword scoring + optional LLM classifier). Failure fallback chains and budget control round it out.</p>
+<blockquote>
+<p>Design inspired by <a href="https://github.com/open-world-project/model-router">open-world-project/model-router</a> (Hermes Agent) and <a href="https://github.com/marco-jardim/opencode-model-router">opencode-model-router</a> (fast/medium/heavy tiers): tiered routing plus a cost mode that decides the drift direction on ambiguity.</p>
+</blockquote>
+<h2>Acknowledgements</h2>
+<p>This plugin builds on ideas from the following open-source projects:</p>
+<ul>
+<li><p><a href="https://github.com/open-world-project/model-router">open-world-project/model-router</a> — Hermes Agent's auto model-router with keyword scoring and cost-aware tier selection</p>
+</li>
+<li><p><a href="https://github.com/marco-jardim/opencode-model-router">opencode-model-router</a> — OpenCode's fast/medium/heavy tier delegation plugin</p>
+</li>
+<li><p><a href="https://github.com/glasshousehq-os/openclaw-routing-yaml">openclaw-routing-yaml</a> — OpenClaw's declarative per-task model routing via YAML</p>
+</li>
+<li><p><a href="https://github.com/openmarkai/openclaw-router">openmarkai/openclaw-router</a> — Benchmark-driven model routing with real evaluation data</p>
+</li>
+<li><p><a href="https://github.com/MoeAisaka/openclaw-model-policy-router">MoeAisaka/openclaw-model-policy-router</a> — Policy-driven fail-closed model routing for OpenClaw</p>
+</li>
+<li><p><a href="https://github.com/NanmiCoder/dsh-auto-mode">NanmiCoder/dsh-auto-mode</a> — DSH's auto permission mode; inspired the client settings section pattern</p>
+</li>
+<li><p><a href="https://github.com/deepseek-ai/deepseek-harness">DeepSeek Harness</a> — The host platform this plugin is built for</p>
+</li>
+<li><p>English (this file)</p>
+</li>
+<li><p><a href="https://github.com/ADVeRTs13/dsh-auto-model-router/blob/HEAD/README.zh.md">中文</a></p>
+</li>
+</ul>
+<h2>How it works</h2>
+<p>One decision is made <strong>per user input</strong> (not per agent step). Steps within the
+same input reuse the decision — the LLM classifier is never called per step.</p>
+<pre><code>user input (new)
+  │
+  ▼
+┌─ current mode?
+│
+│ MODE A heuristic lock (default)
+│   text width of the last N inputs (CJK=2, other=1)
+│   ├─ ≤10  → L0
+│   ├─ ≤100 → L1 (locked)
+│   └─ &gt;100 → ask once: pin a fixed level? enable fully-auto?
+│
+│ MODE B fixed level
+│   use the pinned level; re-ask every askEveryInputs inputs
+│   window falls back ≤100 → return to MODE A
+│
+│ MODE C fully-auto
+│   ① keyword scoring: L1 hits +1, L2 +2, L3 +3 (weights configurable)
+│      0 → L0 · 1-5 → L1 · 6-15 → L2 · 16+ → L3 (bands configurable)
+│   ② score 0 → LLM classifier on 本次+上次输入+上次回复
+│   ③ window falls back ≤100 → return to MODE A
+└──────────────────────────────────────────────────────
+  │
+  ▼
+agent/request reuses the decision for every step of this input
+  │
+  ▼
+LLM dispatch
+</code></pre>
+<h3>The four levels</h3>
+<table>
+<thead>
+<tr>
+<th>Level</th>
+<th>Typical tasks</th>
+<th>Model guidance</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>L0</code></td>
+<td>everyday chat, quick answers</td>
+<td>cheapest/fastest</td>
+</tr>
+<tr>
+<td><code>L1</code></td>
+<td>small edits, simple tests</td>
+<td>regular</td>
+</tr>
+<tr>
+<td><code>L2</code></td>
+<td>writing code, review, refactoring</td>
+<td>strong</td>
+</tr>
+<tr>
+<td><code>L3</code></td>
+<td>complex bug fixes, multi-step tasks, reports</td>
+<td>most powerful</td>
+</tr>
+</tbody></table>
+<p>Each level is a user-assigned provider/model route with a <strong>required</strong>
+<code>reasoningEffort</code> (defaults to <code>off</code> when omitted): <code>off</code> = no thinking mode,
+<code>high</code>/<code>max</code> = thinking intensity. Levels may be left unconfigured; the router
+then falls to the nearest configured level (direction depends on the cost
+mode).</p>
+<h2>Auto mode in the model selector</h2>
+<p>The plugin registers a virtual <code>auto</code> provider, so the model selector shows an
+<strong>Auto Router</strong> group with a single <strong>Auto</strong> model:</p>
+<pre><code>Auto Router
+  └─ Auto
+deepseek-official
+  ├─ deepseek-v4-flash
+  └─ deepseek-v4-flash
+</code></pre>
+<ul>
+<li>Pick <strong>Auto</strong> → this plugin routes the session through the L0–L3 levels.</li>
+<li>Pick any <strong>real model</strong> → the plugin passes the request through untouched;
+your explicit choice wins and the router stays out of the way.</li>
+</ul>
+<h3>Settings section (browser)</h3>
+<p>The browser half registers an <strong>Auto Router</strong> page in DSH's settings panel
+(gear icon → sidebar). It renders the current routing policy — the same
+<code>&lt;dsh-auto-model-router-status&gt;</code> report the host injects on session start —
+with a hint telling you to change the configuration through AI conversation:
+just tell the agent in chat (e.g. <em>"change L2 to deepseek-v4-flash with max
+reasoning"</em> or <em>"switch cost mode to cost-first"</em>), and the AI edits
+<code>cordis.patch.yml</code> for you; restart DSH to apply.</p>
+<p>Selecting <strong>Auto</strong> in the model picker applies immediately — there is no
+confirmation dialog.</p>
+<p>No client build step is needed: <code>client.js</code> is a self-contained ModuleLoader
+bundle maintained in this repository (<code>pnpm run build:client</code> regenerates it
+from <code>client/</code>).</p>
+<h2>Install</h2>
+<pre><code>dsh plugin --profile web add ./dsh-auto-model-router
+</code></pre>
+<p>Or via the published npm package:</p>
+<pre><code>npm install @adverts13/dsh-auto-model-router
+dsh plugin --profile web add @adverts13/dsh-auto-model-router
+</code></pre>
+<h2>Configuration</h2>
+<p>Add to your profile's <code>cordis.patch.yml</code>:</p>
+<pre><code>- insert:
+    - id: dsh-auto-model-router
+      name: '@deepseek-ai/cordis-plugin-group'
+      group: true
+      isolate:
+        modelRouter: true
+      config:
+        - id: dsh-auto-model-router-runtime
+          name: '@adverts13/dsh-auto-model-router'
+          config:
+            # ── four levels (the shipped defaults) ─────────────────────
+            # reasoningEffort: off = no thinking, medium/high/max = intensity.
+            levels:
+              L0:                              # everyday chat
+                provider: deepseek-official
+                model: deepseek-v4-flash
+                reasoningEffort: off
+              L1:                              # code &amp; tests
+                provider: deepseek-official
+                model: deepseek-v4-flash
+                reasoningEffort: medium
+              L2:                              # writing &amp; review
+                provider: deepseek-official
+                model: deepseek-v4-flash
+                reasoningEffort: high
+              L3:                              # complex multi-step
+                provider: deepseek-official
+                model: deepseek-v4-flash
+                reasoningEffort: max
+
+            # Keyword rules only take part in fully-auto mode. Empty by default.
+            rules: []
+
+            # ── MODE A: heuristic lock (zero latency) ──────────────────
+            heuristic:
+              windowSize: 3        # count the last N user inputs
+              counting: cjk2       # CJK char = 2, others = 1; or 'tokens'
+              thresholds:          # width → level (user-adjustable)
+                - maxChars: 10
+                  level: L0
+                - maxChars: 100
+                  level: L1        # lock ceiling; &gt;100 asks the user
+
+            # ── MODE C: keyword scoring (fully-auto) ───────────────────
+            scoring:
+              weights:             # per-hit score per level
+                L1: 1
+                L2: 2
+                L3: 3
+              bands:               # score → level (user-adjustable)
+                - maxScore: 0
+                  level: L0
+                - maxScore: 5
+                  level: L1
+                - maxScore: 15
+                  level: L2
+                - maxScore: null
+                  level: L3
+
+            # ── Tier 2: cost control (user-configurable) ───────────────
+            costControl:
+              enabled: true
+              mode: balanced        # cost-first | quality-first | balanced
+              defaultLevel: L1      # level used when no rule matches
+              tokenBudgetPerSession: 0   # 0 = no budget limit (default);
+                                        # positive value caps per-session spend
+              # What happens when the session budget is exhausted:
+              #   silent  — switch to the cheapest level without telling the user
+              #   notify  — inject a user-visible notice explaining the switch
+              #   ask     — pop a dialog; user may keep the current model
+              #             (waives the budget for the rest of the session)
+              downgradeBehavior: notify
+
+            # ── LLM classifier (fully-auto fallback; enabled by default) ──
+            llmClassifier:
+              enabled: true
+              model:
+                provider: deepseek-official
+                model: deepseek-v4-flash
+              requestTimeoutMs: 10000
+
+            # Fixed-level mode re-asks every N user inputs.
+            askEveryInputs: 3
+
+            # ── Tier 4: failure fallback chain (model-level) ───────────
+            fallbackChain:
+              - provider: deepseek-official
+                model: deepseek-v4-flash
+
+            maxRetries: 1
+</code></pre>
+<h3>costControl modes</h3>
+<table>
+<thead>
+<tr>
+<th>mode</th>
+<th>default level (no rule hit)</th>
+<th>ambiguity drift</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>cost-first</code></td>
+<td>lowest configured level</td>
+<td><strong>down</strong> (cheaper)</td>
+</tr>
+<tr>
+<td><code>quality-first</code></td>
+<td>highest configured level</td>
+<td><strong>up</strong> (stronger)</td>
+</tr>
+<tr>
+<td><code>balanced</code></td>
+<td><code>costControl.defaultLevel</code></td>
+<td>stay put</td>
+</tr>
+</tbody></table>
+<p>A rule hit always wins over the cost mode: a level the user explicitly matched
+is never downgraded by the cost layer.</p>
+<h3>Budget downgrade is visible</h3>
+<p><code>tokenBudgetPerSession</code> <strong>defaults to 0 (no budget)</strong> — the cost layer never
+forces a downgrade from budget exhaustion, and <code>downgradeBehavior</code> is inert.
+Set a positive value to cap spend per session:</p>
+<ul>
+<li>e.g. <code>tokenBudgetPerSession: 300000</code>: downgrade once the session uses 300k tokens.</li>
+<li>The downgrade behavior is controlled by <code>downgradeBehavior</code> (default <code>notify</code>):<ul>
+<li><code>notify</code>: inject a user-visible message explaining the budget is exhausted,
+which model the remaining requests use, and how to raise the cap.</li>
+<li><code>ask</code>: pop a dialog asking "switch to the cheaper model or keep the current
+one?"; choosing "keep" waives the budget for the rest of the session.</li>
+<li><code>silent</code>: switch silently (not recommended — the user wonders why answers
+got worse).</li>
+</ul>
+</li>
+</ul>
+<h3>On-load consultation (no client UI)</h3>
+<p>On the <strong>first session</strong> after installing or hot-reloading the plugin, DSH:</p>
+<ol>
+<li>Injects a status report message (level→model mapping, cost mode, budget,
+fallback chain). The language follows <code>settings.yaml</code>'s
+<code>locale.preference</code> (<code>zh</code>/<code>en</code>, default <code>en</code>).</li>
+<li>Pops a dialog with three questions (asked once per plugin load):</li>
+</ol>
+<table>
+<thead>
+<tr>
+<th>Question</th>
+<th>Options</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>Q1 Tier-1 rules</td>
+<td>Keep current rules / <strong>View current rules</strong> (injects the rule list)</td>
+</tr>
+<tr>
+<td>Q2 Tier-2 cost mode</td>
+<td>Keep current / cost-first / balanced / quality-first (applies immediately)</td>
+</tr>
+<tr>
+<td>Q3 Other config</td>
+<td>Skip / <strong>Check a setting</strong> (type budget, fallbackChain, classifier, …; injects its current value)</td>
+</tr>
+</tbody></table>
+<p>The injected lists and values let the user <strong>decide</strong> whether to adjust;
+persistent changes still live in <code>cordis.patch.yml</code> (the messages say so).
+Headless or no-question-channel setups degrade to report-only and never block.</p>
+<h2>Rule syntax</h2>
+<ul>
+<li>Plain text: <code>match: 'refactor'</code> — case-insensitive substring.</li>
+<li>Regex literal: <code>match: '/\\bdebug\\b/'</code> — slashes delimit the pattern, optional flags after the last slash (<code>/.../i</code>).</li>
+<li>Rules are evaluated <strong>in order</strong>; the first match wins.</li>
+<li><code>match</code> can target user message text, tool-call results text, or the session <code>cwd</code> (matched as <code>cwd:&lt;path&gt;</code>).</li>
+</ul>
+<h2>What the plugin hooks</h2>
+<table>
+<thead>
+<tr>
+<th>DSH event</th>
+<th>Purpose</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>agent/session-start</code></td>
+<td>reset per-session routing state</td>
+</tr>
+<tr>
+<td><code>agent/pre-step</code></td>
+<td>token accounting for budget tracking</td>
+</tr>
+<tr>
+<td><code>system-prompt/assemble</code></td>
+<td>keep <code>{{model}}</code> prompt variables consistent</td>
+</tr>
+<tr>
+<td><code>agent/request</code></td>
+<td><strong>the routing decision</strong> — replace provider/model</td>
+</tr>
+<tr>
+<td><code>agent/request-error</code></td>
+<td>fallback chain → <code>{ kind: 'retry' }</code></td>
+</tr>
+<tr>
+<td><code>session/event</code></td>
+<td>track spend from assistant messages</td>
+</tr>
+</tbody></table>
+<h2>Testing</h2>
+<pre><code>npm test        # node --test *.test.mjs
+</code></pre>
+<p>No external services are required — all layers are unit-tested against fixtures.</p>
+<h2>Known Issues</h2>
+<ul>
+<li><strong>Fully-auto mode latency</strong>: When the LLM classifier is enabled, the first
+step of each new user input incurs an additional LLM call (classification).
+While subsequent steps within the same input are cached and fast, the overall
+round-trip for multi-step tasks is noticeably slower than directly selecting
+a model. Contributions to optimize this are welcome — the classifier could
+potentially be cached across sessions, or a lighter heuristic could be used
+as a first pass before falling back to the LLM.</li>
+</ul>
+<h2>License</h2>
+<p>MIT</p>

@@ -1,0 +1,66 @@
+<h1>dsh-finish-reason-patch</h1>
+<p>DSH plugin: stop agent turns from being aborted when an OpenAI-compatible
+provider (GPT-family models, gateways, proxies) ends a streaming response with
+full output but <strong>without a terminal <code>finish_reason</code></strong>.</p>
+<h2>The bug it fixes</h2>
+<p>DSH routes OpenAI-compatible providers through <code>@earendil-works/pi-ai</code>. When
+the wire stream ends without ever seeing <code>choices[].finish_reason</code>, pi-ai
+raises <code>Stream ended without finish_reason</code> (<code>openai-completions.js:438</code>). By
+that point every content block is already closed and delivered — the response
+is complete, only the terminal marker is missing. pi-ai surfaces that as an
+<code>error</code> event, the <code>dsh-llm-pi-ai</code> adapter maps it to a terminal
+<code>finish {kind:'error', code:'TRANSPORT'}</code> chunk, and the agent loop
+(<code>dsh-agent-loop</code>) throws — aborting a perfectly good model turn. Other agents
+(e.g. Codex) tolerate the same wire behavior by treating end-of-stream as the
+end of the response.</p>
+<h2>The fix</h2>
+<p>The plugin hooks the <code>llm/stream</code> waterfall — every model call (agent turns,
+session-title requests, prepared calls, subagents) flows through it via
+<code>LlmRuntime.streamWithRegistration</code>. When the terminal finish is exactly that
+error, it is rewritten to a normal <code>stop</code> finish (or <code>tool-calls</code> if tool-call
+deltas were delivered), so the turn completes instead of aborting. This holds
+whether or not content was delivered: some OpenAI-compatible gateways stream
+only usage — or nothing — before ending without a <code>finish_reason</code> (reporting
+<code>outputTokens: 0</code>), and they are accepted as complete empty responses instead
+of retry-looping (Codex-style tolerance). All other error finishes (transport
+resets, rate limits, HTTP errors, ...) pass through untouched, so the existing
+retry policy still applies to genuinely broken responses.</p>
+<p>When it fires you'll see:
+<code>[finish-reason-patch] provider finished without finish_reason -&gt; mapped to "stop"</code></p>
+<h2>Installation</h2>
+<p>The plugin is a plain Cordis host plugin (exports <code>name</code> / <code>apply</code>, no external
+dependencies beyond the <code>ctx</code> Cordis passes in).</p>
+<h3>1. As a persistent profile bundle (recommended, survives restarts)</h3>
+<p>Ship this folder as a package named <code>dsh-finish-reason-patch</code>:</p>
+<ol>
+<li>Place the package where your DSH profile can resolve it, e.g. a junction or
+symlink inside <code>&lt;profile root&gt;/node_modules/dsh-finish-reason-patch</code>
+pointing at this folder (same pattern as other local DSH plugins).</li>
+<li>In the profile root <code>package.json</code>, add the package to
+<code>dsh.profile.bundles</code> and to <code>dependencies</code> (e.g.
+<code>"dsh-finish-reason-patch": "link:&lt;absolute path to this folder&gt;"</code>).</li>
+<li>Restart DSH — bundle patches compose at boot. The package's own
+<code>cordis.patch.yml</code> inserts the plugin row automatically.</li>
+</ol>
+<h3>2. As a dynamic Cordis plugin (current process only)</h3>
+<p>Define/run the plugin host body (<code>plugin.mjs</code>) through the Cordis dynamic
+plugin tools. It stays active until the process exits; re-run after a restart.
+Effects are identical and idempotent if both routes are active.</p>
+<h2>Verifying</h2>
+<ul>
+<li>Logic self-test (no network): <code>node selftest.mjs</code> — all 5 cases pass.</li>
+<li>Live: run a normal conversation with a GPT-class model. Turns that used to
+abort now complete, and the log line above appears.</li>
+</ul>
+<h2>Removal</h2>
+<p>Remove the bundle entry + dependency from the profile <code>package.json</code>, delete
+the <code>node_modules</code> junction, restart DSH. No changes are made to any shipped
+DSH file.</p>
+<h2>Files</h2>
+<ul>
+<li><code>plugin.mjs</code> — the plugin (<code>llm/stream</code> waterfall hook + rewrite logic)</li>
+<li><code>cordis.patch.yml</code> — bundle patch layer (the profile-tree insert row)</li>
+<li><code>package.json</code> — npm metadata (<code>dsh.runtime: host</code>, <code>dsh.bundle.patch</code>)</li>
+<li><code>selftest.mjs</code> — local logic self-test</li>
+<li><code>LICENSE</code> — MIT</li>
+</ul>

@@ -1,0 +1,350 @@
+<h1>dsh-rss-digest</h1>
+<p><strong>English · <a href="https://github.com/JohnXu22786/rss-digest/blob/HEAD/README.zh.md">简体中文</a></strong></p>
+<p>RSS/Atom aggregation, smart summarization, and daily Markdown briefings — a
+first-party-style <strong>dsh bundle</strong> (DeepSeek Harness, "everything is a plugin").</p>
+<p>The plugin manages feed subscriptions with local persistence, polls feeds on a
+schedule, deduplicates stories (exact + near-duplicate), summarizes them with
+the harness's LLM (with a deterministic extractive fallback when the model is
+unavailable), and delivers a daily Markdown digest into live conversations
+and/or files. It also ships a standalone CLI that shares the same core.</p>
+<ul>
+<li><strong>dsh integration</strong>: bundle spec (<code>dsh.bundle</code> + <code>cordis.patch.yml</code>),
+model-facing tools via <code>ctx.tools</code>, scheduling via the harness timer seam,
+delivery via agent follow-up messages. See <a href="#architecture">Architecture</a>.</li>
+<li><strong>Zero-friction core</strong>: the fetch/parse/dedupe/store/digest core has no
+dependencies at all — only the dsh integration layer imports dsh packages.</li>
+</ul>
+<hr>
+<h2>Features</h2>
+<ul>
+<li><strong>Subscriptions</strong> — add / remove / list / enable / disable RSS 2.0, Atom,
+and RSS 1.0 (RDF) feeds; persisted in a single versioned JSON document with
+atomic writes and corruption quarantine.</li>
+<li><strong>Scheduled fetching</strong> — configurable poll interval, startup cycle,
+per-request timeout, size cap, retries, and an item retention cap.</li>
+<li><strong>Deduplication</strong> — exact-match hashing plus token-Jaccard near-duplicate
+detection (CJK-aware bigrams), configurable threshold.</li>
+<li><strong>LLM summaries</strong> — one batch call per digest or per-item summaries,
+Chinese or English, bounded output length; automatic degradation to
+extractive summaries on any model failure.</li>
+<li><strong>Daily digest</strong> — Markdown briefing at a wall-clock time (optional IANA
+timezone) delivered to live sessions (<code>Agent.followup</code>) and/or written to
+<code>digests/&lt;day&gt;.md</code> files.</li>
+<li><strong>Two entry points</strong> — the same <code>RssService</code> powers both the dsh plugin
+(<code>ctx.tools</code> + scheduler) and the standalone CLI.</li>
+</ul>
+<h2>Installation (dsh)</h2>
+<p>A bundle is an npm package that ships a configuration layer. Install this
+package into a dsh profile; the loader picks up the <code>dsh.bundle</code> declaration
+and applies <code>cordis.patch.yml</code> automatically:</p>
+<pre><code># from inside a dsh profile (or with --profile &lt;name&gt; from anywhere)
+dsh plugin --profile demo add ./path/to/dsh-rss-digest
+# or from a registry:  dsh plugin --profile demo add dsh-rss-digest
+</code></pre>
+<p>The profile manifest now lists <code>dsh-rss-digest</code> in <code>dsh.profile.bundles</code>, and
+the bundle's patch inserts the plugin row:</p>
+<pre><code>- insert:
+    - id: rss-digest
+      name: 'dsh-rss-digest'
+</code></pre>
+<p>Optional: tune the plugin from your profile's own
+<code>$DSH_HOME/profiles/demo/cordis.patch.yml</code> (a bare row by id replaces the
+row's config; every omitted field keeps its default). A fully annotated
+example lives in <a href="https://github.com/JohnXu22786/rss-digest/blob/HEAD/examples/profile.cordis.patch.yml"><code>examples/profile.cordis.patch.yml</code></a>:</p>
+<pre><code>- id: rss-digest
+  config:
+    fetch:
+      intervalMinutes: 60
+    summary:
+      language: zh
+      mode: batch
+    digest:
+      time: '08:30'
+      timezone: Asia/Shanghai
+      deliverTo: both
+</code></pre>
+<p>The plugin starts with sensible defaults even with no configuration at all;
+use <code>rss_add</code> in a conversation or <code>dsh-rss-digest add</code> in a shell to register
+feeds at runtime.</p>
+<blockquote>
+<p><strong>Peer dependencies</strong>: the plugin declares the dsh packages it links
+against (<code>@deepseek-ai/cordis</code>, <code>@deepseek-ai/dsh-tools</code>,
+<code>@deepseek-ai/dsh-llm</code>, <code>@deepseek-ai/cordis-plugin-timer</code>) as peers. A dsh
+profile already provides them; if your package manager complains about
+unmet peers, <code>pnpm --dir $DSH_HOME/profiles/demo add</code> the same four packages
+once (the profile linker heals the rest).</p>
+</blockquote>
+<h2>Configuration reference</h2>
+<p>All fields are optional; <code>apply(ctx, config)</code> always receives fully defaulted
+values.</p>
+<table>
+<thead>
+<tr>
+<th>Field</th>
+<th>Default</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>dataPath</code></td>
+<td><code>''</code></td>
+<td>Store file path. <code>''</code> resolves to <code>$DSH_RSS_DIGEST_DATA</code>, else <code>$DSH_HOME/data/rss-digest/store.json</code>, else <code>./.dsh-rss-digest/store.json</code>.</td>
+</tr>
+<tr>
+<td><code>sources[]</code></td>
+<td><code>[]</code></td>
+<td>Initial subscriptions merged at startup: <code>{ url, title?, enabled? }</code>. Duplicate URLs are ignored.</td>
+</tr>
+<tr>
+<td><code>fetch.enabled</code></td>
+<td><code>true</code></td>
+<td>Whether the periodic poller runs.</td>
+</tr>
+<tr>
+<td><code>fetch.intervalMinutes</code></td>
+<td><code>60</code></td>
+<td>Poll interval (min 5).</td>
+</tr>
+<tr>
+<td><code>fetch.onStartup</code></td>
+<td><code>true</code></td>
+<td>Run one cycle ~10 s after startup.</td>
+</tr>
+<tr>
+<td><code>fetch.requestTimeoutMs</code></td>
+<td><code>15000</code></td>
+<td>Per-request timeout.</td>
+</tr>
+<tr>
+<td><code>fetch.sizeLimitBytes</code></td>
+<td><code>1048576</code></td>
+<td>Max accepted document size.</td>
+</tr>
+<tr>
+<td><code>fetch.retries</code></td>
+<td><code>2</code></td>
+<td>Retries for transient failures (network / 5xx / 429 / 408).</td>
+</tr>
+<tr>
+<td><code>fetch.maxItemsPerSource</code></td>
+<td><code>50</code></td>
+<td>Parsed items kept per source per cycle (newest kept).</td>
+</tr>
+<tr>
+<td><code>fetch.storeContentChars</code></td>
+<td><code>4000</code></td>
+<td>Truncation for stored summary/content text.</td>
+</tr>
+<tr>
+<td><code>fetch.maxStoredItems</code></td>
+<td><code>1000</code></td>
+<td>Retention cap (oldest fetched pruned on save).</td>
+</tr>
+<tr>
+<td><code>dedupe.threshold</code></td>
+<td><code>0.9</code></td>
+<td>Min token-set Jaccard similarity for near-duplicates.</td>
+</tr>
+<tr>
+<td><code>dedupe.compareContent</code></td>
+<td><code>false</code></td>
+<td>Let identical bodies collapse empty-title items.</td>
+</tr>
+<tr>
+<td><code>summary.enabled</code></td>
+<td><code>true</code></td>
+<td><code>false</code> forces extractive summaries.</td>
+</tr>
+<tr>
+<td><code>summary.mode</code></td>
+<td><code>batch</code></td>
+<td><code>batch</code> = one model call per digest; <code>single</code> = per item.</td>
+</tr>
+<tr>
+<td><code>summary.language</code></td>
+<td><code>zh</code></td>
+<td>Output language of the summary body: <code>zh</code> | <code>en</code>.</td>
+</tr>
+<tr>
+<td><code>summary.maxLength</code></td>
+<td><code>800</code></td>
+<td>Hard character cap on the summary body.</td>
+</tr>
+<tr>
+<td><code>summary.maxTokens</code></td>
+<td><code>1024</code></td>
+<td>Token budget hint for the model call.</td>
+</tr>
+<tr>
+<td><code>summary.provider</code></td>
+<td><code>''</code></td>
+<td>dsh provider route; <code>''</code> = first registered provider.</td>
+</tr>
+<tr>
+<td><code>summary.model</code></td>
+<td><code>''</code></td>
+<td>Model id; <code>''</code> = first listed model of the provider.</td>
+</tr>
+<tr>
+<td><code>digest.enabled</code></td>
+<td><code>true</code></td>
+<td>Whether the daily digest scheduler runs.</td>
+</tr>
+<tr>
+<td><code>digest.time</code></td>
+<td><code>'08:00'</code></td>
+<td>Wall-clock fire time (<code>HH:MM</code>).</td>
+</tr>
+<tr>
+<td><code>digest.timezone</code></td>
+<td><code>''</code></td>
+<td>IANA timezone; <code>''</code> = host local time.</td>
+</tr>
+<tr>
+<td><code>digest.maxItems</code></td>
+<td><code>20</code></td>
+<td>Max items per digest.</td>
+</tr>
+<tr>
+<td><code>digest.deliverTo</code></td>
+<td><code>both</code></td>
+<td><code>agents</code> | <code>file</code> | <code>both</code> — deliver to live sessions, to <code>digests/&lt;day&gt;.md</code>, or both.</td>
+</tr>
+<tr>
+<td><code>digest.includeItemLinks</code></td>
+<td><code>true</code></td>
+<td>Whether the item list embeds permalinks (http/https only).</td>
+</tr>
+</tbody></table>
+<h2>Tools (model-facing)</h2>
+<p>Registered through <code>ctx.tools</code>; the model can call them in any conversation:</p>
+<table>
+<thead>
+<tr>
+<th>Tool</th>
+<th>Parameters</th>
+<th>Behavior</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>rss_list</code></td>
+<td>—</td>
+<td>Lists subscriptions (id, url, title, enabled).</td>
+</tr>
+<tr>
+<td><code>rss_add</code></td>
+<td><code>url</code> (req), <code>title?</code></td>
+<td>Subscribes to a feed; returns the new source.</td>
+</tr>
+<tr>
+<td><code>rss_remove</code></td>
+<td><code>id</code> (req)</td>
+<td>Unsubscribes and drops that source's items.</td>
+</tr>
+<tr>
+<td><code>rss_fetch</code></td>
+<td><code>id?</code></td>
+<td>Polls one source (or all) now; dedupe is automatic.</td>
+</tr>
+<tr>
+<td><code>rss_digest</code></td>
+<td><code>language?</code>, <code>mode?</code>, <code>maxItems?</code></td>
+<td>Builds the Markdown digest over undigested items and returns it.</td>
+</tr>
+</tbody></table>
+<p>Example conversation flow:</p>
+<pre><code>user: 帮我把 Hacker News 加进来，然后生成今天的简报
+model: [rss_add: https://hnrss.org/frontpage]
+       [rss_fetch]
+       [rss_digest: language=zh]
+</code></pre>
+<h2>Scheduling model</h2>
+<p>dsh's <code>ctx.jobs</code> registry tracks long-running task <em>executions</em> (bash /
+subagent jobs) — it is not a cron API. The harness's scheduling seam is the
+timer service (<code>ctx.timeout</code> / <code>ctx.interval</code>, injected via <code>'timer'</code>), which
+is what this plugin uses:</p>
+<ul>
+<li>fetch cycles: <code>ctx.interval</code> (configurable), plus one startup cycle;</li>
+<li>daily digest: a self-re-arming <code>ctx.timeout</code> — after every run the next
+<code>HH:MM</code> occurrence is recomputed (<code>Intl</code>-based, timezone- and DST-aware), so
+the digest stays anchored to the configured wall-clock time; overlapping
+runs are guarded with an in-flight lock.</li>
+</ul>
+<h2>Delivery</h2>
+<p>The harness has no broadcast API; a plugin reaches live sessions by queueing
+a user-role message on each running <code>Agent</code> (<code>Agent.followup</code>, the same
+mechanism the shipped job notices use). <code>digest.deliverTo = agents</code> does that;
+<code>file</code> writes <code>digests/&lt;day&gt;.md</code> next to the store; <code>both</code> is the default.
+Headless profiles without the agent service simply get the file/log path, and
+the plugin never depends on the agent service at startup.</p>
+<h2>CLI</h2>
+<p>The same core, no harness required:</p>
+<pre><code>dsh-rss-digest add https://hnrss.org/frontpage
+dsh-rss-digest fetch
+dsh-rss-digest digest --lang en --out digest.md
+dsh-rss-digest list --items
+dsh-rss-digest status
+</code></pre>
+<p>Run <code>dsh-rss-digest help</code> for the full command reference. The CLI talks to an
+OpenAI-compatible <code>/chat/completions</code> endpoint for summaries (DeepSeek by
+default: <code>https://api.deepseek.com</code>, key from <code>DEEPSEEK_API_KEY</code>, model
+<code>deepseek-chat</code>); without credentials it degrades to extractive summaries,
+exactly like the plugin does when the harness LLM fails.</p>
+<h2>Data</h2>
+<p>One JSON document (<code>schema: 1</code>), written atomically; corrupt files are moved
+aside (<code>.corrupt-&lt;timestamp&gt;</code>) rather than deleted. Full subscription URLs
+(including query strings, which signed feeds often need) are persisted as
+given; log lines show the URL without its query string. Environment
+overrides: <code>DSH_RSS_DIGEST_DATA</code> (store path), <code>DEEPSEEK_API_KEY</code> (CLI).</p>
+<h2>Architecture</h2>
+<pre><code>src/
+  index.ts        dsh bundle entry: name / inject / Config / apply
+  config.ts       Config interface + Schemastery schema (defaults)
+  tools.ts        rss_list / rss_add / rss_remove / rss_fetch / rss_digest
+  scheduler.ts    timer-seam scheduling (fetch cycles + self-re-arming digest)
+  delivery.ts     Agent.followup delivery + digests/&lt;day&gt;.md files
+  dsh-llm.ts      ctx.llm adapter (streaming, provider/model resolution)
+  service.ts      RssService — orchestrates everything (dsh-free)
+  parser.ts       dependency-free RSS 2.0 / Atom / RSS 1.0 parser
+  fetcher.ts      fetch with timeout, size cap, retries, charset detection
+  dedupe.ts       normalization, exact hashing, token-Jaccard similarity
+  store.ts        versioned JSON persistence (atomic, quarantining)
+  summarizer.ts   LLM + extractive summarization (degrade contract)
+  digest.ts       Markdown briefing renderer (safe link handling)
+  llm-client.ts   OpenAI-compatible REST client (CLI)
+  cli.ts          standalone CLI entry (bin: dsh-rss-digest)
+</code></pre>
+<p>The core (<code>service.ts</code> and below) has <strong>zero</strong> runtime dependencies; only the
+dsh layer imports <code>@deepseek-ai/*</code> packages.</p>
+<h2>FAQ</h2>
+<ul>
+<li><p><strong>The package manager warns that dsh peer dependencies are not satisfied.</strong>
+The dsh profile already ships <code>@deepseek-ai/cordis</code>, <code>@deepseek-ai/dsh-tools</code>,
+<code>@deepseek-ai/dsh-llm</code>, and <code>@deepseek-ai/cordis-plugin-timer</code>; the profile
+linker wires them in. If a strict manager still complains, run
+<code>pnpm --dir $DSH_HOME/profiles/&lt;name&gt; add @deepseek-ai/cordis @deepseek-ai/dsh-tools @deepseek-ai/dsh-llm @deepseek-ai/cordis-plugin-timer</code>.</p>
+</li>
+<li><p><strong>Digests fire at the wrong wall-clock time.</strong> Timezones are only honored
+when <code>digest.timezone</code> is set to an IANA zone (e.g. <code>Asia/Shanghai</code>); an
+empty value uses the host's local time.</p>
+</li>
+<li><p><strong>I only get extractive summaries, not LLM ones.</strong> Without a reachable model
+route the plugin degrades deterministically to extractive summaries. Check
+<code>summary.provider</code> / <code>summary.model</code> and, for the CLI, that <code>DEEPSEEK_API_KEY</code>
+is set and the endpoint is reachable.</p>
+</li>
+<li><p><strong>Where is my data?</strong> The store resolves to (in order) an explicit
+<code>config.dataPath</code>, <code>$DSH_RSS_DIGEST_DATA</code>, <code>$DSH_HOME/data/rss-digest/store.json</code>,
+or <code>&lt;cwd&gt;/.dsh-rss-digest/store.json</code>.</p>
+</li>
+</ul>
+<h2>Development</h2>
+<pre><code>npm install
+npm run build     # tsc -&gt; lib/
+npm test          # build + node --test (79 tests: parser, dedupe, store,
+                  # fetcher, time, summarizer, digest, service, cli, wiring)
+node lib/cli.js status
+</code></pre>
+<p>Requires Node &gt;= 22.18.</p>
+<h2>License</h2>
+<p>MIT — see <a href="https://github.com/JohnXu22786/rss-digest/blob/HEAD/LICENSE">LICENSE</a>.</p>

@@ -1,0 +1,210 @@
+<h1>dsh-memory-standard</h1>
+<p><a href="https://github.com/JohnXu22786/memory-standard/blob/HEAD/README.md">English</a> | <a href="https://github.com/JohnXu22786/memory-standard/blob/HEAD/README.zh.md">简体中文</a></p>
+<p><a href="https://github.com/JohnXu22786/memory-standard/actions/workflows/ci.yml"><img src="https://github.com/JohnXu22786/memory-standard/actions/workflows/ci.yml/badge.svg" alt="CI"></a></p>
+<p>A <strong>Memory Standard Protocol (mm)</strong> plugin for the DeepSeek Harness (dsh): a
+deterministic, layered, cross-agent memory system built on plain markdown
+files — not a proprietary protocol.</p>
+<p>The dsh ecosystem has dozens of memory plugins but no shared standard, and
+the official core only ships a default-off MCP memory example. This plugin
+claims the missing "standard seat": <strong>deterministic budgets + layered
+MEMORY.md + cross-agent mutual recognition + session-log ingestion</strong> that
+works with official compaction/session logs.</p>
+<ul>
+<li><strong>Layered memory</strong> — <code>MEMORY.md</code> is the hand-loaded index (hard cap:
+200 lines / 25 KiB, default); detailed notes live in <code>memories/&lt;topic&gt;.md</code>
+and load on demand.</li>
+<li><strong>Deterministic budgets</strong> — over any budget is a structured error with
+usage metrics demanding an index rewrite, <strong>never a silent truncation</strong>.
+Writes carry a character budget and return usage so an agent can compress
+on the spot.</li>
+<li><strong>Cross-agent mutual recognition</strong> — a documented plain-markdown format,
+portable <code>mm://&lt;memoryId&gt;/&lt;topic&gt;</code> URIs, a JSON Schema
+(<code>schema/memory.schema.json</code>), and an open read/write API. No closed
+protocol.</li>
+<li><strong>Write timing</strong> — <code>mem_write</code> API plus session-end / periodic nudging;
+writes persist to disk immediately and load in the <strong>next</strong> session
+(in-session reads stay frozen, protecting any prompt cache).</li>
+<li><strong>Ingestion collaboration</strong> — <code>mem_digest</code> recognizes official dsh session
+logs / compaction output as a memory source and distills candidate memories
+(optional, self-contained, LLM-free).</li>
+<li><strong>Toolchain</strong> — dsh tools <code>mem_read</code>, <code>mem_write</code>, <code>mem_search</code>,
+<code>mem_budget</code>, <code>mem_digest</code>, plus a <code>dsh-memory</code> CLI.</li>
+</ul>
+<p>The core library is dependency-free (Node built-ins only) and works both
+inside dsh and standalone.</p>
+<h2>Status</h2>
+<p>Developer-preview dsh ecosystem; format version <code>mm v1</code> (see
+<a href="https://github.com/JohnXu22786/memory-standard/blob/HEAD/SPEC.md"><code>SPEC.md</code></a>). Compatible with the installed <code>@deepseek-ai/dsh</code> CLI
+and bundle format (<code>dsh.bundle.patch</code> + <code>cordis.patch.yml</code> + <code>apply(ctx)</code>).</p>
+<hr>
+<h2>Quick start</h2>
+<h3>1. Integrate with dsh (local directory bundle)</h3>
+<p>From the directory that contains this package (<code>dsh-memory-standard/</code>):</p>
+<pre><code>dsh plugin --profile demo add ./
+
+# or install directly from this GitHub repository
+dsh plugin --profile demo add github:JohnXu22786/memory-standard
+# or from npm once published
+dsh plugin --profile demo add dsh-memory-standard
+# the standalone CLI is also published as a global npm bin
+npm install -g dsh-memory-standard
+
+# boot the profile; the five mem_* tools + the 'memory-standard' system section load
+dsh --profile demo
+</code></pre>
+<p><code>dsh plugin</code> forwards to pnpm inside the profile; peer dependencies
+(<code>@deepseek-ai/cordis</code>, <code>@deepseek-ai/dsh-tools</code>, <code>@deepseek-ai/schemastery</code>)
+resolve from the dsh installation. Verified against <code>dsh@0.1.0-rc.6</code>.</p>
+<blockquote>
+<p>Notes for other install paths:</p>
+<ul>
+<li>As a dev overlay → copy <code>cordis.patch.yml</code> and point a <code>--patch</code> overlay at
+the package's entry (<code>name</code> = package name for the row).</li>
+<li>The plugin auto-initializes the memory root (<code>$DSH_HOME/memory</code>, or
+<code>$DSH_MEMORY_ROOT</code>) on first load — no manual <code>init</code> needed.</li>
+</ul>
+</blockquote>
+<h3>2. Configure</h3>
+<p>The bundle ships defaults; every value is overridable by overriding the
+<code>memory-standard</code> row by id in a later layer (profile <code>cordis.patch.yml</code>,
+<code>$DSH_HOME</code> overlay, or <code>--patch</code>):</p>
+<pre><code>- id: memory-standard
+  config:
+    root: ''                 # '' =&gt; $DSH_MEMORY_ROOT, else $DSH_HOME/memory
+    memoryId: local
+    indexLines: 200          # hard cap on MEMORY.md lines
+    indexBytes: 25600        # hard cap on MEMORY.md bytes (25 KiB)
+    detailMaxBytes: 65536    # hard cap per detail file
+    defaultWriteBudget: 4000 # per-write character budget
+    search:
+      mode: auto             # auto | scan | fts5
+      limit: 10
+      maxSnippetChars: 160
+    nudge:
+      enabled: true          # session-end / periodic nudging (memory/nudge events)
+      intervalMs: 1800000
+    lang: auto               # auto | en | zh (system-prompt section language)
+</code></pre>
+<h3>3. Use it</h3>
+<p>In a dsh session the agent gets the five tools (plus a system-prompt section
+that explains the protocol):</p>
+<table>
+<thead>
+<tr>
+<th>tool</th>
+<th>purpose</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>mem_read</code></td>
+<td>read the index, all summaries, or one note's full body (frozen snapshot)</td>
+</tr>
+<tr>
+<td><code>mem_write</code></td>
+<td>write/update a note with a character budget; returns usage; never truncates</td>
+</tr>
+<tr>
+<td><code>mem_search</code></td>
+<td>search memory (FTS5 when available, else scan; CJK-aware scan)</td>
+</tr>
+<tr>
+<td><code>mem_budget</code></td>
+<td>deterministic budget report (index caps, per-note usage, pending writes)</td>
+</tr>
+<tr>
+<td><code>mem_digest</code></td>
+<td>distill candidate memories from a session log / text (never writes)</td>
+</tr>
+</tbody></table>
+<p>Other plugins can access memory directly via the provided service:</p>
+<pre><code>const memory = ctx.get('memory')
+memory.write({ topic: 'deploy-region', content: 'us-east-1', summary: 'Deployment region' })
+memory.search('deploy')
+</code></pre>
+<h3>4. Standalone CLI</h3>
+<pre><code>npm run build                # needed once to compile lib/
+node lib/cli.js init --root &lt;dir&gt;
+node lib/cli.js write deploy --content "we deploy to us-east-1" --root &lt;dir&gt;
+node lib/cli.js read deploy --root &lt;dir&gt;
+node lib/cli.js budget --root &lt;dir&gt;
+node lib/cli.js search deploy --root &lt;dir&gt;
+node lib/cli.js digest --file &lt;session.log.jsonl&gt; --root &lt;dir&gt;
+</code></pre>
+<p>All commands accept <code>--json</code> for machine-readable output; <code>--root</code> selects the
+memory root. Install globally with <code>npm i -g .</code> to get the <code>dsh-memory</code> bin.</p>
+<hr>
+<h2>How it works</h2>
+<h3>Layered memory</h3>
+<pre><code>&lt;root&gt;/MEMORY.md          hand-loaded index (small, hard-capped)
+&lt;root&gt;/memories/t1.md     on-demand detail notes (free markdown)
+</code></pre>
+<p><code>mem_read</code> without a topic returns the index (the hand-load surface); a topic
+returns that note's full body. Budget lets the agent decide what belongs in
+the index summary vs. the detail note.</p>
+<h3>Deterministic budgets</h3>
+<p>Three no-truncation guarantees (see <a href="https://github.com/JohnXu22786/memory-standard/blob/HEAD/SPEC.md"><code>SPEC.md</code></a> §6):</p>
+<ol>
+<li>a write over its <strong>character budget</strong> fails with <code>usage.overflow</code>, writes
+nothing; compress and retry,</li>
+<li>a note over its <strong>byte cap</strong> fails, preserving the previous content,</li>
+<li>an index over its <strong>line/byte hard cap</strong> fails and <em>demands a rewrite</em> —
+the error text says so explicitly. Deleting/consolidating to fit again is
+the recovery path.</li>
+</ol>
+<p>A compliant writer must never "fix" an over-budget write by silently dropping
+content — the standard views that as data loss.</p>
+<h3>Frozen snapshots</h3>
+<p><code>Memory</code> loads a snapshot once per session. Reads and search serve that
+snapshot; writes go to disk for the next session. <code>pendingWrites</code> exposes
+staged writes; <code>reload()</code> re-snapshots (used by the CLI and integrations).
+This keeps the session's view self-consistent and protects prompt caches.</p>
+<h3>Cross-agent interop</h3>
+<ul>
+<li>The on-disk format is plain, documented markdown (<code>SPEC.md</code>) and the URI
+scheme is <code>mm://&lt;memoryId&gt;/&lt;topic&gt;</code>.</li>
+<li><code>schema/memory.schema.json</code> describes the note shape for any compliant
+writer/reader.</li>
+<li>The public API (<code>Memory</code>, and <code>ctx.get('memory')</code> in dsh) is an open
+interface — not a closed tool protocol. Any agent or tool can read/write the
+same files.</li>
+</ul>
+<h3>Ingestion collaboration</h3>
+<p>dsh stores sessions under <code>$DSH_HOME/sessions</code> and compacts them; those logs
+are recognized as a memory source. <code>mem_digest</code> reads the most recent
+<code>*.jsonl</code>/<code>*.md</code> (or an explicit file/text), recognizes <code>mm:</code> markers,
+<code>MEMO:</code>/<code>记忆：</code>/<code>记住：</code> lines, summary lines, and markdown headings, and
+returns budgeted candidates for review. It never auto-writes — the agent
+chooses what to commit.</p>
+<hr>
+<h2>Project layout</h2>
+<pre><code>src/
+  types.ts            shared/interop types + defaults (mm v1)
+  core/               dependency-free library (Node built-ins only)
+    memory.ts         Memory facade: snapshots, writes, budget, search, digest
+    format.ts         index/note markdown grammar + URIs (SPEC implementation)
+    budget.ts         deterministic budget arithmetic
+    search.ts         scan search + optional SQLite FTS5 (node:sqlite)
+    digest.ts         session-log distillation
+    paths.ts          layout &amp; root resolution
+  dsh/
+    tools.ts          the five mem_* defineTool registrations
+    guide.ts          system-prompt "standard bit"
+  cli.ts              dsh-memory CLI
+  index.ts            dsh bundle entry (name/inject/Config/apply)
+cordis.patch.yml      bundle patch layer
+schema/memory.schema.json
+SPEC.md / README.md / README.zh.md
+examples/root/        runnable example memory
+test/                 node:test suite (budget/layered/snapshot/search/digest/interop/cli)
+</code></pre>
+<h2>Development</h2>
+<pre><code>npm install
+npm run build      # tsc -&gt; lib/
+npm test           # build + node --test
+npm run typecheck
+</code></pre>
+<p>Uses only dev dependencies (<code>typescript</code>, <code>@types/node</code>, and the dsh peer
+packages for type-checking). Runtime dependencies: none beyond Node built-ins
+(<code>node:sqlite</code> optional for FTS5; graceful fallback to scan).</p>
+<h2>License</h2>
+<p>MIT — see <a href="https://github.com/JohnXu22786/memory-standard/blob/HEAD/LICENSE">LICENSE</a>.</p>

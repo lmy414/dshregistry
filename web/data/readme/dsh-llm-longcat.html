@@ -1,0 +1,192 @@
+<h1>dsh-llm-longcat</h1>
+<p>LongCat adapter for the <a href="https://github.com/deepseek-ai/deepseek-harness">DeepSeek Harness</a> LLM seam.</p>
+<p>Adds <strong>LongCat-2.0</strong> as a model provider: 1M context, thinking mode, tool calling.</p>
+<h2>Features</h2>
+<ul>
+<li><strong>Thinking mode</strong> — recognizes LongCat's <code>reasoning_content</code> field and translates it into harness <code>ReasoningBlock</code>s</li>
+<li><strong>Tool calling</strong> — full function-calling support, with <code>arguments</code> kept a raw JSON string end to end</li>
+<li><strong>Multi-turn</strong> — replays <code>reasoning_content</code> on tool-call turns, as thinking-mode passback requires</li>
+<li><strong>Streaming</strong> — SSE with the <code>usage</code>-before-<code>finish</code> ordering the harness relies on</li>
+<li><strong>Credential seam</strong> — the key resolves per request from <code>ctx.credentials</code> or the environment; no secret in any config file</li>
+</ul>
+<h2>Supported models</h2>
+<table>
+<thead>
+<tr>
+<th>Model</th>
+<th>Context</th>
+<th>Max output</th>
+<th>Notes</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>LongCat-2.0</code></td>
+<td>1,048,576</td>
+<td>131,072</td>
+<td>text-only; thinking + tool calling</td>
+</tr>
+</tbody></table>
+<p>Facts from <code>GET /openai/v1/models/LongCat-2.0</code>, the only documented endpoint that
+reports <code>supported_parameters</code>. Tool calling is <strong>not</strong> mentioned on the
+chat-completions doc page and is only visible there.</p>
+<h2>Install</h2>
+<pre><code>dsh plugin --profile default add github:ffyuuu/dsh-llm-longcat
+export LONGCAT_API_KEY=...   # create one at https://longcat.chat/platform/api_keys
+</code></pre>
+<p>Installing a bundle lets the package's install scripts run on your machine,
+outside the sandbox the agent runs under. Pin a commit so a later push cannot
+change what executes:</p>
+<pre><code>dsh plugin --profile default add github:ffyuuu/dsh-llm-longcat#3dcb3b1b5870ba52baab053453bdbb28826e5f13
+</code></pre>
+<p>Then pick <strong>LongCat-2.0</strong> in the model selector. The key may also be stored
+through the Web UI's Models page instead of the environment.</p>
+<h3>If <code>dsh</code> itself will not install</h3>
+<p>At the time of writing, installing the harness can fail before any plugin is
+reached, with either <code>ETARGET … dsh-typert-protocol@^0.1.0-rc.8</code> or an npm
+heap exhaustion. That is an upstream packaging state, not this plugin:
+<code>@deepseek-ai/dsh</code> published <code>0.1.0-rc.8</code> while several packages it depends on
+stopped at <code>0.1.0-rc.7</code>, and because the manifests use caret ranges,
+<code>^0.1.0-rc.7</code> still resolves up into the missing <code>rc.8</code>. npm then backtracks
+over an unsatisfiable graph until it runs out of memory.</p>
+<p>Pinning every <code>@deepseek-ai/*</code> package to an exact <code>0.1.0-rc.7</code> through npm
+<code>overrides</code> avoids the drift. Nothing in this plugin needs changing either
+way — it declares <code>&gt;=0.1.0-rc.7</code> and works against whichever of those the
+host ends up with.</p>
+<h2>Config</h2>
+<pre><code>- id: llm-longcat
+  name: dsh-llm-longcat
+  config:
+    apiKeyEnv: LONGCAT_API_KEY   # default; resolved per request, never a literal key
+    baseURL: https://api.longcat.chat/openai/v1  # optional; $LONGCAT_BASE_URL then the public API
+    thinking: enabled            # optional deployment policy; `disabled` locks every request to off
+    reasoningEffort: high        # optional; off | high — LongCat's switch is binary
+    maxTokens: 131072            # optional per-request output cap
+    defaultContextWindow: 1048576
+    streamIdleTimeoutMs: 300000  # optional; five-minute default
+    retryPolicy:                 # optional; omission uses bounded normal defaults
+      mode: normal
+      maxRetries: 3
+    models:
+      - id: LongCat-2.0
+        contextWindow: 1048576
+</code></pre>
+<p>A <code>llm-longcat:</code> section in <code>$DSH_HOME/settings.yaml</code> overrides any field
+without a restart: base URL, catalog, request defaults, and idle budget all
+take effect on the next request, while an in-flight stream keeps the facts it
+started with.</p>
+<h2>Reasoning is binary, deliberately</h2>
+<p>LongCat controls thinking with <code>thinking: {type: enabled|disabled}</code> and does
+<strong>not</strong> accept OpenAI's top-level <code>reasoning_effort</code> — its
+<code>supported_parameters</code> lists the former and omits the latter. There is
+therefore no low/medium/high gradient to map, and this adapter offers exactly
+two levels rather than advertising controls that would collapse onto the same
+two request bodies:</p>
+<table>
+<thead>
+<tr>
+<th>Selected effort</th>
+<th>Wire body</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>high</code> ("Thinking")</td>
+<td><code>{"thinking": {"type": "enabled"}}</code></td>
+</tr>
+<tr>
+<td><code>off</code></td>
+<td><code>{"thinking": {"type": "disabled"}}</code></td>
+</tr>
+<tr>
+<td><em>(none named)</em></td>
+<td>resolves from config; still explicit</td>
+</tr>
+</tbody></table>
+<p><code>off</code> serializes an explicit <code>disabled</code> rather than omitting the field —
+omitting it would hand the decision to LongCat's server-side default, which is
+not what selecting Off should mean. Requesting <code>low</code>, <code>medium</code>, or <code>max</code> fails
+with <code>UNSUPPORTED_REASONING_EFFORT</code> before any network I/O.</p>
+<h2>Wire-format notes</h2>
+<ul>
+<li><strong>Tool-call deltas repeat <code>id</code> and <code>name</code> as explicit <code>null</code>.</strong> LongCat sends
+them on the opening delta and then <code>null</code> (not omitted) on every
+continuation, so a naive <code>!== undefined</code> guard blanks the assembled call's
+name. Verified on live traffic; pinned by a regression test.</li>
+<li>Streaming only, with <code>stream_options.include_usage</code> always on. Usage may
+arrive attached to the finish chunk or as a trailing usage-only chunk; both
+are deferred to <code>[DONE]</code> so <code>usage</code> always precedes <code>finish</code>.</li>
+<li>The first thinking-mode delta can be an empty string — it must not open a
+reasoning block.</li>
+<li><strong>Reasoning passback</strong>: on assistant turns that carried tool calls,
+<code>reasoning_content</code> is serialized back into history; on tool-call-free turns
+it is dropped (ignored anyway — saves tokens).</li>
+<li>Assistant <code>content</code> is always a string, never null: the message is durable
+session history, and a null there would make later turns replay a body the
+endpoint can reject.</li>
+<li>Cache accounting: <code>prompt_tokens_details.cached_tokens</code> maps to
+<code>cacheReadTokens</code> and is subtracted out of <code>inputTokens</code> to keep the
+harness's disjoint-count convention.</li>
+</ul>
+<h2>Errors</h2>
+<p>Non-2xx responses throw <code>LlmError</code> with stable codes. LongCat documents a
+dedicated <strong>402</strong> for exhausted token quota and puts <code>insufficient_quota</code> on
+<strong>403</strong>, where most OpenAI-compatible providers use 429 — both are classified
+as <code>QUOTA</code> before the auth and rate-limit buckets, so a depleted balance is
+never reported as a bad key or retried as a transient rate limit.</p>
+<table>
+<thead>
+<tr>
+<th>Condition</th>
+<th>Code</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>402, or quota detail at any status</td>
+<td><code>QUOTA_EXCEEDED</code></td>
+</tr>
+<tr>
+<td>401 / 403</td>
+<td><code>AUTH</code></td>
+</tr>
+<tr>
+<td>429</td>
+<td><code>RATE_LIMIT</code></td>
+</tr>
+<tr>
+<td>400 with context-overflow detail</td>
+<td><code>CONTEXT_WINDOW_EXCEEDED</code></td>
+</tr>
+<tr>
+<td>other 400</td>
+<td><code>INVALID_REQUEST</code></td>
+</tr>
+<tr>
+<td>5xx</td>
+<td><code>SERVER</code></td>
+</tr>
+<tr>
+<td>no <code>[DONE]</code> / bad JSON</td>
+<td><code>STREAM_CLOSED</code> / <code>MALFORMED_RESPONSE</code></td>
+</tr>
+</tbody></table>
+<p>A completed stream that opened no content blocks becomes a <code>finish</code> error with
+<code>EMPTY_RESPONSE</code>, which the shipped retry policy treats as retryable.</p>
+<h2>Tests</h2>
+<pre><code>npm run typecheck   # against the published @deepseek-ai/dsh-llm types
+npm test            # 30 unit tests over serialize + translate
+npm run build       # emits lib/ and lib/types/
+npm run test:e2e    # real API, needs LONGCAT_API_KEY, spends a few hundred tokens
+</code></pre>
+<p><code>test:e2e</code> drives the built adapter's own serialize → SSE → translate pipeline
+against <code>api.longcat.chat</code>, so it verifies what the plugin actually sends
+rather than a hand-written approximation. It is what caught the null-name
+delta bug.</p>
+<h2>Limitations</h2>
+<ul>
+<li><strong>No image input.</strong> LongCat-2.0 reports <code>modality: text-&gt;text</code>, so image
+content is refused before sending, naming the model.</li>
+<li><strong>No stop sequences.</strong> <code>stop</code> is absent from <code>supported_parameters</code>; passing
+one fails with <code>UNSUPPORTED_OPTION</code> rather than silently running past it.</li>
+<li><strong>Reasoning is binary</strong> — no low/medium/high gradient exists to map.</li>
+</ul>
+<h2>License</h2>
+<p>MIT</p>

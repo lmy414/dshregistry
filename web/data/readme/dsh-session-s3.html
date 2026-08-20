@@ -1,0 +1,282 @@
+<h1>dsh-session-s3</h1>
+<p>Unofficial community <a href="https://github.com/deepseek-ai/deepseek-harness">DeepSeek Harness</a> plugin: an S3-backed <strong>SessionPersistence</strong> provider.</p>
+<p>wal3-Lite: <strong>immutable JSONL fragments</strong> + a <strong>CAS manifest</strong> (<code>If-None-Match</code> / <code>If-Match</code>). Per-fragment SHA-256. No setsum in Phase 1.</p>
+<p>Fixes the class of JSONL durability bugs that come from torn writes, missing fsync, and concurrent writers — by never mutating a fragment and coordinating writers on a single compare-and-swap object.</p>
+<p>The 7 field-confirmed DSH corruption discussions (<a href="https://github.com/deepseek-ai/deepseek-harness/discussions/1333">#1333</a>, <a href="https://github.com/deepseek-ai/deepseek-harness/discussions/1452">#1452</a>, <a href="https://github.com/deepseek-ai/deepseek-harness/discussions/1497">#1497</a>, <a href="https://github.com/deepseek-ai/deepseek-harness/discussions/1473">#1473</a>, <a href="https://github.com/deepseek-ai/deepseek-harness/discussions/1586">#1586</a>, <a href="https://github.com/deepseek-ai/deepseek-harness/discussions/2167">#2167</a>, <a href="https://github.com/deepseek-ai/deepseek-harness/discussions/2342">#2342</a>) are encoded as tests in <code>test/corruption-scenarios.test.ts</code>. Results: <a href="https://github.com/gengmao/dsh-session-s3/blob/HEAD/docs/corruption-scenarios.md">docs/corruption-scenarios.md</a>.</p>
+<p>For the correctness boundary, commit point, crash states, sequence domains,
+and rejected alternatives, see <a href="https://github.com/gengmao/dsh-session-s3/blob/HEAD/docs/design-rationale.md">Design rationale</a>.</p>
+<h2>Install</h2>
+<p>Plugins install into a <strong>profile</strong> (<code>$DSH_HOME/profiles/&lt;name&gt;</code>), not globally. <code>dsh plugin</code> is a pnpm forwarder: it adds the package as a dependency, and because this repo declares <code>dsh.bundle.patch</code>, it also appends <code>dsh-session-s3</code> to <code>dsh.profile.bundles</code>.</p>
+<p><strong>From GitHub (typical):</strong></p>
+<pre><code>dsh plugin --profile web add github:gengmao/dsh-session-s3
+</code></pre>
+<p>or without a global <code>dsh</code>:</p>
+<pre><code>npx -y @deepseek-ai/dsh plugin --profile web add github:gengmao/dsh-session-s3
+</code></pre>
+<p>pnpm ≥10 blocks git-hosted <code>prepare</code> scripts (this package runs <code>tsc</code> on install). If add fails, allow the build and re-run:</p>
+<pre><code># $DSH_HOME/profiles/web/pnpm-workspace.yaml
+allowBuilds:
+  dsh-session-s3: true
+</code></pre>
+<p><strong>From a local checkout:</strong></p>
+<pre><code>dsh plugin --profile web add ./dsh-session-s3
+# or
+dsh plugin --profile web add "link:$PWD"
+</code></pre>
+<p><strong>From npm</strong> (once published):</p>
+<pre><code>dsh plugin --profile web add dsh-session-s3
+</code></pre>
+<p>Same action in the Web UI: <strong>Settings → Plugins</strong>. Restart <code>dsh web</code> (or <code>dsh --profile web</code>) after adding.</p>
+<p>Remove with <code>dsh plugin --profile web remove dsh-session-s3</code>.</p>
+<p>Requires <strong>Node &gt;= 22</strong> (<code>PersistenceCoordinator</code> uses <code>Promise.withResolvers</code>; a polyfill is loaded at import so 18–21 do not crash, but DSH itself wants 22).</p>
+<p>Peer packages (<code>@deepseek-ai/dsh-session</code>, <code>dsh-session-persistence</code>) come from the DSH profile. A standalone <code>npm install</code> of this repo uses <code>.npmrc</code> <code>legacy-peer-deps=true</code> because <code>@deepseek-ai/dsh-type-meta</code> is unpublished on npmjs.</p>
+<h2>Config</h2>
+<table>
+<thead>
+<tr>
+<th>Key</th>
+<th>Default</th>
+<th>Notes</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>bucket</code></td>
+<td><em>(required)</em></td>
+<td>S3 bucket</td>
+</tr>
+<tr>
+<td><code>prefix</code></td>
+<td><code>dsh/</code></td>
+<td>Keys live at <code>{prefix}sessions/{sessionId}/</code></td>
+</tr>
+<tr>
+<td><code>region</code></td>
+<td>unset (SDK / <code>AWS_REGION</code>); <code>auto</code> if <code>endpoint</code> is set</td>
+<td>Set explicitly for AWS; <code>auto</code> for R2</td>
+</tr>
+<tr>
+<td><code>endpoint</code></td>
+<td>—</td>
+<td>R2 / Tigris / MinIO / SeaweedFS / GCS interop (must be <code>http(s)</code>)</td>
+</tr>
+<tr>
+<td><code>forcePathStyle</code></td>
+<td><code>true</code> when <code>endpoint</code> is set</td>
+<td>Path-style URLs</td>
+</tr>
+<tr>
+<td><code>accessKeyId</code> / <code>secretAccessKey</code></td>
+<td>unset</td>
+<td>Only for static keys. Prefer the SDK default chain (see below)</td>
+</tr>
+<tr>
+<td><code>flushThresholdEvents</code></td>
+<td><code>50</code></td>
+<td>Library <code>createProvider()</code> only: flush its in-memory buffer after N events</td>
+</tr>
+<tr>
+<td><code>flushThresholdBytes</code></td>
+<td><code>262144</code></td>
+<td>Library <code>createProvider()</code> only: flush after 256 KiB</td>
+</tr>
+<tr>
+<td><code>preparedSessionCacheSize</code></td>
+<td>coordinator default (5)</td>
+<td>DSH seam: LRU of unpublished preparations</td>
+</tr>
+<tr>
+<td><code>writeBatchMaxDelayMs</code></td>
+<td>coordinator default (200)</td>
+<td>DSH seam: coordinator write-behind delay</td>
+</tr>
+</tbody></table>
+<p>Invalid config <strong>fails loud at load</strong>, listing every problem (not just the first).</p>
+<p>The bundle patch replaces the profile <code>sessions</code> row and the default export is a Cordis <code>Service</code> registered as <strong><code>ctx.sessionPersistence</code></strong>, so Harness resume/list/the agent loop talk to S3 instead of JSONL.</p>
+<p>After install, set the bucket (and optional endpoint) in the <strong>profile overlay</strong> <code>$DSH_HOME/profiles/web/cordis.patch.yml</code>:</p>
+<pre><code>- id: sessions
+  name: dsh-session-s3
+  config:
+    bucket: my-sessions
+    region: us-west-2
+    prefix: dsh/
+    # endpoint: https://&lt;account&gt;.r2.cloudflarestorage.com   # R2 / MinIO / Tigris
+</code></pre>
+<p>Do <strong>not</strong> put access keys in the patch. See <a href="#aws-credentials">AWS credentials</a>.</p>
+<p>Library helper (no DSH, not the seam):</p>
+<pre><code>import { createProvider } from "dsh-session-s3";
+
+const persistence = createProvider({
+  bucket: "my-sessions",
+  region: "us-west-2",
+});
+
+await persistence.append("sess-1", { type: "user/message", text: "hi" });
+const events = await persistence.read("sess-1");
+await persistence.compact("sess-1", 10); // keep the last 10 fragments
+await persistence.close("sess-1");
+</code></pre>
+<h2>AWS credentials</h2>
+<p>Resolution order (<code>parseConfig</code> → <code>createS3Client</code>):</p>
+<ol>
+<li>Plugin config <code>accessKeyId</code> <strong>and</strong> <code>secretAccessKey</code> (both required if either is set) — static keys, no session token</li>
+<li>Else <strong>omit keys</strong> and use the AWS SDK default chain (<code>AWS_ACCESS_KEY_ID</code> + <code>AWS_SECRET_ACCESS_KEY</code> + <code>AWS_SESSION_TOKEN</code>, <code>~/.aws/credentials</code>, <code>AWS_PROFILE</code>, SSO, IAM instance/task role)</li>
+</ol>
+<p><strong>Prefer (2) on real AWS.</strong> <code>parseConfig</code> does not copy env keys into static credentials — that would drop <code>AWS_SESSION_TOKEN</code> and break SSO / assumed roles / GitHub OIDC. Leave <code>accessKeyId</code> / <code>secretAccessKey</code> unset in the Cordis patch.</p>
+<h3>Local / laptop</h3>
+<pre><code>aws configure
+# or
+aws sso login --profile myprofile
+export AWS_PROFILE=myprofile
+export AWS_REGION=us-west-2
+# then set bucket in the profile overlay, not via a DSH_S3_* env
+</code></pre>
+<h3>IAM user / access keys (CI, MinIO, R2)</h3>
+<pre><code>export AWS_ACCESS_KEY_ID=AKIA...
+export AWS_SECRET_ACCESS_KEY=...
+# bucket still comes from the profile overlay `config.bucket`
+</code></pre>
+<p>Only set <code>accessKeyId</code> / <code>secretAccessKey</code> in plugin config when you cannot use env or the chain. Do not commit them.</p>
+<h3>EC2 / ECS / Lambda</h3>
+<p>Attach an instance or task role. Do not set keys. The SDK picks up the role.</p>
+<h3>IAM policy (minimum)</h3>
+<pre><code>{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": [
+        "s3:GetObject",
+        "s3:PutObject",
+        "s3:DeleteObject"
+      ],
+      "Resource": "arn:aws:s3:::my-sessions/dsh/*"
+    },
+    {
+      "Effect": "Allow",
+      "Action": ["s3:ListBucket"],
+      "Resource": "arn:aws:s3:::my-sessions",
+      "Condition": {
+        "StringLike": { "s3:prefix": ["dsh/*"] }
+      }
+    }
+  ]
+}
+</code></pre>
+<p><code>If-Match</code> / <code>If-None-Match</code> are request headers, not extra IAM actions. <code>list()</code> / <code>listSnapshots()</code> call <code>ListObjectsV2</code> and need <code>s3:ListBucket</code>.</p>
+<p>On AWS, optionally <strong>require</strong> those headers so a client that forgets CAS cannot PUT:</p>
+<pre><code>{
+  "Sid": "DenyNonConditionalPuts",
+  "Effect": "Deny",
+  "Principal": "*",
+  "Action": "s3:PutObject",
+  "Resource": "arn:aws:s3:::my-sessions/dsh/*",
+  "Condition": {
+    "Null": {
+      "s3:if-match": "true",
+      "s3:if-none-match": "true"
+    }
+  }
+}
+</code></pre>
+<p>Add that statement to the bucket policy. It denies a PUT only when <em>both</em> headers are absent.</p>
+<h3>Latency (S3 Express One Zone)</h3>
+<p>Same plugin, same CAS. Directory buckets and Express One Zone cut PUT latency to single-digit ms in one AZ. Set <code>endpoint</code> / <code>region</code> to the directory bucket; keep S3 Standard if the session must survive an AZ. Request charges still dominate small objects — coordinator batching exists for that.</p>
+<h3>R2 / MinIO / Tigris</h3>
+<p>Same keys, plus <code>endpoint</code>. Path-style is on automatically when <code>endpoint</code> is set:</p>
+<pre><code>export AWS_ACCESS_KEY_ID=...
+export AWS_SECRET_ACCESS_KEY=...
+# set endpoint + bucket on the plugin config in the profile overlay
+</code></pre>
+<h3>Check CAS</h3>
+<pre><code>aws s3api put-object --bucket my-sessions --key dsh/_probe --body /dev/null \
+  --if-none-match '*'
+</code></pre>
+<p>A retry should 412. If it always 200s, the store is ignoring preconditions and this plugin is unsafe there.</p>
+<h2>Object layout</h2>
+<pre><code>s3://{bucket}/{prefix}sessions/{sessionId}/
+├── manifest.json                 # CAS coordination point
+└── fragments/00000001.jsonl      # immutable, SHA-256 in the manifest
+</code></pre>
+<p>Write path (<code>flush</code>):</p>
+<ol>
+<li>GET <code>manifest.json</code>. If the tail already has this batch's SHA-256, treat it as a lost CAS response.</li>
+<li>Buffer is serialized as a JSONL fragment (<code>seq = last + 1</code>). <code>PutObject</code> with <code>If-None-Match: *</code>. On 412, LIST occupied keys, take <code>seq = max(manifest+1, maxOccupied+1)</code>, retry.</li>
+<li>Conditional PUT <code>manifest.json</code> with the ETag from step 1 (<code>If-Match</code>, quoted). Reload only after a 412. Idempotent on seq and tail sha256.</li>
+<li>Drop only the snapshotted prefix of the buffer after CAS succeeds (events appended during the flush stay).</li>
+</ol>
+<p>Uncontended single-writer flush is three S3 requests. A crash between (2) and (3) leaves an <strong>orphan fragment</strong>. Harmless: the manifest is source of truth.</p>
+<p>The successful conditional PUT of <code>manifest.json</code> is the commit point. Fragment
+sequence numbers order storage objects; they are not DSH event <code>seq</code> values.
+CAS preserves every writer's bytes but does not allocate cross-process event
+sequences. See <a href="https://github.com/gengmao/dsh-session-s3/blob/HEAD/docs/design-rationale.md">Design rationale</a> for the precise
+guarantees and remaining races.</p>
+<h2>S3 compatibility</h2>
+<table>
+<thead>
+<tr>
+<th>Backend</th>
+<th>If-Match / If-None-Match</th>
+<th>Phase 1</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>AWS S3</td>
+<td>yes (quoted ETags)</td>
+<td>intended; live IT env-gated</td>
+</tr>
+<tr>
+<td>Cloudflare R2</td>
+<td>yes</td>
+<td>intended</td>
+</tr>
+<tr>
+<td>Tigris</td>
+<td>yes</td>
+<td>intended</td>
+</tr>
+<tr>
+<td>MinIO</td>
+<td>yes</td>
+<td>intended; <code>S3_IT=1</code> against local MinIO</td>
+</tr>
+<tr>
+<td>GCS (S3 interop)</td>
+<td>weak / eventual on some paths</td>
+<td>use with care</td>
+</tr>
+<tr>
+<td>SeaweedFS</td>
+<td>version-dependent</td>
+<td>use with care</td>
+</tr>
+</tbody></table>
+<p>CAS is the correctness mechanism. Do not point this at a store that silently ignores conditional puts.</p>
+<p>Env-gated integration test (and the CI <code>MinIO integration</code> job):</p>
+<pre><code>S3_IT=1 S3_BUCKET=test S3_ENDPOINT=http://127.0.0.1:9000 \
+  S3_REGION=us-east-1 \
+  AWS_ACCESS_KEY_ID=minioadmin AWS_SECRET_ACCESS_KEY=minioadmin \
+  npm test
+</code></pre>
+<h2>Caveats</h2>
+<ol>
+<li><strong>Same composition as JSONL.</strong> <code>S3SessionPersistence</code> extends <code>@deepseek-ai/dsh-session-persistence</code>'s <code>SessionPersistence</code> and implements <code>PersistenceBackend</code>, then constructs <code>PersistenceCoordinator(ctx, this)</code>. Cold <code>load</code> therefore emits synthetic interrupted-turn closers; <code>instanceof SessionPersistence</code> is true. Peer deps (<code>cordis</code>, <code>dsh-session</code>, <code>dsh-session-persistence</code>) are provided by the DSH profile at install time.</li>
+<li><strong>One live writer per session.</strong> DSH does not support two processes concurrently writing the same <code>SessionId</code>. Manifest CAS is a <strong>defensive</strong> check: <code>appendBatch</code> revalidates <code>SessionEvent.seq</code> inside the CAS mutate and throws <code>StaleWriterError</code> instead of committing both batches. The loser's fragment PUT is an unreachable orphan. No leases, heartbeats, or fencing.</li>
+<li><strong>No setsum</strong> (deliberate, Phase 2). Integrity is per-fragment SHA-256 only.</li>
+<li><strong>Response ambiguity is bounded, not exactly-once.</strong> A fragment PUT can leave an orphan. A lost manifest response is recognized by matching the tail SHA-256 (library helper and DSH backend). Library fragments carry a nonce header so identical consecutive batches do not collapse.</li>
+<li><strong>Library <code>createProvider()</code></strong> is a 5-method helper (<code>load</code>/<code>append</code>/<code>read</code>/<code>compact</code>/<code>close</code>) for non-DSH callers. It does <strong>not</strong> interpret <code>SessionEvent.seq</code>. Concurrent library flushes reallocate a stale fragment ordinal above the committed tail instead of appending out of order. DSH uses the default class export. <strong><code>read()</code> includes the in-memory buffer</strong> (not yet on S3). <code>compact</code> / <code>close</code> flush first. <code>trim</code> refuses a session that already has a DSH header.</li>
+<li><strong>Trim vs concurrent readers.</strong> <code>trim</code> CAS-updates the manifest, then deletes dropped objects. A reader holding an old manifest that GETs a deleted fragment sees <code>FragmentCorruptError</code>. Phase 1 assumes one writer and no trim-during-read.</li>
+<li><strong>Manifest rewrite is O(n) bytes per flush.</strong> Each commit rewrites the whole fragment list, so bytes transferred grow O(n²) over an untrimmed session. Fine for Phase 1; compact long-lived logs.</li>
+<li><strong>Trim guard needs a parseable DSH header.</strong> <code>trim</code> refuses a session whose manifest <code>header</code> survived schema parse. A <em>pre-watermark</em> DSH manifest whose header is malformed parses as <code>header: null</code>, so out-of-band compact would not refuse it and could still brick <code>appendBatch</code>. That intersection is not coded around.</li>
+</ol>
+<h2>Roadmap</h2>
+<ul>
+<li>Phase 2 — setsum / global log verification, verified GC</li>
+<li>Optional — binary fragments, DynamoDB Streams notifications</li>
+</ul>
+<h2>Develop</h2>
+<pre><code>npm install
+npm test
+npm run build
+</code></pre>
+<p>CI (<code>.github/workflows/ci.yml</code>) typechecks, runs the unit suite, then repeats the suite against MinIO with <code>S3_IT=1</code>.</p>
+<p><code>SPEC.md</code> is the Phase 1 contract.</p>

@@ -1,0 +1,141 @@
+<h1>@whatsmore-nf/dsh-plugin-pdf-edit</h1>
+<blockquote>
+<p><a href="https://github.com/Whatsmore-nf/dsh-pdf-edit/blob/HEAD/README.en.md">English</a> | 中文</p>
+</blockquote>
+<p>DeepSeek Harness 插件 —— AI 修改 PDF 文字，自动保持原版式不变。</p>
+<h2>这是什么</h2>
+<p>一个面向 PDF 文档的 AI 编辑插件。你用自然语言告诉它要改什么，它就会：</p>
+<ul>
+<li><strong>只改文字，不动排版</strong> —— 字体、字号、颜色、位置全部锁定，改完和原文看起来一模一样</li>
+<li><strong>自动处理溢出</strong> —— 新文字比原来长时，自动缩小字号或截断，不会撑破版面</li>
+<li><strong>支持中文</strong> —— 自动识别并嵌入系统中文字体（SimHei / 微软雅黑 / Noto Sans CJK）</li>
+</ul>
+<h2>适合什么场景</h2>
+<table>
+<thead>
+<tr>
+<th>场景</th>
+<th>举例</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong>术语统一</strong></td>
+<td>全文把「帐号」改成「账号」、「数据中台」改成「数据平台」</td>
+</tr>
+<tr>
+<td><strong>错别字修正</strong></td>
+<td>让 AI 扫一遍，自动修正拼写和语法错误</td>
+</tr>
+<tr>
+<td><strong>合同/报告批量修改</strong></td>
+<td>多页文档统一替换人名、金额、日期等</td>
+</tr>
+<tr>
+<td><strong>格式转换</strong></td>
+<td>把散乱的 PDF 重新排版成学术论文双栏、手机阅读单栏、商务简报等版式</td>
+</tr>
+</tbody></table>
+<h2>安装</h2>
+<pre><code># 通过 Harness 插件 CLI（与官方插件一致）
+dsh plugin --profile web add @whatsmore-nf/dsh-plugin-pdf-edit@latest
+
+# 或直接通过 npm
+npm install @whatsmore-nf/dsh-plugin-pdf-edit
+</code></pre>
+<h2>更新记录</h2>
+<h3>v0.1.1</h3>
+<ul>
+<li>修复 <code>cordis.patch.yml</code> 中插件名与 <code>package.json</code> 不一致导致加载失败的问题</li>
+</ul>
+<h3>v0.1.0</h3>
+<ul>
+<li>初始发布</li>
+<li>样式锁定编辑：AI 修改文字，自动保持原排版</li>
+<li>native 渲染模式：pdf-lib 直绘，零浏览器依赖</li>
+<li>CJK 字体自动探测与嵌入</li>
+<li>溢出处理：shrink / clip / wrap / reject</li>
+<li>术语表全局替换</li>
+<li>三种重排版模板：academic / mobile / briefing</li>
+</ul>
+<h2>工作原理</h2>
+<p>整个编辑流程由 <code>StyleLockedEditor</code>（<code>src/pipeline.ts</code>）统一调度，分为四个阶段：<strong>提取 → AI 修改 → 溢出控制 → 叠加绘制</strong>。下面结合源码逐步说明。</p>
+<h3>1. 提取：pdfjs + 样式锁定（<code>src/extractor.ts</code>）</h3>
+<ul>
+<li>用 <code>pdfjs-dist</code>（<code>src/pdfjs-lazy.ts</code> 延迟加载）打开 PDF，逐页调用 <code>getTextContent()</code> 读取每个文本项（<code>str</code>、<code>transform</code>、<code>width</code>、<code>fontName</code>、<code>height</code>）。</li>
+<li>通过 <code>page.getViewport({ scale: 1 })</code> 把页面坐标系转换为 PDF 点（pt）坐标。</li>
+<li>对每个 <code>str</code> 构造 <code>RawRun</code>：记录 <code>text</code>、<code>x</code>、<code>baselineTop</code>、<code>width</code>、<code>fontSize</code>（由 <code>transform</code> 矩阵计算）、颜色（从 <code>OPS.setFillRGBColor</code> / <code>OPS.setFillGray</code> / <code>OPS.setFillCMYKColor</code> 运算符列表恢复，<code>recoverColors</code>），以及样式签名 <code>sig</code>（<code>fontFamily</code>、<code>fontSizePt</code>、<code>color</code>、<code>bold</code>、<code>italic</code>）。</li>
+<li><code>mergeRuns()</code> 把同一行、同一样式、间距小于 <code>fontSize * maxGapFactor</code> 的 <code>RawRun</code> 合并为一个 <code>Unit</code>（文本单元），每个 <code>Unit</code> 获得唯一 <code>tid</code>（如 <code>p3-0</code>），并计算 <code>top</code>（<code>baselineTop - ascent * fontSize</code>）。</li>
+<li><code>freezeStyles()</code> 把所有 <code>Unit</code> 按样式签名分组，生成 CSS 类名（如 <code>.s1</code>）和 <code>css</code> 字符串，供后续浏览器渲染或原生绘制使用。</li>
+</ul>
+<p>输出 <code>PageExtract</code> 包含：<code>pageNumber</code>、<code>widthPt</code>、<code>heightPt</code>、<code>units[]</code>、<code>css</code>、<code>html</code>（由 <code>buildPageHtml</code> 构造的绝对定位 HTML）。</p>
+<h3>2. AI 修改：分块调用 DeepSeek（<code>src/ai-editor.ts</code>、<code>src/prompts.ts</code>）</h3>
+<ul>
+<li><code>AiTextEditor</code> 接收提取的 <code>EditableUnit[]</code>（只保留 <code>tid</code> 和 <code>text</code>），按字符数分块（<code>packChunks</code>，默认每块不超过 18,000 字符）。</li>
+<li>每块构造提示：系统提示（<code>TEXT_EDIT_SYSTEM_PROMPT</code>）要求只输出 <code>{"items":[{"tid":"...","text":"..."}]}</code>，条目数与输入完全一致，不能新增/删除 <code>tid</code>，未改条目原样返回。</li>
+<li>调用 <code>createDeepSeekChatFn</code>（<code>src/index.ts</code>）：向 <code>https://api.deepseek.com/chat/completions</code> 发送 POST，设置 <code>temperature=0.1</code>、<code>response_format: {type: "json_object"}</code>。</li>
+<li>AI 返回的原始字符串经 <code>parsePatchObject()</code> 解析：先去除代码围栏（代码围栏 <code>```</code>），再提取 JSON 对象，修复常见的尾部逗号错误。如果解析失败或缺少 <code>items</code> 数组则抛出错误。</li>
+<li>每块并行处理（<code>Promise.all</code>），结果合并到 <code>merged</code> Map。完成后执行 <code>reconcilePatches()</code>（<code>src/validator.ts</code>）：<ul>
+<li>严格模式（<code>strictTids=true</code>）下，若 AI 返回未知 <code>tid</code> 或缺失 <code>tid</code> 直接抛错；</li>
+<li>非严格模式下，未知 <code>tid</code> 被丢弃，缺失 <code>tid</code> 用原文补回（<code>missingTidsUseOriginal</code> 默认 <code>true</code>）。</li>
+</ul>
+</li>
+<li>最后应用术语表（<code>Glossary</code>，由 <code>normalizeGlossary</code> 处理为 <code>from→to</code> 数组），对每条修改后的文本执行 <code>applyGlossary()</code>（字符串替换）。</li>
+</ul>
+<h3>3. 溢出控制与文本校验（<code>src/validator.ts</code>、<code>src/util.ts</code>）</h3>
+<p>在将 AI 修改应用到 <code>Unit</code> 前，执行以下安全校验：</p>
+<ol>
+<li><code>sanitizeText()</code>：<ul>
+<li>移除 HTML 标签（<code>...&gt;</code>）；</li>
+<li>移除控制字符（<code>\u0000</code>-<code>\u0008</code>、<code>\u000b</code>、<code>\u000c</code>、<code>\u000e</code>-<code>\u001f</code>）；</li>
+<li>拒绝空文本；</li>
+<li>拒绝长度膨胀超过原长 3 倍 + 16 字符（防止 AI 跑飞）。</li>
+</ul>
+</li>
+<li><code>overflowAction()</code>（根据配置 <code>OverflowPolicy</code>）：<ul>
+<li><code>clip</code>：若新文本宽度超过 <code>unit.width * 1.06 + 2</code>，设置 <code>unit.clip = true</code>（绘制时截断）；</li>
+<li><code>wrap</code>：设置 <code>unit.wrap = true</code>（绘制时换行）；</li>
+<li><code>reject</code>：若溢出直接拒绝，记录到 <code>rejected</code> 列表，不修改该条；</li>
+<li><code>shrink</code>（默认）：计算缩放比例 <code>unit.fontSize * (unit.width / estWidth)</code>，若缩放后字号 ≥ <code>minFontSizePt</code>（默认 6pt）则设置 <code>fontSizeOverride</code>；否则设置为最小字号并同时启用 <code>clip</code>。</li>
+</ul>
+</li>
+<li><code>measure()</code>（<code>fonts-resolver.ts</code>）：通过 <code>font.widthOfTextAtSize()</code>（pdf-lib + fontkit）计算新文本在当前字号下的实际宽度（pt）；若字体未嵌入则回退到 <code>text.length * size * 0.6</code> 估算。</li>
+</ol>
+<h3>4. 叠加绘制：两种渲染模式（<code>src/native-renderer.ts</code>、<code>src/browser-renderer.ts</code>）</h3>
+<p>插件支持两种渲染模式，由 <code>renderMode</code>（默认 <code>"native"</code>）控制：</p>
+<p><strong>Native（原生 pdf-lib 直绘，零浏览器依赖）：</strong></p>
+<ul>
+<li><code>NativePageRenderer.renderPatches()</code> 对每个被修改的 <code>Unit</code> 执行：<ol>
+<li>用 <code>FontResolver.resolveA()</code> 解析字体（标准字体映射到 Helvetica/Times/Courier，中文自动探测系统字体如 <code>simhei.ttf</code> / <code>msyh.ttc</code> / <code>NotoSansCJK-Regular.ttc</code>，或从配置 <code>fonts.cjk</code> 加载）；</li>
+<li>测量新文本宽度，计算遮盖矩形（白色 <code>patchColor</code>，默认 <code>#ffffff</code>），在原位置画白色矩形遮住旧文字；</li>
+<li>画新文字：若 <code>wrap</code> 启用则分行绘制（<code>wrapByMeasure</code>），若 <code>clip</code> 启用则截断（<code>ellipsizeByMeasure</code>）；若 <code>fontSizeOverride</code> 有值则使用缩小后的字号；</li>
+<li>对粗体字体启用 <code>fakeBold</code> 时，在原位置偏移 <code>0.02 * size</code> 再画一次（模拟加粗）。</li>
+</ol>
+</li>
+<li>绘制在加载的原始 <code>PDFDocument</code>（<code>PDFDocument.load</code>）上，通过 <code>doc.getPage()</code> 获取页面对象，修改后 <code>doc.save()</code> 输出新 PDF 字节流。</li>
+<li><code>pdf-ops.ts</code> 提供 <code>replacePages()</code>：当仅部分页修改时，把修改页的 <code>Uint8Array</code> 与未修改页的原页合并到新文档，保留原文档元数据（标题、作者、创建日期等）。</li>
+</ul>
+<p><strong>Browser（浏览器渲染，通过 Puppeteer）：</strong></p>
+<ul>
+<li><code>BrowserRenderer</code> 启动无头 Chrome（<code>puppeteer-core</code>，需配置 <code>browserExecutablePath</code>），并发限制由 <code>browserConcurrency</code> 控制（默认 2）。</li>
+<li>对修改页构造 HTML：<code>buildPageHtml()</code> 生成绝对定位的 <code>.txt</code> span（样式从 <code>freezeStyles</code> 提取），若有背景图则插入 <code>.bg</code> 图片。被修改的单元在原位置上方叠加 <code>.mask</code>（白色矩形）遮盖旧字，再在同位置放新 <code>.txt</code>。</li>
+<li><code>renderPage()</code> 用 <code>page.setContent()</code> 加载 HTML，等待字体就绪（<code>document.fonts.ready</code>），然后 <code>page.pdf()</code> 打印为 PDF（<code>margin: 0</code>、<code>printBackground: true</code>），返回 <code>Uint8Array</code>。</li>
+<li><code>relayout</code>（重排版）模式下：先提取全文构建 <code>FlowBlock</code>（按字号中位数分类：<code>heading</code>、<code>subheading</code>、<code>body</code>、<code>caption</code>），再用 <code>buildFlowBlocks()</code> 生成流式 HTML，填充到 <code>templates.ts</code> 定义的三种模板（<code>academic</code> 双栏、<code>mobile</code> 手机单栏、<code>briefing</code> 商务简报），同样通过浏览器打印为 PDF，并通过 <code>replaceEntireDocument()</code> 替换原文档内容（保留元数据）。</li>
+</ul>
+<h3>5. 整体流程控制（<code>src/pipeline.ts</code>、<code>src/index.ts</code>）</h3>
+<ul>
+<li><code>StyleLockedEditor.open()</code> 初始化：加载 PDF、创建 <code>StyleLockedExtractor</code>、创建 <code>AiTextEditor</code>、设置默认配置（<code>batchSize=10</code>、<code>overflow={mode:"shrink",minFontSizePt:6}</code>、<code>patchColor="#ffffff"</code>、<code>renderMode="native"</code>）。</li>
+<li><code>editPage()</code>：提取单页 → AI 修改 → 应用溢出控制 → 原生/浏览器渲染 → 返回新 PDF 字节。</li>
+<li><code>editDocument()</code>：批量逐页处理：先预取第一批（并发 <code>extractConcurrency</code>，默认 4），每批调用 AI（分块并行），每页应用溢出控制后收集修改页；原生模式下把所有修改页的工作推迟到最后统一绘制（<code>drawPatchedPages</code>），浏览器模式下每页独立渲染后合并（<code>replacePages</code>）。过程中通过 <code>onProgress</code> 回调报告阶段（<code>extract</code> → <code>ai</code> → <code>render</code> → <code>skip</code> → <code>merge</code> / <code>error</code>）。</li>
+<li><code>previewPage()</code>：仅提取并返回可编辑单元列表，不执行修改，用于预览。</li>
+<li><code>relayout()</code>：提取全部页 → 构建流式块 → 按模板渲染新文档 → 替换原文档内容。</li>
+</ul>
+<h3>6. 字体与中文支持（<code>src/fonts-resolver.ts</code>）</h3>
+<ul>
+<li>标准字体：<code>helvetica</code>（无衬线）、<code>times</code>（衬线）、<code>courier</code>（等宽），按 <code>bold</code> / <code>italic</code> 组合映射到 pdf-lib 的 <code>StandardFonts</code>（如 <code>HelveticaBold</code>、<code>TimesRomanItalic</code>）。</li>
+<li>中文（CJK）：检测文本中是否含 <code>\u2E80-\u9FFF</code> 等字符。若含 CJK 且无嵌入字体，则自动从系统路径探测（Windows <code>simhei.ttf</code> / <code>msyh.ttc</code>、macOS <code>Songti.ttc</code> / <code>PingFang.ttc</code>、Linux <code>wqy-microhei.ttc</code> / <code>NotoSansCJK-Regular.ttc</code>），通过 <code>fontkit</code> 嵌入到 PDF。若自动探测失败且未配置 <code>fonts.cjk</code>，则抛出错误。</li>
+<li>自定义字体：支持 <code>fonts.customs</code>（按字体族名匹配）和 <code>fonts.cjk</code>（专门用于中文）。</li>
+<li>字体缓存：<code>FontResolver</code> 对每个解析后的字体对象 (<code>PDFFont</code>) 做缓存（<code>fontCache</code>），避免重复嵌入。</li>
+</ul>
+<p>整个过程纯 JavaScript 完成：提取和原生绘制依赖 <code>pdf-lib</code> + <code>pdfjs-dist</code>，浏览器模式额外依赖 <code>puppeteer-core</code>（系统 Chrome/Edge 可执行文件）。不需要打开真实浏览器窗口，原生模式完全无浏览器依赖。</p>
+<h2>许可证</h2>
+<p><a href="https://github.com/Whatsmore-nf/dsh-pdf-edit/blob/HEAD/LICENSE">MIT</a></p>

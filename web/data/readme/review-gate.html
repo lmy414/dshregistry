@@ -1,0 +1,374 @@
+<h1>review-gate</h1>
+<p><a href="https://www.npmjs.com/package/review-gate"><img src="https://img.shields.io/npm/v/review-gate" alt="npm version"></a>
+<a href="https://github.com/JohnXu22786/review-gate/blob/HEAD/LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License: MIT"></a>
+<a href="https://github.com/JohnXu22786/review-gate/blob/HEAD/README.zh.md">中文说明</a></p>
+<p>A <strong>DeepSeek Harness (dsh) bundle</strong> that turns code review into a hard gate.
+Unlike read-only review/diff viewers, review-gate closes the loop: it produces
+graded findings, blocks or passes merges deterministically, requires a team
+approval quorum, and keeps a durable compliance audit trail — all wired to
+<code>ctx.tools</code> and a standalone CLI for CI/hooks.</p>
+<p>The gap it fills: in the ecosystem, review plugins observe a diff and add
+annotations, but none of them <strong>gate</strong> the merge. review-gate makes review a
+checkpoint that must pass before a PR/merge proceeds.</p>
+<pre><code>  git diff ──► run ──► findings
+                        │  deterministic rules (severe/warning/suggestion)
+                        ▼
+                     gate ──► blocked / passed
+                        │
+                        ▼
+                 team approval quorum ──► approved ⇢ merge unlocked
+                        │
+                        ▼
+                 audit trail (time / person / conclusion / rules version)
+</code></pre>
+<hr>
+<h2>Features</h2>
+<ol>
+<li><strong>Review sessions</strong> — review the working tree, staged changes, a single
+commit, or any <code>base..head</code> range. Findings are graded
+<code>severe</code> / <code>warning</code> / <code>suggestion</code>, produced per file/hunk by:<ul>
+<li><strong>deterministic static rules</strong> (regex over added lines, never a model), and</li>
+<li><strong>LLM-assisted findings</strong> (optional). The model only ever <em>adds findings</em>;
+it can never bypass a threshold.</li>
+</ul>
+</li>
+<li><strong>Gate rules</strong> — configurable thresholds (<code>severe = 0</code>, <code>warning ≤ N</code>,
+suggestions unlimited, manual-confirmation checklist). The pass/fail
+decision is computed by <strong>deterministic rules</strong> from the persisted round
+(findings + acknowledgements + votes) — fully reproducible, never a model
+judgment. If the auto-gate fails, no approval can unlock the merge.</li>
+<li><strong>Team approval flow</strong> — <code>approve</code> / <code>request_changes</code> / <code>reject</code> with a
+configurable quorum (N distinct approvals). Last-writer-wins per reviewer;
+a re-review (new round) invalidates stale approvals <strong>and</strong> stale
+acknowledgements.</li>
+<li><strong>Compliance trail</strong> — every run, vote, acknowledgement and export is
+appended to an immutable audit log (time, actor, conclusion, rules
+version), and can be exported as a JSON or Markdown report.</li>
+<li><strong>CI collaboration</strong> — every tool and CLI command emits machine-readable
+JSON and correct exit codes (<code>gate-check</code> exits non-zero until passable),
+ready for a GitHub Action / hook / branch protection.</li>
+<li><strong>Lessons library</strong> — optional: failed findings can be turned into reusable
+static rules by adding them to the rule set (see <em>Config</em>).</li>
+<li><strong>Toolchain</strong> — dsh tools <code>review_run</code>, <code>review_status</code>, <code>review_approve</code>,
+<code>review_request_changes</code>, <code>review_reject</code>, <code>review_acknowledge</code>,
+<code>gate_check</code>, <code>review_export</code>, plus a standalone <code>review-gate</code> CLI.</li>
+</ol>
+<hr>
+<h2>How it works (short)</h2>
+<ul>
+<li><p>A <strong>session</strong> is keyed by (stable repository identity, diff scope), so a
+committed trail keeps the same identity on any checkout or CI machine. A
+deterministic <strong>fingerprint</strong> of the diff + rules + policy identifies the
+reviewed content; running on unchanged content reuses the round (idempotent)
+and never duplicates audit entries.</p>
+</li>
+<li><p>Findings have <strong>stable ids</strong> derived from their content, so acknowledgements
+and manual-confirmation lists survive identical re-runs. A <em>new</em> round
+(content or policy changed) requires fresh acknowledgements.</p>
+</li>
+<li><p>The <strong>gate</strong> combines the auto-rules and the approval state into one status:</p>
+<table>
+<thead>
+<tr>
+<th>status</th>
+<th>meaning</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>open</code></td>
+<td>created, not yet reviewed (no round)</td>
+</tr>
+<tr>
+<td><code>blocked</code></td>
+<td>auto-gate failed, or a <code>request_changes</code>/<code>reject</code> is active</td>
+</tr>
+<tr>
+<td><code>passed</code></td>
+<td>auto-gate passed, approvals pending</td>
+</tr>
+<tr>
+<td><code>approved</code></td>
+<td>auto-gate passed <strong>and</strong> quorum met, no blockers — merge unlocked</td>
+</tr>
+</tbody></table>
+</li>
+<li><p><strong>Persistence</strong> is a JSON file store with per-session atomic
+read-modify-write (in-process mutex + temp-write/fsync/rename), a
+cross-process lock file, and an append-only <code>audit.jsonl</code>.</p>
+</li>
+</ul>
+<hr>
+<h2>Project layout</h2>
+<pre><code>review-gate/
+├── package.json            # dsh.bundle.patch → cordis.patch.yml
+├── cordis.patch.yml        # mounts the plugin row
+├── tsconfig[.test].json
+├── src/
+│   ├── types.ts            # core domain types
+│   ├── config.ts           # configuration, defaults, validation, rules
+│   ├── git/diff.ts         # unified-diff parser (pure)
+│   ├── git/runner.ts       # `git` interactions (injectable executor)
+│   ├── analyzers/static.ts # deterministic regex analyzer
+│   ├── analyzers/llm.ts    # optional LLM reviewer (lazy ctx.llm)
+│   ├── gate/engine.ts      # deterministic auto-gate
+│   ├── approval/flow.ts    # votes, quorum, last-writer-wins
+│   ├── service/evaluate.ts # combined gate+approval verdict
+│   ├── service/reviewGate.ts # the facade / public API
+│   ├── store/              # durable + in-memory stores, file lock
+│   ├── audit/report.ts     # compliance report rendering
+│   ├── dsh/                # dsh adapter (tools, llm gateway, entry)
+│   ├── cli.ts              # standalone CLI
+│   └── index.ts            # programmatic API exports
+├── test/                   # node:test suites (61 tests)
+├── examples/
+│   ├── review-gate.config.json   # full annotated config
+│   └── github-action.yml         # CI gate workflow
+├── README.md / README.zh.md
+└── LICENSE
+</code></pre>
+<hr>
+<h2>Getting started</h2>
+<blockquote>
+<p>Node.js ≥ 18 is enough for the standalone CLI and programmatic API. When
+running as a dsh bundle, the harness itself requires <code>^22.19.0 || &gt;=24.0.0</code>
+(check the harness install docs). <code>git</code> must be on <code>PATH</code> and the target
+directory must be a git working tree.</p>
+</blockquote>
+<h3>Install</h3>
+<pre><code>npm install -g review-gate   # standalone CLI for any git repo
+</code></pre>
+<p>or install it as a dsh bundle (see below).</p>
+<h3>Run the CLI</h3>
+<pre><code># from a git repo
+review-gate run --json                 # review working tree vs HEAD
+review-gate status --json
+review-gate gate-check --mode merge    # exit 0 only when mergeable
+</code></pre>
+<p>Build &amp; test locally:</p>
+<pre><code>npm install
+npm run build          # → dist/
+npm test               # → builds dist-test/ and runs node --test
+node dist/cli.js run   # or: npm run cli -- run
+</code></pre>
+<h3>Install as a dsh bundle</h3>
+<p><code>review-gate</code> follows the dsh bundle spec:</p>
+<pre><code>// package.json
+"dsh": { "bundle": { "patch": "./cordis.patch.yml" } }
+</code></pre>
+<p><code>cordis.patch.yml</code> inserts a <code>review-gate</code> row into the profile layer; override
+its <code>config</code> per deployment (a patch replaces the whole row config; restate
+every key). Install like any bundle:</p>
+<pre><code>dsh plugin --profile &lt;name&gt; add ./review-gate
+dsh --profile &lt;name&gt; --patch ./review-gate/cordis.patch.yml
+</code></pre>
+<p>The plugin exports <code>name</code> / <code>inject</code> / <code>apply(ctx, config)</code> and registers the
+tools on <code>ctx.tools</code> (see <em>dsh tools</em> below). LLM-assisted review is enabled
+through <code>config.llm.enabled</code> and resolves <code>ctx.llm</code> lazily at call time, so a
+later-mounted model layer is picked up automatically; when no model layer is
+available the plugin records a <code>llm.warn</code> audit event and continues — findings
+from the static rules still rule the gate.</p>
+<h3>Configure</h3>
+<p>Place <code>&lt;repo&gt;/.review-gate.config.json</code> (used by the CLI) and/or the same
+object in the plugin row's <code>config</code>:</p>
+<pre><code>{
+  "cwd": "/absolute/path/to/repo",
+  "store": { "root": ".review-gate", "repoId": "github.com/acme/repo" },
+  "gate": {
+    "severe": 0,
+    "warning": 0,
+    "suggestion": -1,
+    "requiredAcknowledge": []
+  },
+  "approvals": { "required": 2 },
+  "llm": { "enabled": false },
+  "onEmptyDiff": "pass",
+  "maxFindings": 500,
+  "rules": { /* custom static rules, merged over built-ins */ }
+}
+</code></pre>
+<p>Run <code>review-gate init</code> to write an example file. See <code>examples/review-gate.config.json</code>.</p>
+<p><code>store.repoId</code> pins the stable identity used to key sessions so a committed
+trail is readable from every checkout and CI. When unset it is derived from
+<code>remote.origin.url</code>, then the git toplevel, then the working directory — see
+<em>CI collaboration</em>.</p>
+<p><strong>LLM-assisted review</strong> is off by default. To enable it set <code>llm.enabled</code> and,
+where your deployment does not route a default provider/model, <code>llm.provider</code>
+and <code>llm.model</code>. LLM findings are counted by the same deterministic
+thresholds; if the model is unavailable the run still completes.</p>
+<p><strong>Gate thresholds</strong> (<code>-1</code> = unlimited):</p>
+<table>
+<thead>
+<tr>
+<th>field</th>
+<th>default</th>
+<th>meaning</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>gate.severe</code></td>
+<td><code>0</code></td>
+<td>max unacknowledged severe findings allowed</td>
+</tr>
+<tr>
+<td><code>gate.warning</code></td>
+<td><code>0</code></td>
+<td>max unacknowledged warnings allowed</td>
+</tr>
+<tr>
+<td><code>gate.suggestion</code></td>
+<td><code>-1</code></td>
+<td>suggestions never block by default</td>
+</tr>
+<tr>
+<td><code>gate.requiredAcknowledge</code></td>
+<td><code>[]</code></td>
+<td>finding ids that must be explicitly acknowledged; the token <code>"severe"</code> means <em>every</em> severe finding must be acknowledged</td>
+</tr>
+</tbody></table>
+<p><strong>Acknowledging findings</strong> moves them out of the failure set and is always
+audited: <code>review-gate acknowledge &lt;id&gt; --reason "charted in CR-77"</code>.</p>
+<p><strong>Built-in rules</strong> (<code>src/config.ts::defaultRules</code>): <code>todo</code>, <code>debugger</code>,
+<code>console-log</code>, <code>hardcoded-secret</code>, <code>long-line</code>, <code>merge-markers</code>. Each has a
+<code>pattern</code>, <code>severity</code>, <code>message</code>, optional <code>files</code> path regex and <code>suggestion</code>.
+Add or override entries under <code>rules</code> to encode lessons from past failures —
+hundreds of matches are capped by <code>maxFindings</code>.</p>
+<p><strong>Empty diff</strong> — "empty" means git reported no changes at all. A binary-only,
+pure-rename or mode-only change is a real diff: it produces no line-level
+findings but still requires the approval quorum. <code>onEmptyDiff: "pass"</code>
+(default) lets a genuinely empty diff through; <code>"fail"</code> requires an explicit
+review: it inserts a <code>severe</code> finding that must be acknowledged, which is how
+a "nothing changed but this still needs sign-off" policy is expressed.</p>
+<hr>
+<h2>dsh tools</h2>
+<table>
+<thead>
+<tr>
+<th>tool</th>
+<th>purpose</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>review_run</code></td>
+<td>run the review of the current diff / commit / range</td>
+</tr>
+<tr>
+<td><code>review_status</code></td>
+<td>current findings, status, approval progress</td>
+</tr>
+<tr>
+<td><code>review_approve</code></td>
+<td>+1 toward the quorum (blocks if auto-gate fails)</td>
+</tr>
+<tr>
+<td><code>review_request_changes</code></td>
+<td>block until re-reviewed</td>
+</tr>
+<tr>
+<td><code>review_reject</code></td>
+<td>block until re-reviewed</td>
+</tr>
+<tr>
+<td><code>review_acknowledge</code></td>
+<td>acknowledge a finding with a reason (audited)</td>
+</tr>
+<tr>
+<td><code>gate_check</code></td>
+<td>deterministic verdict, machine-readable JSON, modes <code>gate</code>/<code>merge</code></td>
+</tr>
+<tr>
+<td><code>review_export</code></td>
+<td>compliance report as JSON / Markdown</td>
+</tr>
+</tbody></table>
+<p>Every tool returns a JSON value (CI-consumable) and renders a readable summary
+for the model. You can also call the same logic programmatically:</p>
+<pre><code>import { ReviewGate, JsonFileStore, GitRunner, resolveConfig } from 'review-gate/core'
+
+const config = resolveConfig({ cwd: '/path/to/repo' })
+const gate = new ReviewGate({
+  config,
+  store: new JsonFileStore({ root: config.store.root }),
+  git: new GitRunner({ cwd: config.cwd }),
+})
+const { verdict } = await gate.run({ scope: { kind: 'range', base: 'main', head: 'feature' } })
+const check = await gate.gateCheck({ mode: 'merge' })
+</code></pre>
+<hr>
+<h2>CLI reference</h2>
+<pre><code>review-gate &lt;command&gt; [scope] [options]
+
+  run | status | approve | reject | request-changes | acknowledge
+  gate-check | export | audit | init | version
+
+Scope: working | staged | commit:&lt;ref&gt; | range:&lt;base&gt;..&lt;head&gt;   (default working)
+
+  --dir &lt;path&gt;      repository to review            --config &lt;file&gt;
+  --force           new round even if unchanged     --mode gate|merge
+  --reviewer &lt;r&gt;    --comment &lt;text&gt;                --reason &lt;text&gt;
+  --format json|markdown (export)                   --out &lt;file&gt;
+  --actor &lt;label&gt;   --json
+</code></pre>
+<p><code>gate-check</code> is the CI hook: it prints JSON and exits <code>0</code> on <code>--mode gate</code>
+(when status is <code>passed</code>/<code>approved</code>) or <code>0</code> on <code>--mode merge</code> (only when
+<code>approved</code>). All other commands exit <code>0</code> on success, <code>1</code> on a refused
+operation, <code>2</code> on usage/config errors.</p>
+<hr>
+<h2>CI collaboration</h2>
+<p>The gate's state + audit trail live in <code>&lt;repo&gt;/.review-gate/</code>. Because sessions
+are keyed on a <strong>stable repo identity</strong> (<code>store.repoId</code>, or derived from the
+remote URL), a trail recorded in one checkout is readable from any other
+checkout of the same repository — including CI.</p>
+<p>Two deployment models:</p>
+<ul>
+<li><strong>Committed trail (recommended for merge blocking)</strong> — reviewers create and
+update the review state and approvals in their checkout, then <strong>commit
+<code>.review-gate/</code></strong> to the repository. CI simply checks it out and verifies:
+<code>review-gate gate-check --mode merge</code> exits <code>0</code> only when the automatic
+thresholds <em>and</em> the approval quorum are satisfied. <code>examples/github-action.yml</code>
+shows a branch-protection job with this shape.</li>
+<li><strong>Pipeline-owned</strong> — the harness / CLI is the reviewer and records state
+directly in the environment the merge gate reads.</li>
+</ul>
+<p>Important: use <strong>one consistent scope</strong> for a given gate everywhere — the same
+diff scope reviewers approve on must be the one CI checks (<code>working</code> by
+default). <code>gate-check</code> itself never mutates state, so it is safe to run
+repeatedly from hooks.</p>
+<hr>
+<h2>Design notes / tradeoffs</h2>
+<ul>
+<li><strong>Deterministic gate</strong>: the pass/fail decision is a pure function of the
+round's persisted findings + acknowledgements + votes. Model output can only
+contribute findings — never bypass a threshold — and once a round is
+persisted any re-read yields the identical verdict.</li>
+<li><strong>Idempotent</strong>: re-running <code>review_run</code> on unchanged content reuses the
+round; an identical vote/acknowledgement is a no-op; <code>gate_check</code> never
+mutates.</li>
+<li><strong>Concurrency</strong>: sessions are serialized per key (in-process mutex +
+cross-process lock file with stale-breaking and owner tokens); writes are
+temp+fsync+rename so a crash never corrupts a document; the audit trail is
+append-only.</li>
+<li><strong>Scope boundaries</strong>: combined (<code>--cc</code>) merge diffs are intentionally not
+line-reviewed (recorded as a placeholder). Empty diffs are governed by
+<code>onEmptyDiff</code>. Findings are capped by <code>maxFindings</code>.</li>
+<li><strong>Lessons library</strong> is intentionally config-driven (add a rule) rather than
+an auto-mutating subsystem — deterministic and auditable.</li>
+</ul>
+<h2>Security</h2>
+<ul>
+<li>The gate reads the repository read-only (<code>git diff</code> / <code>git show</code>); it never
+modifies working trees.</li>
+<li>Secrets in findings: the <code>hardcoded-secret</code> rule echoes matched lines into
+findings/reports — restrict who may read the trail, and consider tighter
+rules in high-security repos.</li>
+<li>This is a review/compliance helper, not an authorization boundary. Anyone
+who can write to the store can edit approvals; protect <code>.review-gate/</code>
+accordingly.</li>
+</ul>
+<h2>Testing</h2>
+<p><code>npm test</code> runs the <code>node:test</code> suites: <code>git/diff</code> parsers, static analyzer,
+gate engine, approval flow, JSON store (concurrency + durability + locks),
+review runner E2E (incl. empty-diff + LLM fallback + round scoping + stable
+identity), idempotency, reports, config validation, dsh tool registry, and a
+full CLI round-trip against a real thrown-together git repository.</p>
+<h2>License</h2>
+<p>MIT — see <a href="https://github.com/JohnXu22786/review-gate/blob/HEAD/LICENSE">LICENSE</a>.</p>

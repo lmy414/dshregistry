@@ -1,0 +1,210 @@
+<h1>dsh-auto-guard</h1>
+<blockquote>
+<p>DSH 插件：类似 Claude Code 中 Auto Mode 的一种命令通过机制，给 full access 加一层 LLM 安全网的自动审批 / 命令守卫。目的：1. 降低full-access模式的风险。2. 降低full-access模式使用者的焦虑感。</p>
+</blockquote>
+<p><code>Auto Guard</code> 权限预设 = <code>danger-full-access</code> + <code>rules</code> + <code>LLM</code> + <code>ask</code>，由规则、缓存与一次性 LLM 裁决器代替人工完成大多数审批。</p>
+<h2>设计定位</h2>
+<ul>
+<li><strong>基于 full access 兜底</strong>：插件不限制文件系统能力，而是在 <code>danger-full-access</code> 之上做安全裁决，尽量不打断正常开发。</li>
+<li><strong>适配绝大多数开发情况</strong>：日常只读命令、构建、测试等通过白名单 / 缓存直接放行。</li>
+<li><strong>危险命令交给 LLM 裁决</strong>：大部分危险命令和可能泄露信息的命令都会经过 LLM 审查；目录删除、状态改变组合、管道等高风险场景有专门处理。</li>
+<li><strong>不承诺绝对安全</strong>：插件不是沙箱，也不排除极少数隐秘危险命令可能通过审查；请把它当作“安全网”而不是“安全边界”。</li>
+<li><strong>API 密钥不落仓库</strong>：本项目不存储任何 API Key / Token；LLM 调用由 DSH 运行环境注入，敏感文件内容不会发送给 LLM。</li>
+</ul>
+<h2>功能特性</h2>
+<ul>
+<li><strong>分层裁决</strong>：File Tracker → 绝对黑名单 → 目录删除复核 → 复合命令处理 → 静态白名单 → 缓存 → LLM 兜底。</li>
+<li><strong>静态白名单</strong>：默认白名单 + 用户确认放行规则，命中直接放行。</li>
+<li><strong>绝对黑名单</strong>：危险命令直接拒绝，同时注册为 <code>ctx.tools.guard()</code> 单调否决，LLM 不能覆盖。</li>
+<li><strong>复合命令智能处理</strong>：<ul>
+<li><code>;</code>、<code>&amp;&amp;</code>、<code>||</code> 拆成子命令，已白名单 / 已缓存的子命令直接过，只审查未匹配的子命令；</li>
+<li>出现 <code>export</code>、<code>umask</code>、<code>trap</code>、<code>cd</code>、<code>git config</code> 等会改变后续命令运行环境的状态改变命令时，整条复合命令交给 LLM 审查；</li>
+<li><code>|</code> 管道不拆分，按整体审查，但管道内的危险命令仍会被黑名单 / 目录删除 / 每次审查规则拦截。</li>
+</ul>
+</li>
+<li><strong>动态白名单</strong>：<code>unknown</code> 命令被 LLM 判为 <code>low</code> / <code>medium</code> 风险并放行后写入缓存；<code>always-review</code> 类命令（动态执行、依赖安装等）仍每次审查、不缓存。</li>
+<li><strong>目录删除复核流程</strong>：要求 agent 提供 <code>[删除理由]</code>，再由高思考 LLM 复核；只有 <code>allow</code> 才放行，其余结果转人工确认。</li>
+<li><strong>敏感路径门禁</strong>：<code>write</code> / <code>edit</code> 命中 <code>.env</code>、<code>.ssh</code>、<code>/etc/</code> 等名单时直接 ask，不审查文件内容。</li>
+<li><strong>规则可维护</strong>：默认规则存放在用户 <code>.dsh</code> 目录，用户可直接修改；用户覆盖规则与默认规则分层合并。</li>
+<li><strong>裁决可见性</strong>：缓存命中 / LLM 自动决定时追加用户可见消息（可配置关闭）。</li>
+</ul>
+<h2>工作原理</h2>
+<h3>决策流程</h3>
+<pre><code>工具调用（bash / pwsh / write / edit）
+  → File Tracker（写后执行检测）
+  → 绝对黑名单（hard-deny）
+  → 目录删除复核（directory-delete）
+  → 复合命令处理
+  → 静态白名单（默认白名单 + 用户确认放行规则）
+  → 缓存（会话 LRU / 跨会话低风险缓存）
+  → LLM 兜底（allow / deny / ask，ask 转人工确认）
+</code></pre>
+<h3>命令分类</h3>
+<table>
+<thead>
+<tr>
+<th>类别</th>
+<th>说明</th>
+<th>示例</th>
+<th>缓存</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>静态白名单</td>
+<td>规则直接放行</td>
+<td><code>ls</code>、<code>pwd</code>、<code>git status</code>、<code>git diff</code>、<code>git commit</code></td>
+<td>否</td>
+</tr>
+<tr>
+<td>绝对黑名单</td>
+<td>规则直接拒绝</td>
+<td><code>rm -rf /</code>、<code>mkfs</code>、<code>dd of=/dev/...</code></td>
+<td>否</td>
+</tr>
+<tr>
+<td>目录删除复核</td>
+<td>需要 agent 理由 + 高思考 LLM</td>
+<td><code>rm -rf ./dist</code>、<code>cmd /c rd /s /q</code>、<code>Remove-Item -Recurse</code></td>
+<td>否</td>
+</tr>
+<tr>
+<td>用户确认放行规则</td>
+<td>用户主动声明“永远放行”</td>
+<td><code>git push</code></td>
+<td>否</td>
+</tr>
+<tr>
+<td>可缓存类</td>
+<td>LLM 批准后按 TTL 缓存</td>
+<td><code>npm run build</code>、<code>npm test</code></td>
+<td>是</td>
+</tr>
+<tr>
+<td>每次审查类</td>
+<td>每次都必须 LLM 审查</td>
+<td><code>Invoke-Expression</code>、<code>Start-Process</code>、<code>npm install</code>、<code>curl | bash</code></td>
+<td>否</td>
+</tr>
+<tr>
+<td>未分类</td>
+<td>LLM 裁决，低/中风险放行后可缓存</td>
+<td>其他命令</td>
+<td>低/中风险可缓存</td>
+</tr>
+</tbody></table>
+<p>风险等级：<code>low</code> / <code>medium</code> / <code>high</code>。<code>high</code> 风险不写缓存。</p>
+<h2>安装</h2>
+<p>前置要求：DSH 环境、Node.js、pnpm。</p>
+<pre><code># 在本项目目录执行，安装为本地 bundle（自动应用 cordis.patch.yml）
+dsh plugin --profile web add .
+</code></pre>
+<p><code>cordis.patch.yml</code> 注册：</p>
+<ul>
+<li><code>dsh-auto-guard</code> 插件行；</li>
+<li>覆盖 <code>permission</code> 行，保留 <code>read-only</code> / <code>workspace-write</code> / <code>danger-full-access</code>，新增 <code>auto-guard</code> 预设。</li>
+</ul>
+<p>安装后在 Web 权限选择器中选择 <code>Auto Guard</code> 即可启用。</p>
+<h2>配置</h2>
+<pre><code>- id: dsh-auto-guard
+  name: dsh-auto-guard
+  config:
+    rulesPath: '~/.dsh/auto-guard/rules.json'
+    defaultRulesPath: '~/.dsh/auto-guard/defaults.json'
+    cachePath: '~/.dsh/auto-guard/cache.json'
+    provider: 'deepseek'
+    model: 'deepseek-v4-flash'
+    reasoningEffort: 'off'
+    fallbackProvider: 'deepseek-official'
+    fallbackModel: 'deepseek-v4-flash'
+    timeoutMs: 3000
+    lowRiskTtlDays: 30
+    mediumRiskTtlDays: 7
+    onTimeout: 'deny'          # deny | ask
+    notifyCacheHit: true
+    notifyLlmDecision: true
+    fileTrackerDefault: 'ask'  # ask | deny
+</code></pre>
+<h2>规则文件</h2>
+<p>规则和缓存持久化在 <code>~/.dsh/auto-guard/</code>：</p>
+<table>
+<thead>
+<tr>
+<th>文件</th>
+<th>作用</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>defaults.json</code></td>
+<td>默认规则副本。首次运行从源码 <code>defaults/rules.json</code> 复制；之后插件读取这份 <code>.dsh</code> 副本，不再从源码读取。用户可以直接修改它。</td>
+</tr>
+<tr>
+<td><code>rules.json</code></td>
+<td>用户覆盖规则文件。字段缺失时从 <code>defaults.json</code> 合并补齐并回写，不覆盖用户已有字段。</td>
+</tr>
+<tr>
+<td><code>cache.json</code></td>
+<td>跨会话低风险缓存，按 workspace 隔离。</td>
+</tr>
+</tbody></table>
+<p>示例：用户想额外放行某个只读命令，可以编辑 <code>rules.json</code>：</p>
+<pre><code>{
+  "version": 1,
+  "staticAllow": [
+    { "pattern": "git log", "reason": "Read-only git log" }
+  ]
+}
+</code></pre>
+<h2>使用示例</h2>
+<h3>普通复合命令</h3>
+<pre><code>git status; git branch --show-current; git log --oneline -5
+</code></pre>
+<p>拆成子命令后，已白名单 / 已缓存的直接过；未匹配的子命令单独 LLM 审查，通过后进入缓存。</p>
+<h3>状态改变命令</h3>
+<pre><code>export PATH=/tmp/evil:$PATH &amp;&amp; ls
+</code></pre>
+<p>因为出现 <code>export</code>，整条命令交给 LLM 审查，不会因为 <code>ls</code> 在白名单里就直接放行。</p>
+<h3>目录删除</h3>
+<p>第一次执行：</p>
+<pre><code>rm -rf ./dist
+</code></pre>
+<p>会被拒绝并提示：</p>
+<pre><code>Directory deletion requires a reason. Reply with [删除理由] &lt;reason&gt;, then retry the same command.
+</code></pre>
+<p>重试时附带理由：</p>
+<pre><code>[删除理由] 清理构建产物
+</code></pre>
+<p>插件提取理由后，将“命令 + 理由”交给 <code>reasoningEffort: high</code> 的 LLM 复核；只有 <code>allow</code> 才放行，其余结果转人工确认。</p>
+<ul>
+<li>注：虽然设计如此，但当前这部分还未调试好，多数情况下dsh+deepseek无法完成agent解释后的自动放行，可能需人工删除目录。</li>
+</ul>
+<h2>安全边界</h2>
+<ul>
+<li>插件不是沙箱：<code>Auto Guard</code> 预设为 <code>danger-full-access</code>，文件系统不受限。</li>
+<li>LLM 裁决可能被提示词注入，因此高风险命令不缓存、敏感脚本内容不发送给 LLM。</li>
+<li>用户确认放行规则是用户主动声明的信任边界，应谨慎维护。</li>
+<li><code>|</code> 管道和包含状态改变命令的复合命令会整体审查，避免“单条命令安全但组合后危险”的绕过。</li>
+</ul>
+<h2>开发</h2>
+<pre><code>pnpm install
+pnpm typecheck   # tsc --noEmit
+pnpm test        # vitest run
+pnpm test:single tests/guard-service.spec.ts
+</code></pre>
+<h3>目录结构</h3>
+<pre><code>src/
+  index.ts           插件入口（pre-execute + guard + 通知）
+  guard-service.ts   核心裁决逻辑（唯一测试 seam：GuardService.decide）
+  rules.ts           规则加载 / 默认复制 / 命令分类
+  cache.ts           会话 LRU + 跨会话持久缓存
+  llm.ts             DshLlmReviewer（一次性调用 + fallback + 超时）
+  review-parse.ts    严格 JSON 解析（无依赖）
+  file-tracker.ts    跨命令 / 同命令写后执行检测
+  sensitive-path.ts  write/edit 敏感路径匹配
+  command.ts         归一化 + 复合命令拆分 + 状态改变检测
+  adapter.ts         纯适配：ToolExecution → GuardRequest
+  notify-text.ts     通知文案（纯函数）
+defaults/rules.json  默认规则种子
+tests/               单元测试
+</code></pre>
+<h2>License</h2>
+<p>MIT</p>

@@ -1,0 +1,117 @@
+<h1>dsh-wrapped</h1>
+<p><a href="https://github.com/rand0wn/dsh-wrapped/actions/workflows/ci.yml"><img src="https://github.com/rand0wn/dsh-wrapped/actions/workflows/ci.yml/badge.svg" alt="CI"></a></p>
+<p>A <a href="https://github.com/deepseek-ai/deepseek-harness">DeepSeek Harness</a> (<code>dsh</code>) plugin that turns a session into a shareable summary card — Spotify Wrapped, for your agent session.</p>
+<h2>Why</h2>
+<p>Every session already has real, interesting numbers behind it — how much time went to reasoning versus tool calls, how fast the model streamed, how many turns it took — but they only ever show up as a small stats strip you glance at and forget. <code>dsh-wrapped</code> turns those numbers into a dark, screenshot-shaped card built for actually posting somewhere.</p>
+<h2>Install</h2>
+<pre><code>dsh plugin --profile &lt;name&gt; add dsh-wrapped
+</code></pre>
+<p>Add the package name to that profile's <code>dsh.profile.bundles</code> list (see
+<a href="https://github.com/rand0wn/dsh-minimal-anchor#install">dsh-minimal-anchor's README</a>
+for why this second step is required — being a listed dependency alone
+doesn't activate a plugin's <code>dsh.bundle</code> patch):</p>
+<pre><code>{
+  "dsh": {
+    "profile": {
+      "bundles": [
+        "@deepseek-ai/dsh-base",
+        "@deepseek-ai/dsh-web-app",
+        "dsh-wrapped"
+      ]
+    }
+  }
+}
+</code></pre>
+<p>Confirm it composed with <code>dsh --profile &lt;name&gt; --dump-config</code> — look for a
+<code>wrapped</code> entry.</p>
+<h2>Usage</h2>
+<p>Type <code>/wrapped</code> in any session. It writes an SVG card to
+<code>.dsh-wrapped/wrapped-&lt;sessionId&gt;-&lt;timestamp&gt;.svg</code> under the current working
+directory and prints a plain-text summary alongside the file path. Open the
+SVG in a browser and screenshot it, or convert it to PNG with any SVG tool.</p>
+<p>Needs <code>@deepseek-ai/dsh-session-stats</code> mounted in the profile (it ships in
+the <code>dsh-web-app</code> bundle by default) — without it, <code>/wrapped</code> returns a
+clear error instead of a blank or wrong card.</p>
+<h2>What's on the card</h2>
+<ul>
+<li>Turn and step counts</li>
+<li>Tool time vs. thinking (LLM) time</li>
+<li>Average time to first token</li>
+<li>Decode speed (tokens/sec), omitted below a 1-second sample floor to avoid
+a noisy/misleading rate from too few tokens</li>
+<li>A one-line "type" verdict derived from the tool-time/thinking-time ratio:
+<em>The Explorer</em>, <em>The Deep Thinker</em>, or <em>The Balanced Operator</em></li>
+</ul>
+<h2>Configuration</h2>
+<pre><code># profiles/&lt;name&gt;/cordis.patch.yml
+- insert:
+    - id: wrapped
+      name: 'dsh-wrapped'
+      config:
+        minDecodeSampleMs: 1000
+        verdictRatioThreshold: 1.5
+</code></pre>
+<table>
+<thead>
+<tr>
+<th>Field</th>
+<th>Default</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>minDecodeSampleMs</code></td>
+<td><code>1000</code></td>
+<td>Below this much decode time, tokens/sec is shown as <code>—</code> instead of a number — too small a sample is noise, not a rate.</td>
+</tr>
+<tr>
+<td><code>verdictRatioThreshold</code></td>
+<td><code>1.5</code></td>
+<td>How far tool-time and thinking-time must diverge (as a ratio) before the verdict picks <em>Explorer</em>/<em>Deep Thinker</em> rather than <em>Balanced Operator</em>.</td>
+</tr>
+</tbody></table>
+<p>All of it comes from the session's own <code>sessionStats</code> projection — no
+separate tracking, no extra token cost, nothing persisted beyond the SVG
+file itself.</p>
+<h2>How it works</h2>
+<p>Registers a <code>/wrapped</code> command via <code>@deepseek-ai/dsh-commands</code>. The handler
+reads <code>ctx.sessionProjections.snapshot(invocation.agent.session)</code> for the
+<code>sessionStats</code> key (turns, steps, <code>llmMs</code>, <code>toolMs</code>, <code>ttftMs</code>/<code>ttftSteps</code>,
+<code>decodeMs</code>/<code>decodeTokens</code>), transforms it through a pure <code>buildCard()</code>
+function into display rows and a verdict, then renders that to a
+self-contained SVG string and writes it with plain <code>node:fs</code>. Commands never
+enter model history and cost no tokens — this doesn't touch a single
+request.</p>
+<p><code>buildCard</code> and <code>renderSvg</code> are pure functions with no dependency on a
+booted <code>Context</code>, so the interesting logic (verdict thresholds, decode-speed
+sample floor, XML escaping) is unit tested directly — see
+<a href="#development">Development</a>.</p>
+<p>Verified against a real local <code>dsh web</code> boot, not just types: installed
+into a scratch profile, drove a real browser session with Playwright, ran
+<code>/wrapped</code> after a real multi-tool-call turn, and confirmed the written SVG
+file's numbers matched the session's own stats strip.</p>
+<h2>Troubleshooting</h2>
+<p><strong><code>/wrapped</code> returns "sessionStats projection is not available".</strong> Your
+profile doesn't have <code>@deepseek-ai/dsh-session-stats</code> mounted. It ships by
+default in the <code>dsh-web-app</code> bundle; a custom or headless profile may need
+it added explicitly. Check with <code>dsh --profile &lt;name&gt; --dump-config</code>.</p>
+<p><strong>"This session has no completed steps yet."</strong> <code>/wrapped</code> needs at least
+one closed step (<code>step/end</code>) to have something to summarize — it can't
+report on a session where nothing has happened.</p>
+<p><strong>Can't find the SVG file.</strong> It's written relative to the harness process's
+current working directory, not your project directory or the harness
+checkout — check the exact path in the command's success text, or look
+under <code>.dsh-wrapped/</code> from wherever you launched <code>dsh</code>.</p>
+<h2>Development</h2>
+<pre><code>npm install
+npm run typecheck
+npm test
+</code></pre>
+<p><code>buildCard</code>/<code>renderSvg</code> are plain functions with no <code>dsh</code> runtime
+dependency — <code>examples/render-standalone.ts</code> renders a card from
+hand-written stats, useful for iterating on the design without a live
+session:</p>
+<pre><code>npx tsx examples/render-standalone.ts &gt; card.svg
+</code></pre>
+<h2>License</h2>
+<p>MIT</p>

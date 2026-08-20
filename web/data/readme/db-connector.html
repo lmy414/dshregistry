@@ -1,0 +1,290 @@
+<h1>dsh-db-connector</h1>
+<p><a href="https://www.npmjs.com/package/dsh-db-connector"><img src="https://img.shields.io/npm/v/dsh-db-connector" alt="npm version"></a>
+<a href="https://github.com/JohnXu22786/db-connector/blob/HEAD/LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License: MIT"></a>
+<a href="https://github.com/JohnXu22786/db-connector/blob/HEAD/README.zh.md">中文说明</a></p>
+<p>A database connector bundle for <a href="https://github.com/deepseek-ai/deepseek-harness">DeepSeek Harness</a>
+(<code>dsh</code>, the "everything is a plugin" framework built on Cordis).</p>
+<p>It gives your agent safe, audited access to <strong>SQLite</strong>, <strong>PostgreSQL</strong> and
+<strong>MySQL</strong> through five model-facing tools, plus a human <code>/db</code> command, with a
+deliberate focus on <strong>read-only safety, schema intelligence, write approval,
+and a durable SQL audit trail</strong> — an area the official dsh tool set does not
+cover.</p>
+<blockquote>
+<p>This bundle is an independent, from-scratch implementation. It does not
+reuse any existing open-source dsh tool code; the tool names, parameter
+shapes, and result formats are this bundle's own design and are not tied to
+any official dsh schema.</p>
+</blockquote>
+<hr>
+<h2>Feature overview</h2>
+<table>
+<thead>
+<tr>
+<th>Concern</th>
+<th>What the bundle provides</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong>Connections</strong></td>
+<td>Named connections for SQLite / PostgreSQL / MySQL; lazy open, reuse, explicit close, one line of redacted status per connection.</td>
+</tr>
+<tr>
+<td><strong>Credentials</strong></td>
+<td>Secrets come from <strong>environment variables</strong> (<code>${VAR}</code> placeholders, <code>passwordEnv</code>) or the <strong>dsh credentials service</strong> (<code>passwordRef</code>). Never written to logs or audit records.</td>
+</tr>
+<tr>
+<td><strong>Schema introspection</strong></td>
+<td>Tables, views, columns (name/type/nullable/default/primary key), indexes, foreign keys; per-connection snapshot cache with TTL, <code>refresh</code> and <code>filter</code>.</td>
+</tr>
+<tr>
+<td><strong>Read-only queries</strong></td>
+<td><code>db_query</code> runs <strong>only</strong> SELECT / EXPLAIN-style statements. Everything else is rejected <em>before</em> it touches a database. Row caps, SELECT guard-LIMIT, JSON-safe results.</td>
+</tr>
+<tr>
+<td><strong>Write approval gate</strong></td>
+<td>INSERT / UPDATE / DELETE / DDL require an explicit <code>allowWrite: true</code> confirmation. Writes run inside a transaction: COMMIT on success, ROLLBACK on failure.</td>
+</tr>
+<tr>
+<td><strong>SQL audit</strong></td>
+<td>Every call (including denials and failures) appends one JSONL record: time, connection, statement digest + summary, kind, rows, duration, status, error, and who asked (<code>tool</code>/<code>command</code>/<code>cli</code>).</td>
+</tr>
+<tr>
+<td><strong>Injection safety</strong></td>
+<td>Values are always bound as parameters (<code>?</code> or <code>:name</code>), never interpolated into SQL text.</td>
+</tr>
+<tr>
+<td><strong>Timeouts</strong></td>
+<td>Per-statement AbortSignal deadlines with real termination, even for synchronous SQLite (child-process isolation).</td>
+</tr>
+</tbody></table>
+<hr>
+<h2>Minimum requirements</h2>
+<ul>
+<li>Node.js <strong>≥ 22.13</strong> (uses the built-in, unflagged <code>node:sqlite</code>).</li>
+<li>A running <code>dsh</code> profile for the tools to show up on <code>ctx.tools</code>.</li>
+<li><strong>Optional</strong> server drivers (peer dependencies, only needed for those engines):<ul>
+<li>PostgreSQL: <code>npm i pg</code></li>
+<li>MySQL: <code>npm i mysql2</code></li>
+</ul>
+</li>
+</ul>
+<p>SQLite needs nothing extra. Development (<code>npm test</code>) is easiest on Node ≥ 23.6,
+which runs the type-stripped test files natively.</p>
+<hr>
+<h2>How it plugs into dsh (bundle format)</h2>
+<p>This package is a <strong>bundle</strong>: <code>package.json</code> declares
+<code>dsh.bundle.patch → ./cordis.patch.yml</code>, and the patch inserts one plugin row
+that resolves the package by name. The entry module exports the standard
+<code>name</code> / <code>inject</code> / <code>apply(ctx, config)</code> contract.</p>
+<p>Install the bundle into a profile:</p>
+<pre><code>dsh plugin --profile &lt;name&gt; add /path/to/dsh-db-connector
+</code></pre>
+<p>The package is also on npm for the standalone tooling / programmatic API:</p>
+<pre><code>npm install -g dsh-db-connector   # global CLI-style usage of the engine
+npm install dsh-db-connector      # or add it as a local dependency
+</code></pre>
+<p>(Equivalently: add it to the profile's <code>dependencies</code>
+(<code>"dsh-db-connector": "link:/path/to/dsh-db-connector"</code>) and append
+<code>"dsh-db-connector"</code> to <code>dsh.profile.bundles</code>.)</p>
+<p>On boot, <code>apply(ctx, config)</code>:</p>
+<ol>
+<li>reads the plugin config (second <code>apply</code> argument, with <code>$DSH_HOME</code>
+overrides and <code>DSH_DB_CONNECTOR_*</code> environment fallbacks);</li>
+<li>pre-registers any <code>connections</code> from config (opened lazily on first use);</li>
+<li>registers the five tools on <code>ctx.tools</code>;</li>
+<li>registers the <code>/db</code> command on <code>ctx.commands</code> when that service exists;</li>
+<li>on context disposal, closes every connection and flushes the audit log.</li>
+</ol>
+<p>All registrations are effect-based; unloading the row unwinds them.</p>
+<hr>
+<h2>Plugin configuration</h2>
+<p>Configuration is the <code>config:</code> block of the plugin row (or a later patch layer
+overriding row id <code>db-connector</code>).</p>
+<pre><code>- insert:
+    - id: db-connector
+      name: 'dsh-db-connector'
+      config:
+        # Connections pre-registered at boot; each is opened lazily.
+        connections:
+          appdata:
+            driver: sqlite
+            database: ./data/app.db
+          warehouse:
+            driver: postgres
+            host: db.internal
+            database: warehouse
+            user: readonly
+            passwordEnv: WAREHOUSE_PG_PASSWORD   # env var NAME, not the value
+            # ...or passwordRef: WAREHOUSE_PG_PASSWORD (dsh credentials service)
+
+        audit:
+          enabled: true
+          path: .dsh-db/audit.jsonl        # default; supports ${ENV}
+
+        query:
+          maxRows: 1000                    # result row cap
+          timeoutMs: 30000                 # per-statement deadline (ms)
+          maxSqlChars: 512                 # statement text kept per audit record
+
+        schema:
+          ttlMs: 60000                     # snapshot cache lifetime
+
+        defaultAllowWrite: false           # write gate global default (see below)
+</code></pre>
+<p>Environment overrides: <code>DSH_DB_CONNECTOR_AUDIT_PATH</code>,
+<code>DSH_DB_CONNECTOR_MAX_ROWS</code>, <code>DSH_DB_CONNECTOR_TIMEOUT_MS</code>. Any <code>f"${VAR}"</code>
+placeholder in a string value is expanded from the environment at connect time.</p>
+<h3>Credentials — never in logs</h3>
+<p>Security posture: <strong>secrets are referenced by name, never embedded.</strong></p>
+<ul>
+<li><code>passwordEnv: PG_PASSWORD</code> reads the value from the environment with that name.</li>
+<li><code>passwordRef: MY_REF</code> resolves through the dsh credentials service
+(<code>ctx.credentials</code>), falling back to a plain env lookup.</li>
+<li>Any field may use a <code>${VAR}</code> placeholder.</li>
+<li>Inline <code>password</code> is accepted but strongly discouraged.</li>
+</ul>
+<p>The bundle never logs connection configs, passwords, or connection strings:
+connection summaries carry only name / driver / host:port / database plus
+<code>auth=env|credentials|inline|none</code>. Error messages report environment variable
+<strong>names</strong>, not values. Audit records carry statement digests/summaries and
+counts — never connection config.</p>
+<hr>
+<h2>The tools</h2>
+<p>All five tools return a canonical JSON value and are rendered as formatted text
+to the model.</p>
+<h3><code>db_connect</code></h3>
+<p>Register, open, list or close a named connection.</p>
+<pre><code>{ "action": "connect", "name": "app",
+  "config": { "driver": "sqlite", "database": "./data/app.db" } }
+
+{ "action": "connect", "name": "wh",
+  "config": { "driver": "postgres", "host": "db.local", "database": "wh",
+              "user": "readonly", "passwordEnv": "WH_PASSWORD" } }
+
+{ "action": "list" }
+{ "action": "close", "name": "app" }
+</code></pre>
+<p>Connecting a name that is already defined (config-provided or previously
+connected) reopens it instead of failing; connecting a brand-new name fails
+loudly if the database is unreachable. <code>list</code> returns redacted status.</p>
+<h3><code>db_schema</code></h3>
+<p>Introspect a connection. Returns tables/views, columns, indexes and foreign
+keys, cached per connection for <code>schema.ttlMs</code>; <code>refresh: true</code> bypasses the
+cache and <code>filter</code> narrows to table/view names containing the given substring.</p>
+<pre><code>{ "name": "app", "refresh": false, "filter": "user" }
+</code></pre>
+<h3><code>db_query</code></h3>
+<p>Run a <strong>read-only</strong> query (SELECT / EXPLAIN / DESCRIBE / SHOW).</p>
+<ul>
+<li>Enforced <strong>read-only</strong>: any write or DDL statement is rejected with
+<code>READ_ONLY_VIOLATION</code> and recorded as a <code>denied</code> audit entry — before any
+driver is touched. This covers INSERT/UPDATE/DELETE/DDL/PRAGMA, and also the
+sneaky forms: <code>EXPLAIN ANALYZE &lt;dml&gt;</code> (which executes its statement) and
+data-modifying CTEs (<code>WITH x AS (DELETE ...) SELECT ...</code>).</li>
+<li><strong>Result cap</strong>: rows are capped at <code>limit</code> (or <code>query.maxRows</code>). For a plain
+top-level SELECT without its own LIMIT a guard <code>LIMIT</code> is appended.</li>
+<li><strong>Timeouts</strong>: <code>timeoutMs</code> (or the default) is enforced through an
+AbortSignal; SQLite genuinely terminates via child-process teardown.</li>
+</ul>
+<pre><code>{ "name": "app", "sql": "SELECT id, email FROM users WHERE age &gt;= ? AND age &lt; ?",
+  "params": [26, 40], "limit": 100 }
+</code></pre>
+<p>Values can be positional (<code>params</code> array for <code>?</code>) or named
+(<code>namedParams</code> object for <code>:name</code>); both are bound as parameters. Placeholder
+count vs value count mismatches are a friendly <code>INVALID_PARAMS</code> error.</p>
+<h3><code>db_exec</code></h3>
+<p>Execute a statement that <strong>may write</strong> (INSERT / UPDATE / DELETE / DDL, and
+anything the classifier can't read).</p>
+<ul>
+<li>The <strong>write approval gate</strong> is ON by default: you must pass
+<code>"allowWrite": true</code> — the explicit confirmation — for anything that is not a
+pure read. Otherwise it is denied with <code>WRITE_NOT_ALLOWED</code> and audited.</li>
+<li>The statement runs inside a transaction: <strong>COMMIT on success, ROLLBACK on
+failure</strong> (no partial rows survive an error). The result includes affected
+rows and a rollback explanation.</li>
+<li>DDL invalidates that connection's schema cache automatically.</li>
+</ul>
+<pre><code>{ "name": "app", "sql": "UPDATE users SET age = age + 1 WHERE id = ?",
+  "params": [1], "allowWrite": true }
+</code></pre>
+<h3><code>db_audit</code></h3>
+<p>Read the audit trail back (metadata + statement digests/summaries; credentials
+never appear). Filters: <code>name</code> (connection), <code>kind</code>, <code>since</code> (ISO), <code>limit</code>
+(newest first, default 200).</p>
+<pre><code>{ "kind": "denied", "limit": 50 }
+</code></pre>
+<hr>
+<h2>The human command (<code>/db</code>)</h2>
+<p>When a commands service is mounted (dsh-base mounts one), the bundle registers
+one slash command mirroring the tools through the same engine and gates.</p>
+<pre><code>/db status
+/db connect &lt;name&gt; --driver sqlite --db ./data/app.db
+/db connect pg --driver postgres --host h --database d --user u --password-env PG_PASSWORD
+/db close &lt;name&gt;
+/db schema &lt;name&gt; [--refresh] [--filter sub]
+/db query &lt;name&gt; --sql "SELECT ..." [--limit n] [--timeout ms] [--params a,b,c]
+/db exec &lt;name&gt; --sql "UPDATE ..." --allow-write [--params a,b,c] [--timeout ms]
+/db audit [name] [--kind k] [--limit n] [--since ISO]
+/db help
+</code></pre>
+<hr>
+<h2>The SQL audit trail</h2>
+<p>Each entry is one JSON line:</p>
+<pre><code>{"id":"m2x3st-abc123-1","ts":"2026-08-20T00:00:00.000Z","connection":"app",
+ "kind":"write","way":"tool",
+ "statement":{"summary":"UPDATE users SET age = age + 1 WHERE id = ?",
+              "digest":"&lt;sha256&gt;","chars":47},
+ "rows":1,"durationMs":14,"status":"ok"}
+</code></pre>
+<p><code>kind</code> is <code>query | write | ddl | read | schema | denied</code>; <code>status</code> is
+<code>ok | error | denied</code>. Denied and failed calls are recorded too. The file is
+append-only JSONL at <code>audit.path</code> (default <code>.dsh-db/audit.jsonl</code> under the
+working directory; <code>DSH_DB_CONNECTOR_AUDIT_PATH</code> / <code>${VAR}</code> work here too).</p>
+<hr>
+<h2>Driver notes</h2>
+<ul>
+<li><strong>SQLite</strong> — built-in <code>node:sqlite</code>, no install needed. Each connection owns
+a persistent child process so a runaway synchronous statement can be
+<strong>hard-terminated</strong> on timeout (a worker thread stuck in native SQLite code
+cannot be joined, which would hang the host). File-backed databases survive a
+timeout teardown; <code>:memory:</code> connections are intentionally best-effort for
+testing.</li>
+<li><strong>PostgreSQL</strong> — <code>npm i pg</code> (peer, optional). Reads run inside
+<code>BEGIN TRANSACTION READ ONLY … ROLLBACK</code>, writes inside
+<code>BEGIN/COMMIT/ROLLBACK</code>, all parameterized with <code>$1..$n</code>. AbortSignal is
+forwarded to the client. Note: the JSONB <code>?</code> operator is indistinguishable
+from a <code>?</code> placeholder; prefer <code>#&gt;</code>, <code>-&gt;</code>, or <code>@&gt;</code> for JSONB expressions.</li>
+<li><strong>MySQL</strong> — <code>npm i mysql2</code> (peer, optional). Reads run inside a
+<code>READ ONLY</code> transaction; writes inside <code>beginTransaction/commit/rollback</code>,
+using server-side prepared statements. Cancellation destroys the connection;
+it reconnects on the next use.</li>
+</ul>
+<hr>
+<h2>Development</h2>
+<pre><code>npm install            # dev deps (typescript, @types/node); optional drivers via npm i pg / mysql2
+npm run build          # tsc -&gt; dist/
+npm test               # build + full suite (node --test) — 90 tests
+npm run check          # build + typecheck both src and test
+</code></pre>
+<p>The test suite covers: statement classification / read-only rejection, the
+write approval gate, transaction rollback, parameter-injection safety, result
+caps and SELECT guard-LIMIT, timeouts, the audit trail, connection lifecycle,
+the tools, the <code>/db</code> command, and the plugin entry.</p>
+<hr>
+<h2>Limitations and notes</h2>
+<ul>
+<li>One SQL statement per call; multi-statement input is refused.</li>
+<li>The SQL scanner follows ANSI string escaping (<code>''</code>) and handles
+double-quoted identifiers, backtick identifiers, PostgreSQL dollar-quoted
+strings, <code>--</code> / <code>/* */</code> comments, and <code>::</code> / <code>:=</code>. Backslash-escaped quotes
+inside MySQL single-quoted strings are recognized only approximately; because
+classification is used to <em>reject</em> writes rather than to allow them, this
+cannot widen the write surface.</li>
+<li><code>truncated: true</code> can also be reported when a query naturally returns exactly
+<code>limit</code> rows while the guard <code>LIMIT</code> applied (documented ambiguity).</li>
+<li>PostgreSQL/MySQL introspection and execution are implemented but exercised
+only against real servers; the SQLite path is fully covered by the tests.</li>
+</ul>
+<h2>License</h2>
+<p>MIT — see <a href="https://github.com/JohnXu22786/db-connector/blob/HEAD/LICENSE">LICENSE</a>. Found a bug or want a new driver? Open an
+issue at <a href="https://github.com/JohnXu22786/db-connector/issues">github.com/JohnXu22786/db-connector</a>.</p>

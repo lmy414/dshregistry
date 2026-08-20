@@ -1,0 +1,235 @@
+<h1>@whatsmore-nf/dsh-context-steward</h1>
+<p>English | <a href="https://github.com/Whatsmore-nf/dsh-context-steward/blob/HEAD/README.zh.md">中文</a></p>
+<p>A DeepSeek Harness plugin that treats the fixed-capacity context window as a scarce
+<em>cognitive resource</em> and schedules it: within a hard token budget it protects
+attention bandwidth for the agent's current key decisions, tiers compression by
+value density, consolidates completed phases, and keeps a structured fact vault
+so evicted source text stays recallable.</p>
+<p>It ships as a Cordis <code>Service</code> registered at <code>ctx.contextSteward</code>, with a
+<code>schemastery</code>-declared <code>static Config</code> and <code>static inject</code>, following the same
+plugin shape as the official Harness plugins (e.g. <code>@deepseek-ai/dsh-compaction-basic</code>).</p>
+<h2>Relationship to official compaction</h2>
+<p>Official <code>dsh-compaction-*</code> compacts the <em>conversation body itself</em>. This plugin
+is the complementary layer: it schedules <em>injected memory</em> — deduplicating
+repeated observations, tiered compression, phase consolidation, key-decision
+bandwidth guarantees, and fact recall — before the compacted snapshot is
+injected into the model-visible context. Both can run side by side.</p>
+<h2>Install</h2>
+<p>Via Harness plugin CLI (same as other official plugins):</p>
+<pre><code>dsh plugin --profile web add @whatsmore-nf/dsh-context-steward@latest
+</code></pre>
+<p>Or directly via npm:</p>
+<pre><code>npm install @whatsmore-nf/dsh-context-steward
+</code></pre>
+<p>The plugin needs the Harness runtime (<code>@deepseek-ai/cordis</code>, <code>@deepseek-ai/dsh-agent</code>,
+<code>@deepseek-ai/dsh-llm</code>, <code>@deepseek-ai/dsh-session</code>) as peer dependencies; a
+Harness profile already provides them.</p>
+<h2>Load</h2>
+<p>Add a row to a <code>cordis.yml</code> / <code>cordis.patch.yml</code> bundle:</p>
+<pre><code>- id: dsh-context-steward
+  name: '@whatsmore-nf/dsh-context-steward'
+  config:
+    capacity: 8000
+    enabled: true
+    inject: true
+</code></pre>
+<p>Loading registers the <code>ctx.contextSteward</code> Service and wires it automatically
+to the Harness lifecycle events (see <a href="#events">Events</a>).</p>
+<h2>Config (<code>ContextStewardConfig</code>)</h2>
+<p>Every key is optional; missing keys fall back to the resolved defaults below.
+Unknown keys, wrong types, and out-of-range ratios fail plugin load
+(<code>resolveConfig</code> rejects them, mirroring official plugins).</p>
+<table>
+<thead>
+<tr>
+<th>Key</th>
+<th>Default</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>capacity</code></td>
+<td><code>4000</code></td>
+<td>Token budget of the injected compressed context (the fixed bandwidth cap).</td>
+</tr>
+<tr>
+<td><code>reserved</code></td>
+<td><code>0</code></td>
+<td>System tokens excluded from the compressible region.</td>
+</tr>
+<tr>
+<td><code>decisionGuarantee</code></td>
+<td><code>floor(capacity × 0.35)</code></td>
+<td>Attention bandwidth floor: max tokens the working set may occupy while a key decision is protected.</td>
+</tr>
+<tr>
+<td><code>halfLifeMs</code></td>
+<td><code>600000</code></td>
+<td>Time-decay half-life (10 min) for recency weighting.</td>
+</tr>
+<tr>
+<td><code>adaptiveRecency</code></td>
+<td><code>true</code></td>
+<td>Adapt the half-life to observed decision cadence.</td>
+</tr>
+<tr>
+<td><code>minAdaptiveHalfLifeMs</code></td>
+<td><code>10000</code></td>
+<td>Lower bound of the adaptive half-life.</td>
+</tr>
+<tr>
+<td><code>maxAdaptiveHalfLifeMs</code></td>
+<td><code>3600000</code></td>
+<td>Upper bound of the adaptive half-life.</td>
+</tr>
+<tr>
+<td><code>adaptiveThresholds</code></td>
+<td><code>true</code></td>
+<td>Self-tune demote/promote thresholds from churn.</td>
+</tr>
+<tr>
+<td><code>churnWindowMs</code></td>
+<td><code>60000</code></td>
+<td>Churn observation window for threshold tuning.</td>
+</tr>
+<tr>
+<td><code>tuneStep</code></td>
+<td><code>0.03</code></td>
+<td>Threshold tuning step.</td>
+</tr>
+<tr>
+<td><code>demoteThreshold</code></td>
+<td><code>0.35</code></td>
+<td>Score below which working items are demoted to the cold pool.</td>
+</tr>
+<tr>
+<td><code>promoteThreshold</code></td>
+<td><code>0.55</code></td>
+<td>Score above which cold items are promoted back to the working set.</td>
+</tr>
+<tr>
+<td><code>workingRenderRatio</code></td>
+<td><code>0.5</code></td>
+<td>Share of the render budget given to the working set.</td>
+</tr>
+<tr>
+<td><code>maxProtectedDecisions</code></td>
+<td><code>4</code></td>
+<td>Max protected decision snapshots kept verbatim (older ones age out).</td>
+</tr>
+<tr>
+<td><code>coldCompactScore</code></td>
+<td><code>0.4</code></td>
+<td>Minimum score for cold-pool tiered compression.</td>
+</tr>
+<tr>
+<td><code>rehydrateThreshold</code></td>
+<td><code>0.6</code></td>
+<td>Archive score threshold for rehydrating facts back into the working set.</td>
+</tr>
+<tr>
+<td><code>dedupe</code></td>
+<td><code>true</code></td>
+<td>Aggregate repeated observations into <code>repeated ×N</code> records.</td>
+</tr>
+<tr>
+<td><code>consolidate</code></td>
+<td><code>true</code></td>
+<td>Consolidate a finished phase into one structured summary.</td>
+</tr>
+<tr>
+<td><code>renderBudget</code></td>
+<td><code>available capacity</code></td>
+<td>Token cap of the rendered injected context.</td>
+</tr>
+<tr>
+<td><code>maxItemChars</code></td>
+<td><code>6000</code></td>
+<td>Source-text truncation cap per tool/observation item (full text stays in the vault).</td>
+</tr>
+<tr>
+<td><code>reclaimPeekLimit</code></td>
+<td><code>16</code></td>
+<td>Candidate peek count for value-density reclamation.</td>
+</tr>
+<tr>
+<td><code>enabled</code></td>
+<td><code>true</code></td>
+<td><code>false</code> registers the Service only, without event wiring.</td>
+</tr>
+<tr>
+<td><code>inject</code></td>
+<td><code>true</code></td>
+<td>Enable injecting the compressed snapshot (still gated by <code>injectThresholdRatio</code>).</td>
+</tr>
+<tr>
+<td><code>injectThresholdRatio</code></td>
+<td><code>0.8</code></td>
+<td>Injection engages only when measured session pressure <code>totalTokens &gt;= floor(window × ratio)</code> — the same trigger semantics as the official compaction's <code>thresholdRatio</code>. Below it the plugin only keeps invisible in-memory bookkeeping, so normal reasoning steps are not disturbed.</td>
+</tr>
+<tr>
+<td><code>injectContextWindow</code></td>
+<td><code>0</code></td>
+<td>Explicit context-window override (tokens). <code>0</code> = resolve from the routed model adapter's <code>contextWindow</code>; when the window cannot be resolved and no override is set, injection is conservatively skipped.</td>
+</tr>
+</tbody></table>
+<h2>Usage</h2>
+<h3>Service form (inside the Harness)</h3>
+<pre><code>import type { Context } from '@deepseek-ai/cordis'
+import ContextSteward from '@whatsmore-nf/dsh-context-steward'
+
+export const name = 'context-steward'
+export const inject = ['sessions']
+
+export function apply(ctx: Context): void {
+  const plugin = ctx.plugin(ContextSteward, { capacity: 8000 })
+  // Optional: plug in an LLM semantic summarizer (async prewarm during pre-step idle time,
+  // upgrading compression from heuristics to structured summaries)
+  // plugin.asyncSummarize = async (content, depth) =&gt; await llm.complete(
+  //   buildCompactionPrompt({ context: [content] }), { maxTokens: depth &gt;= 3 ? 160 : 80 },
+  // )
+}
+</code></pre>
+<p>The Service is available as <code>ctx.contextSteward</code>; per-session schedulers are
+obtained with <code>ctx.contextSteward.scheduler(session)</code>.</p>
+<h3>Standalone form (demo / unit tests, no Harness runtime)</h3>
+<pre><code>import { createContextStewardPlugin } from '@whatsmore-nf/dsh-context-steward'
+
+const plugin = createContextStewardPlugin({ capacity: 8000 })
+plugin.hooks.onAppend?.({ id: 'u1', kind: 'user', content: '目标是部署服务', timestamp: 0 })
+plugin.hooks.onDecision?.({ goal: '部署服务', currentStep: '选型', attentionFocus: ['部署', '服务'] })
+const prompt = plugin.hooks.onBeforePrompt?.() // 注入压缩后的上下文
+</code></pre>
+<h3>Scheduler core</h3>
+<p><code>CognitiveResourceScheduler</code> is exported standalone: <code>ingest()</code>, <code>checkpoint()</code>,
+<code>setPhase()</code>, <code>consolidatePhase()</code>, <code>compiledContext()</code>, <code>query()</code>,
+<code>exportArchive()</code>, <code>exportState()</code> / <code>restoreState()</code> — see the type
+declarations for the full surface.</p>
+<h2>Events</h2>
+<p>When <code>enabled</code> is <code>true</code>, the plugin subscribes to:</p>
+<table>
+<thead>
+<tr>
+<th>Event</th>
+<th>Purpose</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>session/event</code></td>
+<td>Feed model-visible user/assistant/tool events into the scheduler (dedupe, tiered compression, fact extraction, bandwidth accounting). Self-injected compressed context is skipped.</td>
+</tr>
+<tr>
+<td><code>agent/pre-step</code></td>
+<td>Treat the upcoming step as a key decision: attention re-ranking, then inject the compressed snapshot.</td>
+</tr>
+<tr>
+<td><code>agent/request-error</code></td>
+<td>On <code>CONTEXT_WINDOW_EXCEEDED</code> failure, feed the overflow as an observation so the next snapshot perceives it.</td>
+</tr>
+<tr>
+<td><code>agent/disposed</code></td>
+<td>Export the archive, log closing metrics, and release the session state.</td>
+</tr>
+</tbody></table>
+<h2>License</h2>
+<p>MIT</p>

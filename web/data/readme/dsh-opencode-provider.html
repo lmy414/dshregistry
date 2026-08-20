@@ -1,0 +1,152 @@
+<h1>dsh-opencode-provider</h1>
+<p>Use models available through a local <a href="https://github.com/anomalyco/opencode">OpenCode</a> server inside DeepSeek Harness without a DeepSeek API key.</p>
+<h2>Architecture</h2>
+<pre><code>DeepSeek Harness (DSH)
+  └─ LLM Runtime
+       └─ opencode-local provider route
+            └─ OpenCodeAdapter (dsh-opencode-provider)
+                 ├─ POST /api/session              → create session
+                 ├─ POST /api/session/{id}/prompt   → serialized conversation
+                 ├─ GET  /api/session/{id}/event    → SSE stream
+                 └─ POST /api/session/{id}/interrupt → best-effort cancel
+                          ↕ HTTP + SSE
+                   OpenCode Server (127.0.0.1:4096)
+                          ↕
+                   Model (mimo-v2.5-free)
+</code></pre>
+<p>The adapter serializes the full DSH conversation (system prompt + messages) into a single prompt string, sends it to the OpenCode server, and translates the SSE event stream into DSH <code>StreamChunk</code> values. OpenCode runs its own internal agent/tool loop, so the adapter exposes <strong>text output only</strong> — structured DSH tool calling is not available.</p>
+<h2>Verified Features</h2>
+<ul>
+<li><strong>No API key required</strong> — connects to a local OpenCode server over plain HTTP</li>
+<li><strong>Streaming</strong> — text deltas are delivered as they arrive</li>
+<li><strong>Cancellation</strong> — abort signal tears down the SSE stream and interrupts the session</li>
+<li><strong>Timeouts</strong> — configurable SSE establishment (10 s), prompt admission (10 s), and terminal completion (120 s) limits</li>
+<li><strong>Retry policy</strong> — provider-level retry config forwarded to DSH runtime</li>
+<li><strong>Live SSE event formats</strong> — handles both legacy (<code>session.text.delta</code>, <code>session.execution.succeeded</code>) and current (<code>session.next.text.delta</code>, <code>session.next.step.ended</code>) event envelopes</li>
+<li><strong>Graceful fallback</strong> — unknown SSE events are skipped; non-JSON lines are ignored; <code>data.wrapper</code> envelopes are unwrapped defensively</li>
+</ul>
+<h2>Requirements</h2>
+<ul>
+<li><strong>Node.js</strong> ≥ 22</li>
+<li><strong>OpenCode server</strong> running locally (default: <code>http://127.0.0.1:4096</code>)</li>
+<li><strong>DeepSeek Harness</strong> ≥ 0.1.0-rc.8</li>
+</ul>
+<h2>Installation</h2>
+<h3>Via DSH plugin command</h3>
+<pre><code>dsh plugin --profile web add dsh-opencode-provider
+</code></pre>
+<h3>From source checkout</h3>
+<pre><code>git clone https://github.com/goku54477/dsh-opencode-provider.git
+cd dsh-opencode-provider
+pnpm dsh
+</code></pre>
+<h2>Quick Start</h2>
+<ol>
+<li>Start the OpenCode server:</li>
+</ol>
+<pre><code>opencode serve --hostname 127.0.0.1 --port 4096
+</code></pre>
+<ol>
+<li><p>The adapter auto-configures with the default base URL (<code>http://127.0.0.1:4096</code>). No additional setup is needed.</p>
+</li>
+<li><p>In DeepSeek Harness, select the model:</p>
+</li>
+</ol>
+<pre><code>opencode-local/mimo-v2.5-free
+</code></pre>
+<h2>Configuration</h2>
+<p>All fields are optional. Defaults work out of the box with a local OpenCode server.</p>
+<pre><code># Inside your DSH cordis.yml or plugin config
+llm-opencode:
+  # Endpoint of the OpenCode server
+  baseURL: "http://127.0.0.1:4096"
+
+  # Context window reported to the harness (default: 128000)
+  defaultContextWindow: 128000
+
+  # Max output tokens per request (default: 16384)
+  maxTokens: 16384
+
+  # Advisory model list for discovery consumers
+  models:
+    - id: mimo-v2.5-free
+      name: mimo-v2.5-free
+      description: "OpenCode local agent (text output only)"
+      contextWindow: 128000
+
+  # Retry policy
+  retryPolicy:
+    mode: always
+    backoff:
+      initialDelayMs: 100
+      maxDelayMs: 5000
+      jitterRatio: 0.2
+</code></pre>
+<h2>How It Works</h2>
+<ol>
+<li><strong>Session creation</strong> — <code>POST /api/session</code> with <code>{ model: { id, providerID: "opencode" } }</code></li>
+<li><strong>Concurrent SSE + prompt</strong> — the adapter fires the SSE subscription (<code>GET /api/session/{id}/event</code>) and prompt delivery (<code>POST /api/session/{id}/prompt</code>) concurrently. This avoids a deadlock where the OpenCode server withholds SSE headers until the session has activity.</li>
+<li><strong>Conversation serialization</strong> — the full DSH conversation is formatted as <code>[System]\n...\n\n[User]\n...\n\n[Assistant]\n...</code> and embedded in the prompt.</li>
+<li><strong>Event translation</strong> — SSE events (<code>session.text.delta</code>, <code>session.next.step.ended</code>, <code>session.execution.succeeded</code>, etc.) are mapped to DSH <code>StreamChunk</code> types (<code>block-start</code>, <code>text-delta</code>, <code>block-end</code>, <code>finish</code>).</li>
+<li><strong>Cleanup</strong> — on completion, error, or abort, the adapter sends a best-effort interrupt to the session.</li>
+</ol>
+<h2>Development</h2>
+<pre><code># Build
+npm run build
+
+# Type-check
+npm run typecheck
+
+# Run tests
+npm run test
+
+# Build + test
+npm run check
+
+# Clean output
+npm run clean
+</code></pre>
+<h2>Security Warning</h2>
+<p>This plugin communicates with a <strong>local HTTP server</strong> (no TLS by default). Do not expose the OpenCode server to untrusted networks. The default binding (<code>127.0.0.1</code>) restricts access to the local machine.</p>
+<h2>Platform Compatibility</h2>
+<p>v0.1.0 has been tested on the following exact environment:</p>
+<table>
+<thead>
+<tr>
+<th>Component</th>
+<th>Version</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>OS</td>
+<td>Windows 11</td>
+</tr>
+<tr>
+<td>Node.js</td>
+<td>22.23.2</td>
+</tr>
+<tr>
+<td>DeepSeek Harness</td>
+<td>0.1.0-rc.8</td>
+</tr>
+<tr>
+<td>OpenCode</td>
+<td>1.18.19</td>
+</tr>
+<tr>
+<td>Model</td>
+<td>opencode/mimo-v2.5-free</td>
+</tr>
+</tbody></table>
+<p>Other platforms, Node versions, harness releases, OpenCode versions, and models have not been verified. The adapter may work elsewhere, but no guarantees are made.</p>
+<h2>Limitations</h2>
+<ul>
+<li><strong>Text output only</strong> — OpenCode runs its own agent/tool loop. Structured tool calling exposed by DSH is not available through this adapter.</li>
+<li><strong>No multimodal support</strong> — the adapter reports <code>inputModalities: ["text"]</code> only. Image/audio/video inputs are not forwarded.</li>
+<li><strong>Single model advertised</strong> — the default catalog lists <code>mimo-v2.5-free</code>. Adding models requires manual config; the adapter does not dynamically discover available models from the server.</li>
+<li><strong>Prompt size</strong> — the entire conversation is serialized into a single prompt string. Very long conversations may exceed the model's context window.</li>
+<li><strong>No persistent sessions</strong> — each <code>stream()</code> call creates a fresh OpenCode session. Conversation state is not preserved across requests.</li>
+<li><strong>Local-only by default</strong> — the adapter expects the OpenCode server on <code>127.0.0.1</code>. Remote servers require manual <code>baseURL</code> configuration and appropriate network access.</li>
+</ul>
+<h2>License</h2>
+<p><a href="https://github.com/goku54477/dsh-opencode-provider/blob/HEAD/LICENSE">MIT</a></p>

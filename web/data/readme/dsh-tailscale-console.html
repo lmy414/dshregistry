@@ -1,0 +1,306 @@
+<h1>dsh-tailscale-console</h1>
+<p>A control panel for the <a href="https://github.com/deepseek-ai/dsh">DeepSeek Harness</a> web GUI that operates <strong>secure remote access over Tailscale</strong>: one-click health checks, HTTPS entry (Tailscale Serve) toggle, macOS proxy bypass repair, relay-server ops, and an ACL snippet generator.</p>
+<p>UI language: Chinese. Docs: <a href="https://github.com/evanfang0054/dsh-tailscale-console/blob/HEAD/README.md">English</a> · <a href="https://github.com/evanfang0054/dsh-tailscale-console/blob/HEAD/README.zh-CN.md">中文</a></p>
+<p><a href="https://www.npmjs.com/package/dsh-tailscale-console"><img src="https://img.shields.io/npm/v/dsh-tailscale-console.svg?style=flat-square" alt="npm version"></a>
+<a href="https://github.com/evanfang0054/dsh-tailscale-console/blob/HEAD/LICENSE"><img src="https://img.shields.io/npm/l/dsh-tailscale-console.svg?style=flat-square" alt="License"></a>
+<a href="https://github.com/evanfang0054/dsh-tailscale-console/blob/HEAD/package.json"><img src="https://img.shields.io/badge/node-%3E%3D20-blue.svg?style=flat-square" alt="Node"></a>
+<a href="https://www.npmjs.com/package/dsh-tailscale-console"><img src="https://img.shields.io/npm/dm/dsh-tailscale-console.svg?style=flat-square" alt="Downloads"></a>
+<a href="https://github.com/topics/dsh-plugin"><img src="https://img.shields.io/badge/dsh%20plugin-ready-2ea44f.svg?style=flat-square" alt="dsh plugin"></a></p>
+<hr>
+<h2>Features</h2>
+<table>
+<thead>
+<tr>
+<th>Card</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>① Devices &amp; online alerts</td>
+<td>Per-device online/offline state; auto-alerts when an offline device comes online</td>
+</tr>
+<tr>
+<td>② Health check</td>
+<td>One-click verification of HTTPS entry, page, <code>/api</code> session list, <code>/sidebar/api</code>, server direct path, proxy bypass</td>
+</tr>
+<tr>
+<td>③ HTTPS entry</td>
+<td>Tailscale Serve status / URL + on/off toggle (with verification &amp; retry)</td>
+</tr>
+<tr>
+<td>④ Proxy bypass</td>
+<td>Checks <code>*.ts.net</code> / <code>100.64.0.0/10</code> in the macOS system proxy bypass list; one-click re-apply (macOS only)</td>
+</tr>
+<tr>
+<td>⑤ Relay server</td>
+<td>Tailnet status of your relay server + enable Peer Relay + ping verify</td>
+</tr>
+<tr>
+<td>⑥ Access</td>
+<td>Remote HTTPS URL, local URL, and the exact <code>dsh web</code> start command</td>
+</tr>
+<tr>
+<td>⑦ ACL snippet</td>
+<td>Generates the <code>tailscale.com/cap/relay</code> grants JSON from live device IPs</td>
+</tr>
+</tbody></table>
+<hr>
+<h2>Full Setup Guide (server → local machine → DSH)</h2>
+<blockquote>
+<p>Target architecture: the server joins the tailnet as a <strong>Peer Relay</strong>; the local machine exposes <strong>HTTPS via Tailscale Serve</strong>; DSH keeps listening on 127.0.0.1 only.</p>
+</blockquote>
+<h3>0. Prerequisites</h3>
+<ul>
+<li>Tailscale account (enable 2FA), MagicDNS enabled</li>
+<li>A Linux server with a public IP (Ubuntu 22.04 in this guide)</li>
+<li>Local macOS with the <code>tailscale</code> CLI installed and logged in</li>
+<li>A dsh web profile (<code>~/.dsh/profiles/web</code>) — requires <strong>dsh ≥ 0.1.0-rc.6</strong> (for <code>--trusted-host</code> and the <code>webRuntime</code> service)</li>
+<li><strong>Node 20.x + pnpm ≥ 9</strong> for the profile (<code>pnpm-lock.yaml</code> is v9; the default pnpm 8 under Node 24 will fail. Verified with Node 20.19.2 + pnpm 10.27.0)</li>
+<li>A phone with the Tailscale app installed and logged into the same account (for remote access testing)</li>
+</ul>
+<blockquote>
+<p><strong>How to find your tailnet values</strong> (the <code>&lt;...&gt;</code> placeholders below):</p>
+<ul>
+<li>Local tailnet IP: <code>tailscale ip -4</code></li>
+<li>All devices: <code>tailscale status</code></li>
+<li>MagicDNS name (<code>&lt;hostname&gt;.&lt;tailnet&gt;.ts.net</code>): <code>tailscale status --json | python3 -c "import json,sys; print(json.load(sys.stdin)['Self']['DNSName'].rstrip('.'))"</code>, or read it from the Tailscale admin console → Machines, or from the output of <code>tailscale serve status</code> once serve is up (section 2.1)</li>
+<li>Server tailnet IP: <code>tailscale status</code> on the Mac (the Linux peer)</li>
+</ul>
+<p><strong>Tip</strong>: you can bring the panel up locally first with <code>dsh web</code> (loopback default) — card ⑥ then shows the real remote URL, start command and ACL JSON, which you can copy back into the steps below.</p>
+</blockquote>
+<h3>1. Server side</h3>
+<p><strong>1.1 Install &amp; authenticate Tailscale</strong></p>
+<pre><code>ssh &lt;server&gt; 'curl -fsSL https://tailscale.com/install.sh | sh'
+ssh &lt;server&gt; 'nohup tailscale up &gt;/tmp/ts-up.log 2&gt;&amp;1 &amp; sleep 4; cat /tmp/ts-up.log'
+# Open the https://login.tailscale.com/a/xxxx link printed, authorize with your account.
+# The server comes online automatically; `tailscale status` on the Mac should list it.
+</code></pre>
+<p><strong>1.2 Enable the Peer Relay port + firewall</strong></p>
+<pre><code>ssh &lt;server&gt; 'tailscale set --relay-server-port=40000 &amp;&amp; ufw allow 40000/udp &amp;&amp; ufw allow 41641/udp'
+# 41641 = WireGuard direct port; 40000 = Peer Relay port
+</code></pre>
+<blockquote>
+<p>⚠️ Your cloud security group must also allow inbound UDP 40000 and 41641 (source 0.0.0.0/0) — the guest ufw cannot protect the cloud edge.</p>
+</blockquote>
+<p><strong>1.3 Verify the direct path</strong> (run on the Mac)</p>
+<pre><code>tailscale ping -c 3 &lt;server-tailnet-ip&gt;   # expect "via &lt;public-ip&gt;:41641" (tens of ms); DERP means 41641 is blocked
+</code></pre>
+<h3>2. Local machine</h3>
+<p><strong>2.1 HTTPS entry: Tailscale Serve (the core)</strong></p>
+<pre><code>tailscale serve --bg 3080    # https://&lt;hostname&gt;.&lt;tailnet&gt;.ts.net → 127.0.0.1:3080, tailnet-only
+tailscale serve status       # inspect; `tailscale serve reset` to disable
+</code></pre>
+<blockquote>
+<p>Why HTTPS is mandatory: browsers expose <code>crypto.randomUUID</code> only in secure contexts (HTTPS or localhost), and every DSH client RPC depends on it. The GUI at <code>http://&lt;tailnet-ip&gt;:3080</code> will never work — debug only.</p>
+</blockquote>
+<p><strong>2.2 Proxy bypass (required if you run Clash-family proxies on macOS)</strong></p>
+<p>A local Clash proxy hijacks the private ts.net domain and breaks HTTPS in the browser. Add <code>*.ts.net</code> and <code>100.64.0.0/10</code> to the bypass list in Clash Verge → Settings → System proxy; or apply immediately:</p>
+<pre><code>networksetup -getproxybypassdomains "Wi-Fi"   # first: back up the current list
+networksetup -setproxybypassdomains "Wi-Fi" "*.ts.net" "100.64.0.0/10" "*.local" "&lt;local&gt;" "localhost" "127.0.0.1" "192.168.0.0/16" "10.0.0.0/8" "172.16.0.0/12"
+</code></pre>
+<blockquote>
+<p>⚠️ <code>-setproxybypassdomains</code> <strong>replaces</strong> the whole exception list of that service — back it up first with <code>-getproxybypassdomains</code>.
+Non-macOS: the panel hides card ④ automatically; for Linux/Windows set the equivalent bypass, e.g. <code>export NO_PROXY="*.ts.net,100.64.0.0/10"</code> in your proxy tool or environment.</p>
+</blockquote>
+<p><strong>2.3 (Optional) socat debug forward</strong></p>
+<pre><code>brew install socat
+socat TCP-LISTEN:3080,bind=&lt;local-tailnet-ip&gt;,reuseaddr,fork TCP:127.0.0.1:3080
+# curl/API debugging only; the GUI is unusable over plain HTTP (non-secure context)
+</code></pre>
+<h3>3. DSH configuration</h3>
+<p><strong>3.1 Start command (use this every time)</strong></p>
+<pre><code>dsh web --trusted-host &lt;local-tailnet-ip&gt;:3080 --trusted-host &lt;hostname&gt;.&lt;tailnet&gt;.ts.net
+</code></pre>
+<blockquote>
+<p>⚠️ Every change below (cordis.patch.yml, plugin code, better-sidebar patch) requires <strong>restarting <code>dsh web</code></strong>, which <strong>interrupts the currently running session</strong> — save/finish your work first. The web profile has HMR disabled.</p>
+</blockquote>
+<p><strong>3.2 Static trustedHosts (belt &amp; braces)</strong></p>
+<p>Append to <code>~/.dsh/profiles/web/cordis.patch.yml</code>:</p>
+<pre><code>- id: connection
+  config:
+    trustedHosts: ['&lt;local-tailnet-ip&gt;:3080', '&lt;hostname&gt;.&lt;tailnet&gt;.ts.net']
+</code></pre>
+<p><strong>3.3 Known third-party issue: <code>dsh-better-sidebar</code></strong></p>
+<p>If your profile installs <code>dsh-better-sidebar</code>, its <code>/sidebar/api</code> fence has a bug <strong>in version 0.10.3 (the latest published)</strong>: <code>trustedHostsOf()</code> matches <code>entry.options.name</code> against <code>"connection"</code>, but <code>name</code> is the package name, so the trust list is always empty and <code>/sidebar/api/*</code> is loopback-only (403 remotely — the sidebar breaks). No fixed upstream version exists yet.</p>
+<p>Patch <code>trustedHostsOf()</code> in <code>node_modules/dsh-better-sidebar/lib/index.js</code> (back up the file first) to read the <code>webRuntime</code> service:</p>
+<pre><code>function trustedHostsOf(ctx) {
+  const hosts = []
+  const runtime = ctx.get("webRuntime")
+  if (runtime !== void 0 &amp;&amp; Array.isArray(runtime.trustedHosts)) hosts.push(...runtime.trustedHosts)
+  for (const entry of ctx.loader.entries()) if (entry.options.id === "connection") {
+    const cfg = entry.options.config?.trustedHosts
+    if (Array.isArray(cfg)) hosts.push(...cfg)
+  }
+  return [...new Set(hosts)]
+}
+</code></pre>
+<blockquote>
+<p>⚠️ The patch lives in <code>node_modules</code> and is lost on the next <code>pnpm install</code> — re-apply after every reinstall (check with <code>grep -c 'options.id === "connection"'</code>).</p>
+</blockquote>
+<h3>4. ACL grant (required for phone relaying)</h3>
+<p><a href="https://console.tailscale.com/admin/acls">console.tailscale.com/admin/acls</a> → JSON editor, add to <code>grants</code>:</p>
+<pre><code>{
+  "grants": [
+    {
+      "src": ["&lt;device-A-ip&gt;", "&lt;device-B-ip&gt;"],
+      "dst": ["&lt;server-tailnet-ip&gt;"],
+      "app": { "tailscale.com/cap/relay": [] }
+    }
+  ]
+}
+</code></pre>
+<p>(<code>src</code> = devices allowed to relay, <code>dst</code> = the relay server. Without it, phone traffic falls back to official DERP, 400ms+. Card ⑦ generates this for you.)</p>
+<h3>5. Install this plugin</h3>
+<p>The package declares <code>dsh.bundle</code>, so the official CLI installs <strong>and auto-mounts</strong> it into the profile's bundle stack — one command, no profile file edits:</p>
+<pre><code># npm source (published): auto-appends to dsh.profile.bundles + mounts
+dsh plugin --profile web add dsh-tailscale-console
+
+# or install straight from the repo (also auto-mounts — the repo ships cordis.patch.yml at its root)
+dsh plugin --profile web add github:evanfang0054/dsh-tailscale-console
+</code></pre>
+<p>Restart <code>dsh web</code> → Settings → Tailscale Console.</p>
+<p>Optional per-user options (like <code>sshAlias</code>) are machine-specific and are <strong>not</strong> part of the bundled patch. Override them from the profile's own <code>cordis.patch.yml</code> by targeting the same entry id:</p>
+<pre><code>cd ~/.dsh/profiles/web
+pnpm add "dsh-tailscale-console@file:./packages/dsh-tailscale-console"   # local dev: file: reference
+</code></pre>
+<pre><code># append to ~/.dsh/profiles/web/cordis.patch.yml (optional overrides)
+- id: tailscale-console
+  config:
+    sshAlias: my-server    # optional: ssh alias for server-side mutations (install/relay)
+</code></pre>
+<blockquote>
+<p>⚠️ If you previously mounted this plugin the manual way (an <code>- insert:</code> line in <code>cordis.patch.yml</code>), remove that line before switching to the <code>dsh plugin add</code> bundle channel — keeping both double-mounts the plugin (two host halves, two panels).</p>
+</blockquote>
+<h3>6. Verification checklist</h3>
+<pre><code># HTTPS entry
+curl -s -o /dev/null -w "%{http_code}\n" --noproxy '*' https://&lt;hostname&gt;.&lt;tailnet&gt;.ts.net/      # 200
+# /api fence
+curl -s --noproxy '*' -X POST https://&lt;hostname&gt;.&lt;tailnet&gt;.ts.net/api/session.list \
+  -H 'content-type: application/json' \
+  -d '{"type":"client-request","rpcId":"t-1","method":"session.list","payload":{}}' | head -c 120  # ok:true
+# panel host route
+curl -s -o /dev/null -w "%{http_code}\n" --noproxy '*' -X POST \
+  https://&lt;hostname&gt;.&lt;tailnet&gt;.ts.net/tsctl/api/config -H 'content-type: application/json' -d '{}'   # 200
+# direct path
+tailscale ping -c 3 &lt;server-tailnet-ip&gt;
+# Final: open https://&lt;hostname&gt;.&lt;tailnet&gt;.ts.net on any tailnet device — the sidebar lists all sessions
+</code></pre>
+<hr>
+<h2>Configuration</h2>
+<p>All values come from the plugin <code>Config</code>; the code contains <strong>no personal identifiers</strong>. MagicDNS URLs and tailnet IPs are auto-derived from <code>tailscale status --json</code> when not configured.</p>
+<table>
+<thead>
+<tr>
+<th>Key</th>
+<th>Type</th>
+<th>Default</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>dshPort</code></td>
+<td>number</td>
+<td><code>3080</code></td>
+<td>DSH web GUI port</td>
+</tr>
+<tr>
+<td><code>relayPort</code></td>
+<td>number</td>
+<td><code>40000</code></td>
+<td>Relay server's Peer Relay UDP port</td>
+</tr>
+<tr>
+<td><code>tailnetUrl</code></td>
+<td>string</td>
+<td>auto</td>
+<td>HTTPS base, e.g. <code>https://myhost.tail1234.ts.net</code></td>
+</tr>
+<tr>
+<td><code>sshAlias</code></td>
+<td>string</td>
+<td>—</td>
+<td>SSH alias for server-side mutations (install / relay)</td>
+</tr>
+<tr>
+<td><code>serverPeerPattern</code></td>
+<td>string</td>
+<td>first Linux peer</td>
+<td>Regex to identify the relay server peer</td>
+</tr>
+<tr>
+<td><code>proxyServices</code></td>
+<td>string[]</td>
+<td>macOS set</td>
+<td>Network services for the bypass apply</td>
+</tr>
+</tbody></table>
+<h2>Security model</h2>
+<ul>
+<li><strong>Fixed command allowlist</strong>: every button maps to a hard-coded command; the client cannot pass free-form input.</li>
+<li><strong>Sandbox</strong>: commands run with an explicit <code>danger-full-access</code> sandbox policy (same as the model's bash tool session policy). The default <code>workspace-write</code> confinement kills the detached child of <code>tailscale serve --bg</code>, breaking the HTTPS "on" toggle. Blast radius stays bounded by the allowlist.</li>
+<li><strong>Browser-trust fence</strong>: the <code>/tsctl/api</code> prefix accepts only loopback Hosts or hosts in dsh's <code>--trusted-host</code> list (same fence as dsh's own <code>/api</code>).</li>
+<li><strong>Platform</strong>: proxy bypass cards are macOS-only; other platforms degrade gracefully.</li>
+</ul>
+<h2>Troubleshooting</h2>
+<table>
+<thead>
+<tr>
+<th>Symptom</th>
+<th>Cause</th>
+<th>Fix</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>Panel missing after restart, host route 200</td>
+<td><code>exports</code> lacks <code>"./package.json"</code> — client scan (<code>require.resolve('&lt;pkg&gt;/package.json')</code>) is blocked by Node exports encapsulation</td>
+<td>add <code>"./package.json": "./package.json"</code> to <code>exports</code>; restart</td>
+</tr>
+<tr>
+<td>Stale code served after editing sources</td>
+<td>pnpm <code>file:</code> deps are hard-linked copies</td>
+<td>re-symlink: <code>ln -s ../packages/dsh-tailscale-console node_modules/dsh-tailscale-console</code></td>
+</tr>
+<tr>
+<td>HTTPS "on" fails silently</td>
+<td>sandbox kills <code>serve --bg</code>'s daemon</td>
+<td>fixed in code (explicit policy + verify/retry)</td>
+</tr>
+<tr>
+<td>"On" button dead after HTTPS entry is off</td>
+<td>chicken-and-egg: the HTTPS page itself is unreachable once serve is off (connection refused)</td>
+<td>open the panel at <code>http://127.0.0.1:&lt;port&gt;</code> on the local machine and toggle on (remote page shows a hint)</td>
+</tr>
+<tr>
+<td>Settings/credentials page 403 remotely</td>
+<td>dsh <code>PRIVILEGED_METHODS</code> design limit</td>
+<td>operate locally; do not relax</td>
+</tr>
+<tr>
+<td>Phone access is slow</td>
+<td>ACL grants not saved</td>
+<td>see section 4</td>
+</tr>
+<tr>
+<td><code>tailscale ping</code> (TSMP) works, but real TCP/ICMP all time out</td>
+<td>control-plane ACL lost the default allow rule (only custom rules like the Peer Relay grant remain); tailscaled logs show <code>Drop: ... no rules matched</code></td>
+<td>re-add the default rule at the top of <code>grants</code> (below) — propagates in ~30s, no restart</td>
+</tr>
+</tbody></table>
+<p><strong>Default ACL rule (new <code>grants</code> format — three requirements)</strong></p>
+<p>When configuring a Peer Relay, the default "allow all connections" rule is easily overwritten. Once lost, every real packet is dropped by the ACL filter with <code>no rules matched</code>, while TSMP ping keeps working (internal path, bypasses ACL) — the classic "ping works, data doesn't" illusion. Always keep the default rule first:</p>
+<pre><code>{
+  "grants": [
+    { "src": ["*"], "dst": ["*"], "ip": ["*"] },
+    { "src": ["&lt;device IP&gt;"], "dst": ["&lt;relay server IP&gt;"],
+      "app": { "tailscale.com/cap/relay": [] } }
+  ]
+}
+</code></pre>
+<p>New <code>grants</code> requirements: <code>dst</code> takes no port; an explicit <code>ip</code> field is mandatory; <code>app</code> and <code>ip</code> cannot both be empty.</p>
+<p>Inspect commands:</p>
+<ul>
+<li>Server: <code>journalctl -u tailscaled | grep "no rules matched"</code></li>
+<li>macOS: <code>log show --last 30m --predicate 'eventMessage CONTAINS "no rules matched"'</code></li>
+</ul>
+<h2>License</h2>
+<p>MIT. The browser-trust fence mirrors dsh's <code>api-request-trust</code> logic (see <code>@deepseek-ai/dsh-client-connection</code>).</p>

@@ -1,0 +1,243 @@
+<h1>dsh-pseudo-vision</h1>
+<blockquote>
+<p>给 DeepSeek Harness 的 text-only provider 装上"工具层视觉"：把图片在落地到模型前，自动拆解成 OCR 文字 + 颜色统计 + 像素扫描 + 元信息，让任意纯文本模型也能"看图"。</p>
+</blockquote>
+<p><strong>实机验证通过</strong>（dsh 0.1.0-rc.8 / deepseek-v4-flash 实测：模型收到图片后正确读出 OCR 文字、颜色占比、图片尺寸并回答）。</p>
+<h2>它在做什么</h2>
+<p>当 <code>deepseek-v4-flash</code>（text-only）收到 <code>read_image</code> 失败错误时，可以用 <code>bash</code> + Python 拼出 OCR、像素分析、颜色统计和元信息，再把图片转换为结构化文本。</p>
+<p><strong>dsh-pseudo-vision 将这套本地证据链封装为插件能力</strong>：</p>
+<ol>
+<li>通过 <code>cordis.patch.yml</code> 接管官方 <code>deepseek-official</code> 路由，保持现有 DeepSeek 行为</li>
+<li>按 <code>bridgeProviders</code> 白名单（或显式 <code>bridgeOtherProviders</code>）为其他已注册 provider 生成兄弟路由，例如 <code>dsh-pseudo-vision/kimi-for-coding</code>、<code>dsh-pseudo-vision/openrouter</code></li>
+<li><strong>自动标识为识图</strong>：兄弟路由的 <code>resolveModel</code> / <code>listModels</code> 强制声明 <code>inputModalities: ["text", "image"]</code>，先通过 DSH 的图片 admission 门</li>
+<li><strong>请求时伪视觉</strong>：原生视觉模型原样透传；text-only 模型读附件 → 本地 4 工具转文本 → 替换 image block + 注入 <code>&lt;pseudo-vision-context&gt;</code>，再委托回原 provider</li>
+</ol>
+<p><strong>全程本机执行，无外部视觉 API</strong>。原始 provider 的 HTTP 请求只含文本，text-only 网关不会 400；原始 provider 路由本身不被修改。</p>
+<h2>提供的能力</h2>
+<table>
+<thead>
+<tr>
+<th>工具</th>
+<th>作用</th>
+<th>实现</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>vision_ocr</code></td>
+<td>提取图中所有文字（带归一化坐标）</td>
+<td>tesseract.js（chi_sim + eng，本地语言包）</td>
+</tr>
+<tr>
+<td><code>vision_color_stats</code></td>
+<td>像素占比分析（白/黑/灰/红/绿/蓝等）</td>
+<td>sharp + 直方图统计</td>
+</tr>
+<tr>
+<td><code>vision_pixel_scan</code></td>
+<td>逐行检测目标色像素密度</td>
+<td>sharp raw pixel access</td>
+</tr>
+<tr>
+<td><code>vision_meta</code></td>
+<td>尺寸、格式、色彩空间、四角/中心颜色采样</td>
+<td>sharp metadata</td>
+</tr>
+</tbody></table>
+<h2>OCR 优化管线（v0.4.0）</h2>
+<p>图片证据仍然全部在本机生成；OCR 现在不再固定压到 512px，而是按预算走一条可追溯的预处理管线：</p>
+<pre><code>- id: dsh-pseudo-vision
+  config:
+    ocrBudget: auto       # auto | small | normal | large | mega
+</code></pre>
+<h3>原图证据与 OCR 预处理边界</h3>
+<p>四项视觉证据不会共用被修改过的图片字节，处理分支如下：</p>
+<pre><code>原图 bytes
+├─ vision_color_stats → 原图颜色占比
+├─ vision_pixel_scan  → 原图目标色/红色行
+├─ vision_meta        → 原图尺寸、格式与采样
+└─ vision_ocr         → OCR 专用副本（预算、灰度、反色、增强）
+</code></pre>
+<p>自动伪视觉桥接只对 OCR 副本执行缩放、灰度、反色、对比度、锐化和白边；颜色统计、像素扫描、元信息始终基于原图。直接调用 <code>vision_ocr</code> 工具时也读取原图字节。所有处理都在本机完成，不会把原图发送给外部视觉 API。</p>
+<p><code>ocrNoResize: true</code> 的含义是跳过 OCR 分支的预算缩放和自适应放大，保留原图的几何尺寸；它<strong>不是</strong>完全关闭预处理，OCR 副本仍会增强并添加白边（最终副本会因此增加边框像素）。它也不影响另外三个工具读取原图。</p>
+<table>
+<thead>
+<tr>
+<th>阶段</th>
+<th>行为</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>预算与吸附</td>
+<td><code>small=512²</code>、<code>normal=1024²</code>、<code>large=1448²</code>、<code>mega=4096²</code>；按 Qwen 风格 <code>minPixels/maxPixels + 28</code> 倍数网格吸附</td>
+</tr>
+<tr>
+<td><code>auto</code></td>
+<td>常规图使用 <code>normal</code>；超过约 210 万像素使用 <code>large</code>；小图会先放大到 OCR 友好的尺寸</td>
+</tr>
+<tr>
+<td>小字放大</td>
+<td>OCR 前对小输入用 Lanczos 放大（不超过该预算的最长边上限）</td>
+</tr>
+<tr>
+<td>深色与低对比度</td>
+<td>自动依据原图颜色统计判断暗底，反色后执行灰度、对比度拉伸、轻锐化，并给贴边文字补白边</td>
+</tr>
+<tr>
+<td>超长截图</td>
+<td>原图高度超过 3000px 时先按原图切成 2000px 高、100px 重叠的块，再对每块独立预算预处理和 OCR，输出 <code>[第 i/N 块，y=...]</code> 边界</td>
+</tr>
+<tr>
+<td>低置信度复核</td>
+<td>Tesseract 置信度低于 60 的最多 3 行会裁剪、补边、2× 放大后复核；红色行像素扫描命中时扩大该复核区域</td>
+</tr>
+<tr>
+<td>缓存隔离</td>
+<td>缓存键包含 <code>sha256 + 解析后的 budget + langs/resize 开关 + OCR 管线参数版本</code>；旧缓存文件保留，不会与新管线串结果</td>
+</tr>
+</tbody></table>
+<p><code>auto</code> 适合默认使用；密集表格、细小字体或文档可显式选择 <code>large</code>/<code>mega</code>，只想限制本地 CPU/内存时选择 <code>small</code>。需要保留 OCR 原图尺寸时设 <code>ocrNoResize: true</code>（仍会执行灰度/对比度/锐化/白边增强）。颜色统计、像素扫描、元信息始终读取原图，不会因为 OCR 预处理而改变模型看到的颜色证据。<code>bypassCache: true</code> 可强制重算。</p>
+<h2>安装</h2>
+<pre><code># GitHub 安装（需网络，推荐）
+dsh plugin --profile web add github:DDDFXYqiming/dsh-pseudo-vision
+</code></pre>
+<blockquote>
+<p>⚠️ Windows 注意：本机若报 <code>schannel: CRYPT_E_NO_REVOCATION_CHECK</code> 或 pnpm 安全删除拦截，改用本地路径安装：</p>
+<pre><code>git clone https://github.com/DDDFXYqiming/dsh-pseudo-vision.git
+cd dsh-pseudo-vision
+pnpm install &amp;&amp; pnpm build
+dsh plugin --profile web add &lt;本机绝对路径&gt;
+</code></pre>
+</blockquote>
+<h2>使用</h2>
+<p><strong>装上即生效</strong>，无需额外配置。<code>deepseek-official</code> 路由继续自动支持图片。</p>
+<p><strong>其他 provider 默认不生成兄弟路由</strong>（避免模型选择器出现大量重复条目）。只有当你确实需要在某个 text-only provider 上收图时，才在 profile patch 中显式开启白名单：</p>
+<pre><code>- id: dsh-pseudo-vision
+  config:
+    bridgeProviders: ["kimi-for-coding"]   # 只给这个 provider 生成兄弟路由
+    ocrBudget: auto                        # 也可 small/normal/large/mega
+    ocrNoResize: false                     # true：跳过预算缩放/放大
+</code></pre>
+<p>或一次性桥接除 <code>excludeProviders</code> 外的所有 provider（谨慎：每个模型都会在模型选择器里多出一份 <code>· Pseudo Vision</code> 条目）：</p>
+<pre><code>    bridgeOtherProviders: true
+</code></pre>
+<p>开启后，模型选择器会出现 <code>dsh-pseudo-vision/&lt;provider&gt;</code>（显示为 <code>· Pseudo Vision</code>）兄弟路由；选择它，text-only 模型会自动走本地伪视觉转换，原生视觉模型保持原生透传。</p>
+<p><strong>效果示例</strong>（deepseek-v4-flash 实测收到的伪视觉证据）：</p>
+<pre><code>[dsh-pseudo-vision] sha256=46997842de08 budget=normal 原图:image/png 217068B 预处理:灰度 1392×776
+OCR 文本：23 行（"了解 deepseek harness 的 dsh 安装"等）
+OCR 低置信度重试：1 个区域（2× 局部复核）
+元信息：image/png, 217068B, 原图尺寸 1919×1019
+颜色统计：白色 94.1%、灰色 5.1%、其他 0.6%  → 推断浅色 UI
+像素扫描：无红色高密度行
+</code></pre>
+<p>模型基于以上结构化证据"脑补"出整张图内容。</p>
+<h2>兼容版本</h2>
+<table>
+<thead>
+<tr>
+<th>dsh 版本</th>
+<th>状态</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>0.1.0-rc.7</td>
+<td>⚠️ 结构兼容（未实机验证）</td>
+</tr>
+<tr>
+<td>0.1.0-rc.8</td>
+<td>✅ 实机验证通过</td>
+</tr>
+<tr>
+<td>0.1.0-rc.9+</td>
+<td>⚠️ 需重新验证（dsh 处于开发者预览，破坏性变更常见）</td>
+</tr>
+</tbody></table>
+<h2>权限</h2>
+<ul>
+<li>读取工作区内的图片附件</li>
+<li>写入临时缓存到 <code>~/.dsh/profiles/&lt;profile&gt;/.dsh-pseudo-vision/cache/</code>（键含 sha256、budget、langs/resize 开关、OCR 管线参数版本）</li>
+<li>进程内 tesseract.js OCR + sharp（首次运行从 tesseract CDN 下载语言包到内置缓存，之后离线）</li>
+<li>接管 <code>deepseek-official</code> provider（禁用官方 llm-deepseek，由插件重新注册）</li>
+<li>按配置（<code>bridgeProviders</code> 白名单 / <code>bridgeOtherProviders</code> 全开）为指定 provider 注册兄弟路由；兄弟 adapter 通过公开的 <code>ctx.llm</code> API 委托原始 provider。<strong>默认不注册任何其他 provider 的兄弟路由</strong></li>
+</ul>
+<p><strong>不</strong>会：</p>
+<ul>
+<li>上传任何图片到外部 API</li>
+<li>修改 dsh 核心代码（纯 cordis patch + adapter 包装）</li>
+<li>覆盖或替换原始 provider adapter；原路由仍按原逻辑运行</li>
+</ul>
+<h2>已知边界</h2>
+<ul>
+<li>复杂空间关系、真实照片：描述精度有限，伪视觉证据不等同于真实多模态理解</li>
+<li>OCR 可能认错字（例如把 "DeepSeek" 识别成 "Deepseck"），影响理解</li>
+<li>颜色统计只给占比，无法还原布局/图标细节</li>
+<li>大图：OCR 按 <code>ocrBudget</code> 预算处理；超长截图会先按原图切块，颜色/像素/元信息仍基于原图</li>
+<li>OCR 低置信度复核最多 3 个区域；它提升小字可读性，但不等同于真正的图像超分辨率</li>
+</ul>
+<h2>⚠️ 已知边界 / 路线图</h2>
+<p>当前版本（v0.4.0）已支持通过兄弟路由桥接其他 live provider，并新增可配置 OCR 预算、长截图分块、暗色/低对比度增强、低置信度局部复核与参数隔离缓存；跨 provider 仍<strong>默认关闭</strong>（<code>bridgeProviders</code> 白名单开启），且需要用户在模型选择器中选择带 <code>· Pseudo Vision</code> 标记的路由；原始 provider 不会被隐式改写。</p>
+<table>
+<thead>
+<tr>
+<th>项</th>
+<th>状态</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong>其他 text-only 模型支持</strong>（<code>llm-pi-ai</code> 下的 GLM / Qwen / Kimi / OpenRouter 等）</td>
+<td>✅ 已实现（默认关闭）</td>
+<td>通过 <code>bridgeProviders</code> 白名单或 <code>bridgeOtherProviders</code> 开启；开启后注册 <code>dsh-pseudo-vision/&lt;provider&gt;</code> 兄弟路由，原始路由保持不变</td>
+</tr>
+<tr>
+<td><strong>外部 Vision Backend</strong>（Qwen-VL / Gemini / OpenAI-compatible）</td>
+<td>❌ 未实现</td>
+<td>当前版本坚持本地 OCR/颜色/像素/元信息；后续可增加显式 opt-in 的外部视觉后端</td>
+</tr>
+<tr>
+<td><strong>自动切换兄弟路由</strong></td>
+<td>⚠️ 未实现</td>
+<td>当前需在模型选择器手动选择 <code>· Pseudo Vision</code> 路由，避免污染原始会话模型选择</td>
+</tr>
+<tr>
+<td><strong>npm 发布</strong></td>
+<td>❌ 未发布</td>
+<td>发布为 <code>dsh-pseudo-vision</code> npm 包，支持 <code>dsh plugin add</code> 一行安装</td>
+</tr>
+<tr>
+<td><strong>client 端增强</strong></td>
+<td>⚠️ 基础版</td>
+<td>已有 settings 插件卡片；自动 composer 图片提示未做</td>
+</tr>
+<tr>
+<td><strong>多语言 OCR 配置</strong></td>
+<td>✅ 已支持</td>
+<td><code>langs</code> 配置项（默认 <code>chi_sim+eng</code>）</td>
+</tr>
+<tr>
+<td><strong>图像预缩放策略</strong></td>
+<td>✅ 已实现</td>
+<td><code>ocrBudget</code> + smart resize + 小字自适应放大；<code>auto</code> 按原图像素数选择 normal/large</td>
+</tr>
+<tr>
+<td><strong>长截图 OCR</strong></td>
+<td>✅ 已实现</td>
+<td>原图高度 &gt; 3000px 时 2000px 分块、100px 重叠，块级预算预处理并合并边界</td>
+</tr>
+<tr>
+<td><strong>预处理与局部复核</strong></td>
+<td>✅ 已实现</td>
+<td>暗色反色、灰度/对比度/锐化、白边、低置信度最多 3 区域 2× 重试</td>
+</tr>
+<tr>
+<td><strong>缓存失效/手动刷新</strong></td>
+<td>✅ 已实现</td>
+<td>sha256 + budget + 管线参数版本内容寻址缓存；<code>bypassCache</code> 强制重算</td>
+</tr>
+</tbody></table>
+<h2>关联项目</h2>
+<ul>
+<li><code>dsh-vision-skill</code>（同一作者，已弃用）：早期 paste-to-path 方案</li>
+<li><a href="https://github.com/oil-oil/dsh-vision">oil-oil/dsh-vision</a>：本插件架构参考（adapter 替换思路），但使用外部视觉 API 而非本地工具</li>
+</ul>
+<h2>License</h2>
+<p>MIT</p>

@@ -1,0 +1,158 @@
+<h1>dsh-memory-s3（记忆S3）</h1>
+<blockquote>
+<p>云端跨会话记忆插件 for DeepSeek Harness：结构化条目 + 向量检索，持久化于 S3 兼容对象存储（AWS S3 / MinIO / Cloudflare R2 / 阿里云 OSS）。</p>
+</blockquote>
+<p>记忆不再困于单机——只要握着同一把桶钥匙，任何机器、任何部署、任何 DSH 实例都能共享与续写同一份记忆。<strong>记忆S3</strong> 欺骗的收束点是"记忆的位置"：从本地文件系统，迁移到对象存储的永恒之海。</p>
+<h2>✨ 特性</h2>
+<ul>
+<li><strong>S3 兼容存储后端</strong>：条目 CRUD + listObjects 同步 + 乐观并发（If-Match）；自定义 endpoint 兼容 MinIO/R2/OSS</li>
+<li><strong>结构化记忆模型 v2.1</strong>：<code>preference | project | decision | history | moment</code> 五类条目（moment = 时刻/照片/纪念日，对应 Tulving 情景记忆），带 importance/tags/source/时间戳 + 可选四维字段：<code>subject</code>（主体）/ <code>timeline</code>（时间线归属）/ <code>links</code>（关联引用）/ <code>locked</code>（锁定保护）</li>
+<li><strong>向量语义检索</strong>：可插拔嵌入器 + 余弦 top-k + 元数据/关键词混合召回（中文友好）</li>
+<li><strong>本地缓存投影</strong>：冻结快照只读本地缓存（rc.6 同步注入约束），S3 异步回源，离线降级只读</li>
+<li><strong>写入审批门</strong>：所有写操作强制 DSH approval seam（ask/auto/off），模型不可见不可改</li>
+<li><strong>审计三链</strong>：审批对 + 审计账本 + 快照，可从会话日志重建全部写入</li>
+<li><strong>照片/文件附件</strong>：条目可挂照片/文件——二进制存 S3 <code>files/{id}</code> 不可变对象（uuid 键 + If-None-Match 创建 + sha256 完整性），条目 JSON 只存附件元数据数组；本地文件经扩展名白名单 + 魔法字节嗅探 + 大小上限（20MB）三重校验；<code>memory_s3_attach</code> / <code>memory_s3_get_file</code> / <code>memory_s3_detach</code> 三工具</li>
+<li><strong>反链索引（v2.1）</strong>：写入 <code>links</code>（引用即链接，Obsidian/Zettelkasten 心智）自动回填本地反链索引（<code>lib/backlinks.mjs</code> → <code>backlinks.json</code>，0600 持久化，替换语义）；<code>memory_s3_backlinks</code> 查询「谁引用了该条目」（读路径无审批）；被引用数（图中心性）是快照注入的排序信号</li>
+<li><strong>分层快照注入（v2.1）</strong>：冻结快照按 Bonds（locked / 高重要性约定，保底 40% 预算）→ Moments（moment 按新近）→ Facts（按 importance，同分按被引用数）三层投影；带 links 的条目行尾自动标记 <code>→关联N</code>；<code>locked</code> 条目跳过同 title 自动合并（防无意覆盖）</li>
+<li><strong>会话摘要归档</strong>（规划）：会话结束自动提炼 → 待审提案</li>
+</ul>
+<h2>🚀 快速开始</h2>
+<h3>前置要求</h3>
+<ul>
+<li>Node.js ≥ 20（推荐 22+）</li>
+<li>DeepSeek Harness（<code>dsh</code> CLI，rc.6+），两种获取方式：<ul>
+<li><strong>全局安装</strong>（推荐，一劳永逸）：<code>npm install -g @deepseek-ai/dsh</code></li>
+<li><strong>免安装调用</strong>（新机器/容器首选）：<code>npx @deepseek-ai/dsh</code>（与 <code>dsh</code> 完全等价，本文命令两种前缀可互换）</li>
+</ul>
+</li>
+<li>一个 S3 兼容对象存储桶（AWS S3 / MinIO / R2 / OSS）</li>
+</ul>
+<h3>安装</h3>
+<p>从 GitHub 获取（推荐，pnpm 语法，<code>dsh plugin add</code> 透传）。以下以 <code>npx @deepseek-ai/dsh</code> 为例（无需全局安装）；已全局安装 <code>dsh</code> 时，将 <code>npx @deepseek-ai/dsh</code> 替换为 <code>dsh</code> 即可：</p>
+<pre><code># 方式一：HTTPS 直接安装
+npx @deepseek-ai/dsh plugin --profile web add https://github.com/Re-s/dsh-memory-s3.git
+
+# 方式二：指定分支（如 main）/ tag / commit
+npx @deepseek-ai/dsh plugin --profile web add https://github.com/Re-s/dsh-memory-s3.git#main
+
+# 方式三：SSH 方式（需配置 GitHub SSH key）
+npx @deepseek-ai/dsh plugin --profile web add git@github.com:Re-s/dsh-memory-s3.git
+</code></pre>
+<p>本地开发（源码调试，link 方式）：</p>
+<pre><code>git clone https://github.com/Re-s/dsh-memory-s3.git
+npx @deepseek-ai/dsh plugin --profile web add "link:/path/to/dsh-memory-s3"
+</code></pre>
+<p>配置环境变量：</p>
+<pre><code># S3 凭据（必需；进程内读取，不落盘，绝不进配置文档）
+export AWS_ACCESS_KEY_ID=...
+export AWS_SECRET_ACCESS_KEY=...
+export AWS_SESSION_TOKEN=...   # 可选，临时凭据
+
+# 向量召回嵌入（仅当 embedder.provider=openai-compatible 时用；provider=none 则不需要）
+export OPENAI_API_KEY=...      # 或按 embedder.apiKeyEnv 改名的变量
+</code></pre>
+<blockquote>
+<p>凭据只走环境变量；<strong>bucket / endpoint / region / prefix / writePolicy 等非敏感配置</strong>经官方 <code>ctx.settings</code> 缝（见下）配置——配置与凭据严格分离。</p>
+</blockquote>
+<h3>配置（符合 DSH 官方设置缝 <code>ctx.settings</code>）</h3>
+<blockquote>
+<p>本插件已接入 DSH 官方 <code>ctx.settings</code> 缝。配置经三层解析：
+<strong>schema 默认值 → 该插件条目配置（<code>cordis.patch.yml</code> 的 entry config，composition base）→ 用户设置段（<code>settings.yaml</code> 顶层 <code>memory-s3:</code>）</strong>。
+未挂载 settings 服务的 profile 自动回退到 entry config alone（官方契约：无 provider 时插件不受影响）。</p>
+<p>S3 凭据只从环境变量读取（<code>accessKeyEnv</code>/<code>secretKeyEnv</code>，默认 <code>AWS_ACCESS_KEY_ID</code>/<code>AWS_SECRET_ACCESS_KEY</code>），绝不落盘、绝不进设置文档。</p>
+</blockquote>
+<h4>方式一：官方设置缝（推荐，GUI 设置页可编辑）——<code>$DSH_HOME/settings.yaml</code></h4>
+<p>在 <code>settings.yaml</code> <strong>顶层</strong>写 <code>memory-s3:</code> 段（不是旧文档的 <code>plugins.memory-s3</code> 子段）：</p>
+<pre><code>memory-s3:
+  enabled: true
+  bucket: my-memory-bucket
+  prefix: agent/memory
+  endpoint: ""          # 留空用 AWS；MinIO/R2 填 https://...
+  region: us-east-1
+  writePolicy: ask      # ask | auto | off
+  snapshotOrder: -50    # systemPrompt 注入段顺序
+  maxInjectedItems: 5   # 快照注入条数上限
+  importanceThreshold: 3 # 进入"事实层"注入候选的重要性下限
+  embedder:
+    provider: openai-compatible
+    endpoint: https://api.openai.com/v1/embeddings
+    apiKeyEnv: OPENAI_API_KEY
+    model: text-embedding-3-small
+    dimensions: 768    # 显式覆盖；text-embedding-3-small 常见 1536，此处代码默认 768
+  cacheDir: ""          # 留空 = $DSH_HOME/dsh-memory-s3/cache
+  auditRetentionDays: 0 # 0 = 永久保留
+  maxFileBytes: 20971520      # 附件大小上限（字节；默认 20MB，&gt;100MB 时加载告警）
+  allowedFileTypes: [png, jpg, jpeg, gif, webp, pdf, zip, txt, md, json, csv]  # 附件扩展名白名单（小写，无点）
+</code></pre>
+<h4>方式二：entry config（composition base）</h4>
+<p>在 profile 的 <code>cordis.patch.yml</code> 以小写 id 覆盖该条目的 <code>config</code>（整体替换语义）：</p>
+<pre><code>- id: memory-s3
+  config:
+    enabled: true
+    bucket: my-memory-bucket
+    endpoint: ""
+    region: us-east-1
+    writePolicy: ask
+    embedder:
+      provider: none
+</code></pre>
+<p>用户设置段（方式一）中出现的字段会覆盖 entry config 的同名字段；entry config 又覆盖 schema 默认值。</p>
+<h3>使用</h3>
+<pre><code># 模型工具
+memory_s3_save     保存一条记忆（过审批门；可携附件 attachments:[{path, note?}]）
+memory_s3_search   关键词检索
+memory_s3_recall   语义召回
+memory_s3_list     列表/过滤
+memory_s3_backlinks 查询反链（谁引用了该条目；无审批，读本地索引）
+memory_s3_update   更新（过审批门；支持 subject/timeline/links/locked）
+memory_s3_delete   删除（过审批门）
+memory_s3_forget   抑制自动注入而不删除
+memory_s3_attach   给已有条目挂附件（过审批门）
+memory_s3_get_file 下载附件到本地（无审批，sha256 校验）
+memory_s3_detach   移除附件（过审批门，删 S3 对象 + 条目元数据）
+memory_s3_sync     手动同步 S3 增量
+memory_s3_status   状态视图
+
+# 命令行（规划中，未实现）
+# /memory-s3 status|sync
+</code></pre>
+<h2>📁 项目结构</h2>
+<pre><code>dsh-memory-s3/
+├── index.mjs          # 插件入口（唯一 DSH 依赖面）
+├── types.d.ts         # ctx.memoryS3 类型契约
+├── lib/
+│   ├── s3store.mjs    # S3 对象布局 + CRUD + 乐观并发
+│   ├── cache.mjs      # 本地缓存（索引 + 条目 LRU）
+│   ├── embedder.mjs   # 可插拔嵌入器（OpenAI 兼容 / Ollama）
+│   ├── vector.mjs     # 余弦 top-k + 过滤（纯 JS）
+│   ├── entry.mjs      # 条目模型校验/序列化（含附件元数据 + subject/timeline/links/locked）
+│   ├── backlinks.mjs  # 反链索引（links 入边镜像，本地 backlinks.json 持久化）
+│   ├── filemeta.mjs   # 附件探测：魔法字节 / 扩展名白名单 / 大小上限 / sha256
+│   ├── gate.mjs       # 审批门策略封装
+│   ├── audit.mjs      # 审计账本（JSONL）
+│   └── strings.mjs    # 词表（en/zh）
+├── docs/              # requirements / TECH_STACK / ARCHITECTURE / SECURITY / MODEL / OMDSH_REVIEW / PROBLEM_REPORT.tests-v2.1
+├── test/              # node --test
+├── scripts/           # 冒烟脚本（smoke-rustfs.mjs / smoke-attachments.mjs）
+├── cordis.patch.yml   # bundle 声明
+└── package.json
+</code></pre>
+<h2>🔒 安全边界</h2>
+<ul>
+<li><strong>凭据永不落记忆</strong>：访问密钥仅来自环境变量/DSH 配置，绝不进入条目/快照/审计；内置秘密检测器拒绝含凭据形状的写入</li>
+<li><strong>附件三重防护</strong>：未知扩展名/魔法字节/超限文件一律拒绝（白名单制）；文本类附件内容过秘密检测；附件二进制不进审批 reason 与审计（只进元数据摘要）；下载时 sha256 校验防篡改</li>
+<li><strong>网络面</strong>：仅出站 HTTPS 到配置的 S3 endpoint 与嵌入端点；无其他出站</li>
+<li><strong>静态加密</strong>：依赖 S3 服务端加密（SSE-S3 默认）；本地缓存权限 0600</li>
+<li><strong>最小权限</strong>：IAM/桶策略仅允许单 prefix 读写（见 docs/SECURITY.md 示例）</li>
+<li><strong>共享即共享数据</strong>：同一 bucket+prefix 的所有 DSH 实例共享记忆；先建立信任边界</li>
+<li><strong>卸载不删云上数据</strong>：移除插件注册不影响 S3 中的记忆对象</li>
+</ul>
+<h2>🛠️ 开发</h2>
+<pre><code>npm test              # node --test 跑 test/*.test.mjs
+npm run coverage      # 覆盖率报告
+</code></pre>
+<p>提交使用 Conventional Commits（feat/fix/docs/refactor/test/chore）。</p>
+<h2>📄 License</h2>
+<p><a href="https://github.com/Re-s/dsh-memory-s3/blob/HEAD/LICENSE">MIT</a></p>
+<hr>
+<p><em>El Psy Kongroo.</em></p>

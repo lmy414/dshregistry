@@ -1,0 +1,571 @@
+
+
+<h1>evo</h1>
+<p><strong>Evolving memory for agents — recall before the model thinks, reflect after it answers.</strong></p>
+<p><a href="https://github.com/TIZ36/evo/blob/HEAD/LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License: MIT"></a>
+<a href="https://nodejs.org"><img src="https://img.shields.io/badge/node-%3E%3D22.19-5fa04e.svg" alt="Node"></a>
+<a href="#limitations"><img src="https://img.shields.io/badge/status-alpha-orange.svg" alt="Status"></a></p>
+
+
+<p><code>evo</code> is a provider-neutral memory service with a Cordis plugin and a native DeepSeek Harness
+adapter. It recalls durable memory into the system prompt before a
+model step, and reflects completed turns into structured memory afterwards — so an agent keeps what
+it learned across sessions without you writing it down.</p>
+<blockquote>
+<p><strong>Renamed:</strong> this project was published as <code>evo-memory</code> until <code>0.2.x</code>. The old data directory, the
+old <code>EVO_MEMORY_*</code> environment variables, and the old <code>/evo-memory/*</code> HTTP prefix all still work —
+see <a href="#migrating-from-evo-memory">Migrating from <code>evo-memory</code></a>.</p>
+</blockquote>
+<h2>Contents</h2>
+<ul>
+<li><a href="#features">Features</a> · <a href="#requirements">Requirements</a> · <a href="#install">Install</a> · <a href="#quick-start">Quick start</a></li>
+<li><a href="#how-it-works">How it works</a> · <a href="#workspace-import">Workspace import</a> · <a href="#settings--memory-panel">Settings panel</a></li>
+<li><a href="#claude-code-hook">Claude Code hook</a> · <a href="#codex-plugin">Codex plugin</a> · <a href="#http-api">HTTP API</a></li>
+<li><a href="#configuration">Configuration</a> · <a href="#service-api">Service API</a> · <a href="#memory-scopes">Scopes</a></li>
+<li><a href="#privacy-and-safety">Privacy</a> · <a href="#limitations">Limitations</a> · <a href="#development">Development</a> · <a href="#license">License</a></li>
+</ul>
+<h2>Features</h2>
+<ul>
+<li><strong>Recall + reflect loop.</strong> Memory is assembled into the system prompt on every turn, and each
+successful turn is distilled back into structured memory items.</li>
+<li><strong>Structured, not a scratchpad.</strong> Every item has a scope, a kind (<code>fact</code>, <code>constraint</code>,
+<code>procedure</code>, <code>skill</code>, …), tags, and a source pointing at the session and turn it came from.</li>
+<li><strong>Local by default.</strong> Storage is a single SQLite file via Node's built-in <code>node:sqlite</code> — no
+native addon, no service to run, nothing leaves the machine except the reflection model call.</li>
+<li><strong>Workspace import.</strong> Existing <code>CLAUDE.md</code>, <code>AGENTS.md</code>, <code>.codex/</code>, <code>.copilot/</code>, <code>.agent/</code>, and
+<code>.paper/</code> files in a project are imported as project-scoped memory on first use.</li>
+<li><strong>Provider-neutral core.</strong> The domain model depends on interfaces (<code>MemoryStore</code>, <code>ModelRunner</code>,
+<code>MemoryMaterializer</code>, <code>MemoryEventSink</code>); SQLite and DeepSeek Harness are implementations.</li>
+<li><strong>Native web panel.</strong> A Settings → Memory page plus a composer status chip, shipped as a
+plain-JS client half with no extra build step.</li>
+<li><strong>Claude Code and Codex plugin.</strong> One hook bridge, shipped as a plugin to both CLIs: it
+recalls memory into a session and distils finished turns back into it, using whichever CLI
+it runs under — and that CLI's own credentials.</li>
+</ul>
+<h2>Requirements</h2>
+<ul>
+<li>Node.js 22.19 or newer</li>
+<li>DeepSeek Harness <code>0.1.x</code> (for the adapter and the web panel)</li>
+<li>A configured Harness LLM provider and model for reflection and consolidation</li>
+</ul>
+<p>The Cordis plugin and the core work without Harness; the Harness pieces are optional peers.</p>
+<h2>Install</h2>
+<pre><code>pnpm add evo
+</code></pre>
+<p>From a local checkout, before publication:</p>
+<pre><code>pnpm add /absolute/path/to/evo
+</code></pre>
+<h2>Quick start</h2>
+<h3>DeepSeek Harness, via the installer</h3>
+<p>For an npx-managed Harness profile, run the installer from a checkout:</p>
+<pre><code>./install_evo_dsps.sh
+</code></pre>
+<p>It builds the package, installs a local link through the official <code>dsh plugin</code> command, and
+activates <code>evo</code> as a DSH bundle. The default profile is <code>web</code>; override it with <code>DSH_PROFILE=tui</code>
+or another profile name. The script never edits the profile's user <code>cordis.patch.yml</code>.</p>
+<p>The bundle uses <code>deepseek-official</code> and <code>deepseek-v4-flash</code> by default; override them at launch
+with <code>EVO_PROVIDER</code> and <code>EVO_MODEL</code>.</p>
+<h3>DeepSeek Harness, by hand</h3>
+<p>Add the plugins after the Harness LLM and system-prompt services:</p>
+<pre><code>- id: evo
+  name: evo/cordis
+  config: {}
+
+- id: evo-deepseek
+  name: evo/deepseek
+  config:
+    provider: deepseek-official
+    model: deepseek-chat
+    recallLimit: 40
+    maxContextChars: 6000
+    reflect: true
+
+# Optional: carries the Settings → Memory web panel. The bare package name is
+# required — the client-modules scan only discovers dsh.client bundles there.
+- id: evo-web
+  name: evo
+  config: {}
+</code></pre>
+<p><a href="https://github.com/TIZ36/evo/blob/HEAD/examples/cordis.yml"><code>examples/cordis.yml</code></a> has a copyable fragment.</p>
+<h2>How it works</h2>
+<p>The adapter uses official Harness extension points only:</p>
+<table>
+<thead>
+<tr>
+<th>Extension point</th>
+<th>Role</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>system-prompt/assemble</code></td>
+<td>Recalls global, project, and session memory into dynamic context</td>
+</tr>
+<tr>
+<td><code>session/event</code></td>
+<td>Observes successful <code>turn/end</code> events and reflects user, assistant, and tool activity</td>
+</tr>
+<tr>
+<td><code>ctx.llm.stream()</code></td>
+<td>Runs reflection and consolidation through the configured Harness model route</td>
+</tr>
+</tbody></table>
+<p>Interrupted, aborted, rejected, and failed turns are never reflected.</p>
+<h2>Workspace import</h2>
+<p>When a session opens in a project working directory (<code>session.header.cwd</code>), the adapter imports the
+project's existing agent memory and skill files into the project scope on the first prompt assembly.
+The imported knowledge is then recalled like any other memory — no configuration required.</p>
+<table>
+<thead>
+<tr>
+<th>File / directory (relative to <code>cwd</code>)</th>
+<th>Memory kind</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>CLAUDE.md</code>, <code>.claude/CLAUDE.md</code></td>
+<td>fact</td>
+</tr>
+<tr>
+<td><code>AGENTS.md</code>, <code>agents.md</code>, <code>.agent/AGENTS.md</code></td>
+<td>constraint</td>
+</tr>
+<tr>
+<td><code>.paper/AGENT_MEMORY.md</code>, <code>.paper/**/*.md</code></td>
+<td>fact</td>
+</tr>
+<tr>
+<td><code>.claude/commands/**/*.md</code>, <code>.claude/agents/**/*.md</code></td>
+<td>procedure</td>
+</tr>
+<tr>
+<td><code>.codex/**/*.md</code>, <code>.copilot/instructions/**/*.md</code>, <code>.copilot/prompts/**/*.md</code>, <code>.agent/**/*.md</code></td>
+<td>constraint</td>
+</tr>
+<tr>
+<td><code>.claude/skills/**/SKILL.md</code>, <code>.codex/skills/**/SKILL.md</code>, <code>.copilot/skills/**/SKILL.md</code>, <code>.agent/skills/**/SKILL.md</code>, <code>.paper/skills/**/SKILL.md</code>, <code>.paper/agents/skills/**/SKILL.md</code></td>
+<td>skill</td>
+</tr>
+</tbody></table>
+<p>Each file becomes one memory item titled with its path relative to the workspace root, tagged
+<code>workspace-import</code> plus <code>tool:&lt;tool&gt;</code>, and sourced with <code>runtime: 'workspace-import'</code> and the
+absolute file path. YAML frontmatter is stripped; <code>*.memory.md</code> skill-experience files and empty
+documents are skipped.</p>
+<p>Import is idempotent: items are upserted by <code>(project scope, title)</code>, changed files update in place,
+and removed files are never deleted. A project is imported once; re-scan with <code>force</code>:</p>
+<pre><code>await ctx.evo.importWorkspace('/workspace/app', { force: true })
+</code></pre>
+<p>Disable the automatic import with <code>workspaceImport: false</code> in the <code>evo-deepseek</code> config.</p>
+<h2>Settings → Memory panel</h2>
+<p>The package ships a web client half (<code>dsh.client</code> + <code>exports["./client"]</code>) that adds a <strong>Memory</strong>
+page to the Harness GUI Settings section: the memory list (kind tabs + search), the recent
+reflect/consolidate activity log, and actions to consolidate a scope or force a workspace re-import.
+It is served by the DSH client-modules mechanism at <code>/plugins/evo/client.js</code> and needs no separate
+build step.</p>
+<p>In a live conversation the composer tool row also gets an <strong>evo</strong> chip that keeps the mark visible
+and pulses while evo is reflecting or consolidating (it polls <code>/evo/status</code>). Clicking it opens the
+Settings → Memory page.</p>
+<p>The client half is carried by a no-op Loader row named by the bare package (<code>evo-web</code> in
+<code>cordis.patch.yml</code>): the client-modules scan discovers <code>dsh.client</code> packages only through bare
+package names, so a subpath row like <code>evo/cordis</code> cannot carry a web client. Restart Harness after
+upgrading so the new boot graph includes the panel.</p>
+<h2>Claude Code hook</h2>
+<p>evo also plugs into Claude Code (CLI and desktop, which share <code>~/.claude/settings.json</code>)
+through its hook system — no Harness, no web server, no API key of its own.</p>
+<p>Install it as a plugin:</p>
+<pre><code>/plugin marketplace add TIZ36/evo
+/plugin install evo
+</code></pre>
+<p>or patch the settings file directly with the installer:</p>
+<pre><code>./install_evo_claude.sh              # install or upgrade, for every project
+./install_evo_claude.sh --uninstall  # remove evo's entries again
+</code></pre>
+<p>Use one or the other. Both at once makes evo run twice per turn.</p>
+<p>The installer builds the package and patches the user-level
+<code>~/.claude/settings.json</code> (override the location with <code>CLAUDE_CONFIG_DIR</code>). It is
+meant to be re-run: evo's own entries are replaced with the current set — hook
+events added by a later version included — while every other hook in the file is
+kept as it is. The previous file is copied to <code>settings.json.evo-backup</code> first,
+and the installed command is probed before success is reported.</p>
+<p>To wire it by hand instead, or to scope evo to a single repository through that
+project's <code>.claude/settings.json</code>:</p>
+<pre><code>{
+  "hooks": {
+    "SessionStart":     [ { "hooks": [ { "type": "command", "command": "evo-hook", "timeout": 20 } ] } ],
+    "UserPromptSubmit": [ { "hooks": [ { "type": "command", "command": "evo-hook", "timeout": 20 } ] } ],
+    "Stop":             [ { "hooks": [ { "type": "command", "command": "evo-hook", "timeout": 20 } ] } ]
+  }
+}
+</code></pre>
+<p><code>hooks</code> entries are arrays, so this coexists with hooks you already run. A
+copyable file is in <a href="https://github.com/TIZ36/evo/blob/HEAD/examples/claude-code-settings.json"><code>examples/claude-code-settings.json</code></a>.
+<code>evo-hook</code> is the package's bin; from a local checkout use
+<code>node /path/to/evo/dist/hook/cli.mjs</code> as the command instead. Installing both
+globally and per-project makes evo run twice per turn — pick one.</p>
+<table>
+<thead>
+<tr>
+<th>Event</th>
+<th>What evo does</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>SessionStart</code></td>
+<td>Settles any batch left waiting, imports the workspace's agent files, then prints recalled memory into the session</td>
+</tr>
+<tr>
+<td><code>UserPromptSubmit</code></td>
+<td>Settles this project's batch if it has gone idle, then prints global + project memory, which Claude Code injects as context</td>
+</tr>
+<tr>
+<td><code>Stop</code></td>
+<td>Queues the finished turn, and distils the batch once it is worth a model call</td>
+</tr>
+</tbody></table>
+<p>Reflection runs through the local <code>claude -p</code> CLI, reusing the credentials Claude
+Code already has (under Codex it is <code>codex exec</code> instead — see
+<a href="#codex-plugin">Codex plugin</a>). It takes several seconds, so the hook returns
+immediately and the work continues in a detached process — a session is never
+blocked by evo. The child runs with <code>EVO_HOOK_DISABLE=1</code> so its own hooks exit at
+once; without that guard reflection would recurse.</p>
+<p>Turns are distilled in batches, not one by one. A single turn is thin material:
+what earns a place in memory — the pit stepped into three times, the convention
+confirmed again — only becomes visible across turns, and reflecting per turn pays
+a model call to miss it. A batch is distilled once it holds <code>EVO_HOOK_BATCH_TURNS</code>
+turns, once those turns add up to <code>EVO_HOOK_BATCH_CHARS</code> characters, or once it
+has sat idle for <code>EVO_HOOK_BATCH_IDLE_MS</code>.</p>
+<p>That last condition is checked, never fired: a hook is a fresh short-lived process,
+so no timer survives between turns. Later hook events settle the deadline instead —
+a prompt settles the project it belongs to, and a session start settles every
+project left hanging when work stopped. Set <code>EVO_HOOK_BATCH_TURNS=1</code> to distil
+turn by turn as before.</p>
+<p>The reflector is told which memories the scope already holds and how many it may
+return. Both bounds matter: blind to the store it renames yesterday's fact into a
+new row, and uncapped it quotes one long answer back as eight durable memories. It
+may also name memories the batch disproved, which are then dropped — but only ones
+evo distilled itself. Imported workspace files are a projection of what is on disk;
+evo never evicts them, or one reflection could delete your own rules.</p>
+<h3>As a plugin</h3>
+<p>The repository is also a plugin marketplace: <code>.claude-plugin/marketplace.json</code>
+offers a single plugin whose source is <a href="https://github.com/TIZ36/evo/blob/HEAD/plugin"><code>plugin/</code></a>, holding both hosts'
+manifests, <code>hooks/hooks.json</code>, and one dependency-free bundle at
+<code>plugin/bin/hook.mjs</code>. <a href="#codex-plugin">Codex</a> installs that same directory.</p>
+<p>That bundle is committed on purpose. Both hosts install a plugin by copying the
+repository: they run no build step, and Claude Code restores dependencies only
+for npm and bun lockfiles, never pnpm. So the plugin has to be runnable exactly
+as checked in — <code>pnpm build</code> regenerates it, <code>pnpm test</code> fails if it drifts from
+the source, and the hook commands address it through
+<code>${PLUGIN_ROOT:-${CLAUDE_PLUGIN_ROOT}}</code> (Codex exports the first, Claude Code the
+second) so no machine path is ever written down.</p>
+<h3>What you see</h3>
+<p>Recall is silent: memory arrives as context, not as UI noise. evo speaks in the
+transcript only twice — through the hook's <code>systemMessage</code>, which Claude Code
+renders as its own line:</p>
+<ul>
+<li>after a turn it learned from, on your next prompt: <code>evo · remembered 2, updated 1</code></li>
+<li>when it is broken: <code>evo · memory unavailable: &lt;reason&gt;</code></li>
+</ul>
+<p>Reflection finishes after its turn is over, so its result is left as a
+breadcrumb next to the database and reported once on the following prompt, then
+cleared. <code>SessionStart</code> never reports it — Claude Code consumes that event's
+output without rendering a system message.</p>
+<p>Failures never interrupt a session: the hook always exits 0, and the full error
+goes to <code>&lt;dataDir&gt;/hook.log</code>.</p>
+<table>
+<thead>
+<tr>
+<th>Variable</th>
+<th>Default</th>
+<th>Purpose</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>EVO_HOOK_REFLECT</code></td>
+<td><code>1</code></td>
+<td>Set <code>0</code> to recall only and never write memory</td>
+</tr>
+<tr>
+<td><code>EVO_HOOK_IMPORT</code></td>
+<td><code>1</code></td>
+<td>Set <code>0</code> to skip the workspace import on session start</td>
+</tr>
+<tr>
+<td><code>EVO_HOOK_MODEL</code></td>
+<td><code>claude-haiku-4-5-20251001</code> under Claude Code, your own model under Codex</td>
+<td>Model used for reflection</td>
+</tr>
+<tr>
+<td><code>EVO_HOOK_RECALL_LIMIT</code></td>
+<td><code>40</code></td>
+<td>Memories considered per recall</td>
+</tr>
+<tr>
+<td><code>EVO_HOOK_MAX_CHARS</code></td>
+<td><code>6000</code></td>
+<td>Character budget of the injected context</td>
+</tr>
+<tr>
+<td><code>EVO_HOOK_NOTIFY</code></td>
+<td><code>1</code></td>
+<td>Set <code>0</code> to remove the transcript line entirely</td>
+</tr>
+<tr>
+<td><code>EVO_HOOK_DEBUG</code></td>
+<td>unset</td>
+<td>Set <code>1</code> to log every recall, import and reflection</td>
+</tr>
+<tr>
+<td><code>EVO_HOOK_DISABLE</code></td>
+<td>unset</td>
+<td>Set <code>1</code> to make the hook a no-op (used for the recursion guard)</td>
+</tr>
+<tr>
+<td><code>EVO_HOOK_HOST</code></td>
+<td>auto</td>
+<td><code>claude</code> or <code>codex</code>, when the host has to be forced</td>
+</tr>
+<tr>
+<td><code>EVO_HOOK_BATCH_TURNS</code></td>
+<td><code>10</code></td>
+<td>Turns to gather before distilling; <code>1</code> restores turn-by-turn reflection</td>
+</tr>
+<tr>
+<td><code>EVO_HOOK_BATCH_CHARS</code></td>
+<td><code>12000</code></td>
+<td>Characters of conversation that also trigger a batch</td>
+</tr>
+<tr>
+<td><code>EVO_HOOK_BATCH_IDLE_MS</code></td>
+<td><code>300000</code></td>
+<td>Idle time after which the next hook event settles a waiting batch</td>
+</tr>
+<tr>
+<td><code>EVO_HOOK_TURN_USER_CHARS</code></td>
+<td><code>400</code></td>
+<td>Kept from each user message</td>
+</tr>
+<tr>
+<td><code>EVO_HOOK_TURN_ASSISTANT_CHARS</code></td>
+<td><code>600</code></td>
+<td>Kept from each assistant message</td>
+</tr>
+<tr>
+<td><code>EVO_HOOK_TURN_TOOLS</code></td>
+<td><code>20</code></td>
+<td>Tool names kept per turn</td>
+</tr>
+</tbody></table>
+<p>Project memory is keyed by the canonical (symlink-resolved) working directory.
+When a project moves, or was first recorded through a different path, re-point
+its memories with:</p>
+<pre><code>node scripts/migrate-project-scope.mjs --from /old/path --to /new/path   # add --apply to write
+node scripts/migrate-project-scope.mjs --canonicalize                    # add --apply to write
+</code></pre>
+<h2>Codex plugin</h2>
+<p>The same bundle is a Codex plugin. <code>plugin/</code> carries both manifests
+(<code>.claude-plugin/plugin.json</code> and <code>.codex-plugin/plugin.json</code>) over one
+<code>hooks/hooks.json</code> and one <code>bin/hook.mjs</code>, and the repository is a marketplace
+for either host — <code>.claude-plugin/marketplace.json</code> for Claude Code,
+<code>.agents/plugins/marketplace.json</code> for Codex.</p>
+<p>Install it the same way, from the CLI:</p>
+<pre><code>codex plugin marketplace add TIZ36/evo
+codex plugin add evo@evo
+</code></pre>
+<p>or patch the hooks file directly with the installer:</p>
+<pre><code>./install_evo_codex.sh              # install or upgrade, for every project
+./install_evo_codex.sh --uninstall  # remove evo's entries again
+</code></pre>
+<p>It writes <code>~/.codex/hooks.json</code> (override the location with <code>CODEX_HOME</code>) and is
+re-runnable on the same terms as the Claude Code installer. Codex asks you to
+trust a hook command the first time it runs one; until you say yes, evo stays
+inert. Use the plugin or the installer, not both.</p>
+<p>Three things differ from Claude Code, and evo handles all three itself:</p>
+<ul>
+<li><strong>The transcript.</strong> Codex writes a rollout — <code>{ type, payload }</code> per line — so
+the turn is read from its event stream, where the prompt has no
+<code>&lt;environment_context&gt;</code> block and reasoning is already split off the answer.
+The format is detected from the transcript's own bytes, so one bundle serves
+both hosts.</li>
+<li><strong>Reflection.</strong> It goes through <code>codex exec</code> instead of <code>claude -p</code>, again with
+no key of evo's own. With no <code>EVO_HOOK_MODEL</code>, the model is whatever your Codex
+configuration already selects — evo has no opinion worth hardcoding there.</li>
+<li><strong><code>codex exec</code> runs no lifecycle hooks.</strong> Hooks fire in the interactive CLI, so
+the reflection child cannot recurse even before the <code>EVO_HOOK_DISABLE</code> guard.
+It does, however, wait on piped stdin for input to append to the prompt, so
+evo closes it — otherwise every reflection would hang until its timeout.</li>
+</ul>
+<p>Everything else is the same: the same SQLite file, the same scopes, the same
+<code>systemMessage</code> line, the same variables in the table above.</p>
+<h2>HTTP API</h2>
+<p>The Cordis plugin registers a raw route prefix on the DSH web server when the <code>webServer</code> service is
+present (the <code>/api</code> prefix belongs to the DSH web transport, so a plugin bridge uses its own path).
+These endpoints are the reserved integration surface for external frontends:</p>
+<table>
+<thead>
+<tr>
+<th>Method</th>
+<th>Path</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>GET</td>
+<td><code>/evo/status</code></td>
+<td><code>{ ok, databasePath, busy }</code></td>
+</tr>
+<tr>
+<td>GET</td>
+<td><code>/evo/memories</code></td>
+<td>List; query <code>scopeType</code>, <code>scopeId</code>, <code>scopeKey</code>, <code>kind</code> (comma list), <code>text</code>, <code>tags</code>, <code>limit</code></td>
+</tr>
+<tr>
+<td>GET</td>
+<td><code>/evo/memories/:id</code></td>
+<td>One memory or 404</td>
+</tr>
+<tr>
+<td>GET</td>
+<td><code>/evo/scopes</code></td>
+<td>Scope tree roots</td>
+</tr>
+<tr>
+<td>GET</td>
+<td><code>/evo/events</code></td>
+<td>Recent activity log, newest first; query <code>limit</code></td>
+</tr>
+<tr>
+<td>POST</td>
+<td><code>/evo/consolidate</code></td>
+<td>Body <code>{ scope: { type, id? } }</code> → consolidation result</td>
+</tr>
+<tr>
+<td>POST</td>
+<td><code>/evo/import-workspace</code></td>
+<td>Body <code>{ cwd, force? }</code> → workspace import result</td>
+</tr>
+</tbody></table>
+<p>The web server binds loopback by default and every response is JSON. The same data backs the native
+Settings panel. The pre-rename <code>/evo-memory/*</code> prefix stays mounted as an alias.</p>
+<h2>Configuration</h2>
+<p>With no storage configuration, the SQLite database is created at:</p>
+<table>
+<thead>
+<tr>
+<th>Platform</th>
+<th>Path</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>macOS</td>
+<td><code>~/Library/Application Support/evo/memory.db</code></td>
+</tr>
+<tr>
+<td>Linux</td>
+<td><code>${XDG_DATA_HOME:-~/.local/share}/evo/memory.db</code></td>
+</tr>
+<tr>
+<td>Windows</td>
+<td><code>%APPDATA%\evo\memory.db</code></td>
+</tr>
+</tbody></table>
+<p>Override the directory with <code>EVO_DATA_DIR</code> or plugin config:</p>
+<pre><code>config:
+  dataDir: /srv/agent-memory
+</code></pre>
+<p>Override the complete database path when needed:</p>
+<pre><code>config:
+  databasePath: /srv/agent-memory/team-a.db
+</code></pre>
+<p>Precedence is <code>databasePath</code>, <code>dataDir</code>, <code>EVO_DATA_DIR</code>, <code>EVO_MEMORY_DATA_DIR</code> (legacy), then the
+platform default.</p>
+<table>
+<thead>
+<tr>
+<th>Variable</th>
+<th>Purpose</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>EVO_DATA_DIR</code></td>
+<td>Storage directory</td>
+</tr>
+<tr>
+<td><code>EVO_PROVIDER</code></td>
+<td>Harness provider used for reflection and consolidation</td>
+</tr>
+<tr>
+<td><code>EVO_MODEL</code></td>
+<td>Harness model used for reflection and consolidation</td>
+</tr>
+</tbody></table>
+<h2>Migrating from <code>evo-memory</code></h2>
+<p>Nothing is required beyond installing the new package name; the compatibility surface is:</p>
+<ul>
+<li><strong>Database.</strong> If the platform default <code>evo/</code> directory has no <code>memory.db</code> but the pre-rename
+<code>evo-memory/</code> directory does, evo keeps using the old file. Move it to the new directory whenever
+you like — nothing else points at it.</li>
+<li><strong>Environment.</strong> <code>EVO_MEMORY_DATA_DIR</code>, <code>EVO_MEMORY_PROVIDER</code>, and <code>EVO_MEMORY_MODEL</code> are still
+read, after their <code>EVO_*</code> counterparts.</li>
+<li><strong>HTTP.</strong> <code>/evo-memory/*</code> still answers alongside <code>/evo/*</code>.</li>
+</ul>
+<p>What does change: the package name (<code>evo</code>), the plugin rows (<code>evo/cordis</code>, <code>evo/deepseek</code>, and the
+<code>evo-web</code> carrier), and the Cordis service key (<code>ctx.evo</code>, formerly <code>ctx.evoMemory</code>). Re-run the
+installer, or update the plugin names in a hand-written <code>cordis.patch.yml</code>.</p>
+<h2>Service API</h2>
+<p>The Cordis plugin registers <code>ctx.evo</code>:</p>
+<pre><code>await ctx.evo.remember({
+  scope: { type: 'project', id: '/workspace/app' },
+  kind: 'constraint',
+  title: 'Verification',
+  content: 'Run the full check command before reporting completion.',
+})
+
+const items = await ctx.evo.recall({
+  scopes: [{ type: 'project', id: '/workspace/app' }],
+  text: 'verification',
+})
+
+await ctx.evo.consolidate({ type: 'project', id: '/workspace/app' })
+</code></pre>
+<p>The core exports <code>MemoryStore</code>, <code>ModelRunner</code>, <code>MemoryMaterializer</code>, and <code>MemoryEventSink</code>. SQLite
+and DeepSeek Harness are implementations behind those interfaces, not dependencies of the memory
+domain model.</p>
+<h2>Memory scopes</h2>
+<p>The core supports <code>global</code>, <code>user</code>, <code>project</code>, <code>session</code>, and <code>conversation</code> scopes. The DeepSeek
+adapter writes completed-turn reflection to the project scope when <code>session.header.cwd</code> exists, and
+to the global scope otherwise. Recall combines global, project, and current-session scopes.</p>
+<h2>Privacy and safety</h2>
+<p>Reflection prompts explicitly reject secrets, credentials, raw logs, guesses, and transient task
+state. The SQLite database stays local. Model-based reflection still sends the completed turn to the
+configured Harness model provider — disable it with <code>reflect: false</code> when that is not acceptable.</p>
+<p>Materialized Markdown is deliberately not a source of truth in v1. Structured storage remains
+authoritative.</p>
+<h2>Limitations</h2>
+<ul>
+<li>Recall is deterministic SQLite filtering and ranking, without embeddings.</li>
+<li>Reflection runs once per successful turn; queueing and sleep consolidation are not included yet.</li>
+<li>Consolidation is not scheduled automatically; call <code>consolidate()</code> explicitly.</li>
+<li>Claude Code and Codex are supported through the hook plugin; there are no Paper, MCP,
+remote-store, or synchronization adapters yet.</li>
+<li><code>node:sqlite</code> is still marked experimental by current Node releases even though it ships with
+Node 22+.</li>
+</ul>
+<h2>Development</h2>
+<pre><code>pnpm install
+pnpm check          # test + typecheck + build + rule scan
+pnpm pack --dry-run
+</code></pre>
+<p>The design authority is <a href="https://github.com/TIZ36/evo/blob/HEAD/docs/reference/evo-reference.md"><code>docs/reference/evo-reference.md</code></a>.
+Open-source boundaries and storage decisions are recorded in
+<a href="https://github.com/TIZ36/evo/blob/HEAD/docs/design-principles.md"><code>docs/design-principles.md</code></a> and
+<a href="https://github.com/TIZ36/evo/blob/HEAD/docs/storage-architecture.md"><code>docs/storage-architecture.md</code></a>.</p>
+<p>Contributions are welcome — please run <code>pnpm check</code> before opening a pull request, and keep changes
+scoped to one topic per PR.</p>
+<h3>Project rule</h3>
+<p>This is a personal open-source project. Company identity and sensitive information — company names,
+brands, domains, mailboxes, employee names, internal codenames, intranet addresses, or machine
+absolute paths — must never appear anywhere in the repository, including built artifacts. Team
+attribution is "Paper team" only. The rule is enforced by
+<a href="https://github.com/TIZ36/evo/blob/HEAD/scripts/iron-rule.mjs"><code>scripts/iron-rule.mjs</code></a>: the source tree is checked on <code>pnpm test</code>, and the
+full tree including <code>dist/</code> is checked by <code>pnpm check</code>.</p>
+<h2>License</h2>
+<p><a href="https://github.com/TIZ36/evo/blob/HEAD/LICENSE">MIT</a> © TIZ36</p>

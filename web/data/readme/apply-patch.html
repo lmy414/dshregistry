@@ -1,0 +1,271 @@
+<h1>dsh-patch-apply</h1>
+<p><a href="https://github.com/JohnXu22786/apply-patch/actions/workflows/ci.yml"><img src="https://github.com/JohnXu22786/apply-patch/actions/workflows/ci.yml/badge.svg" alt="CI"></a></p>
+<p><strong>Apply structured unified diffs (git format) to the real filesystem inside <a href="https://github.com/deepseek-ai/deepseek-harness">DeepSeek Harness</a> (dsh) — and anywhere else Node runs.</strong></p>
+<blockquote>
+<p><strong>中文文档：<a href="https://github.com/JohnXu22786/apply-patch/blob/HEAD/README.zh.md">README.zh.md</a></strong></p>
+</blockquote>
+<p>dsh ships string-level <code>edit</code>/<code>write</code> tools but no structured diff-applier that <strong>writes</strong> to disk. <code>dsh-patch-apply</code> fills that gap: it parses a unified diff, applies every hunk with fuzzy context tolerance and line-offset correction, guards the whole operation so it is <strong>all-or-nothing</strong>, and records a <strong>reverse patch</strong> for byte-exact undo.</p>
+<p>Zero runtime dependencies. TypeScript sources, plain-object tool definitions, Node's built-in test runner.</p>
+<hr>
+<h2>Highlights</h2>
+<ul>
+<li><strong>Full <code>git diff</code> coverage</strong> — multi-file, multi-hunk, <code>±</code>/context/add/delete, <code>/dev/null</code> creates &amp; deletes, <code>rename from/to</code>, <code>copy from/to</code>, <code>old mode</code>/<code>new mode</code>, <code>index</code> shas, <code>\ No newline at end of file</code>, binary labels (<code>Binary files … differ</code>, <code>GIT binary patch</code>), quoted paths with spaces. Classic bare <code>---</code>/<code>+++</code> patches are accepted too.</li>
+<li><strong>Self-implemented parser</strong> — no heavy dependencies; the parser validates hunk headers against actual body line counts and fails with the precise patch line number on malformed input.</li>
+<li><strong>Precise hunk location</strong> — exact-at-anchor → exact-anywhere (line-offset correction) → fuzzy (leading-context tolerance, GNU-patch style), where <em>deletions can never be fuzzed</em>, so a fuzzy match cannot delete wrong content.</li>
+<li><strong>All-or-nothing atomicity</strong> — every file is parsed and validated in memory before anything is written; any hunk conflict or structural violation means <em>nothing</em> is written.</li>
+<li><strong>Version guard</strong> — uses the <em>identical identity recipe</em> as the official dsh filesystem (<code>dev:ino:size:mtimeNs:ctimeNs</code>, see <a href="#version-guard-coordination-with-the-official-dsh-fs">Version-guard coordination</a>); writes re-check identity at publication time and abort with <code>STALE</code> on drift.</li>
+<li><strong>Undo everywhere</strong> — a reverse patch is computed before mutating and an undo journal is written first; <code>undo</code> restores byte-identical state. Applies to creates, deletes, renames, copies and mode changes too.</li>
+<li><strong>dry-run</strong> — validates applicability statically; reports conflicts (<code>expected</code> vs <code>actual</code>, hunk number, patch line) without touching the disk.</li>
+<li><strong>CRLF / LF fidelity</strong> — files are modelled line-by-line with their own terminators; untouched regions round-trip byte-for-byte, including mixed endings and a missing trailing newline.</li>
+<li><strong>Binary safety</strong> — binary-labelled files are skipped and reported; a text patch aimed at a binary target is detected (NUL bytes / invalid UTF-8) and skipped, never corrupted.</li>
+</ul>
+<hr>
+<h2>Installation</h2>
+<h3>As a dsh bundle (recommended)</h3>
+<p>The package is a standard dsh bundle: <code>package.json</code> declares
+<code>"dsh": { "bundle": { "patch": "./cordis.patch.yml" } }</code>, and the patch inserts
+one Cordis plugin row whose module exports <code>{ name, inject, apply }</code> and
+registers the four tools on the harness tool registry (<code>ctx.tools</code>).</p>
+<pre><code># published to a registry
+dsh plugin --profile &lt;name&gt; add dsh-patch-apply
+
+# straight from this repository
+dsh plugin --profile &lt;name&gt; add github:JohnXu22786/apply-patch
+
+# or from a local checkout
+dsh plugin --profile &lt;name&gt; add /path/to/apply-patch
+</code></pre>
+<p>Nothing else to configure — the tools <code>patch_apply</code>, <code>patch_dry_run</code>,
+<code>patch_reverse</code>, <code>patch_stat</code> become available to the model immediately.</p>
+<p>Optional plugin config (set as a later profile patch layer targeting the
+<code>patch-apply</code> row, or in the row's <code>config</code>):</p>
+<pre><code>- config:
+    id: patch-apply
+    defaultRoot: /abs/path/to/workspace   # base for relative patch paths (default: process.cwd())
+    io: node                              # node | ctx-fs (see below)
+    fuzzContext: 3                        # max leading context lines droppable by fuzzy matching
+    undo: true                            # persist an undo journal on patch_apply
+    strictSha: false                      # treat index-line SHA-1 mismatches as hard conflicts
+</code></pre>
+<h3>As a standalone CLI</h3>
+<pre><code>npm install dsh-patch-apply          # or: link from a local checkout
+npx dsh-patch --help
+</code></pre>
+<h3>As a library</h3>
+<pre><code>npm install dsh-patch-apply
+</code></pre>
+<pre><code>import { applyPatchText, applyUndo, parsePatch, statPatch } from 'dsh-patch-apply'
+</code></pre>
+<hr>
+<h2>Usage</h2>
+<h3>1. dsh tools</h3>
+<table>
+<thead>
+<tr>
+<th>Tool</th>
+<th>Purpose</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>patch_apply</code></td>
+<td>Apply a unified diff, all-or-nothing, with undo journaling.</td>
+</tr>
+<tr>
+<td><code>patch_dry_run</code></td>
+<td>Validate applicability; report every conflict; write nothing.</td>
+</tr>
+<tr>
+<td><code>patch_reverse</code></td>
+<td>Produce the reverse patch (validated first) without applying.</td>
+</tr>
+<tr>
+<td><code>patch_stat</code></td>
+<td>Summarise a patch (files, hunks, +/−/context counts) without touching the filesystem.</td>
+</tr>
+</tbody></table>
+<p>Common arguments:</p>
+<ul>
+<li><code>patch</code> <em>(string, required)</em> — the unified diff text.</li>
+<li><code>cwd</code> <em>(string, optional)</em> — base directory for relative paths (default: <code>config.defaultRoot</code>).</li>
+<li><code>dry_run</code> / <code>verify_sha</code> <em>(boolean, optional)</em> — dry-run mode / hard SHA-1 mismatch.</li>
+</ul>
+<p><code>patch_apply</code> returns:</p>
+<pre><code>{
+  "ok": true,
+  "dryRun": false,
+  "files": [{ "path": "...", "operation": "modify", "hunks": [{ "hunkNumber": 1, "status": "offset", "atLine": 12 }] }],
+  "conflicts": [],            // [{ file, hunkNumber, sourceLine, reason, expected[], actual[], anchorLine }]
+  "errors": [],               // [{ code, path, message }]
+  "notes": [],                // informational, e.g. SHA-1 pre-flight mismatches
+  "reversePatch": "diff --git ...",
+  "undoFile": "/abs/.dsh-patch-undo.json"
+}
+</code></pre>
+<p><code>files</code> lists each prepared file operation with its per-hunk statuses — what
+<em>was</em> applied on success, or what <em>would</em> be applied in dry-run. All-or-nothing
+means: <code>ok: false</code> (any non-empty <code>conflicts</code>/<code>errors</code>) guarantees nothing was
+written, and on success every hunk of every file was located and committed.</p>
+<h3>2. CLI</h3>
+<pre><code>dsh-patch &lt;command&gt; [options] &lt;file&gt;
+
+Commands
+  apply   &lt;patch&gt;    apply a unified diff (writes an undo journal by default)
+  dry-run &lt;patch&gt;    validate applicability; report conflicts; never write
+  reverse &lt;patch&gt;    print the reverse patch (or write it with --out)
+  stat    &lt;patch&gt;    summarize a patch without touching the filesystem
+  undo    &lt;journal&gt;  apply the reverse patch recorded in an undo journal
+  help               show this help
+
+Options
+  --root &lt;dir&gt;      base directory for relative patch paths (default: cwd)
+  --dry-run         alias for dry-run behavior on 'apply'
+  --no-undo         do not write an undo journal
+  --undo-file &lt;p&gt;   undo journal path for 'apply' (default: &lt;root&gt;/.dsh-patch-undo.json)
+  --fuzz &lt;n&gt;        max leading context lines droppable in fuzzy match (default: 3)
+  --strict-sha      treat index-line SHA-1 mismatches as hard conflicts
+  --out &lt;file&gt;      write reverse output to a file instead of stdout
+  --json            machine-readable JSON output on stdout
+  --help            show this help
+</code></pre>
+<p>Exit codes: <code>0</code> success · <code>1</code> the patch could not be applied · <code>2</code> usage error.</p>
+<pre><code>dsh-patch apply changes.patch --root /workspace
+dsh-patch dry-run changes.patch
+dsh-patch reverse changes.patch &gt; revert.patch
+dsh-patch undo .dsh-patch-undo.json
+</code></pre>
+<h3>3. Library</h3>
+<pre><code>import { applyPatchText } from 'dsh-patch-apply'
+
+const report = await applyPatchText(patchText, {
+  root: process.cwd(),          // absolute base for relative paths
+  fuzzContext: 3,               // fuzzy tolerance
+  dryRun: false,                // validate only?
+  undo: true,                   // write an undo journal?
+  undoFile: '.dsh-patch-undo.json',
+  strictSha: false,             // index SHA-1 mismatches as hard conflicts?
+})
+</code></pre>
+<p>Other exports: <code>parsePatch</code>, <code>statPatch</code>, <code>applyUndo(journal)</code>,
+<code>readJournal</code> / <code>writeJournal</code>, <code>blobSha</code>, the <code>IoAdapter</code>/<code>NodeIoAdapter</code>/
+<code>CtxFsIoAdapter</code> filesystem seam, and the typed error classes.</p>
+<hr>
+<h2>Error codes</h2>
+<table>
+<thead>
+<tr>
+<th>Code</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>PARSE</code></td>
+<td>Malformed diff; message includes the patch line number.</td>
+</tr>
+<tr>
+<td><code>CONFLICT</code></td>
+<td>A hunk could not be located safely; carries <code>expected</code> vs <code>actual</code> around the hunk's line.</td>
+</tr>
+<tr>
+<td><code>VALIDATION</code></td>
+<td>Structural problem before application (create-over-existing, missing target, path escape).</td>
+</tr>
+<tr>
+<td><code>STALE</code></td>
+<td>A file's identity changed between validation and commit (version guard tripped).</td>
+</tr>
+<tr>
+<td><code>IO</code></td>
+<td>A filesystem operation failed (write/chmod/unlink/…).</td>
+</tr>
+<tr>
+<td><code>BINARY</code></td>
+<td>A binary target / binary label — skipped, never corrupted.</td>
+</tr>
+<tr>
+<td><code>UNSUPPORTED</code></td>
+<td>Out-of-scope syntax (e.g. combined <code>diff --cc</code>) or an unavailable backend verb.</td>
+</tr>
+</tbody></table>
+<hr>
+<h2>How it works</h2>
+<h3>Parser (<code>parse.ts</code>)</h3>
+<p>A state machine understands every block of a git diff and the classic bare
+<code>---</code>/<code>+++</code> form. Each <code>@@</code> header is checked against the actual body line
+counts as it is consumed — an over- or under-supplied hunk raises <code>PARSE</code> with
+the offending patch line immediately, so a truncated or corrupted patch can
+never misapply silently.</p>
+<h3>Hunk location (<code>locate.ts</code>, <code>engine.ts</code>)</h3>
+<p>For each file, hunks are applied in order against the current in-memory buffer:</p>
+<ol>
+<li><strong>exact</strong> — the old-side block matches at the anchor (header line minus one,
+shifted by the net delta of earlier hunks);</li>
+<li><strong>offset</strong> — the full old-side block matches exactly elsewhere; the closest
+match to the anchor wins (corrects line-number drift);</li>
+<li><strong>fuzzy</strong> — up to <code>fuzzContext</code> <em>leading context</em> lines may be dropped to
+find a bolt. Only <strong>context</strong> lines are ever droppable (deletions must match
+exactly), and both the old and new sides drop the same prefix, so a fuzzy
+match can never delete wrong content or duplicate fuzzed context lines.</li>
+</ol>
+<p>If no safe location exists the hunk is reported as a conflict with its 1-based
+hunk number, its patch line, and a short excerpt of expected vs actual content
+— and the whole patch is rejected without touching the disk.</p>
+<h3>Atomicity &amp; rollback (<code>apply.ts</code>, <code>io.ts</code>)</h3>
+<ul>
+<li>All files are parsed, read, and transformed <strong>in memory first</strong>. Any conflict
+or structural violation ⇒ nothing is written.</li>
+<li>The reverse patch and (when enabled) the undo journal are written <strong>before</strong>
+the first mutation, so even a crash mid-commit leaves a complete reversion
+path.</li>
+<li>Content writes are <strong>atomic per file</strong> (temp file + rename) with parent
+directories created on demand, then permission changes, then
+deletes/rename-sources (so a destination is always fully written before its
+source disappears).</li>
+<li>If any write/chmod/unlink fails mid-commit, every already-mutated file is
+restored from the in-memory originals (best effort) and the error is
+reported. Physical multi-file atomicity across renames is not possible with a
+single filesystem call; the pre-commit validation is what makes the guarantee
+structural.</li>
+</ul>
+<h3>Version-guard coordination with the official dsh fs</h3>
+<p>The official <code>@deepseek-ai/dsh-fs</code> backend derives its opaque <code>FsVersion</code> from
+stat identity and freshness: <code>dev:ino:size:mtimeNs:ctimeNs</code>. This package
+mirrors that exact recipe in <code>NodeIoAdapter.probe().identity</code>, so a version
+token minted here means the same thing as one the harness mints. Before each
+guarded write, the identity is re-probed at publication time and a drift aborts
+with <code>STALE</code> and rolls back — the same stale-protection contract as the
+official <code>writeText(…, { kind: 'replaceIfVersion' })</code>.</p>
+<p>Two configuration notes, kept deliberately un-coupled:</p>
+<ul>
+<li><strong>Default <code>io: node</code></strong> — direct host access through <code>NodeIoAdapter</code>. This is
+what the CLI uses and what the whole test suite exercises.</li>
+<li><strong><code>io: ctx-fs</code></strong> — resolves/stats/reads/writes route through the mounted
+harness <code>ctx.fs</code> service (<code>CtxFsIoAdapter</code>), mapping guarded writes onto the
+backend's own <code>createIfAbsent</code> / <code>replaceIfVersion</code> intents, i.e. the version
+guard is enforced by the backend itself. Because the official Service
+Definition exposes <strong>no unlink/rename/chmod/mkdir verbs</strong>, a patch needing
+those fails with a precise <code>UNSUPPORTED</code> error <em>before</em> any mutation rather
+than silently doing something surprising. For full coverage of delete /
+rename / mode operations, use <code>io: node</code>.</li>
+</ul>
+<h3>Line endings</h3>
+<p>Files are kept as a list of <code>{ text, sep }</code> lines where <code>sep</code> is the line's own
+literal terminator (<code>\r\n</code>, <code>\n</code>, or <code>''</code> for a final line without one). Patch
+lines are matched on text only, so CRLF and LF files both apply cleanly; new
+lines inserted by the patch inherit the file's dominant ending, and the
+no-trailing-newline state is carried through the <code>\ No newline at end of file</code>
+marker (old and new sides independently).</p>
+<hr>
+<h2>Development</h2>
+<pre><code>npm install
+npm test          # tsc build, then node --test over build/test/*.test.js
+npm run build     # tsc -&gt; build/
+npm run typecheck # tsc --noEmit
+</code></pre>
+<p>Test layout: <code>parse</code> (format coverage + malformed-input precision),
+<code>apply</code> (single/multi-file, CRLF, create/delete/rename/copy/mode, binary,
+dry-run purity, undo round-trips), <code>fuzzy</code> (offset / fuzzy / refusal paths,
+SHA-1), <code>conflict</code> (report precision), <code>rollback</code> (all-or-nothing, physical
+rollback on injected I/O failure, <code>STALE</code> guard), <code>cli</code> (exit codes, JSON,
+reverse/undo flows).</p>
+<h2>License</h2>
+<p>MIT — see <a href="https://github.com/JohnXu22786/apply-patch/blob/HEAD/LICENSE">LICENSE</a>. © 2026 dsh-patch-apply contributors.</p>

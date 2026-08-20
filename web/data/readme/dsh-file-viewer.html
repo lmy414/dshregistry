@@ -1,0 +1,190 @@
+<h1>DSH File Viewer</h1>
+<p>A universal file preview layer for <a href="https://github.com/deepseek-ai/deepseek-harness">DeepSeek Harness</a>:
+open and inspect files right inside the web UI — no external application needed.</p>
+<blockquote>
+<p><strong>Preview ≠ Execute.</strong> The viewer is strictly read-only: previewing a file never
+runs shell commands, scripts, macros, or HTML. SVG is rendered through <code>&lt;img&gt;</code>,
+and Markdown is sanitized before display.</p>
+</blockquote>
+<h2>Supported file types</h2>
+<table>
+<thead>
+<tr>
+<th>Type</th>
+<th>Renderer</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>PNG / JPG / GIF / WEBP / SVG / BMP</td>
+<td>Image (fit, zoom, pan, dimensions)</td>
+</tr>
+<tr>
+<td>PDF</td>
+<td>PDF.js (page nav, page input, zoom, fit width/page)</td>
+</tr>
+<tr>
+<td>CSV / TSV</td>
+<td>Data table (delimiter auto-detect, sticky header, row numbers, search, sort, column resize, windowed rows, chunked loading)</td>
+</tr>
+<tr>
+<td>TXT / LOG / OUT / INI / CONF</td>
+<td>Text (line numbers, wrap, search, font size, chunk navigation)</td>
+</tr>
+<tr>
+<td>JS / TS / Python / Go / Rust / Java / C/C++ / C# / Shell / HTML / CSS / SQL / …</td>
+<td>Code (highlight.js, read-only)</td>
+</tr>
+<tr>
+<td>Markdown</td>
+<td>Preview (sanitized) + Source</td>
+</tr>
+<tr>
+<td>JSON / JSONL</td>
+<td>Tree (expand/collapse, copy value/path) + Source</td>
+</tr>
+<tr>
+<td>YAML</td>
+<td>Source + parsed Tree</td>
+</tr>
+<tr>
+<td>anything else</td>
+<td>Fallback (metadata + Open externally / Reveal / Copy path / optional Open as text)</td>
+</tr>
+</tbody></table>
+<h2>How it works</h2>
+<ul>
+<li><strong>Host half</strong> (<code>dist/index.js</code>) registers the <code>/fileviewer</code> loopback RPC
+channel and exposes both a <code>fileViewerContent</code> provider registry and a
+<code>fileViewerHost</code> bounded service for trusted transport plugins. The viewer does
+not assume content lives in a local folder: other host plugins can register
+readers for locators such as <code>artifact://run/report.json</code>, object storage,
+generated output, or remote APIs. A boundary-checked <code>ctx.fs</code> provider is
+installed only when that service is available, preserving local-file
+compatibility without making it a hard dependency.</li>
+<li><strong>Client half</strong> (<code>dist/client.js</code>) provides the <code>fileViewer</code> service
+(<code>ctx.get('fileViewer')</code> → <code>openFile(path, { line, renderer })</code>) and renders
+a <strong>right-docked viewer column</strong> (styled like the Harness details panel)
+through the <code>shell.overlay</code> slot. It opens from:<ul>
+<li>produced-file chips in the conversation (<code>conversation.chat.turnTail</code>,
+priority -1 — clicking an agent-generated file previews it in-app), or</li>
+<li>the <strong>"浏览文件 / Browse files"</strong> entry added to each workspace row's
+"…" menu (see the compatibility patch below).</li>
+</ul>
+</li>
+<li><strong>Workspace "…" menu patch</strong> (<code>scripts/patch-workspace-menu.mjs</code>): the
+workspace browser renders its row menu from a hardcoded list with no slot
+hook, so this script applies three guarded, idempotent edits to the
+installed <code>@deepseek-ai/dsh-client-ui-workspace</code> client bundle: a
+<code>browseFiles</code> menu item (zh/en labels), an <code>onSelect</code> branch calling
+<code>window.__dsfvBrowseWorkspace(workspaceId)</code>, and the two dictionary keys.
+It aborts loudly on version drift and can be re-run safely after Harness
+updates (<code>node scripts/patch-workspace-menu.mjs</code>).</li>
+<li><strong>Large-file strategy</strong>: <code>&lt; 5 MB</code> whole-file, <code>5–50 MB</code> chunked streaming,
+<code>&gt; 50 MB</code> head-only with explicit "Load more / Go to end" navigation. Range
+reads are capped (8 MiB per call) and text/CSV rows are windowed, so a
+500 MB log never lands in browser memory.</li>
+<li><strong>Theming</strong>: styles use <code>--dsw-alias-*</code> tokens and match Harness's details
+panel proportions, so light/dark follow the Harness theme automatically.</li>
+</ul>
+<h2>Public API</h2>
+<pre><code>// client side, any web plugin:
+const fileViewer = ctx.get('fileViewer')
+fileViewer.openFile('/workspace/output/report.csv')
+fileViewer.openFile('artifact://run-42/report.csv')
+fileViewer.openFile('/workspace/src/main.ts', { line: 125 })
+fileViewer.openFile('/workspace/data.bin', { renderer: 'text' }) // force a renderer
+</code></pre>
+<h3>Provide content from another host plugin</h3>
+<p>Register a provider once, then open its locators from any client plugin. The
+provider owns locator matching, authorization, metadata, and range reads; the
+viewer owns preview selection, bounded RPC transfer, and rendering.</p>
+<pre><code>import type { FileViewerContentRegistry } from 'dsh-file-viewer'
+const report = new TextEncoder().encode('{"status":"ok"}')
+
+ctx.inject(['fileViewerContent'], runtime =&gt; {
+  const content = runtime.get&lt;FileViewerContentRegistry&gt;('fileViewerContent')!
+  runtime.effect(() =&gt; content.register({
+    id: 'run-artifacts',
+    supports: locator =&gt; locator.startsWith('artifact://'),
+    async stat(locator) {
+      if (locator !== 'artifact://run-42/report.json') return undefined
+      return {
+        name: 'report.json',
+        mime: 'application/json',
+        size: report.byteLength,
+      }
+    },
+    async read(locator, { offset, length }) {
+      if (locator !== 'artifact://run-42/report.json') throw new Error('Not found')
+      return report.slice(offset, offset + length)
+    },
+  }), 'register run artifact viewer')
+})
+</code></pre>
+<p>Providers may additionally implement <code>list()</code> for directory-like locators and
+<code>openExternal()</code> for source-specific hand-off. <code>register()</code> returns an
+unregister function, making provider lifetime follow the supplying plugin.</p>
+<p>Trusted transport plugins can inject <code>fileViewerHost</code> and forward an explicit
+allowlist of its endpoints. This is how <code>dsh-remote</code> previews files on a Remote
+Host: access checks remain owned by the selected File Viewer content provider,
+while the transport applies its own authentication, size limits, and method
+allowlist. <code>openExternal</code> is intentionally not part of that remote surface.</p>
+<p>Browser-only plugins can register the same reader directly on the client
+service—no host RPC or local path is required:</p>
+<pre><code>import type { FileViewerClientService } from 'dsh-file-viewer'
+const markdown = new TextEncoder().encode('# Live preview')
+
+ctx.inject(['fileViewer'], runtime =&gt; {
+  const viewer = runtime.get&lt;FileViewerClientService&gt;('fileViewer')!
+  runtime.effect(() =&gt; viewer.registerContentProvider({
+    id: 'live-preview',
+    supports: locator =&gt; locator === 'memory://preview.md',
+    async stat() { return { name: 'preview.md', size: markdown.byteLength } },
+    async read(_locator, { offset, length }) {
+      return markdown.slice(offset, offset + length)
+    },
+  }), 'register live preview')
+  viewer.openFile('memory://preview.md')
+})
+</code></pre>
+<h2>Configuration</h2>
+<pre><code># cordis.patch.yml / settings
+- id: dsh-file-viewer
+  name: dsh-file-viewer
+  config:
+    enabled: true
+    extraRoots:
+      - /srv/data          # optional extra directories the viewer may read
+</code></pre>
+<h2>Development</h2>
+<pre><code>npm install            # (use a reachable registry if npmjs TLS is flaky)
+npm run build          # declarations + esbuild → dist/types + dist/index.js + dist/client.js
+npm run check          # tsc (strict) over src and tests
+npm test               # vitest: mime, renderer, paths, large-file, csv, json, file-service
+</code></pre>
+<h3>Install into a DSH profile</h3>
+<pre><code># from the repo root (the profile resolves relative specs from your cwd)
+dsh plugin --profile web add /path/to/dsh-file-viewer
+# compatibility patch: add "浏览文件" to each workspace's "…" menu
+node scripts/patch-workspace-menu.mjs
+# then restart the web service (preflight on 43124 → 43123), see
+# scripts/restart-dsh-web.sh for the safe pattern used in this repo.
+</code></pre>
+<p>Client-only changes hot-reload via <code>dsh-client-hmr</code>; node-half changes need a
+web restart. Re-run <code>scripts/patch-workspace-menu.mjs</code> after any Harness
+update that reinstalls <code>@deepseek-ai/dsh-client-ui-workspace</code>.</p>
+<h2>Security notes</h2>
+<ul>
+<li>Path validation is enforced host-side on realpath'd targets against allowed
+roots (<code>fs.contains</code>) by the optional local-files provider. Custom providers
+are responsible for authorization within their own locator namespace.</li>
+<li>Markdown is rendered with <code>html: false</code> and sanitized with DOMPurify
+(scripts, iframes, event handlers and <code>javascript:</code> URLs removed).</li>
+<li>SVG is never injected as HTML — it is displayed through <code>&lt;img&gt;</code>.</li>
+<li>Binary detection: NUL scan + magic bytes; "Open as text" is always an
+explicit user action.</li>
+<li>Per-renderer error boundaries: a broken PDF/JSON can never crash the
+Harness UI.</li>
+</ul>
+<h2>License</h2>
+<p>MIT</p>

@@ -1,0 +1,182 @@
+<h1>dsh-time-travel</h1>
+<p>给 DeepSeek Harness (DSH) 的 Cordis 插件：<strong>可逆时间旅行与审计</strong> —— 为工具副作用建立「前状态快照 → 执行 → 补偿操作」链路，提供 <code>rewindTo(turnId)</code> 按轮次倒序恢复工作区，并内置审计规则引擎把危险操作落盘 <code>audit-log.jsonl</code>。</p>
+<p>兼容 DSH <code>0.1.0-rc.6</code>（cordis <code>4.x</code> / schemastery <code>3.x</code>）。<strong>请勿裸装 <code>@latest</code></strong>，以本仓库版本为准。</p>
+<h2>功能定位</h2>
+<p>一句话：<strong>把"模型用工具改坏了工作区"这件事变得可逆且可审计</strong>。</p>
+<ul>
+<li>监听 <code>tools/pre-execute</code> / <code>tools/result</code> 工具管线事件，对 <code>fs.write</code> / <code>fs.delete</code> / <code>bash</code> / <code>http.request</code> 四类工具建立快照与补偿；</li>
+<li><code>ctx.timeTravel.rewindTo(turnId)</code>：按轮次<strong>倒序</strong>执行补偿，恢复工作区到指定轮次之前；</li>
+<li>审计规则引擎：命中危险 shell、敏感路径写、不可补偿写操作后，追加一行 JSON 到 <code>audit-log.jsonl</code>；</li>
+<li>全部副作用经 <code>ctx.on()</code> 注册，插件卸载时自动撤销，不污染 dsh 工具管线（快照/审计失败都会被包含，绝不影响工具执行）。</li>
+</ul>
+<h2>安装</h2>
+<pre><code># 在插件工程根目录执行（本目录绝对路径）
+dsh plugin --profile web add /absolute/path/to/dsh-time-travel
+
+# 或手动打包安装（绕过 pnpm forwarder 时的等价路径）
+npm pack &amp;&amp; cd ~/.dsh/profiles/web &amp;&amp; npm install /absolute/path/to/dsh-time-travel-0.1.0.tgz --no-save --no-audit --no-fund
+</code></pre>
+<p>安装后重启 dsh web（端口 <code>3080</code>）生效。插件挂载后：</p>
+<ul>
+<li><code>ctx.timeTravel</code> 可用（<code>rewindTo</code> / <code>rewindAll</code> / <code>records</code> / <code>clear</code>）；</li>
+<li>当前目录生成 <code>audit-log.jsonl</code>（可用 <code>audit.logPath</code> 配置）。</li>
+</ul>
+<h2>配置</h2>
+<p>插件导出 schemastery <code>Config</code>，可在 dsh 的插件配置面板 / profile 中覆盖：</p>
+<table>
+<thead>
+<tr>
+<th>配置项</th>
+<th>类型</th>
+<th>默认值</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>turnGapMs</code></td>
+<td>number</td>
+<td><code>5000</code></td>
+<td>同一会话内两次工具调用超过该间隔（ms）则开启新轮次；<code>0</code> = 每次调用独立成轮</td>
+</tr>
+<tr>
+<td><code>audit.enabled</code></td>
+<td>boolean</td>
+<td><code>true</code></td>
+<td>是否启用审计规则引擎</td>
+</tr>
+<tr>
+<td><code>audit.logPath</code></td>
+<td>string</td>
+<td><code>audit-log.jsonl</code></td>
+<td>审计日志输出路径（JSON Lines，相对 cwd）</td>
+</tr>
+<tr>
+<td><code>audit.rules</code></td>
+<td>dict&lt;boolean&gt;</td>
+<td>全部 <code>true</code></td>
+<td>按规则 id 开关：<code>dangerous-shell</code> / <code>sensitive-path-write</code> / <code>non-compensable-write</code> / <code>delete-whole-dir</code></td>
+</tr>
+<tr>
+<td><code>watchTools</code></td>
+<td>dict&lt;kind&gt;</td>
+<td>见下表</td>
+<td>工具名 → 补偿器类别映射</td>
+</tr>
+<tr>
+<td><code>maxRecords</code></td>
+<td>number</td>
+<td><code>10000</code></td>
+<td>内存保留的最大工具记录数（超出丢弃最旧；审计日志不受影响）</td>
+</tr>
+<tr>
+<td><code>dryRun</code></td>
+<td>boolean</td>
+<td><code>false</code></td>
+<td><code>true</code> 时 rewind 只出报告、不实际执行补偿</td>
+</tr>
+</tbody></table>
+<p><code>watchTools</code> 默认映射（按 DSH 0.1.0-rc.6 实际工具名 + 通用桥接名）：</p>
+<table>
+<thead>
+<tr>
+<th>工具名</th>
+<th>补偿器类别</th>
+<th>可自动补偿</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>write</code> / <code>edit</code></td>
+<td><code>fs-write</code></td>
+<td>✅ 恢复原内容 / 删除新建</td>
+</tr>
+<tr>
+<td><code>delete</code></td>
+<td><code>fs-delete</code></td>
+<td>✅ 写回原内容</td>
+</tr>
+<tr>
+<td><code>bash</code></td>
+<td><code>bash</code></td>
+<td>❌ 仅审计 + manual 提示</td>
+</tr>
+<tr>
+<td><code>pwsh</code></td>
+<td><code>bash</code></td>
+<td>❌ 仅审计（Windows 上 dsh 的 bash 工具实际注册名为 <code>pwsh</code>，PowerShell）</td>
+</tr>
+<tr>
+<td><code>http.request</code></td>
+<td><code>http</code></td>
+<td>❌ 仅审计</td>
+</tr>
+</tbody></table>
+<h2>最小使用示例</h2>
+<pre><code>import { Context } from '@deepseek-ai/cordis'
+import { apply } from 'dsh-time-travel'
+
+// 插件被 dsh 加载后，apply 已执行；以下仅为编程调用示例
+const ctx: Context = /* dsh 注入的根 Context */
+
+// 模型调用 write 覆盖了 a.txt 之后：
+const report = await ctx.timeTravel.rewindTo('T3') // 撤销 T3 及之后所有工具副作用
+// report: { requestedTurnId: 'T3', rewound: 2, skipped: 1, failed: 0, details: [...] }
+
+// 查看当前记录（可按会话过滤）
+const records = ctx.timeTravel.records('session-abc123')
+
+// 全部回退
+await ctx.timeTravel.rewindAll()
+</code></pre>
+<p>审计日志示例（<code>audit-log.jsonl</code>）：</p>
+<pre><code>{"at":"2026-08-20T08:00:00.000Z","turnId":"T1","sessionId":"s1","callId":"c1","toolName":"bash","kind":"bash","isError":false,"hits":[{"ruleId":"dangerous-shell","severity":"critical","message":"bash 命令命中高危模式（rm -rf / mkfs / dd 写盘 / shutdown / curl|sh 等）"}],"command":"rm -rf /tmp/doomed"}
+</code></pre>
+<h2>与 dsh-replay / dsh-turn-rewind 的差异</h2>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>dsh-time-travel</th>
+<th>dsh-replay</th>
+<th>dsh-turn-rewind</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>关注对象</td>
+<td>工作区<strong>文件系统副作用</strong>的可逆补偿</td>
+<td>会话事件日志的<strong>重放</strong>（时序复现）</td>
+<td>会话状态按轮次的<strong>回退</strong>（消息层）</td>
+</tr>
+<tr>
+<td>回滚手段</td>
+<td>工具调用级<strong>前状态快照 + 补偿操作</strong>（restore/delete）</td>
+<td>按日志重新派发事件</td>
+<td>截断 / 重建轮次内的消息</td>
+</tr>
+<tr>
+<td>审计</td>
+<td>✅ 内置规则引擎（危险 shell / 敏感路径 / 不可补偿写）</td>
+<td>通常依赖日志本身</td>
+<td>视实现而定</td>
+</tr>
+<tr>
+<td>对外 API</td>
+<td><code>ctx.timeTravel</code> Service（rewindTo / records）</td>
+<td>重放驱动</td>
+<td>轮次回退 API</td>
+</tr>
+<tr>
+<td>不可补偿操作</td>
+<td>显式标记 <code>manual</code> 并审计，交由人工处理</td>
+<td>重放无法改变历史副作用</td>
+<td>消息回退不触碰文件系统</td>
+</tr>
+</tbody></table>
+<p>一句话：<code>dsh-replay</code> / <code>dsh-turn-rewind</code> 处理的是"<strong>对话/会话</strong>怎么回到过去"，本插件处理的是"<strong>工作区文件</strong>怎么回到过去"，两者互补；对不可自动补偿的副作用（bash / http），本插件选择<strong>审计留痕 + 人工回滚</strong>而非冒险猜测。</p>
+<h2>开发</h2>
+<pre><code>pnpm install
+pnpm run check   # tsc --noEmit，严格模式零错误
+pnpm run build   # tsc → lib/
+pnpm test        # node --test（含 rewindTo 恢复文件的端到端事件测试）
+</code></pre>
+<h2>License</h2>
+<p>MIT</p>

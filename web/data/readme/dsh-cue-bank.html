@@ -1,0 +1,360 @@
+<h1>dsh-cue-bank — 跨会话「事件触点记忆」插件</h1>
+<blockquote>
+<p>让 Agent 的记忆能力向人类靠拢：人脑可以在不同任务间随时切换，靠的是对事件建立<strong>多维触点</strong>（关键词、视角、触发物…），触点被当前情境激活后，从长期记忆快速拉取事件细节。本插件把这一机制在 dsh（DeepSeek Harness）上落地。</p>
+</blockquote>
+<h2>设计原理</h2>
+<pre><code>人脑记忆模型                          本插件实现
+─────────────────                    ─────────────────────────────
+事件经历                              触点库中的 topic（带摘要+关键词+时间）
+事件触点（关键词/视角/触发物）         topic.keywords + dimensions
+情境激活触点 → 唤醒事件               用户新消息关键词 → 扫描触点库
+话题切换 → 快速拉取细节                重合度低于阈值 → 注入记忆唤醒上下文
+记忆渐进完善                          每次触碰更新 lastTouchedAt / 合并关键词
+</code></pre>
+<h2>两层架构</h2>
+<pre><code>┌─ 写入侧（建库，每轮 turn 结束时）─────────────────────┐
+│ agent/status=idle → 读本 turn 文本                    │
+│   ├─ 对话级触点：本轮关键词（2~4 字中文 gram + 英文词）│
+│   ├─ 任务级触点：session 聚合关键词（合并更新）        │
+│   └─ 用户惯用词：近 N 轮窗口的高频个人用词（第二类）    │
+│ → upsert 进全局触点库（原子写 JSON）                   │
+└───────────────────────────────────────────────────────┘
+┌─ 唤醒侧（话题切换时，每步组装前）─────────────────────┐
+│ systemPrompt.context() provider（同步契约）           │
+│   → 提取新消息关键词 → 与上轮关键词算重合度           │
+│   → 重合度 &lt; 阈值 = 话题切换                          │
+│   → 扫描触点库（关键词 TF 加权 / 向量余弦）           │
+│   → 命中 top-N → 注入 &lt;system-reminder&gt; 记忆唤醒块    │
+│   → 命中用户惯用词 → 追加「用户惯用词」提示行          │
+└───────────────────────────────────────────────────────┘
+</code></pre>
+<h2>关键设计决策</h2>
+<h3>1. 动态组装注入（不污染持久历史）</h3>
+<p>使用 <code>systemPrompt.context()</code> 注册动态上下文：每次 prompt 组装时求值 provider，生成<strong>带来源的 runtime-context 快照</strong>，随请求发送但不写入持久 session 历史。话题不切换时不注入，保持上下文干净。这正是与 <code>agent-instructions</code>（持久注入）的关键区别。</p>
+<h3>2. 触发时机可配置</h3>
+<table>
+<thead>
+<tr>
+<th>配置</th>
+<th>默认</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>topic.switchDetection</code></td>
+<td><code>true</code></td>
+<td>开启话题切换检测</td>
+</tr>
+<tr>
+<td><code>topic.switchThreshold</code></td>
+<td><code>0.25</code></td>
+<td>关键词重合度低于此值视为切换（0~1）</td>
+</tr>
+<tr>
+<td><code>topic.scanEveryTurn</code></td>
+<td><code>false</code></td>
+<td>每轮都扫描（灵敏但开销大）；<code>false</code> 时只在切换时扫描</td>
+</tr>
+</tbody></table>
+<h3>3. 匹配算法：双模式可配置</h3>
+<table>
+<thead>
+<tr>
+<th>模式</th>
+<th>成本/次唤醒</th>
+<th>效果</th>
+<th>适用</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>keyword</code>（TF 加权穷举）</td>
+<td>0（纯本地）</td>
+<td>词面重合准确，语义弱</td>
+<td>无外部 key</td>
+</tr>
+<tr>
+<td><code>vector</code>（向量余弦）</td>
+<td>≈ ¥0.000025（见下）</td>
+<td>语义匹配强</td>
+<td>有 embedding key</td>
+</tr>
+<tr>
+<td><code>auto</code>（默认）</td>
+<td>—</td>
+<td>有 key 用向量，否则降级关键词</td>
+<td>推荐</td>
+</tr>
+</tbody></table>
+<blockquote>
+<p>⚠️ <strong>DeepSeek 官方 API 不提供 embedding 端点</strong>（见 <a href="https://github.com/deepseek-ai/DeepSeek-V3/issues/806">issue #806</a>），向量模式走 OpenAI 兼容接口（默认 SiliconFlow <code>BAAI/bge-m3</code>）。库向量在<strong>写入时</strong>预计算并缓存，唤醒时只编码 1 条 query，不重复计费。</p>
+</blockquote>
+<p><strong>成本估算</strong>（bge-m3 / SiliconFlow，2026-08 行情）：</p>
+<ul>
+<li>单次唤醒：编码 query ~50 tokens ≈ <strong>¥0.000025</strong>（每 1 万次话题切换约 ¥0.25）</li>
+<li>写入时：每轮 1 次嵌入（可忽略）</li>
+<li>关键词模式：零外部成本</li>
+</ul>
+<h3>4. 通用插件（所有 agent 生效）</h3>
+<p>监听全局 <code>agent/created</code>，对每个 agent 挂载唤醒/写入钩子，不限于飞书。<code>userId</code> 从 session id 提取（<code>feishu:ou_xxx</code> → <code>ou_xxx</code>；其他 session 用完整 id），按用户分片存储。</p>
+<h3>5. 全局存储</h3>
+<p>触点库存于 <strong><code>$DSH_HOME/storages/cue-bank/users/&lt;userId&gt;.json</code></strong>（默认），跨 profile、跨会话共享；可用 <code>storageRoot</code> 覆盖。单用户触点上限 200 条（LRU 淘汰），惯用词上限 50 条。</p>
+<h2>安装</h2>
+<h3>1. 一键安装（推荐）</h3>
+<pre><code>dsh plugin --profile web add github:itr-del/dsh-cue-bank
+</code></pre>
+<p>安装器通过 package.json 的 <code>dsh.bundle</code> manifest 解析插件（<code>cordis.patch.yml</code>），挂载到指定 profile 后重启 dsh 即生效。</p>
+<blockquote>
+<p>也可以从 npm 安装：<code>dsh plugin --profile web add dsh-cue-bank</code>（已发布到 npm，见 <a href="https://www.npmjs.com/package/dsh-cue-bank">npmjs.com/package/dsh-cue-bank</a>）。</p>
+</blockquote>
+<h3>2. 手动挂载到 profile（可选）</h3>
+<p>在 profile 的 <code>package.json</code> 加依赖：</p>
+<pre><code>"dependencies": {
+  "dsh-cue-bank": "^0.1.0"
+}
+</code></pre>
+<p>在 profile 的 <code>cordis.patch.yml</code> 插入：</p>
+<pre><code>- insert:
+    - id: cue-bank
+      name: 'dsh-cue-bank'
+      config:
+        storageRoot: ''
+        matchMode: 'auto'
+        embedding:
+          provider: 'openai-compatible'
+          baseURL: 'https://api.siliconflow.cn/v1'
+          apiKeyEnv: 'SILICONFLOW_API_KEY'
+          model: 'BAAI/bge-m3'
+          dimensions: 1024
+        topic:
+          switchDetection: true
+          switchThreshold: 0.25
+          scanEveryTurn: false
+        inject:
+          enabled: true
+          maxCues: 3
+          maxDetailChars: 400
+        dbg: false
+</code></pre>
+<h3>3. 安装并重启</h3>
+<pre><code>cd ~/.dsh/profiles/web &amp;&amp; pnpm install
+# 重启 dsh web 后生效（插件在启动时加载）
+</code></pre>
+<blockquote>
+<p>🔒 <strong>隐私提示</strong>：向量模式（<code>matchMode: auto</code> 且设置了 <code>SILICONFLOW_API_KEY</code>）会把对话文本编码后发送到 <strong><a href="https://api.siliconflow.cn/v1">https://api.siliconflow.cn/v1</a></strong>（默认第三方 OpenAI 兼容端点）生成嵌入向量，用于库内语义匹配。写入时的库向量也会经该端点预计算。若需完全本地运行，请勿设置该 API key（自动降级为纯关键词本地匹配），或把 <code>embedding.baseURL</code> 改为自托管端点。</p>
+</blockquote>
+<h2>完整配置项</h2>
+<table>
+<thead>
+<tr>
+<th>键</th>
+<th>默认</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>storageRoot</code></td>
+<td><code>''</code></td>
+<td>空 = <code>$DSH_HOME/storages/cue-bank</code></td>
+</tr>
+<tr>
+<td><code>matchMode</code></td>
+<td><code>auto</code></td>
+<td><code>auto</code> | <code>keyword</code> | <code>vector</code></td>
+</tr>
+<tr>
+<td><code>embedding.baseURL</code></td>
+<td><code>https://api.siliconflow.cn/v1</code></td>
+<td>OpenAI 兼容端点</td>
+</tr>
+<tr>
+<td><code>embedding.apiKeyEnv</code></td>
+<td><code>SILICONFLOW_API_KEY</code></td>
+<td>API key 环境变量名</td>
+</tr>
+<tr>
+<td><code>embedding.model</code></td>
+<td><code>BAAI/bge-m3</code></td>
+<td>嵌入模型</td>
+</tr>
+<tr>
+<td><code>embedding.dimensions</code></td>
+<td><code>1024</code></td>
+<td>向量维度</td>
+</tr>
+<tr>
+<td><code>embedding.timeoutMs</code></td>
+<td><code>5000</code></td>
+<td>嵌入超时</td>
+</tr>
+<tr>
+<td><code>topic.switchDetection</code></td>
+<td><code>true</code></td>
+<td>话题切换检测开关</td>
+</tr>
+<tr>
+<td><code>topic.switchThreshold</code></td>
+<td><code>0.25</code></td>
+<td>切换阈值（关键词重合度）</td>
+</tr>
+<tr>
+<td><code>topic.scanEveryTurn</code></td>
+<td><code>false</code></td>
+<td>每轮扫描</td>
+</tr>
+<tr>
+<td><code>topic.maxKeywords</code></td>
+<td><code>10</code></td>
+<td>每轮提取关键词数</td>
+</tr>
+<tr>
+<td><code>inject.enabled</code></td>
+<td><code>true</code></td>
+<td>唤醒注入开关</td>
+</tr>
+<tr>
+<td><code>inject.maxCues</code></td>
+<td><code>3</code></td>
+<td>最多注入几条记忆</td>
+</tr>
+<tr>
+<td><code>inject.maxDetailChars</code></td>
+<td><code>400</code></td>
+<td>单条细节截断长度</td>
+</tr>
+<tr>
+<td><code>extract.enabled</code></td>
+<td><code>true</code></td>
+<td>建库开关</td>
+</tr>
+<tr>
+<td><code>extract.maxKeywordsPerTurn</code></td>
+<td><code>12</code></td>
+<td>每轮入库关键词数</td>
+</tr>
+<tr>
+<td><code>extract.keywordMinLen</code></td>
+<td><code>2</code></td>
+<td>关键词最小长度</td>
+</tr>
+<tr>
+<td><code>extract.userIdiomWindowTurns</code></td>
+<td><code>10</code></td>
+<td>惯用词统计窗口（轮）</td>
+</tr>
+<tr>
+<td><code>extract.maxIdiomHints</code></td>
+<td><code>5</code></td>
+<td>唤醒时最多提示几个惯用词</td>
+</tr>
+<tr>
+<td><code>dbg</code></td>
+<td><code>false</code></td>
+<td>调试日志</td>
+</tr>
+</tbody></table>
+<h2>数据模型</h2>
+<pre><code>{
+  "version": 1,
+  "userId": "ou_xxx",
+  "idiosyncrasies": [                      // 第二类触点：用户用词偏好
+    { "word": "闭环", "score": 0.2, "firstSeen": "...", "lastSeen": "..." }
+  ],
+  "topics": [                              // 第一类触点：事件
+    {
+      "id": "t-...",
+      "level": "task" | "conversation",
+      "keywords": [ { "word": "飞书插件", "score": 0.035 } ],
+      "summary": "对话: 讨论飞书插件…",
+      "dimensions": { "trigger": "keywords", "perspective": "task" },
+      "embedding": [0.1, 0.2, ...] | null, // 向量模式缓存
+      "refSessions": ["feishu:ou_xxx"],
+      "createdAt": "...", "lastTouchedAt": "...", "hitCount": 3
+    }
+  ]
+}
+</code></pre>
+<h2>唤醒注入示例（模型视角）</h2>
+<pre><code>&lt;system-reminder&gt;
+📌 记忆唤醒（cue-bank）: 检测到话题切换，以下为与该话题相关的历史记忆，可作为参考：
+- [conversation] 对话: 我想做一个飞书插件，用来管理跨会话记忆…
+  触点命中: 飞书插件、插件
+  最近提及: 2026-08-15
+  细节: 对话: 我想做一个飞书插件…
+- [task] 任务: 我想做一个飞书插件…
+用户惯用词: 形成闭环、闭环（用户习惯的表述，回复可顺应）
+&lt;/system-reminder&gt;
+</code></pre>
+<h2>与 dsh 官方插件的对比（重复度调研）</h2>
+<blockquote>
+<p>调研日期：2026-08，基于 dsh-base 实际装配的插件清单逐一核验源码/README。</p>
+</blockquote>
+<p><strong>结论：核心能力几乎不重复（估计重复度 10-15%），方向相反——官方是「被动查询」，cue-bank 是「自动记忆 + 主动唤醒」。</strong></p>
+<table>
+<thead>
+<tr>
+<th>官方插件（dsh-base 已装配）</th>
+<th>做什么</th>
+<th>与 cue-bank 重复度</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>dsh-session-query</code> + <code>sqlite</code></td>
+<td>会话历史 FTS5 全文检索、关系追踪（<strong>被动查询 API</strong>，需有人调用）</td>
+<td>⚠️ 低——管"查"，不管"自动记+自动唤醒"</td>
+</tr>
+<tr>
+<td><code>dsh-session-reference</code></td>
+<td>显式 <code>@</code> 引用跨会话快照注入（<strong>需用户主动提及</strong>，dsh-base 默认未启用）</td>
+<td>⚠️ 低——被动触发 vs 话题切换主动触发</td>
+</tr>
+<tr>
+<td><code>dsh-compaction(-basic)</code></td>
+<td><strong>同会话内</strong> token 压力摘要压缩（管理当前窗口）</td>
+<td>✅ 无——不跨会话</td>
+</tr>
+<tr>
+<td><code>dsh-agent-instructions</code></td>
+<td>AGENTS.md/CLAUDE.md <strong>静态指令</strong>文件加载</td>
+<td>✅ 无——静态文件</td>
+</tr>
+<tr>
+<td><code>dsh-spill</code></td>
+<td>超大工具输出暂存+取回定位</td>
+<td>✅ 无——存储优化</td>
+</tr>
+</tbody></table>
+<p><strong>cue-bank 独有能力（官方全部缺失）：</strong></p>
+<ol>
+<li><strong>自动建库</strong>：turn 结束自动提取任务级/对话级关键词 + 用户惯用词（官方只存原始日志，零自动提取）</li>
+<li><strong>话题切换检测</strong>：关键词重合度阈值触发唤醒（官方无此机制）</li>
+<li><strong>自动注入</strong>：<code>systemPrompt.context()</code> 动态组装，无需用户提及（官方 <code>session-reference</code> 必须显式 <code>@</code>）</li>
+<li><strong>用户用词画像</strong>：第二类触点（惯用词）官方完全没有</li>
+<li><strong>结构化全局存储</strong>：<code>$DSH_HOME/storages/cue-bank/</code>（官方是 SQLite/JSONL 原始日志）</li>
+</ol>
+<p><strong>协同方向（可选，不影响当前设计）</strong>：未来可用 <code>session-query</code> 的 FTS 作为 cue-bank 的补充召回通道——关键词穷举漏掉的记忆用全文搜索兜底，互补而非竞争。</p>
+<h2>测试</h2>
+<pre><code>cd dsh-cue-bank
+node test/keywords.test.js      # 22/22 通过（提取/合并/重合度/惯用词）
+node test/store.test.js         # 16/16 通过（持久化/合并/容错）
+node test/embedding.test.js     # 18/18 通过（余弦/可用性/维度，不发网络请求）
+node test/integration.test.js   # 13/13 通过（全链路，真实 cordis Context）
+</code></pre>
+<p>覆盖：写入建库、话题切换唤醒、同话题抑制、无关话题抑制、惯用词提取、惯用词参与唤醒（第二类触点闭环）。</p>
+<p>真实环境验证（headless profile，真实 dsh 进程）：插件加载无报错、turn 结束自动写入全局触点库（conversation+task 两级）、emoji 过滤生效。</p>
+<h3>向量模式离线验证（未配置真实 key）</h3>
+<p>用本地 mock OpenAI 兼容 embedding 服务器验证代码路径，<strong>未调用任何真实 API</strong>：</p>
+<ul>
+<li>✅ API 调用契约（POST <code>/embeddings</code>、Bearer auth、OpenAI 兼容格式）</li>
+<li>✅ 余弦相似度算法：相关文本 0.68 vs 无关文本 0.12，阈值 0.3 命中/不误报判定正确</li>
+<li>✅ 无 key 时 <code>available=false</code> → <code>matchMode: auto</code> 自动降级 keyword</li>
+<li>✅ 超时中止（AbortController）错误处理</li>
+</ul>
+<p>启用向量模式只需设置 <code>SILICONFLOW_API_KEY</code> 环境变量（或配置 <code>embedding.apiKey</code>），无需改代码或配置。</p>
+<h2>后续演进方向</h2>
+<ul>
+<li> 图片/文件触点（dimensions.trigger 已预留，需接入 attachment 解析）</li>
+<li> 闹钟/定时触点（dsh-schedule 联动）</li>
+<li> 向量模式本地化（bge-small 本地推理，零 API 成本）</li>
+<li> 触点衰减（久未触碰的触点降权）</li>
+<li> 记忆来源可追溯（点击注入块跳转原文）</li>
+</ul>

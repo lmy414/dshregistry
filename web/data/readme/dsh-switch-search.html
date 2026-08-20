@@ -1,0 +1,171 @@
+<p align="center">
+  <strong>给 DeepSeek Harness 侧边栏加一个会话内容检索——标题/内容一键切换，还能按用户/回复/工具筛选</strong>
+</p>
+<p align="center">
+  <strong>中文</strong> · <a href="https://github.com/drscrewdriver/dsh-switch-search/blob/HEAD/README.en.md">English</a>
+</p>
+<p align="center">
+  <a href="https://github.com/drscrewdriver/dsh-switch-search/blob/HEAD/LICENSE"><img alt="MIT License" src="https://img.shields.io/badge/license-MIT-263146?style=flat-square"></a>
+  <img alt="Public" src="https://img.shields.io/badge/status-public-7da1de?style=flat-square">
+</p>
+
+<h1>dsh-switch-search</h1>
+<blockquote>
+<p>DSH web 侧边栏<strong>会话搜索增强</strong>：在侧边栏底部新增 <strong>"搜索"</strong> 入口，浮层面板一键在 <strong>标题搜索 ↔ 内容搜索</strong> 间切换；内容模式按<strong>会话聚合</strong>展示标题与命中片段，并按 <strong>用户 / 回复 / 工具</strong> 分类筛选。</p>
+</blockquote>
+<p>无需修改 dsh 源码、无需提 PR：<code>dsh plugin</code> 命令组装 + bundle patch 装配的 cordis 客户端 + 插件宿主半。</p>
+<h2>它能做什么</h2>
+<ul>
+<li><strong>标题 ↔ 内容双模式</strong>：一个入口两种搜法——切到"标题"按会话标题/工作目录子串即时过滤；切到"内容"走 DSH 自带 FTS5 全文索引搜会话消息正文。</li>
+<li><strong>内容按会话聚合</strong>：内容搜索结果每个会话一行（会话标题 + 最强命中片段 + 类型标签），点击即打开该会话，不刷屏逐条堆消息。</li>
+<li><strong>内容类型筛选</strong>：内容模式顶部筛选 chip——<strong>全部 / 用户 / 回复 / 工具</strong>；<code>工具</code> 放开 <code>tool/call</code> 与 <code>tool/result</code> 事件进结果，直接搜到工具调用参数与返回值。</li>
+<li><strong>索引可用性探测</strong>：Host 侧 <code>search-status</code> 探测 <code>sessionQuery</code> 全文索引是否开启；未开启时内容模式给出一句具体配置指引，而非裸报错"内容搜索不可用"。</li>
+<li><strong>通用设置行</strong>：设置 → 通用新增 <strong>"会话搜索"</strong> 行——启用开关 + 默认搜索模式（标题/内容），配置即写即生效。</li>
+<li><strong>点击直达</strong>：搜索结果点击跳转打开对应会话，定位到命中内容所在上下文。</li>
+</ul>
+<h2>界面预览</h2>
+<p>侧边栏底部入口与浮层面板布局示意：</p>
+<pre><code>┌─ Sidebar ───────────────────────────────┐
+│ ▸ 会话搜索        （sidebar.footer.action）
+│        ┌─ 搜索面板（portalled 浮层）────────┐
+│        │ [标题|内容]   [🔍 搜索会话…]        │
+│        │ [全部|用户|回复|工具] ← 类型筛选     │
+│        │ ┌─ 结果列表 ──────────────────┐    │
+│        │ │ 📄 会话标题一              │    │
+│        │ │    命中片段…（snippet）     │    │
+│        │ │ 📄 会话标题二 · 工具调用     │    │
+│        │ │    bash -c "xxx"           │    │
+│        │ └───────────────────────────┘    │
+│        └─────────────────────────────────┘│
+└──────────────────────────────────────────┘
+</code></pre>
+<h2>内容搜索的底层：DSH FTS5 派生索引</h2>
+<p>内容模式不自己建库，直接复用 DSH 本体的 <strong>SQLite FTS5 派生索引</strong>（<code>session-query-sqlite</code>）：</p>
+<table>
+<thead>
+<tr>
+<th>表</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>persisted_docs</code> (FTS5)</td>
+<td>持久化会话的全文文档（<code>text</code> 可搜，<code>type/session_id/seq/...</code> 作过滤列）</td>
+</tr>
+<tr>
+<td><code>temp.live_docs</code> (FTS5)</td>
+<td>当前进程存活会话的全文文档</td>
+</tr>
+<tr>
+<td><code>persisted_sessions</code> / <code>live_sessions</code></td>
+<td>会话头 + <code>revision</code>/<code>fingerprint</code>（增量重建依据）</td>
+</tr>
+<tr>
+<td><code>search_state</code></td>
+<td>generation 计数，驱动分页游标失效</td>
+</tr>
+</tbody></table>
+<ul>
+<li><strong>懒索引</strong>：<code>openAt: first-search</code> 时首次搜索才建索引；每次搜索前<strong>增量 reconcile</strong>（只重建有差异的会话），大语料首搜稍慢、之后很快。</li>
+<li><strong>tool 内容能搜到</strong>：<code>extraction.ts</code> 明确提取了 <code>tool/call</code>（工具名+参数）与 <code>tool/result</code>（结果文本）进索引——这正是本插件"工具筛选"的数据基础。</li>
+</ul>
+<h3>⚠️ 前置：开启全文索引</h3>
+<p><strong>DSH 官方 bundle 默认关闭全文索引</strong>（<code>session-query-sqlite</code> 的 <code>openAt: never</code>，见 <code>deepseek-harness/packages/bundle/web-app/cordis.patch.yml</code>）。要内容搜索生效，在你的 profile 的 <code>cordis.patch.yml</code> 或 overlay 里覆盖：</p>
+<pre><code>- id: session-query-sqlite
+  config:
+    path: ':memory:'               # 或可持久化的绝对路径（重启不重建）
+    openAt: first-search           # 或 startup
+</code></pre>
+<p>然后重启 DSH web。不开启时插件内容模式会显示配置指引，标题模式不受影响。</p>
+<h2>安装</h2>
+<pre><code># 方式一：从 GitHub 直装（推荐）——仓库已提交 lib/，无需本地构建
+dsh plugin --profile web add github:drscrewdriver/dsh-switch-search#release-v0.1.0   # 稳定版
+dsh plugin --profile web add github:drscrewdriver/dsh-switch-search#master          # 基线
+dsh plugin --profile web add github:drscrewdriver/dsh-switch-search#feat/type-filter-search  # 最新开发
+
+# 方式二：本地路径/源码组装（见"开发"章节）
+
+# 重启 dsh web —— 必做！运行中实例不热载 bundle 层
+dsh web
+# 或用随包脚本
+bash ~/.dsh/profiles/web/node_modules/dsh-switch-search/restart-dsh-web.sh
+</code></pre>
+<p>装完侧边栏底部出现 <strong>"搜索"</strong> 按钮；设置 → 通用出现 <strong>"会话搜索"</strong> 配置行。</p>
+<h2>开发</h2>
+<pre><code>pnpm install            # 含 @deepseek-ai client 包链 + tsdown/tsc
+pnpm typecheck          # tsc --noEmit
+pnpm build              # tsc(lib/types) + tsdown(lib/index.mjs + lib/client.js)
+</code></pre>
+<h3>工作区结构</h3>
+<pre><code>src/
+├── index.ts            # 宿主半（node）：Config schema + installSettingsSection + 路由
+├── config.ts           # 纯共享配置（enabled/defaultMode + 命名空间常量，client 免 schemastery）
+└── client/
+    └── index.ts        # 浏览器半：sidebar.footer.action 入口 + 浮层面板 + settings.general.item 配置行
+</code></pre>
+<ul>
+<li><strong>宿主半</strong>：注册 fenced HTTP 路由 <code>/switch-search/api</code>（<code>list-sessions</code> / <code>content-search</code> / <code>search-status</code>），浏览器信任围栏与 DSH <code>/api</code> 网关一致（loopback Host 或 trustedHosts，拒绝 cross-site）。</li>
+<li><strong>配置模式</strong>：借鉴 dsh-thinking-levels——宿主经 <code>settings</code> 服务注册 <code>switch-search</code> 命名空间 + schemastery <code>Config</code>；client 半 <code>defineStore</code> + <code>settingsScope.bind</code> 镜像读写；共享纯模块 <code>src/config.ts</code> 保持 client bundle 无 schemastery。</li>
+<li><strong>构建链</strong>：tsdown 复制 harness <code>packages/client/tsdown.client.ts</code> 语义（<code>__ModuleLoader__.load</code> banner、平台模块 external 表、bundle purity gate）。</li>
+<li><strong>lib/ 提交进仓库</strong>：GitHub 直装靠已提交的构建产物运行（dsh 从 git 安装不跑 prepare），<code>.gitignore</code> 不忽略 <code>lib/</code>。</li>
+</ul>
+<h2>分支说明</h2>
+<table>
+<thead>
+<tr>
+<th>分支</th>
+<th>用途</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>master</code></td>
+<td>稳定基线（标题 ↔ 内容切换，会话聚合）</td>
+</tr>
+<tr>
+<td><code>feat/type-filter-search</code></td>
+<td>开发分支（内容类型筛选 + 设置页索引进口 + 索引可用性探测）</td>
+</tr>
+<tr>
+<td><code>release-v0.1.0</code></td>
+<td>从已验证开发状态派生的<strong>稳定可装版本</strong>，含 lib/ 构建产物</td>
+</tr>
+</tbody></table>
+<h2>与官方侧边栏搜索的关系</h2>
+<ul>
+<li>官方侧边栏的搜索框在 <code>sidebar.workspaces</code>（single slot），外部插件<strong>无法替换</strong>；本插件在侧边栏底部<strong>新增独立入口</strong> <code>sidebar.footer.action</code>，二者并存、互不干扰。</li>
+<li>官方内容搜索在 apiproxy 硬编码只搜 <code>user/message</code> + <code>assistant/message</code>；本插件通过 <code>types</code> 参数放开 <code>tool/call</code> + <code>tool/result</code>，实现工具级筛选。</li>
+</ul>
+<h2>兼容性与隐私</h2>
+<ul>
+<li>需要已安装 DeepSeek Harness 并使用 web profile；数据全部经 DSH 现成 <code>sessionQuery</code> 服务（live-preferred 语料库），<strong>不改任何官方源码、不建派生库</strong>。</li>
+<li>配置仅存于 DSH settings 命名空间与浏览器浮层状态；不读取、不上传会话内容以外的数据。</li>
+<li>宿主/客户端契约类型在 <code>src/*.ts</code> 本地结构声明（npm 上 dsh client 包链不完整），构建时以 harness 源码核实为准。</li>
+</ul>
+<h2>drscrewdriver DSH Plugin Family</h2>
+<p>本项目是 <a href="https://github.com/drscrewdriver">drscrewdriver</a> 维护的 DSH 插件系列之一。如果这个对你有用，其他插件多半也有用：</p>
+<table>
+<thead>
+<tr>
+<th>插件</th>
+<th>一句话描述</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><a href="https://github.com/drscrewdriver/dsh-input-traffic">dsh-input-traffic</a></td>
+<td>DSH Web GUI 忙时输入队列：三档交通管制，拖拽重排，会话冻结</td>
+</tr>
+<tr>
+<td><a href="https://github.com/drscrewdriver/dsh-thinking-levels">dsh-thinking-levels</a></td>
+<td>逐轮 reasoning_effort 控制：Auto 智能调度或手动固定档位</td>
+</tr>
+<tr>
+<td><a href="https://github.com/drscrewdriver/dsh-seatbelt-sandbox">dsh-seatbelt-sandbox</a></td>
+<td>macOS Seatbelt 沙箱适配器：libsandbox 原生 loader，接替弃用的 sandbox-exec</td>
+</tr>
+<tr>
+<td><strong><a href="https://github.com/drscrewdriver/dsh-switch-search">dsh-switch-search</a></strong></td>
+<td>侧边栏会话搜索增强：标题/内容切换，按用户/回复/工具筛选</td>
+</tr>
+</tbody></table>
+<h2>License</h2>
+<p>MIT</p>

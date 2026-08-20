@@ -1,0 +1,131 @@
+<h1>@richie.liu/dsh-hybrid-coder</h1>
+<p>English | <a href="https://github.com/jackiesre721/dsh-hybrid-coder/blob/HEAD/README.zh.md">中文</a></p>
+<p>Dual-model routing policy plugin: a premium model plans and rescues, a local small model (e.g. a local Ollama instance) implements ordinary steps, and the route escalates back to premium automatically after consecutive local failures.</p>
+<p>This plugin is a <strong>routing policy</strong>, not a model transport: model requests still go out through the registered LLM adapters (e.g. <code>@deepseek-ai/dsh-llm-deepseek</code>, <code>@deepseek-ai/dsh-llm-pi-ai</code>). It rewrites the target <code>provider</code>/<code>model</code> at each step's request assembly point and switches routes when the tool-failure chain crosses a threshold. Experimental status: public contracts may change and it is not shipped with official releases.</p>
+<h2>Installation</h2>
+<p>After publishing to npm, install it in the target profile with one command (the package's <code>cordis.patch.yml</code> declares <code>dsh.bundle</code>, so installing also activates it as a profile layer):</p>
+<pre><code>dsh plugin --profile web add @richie.liu/dsh-hybrid-coder
+</code></pre>
+<p>Or enable it via a local tarball / overlay while developing (see "Local provider configuration (Ollama)" below). The bundled example config points at GLM + Ollama routes; override <code>premium</code>/<code>local</code> provider and model to match your environment.</p>
+<h2>How it works</h2>
+<p>A "step" is one model request plus the tool calls it triggers. While each step assembles its request, the plugin decides the route by the following priority:</p>
+<ol>
+<li><strong>Escalated</strong> → premium. The escalation latch set by a previous local failure streak has not been released.</li>
+<li><strong>Plan mode active</strong> → premium. Planning always uses the stronger model.</li>
+<li><strong>Otherwise</strong> → local.</li>
+</ol>
+<p>Plan-mode state folds directly from the <code>plan/mode</code> events in the session log (<code>@deepseek-ai/dsh-plan-mode</code>); the plugin stores no planning state of its own. The escalation latch and success counts fold from the log too, so fork, resume, and process restart recover identical routing decisions with no in-process live state.</p>
+<h3>Escalation (Strategy B)</h3>
+<p>A <code>tools/post-execute</code> listener observes every tool execution result. While the <strong>effective provider is local</strong>, it counts "consecutive failed tool executions":</p>
+<ul>
+<li>Failure = the tool-result block's <code>isError: true</code> on <code>tool/result</code> (the always-persisted authoritative failure signal). The <code>error</code> field exists only when the tool threw a machine-coded HarnessError; failures thrown as plain <code>Error</code> count the same.</li>
+<li>Cancelled results whose <code>error.code</code> is <code>ABORTED</code> or <code>ABORTED_BEFORE_DISPATCH</code> are excluded (cancellation is not a model capability problem).</li>
+<li>The count resets on any non-error tool result, on a new turn (<code>turn/start</code>), and when the effective provider leaves local.</li>
+<li>The window is the <strong>current turn</strong>: each new user turn gives the local model a fresh chance.</li>
+</ul>
+<p>When the consecutive failure count within one turn reaches <code>failureThreshold</code>:</p>
+<ol>
+<li>Append the durable event <code>hybrid/route { to: 'premium', reason: 'tool-failures', turn, step }</code>;</li>
+<li>Inject an escalation guidance message into the next step's inbox (see below), containing the recent failure trajectory (bounded);</li>
+<li>Later <code>agent/request</code> folds to that event and routes to premium.</li>
+</ol>
+<h3>Request-level fallback</h3>
+<p>An <code>agent/request-error</code> listener handles <strong>transport-level</strong> failures of the local provider (<code>failure.code</code> is <code>TRANSPORT</code> or <code>TIMEOUT</code>, e.g. Ollama not running, connection refused). It first appends <code>hybrid/route { to: 'premium', reason: 'request-failure' }</code>, then returns <code>{ kind: 'retry' }</code> so the loop re-issues the same step with premium; other error codes are left to <code>@deepseek-ai/dsh-llm-retry</code>.</p>
+<h3>De-escalation</h3>
+<p>After escalation, the plugin counts "clean premium steps": a step whose effective provider is premium, which produced an assistant message, and had no error tool results (a plain text reply counts as success). When the count reaches <code>premiumStepsBeforeDeescalation</code>, it appends <code>hybrid/route { to: 'local', reason: 'recovered' }</code> and routing returns to local. De-escalation injects no guidance message.</p>
+<h3>System-prompt identity sync</h3>
+<p>The product system prompt contains identity variables such as "powered by the <code>{{model}}</code> model", whose defaults come from the declared route rather than the per-step request config. Without handling, a request switched to local would still claim to be the premium model. The plugin therefore also listens to <code>system-prompt/assemble</code> and overwrites the <code>provider</code>/<code>model</code> template variables with the next step's actual route, keeping identity consistent with model selection.</p>
+<p>When a request-level fallback flips the route mid-step, that retry step's identity text may still refer to the previous route; this is a benign directional skew (the stronger premium model is actually serving) and is recorded under Known Limitations.</p>
+<h2>Config</h2>
+<pre><code>- id: hybrid-coder
+  name: '@richie.liu/dsh-hybrid-coder'
+  config:
+    premium:
+      provider: glm
+      model: glm-4-plus
+      reasoningEffort: high        # optional; unset keeps the provider default
+    local:
+      provider: ollama
+      model: qwen2.5-coder:7b
+    escalation:
+      failureThreshold: 2                  # consecutive failed tool executions in the current turn, &gt;= 1
+      premiumStepsBeforeDeescalation: 2    # consecutive clean premium steps, &gt;= 1
+</code></pre>
+<p>Unknown config keys fail at load. <code>premium.provider</code> and <code>local.provider</code> must be registered provider routes (see <code>ctx.llm.listProviders()</code>); when the target route is missing at the first routing decision, the request fails with an explicit error instead of silently falling back.</p>
+<p><code>reasoningEffort</code> applies to the premium route only; the local route always clears any inherited effort and restores its provider's default behavior.</p>
+<h2>Local provider setup (Ollama)</h2>
+<p>The local model connects through <code>@deepseek-ai/dsh-llm-pi-ai</code>'s hand-declared routes, no code needed:</p>
+<pre><code>- id: llm-pi-ai
+  name: '@deepseek-ai/dsh-llm-pi-ai'
+  config:
+    providers:
+      ollama:
+        displayName: Ollama (local)
+        api: openai-completions
+        apiKeyEnv: OLLAMA_API_KEY
+        baseURL: http://localhost:11434/v1
+        models:
+          - id: qwen3:4b-32k
+            name: Qwen3 4B
+            contextWindow: 32768
+        retryPolicy:
+          mode: normal
+          maxRetries: 0
+</code></pre>
+<p>Three settings proved necessary in live runs (all three required):</p>
+<ul>
+<li><strong><code>apiKeyEnv</code> must be declared</strong>: pi-ai's <code>openai-completions</code> protocol requires a credential reference to exist, or the request fails with <code>PI_AI_ERROR: No API key for provider</code>. Ollama ignores the bearer value; a placeholder environment variable (e.g. <code>OLLAMA_API_KEY=ollama</code>) suffices.</li>
+<li><strong>Context length must be &gt;= 32768</strong>: Ollama's default <code>num_ctx</code> is 4096, which cannot hold the harness system prompt plus tool definitions (~13000 tokens measured) — the model never sees the tools and replies in plain text. The profile's <code>contextWindow</code> is metadata only and does not change Ollama behavior; derive a model via a Modelfile: <code>printf 'FROM qwen3:4b\nPARAMETER num_ctx 32768\n' &gt; Modelfile &amp;&amp; ollama create qwen3:4b-32k -f Modelfile</code>.</li>
+<li><strong>The model must return structured tool_calls</strong>: in live testing <code>qwen2.5-coder:7b</code> (which declares tools support) emitted tool calls as plain-text JSON on Ollama's OpenAI-compatible endpoint (<code>tool_calls: null</code>), so the turn ended as plain text; <code>qwen3:4b</code> returns structured calls and works. Verify before adopting a model.</li>
+</ul>
+<h3>Premium provider setup (GLM)</h3>
+<p>The premium route is declared the same way — another hand-declared provider on the same adapter, pointing at an OpenAI-compatible endpoint:</p>
+<pre><code>      glm:
+        displayName: Zhipu GLM
+        api: openai-completions
+        apiKeyEnv: GLM_API_KEY
+        baseURL: https://open.bigmodel.cn/api/paas/v4
+        models:
+          - id: glm-4-plus
+            name: GLM-4-Plus
+            contextWindow: 128000
+        retryPolicy:
+          mode: normal
+          maxRetries: 0
+</code></pre>
+<p>Then point <code>premium.provider</code> / <code>premium.model</code> at it in the <code>hybrid-coder</code> config (e.g. <code>glm</code> / <code>glm-4-plus</code>). The key comes from the <code>GLM_API_KEY</code> environment variable or <code>~/.dsh/.credentials.yaml</code>; <code>retryPolicy.maxRetries: 0</code> for the same reason as local — let the plugin own transport failover immediately.</p>
+<h3>Composition contract with <code>llm-retry</code></h3>
+<p><code>@deepseek-ai/dsh-llm-retry</code> registers by default on the outer layer of the request-error recovery chain. A <code>TRANSPORT</code> from a dead Ollama endpoint belongs to the default retryable codes; with the default <code>retryPolicy</code> (5 backoff attempts) on the local route, llm-retry would back off against the dead endpoint for roughly 5 rounds before this plugin gets to switch to premium — a slow failover.</p>
+<p>The local route <strong>must</strong> therefore set <code>retryPolicy.maxRetries</code> to <code>0</code> (or remove <code>TRANSPORT</code> from <code>retryableCodes</code>), so llm-retry delegates immediately and this plugin owns transport failover instantly. This is provider-owned configuration (<code>retryPolicy</code> belongs to each provider config, not this plugin's config), consistent with the architecture's "providers own retryPolicy" separation of concerns.</p>
+<h2>Durable events</h2>
+<p>The plugin adds one event to <code>SessionEventMap</code>:</p>
+<pre><code>hybrid/route { to: 'premium' | 'local', reason: 'tool-failures' | 'request-failure' | 'recovered', turn: number, step: number }
+</code></pre>
+<ul>
+<li><code>tool-failures</code>: local consecutive tool failures reached the threshold; escalate.</li>
+<li><code>request-failure</code>: local request failed at transport level; escalate immediately and retry.</li>
+<li><code>recovered</code>: enough clean premium steps after escalation; de-escalate back to local.</li>
+</ul>
+<p><code>turn</code>/<code>step</code> name the turn and step open when the event fires. The event records only the sticky escalation latch; premium routing caused by plan mode is not re-persisted (re-derived from <code>plan/mode</code> every step). The event is registered through the persistence catalog generator and persists with the session log across fork and resume.</p>
+<p>The <code>./invariant</code> companion plugin replays and validates before each append: payload shape, turn/step ownership and monotonicity, and legal transitions (<code>to: 'premium'</code> may only enter from a non-escalated state; <code>to: 'local'</code> may only recover from an escalated state).</p>
+<h2>Model Experience</h2>
+<h3>Escalation guidance</h3>
+<h4>What the model sees</h4>
+<p>When a tool-failure streak triggers escalation, the next step's model receives a user-role message whose source is a plugin notification (<code>source.kind: 'plugin'</code>), containing fixed framework text plus the recent failure trajectory. The framework text is verbatim:</p>
+<pre><code>The previous model made repeated failed tool calls. A stronger model is now handling the session. Diagnose the failure from the trajectory below and continue the task. Do not repeat the failing approach.
+
+Recent failed tool calls:
+</code></pre>
+<p>The failed tool names and error messages follow, one bullet each. The trajectory keeps only the last 4 entries, each error message truncated; the whole message is capped at 2000 UTF-8 bytes. Older failure entries are dropped first when over budget. With no failure trajectory the message does not appear (which cannot happen, since escalation is itself triggered by failures).</p>
+<h4>Token effects</h4>
+<p>The message appends exactly once per escalation trigger, as conditional, bounded (≤2000 bytes), append-only input. Plan-mode routing, de-escalation, and request-level fallback add no model tokens by themselves.</p>
+<h4>KV cache effects</h4>
+<p>The escalation flip replaces the request's provider/model prefix, invalidating cache reuse for that provider (the model endpoint physically switches); the premium steps after escalation share a stable prefix, and de-escalation to local behaves the same. The guidance message appends after the reusable history and does not change the previously persisted prefix.</p>
+<h2>Known Limitations and Deferred Work</h2>
+<ul>
+<li><strong>No AST skeletonized context</strong>: file contents enter the model only as tool results after the model explicitly calls a reading tool; the context assembly stage does not mount raw file content, so the originally envisioned "pre-step skeletonized files" has no object to act on. Oversized tool results are handled by <code>@deepseek-ai/dsh-spill-policy</code>. A future <code>tools/post-execute</code> step could replace read results for the local route with signature skeletons (requires a TypeScript compiler dependency and full syntax-surface coverage); not implemented today.</li>
+<li><strong>No automatic file-write rollback</strong>: the plugin owns no filesystem transactions; erroneous writes from the local model are corrected through normal tool-result feedback and the escalation flow, not by undoing disk changes automatically.</li>
+<li><strong>Routing overrides user model choice</strong>: mounting this plugin means it owns routing for every agent in the composition; explicit per-session model selections are kept only when they match the configured route pair. There is no opt-out switch to honor explicit selections (no evidence of a current consumer).</li>
+<li><strong>Retry-step identity text may lag</strong>: a request-level fallback flips the route mid-step, so that retry step's system-prompt identity variables may still show local while premium is actually serving. Benign directional skew; does not affect results.</li>
+<li><strong>Experimental contract</strong>: event names, config fields, and guidance text may change before the first tagged release; persisted logs promise no cross-version compatibility (consistent with the repository's pre-release stance).</li>
+</ul>

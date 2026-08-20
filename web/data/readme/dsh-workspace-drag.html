@@ -1,0 +1,134 @@
+<p align="center">
+  <img src="https://img.shields.io/static/v1?label=dsh-workspace-drag&amp;message=Drag%20to%20Organize&amp;color=4f8cff&amp;style=for-the-badge&amp;labelColor=1a1d24" alt="dsh-workspace-drag">
+</p>
+
+<h1 align="center">dsh-workspace-drag</h1>
+
+<p align="center">
+  DSH Web UI plugin — drag a conversation onto any workspace to organize it
+</p>
+
+<p align="center">
+  <code>drag session row → workspace group → move(cwd + files + registry)</code>
+</p>
+
+<p align="center">
+  <a href="https://github.com/lanscer/dsh-workspace-drag/blob/main/README.zh.md"><img src="https://img.shields.io/static/v1?label=%E4%B8%AD%E6%96%87&amp;message=README.zh.md&amp;color=10a37f&amp;style=flat-square" alt="中文文档"></a>
+  <img src="https://img.shields.io/static/v1?label=license&amp;message=MIT&amp;color=green&amp;style=flat-square" alt="License: MIT">
+  <img src="https://img.shields.io/static/v1?label=dsh-plugin&amp;message=%E2%9C%93&amp;color=4f8cff&amp;style=flat-square" alt="DSH plugin">
+  <img src="https://img.shields.io/static/v1?label=platform&amp;message=macOS%20%7C%20Linux&amp;color=9aa4b2&amp;style=flat-square" alt="Platform">
+</p>
+
+<hr>
+<p><strong>DSH Web UI plugin</strong> — in the sidebar grouped view, drag a conversation onto another workspace's title (or any session row within that group) and release to move the conversation there. <strong>Seamless drag-and-drop</strong>: no popups, no intermediate panels — drop it and it's organized.</p>
+<h2>Installation</h2>
+<p>One-command install into the DSH web profile. <strong>Run this from inside the plugin directory</strong> (the folder containing <code>package.json</code> — after cloning <code>dsh-workspace-drag</code>, <code>cd</code> into it first):</p>
+<pre><code>npm run install:plugin
+</code></pre>
+<p>Or directly (cross-platform, uses Node.js):</p>
+<pre><code>node install-plugin.mjs
+</code></pre>
+<p>Works on <strong>Windows (PowerShell), macOS and Linux</strong> — the installer is a plain Node.js script, no bash or PowerShell-specific syntax.</p>
+<p>This registers the plugin into <code>~/.dsh/profiles/web</code> (on Windows: <code>%USERPROFILE%\.dsh\profiles\web</code>) by adding a <code>link:</code> dependency to the profile's <code>package.json</code> and creating a <code>node_modules</code> symlink. It does <strong>not</strong> run <code>pnpm install</code>, so it avoids the pnpm <code>minimumReleaseAge</code> policy that rejects dependencies published within the last 24 hours. Idempotent — re-running is a no-op when already installed.</p>
+<blockquote>
+<p>⚠️ <strong>Windows notes</strong></p>
+<ul>
+<li>Run the command <strong>inside the cloned plugin folder</strong>, not in your home directory — <code>npm run</code> needs a <code>package.json</code> in the current directory (the error <code>ENOENT ... C:\Users\&lt;you&gt;\package.json</code> means you ran it in the wrong folder).</li>
+<li>Creating the symlink uses <code>junction</code>, which works on Windows without Developer Mode or Administrator rights.</li>
+<li>If symlink creation is blocked by policy, the <code>link:</code> dependency is still written to the profile — then finish with <code>dsh plugin --profile web add link:&lt;plugin-path&gt;</code>.</li>
+</ul>
+</blockquote>
+<p>After installation:</p>
+<ul>
+<li>Client-only changes: refresh the browser page.</li>
+<li>Host changes: restart <code>dsh web</code>.</li>
+</ul>
+<blockquote>
+<p>Note: the plugin requires the <code>zstd</code> CLI (see <a href="#dependencies">Dependencies</a>).</p>
+</blockquote>
+<h2>Features</h2>
+<ul>
+<li><strong>Seamless cross-workspace drag-and-drop</strong>: drag a session row → hover over another workspace group (title or any session row within it) to highlight → release to migrate.<ul>
+<li>No floating panels, no confirmation dialogs; same-workspace drag-and-drop is left to DSH's native reordering, undisturbed.</li>
+<li>A brief success banner appears after the move, and the conversation immediately appears in the target workspace.</li>
+</ul>
+</li>
+<li><strong>Toggle</strong>: enable/disable with one click on the <strong>Settings → Drag to Organize</strong> page; when disabled, drag-and-drop is inert (no highlighting, no migration).</li>
+<li><strong>Safety</strong>:<ul>
+<li>Sessions whose agent is currently running <strong>cannot be moved</strong> (exact agent-status check, no more coarse 30-second mtime window).</li>
+<li>For a conversation that just finished: the host automatically waits for the log to quiesce (up to 15 s) and then migrates — one drop completes the move, no "retry later" loop.</li>
+<li>The host-side migration is a copy-verify-atomic-swap: the session directory is copied to a staging location, the rewritten log is verified, then published to the destination. The old directory is only removed after the new copy is verified — data is never lost on failure.</li>
+<li>The migration physically relocates the session log file, rewrites the header <code>cwd</code> field, and updates the workspace registry ownership account plus in-memory state (live header / persistence-coordinator cache / registry index), so the conversation remains usable after the move.</li>
+</ul>
+</li>
+</ul>
+<h2>Data Model</h2>
+<ul>
+<li>Each session's workspace identity is its header <code>cwd</code> (an absolute directory path).</li>
+<li>Sessions are stored at <code>~/.dsh/sessions/&lt;projectKey(cwd)&gt;/&lt;session-id&gt;/session.jsonl[.zstd]</code>.</li>
+<li>Migration = relocating the session directory under the new workspace's <code>projectKey</code> directory + rewriting the first (header) line's <code>cwd</code> + using <code>ctx.workspaceRegistry</code>'s detach/attach to update the workspace ownership ledger.</li>
+<li>zstd logs are <strong>concatenated multi-frame containers</strong>: frame 1 = exactly one header line (newline-terminated), frames 2..N = appended event batches. The DSH reader requires the <strong>first frame to decode to exactly this header line</strong>.</li>
+<li>During migration, zstd logs undergo <strong>frame-preserving surgery</strong>: only frame 1 is decoded → the header <code>cwd</code> is rewritten → re-encoded as a single checksummed frame (matching the DSH backend) → concatenated with the remaining original frames (byte-identical). The log must <strong>never</strong> be compressed as a single frame (that would break the DSH reader's "first frame = header only" invariant).</li>
+</ul>
+<h2>File Layout</h2>
+<pre><code>dsh-workspace-drag/
+├── package.json          # dsh.bundle.patch + client inject
+├── cordis.patch.yml      # registers the plugin row in the web profile
+├── lib/
+│   ├── index.js          # Host: config/move HTTP routes + migration logic
+│   └── client.js         # Browser: settings page (toggle) + document-level drag engine
+├── test/
+│   ├── fixtures/multiframe-session.jsonl.zstd  # multi-frame zstd session sample (7 frames)
+│   ├── verify-core.mjs              # zstd round-trip + DSH frame scanner compatibility
+│   └── integration-move.mjs         # end-to-end integration test for moveSessionToWorkspace
+└── README.md
+</code></pre>
+<h2>Host HTTP API</h2>
+<table>
+<thead>
+<tr>
+<th>Method</th>
+<th>Path</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>GET</td>
+<td><code>/api/dsh-workspace-drag/config</code></td>
+<td>Read toggle <code>{ "enabled": true }</code></td>
+</tr>
+<tr>
+<td>POST</td>
+<td><code>/api/dsh-workspace-drag/config</code></td>
+<td>Write toggle <code>{ "enabled": false }</code></td>
+</tr>
+<tr>
+<td>POST</td>
+<td><code>/api/dsh-workspace-drag/move</code></td>
+<td><code>{ "sessionId", "targetWorkspaceId", "waitMs" }</code> — move a conversation; optional <code>waitMs</code> (0–30000) makes the host wait for the agent/log to quiesce and finish automatically; failures carry a <code>code</code> (<code>agent-running</code> / <code>writing</code> / <code>move-failed</code>)</td>
+</tr>
+</tbody></table>
+<p>Configuration is persisted in <code>~/.dsh/dsh-workspace-drag.json</code>.</p>
+<h2>Dependencies</h2>
+<ul>
+<li>The host half requires the <code>zstd</code> CLI. The plugin auto-detects the binary via <code>PATH</code> search, falling back to common paths (<code>/opt/homebrew/bin/zstd</code>, <code>/usr/local/bin/zstd</code>, <code>/usr/bin/zstd</code>). Install via <code>brew install zstd</code> (macOS) or <code>apt install zstd</code> (Linux).</li>
+<li>Requires DSH built-in services: <code>webServer</code> / <code>sessions</code> / <code>sessionPersistence</code> / <code>workspaceRegistry</code>
+(all loaded by <code>@deepseek-ai/dsh-web-app</code>).</li>
+</ul>
+<h2>Tests</h2>
+<pre><code>cd test
+node verify-core.mjs      # Validate zstd round-trip + DSH frame scanner compatibility
+node integration-move.mjs # End-to-end integration test (temp directory, does not touch real data)
+</code></pre>
+<h2>Limitations</h2>
+<ul>
+<li>Conversations whose agent is currently running cannot be moved (you are asked to wait for the reply to finish); for a just-finished conversation the host waits for the log to quiesce and migrates automatically.</li>
+<li>Migration changes the session's <code>cwd</code> — its workspace ownership and disk storage location. This is the essence of "organizing into a workspace."</li>
+<li>The <code>zstd</code> CLI must be installed (auto-detected via PATH; no hardcoded path).</li>
+</ul>
+<h2>License</h2>
+<p><a href="https://github.com/lanscer/dsh-workspace-drag/blob/HEAD/LICENSE">MIT</a></p>
+<hr>
+<p align="center">
+  <a href="https://github.com/lanscer/dsh-workspace-drag/blob/main/README.zh.md">中文文档</a> · <a href="https://github.com/lanscer/dsh-workspace-drag">English</a>
+</p>

@@ -1,0 +1,243 @@
+<h1>dsh-session-export</h1>
+<p><a href="https://github.com/JohnXu22786/session-export/blob/HEAD/README.md">English</a> | <a href="https://github.com/JohnXu22786/session-export/blob/HEAD/README.zh.md">简体中文</a></p>
+<p><a href="https://github.com/JohnXu22786/session-export/actions/workflows/ci.yml"><img src="https://github.com/JohnXu22786/session-export/actions/workflows/ci.yml/badge.svg" alt="CI"></a></p>
+<p>Session export &amp; compliance archiving for <a href="https://github.com/deepseek-ai/deepseek-harness">DeepSeek Harness</a> (<code>dsh</code>).</p>
+<p>Turns any current or historical session into verifiable, <strong>sanitized</strong> archives in
+multiple formats, manages them on disk, and gives you a compliance/traffic view —
+all as a dependency-free <a href="#installation">dsh bundle</a>.</p>
+<h2>Why</h2>
+<p>Exports are only useful for compliance or archival if they do not leak. This plugin
+combines, in one bundle:</p>
+<ul>
+<li><strong>Deterministic redaction by default</strong> — API keys, tokens, JWTs, <code>.env</code>-style
+lines, URL credentials and absolute file paths are masked <em>before</em> anything
+touches disk. The same input always yields the same output, and masked values
+carry a stable fingerprint so archives stay correlatable without leaking secrets.</li>
+<li><strong>Multiple formats</strong> — a readable Markdown narrative, a machine-readable JSONL
+full record, and PDF (print-ready HTML plus optional headless-Chromium
+rendering).</li>
+<li><strong>Archive management</strong> — exports are organized by session/date, discoverable,
+searchable, and deletable (with path-traversal guarding).</li>
+<li><strong>Compliance metadata</strong> — every export embeds a header with session id, models,
+sanitization level, counts, and an optional SHA-256 content hash; a trend/audit
+view summarizes what was exported, when, and how sensitive it was.</li>
+<li><strong>No model dependency</strong> — redaction is rule-based. An optional hook exists if you
+want to layer an LLM-assisted masker on top.</li>
+</ul>
+<h2>Features</h2>
+<h3>1. Session export</h3>
+<ul>
+<li>Current or historical sessions, from the harness's own event log
+(<code>ctx.sessionPersistence</code> / <code>ctx.sessions</code>).</li>
+<li>Formats: <code>markdown</code>, <code>jsonl</code>, <code>pdf</code>, or <code>all</code>.</li>
+<li>Event-log folding is tolerant of unknown event types and payload shapes across
+harness versions.</li>
+<li>Large exports are split into numbered parts (with a <code>parts.json</code> manifest); long
+messages can be truncated in Markdown with an explicit marker (JSONL always keeps
+the full record).</li>
+</ul>
+<h3>2. Redaction (on by default)</h3>
+<table>
+<thead>
+<tr>
+<th>Rule</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>api-key</code></td>
+<td><code>sk-…</code>, <code>pk-…</code>, <code>ghp_/gho_/github_pat_</code> (GitHub), <code>hf_</code>, <code>AKIA…</code>, <code>AIza…</code>, long base64-style tokens</td>
+</tr>
+<tr>
+<td><code>jwt</code></td>
+<td><code>eyJ…</code> tokens</td>
+</tr>
+<tr>
+<td><code>high-entropy-token</code></td>
+<td>any 32+ char alphanumeric run</td>
+</tr>
+<tr>
+<td><code>env-value</code></td>
+<td><code>KEY=value</code> assignment lines (e.g. pasted <code>.env</code>)</td>
+</tr>
+<tr>
+<td><code>bearer</code></td>
+<td><code>Bearer</code>/<code>token</code> values</td>
+</tr>
+<tr>
+<td><code>url-credential</code></td>
+<td><code>https://user:pass@host</code></td>
+</tr>
+<tr>
+<td><code>absolute-path</code></td>
+<td>Windows drive / UNC / POSIX home paths — masked, or relativized to <code>&lt;project-root&gt;</code> when <code>pathMode: relative</code></td>
+</tr>
+<tr>
+<td><code>email</code></td>
+<td>opt-in</td>
+</tr>
+<tr>
+<td><code>custom</code></td>
+<td>arbitrary user regexes</td>
+</tr>
+</tbody></table>
+<p>All matched values are replaced with
+<code>&lt;redacted:&lt;rule&gt; sha256:&lt;fingerprint&gt;&gt;</code> where the fingerprint is a salted SHA-256
+(12 hex chars). Determinism + a configurable <code>salt</code> keep exports correlatable across
+files and machines without exposing the secret: because the fingerprint is derived
+from the secret value alone (not the rule label), the same secret gives the same hex
+whether it was caught by the <code>env-value</code>, <code>api-key</code>, or <code>jwt</code> rule. The <code>env-value</code>
+rule runs first, so a <code>KEY=sk-…</code> line is reduced to <code>KEY=&lt;redacted:env …&gt;</code> in one
+step (masking the value token or quoted string while preserving surrounding prose
+and commands) before token rules see it.</p>
+<h3>3. Archive management</h3>
+<pre><code>&lt;outDir&gt;/
+  sessions/&lt;session&gt;/&lt;YYYY-MM-DD&gt;/&lt;YYYY-MM-DD&gt;_&lt;HHMMSS&gt;-&lt;tag&gt;_&lt;format&gt;.&lt;ext&gt;
+    &lt;file&gt;.meta.json       # one sidecar per export (see ArchiveEntry)
+    &lt;file&gt;.parts.json      # present when the export was split
+  archives.json            # searchable index (rebuilt from sidecars if lost)
+</code></pre>
+<p>Files are named with a process-unique tag so two exports in the same second never
+overwrite each other. List/search by session, format, ISO date range, free-text
+query, and limit; delete by archive id, file name, or relative path — strictly
+confined to the archive root (path traversal is rejected). Index writes are
+serialized in-process, so concurrent tool calls cannot lose records.</p>
+<h3>4. Compliance</h3>
+<p>Every export embeds a metadata header:
+<code>plugin</code> (name, version), <code>session</code> (id, project, cwd, createdAt), <code>exportedAt</code>,
+<code>model</code>s used, <code>sanitization</code> (enabled, level, fired rules, salt fingerprint),
+event/message counts, optional <code>contentHash</code>, and warnings. An optional SHA-256 hash
+over the sanitized transcript is included (<code>includeHash: true</code>).</p>
+<p>Note: warnings that only become known while writing (large-export chunking, PDF
+fallback) cannot be embedded in the already-rendered header; they are recorded on
+the archive index entry + <code>.meta.json</code> sidecar and re-surfaced on tool results.</p>
+<p>A <strong>trend/audit view</strong> (<code>/export-audit</code>) aggregates exports by day, format, session
+and sanitization level.</p>
+<h3>5. Toolchain</h3>
+<ul>
+<li><strong>Model-facing tools</strong> (<code>ctx.tools</code>): <code>session_export</code>, <code>session_export_list</code>,
+<code>export_delete</code>, <code>sanitize_config</code>.</li>
+<li><strong>Human slash-commands</strong> (<code>ctx.commands</code>): <code>/session-export</code>,
+<code>/session-export-list</code>, <code>/export-delete</code>, <code>/sanitize-config</code>, <code>/export-audit</code>.</li>
+<li><strong>Reusable library</strong>: import the harness-independent core via the
+<code>dsh-session-export/core</code> subpath.</li>
+</ul>
+<h2>Requirements</h2>
+<ul>
+<li>Node.js 20+ (Node 24+ recommended for running the source <code>.ts</code> test suite directly).</li>
+<li>A DeepSeek Harness profile with the base bundle (provides <code>sessions</code>,
+<code>sessionPersistence</code>, <code>tools</code>, <code>commands</code>).</li>
+</ul>
+<h2>Installation</h2>
+<p>This is a standard dsh <strong>bundle</strong>: an npm package whose <code>package.json</code> declares the
+<code>dsh.bundle</code> manifest and ships a <code>cordis.patch.yml</code> patch layer plus an entry module
+exporting <code>name</code>/<code>inject</code>/<code>apply</code>.</p>
+<pre><code># from this repository
+dsh plugin --profile demo add github:JohnXu22786/session-export
+# or from npm once published
+npm install -g dsh-session-export
+</code></pre>
+<p>The patch inserts one row:</p>
+<pre><code># cordis.patch.yml
+- insert:
+    - id: dsh-session-export
+      name: dsh-session-export
+      config:
+        outDir: !!js dshHomePath('exports')
+</code></pre>
+<p><code>outDir</code> defaults to <code>$DSH_HOME/exports</code> (i.e. <code>~/.dsh/exports</code>). Override any
+setting by targeting the same row id in a later patch layer (config is a whole-row
+replacement, per harness semantics).</p>
+<h2>Configuration</h2>
+<pre><code>- id: dsh-session-export
+  name: dsh-session-export
+  config:
+    outDir: !!js dshHomePath('exports')
+    enabled: true
+    defaultFormat: markdown        # markdown | jsonl | pdf | auto
+    includeNotes: false            # include todo/command/feedback bookkeeping
+    includeDocuments: true         # emit the document-tree appendix
+    maxChunkBytes: 4194304         # split big exports (0 = never)
+    maxMessageChars: 0             # truncate message display in Markdown (0 = never)
+    prettyToolArgs: false
+    includeHash: true
+    redaction:
+      enabled: true
+      pathMode: mask               # mask | relative | off
+      projectRoots: []             # e.g. ['C:\\Users\\you\\work']
+      maskApiKeys: true
+      maskEnvValues: true
+      maskBearerTokens: true
+      maskUrlCredentials: true
+      maskAbsolutePaths: true
+      maskEmails: false
+      salt: ""                     # set a secret to harden correlatable fingerprints
+      customPatterns:              # [{ pattern, flags?, replacement? }]
+        - pattern: '\\d{4}-\\d{4}'
+          replacement: '[CARD]'
+      aiMaskEnabled: false         # layer a user-provided aiMaskFn on top
+    pdf:
+      engine: auto                 # auto | chrome | html
+      chromePath: ""               # explicit chromium-family binary
+</code></pre>
+<h2>Usage</h2>
+<h3>Tools (for the model)</h3>
+<ul>
+<li><strong><code>session_export { format?, sessionId?, redact? }</code></strong> — export a session.
+Returns artifact paths plus a compliance summary. <code>redact: false</code> opts out for
+one-off exports.</li>
+<li><strong><code>session_export_list { query?, sessionId?, format?, before?, after?, limit? }</code></strong>
+— list/search the archive.</li>
+<li><strong><code>export_delete { target }</code></strong> — delete by archive id / file name / relative path.</li>
+<li><strong><code>sanitize_config { action?, sample? }</code></strong> — <code>show</code> the active rules or <code>test</code> a
+sample string against them.</li>
+</ul>
+<h3>Slash commands</h3>
+<pre><code>/session-export [format] [--id=&lt;session&gt;] [--no-redact]
+/session-export-list [query] [--format=&lt;f&gt;] [--limit=&lt;n&gt;] [--id=&lt;session&gt;]
+/export-delete &lt;id|path|filename&gt;
+/sanitize-config [--test &lt;text&gt;]
+/export-audit
+</code></pre>
+<h2>PDF generation approach</h2>
+<p><code>pdf</code> is optional and lightweight by design:</p>
+<ol>
+<li>The session is rendered as a <strong>print-ready, self-contained HTML</strong> file (embedded
+CSS, <code>meta</code> CSP, no scripts, <code>@media print</code> rules).</li>
+<li>With <code>pdf.engine: chrome</code> (or <code>auto</code>), the plugin drives a headless
+Chromium-family binary (<code>chromePath</code> or <code>CHROME_PATH</code>, then common install
+locations) via <code>--headless --print-to-pdf</code>.</li>
+<li>If no browser binary is available, the export archives the HTML and reports a
+warning — open it and use your system "Print to PDF".</li>
+</ol>
+<p>This avoids heavy PDF dependencies (no native renderer is shipped).</p>
+<h2>Compliance hash</h2>
+<p><code>contentHash</code> is <code>sha256</code> over the canonical JSON-Lines serialization of the
+sanitized transcript (header excluded), so two exports of the same sanitized record
+hash identically regardless of format.</p>
+<h2>Development</h2>
+<pre><code>npm install
+npm test          # node --test over test/*.test.ts (needs Node 24+ for .ts)
+npm run typecheck
+npm run build     # tsc → dist/
+</code></pre>
+<p>Structure:</p>
+<pre><code>src/
+  index.ts            # bundle entry: name / inject / apply
+  commands.ts         # slash-command definitions
+  tools.ts            # ctx.tools definitions + registration
+  adapter/            # thin dsh&lt;-&gt;core bridge (backend, types, defineTool)
+  engine.ts           # export pipeline orchestration
+  config.ts           # configuration shape + normalization
+  core/               # harness-independent library (./core subpath)
+    fold.ts           # event-log → transcript document
+    redact.ts         # deterministic sanitization engine
+    archive.ts        # on-disk archive, index, chunking, traversal guard
+    render/           # markdown / jsonl / html / pdf
+    meta.ts           # compliance header
+    audit.ts          # trend/audit aggregation
+    filenames.ts      # platform-safe names
+    hash.ts           # sha256 / fingerprints
+</code></pre>
+<h2>License</h2>
+<p><a href="https://github.com/JohnXu22786/session-export/blob/HEAD/LICENSE">MIT</a></p>

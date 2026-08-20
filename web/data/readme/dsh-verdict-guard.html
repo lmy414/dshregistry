@@ -1,0 +1,166 @@
+<h1>verdict-guard</h1>
+<p>A native <a href="https://github.com/deepseek-ai/deepseek-harness">DeepSeek Harness</a> plugin.
+<strong>A turn that states a verdict does not close until the verdict carries something a reader can follow.</strong></p>
+<pre><code>model:  "The filter does not work. Closing this direction."
+guard:  held back — a verdict without evidence.
+model:  (runs the check, quotes the output — or withdraws the claim)
+</code></pre>
+<h2>Why</h2>
+<p>The most expensive thing an agent produces is not a wrong fix. It is a wrong
+<strong>closing verdict</strong>: <em>"it doesn't work"</em>, <em>"no bug here"</em>, <em>"not reproducible"</em>.</p>
+<p>A false <em>"it works"</em> is caught by the next run — it leaves a trace.
+A false <em>"it doesn't work"</em> leaves none. The direction is closed quietly, and
+nobody re-opens a question that already has an answer. The two error classes
+are not equally priced, so they should not carry the same standard of proof.</p>
+<p>This plugin makes the asymmetry mechanical: at the turn's stop boundary it
+reads what the model is about to close on, and what the turn <strong>actually did</strong>.</p>
+<h2>What counts as evidence</h2>
+<table>
+<thead>
+<tr>
+<th>Signal</th>
+<th>Where it comes from</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>a fenced block, an exit code, a test tally, an HTTP status</td>
+<td>the answer's text</td>
+</tr>
+<tr>
+<td><code>file.ts:88</code>, a path, a log name, <code>journalctl</code>, <code>pytest</code>, …</td>
+<td>the answer's text</td>
+</tr>
+<tr>
+<td>a verifying tool result — <code>bash</code>, <code>read</code>, <code>grep</code>, <code>test</code>, …</td>
+<td><strong>the session log for that turn</strong></td>
+</tr>
+</tbody></table>
+<p>The third row is why this is a plugin and not a shell hook. A text-only checker
+sees what the model <em>wrote</em>. The session log says what actually <strong>ran</strong>.</p>
+<p>That gives one check a hook cannot make:</p>
+<blockquote>
+<p>The answer pastes a command transcript — a fenced block, <code>12 passed, 0 failed</code>,
+an exit code — while the turn called <strong>no tool at all</strong>. Nothing produced that
+text except the model. It is held back with a sharper message than a plain
+missing citation.</p>
+</blockquote>
+<p>A bare file path is deliberately <em>not</em> enough to trigger that stricter case: a
+path can honestly be recalled from earlier in the conversation, a transcript cannot.</p>
+<h2>Install</h2>
+<pre><code>dsh plugin add dsh-plugin-verdict-guard
+</code></pre>
+<p>That is the whole install. The package declares a <code>dsh.bundle</code> manifest, so it
+enters your profile as its own bundle layer with every option at its default —
+no row to write by hand. Verify it composed into the tree:</p>
+<pre><code>dsh --profile headless --dump-config | grep -A 3 verdict-guard
+</code></pre>
+<p>To change a default, add a row to your profile's own patch layer
+(<code>$DSH_HOME/profiles/&lt;profile&gt;/cordis.patch.yml</code>), which is applied after every
+bundle layer:</p>
+<pre><code>- id: verdict-guard
+  config:
+    locale: en
+    requireToolEvidence: false
+    maxInterventionsPerTurn: 2
+</code></pre>
+<h2>Config</h2>
+<table>
+<thead>
+<tr>
+<th>Option</th>
+<th>Default</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>locale</code></td>
+<td><code>both</code></td>
+<td>which verdict vocabularies participate — <code>en</code>, <code>ru</code>, <code>both</code></td>
+</tr>
+<tr>
+<td><code>requireToolEvidence</code></td>
+<td><code>true</code></td>
+<td>a verdict needs a <strong>verifying</strong> tool result, not merely any tool result — writing a file is not checking a claim</td>
+</tr>
+<tr>
+<td><code>verifyingTools</code></td>
+<td>bash/read/grep/test/…</td>
+<td>tool names that count as verification</td>
+</tr>
+<tr>
+<td><code>extraVerdictPatterns</code></td>
+<td>—</td>
+<td>regex sources appended to the built-in verdict vocabulary</td>
+</tr>
+<tr>
+<td><code>extraEvidencePatterns</code></td>
+<td>—</td>
+<td>regex sources appended to the built-in evidence vocabulary</td>
+</tr>
+<tr>
+<td><code>verdictPatterns</code></td>
+<td>—</td>
+<td>replace the built-in verdict vocabulary entirely</td>
+</tr>
+<tr>
+<td><code>evidencePatterns</code></td>
+<td>—</td>
+<td>replace the built-in evidence vocabulary entirely</td>
+</tr>
+<tr>
+<td><code>maxInterventionsPerTurn</code></td>
+<td><code>1</code></td>
+<td>how many times one turn may be held back</td>
+</tr>
+<tr>
+<td><code>maxInterventionsPerSession</code></td>
+<td><code>6</code></td>
+<td>total holds per session</td>
+</tr>
+<tr>
+<td><code>verbose</code></td>
+<td><code>false</code></td>
+<td>log every pass decision at debug level</td>
+</tr>
+</tbody></table>
+<p>An empty list is read as <em>"not supplied"</em>, never as <em>"match nothing"</em> — so a
+config that fills unset array options with <code>[]</code> cannot silently disarm the guard.</p>
+<h2>What this is not</h2>
+<p>It does not verify that a claim is <em>true</em> — no oracle, no acceptance criteria,
+no contract. It checks one thing: whether the answer offers anything to check
+at all. A wrong claim with a real command output beside it passes here and is
+caught by the reader; a right claim with nothing beside it is held.</p>
+<p>It also holds only <strong>once</strong> per turn by default. It is a speed bump on the way
+out, not a gate you have to satisfy.</p>
+<h2>How it works</h2>
+<p>One listener on <code>agent/turn-stopping</code>, the harness's own stop boundary:</p>
+<pre><code>agent/turn-stopping  →  read the turn's closing assistant text
+                     →  read the turn's tool/call + tool/result events
+                     →  verdict? evidence?  →  agent.steer(reason)
+</code></pre>
+<p>Steering makes the machine observe pending input and run another step, which is
+the documented way for a listener to object at that boundary. Nothing in the
+agent loop is modified.</p>
+<p><strong>The guard caps itself.</strong> The harness has no loop guard here yet: the loop
+carries a <code>TODO(stop-loop-guard)</code>, and the Claude Code hook bridge reports
+<code>stop_hook_active: false</code> unconditionally, so a listener that steers must limit
+itself or it can hold a turn open forever. <code>maxInterventionsPerTurn</code> (default
+<code>1</code>) is that limit — one hold, then the turn closes whatever the model says.</p>
+<h2>Compatibility</h2>
+<p>Built and tested against <code>0.1.0-rc.8</code>.</p>
+<p>⚠️ <strong>The <code>latest</code> dist-tag on the harness's own sub-packages is stale.</strong>
+<code>@deepseek-ai/dsh-tools</code>, <code>-llm</code>, <code>-session</code> and friends publish their current
+line under <code>next</code> (<code>0.1.0-rc.8</code>) while <code>latest</code> still points at <code>0.0.1-rc.1</code>.
+Installing them without an explicit range mixes two incompatible generations —
+and some <code>0.0.1-rc.1</code> packages depend on <code>@deepseek-ai/dsh-bash</code>, which no
+longer exists. Pin <code>^0.1.0-rc.8</code>, or install with <code>@next</code>.</p>
+<h2>Development</h2>
+<pre><code>npm install
+npm test     # 24 tests: the detector, plus the plugin on a real agent loop
+npm run build
+</code></pre>
+<p>The integration tests drive the real <code>AgentLoop</code> with a scripted model adapter,
+so both outcomes — held and closed — are proven without a provider key.</p>
+<h2>License</h2>
+<p>MIT</p>
+<p><a href="https://github.com/deepseek-ai/deepseek-harness"><img src="https://img.shields.io/badge/powered_by-dsh-4D6BFE?style=flat-square&amp;logo=deepseek&amp;logoColor=white" alt=""></a></p>

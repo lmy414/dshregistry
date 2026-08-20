@@ -1,0 +1,173 @@
+<h1>dsh-session-integrity</h1>
+<p><a href="https://github.com/DON738110198/dsh-session-integrity/blob/HEAD/README.md">English</a> | <a href="https://github.com/DON738110198/dsh-session-integrity/blob/HEAD/README.zh-CN.md">简体中文</a></p>
+<p>Session integrity diagnosis and non-destructive recovery for
+<a href="https://github.com/deepseek-ai/deepseek-harness">DeepSeek Harness</a>.</p>
+<p>A single internal scheduler exception can turn an ordinary tool failure into a
+durable transcript defect that makes every later model request fail before the
+model can answer.</p>
+<h2>The problem</h2>
+<h3>The provider invariant</h3>
+<p>When an assistant message requests tools, every provider-visible tool call id
+must be followed by its matching tool result. A normal tool failure is safe for
+the conversation because Harness serializes the failure as that result and the
+model can decide what to do next.</p>
+<p>The broken case is different: Harness persists the assistant request and the
+execution start, but no result reaches the model-visible Session surface.</p>
+<pre><code>assistant/message  tool-call c1
+tool/call          c1
+scheduler.prepare  throws
+step/end
+turn/end           error
+
+# Missing: tool/result c1
+</code></pre>
+<p>The next request replays the assistant tool call without a result. DeepSeek
+rejects the request before inference with a protocol error such as:</p>
+<pre><code>An assistant message with 'tool_calls' must be followed by tool messages
+responding to each 'tool_call_id'.
+</code></pre>
+<p>This is why sending another user message does not recover the Session. The
+invalid history is durable and is sent again on every turn.</p>
+<pre><code>sequenceDiagram
+    participant M as Model
+    participant H as Harness
+    participant S as Tool scheduler
+    participant P as Provider
+    M--&gt;&gt;H: assistant tool-call c1
+    H-&gt;&gt;H: persist assistant/message and tool/call
+    H-&gt;&gt;S: prepare(c1)
+    S--xH: throws
+    H-&gt;&gt;H: persist turn/end(error), no tool/result
+    H-&gt;&gt;P: later request replays unmatched c1
+    P--xH: HTTP 400 before inference
+</code></pre>
+<h3>Why one error becomes permanent</h3>
+<p>There are three separate layers:</p>
+<ol>
+<li><strong>Trigger:</strong> <code>prepare()</code> or another internal scheduler boundary throws. A
+duplicated runtime package and mismatched symbol can cause this, but it is
+only one possible trigger.</li>
+<li><strong>Persistence defect:</strong> <code>tool/call</code> has already been recorded, while the only
+path that appends <code>tool/result</code> is never reached.</li>
+<li><strong>Replay amplification:</strong> the turn still receives <code>turn/end</code>, so open-tail
+crash recovery does not repair it. Every later provider request contains the
+same unmatched tool call and fails again.</li>
+</ol>
+<p>The structural bug therefore exists independently of the original trigger.
+Any exception in the vulnerable interval can poison a previously healthy
+Session.</p>
+<h3>Why blindly adding a generic error is unsafe</h3>
+<p>If failure happens before dispatch, the tool definitely did not run and a retry
+is safe when still needed. If dispatch started but its result was not durably
+committed, external side effects may already exist. That outcome must be marked
+unknown and verified before retrying a write, payment, deployment, or other
+non-idempotent operation.</p>
+<h2>What this project does</h2>
+<ul>
+<li>The Cordis plugin scans live Sessions at load and after <code>turn/end</code>.</li>
+<li>The offline CLI checks exported JSON or uncompressed JSONL without starting a
+model request.</li>
+<li>Provider-visible defects are separated from raw execution gaps already
+shadowed by compaction.</li>
+<li>Reports use hashed references and omit prompts, tool arguments, and tool
+results.</li>
+<li>The recovery planner finds the latest completed prefix that is still safe to
+send to a provider.</li>
+<li>The Web plugin adds <strong>Continue from here</strong> to historical assistant turns. It
+creates and opens a fork while retaining the original Session.</li>
+<li>The analyzer and planner are read-only. Recovery uses Harness's public fork
+operation rather than rewriting durable history.</li>
+</ul>
+<p>The issue was reproduced on a clean <code>dsh-v0.1.0-rc.8</code> / <code>master</code> baseline: the
+unpatched regression recorded one <code>tool/call</code> and zero <code>tool/result</code> events.
+The tested prevention patch in the linked fork closes undispatched calls with
+<code>TOOL_SCHEDULER_FAILED_BEFORE_DISPATCH</code> and dispatched calls with
+<code>TOOL_SCHEDULER_OUTCOME_UNKNOWN</code>, without rerunning dispatch or finalizers.
+It is a proposal for upstream review, not a change already merged by DeepSeek.</p>
+<ul>
+<li><a href="https://github.com/deepseek-ai/deepseek-harness/discussions/3524#discussioncomment-18089302">Upstream incident and reproduction</a></li>
+<li><a href="https://github.com/DON738110198/deepseek-harness/tree/fix/scheduler-failure-tool-results">Proposed core prevention patch (fork)</a></li>
+<li><a href="https://github.com/deepseek-ai/deepseek-harness/discussions/3555">Plugin showcase in the upstream Discussions</a></li>
+</ul>
+<p>DeepSeek Harness currently routes external contributions through Discussions,
+plugins, guides, and community support rather than external Pull Requests; see
+the official <a href="https://github.com/deepseek-ai/deepseek-harness/blob/master/CONTRIBUTING.md">contribution policy</a>.
+The fork keeps the complete patch reviewable until maintainers invite or reopen
+the PR path.</p>
+<h2>Safety contract</h2>
+<ul>
+<li>Never mutates, repairs, deletes, or replaces events in the source Session.</li>
+<li>Recovery creates a child Session through Harness's fork API. It never retries
+tools and never claims that external side effects were rolled back.</li>
+<li>Never logs prompt text, tool arguments, tool output, raw Session ids, or raw
+tool call ids.</li>
+<li>Separates provider-visible transcript defects from shadowed execution-log
+warnings.</li>
+<li>Does not implement hard deletion. The current public persistence service has
+no backend-independent Session deletion operation.</li>
+</ul>
+<h2>Install from GitHub</h2>
+<pre><code>dsh plugin --profile web add github:DON738110198/dsh-session-integrity#v0.2.1
+dsh --profile web --dump-config
+dsh --profile web
+</code></pre>
+<p>The package ships built JavaScript, so a Git install does not need a build
+allowance. The Host plugin scans already-live Sessions when it loads and checks
+a Session again at <code>turn/end</code>. Each distinct defect is logged once.</p>
+<p>In the Web UI, finalized assistant messages that have later conversation
+history receive a branch icon. Pressing it creates a child through the official
+Session fork API and opens that child. It refuses while the source turn is
+running, retains the original Session, and does not archive it automatically.</p>
+<h2>Offline check</h2>
+<p>Use an uncompressed <code>session.jsonl</code> artifact or an exported JSON document with
+an <code>events</code> array:</p>
+<pre><code>dsh plugin --profile web exec dsh-session-integrity ./session.jsonl
+dsh plugin --profile web exec dsh-session-integrity ./session.jsonl --json &gt; integrity-report.json
+dsh plugin --profile web exec dsh-session-integrity recover ./session.jsonl --json &gt; recovery-plan.json
+dsh plugin --profile web exec dsh-session-integrity recover ./session.jsonl --at 42
+</code></pre>
+<p>From a repository checkout, use <code>node ./cli.js ./session.jsonl</code> instead. The
+package is not published to npm yet, so a bare <code>npx dsh-session-integrity</code>
+command is intentionally not documented as an available install path.</p>
+<p><code>recover</code> interprets <code>--at</code> as a Session event anchor. It first considers the
+completed turn at or after that anchor, then walks backward until the prefix has
+no provider-blocking defect. The output is a plan only: it does not modify the
+artifact or a live Session.</p>
+<p>For <code>scan</code>, exit codes are <code>0</code> for no provider-blocking defect, <code>1</code> for an input
+error, and <code>2</code> for a critical defect. For <code>recover</code>, <code>0</code> means a safe fork
+boundary was found and <code>2</code> means a fresh Session is required. Zstandard logs
+are intentionally not decoded independently; use a Harness export or an
+uncompressed backend.</p>
+<h2>Why recovery is a fork, not rollback</h2>
+<p>Harness Sessions are append-only event logs. Removing a visible message can
+also remove tool calls, request headers, compaction provenance, or evidence of
+an external side effect. <code>Continue from here</code> therefore creates a new lineage
+from a completed turn instead of pretending the old events never happened.</p>
+<p>Permanent deletion is a separate core capability: it must coordinate the live
+agent, JSONL and SQLite backends, workspace accounting, projections, cached
+indexes, and attachment retention. A frontend-only delete button or direct file
+removal would not provide that contract, so this plugin deliberately does not
+offer one.</p>
+<h2>What it checks</h2>
+<ul>
+<li>assistant tool requests missing matching provider-visible tool results</li>
+<li>unexpected or mismatched tool results</li>
+<li>duplicate assistant call ids and duplicate execution events</li>
+<li>unsettled <code>tool/call</code> records hidden from the current surface</li>
+<li>malformed or invalid surface operations</li>
+<li>non-monotonic event sequences</li>
+</ul>
+<h2>Development</h2>
+<pre><code>npm test
+npm run check
+npm run pack:check
+</code></pre>
+<p>The fixture suite covers healthy and poisoned recovery boundaries, a
+<code>prepare()</code>-style failure, synthetic cancellation, an open crash tail, a
+compaction-shadowed orphan, packed JSONL rows, browser fork orchestration,
+plugin warning deduplication, and CLI exit behavior.</p>
+<h2>Status</h2>
+<p><code>0.2.x</code> targets DeepSeek Harness <code>dsh-v0.1.0-rc.8</code>. Harness is a developer
+preview, so compatibility is tested per release rather than assumed.</p>
+<h2>License</h2>
+<p>MIT</p>

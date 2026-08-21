@@ -1,0 +1,134 @@
+<h1>dsh-voice</h1>
+<p>回合制语音通道 for <a href="https://github.com/deepseek-ai/deepseek-harness">DeepSeek Harness</a>（<code>dsh</code>）——为「面向面试者的 preset」而生的语音插件。</p>
+<p>Agent 通过三个工具获得语音能力，浏览器端自动配合录音/播放，形成完整的一问一答闭环：</p>
+<table>
+<thead>
+<tr>
+<th>工具</th>
+<th>方向</th>
+<th>作用</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>voice_speak</code></td>
+<td>Agent → 人</td>
+<td>把提问/反馈合成语音，浏览器自动播放</td>
+</tr>
+<tr>
+<td><code>voice_listen</code></td>
+<td>人 → Agent</td>
+<td>弹出录音面板，候选人作答后自动转写回传</td>
+</tr>
+<tr>
+<td><code>voice_status</code></td>
+<td>—</td>
+<td>引擎健康检查（TTS/ASR 可用性、队列、录音状态）</td>
+</tr>
+</tbody></table>
+<h2>三引擎 provider 抽象</h2>
+<p>TTS 与 ASR 各自独立选择引擎，<code>auto</code> 模式按 <code>qwen → mimo → local</code> 顺序探测，取第一个可用者：</p>
+<table>
+<thead>
+<tr>
+<th>引擎</th>
+<th>TTS</th>
+<th>ASR</th>
+<th>依赖</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong>qwen</strong>（首发）</td>
+<td><code>qwen3-tts-flash</code>（DashScope 原生 multimodal-generation）</td>
+<td><code>qwen3-asr-flash</code>（OpenAI 兼容 <code>/audio/transcriptions</code>）</td>
+<td>环境变量 <code>DASHSCOPE_API_KEY</code></td>
+</tr>
+<tr>
+<td><strong>mimo</strong></td>
+<td><code>MiMo-V2.5-TTS</code>（<code>POST /audio/speech</code>）</td>
+<td><code>MiMo-V2.5-ASR</code>（<code>POST /audio/transcriptions</code>）</td>
+<td>环境变量 <code>MIMO_API_KEY</code>；baseUrl/model 可配（本地 MiMo 网关同理）</td>
+</tr>
+<tr>
+<td><strong>local</strong></td>
+<td>sherpa-onnx / piper 二进制 / macOS <code>say</code></td>
+<td>sherpa-onnx（paraformer/zipformerCtc 等离线模型）/ whisper.cpp 二进制</td>
+<td>本地模型与二进制，零 API 依赖</td>
+</tr>
+</tbody></table>
+<blockquote>
+<p><strong>本地 ASR（sherpa-onnx）已验证闭环</strong>：macOS <code>say</code> 合成中文 → 16 kHz WAV →
+<code>sherpa-onnx-paraformer-zh-small-2024-03-09</code>（int8，约 82 MB，hf-mirror 可下载）
+转写，552 ms、逐字命中。插件将 <code>sherpa-onnx-node</code> 声明为 optionalDependency，
+本地引擎生效只需：模型目录就位 + 配置 <code>asr.local.{kind, modelType, modelDir, model}</code>。</p>
+</blockquote>
+<p>音频落盘在 <code>~/.dsh/voice</code>（可配），由本机 loopback 路由（支持 Range）服务给浏览器；浏览器端以 16 kHz 单声道 WAV 录音（对所有 ASR 后端通用）。云引擎只收到需要转写的音频本身。</p>
+<h2>安装</h2>
+<pre><code>dsh plugin --profile web add @harness-flow/dsh-voice
+</code></pre>
+<blockquote>
+<p>安装后重启对应 profile 生效。插件行的默认配置是中性值；在你的 profile 的
+<code>cordis.patch.yml</code> 里按行 id <code>dsh-voice</code> 覆盖（不要重复 insert 同一 id）。</p>
+</blockquote>
+<h2>配置</h2>
+<pre><code>- id: dsh-voice
+  config:
+    asr:
+      engine: auto          # auto | qwen | mimo | local
+      language: zh
+      # qwen: { apiKeyEnv: DASHSCOPE_API_KEY, model: qwen3-asr-flash, baseUrl: https://dashscope.aliyuncs.com/compatible-mode/v1 }
+      # mimo: { apiKeyEnv: MIMO_API_KEY, model: MiMo-V2.5-ASR, baseUrl: https://api.mimo.mi.com/v1 }
+      # local: { kind: sherpa-onnx | whisper-bin, modelType: paraformer, modelDir: ~/.dsh/voice-models/paraformer-zh-small, model: model.int8.onnx, bin: ... }
+    tts:
+      engine: auto          # auto | qwen | mimo | local
+      voice: Cherry
+      # qwen: { apiKeyEnv: DASHSCOPE_API_KEY, model: qwen3-tts-flash, baseUrl: https://dashscope.aliyuncs.com/api/v1 }
+      # mimo: { apiKeyEnv: MIMO_API_KEY, model: MiMo-V2.5-TTS, baseUrl: https://api.mimo.mi.com/v1 }
+      # local: { kind: sherpa-onnx | piper-bin | say, modelDir: ..., bin: ..., model: ... }
+    audioDir: ~/.dsh/voice
+    listenTimeoutSec: 120
+</code></pre>
+<ul>
+<li>云引擎密钥只在调用时从引用的环境变量读取，配置里只写变量名，永不写密钥。</li>
+<li><code>sherpa-onnx</code> 需要 profile 里安装 <code>sherpa-onnx-node</code> 并配置模型目录；<code>whisper-bin</code>/<code>piper-bin</code> 指向 whisper.cpp / piper 的可执行文件与模型。</li>
+<li>本地 MiMo（MiMo-Audio-7B 经 vLLM-Omni 等 OpenAI 兼容网关）通过 <code>tts.mimo.baseUrl</code> / <code>asr.mimo.baseUrl</code> 指向本机地址即可复用同一实现。</li>
+</ul>
+<h2>面试官 preset（推荐用法）</h2>
+<p>preset 与插件各司其职：插件负责语音链路（host 侧服务 + 浏览器 UI），preset 只负责「面试官」这个角色与流程。给面试 preset 的 persona 建议：</p>
+<pre><code>- id: persona
+  name: '@deepseek-ai/dsh-persona'
+  config:
+    text: &gt;-
+      你是一位专业的面试官，正在通过语音进行一场结构化面试。
+      一次只提一个问题：用 voice_speak 朗读问题，随后立刻调用 voice_listen
+      等待候选人作答；根据 transcript 追问或进入下一题。
+      流程：开场寒暄 → 自我介绍 → 技术/项目深挖 → 行为面 → 候选人提问 →
+      结束语与后续安排。全程专业、中立、鼓励，不做主观臆断；
+      面试结束后输出评分表（各维度 1–5 分 + 一句话依据）与录用建议。
+</code></pre>
+<h2>开发</h2>
+<pre><code>pnpm install
+pnpm check                  # build + 22 项单元测试
+pnpm run verify:dsh-offline # 一次性 DSH_HOME 隔离 profile 启动验证（不碰用户 profile）
+</code></pre>
+<ul>
+<li>Host：<code>src/index.ts</code>（TypeScript，tsc 直出 ESM 到 <code>lib/</code>）</li>
+<li>Client：<code>src/client/*.tsx</code>（esbuild 打成 <code>window.__ModuleLoader__.load</code> 懒加载 CJS 包）</li>
+<li>测试：<code>node --test test/*.test.mjs</code>（fake/mock 引擎，不访问网络）</li>
+<li>浏览器验收：<code>scripts/browser-accept.mjs</code>（Playwright，需 <code>DSH_VOICE_BASE_URL</code> + <code>PLAYWRIGHT_ENTRY</code> 环境变量）</li>
+</ul>
+<h2>发布与市场</h2>
+<ul>
+<li>GitHub：<code>Harzva/dsh-voice</code>（topic: <code>dsh-plugin</code>），Release tarball 即安装包：
+<code>dsh plugin --profile web add github:Harzva/dsh-voice</code></li>
+<li>awesome-dsh-plugin.com 收录后自动辐射 dsh-market、dsh-find-plugin、
+dsh-webui-market-plugin 与内置 dsh-market 的桌面客户端；
+带 <code>dsh-plugin</code> topic 的仓库会在话题驱动市场（DSH-Plugins-Marketplace、
+DSH-Plugin-Market 等）自动收录。</li>
+</ul>
+<h2>边界与设计取舍（v0.1）</h2>
+<ul>
+<li><strong>回合制优先</strong>：<code>voice_speak</code> 阻塞到合成完成（2–5s），保证「提问 → 收听」顺序；全双工打断（barge-in）留给后续版本。</li>
+<li><strong>单客户端桥接</strong>：listen 会话与播放队列在内存中，假设 DSH web UI 一个浏览器；页面关闭后队列自动丢弃。</li>
+<li><strong>不做会话事件持久化</strong>：v0.1 不写 <code>voice/*</code> 会话事件（历史加载兼容风险），聊天记录里保留文本转写。</li>
+<li><strong>失败局部化</strong>：引擎探测失败只影响该引擎；浏览器播放被自动播放策略拦截时，等下一次用户手势重试。</li>
+</ul>

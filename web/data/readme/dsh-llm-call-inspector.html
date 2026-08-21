@@ -1,0 +1,216 @@
+<h1>dsh-llm-call-inspector</h1>
+<p>English | <a href="https://github.com/striveh/dsh-llm-call-inspector/blob/HEAD/README.zh.md">中文</a></p>
+<p><a href="https://github.com/striveh/dsh-llm-call-inspector/actions/workflows/ci.yml"><img src="https://github.com/striveh/dsh-llm-call-inspector/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+<a href="https://github.com/striveh/dsh-llm-call-inspector/blob/HEAD/LICENSE"><img src="https://img.shields.io/badge/License-MIT-blue.svg" alt="License: MIT"></a></p>
+<p>A local, session-scoped LLM request and response inspector for <a href="https://github.com/deepseek-ai/deepseek-harness">DeepSeek Harness</a> Web. It adds an <strong>LLM Calls</strong> view beside Chat and Trajectory so developers can inspect each session-associated normalized <code>llm/stream</code> call without changing what the model receives or what the caller receives.</p>
+<p>This is a community plugin, not an official DeepSeek Harness release. Version <code>0.1.2</code> is verified against the <code>0.1.0-rc.8</code> and <code>0.1.1-rc.1</code> API surfaces.</p>
+<p><img src="https://raw.githubusercontent.com/striveh/dsh-llm-call-inspector/HEAD/docs/llm-calls.png" alt="LLM Calls view showing a session-scoped call list and ordered response chunks"></p>
+<blockquote>
+<p>[!WARNING]
+Request and response bodies can contain prompts, source code, tool arguments, tool results, personal data, or secrets embedded in content. Installing this plugin opts the Host into body capture by default. Read <a href="https://github.com/striveh/dsh-llm-call-inspector/blob/HEAD/docs/privacy.md">Privacy and data handling</a> before using it with sensitive sessions.</p>
+</blockquote>
+<h2>What it shows</h2>
+<ul>
+<li>A newest-first list of calls for the active DSH session.</li>
+<li>Provider, model, purpose, status, start time, duration, chunk count, and body-capture state.</li>
+<li>Search plus status and purpose filters.</li>
+<li>A master/detail layout with separate request and response tabs, expandable JSON, and copy actions.</li>
+<li>Live polling, explicit refresh, session-local clear, error and empty states, keyboard focus, responsive layout, and English/Chinese labels.</li>
+<li>Calls made for assistant work, compaction, session-title generation, or another normalized purpose when the call carries a <code>sessionId</code>.</li>
+</ul>
+<p>The captured normalized request allowlist is:</p>
+<p><code>provider</code>, <code>model</code>, <code>reasoningEffort</code>, <code>messages</code>, <code>system</code>, <code>tools</code>, <code>temperature</code>, <code>maxTokens</code>, <code>stop</code>, <code>sessionId</code>, and <code>purpose</code>.</p>
+<p>The captured response is the ordered array of DSH <code>StreamChunk</code> values observed at <code>llm/stream</code>. The observer delegates exactly once, yields the original chunk objects in the original order, and preserves downstream throws. Whole-chunk capture also preserves JSON-compatible adapter replay metadata, including <code>finish.replayState</code> when an adapter emits it.</p>
+<p>The current built-in DSH image block carries attachment-reference metadata (opaque attachment id, media type, byte size, dimensions, and optional display name), and that reference is captured as part of <code>messages</code>. The plugin does not independently load attachment bytes or observe provider-side base64 wire payloads. Because normalized <code>messages</code> are copied whole, any extension that embeds bytes, base64, credentials, or other private fields inside a custom message block would place that data inside the capture boundary.</p>
+<h2>Scope boundary</h2>
+<p>This plugin inspects the <strong>DSH-normalized LLM boundary</strong>. It is not a provider wire proxy.</p>
+<p>It does not capture:</p>
+<ul>
+<li>provider-native HTTP request or response bodies;</li>
+<li>HTTP headers, top-level API keys, abort signals, or undeclared adapter-private fields on the request object;</li>
+<li>raw SSE frames, transport retries hidden inside an adapter, or provider-side processing;</li>
+<li>sessionless <code>llm/stream</code> calls; or</li>
+<li>hidden reasoning that the provider does not return as a normalized chunk.</li>
+</ul>
+<p>Top-level structural exclusion is not content redaction. A key pasted into a prompt, returned by a tool, or nested inside a plugin-defined message block can still be captured.
+Response chunks are preserved whole, so adapter-private JSON inside <code>finish.replayState</code> can also be captured and must be treated as sensitive content.</p>
+<h2>Why a separate view instead of merging with Trajectory</h2>
+<p>DeepSeek Harness <code>0.1.0-rc.8</code> and <code>0.1.1-rc.1</code> expose <code>conversation.view</code> as the public additive UI seam. The built-in Trajectory uses that seam but does not expose a supported inner row or panel extension point.</p>
+<p>Trajectory and this inspector also answer different questions:</p>
+<ul>
+<li><strong>Trajectory</strong> explains the durable session story: user/assistant/tool events, steps, timing, usage, and outcomes.</li>
+<li><strong>LLM Calls</strong> exposes each normalized invocation boundary: the exact captured request snapshot and ordered response chunks observed for that invocation.</li>
+</ul>
+<p>The plugin therefore registers an adjacent view at order 20 instead of copying, patching, or depending on Trajectory internals. If Trajectory later publishes a stable cross-link or inner-extension seam, the two views can be connected without changing capture ownership.</p>
+<h2>Architecture</h2>
+<pre><code>session-associated GenerateOptions
+              |
+              v
+      llm/stream observer
+              |
+              v
+ bounded per-session memory store
+              |
+              v
+ Connection RPC /dsh-llm-call-inspector (loopback only)
+              |
+              v
+ conversation.view / LLM Calls
+</code></pre>
+<p>One package contains both runtime faces:</p>
+<ul>
+<li><strong>Host</strong> injects <code>llm</code> and <code>connection</code>, prepends a transparent <code>llm/stream</code> observer, owns bounded memory, and registers one loopback-only Connection RPC channel.</li>
+<li><strong>Client</strong> injects <code>connection</code>, <code>slots</code>, and <code>locale</code>, then registers one <code>conversation.view</code> entry. It polls body-free summaries and fetches the full body only for the selected call.</li>
+<li><strong>Bundle</strong> declares <code>dsh.bundle.patch</code> and a Web client export, so <code>dsh plugin</code> adds both faces through the supported profile mechanism.</li>
+</ul>
+<p>The store never writes captured bodies to disk. Records disappear when you clear the current session in the UI, the configured per-session/session/global-body bounds evict them, the plugin reloads, or DSH restarts.</p>
+<h2>Install</h2>
+<p>Prerequisites:</p>
+<ul>
+<li>DeepSeek Harness <code>0.1.0-rc.8</code> or <code>0.1.1-rc.1</code>;</li>
+<li>Node.js <code>22.19</code> or newer supported by the package engine; and</li>
+<li>pnpm on <code>PATH</code>, as required by <code>dsh plugin</code>.</li>
+</ul>
+<p>Install the GitHub repository into the Web profile:</p>
+<pre><code>dsh plugin --profile web add github:striveh/dsh-llm-call-inspector
+dsh --profile web --dump-config
+dsh web
+</code></pre>
+<p>Restart a running Web profile after adding, updating, or removing a bundle. The config dump should contain a <code># == dsh-llm-call-inspector</code> layer.</p>
+<p>For reproducible use, pin a reviewed commit:</p>
+<pre><code>dsh plugin --profile web add github:striveh/dsh-llm-call-inspector#&lt;commit-sha&gt;
+</code></pre>
+<p>The repository ships checked-in <code>lib/</code> artifacts and deliberately has no <code>prepare</code> or install lifecycle script. A GitHub install therefore does not need pnpm <code>allowBuilds</code> permission.</p>
+<h2>Configuration</h2>
+<p>The bundle defaults are:</p>
+<table>
+<thead>
+<tr>
+<th>Field</th>
+<th align="right">Default</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>captureBodies</code></td>
+<td align="right"><code>true</code></td>
+<td>Capture allowlisted request fields and ordered response chunks. <code>false</code> keeps call metadata but marks both bodies omitted.</td>
+</tr>
+<tr>
+<td><code>maxCallsPerSession</code></td>
+<td align="right"><code>100</code></td>
+<td>Maximum retained calls in one session; oldest calls are evicted first.</td>
+</tr>
+<tr>
+<td><code>maxSessions</code></td>
+<td align="right"><code>32</code></td>
+<td>Maximum retained session buckets; least-recently-used buckets are evicted.</td>
+</tr>
+<tr>
+<td><code>maxRequestBytes</code></td>
+<td align="right"><code>524288</code></td>
+<td>UTF-8 JSON byte ceiling for one request snapshot.</td>
+</tr>
+<tr>
+<td><code>maxResponseBytes</code></td>
+<td align="right"><code>1048576</code></td>
+<td>UTF-8 JSON byte ceiling for one response chunk array.</td>
+</tr>
+<tr>
+<td><code>maxTotalBodyBytes</code></td>
+<td align="right"><code>67108864</code></td>
+<td>Global retained captured-JSON budget across all sessions; settled calls are evicted before running calls, then oldest creation order first.</td>
+</tr>
+<tr>
+<td><code>pollIntervalMs</code></td>
+<td align="right"><code>750</code></td>
+<td>Interval advertised to the mounted browser view.</td>
+</tr>
+</tbody></table>
+<p>To override them, add a later row to <code>$DSH_HOME/profiles/web/cordis.patch.yml</code>. A DSH patch replaces the row's complete <code>config</code>, so this example restates every field:</p>
+<pre><code>- id: dsh-llm-call-inspector
+  config:
+    captureBodies: true
+    maxCallsPerSession: 50
+    maxSessions: 16
+    maxRequestBytes: 262144
+    maxResponseBytes: 524288
+    maxTotalBodyBytes: 33554432
+    pollIntervalMs: 1000
+</code></pre>
+<p>If a body exceeds its limit, the plugin drops the whole body and exposes an explicit <code>size-limit</code> omission with measured bytes. Non-JSON-compatible values and disabled capture also produce explicit omission states; metadata and chunk counts remain available.</p>
+<h3>Metadata-only mode</h3>
+<p>Set <code>captureBodies: false</code> when provider/model, status, timing, and chunk counts are sufficient:</p>
+<pre><code>- id: dsh-llm-call-inspector
+  config:
+    captureBodies: false
+    maxCallsPerSession: 100
+    maxSessions: 32
+    maxRequestBytes: 524288
+    maxResponseBytes: 1048576
+    maxTotalBodyBytes: 67108864
+    pollIntervalMs: 750
+</code></pre>
+<p>Changing this configuration reloads the plugin and discards its current in-memory records.</p>
+<h2>Disable or uninstall</h2>
+<p>To keep the dependency installed but disable the plugin, add this later profile patch and restart Web:</p>
+<pre><code>- id: dsh-llm-call-inspector
+  disabled: true
+</code></pre>
+<p>To remove the dependency and its bundle layer:</p>
+<pre><code>dsh plugin --profile web remove dsh-llm-call-inspector
+</code></pre>
+<p>Restart the profile after removal. Uninstalling or disabling the plugin cannot recover already-evicted in-memory records; none are persisted by this plugin.</p>
+<h2>Existing options and when to use them</h2>
+<p>This landscape changes quickly; follow each linked project's current documentation before choosing one.</p>
+<table>
+<thead>
+<tr>
+<th>Option</th>
+<th>Primary data and UI</th>
+<th>Better fit when</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>Built-in <a href="https://github.com/deepseek-ai/deepseek-harness">Trajectory</a></td>
+<td>Durable session events in the native UI</td>
+<td>You need the agent/session narrative, tool flow, usage, and outcomes rather than call bodies.</td>
+</tr>
+<tr>
+<td><a href="https://github.com/izz-BLUE/dsh-devtools">dsh-devtools</a></td>
+<td>Metadata-first runtime profiler in a Web view; intentionally omits prompts and tool bodies</td>
+<td>You need performance and runtime diagnostics with a smaller content-privacy surface.</td>
+</tr>
+<tr>
+<td><a href="https://github.com/cdxiaodong/dsh-llm-inspector">dsh-llm-inspector</a></td>
+<td>Reasoning controls, traffic statistics, a <code>think</code> workflow, and optional audit files; no native request/detail Web UI documented</td>
+<td>You explicitly want those behavior-changing or file-audit features.</td>
+</tr>
+<tr>
+<td><a href="https://github.com/linyp/dsh-plugin-langfuse">dsh-plugin-langfuse</a></td>
+<td>Session events exported as OpenTelemetry traces to Langfuse</td>
+<td>You need centralized, cross-session observability and accept/configure external export.</td>
+</tr>
+<tr>
+<td><strong>dsh-llm-call-inspector</strong></td>
+<td>Local native master/detail UI over normalized call bodies; bounded process memory only</td>
+<td>You need focused trace, debug, teaching, or research inspection on the local Web surface.</td>
+</tr>
+</tbody></table>
+<p>GitHub topics are discovery metadata, not a security review or official endorsement.</p>
+<h2>Development</h2>
+<pre><code>pnpm install --frozen-lockfile
+pnpm verify
+pnpm pack --dry-run
+</code></pre>
+<p><code>pnpm verify</code> runs host and client typechecks, automated tests, a clean build, and read-only package checks. The package verifier checks the public exports, committed build artifacts, Web loader identity, bundle patch, DSH client declaration, documentation install command, and absence of install-time lifecycle scripts.</p>
+<p>To test a local checkout after building it:</p>
+<pre><code>dsh plugin --profile web add .
+dsh --profile web --dump-config
+dsh web
+</code></pre>
+<p>See <a href="https://github.com/striveh/dsh-llm-call-inspector/blob/HEAD/CONTRIBUTING.md">CONTRIBUTING.md</a> for change constraints and <a href="https://github.com/striveh/dsh-llm-call-inspector/blob/HEAD/SECURITY.md">SECURITY.md</a> for private vulnerability reporting.</p>
+<h2>Compatibility</h2>
+<p>DeepSeek Harness is in developer preview and does not promise plugin compatibility across prereleases. This release verifies <code>@deepseek-ai/dsh-*</code> <code>0.1.0-rc.8</code> and <code>0.1.1-rc.1</code> in separate CI lanes. The rc.1 source audit found the inspector's <code>llm/stream</code>, Connection RPC, <code>conversation.view</code>, client-loader, and bundle/profile seams source-compatible; a fresh rc.1 profile must also pass fixed-commit install and browser interaction before release. No other DSH version is claimed as verified until it passes the same gates.</p>
+<h2>License</h2>
+<p><a href="https://github.com/striveh/dsh-llm-call-inspector/blob/HEAD/LICENSE">MIT</a></p>

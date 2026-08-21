@@ -1,0 +1,111 @@
+<h1>dsh-a-share-screener</h1>
+<p>An <a href="https://en.wikipedia.org/wiki/Stock_screener">A-share</a> stock-screening plugin for <a href="https://github.com/deepseek-ai/deepseek-harness">DeepSeek Harness</a> (<code>dsh</code>): pluggable screening strategies on a free, token-less Eastmoney data source, behind an extensible data-source abstraction.</p>
+<p><strong>This is a technical screening tool for historical price/volume patterns. It is NOT investment advice.</strong></p>
+<h2>Install</h2>
+<p>Requires the <code>dsh</code> CLI (<a href="https://github.com/deepseek-ai/deepseek-harness">DeepSeek Harness</a>).</p>
+<pre><code>dsh plugin --profile myprofile add github:Gaines-cz/dsh-a-share-screener
+</code></pre>
+<p>Git installs pull source, so pnpm runs the package's <code>prepare</code> build script. pnpm ≥ 10 blocks that until you authorize it once — copy the exact package key pnpm prints into the profile's <code>pnpm-workspace.yaml</code>:</p>
+<pre><code>allowBuilds:
+  dsh-a-share-screener: true
+</code></pre>
+<p>then re-run the <code>add</code> command. Authorizing this means you allow the package's build script to run on your machine at install time — pin a commit (<code>github:Gaines-cz/dsh-a-share-screener#&lt;sha&gt;</code>) if you want immutability.</p>
+<p>Start with the profile:</p>
+<pre><code>dsh --profile myprofile
+</code></pre>
+<h2>Use</h2>
+<p>Ask the agent in natural language:</p>
+<blockquote>
+<p>List the available screening strategies.
+Screen all A-shares with low_flat_limit_up, minDrawdownFromHigh 0.7.</p>
+</blockquote>
+<p>Two tools are registered:</p>
+<table>
+<thead>
+<tr>
+<th>Tool</th>
+<th>Purpose</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>a_share_list_strategies</code></td>
+<td>Strategy ids, descriptions, parameters, defaults, valid ranges</td>
+</tr>
+<tr>
+<td><code>a_share_screen</code></td>
+<td>Full-market scan; returns candidates with quantified evidence</td>
+</tr>
+</tbody></table>
+<p>The first full scan downloads history into a local disk cache and can take many minutes (bounded by the data source's rate limit); later scans reuse the cache and only fetch new trade dates. Cancellation is cooperative — aborting the tool call stops the scan.</p>
+<h2>The <code>low_flat_limit_up</code> strategy</h2>
+<p>"Historical low, flat base, faded volume-heavy limit-up": the stock sits deep below its window high (default ≥ 65% drawdown) at the bottom of its recent distribution (≤ 15th percentile of ~3 years), the last month is a flat, MA-converged base, and within ~6 months there was a limit-up day on ≥ 2× the prior 5-day average volume that has since pulled back below its close while volume cooled to ≤ 40% of the limit-up day.</p>
+<p>All thresholds are per-call parameters with defaults (see <code>a_share_list_strategies</code>). Board-aware limit-up thresholds: 10% main board, 20% ChiNext/STAR, 30% BSE. All price-level math runs on a chained daily-return index, so splits and dividends cannot fake a crash or a bottom. Universe filters (all configurable): ST/delisting names, BSE, listings younger than 365 days.</p>
+<h2>Data source</h2>
+<p>The plugin ships one free, token-less data source: <a href="https://www.eastmoney.com/">Eastmoney</a> public endpoints.</p>
+<table>
+<thead>
+<tr>
+<th>Source</th>
+<th>Token</th>
+<th>Cold scan</th>
+<th>Incremental</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>Eastmoney (built-in)</td>
+<td>none</td>
+<td>per-stock back-adjusted klines; clist host fails over realtime → delayed</td>
+<td>per-stock append with overlap-consistency check</td>
+</tr>
+</tbody></table>
+<p>Every adapter sits behind a <code>DataSource</code> interface (<code>src/datasources/types.ts</code>); the screener, tools, and plugin entry import only that interface, never a concrete vendor. Cache lives under <code>$DSH_HOME/a-share-screener/&lt;source-id&gt;/</code> (override with <code>cacheDir</code>).</p>
+<h3>Add a data source</h3>
+<p>To support another vendor later, implement <code>DataSource</code> and register it in <code>src/datasources/index.ts</code>:</p>
+<pre><code>// src/datasources/my-vendor.ts
+import type { DataSource } from './types.js'
+
+export function createMyVendorDataSource(limiter: RateLimiter): DataSource {
+  async function listStocks(signal: AbortSignal) { /* → StockMeta[] */ }
+  async function dailyBars(fullCode: string, startDate: string, signal: AbortSignal) { /* → Bar[] */ }
+  return { id: 'my-vendor', capabilities: { industry: false }, listStocks, dailyBars }
+}
+</code></pre>
+<p>add <code>myvendor: createMyVendorDataSource</code> to <code>FACTORIES</code>. Set <code>capabilities.industry: true</code> (and populate <code>StockMeta.industry</code>) if the vendor can classify sectors.</p>
+<h2>Plugin configuration</h2>
+<p>Set in your profile's <code>cordis.patch.yml</code> (all fields have defaults):</p>
+<pre><code>- replace:
+    - id: a-share-screener
+      config:
+        # cacheDir: /path/to/cache   # optional, defaults to $DSH_HOME/a-share-screener
+        requestsPerMinute: 200
+        historyBars: 800
+        scanTimeoutMs: 1800000
+        excludeST: true
+        excludeBSE: true
+        minListDays: 365
+</code></pre>
+<h2>Add a strategy</h2>
+<p>Strategies are pure predicates registered at plugin load:</p>
+<pre><code>// src/strategies/my-strategy.ts
+import type { Strategy } from './registry.js'
+
+export const myStrategy: Strategy = {
+  id: 'my_strategy',
+  description: 'What it looks for, model-facing.',
+  paramDocs: { /* name → { type, default, description, min?, max? } */ },
+  screen({ stock, bars }, params) {
+    // bars: ascending { date, close, volume, ret } — ret is the true daily return
+    return null // or { code, fullCode, name, board, strategy, evidence }
+  },
+}
+</code></pre>
+<p>Register it in <code>src/index.ts</code> next to the built-in one — no other changes. The tool schemas and <code>a_share_list_strategies</code> pick it up automatically.</p>
+<h2>Limitations</h2>
+<ul>
+<li>Eastmoney endpoints are public but undocumented; field drift fails loudly rather than silently, and the clist host fails over realtime → delayed so one blocked host does not kill a scan.</li>
+<li>The Eastmoney source does not classify industries (<code>capabilities.industry</code> is false); sector-based screening needs a vendor that provides it.</li>
+<li>ST filtering uses the current stock name (no historical name-change tracking).</li>
+<li>Everything runs in the local process; no data leaves your machine except API calls to the data source.</li>
+</ul>
+<h2>License</h2>
+<p>MIT</p>

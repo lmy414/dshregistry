@@ -1,0 +1,199 @@
+<h1>websearch-plugins</h1>
+<p>个人用的 <strong>DeepSeek Harness</strong> 搜索插件包：<strong>聚合搜索</strong>（16 个国内+海外引擎，结果层过滤）+
+<strong>目标网址直接抓取</strong>，全部<strong>不依赖任何 API Key</strong>。注册后 <code>web_search</code> / <code>web_fetch</code> 工具在
+没有 <code>DEEPSEEK_API_KEY</code> 的环境里也能真实可用。</p>
+<h2>基座思路：PhantomJS 式无头抓取</h2>
+<p>基座是最上游的 <a href="https://github.com/ariya/phantomjs">ariya/phantomjs</a>（<strong>BSD-3-Clause</strong>）的无头抓取
+思想——“scriptable headless browser”：不渲染 GUI、不依赖浏览器，直接用代码把网页数据拿给 <strong>agent</strong> 用。
+（本地基座素材来自我的 fork <a href="https://github.com/asdshuaishuai/phantomjs">asdshuaishuai/phantomjs</a>，
+与上游是同一份源码。）这里把同一哲学在 Node 里落地为 <strong>全方面适配</strong> 的聚合搜索：不针对某台机器/某个网络，
+而是把国内 + 海外的引擎全部配上；谁通谁用，网络异常/被墙/验证码/空结果的引擎直接在<strong>结果层过滤</strong>。</p>
+<h2>引擎清单（16 个，全部注册、按需过滤）</h2>
+<table>
+<thead>
+<tr>
+<th>区域</th>
+<th>引擎（provider id = <code>phantom-&lt;id&gt;</code>）</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>国内 domestic</td>
+<td><code>baidu</code> 百度、<code>sogou</code> 搜狗、<code>so360</code> 360搜索、<code>smcn</code> 神马、<code>bingcn</code> 必应中国</td>
+</tr>
+<tr>
+<td>海外 overseas</td>
+<td><code>bing</code> 必应国际、<code>google</code>、<code>duckduckgo</code>、<code>brave</code>、<code>mojeek</code>、<code>qwant</code>、<code>ecosia</code>、<code>yahoo</code>、<code>yandex</code>、<code>startpage</code>、<code>searx</code>（SearXNG searx.be）</td>
+</tr>
+</tbody></table>
+<p>每个引擎既可单独用（<code>phantom-&lt;id&gt;</code>），也默认全部汇入聚合 <code>phantom-aggregate</code>。</p>
+<h2>三个 provider</h2>
+<ul>
+<li><strong><code>phantom-aggregate</code></strong>（<code>web_search</code> 默认选中）：16 个引擎并行 fan-out，能通就收，
+留在结果层的只有成功项——失败/超时/被墙/空结果的引擎被过滤并把原因写进摘要；
+跨引擎按 URL 归一化去重（同一条目优先保留带摘要的），轮询交错排序让 top-N 覆盖多个引擎，
+按 <code>maxResults</code> 封顶。</li>
+<li><strong><code>phantom-&lt;engine&gt;</code></strong>：16 个单引擎 provider，可单独指定。</li>
+<li><strong><code>phantom-http</code></strong>（<code>web_fetch</code>）：直接抓取目标网址。手工逐跳处理重定向，每跳做
+<strong>SSRF 防护</strong>（拒绝环回/私网/链路本地/CGNAT/保留地址，域名先解析再校验）；
+非 2xx 视为结果而非错误；HTML 上限 1MB / 文本 512KB，超出截断并置 <code>truncated</code>。</li>
+</ul>
+<h2>实现原理</h2>
+<h3>一条搜索请求怎么走</h3>
+<pre><code>模型调用 web_search(query)
+  └─ dsh-tool-web 工具 → ctx.web.search({query, maxResults})     ← harness 的 web 接缝
+       └─ seam 按 web.searchProvider 选中 phantom-aggregate
+            └─ AggregateSearchProvider.search()
+                 ├─ 并行 fan-out：16 个 SerpSearchProvider（各自抓取 + 解析，互不阻塞）
+                 │    ├─ 抓取层 = 浏览器式无头请求（见“关键设计”）
+                 │    │    ├─ HTTP 主路：Chrome 桌面级完整标头 + cookie jar
+                 │    │    └─ JS 壳/反爬页 → 专为本插件常驻的极简无头 Blink 渲染服务（CDP）渲染再解析
+                 ├─ Promise.allSettled → 结果层过滤
+                 │    ├─ rejected（超时/403/被墙/网络错误）→ 丢弃，计入“已过滤异常”
+                 │    └─ fulfilled 但解析为空 → 丢弃，计入“已过滤无结果”
+                 ├─ 跨引擎去重（URL 归一化）+ 轮询交错
+                 └─ 按 maxResults 封顶 → WebSearchResult{ sources, content(聚合摘要) }
+</code></pre>
+<h3>关键设计</h3>
+<ul>
+<li><strong>能力接缝，不是工具</strong>：插件只做 <code>ctx.web.registerSearchProvider({id, available(), search()})</code>。
+面向模型的 <code>web_search</code> 名称/描述/schema/呈现全部由 <code>dsh-tool-web</code> 拥有；provider 一行都不肖
+写进模型。<code>available()</code> 是廉价本地检查（无网络 IO）。</li>
+<li><strong>为什么是“结果层过滤”</strong>：聚合的输入是“16 个引擎全上”= 通用适配（不针对本地）；输出层把
+不通的引擎滤掉 = 结果层过滤。所以这台机器通不了 Google/DDG 也不影响聚合结果，换到出口更宽的
+网络它们会自动开始贡献。</li>
+<li><strong>浏览器式无头请求层（PhantomJS 的法子）</strong>：对端网站要看到的是一个真实浏览器——<ul>
+<li>请求默认带完整 Chrome 桌面级标头（<code>sec-ch-ua</code>/<code>sec-fetch-*</code>/<code>upgrade-insecure-requests</code>/<code>accept-language</code> 等），
+而不是裸库 UA；</li>
+<li>进程内按域名维护 <strong>cookie jar</strong>，首次访问种下的 <code>BAIDUID</code>/<code>MUID</code> 之类延续到后续搜索，
+像浏览器会话一样；</li>
+<li>当返回体是 JS 壳/反爬页（无结果标记却有 <code>captcha/x5sec/are you not a robot</code> 等标记）时，
+<code>fetchMode: auto</code> 会把 URL 交给一个<strong>专为本插件服务的常驻极简无头浏览器</strong>：只起一次的
+Blink(Chromium) 无头进程，开标签→导航→等 <code>readyState=complete</code>→取 <code>outerHTML</code>→关页，
+全程走 CDP（内置 <code>WebSocket</code>，零依赖），跨搜索复用；没有完整浏览器时再回落
+<code>--headless=new --dump-dom</code> 一次性渲染。这就是上游 PhantomJS 那句 “scriptable headless
+browser”。对 IP 层风控（本机把 Shenma/Yandex/Mojeek 判断为自动查询）无头浏览器也过不去，
+结果层照样过滤；换到放行的网络/IP 上，这类 JS 壳引擎会自动被常驻渲染器解锁。</li>
+<li>每引擎的 Chrome 兜底带<strong>负缓存</strong>（连续失败 2 次本进程内不再试），避免被风控的引擎每次都白等几秒。</li>
+</ul>
+</li>
+<li><strong>单引擎解析是 best-effort</strong>：每个引擎一个轻量正则解析器（提取结果 URL/标题/摘要）；某引擎的
+专属选择器解析不到时自动回落通用 <code>&lt;h3&gt;</code> 锚点扫描；源头标记质量差（如百度/360 把结果包在
+<code>baidu.com/link</code>、<code>so.com/link</code> 跳转里）是引擎自身行为，不是插件缺陷。</li>
+<li><strong>fetch 的 SSRF 防护</strong>：<code>web_fetch</code> 用手工逐跳跟随重定向，每一跳先把域名/字面 IP
+解析并校验——环回(127.0.0.0/8, ::1)、私网(10/8, 172.16/12, 192.168/16)、链路本地
+(169.254/16, fe80::/10)、CGNAT(100.64/10)、保留/组播地址一律拒绝，才发请求。</li>
+<li><strong>错误分类</strong>：调用方取消 → <code>WEB_ABORTED</code>；单引擎超时/HTTP 失败 → <code>WEB_PROVIDER_ERROR</code>
+（聚合层整体捕获并过滤，不打断整次搜索）；<code>web_fetch</code> 抓非公网目标 → <code>WEB_PROVIDER_ERROR</code>。</li>
+<li><strong>零外部运行时依赖</strong>：只用 Node 内建 <code>fetch</code> / <code>node:net</code> / <code>node:dns</code>；
+<code>@deepseek-ai/dsh-web</code> 的 <code>WebError</code> 通过包内 <code>node_modules -&gt; ~/.dsh/profiles/node_modules</code>
+符号链接解析（与 harness 的 shared-module fallback 一致）。</li>
+</ul>
+<h2>结构</h2>
+<pre><code>websearch-plugins/
+  package.json            # 标准 DSH 插件声明：dsh.bundle.patch / exports / keywords / repository
+  cordis.patch.yml        # 插件自带的 bundle 层：注册 + 选中聚合 + 挂 fetch + 打开 web_fetch
+  lib/
+    index.js              # Cordis 插件：name / inject(['web']) / apply()，注册全部 provider
+    net.js                # 共享网络层（浏览器式标头 + cookie jar）+ 文本/URL工具 + SSRF 防护
+    engines.js            # 16 个引擎的 URL 构造 + 解析器（失败回落通用 h3 锚点）+ JS 壳判定
+    chrome.js             # 一次性无头 Chrome(--headless --dump-dom)渲染后端（兜底）
+    headless.js           # 专为本插件的常驻极简无头 Blink 渲染服务（单例进程 + CDP，零依赖）
+    search.js             # 单引擎 provider（HTTP/auto/Chrome）+ 聚合 provider
+    fetch.js              # web_fetch 的目标网址抓取 provider
+    types/index.d.ts
+  test/
+    engines.mjs           # 引擎连通性巡检矩阵（HTTP/auto/chrome 三档）
+    diagnose.mjs          # 失败归因：网络 vs 风控/JS壳 vs 解析空
+    aggregate.mjs         # 直接跑聚合 provider
+    headless.mjs          # 常驻无头渲染服务：JS 执行 + 渲染 + 复用提速
+    plugin.mjs            # 模拟 ctx.web 注册表：聚合搜索 + fetch + SSRF 验证
+  README.md LICENSE
+</code></pre>
+<h2>接入方式（标准 DSH 插件）</h2>
+<p>本包是一个<strong>标准 DSH 插件</strong>：<code>package.json</code> 声明了 <code>dsh.bundle.patch</code>（自带
+<code>cordis.patch.yml</code> 层），因此可用 <code>dsh plugin</code> 直接装成 profile bundle，<strong>不用手工改 profile 补丁</strong>
+（注册 provider、选中 <code>phantom-aggregate</code>、挂 <code>phantom-http</code>、打开 <code>web_fetch</code> 全部由插件自带层完成）。</p>
+<p>本地安装：</p>
+<pre><code>dsh plugin --profile web add file:/home/kelthas/code/websearch/websearch-plugins
+</code></pre>
+<p>从 GitHub 安装（最上游发布源）：</p>
+<pre><code>dsh plugin --profile web add github:asdshuaishuai/websearch-plugins
+</code></pre>
+<p><code>dsh plugin</code> 会把它加进 <code>dsh.profile.bundles</code>，之后<strong>重启 GUI</strong>（在启动 <code>dsh web</code> 的终端里
+Ctrl+C 后重新运行）并刷新页面即生效。</p>
+<p><strong>旧方式（手动）</strong>——仅当不便 <code>dsh plugin</code> 时可选：软链
+<code>~/.dsh/profiles/node_modules/websearch-plugins</code> → 本目录，并手工在
+<code>~/.dsh/profiles/web/cordis.patch.yml</code> 写 <code>insert: [web-search-phantom]</code> +
+<code>web.searchProvider/fetchProvider</code> + <code>tool-web.fetch</code> 三处。装了标准 bundle 后不要再叠加手工条目，
+避免重复 id。</p>
+<blockquote>
+<p>想切回 DeepSeek 官方搜索：把 profile 补丁（或本包 <code>cordis.patch.yml</code> 里的）
+<code>web.searchProvider</code> 改回 <code>deepseek-official</code> 即可（deepseek provider 从未被删除）。</p>
+</blockquote>
+<h2>仓库 topic（供 dshmk 插件市场收录）</h2>
+<p>本仓库声明了 <code>dsh-plugin</code>（<a href="https://www.dshmk.com/">dshmk.com 的 DSH 插件市场</a>正是按此 topic
+自动收录 GitHub 项目）以及 <code>deepseek-harness</code> / <code>web-search</code> / <code>headless-browser</code> / <code>phantomjs</code>。</p>
+<h2>配置</h2>
+<p><code>web-search-phantom</code> 行 <code>config:</code> 里全部可选：</p>
+<pre><code>config:
+  engineCount: 5            # 聚合时每个引擎取的条数（默认 5）
+  aggregateMaxResults: 10   # 无 maxResults 时的总条数上限
+  engineTimeoutMs: 7000     # 每个引擎的默认超时（毫秒）；通不了的引擎按此快速过滤
+  include: [baidu, bing, google]   # 只聚合这些引擎（默认全部）
+  blockedHosts: [...]              # 额外过滤的域名
+  fetchMode: auto           # http(纯浏览器式抓取) | chrome(恒走常驻无头渲染) | auto(HTTP优先,JS壳自动渲染兜底)
+  chrome:                   # 常驻无头 Blink 渲染服务参数
+    path: ""                # 留空自动探测（优先极简 headless-shell，其次 chrome/chromium）
+    timeoutMs: 7000         # 单次渲染超时
+    settleMs: 400           # 加载完成后再等 JS 出 markup 的缓冲
+    virtualTime: 1500       # 一次性渲染兜底的 virtual-time 预算
+    browserTimeoutMs: 12000 # 常驻浏览器启动超时
+  engines:                  # 单引擎覆盖（可带 fetchMode）
+    bing:    { count: 8, timeoutMs: 5000 }
+    baidu:   { count: 5 }
+    smcn:    { fetchMode: chrome }   # 例：神马强制无头渲染
+  userAgent: "Mozilla/5.0 ..."
+  fetch:                    # web_fetch
+    timeoutMs: 15000
+    maxBytesHtml: 1048576
+    maxBytesText: 524288
+    maxRedirects: 5
+</code></pre>
+<blockquote>
+<p>失败归因速查：<strong>网络不通</strong>（Google/DDG/Brave/Qwant/Yahoo/Startpage/SearXNG 在本机超时）
+属出口环境问题，暂不处理；<strong>IP 层风控</strong>（神马/Yandex 验证码、Mojeek 403）连真无头浏览器都过不去，
+结果层自动过滤；换到放行网络它们才会上。解析器对各引擎真模板均可用。</p>
+</blockquote>
+<h2>错误与取消</h2>
+<ul>
+<li>调用方取消 → <code>WebError</code> <code>WEB_ABORTED</code></li>
+<li>单引擎超时/HTTP 失败 → 各自 <code>WEB_PROVIDER_ERROR</code>；聚合层全部捕获并过滤，不抛错</li>
+<li><code>web_fetch</code> 抓私网/环回/链路本地目标 → <code>WEB_PROVIDER_ERROR</code>（SSRF 防护）</li>
+<li>所有 provider 均 honor <code>AbortSignal</code>；<code>available()</code> 为廉价本地检查（无网络 IO）</li>
+</ul>
+<h2>致谢</h2>
+<p>感谢最上游的 PhantomJS 项目 <strong><a href="https://github.com/ariya/phantomjs">ariya/phantomjs</a></strong>
+（<strong>BSD-3-Clause</strong>，已归档）：本项目只借用了它“scriptable headless browser / 用脚本直接取网页数据”
+的思路，<strong>未复制其代码</strong>；这里把同一哲学在 Node 中实现为聚合搜索与直接抓取。
+同时感谢 <a href="https://github.com/deepseek-ai/deepseek-harness">DeepSeek Harness</a> 的 web 能力接缝
+（<code>@deepseek-ai/dsh-web</code> 定义 <code>ctx.web</code>，<code>dsh-tool-web</code> 承载面向模型的工具；provider 写法参考了
+<code>@deepseek-ai/dsh-web-search-deepseek</code>）。本项目代码为原创，LICENSE 采用 MIT。</p>
+<h2>自检</h2>
+<pre><code>node test/engines.mjs               # 引擎连通性矩阵（http；传 auto/chrome 可测无头兜底）
+node test/diagnose.mjs              # 失败归因：网络不通 vs 风控/JS壳 vs 解析
+node test/aggregate.mjs "query"     # 直接跑聚合，看过滤/去重/摘要
+node test/headless.mjs              # 常驻无头渲染服务：JS 执行 + 渲染 + 复用提速
+node test/plugin.mjs "query"        # 模拟 seam：聚合 + web_fetch + SSRF 防护
+</code></pre>
+<h2>继续迭代（维护指南）</h2>
+<ul>
+<li><strong>加引擎</strong>：在 <code>lib/engines.js</code> 的 <code>ENGINES</code> 数组加一个 <code>engine(id, region, label, buildUrl, parse)</code>，
+解析器 Share 通用 <code>&lt;h3&gt;</code> 回落，无需改别处；聚合/单引擎/过滤自动生效。</li>
+<li><strong>调优某引擎</strong>：profile 补丁 <code>web-search-phantom.config.engines.&lt;id&gt;</code> 里给 <code>count/timeoutMs/fetchMode</code>，
+或全局 <code>fetchMode</code> / <code>chrome</code> / <code>engineTimeoutMs</code>。</li>
+<li><strong>改配置形状</strong>：动了 <code>index.js</code> 的 <code>DEFAULT_CONFIG</code> 后同步 <code>lib/types/index.d.ts</code>。</li>
+<li><strong>回归</strong>：跑上面 <code>自检</code> 一节全部脚本再提交。</li>
+<li><strong>发布新版本</strong>：<code>git tag vX.Y.Z &amp;&amp; git push origin vX.Y.Z</code>，再 <code>gh release create vX.Y.Z</code>；
+标准 bundle 安装方（<code>dsh plugin add github:...</code>）会拿到新版本。仓库保持 <code>dsh-plugin</code> topic，
+dshmk 插件市场会自动收录/更新。</li>
+</ul>

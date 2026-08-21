@@ -1,0 +1,227 @@
+<h1>dsh-aloof</h1>
+<p>把公司在 <a href="https://inside.aloof-ai.cn">Aloof</a> 上的<strong>团队资料库和办公审批</strong>，接成你自己电脑上 <a href="https://github.com/deepseek-ai/deepseek-harness">DeepSeek Harness</a>（dsh）的原生工具。</p>
+<p>装上之后，你在本机的 dsh 里可以直接说：</p>
+<ul>
+<li>「这个客户的电价方案，我们以前是怎么算的？」→ 它去团队资料库里搜，读出同事写过的那份，照着来</li>
+<li>「把刚才这套踩坑记追加到《电价踩坑记》里」→ 写回同一份共享文档，同事在网页上立刻看得见</li>
+<li>「我这个月的差旅报销提一下」→ 按模板发起审批，走公司的审批链</li>
+</ul>
+<p><strong>分工是清楚的</strong>：Aloof 是团队那一份——权限、数据范围、审批链、审计留痕都在它那边，它是权威源；你本机这台 dsh 是你自己的手脚，快、私密、想怎么折腾都行。这个插件是把两者接起来的<strong>受控通路</strong>：一张能单独吊销的票、一份写操作白名单、加上本机的确认闸。不是把公司数据拷到本地，也不是把本机的 AI 放进公司系统随便动手。</p>
+<p>它同时是一份<strong>可运行的 dsh 插件样板</strong>——插件机制的每一层都用到了（工具注册、凭据服务、写操作审批闸门、结果渲染），单文件、没有一句 <code>import</code>（为什么见 <code>index.js</code> 顶部）。</p>
+<h2>装</h2>
+<pre><code>dsh plugin --profile web add dsh-aloof
+</code></pre>
+<p>然后把票粘进来就完事了（下一节说票从哪拿）：</p>
+<pre><code>export ALOOF_TOKEN='alf_xxxx@https://aloof.你的公司.com'
+dsh web
+</code></pre>
+<p><strong>只有这一个东西要配，没有第二项。</strong> 票里 <code>@</code> 后面那截就是你公司那台 Aloof 的地址——密钥和它该发去哪台<strong>绑在一起</strong>，所以不存在「地址填串了、票发到别人服务器上」这回事。整串复制，别只粘前半截。</p>
+<p>也可以直接从 GitHub 装，<strong>建议钉住某个提交</strong>，免得哪天一次推送悄悄改了你机器上跑的东西：</p>
+<pre><code>dsh plugin --profile web add 'github:gaochonggeng/dsh-aloof#&lt;commit-sha&gt;'
+</code></pre>
+<p>（这个插件是纯 JS、没有构建步骤，所以 git 安装不需要 <code>allowBuilds</code> 那道构建授权。）</p>
+<p>卸载 <code>dsh plugin --profile web remove dsh-aloof</code>，profile 的 <code>bundles</code> 列表会自动摘掉这一层。</p>
+<h2>工具</h2>
+<h3>团队资料库（六个）</h3>
+<p>这组是「团队共享知识」落到本机的通路。<strong>你在网页上进得去的空间，这里进得去；进不去的，拿这张票一样进不去</strong>——空间 ACL 是同一套，插件不放宽任何东西。</p>
+<table>
+<thead>
+<tr>
+<th>工具</th>
+<th>干什么</th>
+<th>读/写</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>kb_spaces</code></td>
+<td>我能进哪些空间，返回 <code>spaceId</code> 和我在里面的角色</td>
+<td>读</td>
+</tr>
+<tr>
+<td><code>kb_search</code></td>
+<td>按名字、用途说明和<strong>正文全文</strong>搜，返回 <code>nodeId</code> 和命中的那句话</td>
+<td>读</td>
+</tr>
+<tr>
+<td><code>kb_list</code></td>
+<td>列一个目录下的一层，用来摸结构 / 挑 <code>parentId</code></td>
+<td>读</td>
+</tr>
+<tr>
+<td><code>kb_read</code></td>
+<td>读一份的全文（太长会截断并说明）</td>
+<td>读</td>
+</tr>
+<tr>
+<td><code>kb_write</code></td>
+<td>新建一份，或往已有的那份<strong>追加 / 覆盖</strong></td>
+<td><strong>写，过闸门</strong></td>
+</tr>
+<tr>
+<td><code>kb_delete</code></td>
+<td>删一个文件或目录</td>
+<td><strong>写，过闸门；不可恢复</strong></td>
+</tr>
+</tbody></table>
+<p>几个刻意的设计：</p>
+<ul>
+<li><strong><code>kb_write</code> 默认是追加不是覆盖</strong>（<code>mode</code> 默认 <code>append</code>）。「把这条记下来」的常态是往一份活文档后面接一段，不是把整篇换掉；要覆盖得显式 <code>mode: replace</code>，确认文案里也会写明「原文会没了」。</li>
+<li><strong>版本号（<code>rev</code>）插件自己处理</strong>，不让模型编。改一份文档时它先读一遍拿到 <code>rev</code> 再提交，中间有人改过就会被后端拒——这是乐观锁，撞上了重读一遍再写就行。要是把 <code>rev</code> 交给模型，它迟早会随便填一个数把同事的修改盖掉。</li>
+<li><strong><code>kb_read</code> 碰到读不了的东西会明说</strong>。Word / Excel / PPT 是压缩包，按文本读只会读出一堆乱码；PDF、图片同理。这种情况返回「读不出来，去网页看」，<strong>不把乱码当正文喂给模型</strong>——喂了它会照着乱码瞎猜。</li>
+<li><strong><code>kb_delete</code> 的确认文案是服务端问出来的</strong>，不是模型自己报的。删目录之前先查出这个目录叫什么、底下直接挂着几项，写进确认里。让模型自己报的话，它报错一次，人就是在给一句假话点同意。资料库<strong>没有回收站</strong>，删了就是没了，所以这一句必须准。</li>
+</ul>
+<h3>办公审批（五个）</h3>
+<table>
+<thead>
+<tr>
+<th>工具</th>
+<th>干什么</th>
+<th>读/写</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>oa_todo</code></td>
+<td>查等我处理的单子，返回 <code>taskId</code></td>
+<td>读</td>
+</tr>
+<tr>
+<td><code>oa_templates</code></td>
+<td>我能发起哪些审批，返回 <code>templateId</code></td>
+<td>读</td>
+</tr>
+<tr>
+<td><code>oa_form</code></td>
+<td>某模板要填哪些字段（key / 类型 / 必填 / 选项）</td>
+<td>读</td>
+</tr>
+<tr>
+<td><code>oa_submit</code></td>
+<td>发起一单</td>
+<td><strong>写，过闸门</strong></td>
+</tr>
+<tr>
+<td><code>oa_decide</code></td>
+<td>同意 / 驳回一条待办</td>
+<td><strong>写；接入令牌下后端直接拒</strong>，见下</td>
+</tr>
+</tbody></table>
+<p>刻意分成四步（列模板 → 读字段 → 填 → 提交）：模型不该猜表单字段名，<code>oa_form</code> 就是把「猜」换成「查」。</p>
+<h2>票据：用「dsh 接入令牌」，不要用登录票</h2>
+<p>在 Aloof 里点左下角自己的名字 → <strong>dsh 接入</strong> → 生成一张。复制出来的是这么一整串：</p>
+<pre><code>alf_kQ3xN…7Bv@https://aloof.你的公司.com
+</code></pre>
+<p>前半截是密钥，<code>@</code> 后面是这台 Aloof 的地址（就是你访问它用的那个地址）。<strong>明文只显示一次，当场抄走</strong>；丢了不要紧，回来吊销掉再生成一张。</p>
+<p>为什么把地址塞进票里：这样 dsh 那头只有一个东西要配。地址和票各自是一个可填字段时，「填串了、票发到别处去」就永远可能发生；合成一串之后这件事在物理上就不成立了。</p>
+<p>为什么不直接把网页的登录票复制过来：那张票带着这个人的<strong>全部</strong>权限、三十天有效、没法单独作废——放在笔记本上被捞走的人能替他批审批。接入令牌反过来长：</p>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>登录票</th>
+<th>接入令牌（<code>alf_</code> 开头）</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>查数据</td>
+<td>✅</td>
+<td>✅ 范围完全一样（该看见什么就看见什么）</td>
+</tr>
+<tr>
+<td>读写资料库内容</td>
+<td>✅</td>
+<td>✅ 共享知识要能双向流动，只读的话「共享」只剩一半</td>
+</tr>
+<tr>
+<td>提审批单 / 撤回</td>
+<td>✅</td>
+<td>✅ 提单是「请人来批」，不是终局动作</td>
+</tr>
+<tr>
+<td>同意 / 驳回</td>
+<td>✅</td>
+<td>❌ <strong>403</strong>，只能本人在网页上点</td>
+</tr>
+<tr>
+<td>拉人进空间 / 发邀请链接</td>
+<td>✅</td>
+<td>❌ 403，那是<strong>授权</strong>动作，得在网页上当面点</td>
+</tr>
+<tr>
+<td>建空间 / 删整个空间</td>
+<td>✅</td>
+<td>❌ 403</td>
+</tr>
+<tr>
+<td>改别的业务数据</td>
+<td>✅</td>
+<td>❌ 403</td>
+</tr>
+<tr>
+<td>单独吊销</td>
+<td>❌</td>
+<td>✅ 按设备，管理员那边还看得见它最后一次从哪连的</td>
+</tr>
+</tbody></table>
+<p>分界线是：<strong>内容可以从 dsh 写，权限和终局动作不行</strong>。写一份文档是干活，谁能看这个空间、这单批不批，是要人当面拍的。</p>
+<p>所以 <code>oa_decide</code> 在接入令牌下必然 403。<strong>这是设计如此，不是配置错了</strong>——工具描述里写了这句话，模型不会改参数重试。</p>
+<h2>配</h2>
+<p><strong>正常情况下什么都不用配</strong>——地址跟着票来，装完粘一串票就能用。下面这些是给需要拧的人看的。</p>
+<p>默认值在包自带的 <code>cordis.patch.yml</code> 里。<strong>不要改那个文件</strong>（升级会覆盖），要改就在 profile 自己的 <code>cordis.patch.yml</code> 里按 id 覆盖。patch 是<strong>整块替换</strong> <code>config</code> 而不是深合并，所以覆盖时键要写全：</p>
+<pre><code>- id: aloof
+  name: 'dsh-aloof'
+  config:
+    tokenEnv: ALOOF_TOKEN
+    timeoutMs: 20000
+    requireApproval: true
+</code></pre>
+<table>
+<thead>
+<tr>
+<th>键</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>tokenEnv</code></td>
+<td>令牌的<strong>引用名</strong>（POSIX 标识符），不是令牌本身</td>
+</tr>
+<tr>
+<td><code>timeoutMs</code></td>
+<td>单次 HTTP 超时</td>
+</tr>
+<tr>
+<td><code>requireApproval</code></td>
+<td>写操作是否必须先问人。<code>true</code> = fail closed</td>
+</tr>
+<tr>
+<td><code>baseUrl</code></td>
+<td><strong>默认没有这一项，通常也不该加。</strong> 填了就以它为准（盖掉票里带的地址）</td>
+</tr>
+</tbody></table>
+<p><code>baseUrl</code> 只有一种情形该填：<strong>网页地址和 dsh 能到达的地址确实不是同一个</strong>——反向代理、内外网双入口，网页在 <code>https://aloof.corp.com</code>，而你的 dsh 只能走 <code>http://10.0.0.5:8000</code>。除此之外填它只是给自己留一个填错的机会，而包里之所以不带这一项，是因为一旦带了具体域名，装完没改的人的票就会发到那个域名去（那边只会回 401，但票已经出网了）。</p>
+<p>令牌的值走 dsh 的 credentials（进程环境变量或 <code>$DSH_HOME/.credentials.yaml</code>），配置里只留引用名——这样配置可以随便同步、随便渲染到界面上，换令牌也不用碰文件，而且<strong>每次调用现取不缓存</strong>，换完（甚至换成另一家公司的实例）下一次请求就生效，不用重启 dsh。</p>
+<p>票里带不带地址，取决于<strong>发票的那台 Aloof</strong>（是它的网页拼上去的），和插件版本无关。老票不带 <code>@</code>，还能用，但得自己在 <code>baseUrl</code> 里补地址——去网页上重新生成一张就不用管了。</p>
+<h2>团队里多个人一起用</h2>
+<p>一人一张票，各自在自己机器上生成，互不相干。想在<strong>同一台机器上模拟多个人</strong>（测试、或者一台共用的机器），靠 <code>DSH_HOME</code> 隔开就行——profile、插件、凭据全在那个目录里：</p>
+<pre><code>DSH_HOME=~/.dsh-alice ALOOF_TOKEN='alf_甲的票@https://aloof.你的公司.com' dsh web --port 3081
+DSH_HOME=~/.dsh-bob   ALOOF_TOKEN='alf_乙的票@https://aloof.你的公司.com' dsh web --port 3082
+</code></pre>
+<p>两边搜到的资料库内容按各自账号的空间权限算，写进去的东西对方立刻搜得到——<strong>共享的是同一份，不是各存一份</strong>。</p>
+<p>管理员那边（Aloof 的 系统管理 → dsh 接入）能看到全公司谁的哪台机器连着、最后一次什么时候从哪个 IP 连的、用的什么客户端，也能替人吊销（人离职了、电脑丢了）。<strong>但看不到明文、也发不了票</strong>——票只能本人自己生成，不然审计里「这是他干的」就不成立了。</p>
+<h2>写操作的两道闸</h2>
+<p>别搞混，这是两道独立的闸，分别在两个地方：</p>
+<p><strong>本机这道</strong>：所有写工具（<code>kb_write</code> / <code>kb_delete</code> / <code>oa_submit</code> / <code>oa_decide</code>）在发请求之前先走 dsh 的 <code>ctx.approval.request()</code>，把「要改什么」写进 <code>reason</code> 交给人，只有拿到 <code>allowed-once</code> 才继续。三条拒绝路径都是不落库的——人点拒绝（<code>rejected</code>）、人关掉提示或会话被取消（<code>cancelled</code>）、这台 dsh 根本没有审批服务（直接拒，<strong>不是</strong>默认放行）。</p>
+<p><code>approval</code> 故意没写进模块级 <code>inject</code>：写进去会让整个插件在没有审批服务的装配里根本不挂载，连查资料都用不了。改成运行时探测 + fail closed，是能力降级而不是整体消失。</p>
+<p><strong>服务端那道</strong>：Aloof 后端按令牌类型和一张 <strong>(方法, 路由) 白名单</strong>拦——不在名单里的写请求一律 403，<strong>以后新加的写端点默认也进不来</strong>。所以 <code>oa_decide</code> 就算在本机被人点了同意，到了后端照样 403：「批准」这个动作不接受来自一张笔记本上的票。</p>
+<p>两道闸管的是不同的事：本机那道防「模型自己悄悄干了」，服务端那道防「这张票压根不该能干这个」。前者可以关（<code>requireApproval: false</code>，你自己的机器你负责），后者关不掉。</p>
+<h2>有问题</h2>
+<p>提 <a href="https://github.com/gaochonggeng/dsh-aloof/issues">issue</a>。这个插件只是个转发壳，业务逻辑（权限、数据范围、审批链、审计）全在 Aloof 后端——所以「它不让我批审批」「它进不去某个空间」这类不是插件的问题，见上面「票据」那节。</p>
+<h2>还没做</h2>
+<ul>
+<li><strong>没有设置页</strong>：<code>baseUrl</code> / 令牌目前只能写 YAML 或环境变量。做成设置里的表单需要 <code>installSettingsSection</code> + schemastery，那就得引入运行时依赖。</li>
+<li><strong>没有专用 UI 卡片</strong>：<code>output.render</code> 只给了文本。要把同意/驳回按钮、资料 diff 画在对话里，得写浏览器那半边。</li>
+<li><strong>传不了文件</strong>：<code>kb_write</code> 只写文本文档（md / csv / html / txt / json）。上传二进制要走 multipart，那是另一套写法。</li>
+<li><strong>没做转办 / 催办 / 抄送</strong>：后端接口都有，照现有工具复制即可。</li>
+</ul>
+<h2>License</h2>
+<p>MIT</p>

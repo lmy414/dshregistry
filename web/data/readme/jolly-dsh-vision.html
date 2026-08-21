@@ -1,0 +1,249 @@
+<h1>jolly-dsh-vision</h1>
+<p>ModLens 风格的视觉桥接插件：<strong>一个纯文本大模型当大脑，一个视觉模型当眼睛</strong>（默认 deepseek-v4-pro + deepseek-v4-flash-vision-exp）。</p>
+<p>大脑看不到像素。本插件提供两条视觉通路：</p>
+<ol>
+<li><strong><code>vision</code> 工具</strong>：传入图片路径或 URL，工具把图片存进附件库，通过 harness 的 LLM seam 调眼睛模型，返回一份 <strong>modlens 式结构化证据 JSON</strong>（summary / ocr / layout / semantics / visual / uncertainty），大脑引用证据作答而不是猜图。</li>
+<li><strong>视觉版模型（"(ds vision)" 孪生）</strong>：在模型选择器里出现 <code>DeepSeek-V4-Pro (ds vision)</code> 等视觉孪生条目——选中后<strong>可以直接在输入框粘贴/拖入图片</strong>，插件在请求发出前自动把图片转成证据文本再交给大脑。</li>
+</ol>
+<p>参考实现：<a href="https://github.com/liustack/modlens">liustack/modlens</a>（MIT 许可；本项目的证据词汇与包装器机制派生自它，见 <a href="https://github.com/JollY-Life/jolly-dsh-vision/blob/HEAD/THIRD_PARTY_NOTICES.md">THIRD_PARTY_NOTICES.md</a>）。</p>
+<h2>架构</h2>
+<pre><code>通路 A — vision 工具（大脑主动调用）
+大脑 (纯文本模型)
+  └─ 调用工具 vision(path, prompt?)
+       ├─ 读本地文件 / 抓 http(s) URL（大小上限、魔数嗅探 png/jpeg/gif/webp）
+       ├─ SSRF 防护：拒绝私有/环回/链路本地地址（可配置放开）
+       ├─ ctx.attachments.saveImage()  → 持久化图片引用
+       ├─ ctx.llm.stream({ provider, model: 眼睛模型, system: 证据提示词, user: [文本+图片] })
+       ├─ 装配文本流 → 解析证据 JSON（容忍 markdown 围栏）
+       └─ 返回证据对象（output.schema + render 转成模型可读 markdown）
+
+通路 B — (ds vision) 孪生模型（贴图自动转换，modlens 的 Phase 3 机制）
+输入框贴图 ──► 模型选择器选中 "DeepSeek-V4-Pro (ds vision)"
+                （孪生声明 image 输入 ⇒ 附件准入通过、缩略图正常）
+  └─ 请求到达插件注册的 vision 适配器
+       ├─ 递归扫描消息（含 tool-result 嵌套）里的图片块
+       ├─ 每张图（按 attachmentId 缓存，失败用恒定占位文本降级）
+       │    ctx.attachments.readImage → 眼睛模型 → 证据 markdown
+       ├─ 图片块 ⇒ 文本块 "[Attached image, converted to evidence ...]"
+       ├─ 自家 assistant 回合改标为上游 provider（保住推理连续性/replay state）
+       └─ 转发给真实上游路由（大脑只见文本，不见像素）
+</code></pre>
+<h3>与 modlens 的差异</h3>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>@liustack/modlens</th>
+<th>jolly-dsh-vision</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>视觉引擎调用</td>
+<td>spawn 自带 CLI 子进程</td>
+<td>直接走 harness 的 <code>ctx.llm</code> seam</td>
+</tr>
+<tr>
+<td>引擎/密钥配置</td>
+<td>独立 <code>~/.modlens/config.json</code>，自管多家引擎</td>
+<td>复用 <code>settings.yaml</code>（模型目录）+ 凭据 seam（API key 环境变量）</td>
+</tr>
+<tr>
+<td>运行时依赖</td>
+<td>commander + undici</td>
+<td><strong>零依赖</strong>（纯 node 内置模块，无构建步骤）</td>
+</tr>
+<tr>
+<td>工具</td>
+<td><code>modlens_read_image</code></td>
+<td><code>vision</code>（可配置改名）</td>
+</tr>
+<tr>
+<td>视觉孪生</td>
+<td>有（自动发现多条路由）</td>
+<td>有（单路由，默认包裹一条上游的纯文本模型）</td>
+</tr>
+<tr>
+<td>粘贴转路径（浏览器注入）</td>
+<td>有</td>
+<td>无（孪生模型直接解锁贴图，无需转路径）</td>
+</tr>
+<tr>
+<td>大脑引导</td>
+<td>无</td>
+<td>有（系统提示词区段，教大脑何时调工具/何时引用已转换证据）</td>
+</tr>
+<tr>
+<td>SSRF 防护</td>
+<td>无</td>
+<td>有（默认拒绝内网/环回/链路本地，可配置）</td>
+</tr>
+</tbody></table>
+<p>零依赖是刻意的：树外 DSH 插件无法可靠解析 <code>@deepseek-ai/*</code> 包（modlens 的 dsh/index.js 注释也确认了这一点），所以工具定义走原始 JSON-Schema 注册路径、消息/流块/适配器全部鸭子类型化。</p>
+<h2>文件结构</h2>
+<pre><code>package.json          # dsh.bundle.patch 接入清单 + 发布元信息（files/repository）
+cordis.patch.yml      # 插件条目 + 默认配置（可在此覆盖）
+src/index.js          # 插件入口：name/inject/apply，注册工具+引导+包装器
+src/pipeline.js       # 眼睛调用管线（analyzeImageEvidence / runVision，可离线测试）
+src/wrapper.js        # (ds vision) 视觉孪生：适配器注册、图片→证据转换、缓存
+src/evidence.js       # 证据提示词、output schema、模型可读渲染
+src/images.js         # 路径/URL → 字节：大小上限、魔数嗅探、SSRF 防护
+src/stream.js         # 极简 BlockAssembler、finish 错误、JSON 解析
+tests/offline.test.mjs      # 离线逻辑测试（含 SSRF，不联网）
+tests/wrapper.test.mjs      # 视觉孪生适配器测试（假 harness）
+tests/plugin-smoke.test.mjs # 插件注册冒烟测试
+</code></pre>
+<h2>安装</h2>
+<h3>从 npm（发布后）</h3>
+<pre><code>dsh plugin --profile web add jolly-dsh-vision
+</code></pre>
+<h3>从本地路径（开发 / 未发布时）</h3>
+<pre><code>dsh plugin --profile web add &lt;本地仓库路径&gt;
+</code></pre>
+<p><code>dsh plugin add</code> 会把依赖写入 profile 的 package.json；该包带 <code>dsh.bundle.patch</code> 清单，会被加入 <code>dsh.profile.bundles</code>（如未自动加入，手动确认 <code>dsh.profile.bundles</code> 包含 <code>jolly-dsh-vision</code>）。</p>
+<p>用本地路径安装时为 <code>link:</code> 依赖，改代码后重启 dsh web 即生效（无需重装）。</p>
+<blockquote>
+<p>pnpm 11 的供应链策略默认要求"发布满 1 天"；若安装时遇到
+<code>ERR_PNPM_MINIMUM_RELEASE_AGE_VIOLATION</code>，把相关包加入 profile 的
+<code>pnpm-workspace.yaml</code> 中 <code>minimumReleaseAgeExclude</code> 白名单即可。</p>
+</blockquote>
+<h2>前置条件</h2>
+<p><code>~/.dsh/settings.yaml</code>：</p>
+<pre><code>agent-default-model:
+  provider: deepseek-official
+  model: deepseek-v4-pro          # 大脑
+llm-deepseek:
+  models:
+    - id: deepseek-v4-flash-vision-exp
+      name: DeepSeek-V4-Flash-Vision-Exp
+      inputModalities:
+        - text
+        - image                     # 眼睛必须声明 image 输入，否则适配器拒收图片
+</code></pre>
+<p>凭据：凭据 seam 中的 API key（dsh-llm-deepseek 默认按 <code>apiKeyEnv: DEEPSEEK_API_KEY</code> 解析，即环境变量或 <code>.credentials.yaml</code>）。</p>
+<h2>配置</h2>
+<p>默认值在 <code>cordis.patch.yml</code>，均可覆盖：</p>
+<table>
+<thead>
+<tr>
+<th>键</th>
+<th>默认值</th>
+<th>含义</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>provider</code></td>
+<td><code>deepseek-official</code></td>
+<td>眼睛模型所在的路由</td>
+</tr>
+<tr>
+<td><code>model</code></td>
+<td><code>deepseek-v4-flash-vision-exp</code></td>
+<td>眼睛模型 id</td>
+</tr>
+<tr>
+<td><code>toolName</code></td>
+<td><code>vision</code></td>
+<td>暴露给大脑的工具名</td>
+</tr>
+<tr>
+<td><code>maxImageBytes</code></td>
+<td><code>20971520</code> (20MB)</td>
+<td>单张图片大小上限</td>
+</tr>
+<tr>
+<td><code>timeoutMs</code></td>
+<td><code>120000</code></td>
+<td>一次眼睛调用的协作式超时</td>
+</tr>
+<tr>
+<td><code>maxOutputTokens</code></td>
+<td><code>8192</code></td>
+<td>证据输出上限</td>
+</tr>
+<tr>
+<td><code>visionProvider</code></td>
+<td><code>true</code></td>
+<td>注册 <code>(ds vision)</code> 视觉孪生路由</td>
+</tr>
+<tr>
+<td><code>wrapperProvider</code></td>
+<td><code>deepseek-vision</code></td>
+<td>孪生路由 id（模型选择器里的分组）</td>
+</tr>
+<tr>
+<td><code>sourceProvider</code></td>
+<td><code>deepseek-official</code></td>
+<td>被包裹的上游路由（其纯文本模型生成孪生）</td>
+</tr>
+<tr>
+<td><code>twinSuffix</code></td>
+<td><code>(ds vision)</code></td>
+<td>孪生模型名后缀</td>
+</tr>
+<tr>
+<td><code>evidenceCacheMax</code></td>
+<td><code>128</code></td>
+<td>每图证据缓存容量（按 attachmentId 去重）</td>
+</tr>
+<tr>
+<td><code>guide</code></td>
+<td><code>true</code></td>
+<td>给大脑加系统提示词引导区段</td>
+</tr>
+<tr>
+<td><code>allowPrivateUrls</code></td>
+<td><code>false</code></td>
+<td><code>false</code> 时拒绝私有/环回/链路本地 URL（SSRF 防护）</td>
+</tr>
+</tbody></table>
+<h2>使用</h2>
+<h3>通路 A：路径/URL + vision 工具</h3>
+<ol>
+<li>给大脑一张图：本地绝对/相对路径，或 http(s) URL，可带关注点。</li>
+<li>引导区段会让大脑在该调 <code>vision</code> 时调用它；大脑基于 OCR 全文与布局作答，看不清的地方会出现在 uncertainty 里。</li>
+</ol>
+<h3>通路 B：直接贴图 + (ds vision) 孪生模型</h3>
+<ol>
+<li>在模型选择器里选带 <code>(ds vision)</code> 后缀的条目。</li>
+<li>直接在输入框粘贴/拖入图片——准入检查通过，缩略图正常显示。</li>
+<li>请求发出前，插件自动把图片转成证据文本（带 <code>[Attached image, converted to evidence by the jolly-dsh-vision bridge]</code> 标记）注入给大脑；大脑按引导直接引用，不会重复调用工具。</li>
+<li>同一张图在一次会话内只转换一次（附件内容寻址 + 缓存）；转换失败会降级为恒定占位文本并继续对话，细节留在 harness 日志。</li>
+</ol>
+<blockquote>
+<p>注意：模型选择器里的"普通版"纯文本模型依然不接受贴图——想要贴图就选带 <code>(ds vision)</code> 后缀的条目。</p>
+</blockquote>
+<h2>安全与隐私</h2>
+<ul>
+<li><strong>API key 零接触</strong>：本插件不读取、不记录、不转发任何密钥；密钥由 harness 凭据 seam 在每次调用时解析，代码不构造 <code>Authorization</code> 头、不读 <code>process.env</code>。</li>
+<li><strong>数据出网</strong>：图片字节与 OCR 文本会发送到你配置的视觉 provider（这是功能本身）。除此之外插件不发出任何网络请求、不上报遥测。</li>
+<li><strong>SSRF 防护</strong>：<code>vision</code> 工具默认拒绝私有网段 / 环回 / 链路本地 / 云元数据地址（含对主机名的 DNS 解析检查），防止恶意提示词诱导请求内网。确有内网需求时把 <code>allowPrivateUrls</code> 设为 <code>true</code>。</li>
+<li><strong>提示注入</strong>：图片里的文字经 OCR 进入对话，恶意图片可能夹带指令。转换块已被框定为"证据，请引用"，但无法完全免疫——请把图片视为不可信输入。</li>
+<li><strong>信任边界</strong>：<code>vision</code> 能读取 harness 进程可读的任意图片文件并外发；图片路径（含解析后的绝对路径）会进入会话日志。多人共享会话导出时注意这一点。</li>
+<li><strong>零运行时依赖</strong>：无第三方包，也就没有供应链投毒面。</li>
+</ul>
+<h2>测试</h2>
+<pre><code>node tests/offline.test.mjs      # 嗅探/上限/提示词/解析/装配/管线/SSRF
+node tests/wrapper.test.mjs      # 视觉孪生：列表/解析/透传/转换/缓存/降级/重名
+node tests/plugin-smoke.test.mjs # 插件导出、工具+引导+包装器注册
+</code></pre>
+<h2>故障排查</h2>
+<ul>
+<li><strong>工具没有出现</strong>：确认 <code>dsh.profile.bundles</code> 含 <code>jolly-dsh-vision</code>，重启了 dsh web，且 <code>cordis.patch.yml</code> 中没有 <code>- id: vision / disabled: true</code>。</li>
+<li><strong>模型选择器里没有 <code>(ds vision)</code> 条目</strong>：确认 <code>visionProvider: true</code>；重启后查看 harness 日志里有没有 <code>[jolly-dsh-vision] vision provider registration skipped</code>。</li>
+<li><strong>贴图报"模型不支持图片"</strong>：说明当前选中的是纯文本条目——选带 <code>(ds vision)</code> 后缀的条目。</li>
+<li><strong>贴图后大脑收到占位文本</strong>：harness 日志里会有 <code>[jolly-dsh-vision] image read failed (store|media|eyes)</code>：store=附件库异常，media=不支持的图片格式，eyes=眼睛模型调用失败（查凭据/配额）。</li>
+<li><strong>URL 报 refusing to fetch a private/internal address</strong>：命中 SSRF 防护；确需内网时把 <code>allowPrivateUrls</code> 设为 <code>true</code>。</li>
+<li><strong>报 MISSING_CREDENTIAL</strong>：凭据 seam 里没有可用的 API key。</li>
+<li><strong>报拒绝图片输入</strong>：settings.yaml 里眼睛模型的 <code>inputModalities</code> 缺 <code>image</code>。</li>
+<li><strong>证据格式错误</strong>：眼睛模型偶发输出围栏外的杂音，<code>parseEvidenceJson</code> 已做容错；持续失败可调小 <code>maxOutputTokens</code> 或加 <code>prompt</code> 收窄焦点。</li>
+<li><strong>与 modlens 的关系</strong>：两者工具名不同（<code>vision</code> vs <code>modlens_read_image</code>）、孪生路由不同，可共存。</li>
+</ul>
+<h2>已知限制 / v2 想法</h2>
+<ul>
+<li>仅支持 png/jpeg/gif/webp；HEIC 需先转码。</li>
+<li>视觉孪生为单路由实现；modlens 的自动发现多路由、上游重注册刷新（<code>llm/adapters-updated</code> 再扫描）暂未做。</li>
+<li>未注册设置卡片；配置走 cordis.patch.yml。</li>
+</ul>
+<h2>License</h2>
+<p>本项目代码采用 MIT 许可（Copyright (c) 2026 Jolly-Life，见 <a href="https://github.com/JollY-Life/jolly-dsh-vision/blob/HEAD/LICENSE">LICENSE</a>）。</p>
+<p>其中派生自 <a href="https://github.com/liustack/modlens">@liustack/modlens</a> 的部分，其 MIT 声明与许可文本见 <a href="https://github.com/JollY-Life/jolly-dsh-vision/blob/HEAD/THIRD_PARTY_NOTICES.md">THIRD_PARTY_NOTICES.md</a>（Copyright (c) 2026 Leon Liu）。</p>

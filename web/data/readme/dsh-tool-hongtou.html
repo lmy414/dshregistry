@@ -1,0 +1,65 @@
+<h1>dsh-tool-hongtou</h1>
+<p>DeepSeek Harness 红头公文总结插件（Cordis 主机侧插件）——<strong>两阶段解耦流水线</strong>。</p>
+<h2>架构</h2>
+<pre><code>/ hongtou [事由/标题]
+  │
+  ├─ 会话上下文：ctx.sessionQuery.readSession() 读取完整原始事件日志
+  │
+  ├─ 阶段一：LLM 结构化输出（lib/phase1-llm.js）
+  │    · 只输出合法 JSON 提纲，严禁手写 XML 标签与 Markdown 符号
+  │    · 输出经 schema 校验（lib/schema.js）+ Markdown/占位符清洗
+  │    · 失败自动重试一次；仍失败回退确定性提炼（lib/fallback.js，同为 JSON）
+  │
+  └─ 阶段二：确定性排版渲染（lib/phase2-render.js）
+       · Node.js 纯代码解析 JSON，注入 templates/document-skeleton.xml 骨架
+       · 序号（一、/（一）/1.）、字体、行距、红线全部由代码确定性生成
+       · 最终校验：无文本框/批注/注释/占位符/Markdown 残留 → 落盘 output/
+</code></pre>
+<h2>关键保证</h2>
+<ul>
+<li><strong>版式 100% 复刻标准红头公文样板</strong>（<code>templates/document-skeleton.xml</code> 由一次性构建脚本从样板真实片段组装）：<ul>
+<li>完整复制样板 <code>&lt;w:fonts&gt;</code>（含方正粗宋简体/华文中宋/宋体/仿宋_GB2312/黑体/楷体等）、<code>&lt;w:styles&gt;</code>（11 个样式）、<code>&lt;w:docPr&gt;</code>、<code>&lt;w:sectPr&gt;</code>（含页眉页脚与页码框架）；</li>
+<li>红头机关名 = VML 艺术字 <code>v:textpath</code>（华文中宋加粗、fillcolor=red、height 51pt，宽度按机关名字数自适应居中）；</li>
+<li>红色分割线 = 样板原样双 VML 线条（3pt 粗线 from 5.25pt,53.2pt → 1.5pt 细线 60.65pt，横跨版心）；</li>
+<li>文号段 <code>first-line=4960</code>、标题段宋体加粗 2 号居中 <code>right=654</code>、正文段 <code>first-line-chars=200</code>（首行缩进 2 字符）、落款段 <code>first-line=645</code>+前导空格、日期段 <code>first-line-chars=1400</code>、全程 <code>spacing line=560 exact</code>（28 磅固定行距）、<code>snapToGrid off</code>；</li>
+<li>模板<strong>不含任何文本框、批注</strong>；最终文档经 split 移除注入占位符，无注释残留。</li>
+</ul>
+</li>
+<li><strong>模型零排版权</strong>：LLM 输出在进入渲染层前经过 <code>stripMarkdown</code>（链接、强调、列表、代码符号、表格管道）与 <code>hasForbiddenContent</code>（xxxx、×××、（空一行）、（空两格）、（此处填写…）等）双重清洗；非法内容直接回退，绝不进入文档。</li>
+<li><strong>序号确定性生成</strong>：<code>sections</code> 编号 <code>一、二、…</code>，子条款编号 <code>（一）（二）…</code>，由阶段二按数组顺序生成，杜绝模型序号错乱。</li>
+</ul>
+<h2>安装 / 挂载</h2>
+<p>插件通过 <code>dsh.bundle.patch</code> 声明挂载行。安装到 web profile：</p>
+<pre><code># 从 npm 安装
+dsh plugin --profile web add dsh-tool-hongtou
+
+# 或从 GitHub 安装
+dsh plugin --profile web add github:ExElectron/dsh-tool-hongtou
+</code></pre>
+<p>或手动在 profile 的 <code>package.json</code> 中添加依赖并声明 bundle：</p>
+<pre><code>"dependencies": {
+  "dsh-tool-hongtou": "^0.2.0"
+  // 或 "dsh-tool-hongtou": "github:ExElectron/dsh-tool-hongtou"
+},
+"dsh": { "profile": { "bundles": ["dsh-tool-hongtou"] } }
+</code></pre>
+<p>挂载后<strong>重启 dsh</strong>（web profile 在启动时装配 bundle 补丁），然后在会话中输入：</p>
+<pre><code>/hongtou
+/hongtou 红头公文插件重构事项
+</code></pre>
+<h2>开发</h2>
+<pre><code># 语法检查与单元测试（dsh 沙箱内需 --test-isolation=none，避免子进程管道 EPERM）
+node --check lib/index.js &amp;&amp; node --check lib/schema.js &amp;&amp; node --check lib/phase1-llm.js &amp;&amp; node --check lib/phase2-render.js
+node --test --test-isolation=none test/schema.test.js test/phase1.test.js test/phase2.test.js test/e2e.test.js
+</code></pre>
+<h2>结构</h2>
+<ul>
+<li><code>lib/index.js</code> — Cordis 插件入口（<code>apply</code> / <code>inject</code> / <code>name</code>），两阶段编排与落盘。</li>
+<li><code>lib/phase1-llm.js</code> — 阶段一：LLM 结构化 JSON 输出（system 强约束、JSON 提取、校验重试）。</li>
+<li><code>lib/schema.js</code> — JSON schema 校验、Markdown/占位符清洗、提纲规范化。</li>
+<li><code>lib/phase2-render.js</code> — 阶段二：模板注入渲染、转义、序号生成、生成后校验。</li>
+<li><code>lib/fallback.js</code> — 确定性回退提炼（模型不可用时）。</li>
+<li><code>lib/log.js</code> — 会话事件日志序列化与统计。</li>
+<li><code>templates/document-skeleton.xml</code> — Word 2003 XML 模板骨架（标准红头版心，无文本框/批注）。</li>
+<li><code>test/</code> — schema / phase1 / phase2 / 端到端测试。</li>
+</ul>

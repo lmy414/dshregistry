@@ -1,0 +1,102 @@
+<h1>dsh-fingerprint-show</h1>
+<p>一个 <a href="https://deepseek-harness.github.io/deepseek-harness/">DeepSeek Harness</a>（DSH）插件：捕获每次模型调用的<strong>提供方模型指纹</strong>（OpenAI 兼容的 <code>system_fingerprint</code> 字段），并在 Web UI 中每条 AI 回复的指标行末尾以纯文本显示。</p>
+<h2>功能</h2>
+<ul>
+<li><strong>完整指纹文本</strong> — 每条有指标行的 AI 回复末尾以纯文本追加该次调用实际的
+模型指纹（如 <code>… 127 tok/s · 0123456789abcdef0123456789abcdef</code>），完整不截断、
+无按钮、无图标、无复制交互；</li>
+<li><strong>样式与原生一致</strong> — 字体 14px、行高 24px、三级灰色
+（<code>--dsw-alias-label-tertiary</code>）、10px 圆点间距，与指标文本像素级统一；</li>
+<li><strong>悬停同步</strong> — 指纹与 <code>时间 · 用时 · 首 token · tok/s</code> 指标文本<strong>同生同隐</strong>：
+悬停或聚焦消息时一起淡入，移开一起消失（与框架原生行为相同的 80ms 过渡）；</li>
+<li><strong>历史保留</strong> — 中途切换模型后，每条回复各自标注当时实际生效的部署；</li>
+<li><strong>悬停提示</strong> — tooltip 显示模型 id、提供方与调用时间；</li>
+<li><strong>零侵入</strong> — 不修改会话日志、不进入模型上下文、不影响 KV 缓存。</li>
+</ul>
+<h2>工作原理</h2>
+<p>DSH 自带的 DeepSeek 适配器把提供方 SSE 翻译成框架内部的 <code>StreamChunk</code> 协议，
+响应级元数据（包括 <code>system_fingerprint</code>）在这一步被丢弃，因此 <code>llm/stream</code>
+瀑布事件里看不到指纹。本插件在两个互补的接缝上工作：</p>
+<ol>
+<li><strong>fetch 包装</strong>（主机侧）— 所有适配器最终都走全局 <code>fetch</code>。插件 tee 每个
+匹配 <code>chat/completions</code> 的响应体，从 SSE 分支中提取
+<code>system_fingerprint</code>，另一分支原样交还适配器。</li>
+<li><strong><code>llm/stream</code> 瀑布监听</strong>（主机侧）— 提供 <code>(sessionId, model, purpose)</code>。
+每次流式调用恰好对应一个提供方请求，观测按「同模型优先、时间最近」关联到
+进行中的瀑布调用。</li>
+<li><strong>HTTP 路由</strong>（主机侧）— 通过 <code>ctx.webServer.register()</code> 在 Web 服务上暴露
+<code>GET &lt;pathPrefix&gt;/api/observations?sessionId=…&amp;limit=…</code>。之所以不用自定义
+会话事件：持久化读取层会拒绝未知事件类型且 <code>Session.append</code> 不支持
+<code>ignorable</code> 标记；Remote 命名空间则需要构建期代码生成。</li>
+<li><strong>消息内文本</strong>（浏览器侧）— 客户端半区注册
+<code>conversation.chat.assistant-actions</code> 槽位条目（定稿 AI 消息的操作条，
+与复制/分支按钮同区），按时间单调对齐观测与消息——每条消息取「开始于该
+消息落盘之前、且未被更早消息消费」的最新观测——以纯文本渲染在指标行末尾；
+可见性与指标文本同步（悬停显示）。样式完全镜像原生时间文本
+（<code>font-size:14px</code>、<code>line-height:24px</code>、三级灰色、圆点仅右侧 10px
+边距、左侧间距由行的 flex <code>gap:10px</code> 提供）。</li>
+</ol>
+<h2>安装</h2>
+<p>前置条件：已安装 <code>dsh</code> CLI 与 pnpm。</p>
+<pre><code>git clone &lt;this-repo&gt; dsh-fingerprint-show
+cd dsh-fingerprint-show
+pnpm install        # prepare 钩子自动构建 lib/
+dsh plugin --profile web add &lt;path-to-checkout&gt;   # 插件包目录本身的绝对路径，或 .
+</code></pre>
+<blockquote>
+<p>注意 <code>add</code> 的参数是<strong>插件包目录本身</strong>。在仓库目录里执行 <code>add ./dsh-fingerprint-show</code>
+会把链接指到不存在的子目录（pnpm 会照常记录依赖但 bundle 层不会生效）。
+装好后用 <code>dsh --profile web --dump-config</code> 确认输出里有
+<code># == dsh-fingerprint-show</code> 一层。</p>
+</blockquote>
+<p>重启 <code>dsh web</code> 后，发起一次对话；把鼠标移到 AI 回复上，指标行末尾会出现
+<code>· 完整指纹</code> 文本。</p>
+<blockquote>
+<p>插件只在 <strong>web profile</strong> 下激活（依赖其 <code>webServer</code> 服务）；headless profile
+中保持休眠。也可以用开发模式快速试用：
+<code>dsh web --patch ./cordis.patch.yml</code>（需先把 patch 中 <code>name:</code> 改为指向
+<code>src/index.ts</code> 的绝对路径）。</p>
+</blockquote>
+<h2>配置</h2>
+<p>在 profile 的 <code>cordis.patch.yml</code> 或 <code>--patch</code> 覆盖层中按 id 覆盖该行配置：</p>
+<pre><code>- id: fingerprint-show
+  config:
+    pathPrefix: /dsh-fingerprint-show   # HTTP 路由前缀
+    matchPatterns:                      # 对请求 URL 做子串匹配
+      - chat/completions
+    maxObservations: 500                # 进程内环形缓冲容量
+</code></pre>
+<p>注意：patch 会整行替换 config，覆盖时请重述全部需要的键。</p>
+<h2>诊断</h2>
+<p>浏览器直接访问 <code>/dsh-fingerprint-show/api/observations</code>（同源）可查看捕获结果：</p>
+<pre><code>{
+  "observations": [ { "fingerprint": "…", "model": "…", "sessionId": "…", "time": 123 } ],
+  "stats": {
+    "matchedResponses": 2,     // 被拦截的匹配响应数
+    "capturedFingerprints": 2, // 成功提取指纹数
+    "parsedChunks": 2,         // 解析的 SSE 载荷数
+    "inflightCalls": 0,        // 进行中的瀑布调用数
+    "totalStored": 2           // 缓冲中观测总数
+  }
+}
+</code></pre>
+<p>若 <code>matchedResponses &gt; 0</code> 而 <code>capturedFingerprints = 0</code>，说明提供方响应里没有
+<code>system_fingerprint</code>（自建/代理端点常见）；<code>lastPayloadSample</code> 会给出最近一次
+无指纹响应的首个 SSE 载荷样本。</p>
+<h2>已知限制</h2>
+<ul>
+<li>并发同模型调用（如同时运行的 subagent）之间按「时间最近」归因，极端并发下
+可能归属到相邻调用——但指纹本身标识的是模型部署版本，值始终正确；</li>
+<li>辅助调用（会话标题、压缩）带 <code>purpose</code> 标记，匹配时排除，不参与消息标注；</li>
+<li>指纹由提供方返回，非 OpenAI 兼容的自建端点可能不携带该字段（此时不显示）；</li>
+<li>只在有指标行（<code>timing</code>）的消息上显示，无指标文本的消息不显示指纹。</li>
+</ul>
+<h2>开发</h2>
+<pre><code>pnpm install
+pnpm run build     # esbuild → lib/index.js (Node ESM) + lib/client.js (浏览器 lazy-CJS)
+pnpm test          # 主机流水线 + 客户端 bundle 冒烟测试
+</code></pre>
+<p>客户端半区必须构建为 DSH 模块加载器的 lazy-CJS 工厂形式
+（<code>window.__ModuleLoader__.load({id, factory})</code>），见 <code>scripts/build.mjs</code>。</p>
+<h2>License</h2>
+<p>MIT</p>

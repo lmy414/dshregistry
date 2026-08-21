@@ -1,0 +1,118 @@
+<h1>dsh-consult</h1>
+<p>跨供应商第二意见服务：dsh 自身 agent 获得跨供应商咨询工具，外部 harness
+（ZCode 等）获得轻量本地 OpenAI 兼容顾问 API。对应需求文档
+<code>dsh-advisor-plugin-需求.md</code> 的路径 B 产品化。</p>
+<h2>能力（对照需求 F1–F6）</h2>
+<table>
+<thead>
+<tr>
+<th>#</th>
+<th>能力</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>F1</td>
+<td><code>DSH_MODEL=provider/model</code> 直选</td>
+<td>经 <code>agent/request</code> waterfall 改道主代理请求，<strong>不受 settings.yaml <code>agent-default-model</code> 用户层压制</strong>（旧 <code>--patch</code> 方案会被压过而静默走错模型）；改道动作写日志、实际路由写入会话 <code>request/header</code>；headless profile 的 patch 层另含 <code>!!js</code> 条目让 <code>--dump-config</code> 与选择一致</td>
+</tr>
+<tr>
+<td>F2</td>
+<td>OpenAI 兼容端点</td>
+<td><code>POST http://127.0.0.1:3080/v1/chat/completions</code>，复用现有 web 端口（不另起端口）；Bearer token（<code>settings.yaml</code> 的 <code>advisor.token</code>，首启自动生成）；SSE 流式 + 非流式；仅回环、无 CORS；<code>model</code> 字段接受 <code>provider/model</code></td>
+</tr>
+<tr>
+<td>F3</td>
+<td><code>consult</code> 工具</td>
+<td>注册给所有 agent；默认自动路由到与当前模型<strong>异源</strong>的供应商（优先用户在 <code>llm-pi-ai</code> settings 里配置过凭证的网关，如 XQAPI），可显式传 <code>model="provider/model"</code>；绝不静默换模型——无解时显式报错并列出可用 provider</td>
+</tr>
+<tr>
+<td>F4</td>
+<td>结构化输出</td>
+<td>consult 默认要求 JSON <code>{recommendation, reasons, confidence, risks, alternatives}</code>（宽松解析，失败降级纯文本并标注）；HTTP 端点支持 <code>response_format: json_schema / json_object</code>（提示级约束 + 解析）</td>
+</tr>
+<tr>
+<td>F5</td>
+<td>上游溯源</td>
+<td>HTTP 响应头 <code>x-model-upstream: provider/model</code>；consult 返回 <code>backend: dsh-advisor(model@provider)</code>。注意：中转商自报身份不可验证的部分与需求 G3 相同，此为网关侧尽力而为</td>
+</tr>
+<tr>
+<td>F6</td>
+<td>咨询审计</td>
+<td><code>$DSH_HOME/storages/advisor/audit.jsonl</code>：时间 / 来源(tool|http) / sessionId / 问题摘要 / 路由 / 思维等级 / 耗时 / 是否结构化；<code>adopted</code> 字段留待回填</td>
+</tr>
+<tr>
+<td>F9</td>
+<td>思维等级（reasoning effort）</td>
+<td>consult 参数 <code>reasoning</code> / HTTP 字段 <code>reasoning_effort</code> / settings <code>advisor.reasoningEffort</code>，词表 <code>off/minimal/low/medium/high/xhigh/max</code>；逐模型校验（resolveModelInfo），不支持时显式报错列出支持项；<strong>默认不传 = provider 默认（自适应思考）</strong></td>
+</tr>
+</tbody></table>
+<h2>思维等级：默认为什么不是 max（实测依据）</h2>
+<ul>
+<li><strong>等级是「上限」不是「下限」</strong>：混合思考模型（deepseek-v4-flash 等）按问题难度自适应思考，
+实测一句话问题上 <code>max</code> 与 <code>high</code> 推理量无差别；<code>off</code> 才是确定性开关（官方路由 0 推理、896ms）</li>
+<li><strong>延迟</strong>：官方路由 off≈0.9s，思考态 1.2~5s（波动来自问题难度，不是等级档位）</li>
+<li><strong>中转盲区（G3 又一实证）</strong>：XQAPI 中转<strong>不透传</strong> effort 参数（off 请求仍返回 195~421 字符推理，
+与等级完全不相关）——经 <code>deepseek</code>（XQAPI）路由时设置等级是无效 placebo；
+<code>deepseek-official</code> 路由才保证生效。想让等级真正生效可配 <code>advisor.route: deepseek-official/deepseek-v4-flash</code></li>
+<li>结论：<strong>缺省不传</strong>（provider 默认，官方 flash 默认即 high 且自适应）；难题在 consult 时
+显式传 <code>reasoning: high/max</code>；要全局固定用 settings <code>advisor.reasoningEffort</code></li>
+</ul>
+<h2>安装</h2>
+<ul>
+<li>克隆本仓库到插件目录：<code>git clone &lt;本仓库地址&gt; ~/.dsh/local-plugins/dsh-advisor</code></li>
+<li><code>~/.dsh/profiles/web/package.json</code> 与 <code>~/.dsh/profiles/headless/package.json</code>：
+<code>dependencies</code> 加 <code>link:</code> 依赖 + <code>dsh.profile.bundles</code> 加 <code>dsh-advisor</code></li>
+<li>两个 profile 目录各跑一次 <code>pnpm install</code>（link 包的依赖装在插件目录自身）</li>
+<li>headless 的 <code>cordis.patch.yml</code> 含 F1 的 <code>!!js</code> 条目</li>
+</ul>
+<p><strong>web profile 需重启 <code>dsh web</code> 后生效</strong>（bundle 列表在启动时读取）；
+headless 每次运行都是新进程，即时生效。</p>
+<h2>配置</h2>
+<p>组合层（bundle patch 的 <code>config</code>）：</p>
+<pre><code>- id: dsh-advisor
+  name: 'dsh-advisor'
+  config:
+    httpEnabled: true   # false 可关掉 HTTP 端点（consult 工具不受影响）
+</code></pre>
+<p>用户层（<code>~/.dsh/settings.yaml</code>，优先）：</p>
+<pre><code>advisor:
+  token: dsha_...            # 首次启动自动生成；换 token 直接改这里
+  route:                     # 可选：固定 consult 的默认顾问路由
+    provider: deepseek
+    model: deepseek-v4-flash
+</code></pre>
+<h2>使用示例</h2>
+<pre><code># F1：headless 直选模型（替代旧 --patch hack，不粘住、不会被 settings 压过）
+DSH_MODEL=deepseek/deepseek-v4-flash dsh --profile headless "问题"
+
+# F1 验收：dump-config 与选择一致
+DSH_MODEL=deepseek/deepseek-v4-flash dsh --profile headless --dump-config
+
+# F2：标准 OpenAI 客户端直调（token 见 settings.yaml 的 advisor.token）
+curl -X POST http://127.0.0.1:3080/v1/chat/completions \
+  -H 'content-type: application/json' \
+  -H 'authorization: Bearer dsha_...' \
+  -d '{"model":"deepseek/deepseek-v4-flash","messages":[{"role":"user","content":"…"}]}'
+# 流式加 "stream":true；结构化加 response_format json_schema
+
+# F3：会话内 agent 自动可用 consult 工具（无需配置）
+</code></pre>
+<h2>实测记录（2026-08-21）</h2>
+<ul>
+<li>401（无/错 token）、405（GET，带 Allow: POST）、400（裸模型名，列出可用 provider）✓</li>
+<li>非流式 fib(10)=55，SSE 分片 + usage + [DONE]，json_schema 结构化输出 ✓</li>
+<li><code>DSH_MODEL</code> headless：日志显示 <code>改道 zai-coding-cn/glm-5.3 → deepseek/deepseek-v4-flash</code>，
+会话 <code>request/header</code> 记录 deepseek 路由 ✓</li>
+<li>GLM agent 会话内调 consult → 自动路由 deepseek（XQAPI 中转），结构化意见 + 审计落盘 ✓</li>
+<li>P50：HTTP 化后 5–9s（旧 headless CLI ~7s + 冷启动）✓</li>
+</ul>
+<h2>未做 / 边界</h2>
+<ul>
+<li>F7（配额限速）、F8（并发 quorum）：未实现，留待后续</li>
+<li><code>--model</code> CLI 旗标本体需改 dsh 源码（路径 A 提 issue）；本插件以 <code>DSH_MODEL</code> env<ul>
+<li><code>agent/request</code> 改道达成同等效果且更稳</li>
+</ul>
+</li>
+<li>consult 的 <code>adopted</code> 回填目前靠主模型在回复中标注「已采纳/未采纳」（审计字段已预留）</li>
+</ul>

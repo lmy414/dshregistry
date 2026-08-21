@@ -1,0 +1,242 @@
+<h1>dsh-relay</h1>
+<p><a href="https://www.npmjs.com/package/dsh-relay"><img src="https://img.shields.io/npm/v/dsh-relay" alt="npm"></a>
+<a href="https://github.com/sorsama/deepseek-harness-relay/actions/workflows/ci.yml"><img src="https://github.com/sorsama/deepseek-harness-relay/actions/workflows/ci.yml/badge.svg" alt="CI"></a></p>
+<p>Authenticated remote access for a <a href="https://github.com/deepseek-ai/deepseek-harness">DeepSeek Harness</a> web profile — reach your harness from your phone over Wi-Fi, or from anywhere if you forward a port, without leaving an unauthenticated coding agent open on the network.</p>
+<p>Built on DeepSeek Harness. Not an official DeepSeek project.</p>
+<h2>Why this exists</h2>
+<p>The harness serves its browser API on loopback and is explicit about what it does not do:</p>
+<ul>
+<li><code>packages/client/connection/src/api-request-trust.ts</code> — the <code>/api</code> fence "is not an auth layer".</li>
+<li><code>packages/client/connection/src/index.ts</code> — the configuration plane stays loopback-only "until a real authentication layer exists".</li>
+<li><code>packages/bundle/web-app/src/startup.ts</code> — <code>dsh web --host 0.0.0.0</code> is refused, because "it would expose remote code execution to the network".</li>
+</ul>
+<p>The workaround people use today is a config patch that rebinds the web server to <code>0.0.0.0</code> with no authentication at all. Anyone on the same Wi-Fi can then drive the agent, which means running commands on your computer.</p>
+<p><code>dsh-relay</code> is the missing layer, mounted beside the harness rather than inside it. The harness keeps its loopback bind; the relay is a second listener that terminates TLS, authenticates, and forwards.</p>
+<pre><code>phone / browser ──TLS──▶ relay :3443 ──plain HTTP──▶ harness 127.0.0.1:3080
+                          ├─ /relay/password
+                          ├─ /relay/login
+                          ├─ /relay/pair
+                          ├─ /relay/devices
+                          └─ everything else ─proxy─▶ /api · WebSocket downlinks · web UI
+</code></pre>
+<p>Because the harness stays on loopback, a relay that fails to start or is misconfigured leaves the harness <strong>unreachable</strong> from the network — never open to it. The relay refuses to start at all if it finds the harness already bound to <code>0.0.0.0</code>.</p>
+<h2>What you get</h2>
+<ul>
+<li><strong>Password sign-in</strong> for a browser, as a signed <code>HttpOnly; SameSite=Strict</code> cookie over a scrypt hash, with per-address lockout.</li>
+<li><strong>QR and passcode pairing</strong> for devices, minting a revocable bearer token. Codes are single-use, short-lived, and can only be issued from the machine running the harness.</li>
+<li><strong>A device list</strong> with per-device revoke and a "sign out everywhere" that rotates the signing key.</li>
+<li><strong>TLS</strong>, either from your own certificate or self-signed with a published SPKI pin.</li>
+<li><strong>mDNS advertisement</strong> on <code>_dsh._tcp</code>, so a client can find the relay without sweeping the subnet.</li>
+<li><strong>The whole web UI</strong>, unchanged. The proxy is transparent, so the browser app works from a phone exactly as it does locally, with a <strong>Relay</strong> link in the corner for the pages above.</li>
+<li><strong>A card in Settings → Plugins</strong>, on the machine running the harness, for the switches that are configuration rather than operations.</li>
+</ul>
+<h2>Install</h2>
+<p><strong>New here? Start with <a href="https://github.com/sorsama/deepseek-harness-relay/blob/HEAD/docs/GETTING_STARTED.md">docs/GETTING_STARTED.md</a></strong> — a step-by-step walkthrough for <code>npx @deepseek-ai/dsh web</code>, including the LAN patch you have to remove first.</p>
+<p>The short version. If your harness currently binds <code>0.0.0.0</code> (the DSH Mobile LAN patch), remove that row from <code>~/.dsh/profiles/web/cordis.patch.yml</code> first — the relay refuses to start in front of an already-open server. Then:</p>
+<pre><code>dsh plugin --profile web add dsh-relay
+dsh web
+</code></pre>
+<p>No <code>dsh</code> on your PATH? Every command works the same as <code>npx @deepseek-ai/dsh ...</code>.</p>
+<p>The registry package ships prebuilt, so nothing runs a build on your machine; adding a bundle needs a restart. The terminal then prints the relay URL. Open <code>/relay/password</code> on it <strong>from the machine running the harness</strong> and set a password — until one exists that page is loopback-only, so nobody on the network can claim the relay first.</p>
+<p>A request from that machine never has to sign in: loopback is the operator, because whoever is at the keyboard already has a shell. The password is what the network needs.</p>
+<h2>Pair a phone</h2>
+<ol>
+<li>On the machine running the harness, open <code>https://127.0.0.1:3443/relay/pair</code>.</li>
+<li>Scan the QR with the phone, or open the same path on the phone and type the code.</li>
+<li>Name the device. It is now enrolled, and appears under <code>/relay/devices</code>.</li>
+</ol>
+<h2>Using it with DSH Mobile</h2>
+<p><a href="https://github.com/sorsama/deepseek-harness-mobile">DSH Mobile</a> 0.5.0 predates this plugin and has two limits the relay works around rather than pretends away:</p>
+<p><strong>It cannot speak TLS.</strong> The app hardcodes <code>http://</code> for its RPC calls and both of its WebSocket downlinks, so it cannot reach a TLS listener. Run a plain listener alongside the TLS one:</p>
+<pre><code>DSH_RELAY_PLAIN_PORT=3444 dsh web
+</code></pre>
+<p>The plain listener accepts only compatibility clients, serves no sign-in or pairing pages, and never reaches the harness settings or credentials.</p>
+<p><strong>It cannot present a credential.</strong> The app sends no <code>Authorization</code> header, no cookies, and no <code>Origin</code> — there is no field in it that could carry a token. So pairing from the phone's <em>browser</em> records that phone's network address, and the app then connects from the same address.</p>
+<p>Be clear-eyed about what that is: a source address is <strong>not</strong> authentication. It is shared behind NAT, reassigned by DHCP, rotated by IPv6 privacy extensions, and spoofable by anything on the same Wi-Fi. The relay narrows it as far as it can — private address ranges only, a TTL, dies with the device that created it, and never reaches the configuration plane — but it is a bridge until the app can hold a token, not a destination. Turn it off with <code>compat.addressGrants: false</code> and pair a client that can authenticate.</p>
+<p><code>docs/CLIENT_INTEGRATION.md</code> is the contract for that client work.</p>
+<h2>Configuration</h2>
+<p>Every value lives in your profile's <code>cordis.patch.yml</code> under the <code>relay</code> row. Your layer applies after the bundle's, so it wins. A patch replaces the row's <strong>whole</strong> <code>config</code>, so restate every key you want — including <code>stateDir</code>, which has no default.</p>
+<pre><code>- id: relay
+  name: 'dsh-relay'
+  config:
+    bind: '0.0.0.0'
+    port: 3443
+    stateDir: !!js dshHomePath('relay')
+    tls: 'files'
+    tlsCertPath: '/path/to/fullchain.pem'
+    tlsKeyPath: '/path/to/privkey.pem'
+    publicHostnames: ['relay.example.com']
+    privilegedMethods: 'allow-authenticated'
+    compat:
+      addressGrants: true
+      addressGrantTtlMs: 86400000
+      plainPort: 3444
+</code></pre>
+<table>
+<thead>
+<tr>
+<th>Field</th>
+<th>Default</th>
+<th>What it decides</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>bind</code> / <code>port</code></td>
+<td><code>0.0.0.0</code> / <code>3443</code></td>
+<td>The primary listener.</td>
+</tr>
+<tr>
+<td><code>tls</code></td>
+<td><code>self-signed</code></td>
+<td><code>files</code> for a certificate a browser trusts, <code>self-signed</code> for pinning clients, <code>off</code> for plaintext.</td>
+</tr>
+<tr>
+<td><code>publicHostnames</code></td>
+<td><code>[]</code></td>
+<td>Extra names this relay is reached by — certificate SANs, and accepted <code>Host</code> values.</td>
+</tr>
+<tr>
+<td><code>trustedHosts</code></td>
+<td><code>[]</code></td>
+<td>Additional authorities the fence accepts, as bare <code>host</code> or <code>host:port</code>.</td>
+</tr>
+<tr>
+<td><code>auth</code></td>
+<td><code>both</code></td>
+<td>Which credential classes are accepted.</td>
+</tr>
+<tr>
+<td><code>sessionTtlMs</code></td>
+<td>12 h</td>
+<td>Browser cookie lifetime.</td>
+</tr>
+<tr>
+<td><code>deviceTokenTtlMs</code></td>
+<td>30 d</td>
+<td>Device token lifetime.</td>
+</tr>
+<tr>
+<td><code>pairingWindowMs</code></td>
+<td>5 min</td>
+<td>How long a pairing code stays claimable.</td>
+</tr>
+<tr>
+<td><code>maxFailedAttempts</code> / <code>lockoutMs</code></td>
+<td>5 / 15 min</td>
+<td>Sign-in lockout.</td>
+</tr>
+<tr>
+<td><code>rateLimitPerMinute</code></td>
+<td>600</td>
+<td>Per-address request ceiling.</td>
+</tr>
+<tr>
+<td><code>privilegedMethods</code></td>
+<td><code>allow-authenticated</code></td>
+<td>Whether an authenticated remote client reaches settings, credentials, model discovery, and host pickers. Address-granted clients never do, regardless.</td>
+</tr>
+<tr>
+<td><code>extraProxyPaths</code></td>
+<td><code>[]</code></td>
+<td>Additional path prefixes a write may address.</td>
+</tr>
+<tr>
+<td><code>compat.addressGrants</code></td>
+<td><code>true</code></td>
+<td>The DSH Mobile 0.5.0 bridge described above.</td>
+</tr>
+<tr>
+<td><code>compat.plainPort</code></td>
+<td><code>0</code></td>
+<td>Plain-HTTP listener for clients that cannot use TLS.</td>
+</tr>
+<tr>
+<td><code>uiLink</code></td>
+<td><code>true</code></td>
+<td>Add the <strong>Relay</strong> link to the harness web UI.</td>
+</tr>
+<tr>
+<td><code>mdns</code></td>
+<td><code>true</code></td>
+<td>Advertise <code>_dsh._tcp</code>.</td>
+</tr>
+</tbody></table>
+<h3>Per-invocation overrides</h3>
+<p><strong>There are no <code>--relay-*</code> flags, and there cannot be.</strong> The harness's web app owns the invocation's parser and rejects any option it does not declare, so a flag added by a bundle fails <code>dsh web</code> before any plugin loads. The shipped patch reads the environment instead:</p>
+<table>
+<thead>
+<tr>
+<th>Variable</th>
+<th>Effect</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>DSH_RELAY_PORT</code></td>
+<td>primary listener port</td>
+</tr>
+<tr>
+<td><code>DSH_RELAY_BIND</code></td>
+<td>listen address</td>
+</tr>
+<tr>
+<td><code>DSH_RELAY_TLS</code></td>
+<td><code>self-signed</code>, <code>files</code>, or <code>off</code></td>
+</tr>
+<tr>
+<td><code>DSH_RELAY_PLAIN_PORT</code></td>
+<td>plain-HTTP listener port; <code>0</code> disables it</td>
+</tr>
+<tr>
+<td><code>DSH_RELAY_DISABLE=1</code></td>
+<td>skip the relay entirely this run</td>
+</tr>
+</tbody></table>
+<pre><code>DSH_RELAY_PLAIN_PORT=3444 dsh web
+</code></pre>
+<h2>Certificates</h2>
+<p>A phone browser will warn on a self-signed certificate. For browser use, point <code>tls: files</code> at something already trusted — <a href="https://github.com/FiloSottile/mkcert">mkcert</a> on a LAN, or an ACME certificate on a forwarded name.</p>
+<p>Self-signed mode exists for pinning clients: the relay publishes the SHA-256 of its SubjectPublicKeyInfo in the QR payload and on the devices page, and a client that pins that value gets real transport security with no certificate authority involved. The pin covers the public key rather than the certificate, so renewing with the same key leaves paired devices working.</p>
+<p>The generated key is written mode <code>0600</code>. <strong>On Windows that is a no-op</strong> — the file inherits the ACL of your harness home. If that directory is shared, restrict it with <code>icacls</code> or manage the certificate yourself with <code>tls: files</code>.</p>
+<h2>Exposing it to the internet</h2>
+<p>Forward the relay's port, not the harness's. Then:</p>
+<ul>
+<li>Set <code>publicHostnames</code> to the name you reach it by, or the fence will refuse the request.</li>
+<li>Use a real certificate. Self-signed plus pinning is a LAN answer.</li>
+<li>Leave <code>compat.addressGrants</code> off. Behind carrier NAT a public address is shared with strangers, and the relay refuses to grant one anyway.</li>
+<li>Consider <code>privilegedMethods: loopback-only</code>.</li>
+</ul>
+<h2>Security model</h2>
+<p>Read <code>docs/SECURITY.md</code> for the full statement. The short version: <strong>signing in grants the same power as a shell on the host machine</strong>, because the agent runs commands there. Everything in this plugin follows from that.</p>
+<h2>Troubleshooting</h2>
+<p><strong>Nothing answers, the connection times out.</strong> The firewall is dropping packets. On Windows, an unrecognised network goes into the Public profile, which blocks inbound TCP:</p>
+<pre><code>New-NetFirewallRule -DisplayName "DSH Relay" -Direction Inbound `
+    -Action Allow -Protocol TCP -LocalPort 3443 -Profile Private,Domain
+</code></pre>
+<p>Set the network to Private. If it still times out, check the router for AP/client isolation — guest SSIDs almost always have it.</p>
+<p><strong>Connection refused.</strong> Nothing is listening. Confirm the relay started (<code>netstat -ano | findstr 3443</code>) and that <code>--no-relay</code> is not in effect.</p>
+<p><strong>403 from the relay.</strong> The <code>Host</code> you reached it by is not trusted. Connect by an IP literal the relay derived itself, or add the name to <code>publicHostnames</code>.</p>
+<p><strong>The plugin refuses to start, naming the webserver row.</strong> You still have the old LAN patch that binds the harness to <code>0.0.0.0</code>. Remove it — the relay cannot protect a server that is already answering the network.</p>
+<p><strong>DSH Mobile says "the harness rejected this address".</strong> That is a 403. Either the address grant expired or the phone's address changed; pair again from the phone's browser.</p>
+<h2>Development</h2>
+<pre><code>pnpm install
+pnpm build        # tsc -b, then tsdown
+pnpm test
+pnpm typecheck
+</code></pre>
+<p>Point a source checkout at a running harness with an overlay that names the
+built entry points directly:</p>
+<pre><code>- insert:
+    - id: relay
+      name: 'file:///D:/path/to/deepseek-harness-relay/lib/index.js'
+      config:
+        stateDir: 'D:/path/to/scratch/relay-state'
+        tls: 'off'
+</code></pre>
+<pre><code>dsh web --patch ./dev.cordis.yml
+</code></pre>
+<p>On Windows the path must be a <code>file://</code> URL, not a bare absolute path — the
+loader hands it to the ESM resolver, which rejects a <code>d:</code> protocol.</p>
+<h2>Naming</h2>
+<p>The harness's brand guidelines ask ecosystem projects to use the <code>DSH</code> abbreviation rather than the full trademark in their names, and not to present official brand art. The npm package is <code>dsh-relay</code> and the pages carry this project's own mark.</p>
+<h2>License</h2>
+<p>MIT</p>

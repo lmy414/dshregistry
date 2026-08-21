@@ -1,0 +1,115 @@
+<h1>dsh-web-pass</h1>
+<blockquote>
+<p>简体中文 | <a href="https://github.com/linz919/dsh-web-pass/blob/HEAD/README.en.md">English</a></p>
+</blockquote>
+<p>一个<strong>零依赖</strong>的 DeepSeek Harness Web 插件：在 DSH 前面加一道<strong>网页密码门</strong>。</p>
+<ul>
+<li><strong>Cookie 会话认证</strong>跑在反向代理上（不是 nginx Basic Auth）。密码错误次数过多（默认 3 次）→ 临时锁定（401）。</li>
+<li><strong>首次访问强制设置密码</strong>（输入两次；强度要求 ≥8 位且含大小写字母和数字）。</li>
+<li>DSH 设置页新增**「网页密码」标签页**：网关状态、修改访问密码（带确认与强度指示）、一键退出登录。</li>
+<li><strong>登录访问日志</strong>内嵌在 <code>/dsh-logs/</code>：只记录密码验证相关请求的访客 IP（成功 / 失败 / 锁定 / 浏览），自动刷新，<strong>按大小轮转（默认单文件 1MB、保留 7 份历史）</strong>，体积有硬上限。</li>
+<li>日志不落原始 IP——用 HMAC-SHA256 假名化 + 网络前缀（IPv4 /24、IPv6 /64），可聚合分析又不泄隐私。</li>
+</ul>
+<p>插件仓库里不落任何运行时数据——数据都在 <code>$DSH_HOME/dsh-web-pass/</code>（密码哈希、会话、日志）。</p>
+<h2>工作原理</h2>
+<pre><code>浏览器 → (TLS / 反向代理) → dsh-web-pass :3081 → 127.0.0.1:3080 (DSH)
+</code></pre>
+<p>插件在 <code>dsh web</code> 进程内部运行一个反向代理：把 <code>Host</code>/<code>Origin</code> 改写为回环地址，从而<strong>不改任何 DSH 配置</strong>就能通过 DSH 的浏览器信任检查，并在其上叠加 cookie 密码认证。TLS 通常由上游终止（反向代理 / 隧道 / nginx）。</p>
+<h2>安装</h2>
+<p><strong>方式一：从 npm 安装（推荐）</strong></p>
+<pre><code>dsh plugin --profile web add dsh-web-pass
+# 然后重启 dsh web
+</code></pre>
+<p><strong>方式二：从源码安装</strong></p>
+<pre><code>git clone https://github.com/linz919/dsh-web-pass.git
+dsh plugin --profile web add ./dsh-web-pass -w
+# 然后重启 dsh web
+</code></pre>
+<p>确认已加载：</p>
+<pre><code>ss -tln | grep -E ':3081|:3082'
+</code></pre>
+<h2>配置</h2>
+<p><strong>所有选项都有内置默认值——完全不写任何配置也能正常工作</strong>（日志轮转默认即 1MB × 7 份）。即使 <code>cordis.patch.yml</code> 在安装其他插件时被覆盖、丢失自定义配置，功能也不受影响：日志轮转回落到内置默认，访问密码的环境变量名回落到内置的 <code>DSH_WEB_PASS_PASSWORD</code>。</p>
+<p>来自插件配置（<code>cordis.patch.yml</code> 的 <code>config</code> 段，可选）：</p>
+<table>
+<thead>
+<tr>
+<th>选项</th>
+<th>默认值</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>port</code></td>
+<td><code>3081</code></td>
+<td>反向代理监听端口</td>
+</tr>
+<tr>
+<td><code>logViewerPort</code></td>
+<td><code>3082</code></td>
+<td>内嵌日志查看器端口</td>
+</tr>
+<tr>
+<td><code>maxLoginAttempts</code></td>
+<td><code>3</code></td>
+<td>锁定前允许的密码错误次数</td>
+</tr>
+<tr>
+<td><code>loginLockMs</code></td>
+<td><code>60000</code></td>
+<td>超次后的锁定时长（毫秒）</td>
+</tr>
+<tr>
+<td><code>passwordEnv</code></td>
+<td><code>DSH_WEB_PASS_PASSWORD</code></td>
+<td>提供密码的环境变量名</td>
+</tr>
+<tr>
+<td><code>trustProxy</code></td>
+<td><code>false</code></td>
+<td>是否信任 <code>X-Forwarded-For</code> / <code>CF-Connecting-IP</code> 头（用于访客 IP 识别与登录限速）</td>
+</tr>
+<tr>
+<td><code>logMaxBytes</code></td>
+<td><code>1048576</code></td>
+<td>访问日志单文件大小上限（字节），达到即轮转，下限 64KB</td>
+</tr>
+<tr>
+<td><code>logMaxFiles</code></td>
+<td><code>7</code></td>
+<td>轮转后保留的历史文件份数（<code>access.log.1</code> … <code>access.log.N</code>），超出自动删除</td>
+</tr>
+</tbody></table>
+<blockquote>
+<p><strong>关于 <code>trustProxy</code></strong>：默认关闭时，访客 IP 与登录限速只依据 socket 直连地址，防止伪造 XFF 头污染日志或绕过限速。仅当你在网关前面部署了可信的反向代理（nginx、Cloudflare 隧道等）时才开启。</p>
+</blockquote>
+<h2>密码存储</h2>
+<ul>
+<li><strong>默认为空。</strong> 首次访问 3081 会强制进入设置页（输入两次；须 ≥8 位且含大小写字母和数字）。</li>
+<li>优先级：环境变量 <code>DSH_WEB_PASS_PASSWORD</code>（设到 <code>dsh web</code> 服务进程环境里）<strong>&gt;</strong> 文件 <code>$DSH_HOME/dsh-web-pass/password</code>（scrypt 哈希）。</li>
+<li>如果清空（删除环境变量 / 文件）→ 下次访问重新进入设置页。</li>
+<li><code>cordis.patch.yml</code> 只引用环境变量<strong>名</strong>——绝不要把密码明文写进去（该文件会进 git / 仓库）。</li>
+</ul>
+<h2>访问日志</h2>
+<ul>
+<li>页面入口 <code>/dsh-logs/</code>（也可从设置页「访问日志」按钮打开）：只记录 <code>/gate-login</code>、<code>/gate/setup</code>、<code>/gate/logout</code> 的请求，按「方法 + 路径 + 状态码」判定语义：<ul>
+<li>✅ 验证成功（POST 登录 → 302）</li>
+<li>❌ 密码错误（POST 登录 → 200）</li>
+<li>🔒 超次锁定（POST 登录 → 401）</li>
+<li>👁 打开登录页 / 设置页（GET 浏览）</li>
+<li>🚪 登出（POST logout）</li>
+<li>🔑 首次设置完成（POST setup → 302）</li>
+</ul>
+</li>
+<li>时间使用<strong>服务器本地时区</strong>渲染；5 秒自动刷新；支持按 IP / 请求关键字筛选。</li>
+<li>文件：<code>$DSH_HOME/dsh-web-pass/access.log</code> —— <strong>按大小轮转</strong>：单文件达到 <code>logMaxBytes</code>（默认 1MB）就滚动为 <code>access.log.1</code>，更早的依次后移为 <code>access.log.2</code> …，最多保留 <code>logMaxFiles</code> 份（默认 7 份），最旧的自动删除。日志总体积因此有硬上限（默认约 8MB），不会随时间无限增长。</li>
+<li>IP 假名化密钥存于同目录 <code>.hmac-key</code>（自动生成，0600 权限）；<strong>不要删除它</strong>，否则同一 IP 会产生新的假名，聚合分析断档。</li>
+</ul>
+<h2>安全说明</h2>
+<ul>
+<li>单一共享密码，无账号 / 2FA。</li>
+<li><strong>务必经 HTTPS 暴露</strong>（上游 TLS）；不要把纯 HTTP 端口直接映射到公网。</li>
+<li>登录限速与日志 IP 默认取 socket 地址；开启 <code>trustProxy</code> 后取 <code>X-Forwarded-For</code> / <code>CF-Connecting-IP</code>——用于识别参考，不是安全边界。</li>
+</ul>
+<h2>许可证</h2>
+<p><a href="https://github.com/linz919/dsh-web-pass/blob/HEAD/LICENSE">MIT</a></p>

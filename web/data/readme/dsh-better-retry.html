@@ -1,0 +1,122 @@
+<h1>dsh-better-retry 🔁</h1>
+<blockquote>
+<p>A <a href="https://github.com/deepseek-ai/deepseek-harness">DeepSeek Harness</a> (DSH) Cordis plugin that retries <strong>any</strong> model-request failure — whatever the error code — with durable, backoff-scheduled retries, plus <strong>Settings → General sliders</strong> to tune the retry budget (0–64, default 8) and the 429 wait (5–120 s, default 15 s) live.
+一个 DSH（DeepSeek Harness）Cordis 插件：无论报什么错都自动重试模型请求（持久化 + 指数退避），并在 设置 → 常规 里提供滑块实时调整重试次数（0–64，默认 8）与 429 等待时长（5–120 秒，默认 15 秒）。</p>
+</blockquote>
+<p><a href="https://github.com/Yaing-Yan/dsh-better-retry/blob/HEAD/LICENSE"><img src="https://img.shields.io/badge/License-MIT-yellow.svg" alt="License: MIT"></a>
+<a href="https://github.com/deepseek-ai/deepseek-harness"><img src="https://img.shields.io/badge/DSH-Cordis%20Plugin-blueviolet" alt="DSH"></a></p>
+<h2>✨ Why / 为什么需要它</h2>
+<p>The stock <code>dsh-llm-retry</code> plugin only retries failures whose code appears in the provider route's <code>retryPolicy.retryableCodes</code> (default: <code>EMPTY_RESPONSE</code>, <code>RATE_LIMIT</code>, <code>SERVER</code>, <code>TIMEOUT</code>, <code>TRANSPORT</code>). Everything else — <code>AUTH</code>, <code>QUOTA</code>, <code>INVALID_REQUEST</code>, <code>PI_AI_ERROR</code>, <code>LLM_STREAM_IDLE_TIMEOUT</code>, … — ended the turn immediately with "本轮运行失败".</p>
+<p>内置的 <code>dsh-llm-retry</code> 只重试 provider 策略里列出的错误码（默认：空响应、限流、5xx、超时、传输错误）。其它错误（鉴权、配额、无效请求、流空闲超时……）一遇即终，直接「本轮运行失败」。本插件把这张白名单变成"全量重试"。</p>
+<ul>
+<li><strong>Any error code</strong> — retries every failure class, capped by your budget.</li>
+<li><strong>Durable &amp; visible</strong> — appends the same <code>llm/retry</code> / <code>llm/retry-started</code> events as the stock plugin, so the chat UI shows "正在重试模型请求（n/N）· Xs" and sessions stay replay-safe.</li>
+<li><strong>Sliders in Settings</strong> — Settings → General → "失败重试次数 / Failure retries" (0–64, default 8) and "429 等待（秒） / 429 wait (s)" (5–120, default 15), persisted to <code>settings.yaml</code>, apply to the <em>next</em> failure with no restart.</li>
+<li><strong>Two deliberate exceptions</strong> — <code>ABORTED</code> (user cancel) and <code>CONTEXT_WINDOW_EXCEEDED</code> (handled by the compaction plugin) are never retried.</li>
+<li><strong>Plays well with stock retry</strong> — a downstream retry/compaction decision always wins; this plugin only recovers failures nobody else claimed.</li>
+</ul>
+<h2>🧩 How it works / 工作原理</h2>
+<table>
+<thead>
+<tr>
+<th>Half</th>
+<th>Role</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong>Host</strong> (<code>lib/index.js</code>)</td>
+<td>Listens on the agent loop's <code>agent/request-error</code> waterfall. For any failure not in the never-retry set and not already recovered downstream, it appends a durable <code>llm/retry</code> event, waits out exponential backoff (500 ms → 10 s cap, 10% jitter) — or, for a failure carrying <code>Retry-After</code> (429 rate-limit/quota), the server-requested wait clamped into the user's 429 window [5 s, <code>retryAfterMs</code>] — appends <code>llm/retry-started</code>, and returns <code>{ kind: "retry" }</code> so the loop re-issues the request. The settings live in the <code>dsh-better-retry</code> namespace (<code>maxRetries</code> default 8 max 64, <code>retryAfterMs</code> default 15 s range 5–120 s), hot-reloaded per change.</td>
+</tr>
+<tr>
+<td><strong>Client</strong> (<code>lib/client.js</code>)</td>
+<td>Registers two <code>settings.general.item</code> rows: range sliders that read/write the Host half's same-origin route <code>/dsh-better-retry/config</code> (the settings wire API only serves apiproxy-allowlisted namespaces, so the Host serves its own route through the settings service) — every release persists <code>dsh-better-retry.maxRetries</code> / <code>retryAfterMs</code> into <code>settings.yaml</code> immediately.</td>
+</tr>
+</tbody></table>
+<pre><code>model request fails (any code)
+        │
+        ▼
+agent/request-error (waterfall)
+        │  downstream first: stock retry / compaction decide?
+        ▼
+  never-retry? ── ABORTED / CONTEXT_WINDOW_EXCEEDED ──► pass through
+        │
+        ▼
+  append llm/retry (durable) ──► backoff ──► llm/retry-started ──► loop retries
+        │                                                         (max: slider value)
+        ▼
+  budget exhausted ──► original failure surfaces ("本轮运行失败")
+</code></pre>
+<h2>📦 Install / 安装</h2>
+<h3>A. Global static plugin (recommended — survives restarts)</h3>
+<pre><code>cd "$DSH_HOME/profiles/web"          # DSH_HOME defaults to ~/.dsh
+pnpm add https://github.com/Yaing-Yan/dsh-better-retry/archive/refs/tags/v1.0.0.tar.gz
+# then add "dsh-better-retry" to the "dsh.profile.bundles" array in package.json
+dsh --profile web                    # restart the app
+</code></pre>
+<p>That is exactly how <code>dsh-at-file</code> / <code>dsh-better-status</code> / <code>dsh-show-picture</code> are installed. The Host half registers the retry listener; the Client half is served as a web module (<code>/plugins/dsh-better-retry/client.js</code>) and adds the slider row to Settings → General.</p>
+<h3>B. Dynamic Cordis plugin (session-local)</h3>
+<p>The plugin can also be created in a single session with <code>cordis_define</code> (kind <code>new</code>):</p>
+<ul>
+<li><code>code.host</code> ← paste the content of <a href="https://github.com/Yaing-Yan/dsh-better-retry/blob/HEAD/plugin/host.js"><code>plugin/host.js</code></a></li>
+<li><code>code.client</code> ← paste the content of <a href="https://github.com/Yaing-Yan/dsh-better-retry/blob/HEAD/plugin/client.js"><code>plugin/client.js</code></a></li>
+</ul>
+<p>then activate with <code>cordis_run</code> (mode <code>run</code>). First activation of the Client half asks for <strong>user approval</strong> in the UI. Dynamic plugins are process-local: they do <strong>not</strong> survive a DSH restart and belong to the session that created them. In dynamic mode the budget is <strong>fixed at 8</strong> (the sandbox has no <code>settings</code> service); the slider still persists the value for the static install.</p>
+<p>Full step-by-step (including upgrades and rollback) is in <a href="https://github.com/Yaing-Yan/dsh-better-retry/blob/HEAD/docs/INSTALL.md"><code>docs/INSTALL.md</code></a>.</p>
+<h2>🎚 Configuration / 配置</h2>
+<table>
+<thead>
+<tr>
+<th>Where</th>
+<th>What</th>
+<th>Default</th>
+<th>Range</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>Settings → General → 失败重试次数</td>
+<td><code>dsh-better-retry.maxRetries</code></td>
+<td>8</td>
+<td>0–64</td>
+</tr>
+<tr>
+<td>Settings → General → 429 等待（秒）</td>
+<td><code>dsh-better-retry.retryAfterMs</code></td>
+<td>15 s</td>
+<td>5–120 s</td>
+</tr>
+<tr>
+<td><code>~/.dsh/settings.yaml</code> → <code>dsh-better-retry:</code> → <code>maxRetries</code> / <code>retryAfterMs</code></td>
+<td>same, hand-editable</td>
+<td>8 / 15000 ms</td>
+<td>0–64 / 5000–120000 ms</td>
+</tr>
+</tbody></table>
+<ul>
+<li><code>0</code> disables the any-code retry entirely (stock policy still applies).</li>
+<li>Changes apply to the <strong>next</strong> failure; an in-flight retry chain keeps the budget it started with (the chain's <code>policyKey</code> embeds the budget).</li>
+<li>Backoff: 500 ms initial, doubling, 10 s cap, ±10% jitter.</li>
+<li>A provider <code>Retry-After</code> (429 quota/rate-limit) is honored as the wait, clamped into <code>[5 s, retryAfterMs]</code> — never skipped, so quota errors are retried up to the budget (e.g. 60 s Retry-After with the default 15 s cap waits 15 s per retry).</li>
+</ul>
+<h2>⚠️ Notes / 说明</h2>
+<ul>
+<li>Retrying an <code>AUTH</code>/<code>QUOTA</code> failure only helps for transient blips — a permanently bad key or empty balance will simply fail 9 times (1 + 8 retries) before surfacing.</li>
+<li>Context-window overflow is recovered by <code>dsh-compaction-basic</code> (compact, then retry from the replacement surface), not by blind repetition.</li>
+<li>Session replay stays valid: emitted events satisfy the stock <code>llm-retry</code> invariants (mode, ascending retry numbers, per-chain retryId).</li>
+</ul>
+<h2>📁 Repository layout / 目录结构</h2>
+<pre><code>dsh-better-retry/
+├── lib/
+│   ├── index.js         # Host half (any-error retry + settings section) — static install
+│   └── client.js        # Client half (Settings slider) — served as a web module
+├── plugin/
+│   ├── host.js          # Host half — paste as code.host (dynamic; budget fixed at 8)
+│   └── client.js        # Client half — paste as code.client (dynamic)
+├── docs/
+│   └── INSTALL.md       # Step-by-step install / update / rollback
+├── cordis.patch.yml     # Bundle patch: inserts the dsh-better-retry row
+├── dsh.plugin.json      # Plugin metadata (entry + client platform)
+├── package.json
+└── LICENSE
+</code></pre>
+<h2>📄 License / 许可证</h2>
+<p><a href="https://github.com/Yaing-Yan/dsh-better-retry/blob/HEAD/LICENSE">MIT</a> © 2026 dsh-better-retry contributors</p>

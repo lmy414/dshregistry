@@ -1,0 +1,254 @@
+<h1>dsh-llm-kiro</h1>
+<p>A Kiro provider for the <a href="https://github.com/deepseek-ai/deepseek-harness">DeepSeek Harness</a> LLM seam.</p>
+<p>The package is a standalone Cordis plugin: it mounts in any harness composition through
+<code>cordis.yml</code>, registers the <code>kiro</code> provider route on <code>ctx.llm</code>, and needs no changes to the
+harness itself.</p>
+<h2>What it handles</h2>
+<table>
+<thead>
+<tr>
+<th>Concern</th>
+<th>Implementation</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong>Existing credentials</strong></td>
+<td>Picks up an existing kiro-cli login (the <code>auth_kv</code> table of kiro-cli's SQLite store, IDC and social tokens) and the Kiro IDE token (<code>~/.aws/sso/cache/kiro-auth-token.json</code> with its OIDC client registration) — no second sign-in. An optional <code>bearerTokenEnv</code> reference bypasses ambient discovery for CI/bots.</td>
+</tr>
+<tr>
+<td><strong>Token refresh</strong></td>
+<td>Silent refresh of expired tokens through the AWS SSO OIDC <code>/token</code> endpoint (Builder ID / IAM Identity Center) or the Kiro desktop auth service (Google/GitHub social), write-back into the kiro-cli store so both consumers stay in sync; a 403 mid-stream re-reads the shared store and falls back to <code>kiro-cli debug refresh-auth-token</code>; last-resort failure surfaces as <code>MISSING_CREDENTIAL</code>/AUTH with guidance.</td>
+</tr>
+<tr>
+<td><strong>The backend</strong></td>
+<td>Region/endpoint resolution (SSO region → Kiro API region), the management control plane (<code>List-Available-Profiles</code>, <code>List-Available-Models</code>, shared <code>~/.kiro-management-models-cache.json</code> catalog cache), and the runtime <code>generateAssistantResponse</code> call over the AWS event-stream protocol (Smithy framing via <code>@smithy/core</code>), with capacity backoff, first-token timeout, and the harness idle watchdog.</td>
+</tr>
+<tr>
+<td><strong>Models</strong></td>
+<td>A bootstrap catalog mirroring the kiro-cli-verified menu (15 models with context windows, output caps, reasoning capability, image modality), exact wire-id resolution (dashed harness ids ⇄ dotted wire ids), and management discovery for the Models page. Reasoning efforts map the harness <code>off</code>/<code>low</code>/<code>high</code>/<code>max</code> vocabulary onto each model's authenticated effort schema, with the Kiro thinking markers on the system prompt.</td>
+</tr>
+</tbody></table>
+<p>Every runtime request carries the harness attribution <code>User-Agent</code> (from <code>@deepseek-ai/dsh-llm</code>
+<code>attributionHeaders()</code>) plus the AWS SDK-shaped <code>x-amz-user-agent</code> telemetry header the backend expects.</p>
+<h2>Install</h2>
+<p>The package is ESM and declares the harness packages it talks to as peer dependencies — the host
+DSH installation provides them. It also declares the <code>dsh</code> bundle manifest
+(<code>cordis.patch.yml</code> ships with the package), so it mounts as a profile bundle as well as a
+plain plugin dependency.</p>
+<pre><code>npx -y @deepseek-ai/dsh plugin --profile web install @joshryandavis/dsh-llm-kiro
+</code></pre>
+<p>Mount it in <code>cordis.yml</code>:</p>
+<pre><code>- id: llm-kiro
+  name: '@joshryandavis/dsh-llm-kiro'
+  config:
+    region: us-east-1        # optional; the credential's region wins when omitted
+    reasoningEffort: high    # optional; off | low | high | max (default high)
+</code></pre>
+<p>That is the whole configuration for an existing kiro-cli or Kiro IDE login: credentials are picked
+up ambiently, refreshed silently, and written back. A static bearer token works too:</p>
+<pre><code>- id: llm-kiro
+  name: '@joshryandavis/dsh-llm-kiro'
+  config:
+    bearerTokenEnv: KIRO_BEARER_TOKEN   # stored via the harness credentials service
+</code></pre>
+<h2>Config reference</h2>
+<p>All fields are optional; the <code>llm-kiro</code> user-settings section uses the same schema and can be
+edited at runtime — a change reaches the next request without a restart.</p>
+<table>
+<thead>
+<tr>
+<th>Field</th>
+<th>Default</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>region</code></td>
+<td>credential's region, else <code>us-east-1</code></td>
+<td>Kiro API region override.</td>
+</tr>
+<tr>
+<td><code>runtimeURL</code></td>
+<td><code>https://runtime.&lt;region&gt;.kiro.dev</code></td>
+<td>Runtime endpoint override for gateway/proxy deployments.</td>
+</tr>
+<tr>
+<td><code>profileArn</code></td>
+<td>management discovery</td>
+<td>Profile ARN override.</td>
+</tr>
+<tr>
+<td><code>bearerTokenEnv</code></td>
+<td>—</td>
+<td>Credential reference for a static bearer token; bypasses ambient discovery.</td>
+</tr>
+<tr>
+<td><code>thinking</code></td>
+<td><code>enabled</code></td>
+<td>Deployment lock; <code>disabled</code> limits every request to <code>off</code>.</td>
+</tr>
+<tr>
+<td><code>reasoningEffort</code></td>
+<td><code>high</code></td>
+<td>Default effort; <code>off</code> disables thinking.</td>
+</tr>
+<tr>
+<td><code>maxTokens</code></td>
+<td><code>8192</code></td>
+<td>Default per-request output cap; per-model caps and explicit values win.</td>
+</tr>
+<tr>
+<td><code>defaultContextWindow</code></td>
+<td><code>200000</code></td>
+<td>Context capacity for models without an exact value.</td>
+</tr>
+<tr>
+<td><code>models</code></td>
+<td>bootstrap catalog</td>
+<td>Advisory model list shown to discovery consumers.</td>
+</tr>
+<tr>
+<td><code>streamIdleTimeoutMs</code></td>
+<td><code>300000</code></td>
+<td>Per-read idle budget.</td>
+</tr>
+<tr>
+<td><code>firstTokenTimeoutMs</code></td>
+<td><code>90000</code></td>
+<td>First-event budget; per-model overrides exist for slow models.</td>
+</tr>
+<tr>
+<td><code>retryPolicy</code></td>
+<td>normal, five retries</td>
+<td>Provider-owned retry policy for <code>dsh-llm-retry</code>.</td>
+</tr>
+<tr>
+<td><code>kiroCliDbPath</code></td>
+<td>platform application-support</td>
+<td>kiro-cli SQLite store override.</td>
+</tr>
+<tr>
+<td><code>ssoCacheDir</code></td>
+<td><code>~/.aws/sso/cache</code></td>
+<td>Kiro IDE token directory override.</td>
+</tr>
+<tr>
+<td><code>allowKiroCliRefresh</code></td>
+<td><code>true</code></td>
+<td>Whether 403 recovery may shell out to <code>kiro-cli</code>.</td>
+</tr>
+</tbody></table>
+<h2>Models</h2>
+<p>Bootstrap catalog (harness id → wire id):</p>
+<table>
+<thead>
+<tr>
+<th>Harness id</th>
+<th>Wire id</th>
+<th>Context</th>
+<th>Reasoning</th>
+<th>Images</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>claude-opus-4-8</code> / <code>claude-opus-4-7</code></td>
+<td><code>claude-opus-4.8</code> / <code>claude-opus-4.7</code></td>
+<td>1M</td>
+<td>✓</td>
+<td>✓</td>
+</tr>
+<tr>
+<td><code>claude-opus-4-6</code></td>
+<td><code>claude-opus-4.6</code></td>
+<td>1M</td>
+<td>✓</td>
+<td>✓</td>
+</tr>
+<tr>
+<td><code>claude-sonnet-5</code> / <code>claude-sonnet-4-6</code></td>
+<td><code>claude-sonnet-5</code> / <code>claude-sonnet-4.6</code></td>
+<td>1M</td>
+<td>✓</td>
+<td>✓</td>
+</tr>
+<tr>
+<td><code>claude-sonnet-4-5</code> / <code>claude-sonnet-4</code></td>
+<td><code>claude-sonnet-4.5</code> / <code>claude-sonnet-4</code></td>
+<td>200K</td>
+<td>✓</td>
+<td>✓</td>
+</tr>
+<tr>
+<td><code>claude-haiku-4-5</code></td>
+<td><code>claude-haiku-4.5</code></td>
+<td>200K</td>
+<td>✗</td>
+<td>✓</td>
+</tr>
+<tr>
+<td><code>claude-fable-5</code></td>
+<td><code>claude-fable-5</code></td>
+<td>1M</td>
+<td>✓</td>
+<td>✓</td>
+</tr>
+<tr>
+<td><code>deepseek-3-2</code></td>
+<td><code>deepseek-3.2</code></td>
+<td>164K</td>
+<td>✓</td>
+<td>✗</td>
+</tr>
+<tr>
+<td><code>minimax-m2-5</code> / <code>minimax-m2-1</code></td>
+<td><code>minimax-m2.5</code> / <code>minimax-m2.1</code></td>
+<td>196K</td>
+<td>✗</td>
+<td>✗</td>
+</tr>
+<tr>
+<td><code>glm-5</code></td>
+<td><code>glm-5</code></td>
+<td>200K</td>
+<td>✓</td>
+<td>✗</td>
+</tr>
+<tr>
+<td><code>qwen3-coder-next</code></td>
+<td><code>qwen3-coder-next</code></td>
+<td>256K</td>
+<td>✓</td>
+<td>✗</td>
+</tr>
+<tr>
+<td><code>auto</code></td>
+<td><code>auto</code></td>
+<td>1M</td>
+<td>✓</td>
+<td>✓</td>
+</tr>
+</tbody></table>
+<p>Both dashed and dotted spellings resolve to the wire id. The authenticated management catalog
+(per credential, per region) overrides capacities and effort ladders when discovery has run; the
+catalog cache at <code>~/.kiro-management-models-cache.json</code> is shared with pi-provider-kiro.</p>
+<h2>Development</h2>
+<pre><code>pnpm install
+pnpm run build       # tsc -b: builds the dependency closure (into the .context checkout) + this package
+pnpm test            # vitest suite (95 tests): endpoints, store, refresh, models, serialize,
+                     # translate, adapter transport, real Loader composition
+</code></pre>
+<p>Tests resolve the harness packages from the sibling <code>.context/deepseek-harness</code> checkout through
+tsconfig paths (see <code>vitest.config.ts</code>), so they exercise the exact source APIs. Credential tests
+are fully isolated from the host machine's real kiro-cli / Kiro IDE stores.</p>
+<h2>Known limitations and deferred work</h2>
+<ul>
+<li><strong>Interactive login</strong> is not bundled: with no ambient credentials the provider fails with
+<code>MISSING_CREDENTIAL</code> and points at <code>kiro-cli login</code> or the Kiro IDE. A device-code flow can be
+added later on the management seam.</li>
+<li><strong>Legacy inline thinking dialect</strong>: reasoning arrives through the native <code>thinkingText</code> events;
+models that emit <code>&lt;thinking&gt;</code> tags inside content keep them in the visible text block.</li>
+<li><strong>Replay state</strong> is not emitted; history is resent as provider-neutral content on follow-ups.</li>
+<li>The management catalog refresh is pull-based (discovery or cache age), not background-warmed.</li>
+</ul>
+<h2>License</h2>
+<p>MIT</p>

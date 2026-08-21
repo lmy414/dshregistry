@@ -1,0 +1,155 @@
+<h1>dsh-compact</h1>
+<p><code>dsh-compact</code> 是面向 <a href="https://github.com/deepseek-ai/DeepSeek-Harness">DeepSeek Harness</a> 的上下文压缩插件，用于在对话接近模型上下文上限时自动生成检查点摘要，并在发生上下文溢出时进行有界恢复。</p>
+<p>该插件最初随 <a href="https://github.com/zouyuxuan122/Deepseek-Harness-EAC">Deepseek Harness EAC</a> 开发，独立仓库用于单独维护和分发插件本体。</p>
+<h2>功能</h2>
+<ul>
+<li>根据上下文占用比例，在普通请求开始前自动压缩历史内容。</li>
+<li>提供 <code>/compact</code> 命令和设置页中的手动压缩入口。</li>
+<li>保留最近一段上下文，将较早内容替换成持久化摘要。</li>
+<li>上下文溢出时最多按配置进行有限次数的压缩恢复和请求重试。</li>
+<li>裁剪过长的工具结果，降低工具输出持续占用上下文的概率。</li>
+<li>支持按模型配置不同的触发比例、保留比例和恢复策略。</li>
+<li>压缩失败时不中断用户当前请求。</li>
+<li>单次压力检查最多生成一个摘要，避免同一回合连续压缩。</li>
+<li>当摘要模型返回空文本时，会移除 Agent system prompt 和工具定义后降级重试一次。</li>
+</ul>
+<h2>安装</h2>
+<h3>Deepseek Harness EAC</h3>
+<p>当包含该插件的 EAC 版本正式发布后，插件会作为内置组件安装，不需要重复添加。</p>
+<h3>从 GitHub 安装</h3>
+<p>完全退出正在运行的 DSH 服务，然后执行：</p>
+<pre><code>dsh plugin --profile web add "github:zixin947/dsh-compact#main"
+</code></pre>
+<p>安装完成后重新启动 DSH Web 服务。</p>
+<p>默认挂载配置由 <code>cordis.patch.yml</code> 提供：</p>
+<pre><code>- id: compact
+  name: 'dsh-compact'
+</code></pre>
+<p>如果目标 Agent preset 需要独立的 Agent 级压缩入口，可以在对应组合中挂载：</p>
+<pre><code>- id: compact-agent
+  name: 'dsh-compact/agent'
+  isolate:
+    compaction: true
+    toolResultPruner: true
+</code></pre>
+<p><code>dsh-compact/agent</code> 会在同一个 Agent 局部作用域中组合压缩引擎、<code>/compact</code> 命令和工具结果裁剪器。</p>
+<h2>默认配置</h2>
+<table>
+<thead>
+<tr>
+<th>配置项</th>
+<th align="right">默认值</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>enabled</code></td>
+<td align="right"><code>true</code></td>
+<td>是否启用自动压缩和溢出恢复</td>
+</tr>
+<tr>
+<td><code>thresholdRatio</code></td>
+<td align="right"><code>0.75</code></td>
+<td>上下文达到模型窗口的 75% 时触发自动压缩</td>
+</tr>
+<tr>
+<td><code>retainRatio</code></td>
+<td align="right"><code>0.20</code></td>
+<td>压缩后保留最近约 20% 的上下文</td>
+</tr>
+<tr>
+<td><code>recoverOnOverflow</code></td>
+<td align="right"><code>true</code></td>
+<td>上下文溢出时是否尝试压缩恢复</td>
+</tr>
+<tr>
+<td><code>maxOverflowRetries</code></td>
+<td align="right"><code>1</code></td>
+<td>原请求发生溢出后允许的最大恢复重试次数</td>
+</tr>
+<tr>
+<td><code>modelPolicies</code></td>
+<td align="right"><code>[]</code></td>
+<td>按 provider 和 model 精确覆盖默认策略</td>
+</tr>
+</tbody></table>
+<p>示例：</p>
+<pre><code>- id: compact
+  name: 'dsh-compact'
+  config:
+    enabled: true
+    thresholdRatio: 0.75
+    retainRatio: 0.20
+    recoverOnOverflow: true
+    maxOverflowRetries: 1
+    modelPolicies:
+      - provider: youchu
+        model: deepseek-v4-flash
+        thresholdRatio: 0.80
+        retainRatio: 0.20
+</code></pre>
+<p>约束：</p>
+<ul>
+<li><code>thresholdRatio</code> 允许范围为 <code>0.50</code> 到 <code>0.95</code>。</li>
+<li><code>retainRatio</code> 允许范围为 <code>0.05</code> 到 <code>0.50</code>。</li>
+<li><code>retainRatio</code> 必须小于对应的 <code>thresholdRatio</code>。</li>
+<li>模型策略使用 <code>provider + model</code> 精确匹配。</li>
+</ul>
+<h2>工作机制</h2>
+<h3>自动压缩</h3>
+<p>每次 Agent 请求开始前，插件读取当前模型的上下文窗口和会话 Token 估算值。达到触发阈值时：</p>
+<ol>
+<li>选择可以压缩的较早会话区间。</li>
+<li>使用当前会话的模型生成结构化检查点摘要。</li>
+<li>将原区间替换为带来源信息的持久摘要。</li>
+<li>继续执行用户原本的请求。</li>
+</ol>
+<p>每次压力检查只进行一次压缩。如果压缩后仍高于阈值，当前请求不会立即进行第二轮摘要；后续普通请求仍可再次触发压缩。</p>
+<h3>溢出恢复</h3>
+<p>当模型明确返回上下文窗口超限错误时，插件可以压缩当前会话并重试原请求。恢复次数受 <code>maxOverflowRetries</code> 限制，取消中的请求不会重试，也不会无限循环。</p>
+<h3>空摘要降级</h3>
+<p>如果首次摘要调用成功返回但没有任何文本，插件会删除用于普通 Agent 工作的 system prompt 和工具定义，再使用相同会话消息重试一次。其他模型或网络错误不会被误判为可重试的空摘要错误。</p>
+<h2>导出入口</h2>
+<table>
+<thead>
+<tr>
+<th>入口</th>
+<th>用途</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>dsh-compact</code></td>
+<td>设置、状态接口和默认插件入口</td>
+</tr>
+<tr>
+<td><code>dsh-compact/agent</code></td>
+<td>组合压缩引擎、命令和工具结果裁剪器</td>
+</tr>
+<tr>
+<td><code>dsh-compact/engine</code></td>
+<td>压缩引擎入口</td>
+</tr>
+<tr>
+<td><code>dsh-compact/client</code></td>
+<td>Web 设置界面入口</td>
+</tr>
+</tbody></table>
+<p>一般使用者只需要挂载 <code>dsh-compact</code> 或 <code>dsh-compact/agent</code>，不建议单独挂载内部实现入口。</p>
+<h2>安全与限制</h2>
+<ul>
+<li>插件只处理 DSH 会话上下文，不会删除工作区文件。</li>
+<li>压缩会用摘要替换较早的会话显示内容，因此摘要质量取决于当前模型。</li>
+<li>自动压缩失败时会记录状态并继续用户请求，不会因为摘要服务异常直接中断当前回合。</li>
+<li>该版本面向 <code>@deepseek-ai/dsh 0.1.0-rc.7</code> 及相同插件 API 的版本。</li>
+<li>独立仓库只包含插件本体；EAC 的 preset 迁移和桌面宿主集成仍由 EAC 主项目维护。</li>
+</ul>
+<h2>反馈问题</h2>
+<p>发现问题时，请在 <a href="https://github.com/zixin947/dsh-compact/issues">GitHub Issues</a> 提交，并尽量附上：</p>
+<ul>
+<li>DSH 和插件版本；</li>
+<li>使用的 provider 与 model；</li>
+<li>是否为自动压缩、手动压缩或溢出恢复；</li>
+<li>脱敏后的错误日志和复现步骤。</li>
+</ul>
+<h2>许可证</h2>
+<p><a href="https://github.com/zixin947/dsh-compact/blob/HEAD/LICENSE">MIT License</a></p>

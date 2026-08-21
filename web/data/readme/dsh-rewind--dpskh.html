@@ -1,0 +1,47 @@
+
+<h1>@dpskh/tool-rewind — exploration fold for the DeepSeek Harness</h1>
+
+<p>English | <a href="https://github.com/dpskh/dsh-rewind/blob/HEAD/README.zh.md">中文</a></p>
+<p><a href="https://dshfind.com/zh/plugins/dpskh/dsh-rewind?ref=badge"><img src="https://dshfind.com/api/card/dpskh/dsh-rewind?lang=zh" alt="dshfind"></a></p>
+
+
+<p>One package, one entry plugin. Mounting <code>@dpskh/tool-rewind</code> provides <code>ctx.rewind</code> (a service that folds everything since the most recent checkpoint mark into an auto-generated report) and the model-facing <code>rewind</code> tool over it. The fold shadows the exploration's surface range with the report — the same <code>surfaceOp: { op: 'replace' }</code> mechanism the DeepSeek Harness compaction seam uses — so subsequent requests no longer carry the exploration's intermediate steps (reads, searches, experiments), while the durable log keeps the full exploration for audit. The report is produced by <code>ctx.llm</code> (auto-generated); the mark is owned and served by the sibling <a href="https://github.com/dsh-external/dsh-checkpoint"><code>@dpskh/tool-checkpoint</code></a> plugin (<code>ctx.checkpoint.latestMark</code> / <code>hasActive</code> / <code>completeFold</code>). This plugin writes <strong>no session events of its own</strong> — the fold commits only the core-vocabulary <code>user/message</code> replacement, so the durable session log stays readable by any harness. No upstream package is modified.</p>
+<h2>Configuration</h2>
+<pre><code>- id: tool-rewind
+  name: '@dpskh/tool-rewind'
+  config:
+    toolName: rewind                # model-facing tool name (default rewind)
+    maxTokens: 1024                 # summarization output budget
+    maxSummarizationRetries: 2      # empty-completion retries before failing
+    summarizationProvider: deepseek # optional override of the routed provider
+    summarizationModel: deepseek-chat
+    reportLanguage: en              # en | zh (report instruction language)
+</code></pre>
+<p>Provider/model resolution order for the report call: configured overrides, then the session's last routed <code>request/header</code> config, then the agent's options. Missing all three fails loud.</p>
+<p>The report call runs with thinking disabled when the route exposes an <code>off</code> reasoning effort — condensing an exploration is mechanical, and a reasoning model's thinking tokens otherwise compete with the report text under <code>maxTokens</code> (thinking can exhaust the budget before any text starts, leaving an empty completion). Empty completions retry up to <code>maxSummarizationRetries</code>; an exhausted budget rejects with a message carrying the finish reason and token usage, which the rejection message preserves.</p>
+<h2>Working together</h2>
+<p>The fold needs a marker: mount both plugins so <code>rewind</code> can collapse the exploration anchored by a <code>checkpoint</code>. <code>rewind</code> alone has nothing to fold and fails with a no-checkpoint error; <code>checkpoint</code> alone records inert markers.</p>
+<pre><code>- id: tool-checkpoint
+  name: '@dpskh/tool-checkpoint'    # https://github.com/dpskh/dsh-checkpoint
+- id: tool-rewind
+  name: '@dpskh/tool-rewind'
+  config:
+    reportLanguage: en              # en | zh report instruction language
+</code></pre>
+<h2>Contract</h2>
+<ul>
+<li><code>ctx.rewind.rewind(agent, signal)</code> — read the session's latest mark through <code>ctx.checkpoint</code>; select the surface span after it (never folding the rewind call itself, never splitting a tool-call/result pair at the trailing boundary); summarize the span over <code>ctx.llm</code>; then commit, in one synchronous block, a replacement <code>user/message</code> carrying the report with source marker <code>{ kind: 'plugin', plugin: 'rewind' }</code> (<code>isRewindReportSource</code> recognizes it) and stamp the mark folded through <code>ctx.checkpoint.completeFold</code>. Failures write nothing — the region stays intact, the mark stays active, and the fold is retryable — and reject with a classified <code>RewindError</code> (<code>NO_CHECKPOINT</code>, <code>EMPTY_REGION</code>, <code>UNBALANCED</code>, <code>FOLD_IN_PROGRESS</code>, <code>CHANGED</code>, <code>SHRINK</code>). A per-session in-process lock rejects concurrent folds. A mark taken mid-call — the checkpoint tool runs between its own tool-call and result — leaves that result orphaned right after the mark; selection skips exactly that node, so the checkpoint call's own pair stays visible and the fold starts at the exploration that follows. Exploration calls issued in parallel with the checkpoint (same assistant message) leave their results behind the mark too; those are folded, so a parallel exploration never collapses into an empty region.</li>
+<li><code>rewind</code> tool — no arguments → <code>{ markId, foldedNodes, start, end, foldedChars, reportChars }</code>, where <code>foldedChars</code> is the model-visible text the folded region contributed (assistant text, reasoning, tool-call arguments, and tool outputs) and <code>reportChars</code> is the replacement report's length — the shrink accounting is visible in every result and error. Render intent: generic card.</li>
+<li><strong>Turn guard</strong> — while the session has an active (unfolded) checkpoint mark, <code>agent/turn-stopping</code> injects a standing warning into the agent's next-step inbox (one per agent per turn), so the turn cannot end until <code>rewind</code> folds the exploration. Activeness is read through <code>ctx.checkpoint</code>. A rewind that legitimately fails (e.g. an empty region) cannot trap the turn in a warning loop.</li>
+</ul>
+<h2>Model Experience</h2>
+<p>Directly: the <code>rewind</code> tool call and its fold result. The replacement report message is model-visible from the next request on; the exploration's durable events stay in the log but out of the model-visible surface. A <code>tool:rewind</code> system-prompt section makes fold discipline a standing instruction (rewind immediately after the marked exploration, before unrelated work).</p>
+<h4>KV Cache effect</h4>
+<p>The report call reuses the session's system prompt and tool schemas so it stays a prefix of the last routed request (warm prefix cache). The fold itself shifts the model-visible prefix of subsequent requests by design.</p>
+<h2>Known Limitations and Deferred Work</h2>
+<ul>
+<li><strong>Shrink check is char-based</strong> — the report must be shorter than the folded region's model-visible text (measured in characters, not tokens); the yardstick counts every block the model reads: assistant/user text, reasoning, tool-call arguments, and tool outputs (recursively). A token-meter-based check would be more precise; image blocks carry no text yardstick and are conservatively ignored.</li>
+<li><strong>Empty completions on routes without an <code>off</code> reasoning effort</strong> — such routes keep their default thinking; if thinking exhausts <code>maxTokens</code> the completion is empty and only the retry budget saves the fold.</li>
+<li><strong>One fold per marker</strong> — folding the same marker twice is rejected as an empty region; a new exploration needs a fresh <code>checkpoint</code>.</li>
+<li><strong>Mid-exploration compaction</strong> — if automatic compaction shadows part of the exploration before <code>rewind</code> runs, the fold covers whatever remains on the surface; the storage-resident mark survives either way.</li>
+</ul>

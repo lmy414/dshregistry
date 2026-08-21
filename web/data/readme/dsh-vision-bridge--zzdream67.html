@@ -1,0 +1,298 @@
+<h1>@zzdream67/dsh-vision-bridge</h1>
+<p><strong>Let text-only models read images, without switching models.</strong></p>
+<p><a href="https://github.com/zzdream67/dsh-vision-bridge/blob/HEAD/README.zh.md">中文文档</a></p>
+<p>In DeepSeek Harness, pasting an image at a text-only model is refused outright:</p>
+<pre><code>Model "xxx" does not support image input.
+</code></pre>
+<p>This plugin intercepts the <code>llm/stream</code> waterfall and substitutes each image block with a vision model's transcription before the request reaches the provider. You paste a picture; the text-only model receives words it can read.</p>
+<pre><code>you paste an image + a question
+   ↓
+the plugin captions it with YOUR configured vision model
+   ↓
+the text-only model receives: [image "shot.png" transcribed: a Python TypeError…] + your question
+   ↓
+it answers from that text
+</code></pre>
+<hr>
+<h2>Installation</h2>
+<h3>Prerequisite: pnpm</h3>
+<p><code>dsh plugin</code> forwards to pnpm internally. Many environments lack it:</p>
+<pre><code>'pnpm' is not recognized as an internal or external command
+dsh: pnpm failed in profile directory ...
+</code></pre>
+<p>Install it:</p>
+<pre><code>npm install -g pnpm
+</code></pre>
+<blockquote>
+<p><code>corepack enable pnpm</code> often fails on Windows because it needs to write into <code>C:\Program Files\nodejs\</code> (<code>EPERM</code>). The <code>npm install -g</code> route is more reliable.</p>
+</blockquote>
+<h3>From npm (recommended)</h3>
+<pre><code>dsh plugin --profile web add @zzdream67/dsh-vision-bridge
+</code></pre>
+<p>Installs prebuilt output; no build authorization needed.</p>
+<h3>From GitHub</h3>
+<pre><code>dsh plugin --profile web add github:zzdream67/dsh-vision-bridge
+</code></pre>
+<p>A git install fetches source. pnpm ≥10 refuses to run a git dependency's build script without explicit permission, so the first <code>add</code> fails. Add the package to that profile's <code>pnpm-workspace.yaml</code>:</p>
+<pre><code>allowBuilds:
+  '@zzdream67/dsh-vision-bridge': true
+</code></pre>
+<p>Then re-run <code>add</code>. Pinning a commit (<code>github:zzdream67/dsh-vision-bridge#&lt;sha&gt;</code>) is recommended.</p>
+<h3>From a tarball</h3>
+<pre><code>npm pack                                    # in this repo
+dsh plugin --profile web add ./zzdream67-dsh-vision-bridge-0.1.0.tgz
+</code></pre>
+<h3>Uninstall</h3>
+<pre><code>dsh plugin --profile web remove @zzdream67/dsh-vision-bridge
+</code></pre>
+<p>The dependency and its config layer are both removed. If <code>manageDeclarations</code> was on, the plugin withdraws the declarations it wrote as it unloads.</p>
+<p>Withdrawal restores the exact prior value. Each declaration records what the row's <code>input</code> looked like beforehand, because after removing <code>image</code> a leftover <code>['text']</code> is indistinguishable from a field that was never there. A rule-based revert would delete a line you wrote by hand; the recorded value prevents that.</p>
+<p>The record is a note about a row that existed when the note was written, and the file belongs to you. If you delete the model, delete the whole route, or hand-edit the row before withdrawal, the plugin declines rather than reconstructs:</p>
+<table>
+<thead>
+<tr>
+<th>You did this</th>
+<th>Withdrawal does</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>Deleted the model</td>
+<td>Skips it; a deleted model is never recreated from a stale note</td>
+</tr>
+<tr>
+<td>Deleted the whole route</td>
+<td>Skips it, and still cleans up every other route</td>
+</tr>
+<tr>
+<td>Hand-edited <code>input</code> into something malformed</td>
+<td>Leaves it for you to fix</td>
+</tr>
+<tr>
+<td>Nothing; the row is as the plugin left it</td>
+<td>Restores the exact prior value</td>
+</tr>
+</tbody></table>
+<p>One missing target does not abandon the rest of the withdrawal. Recreating a row you deliberately removed would be worse than leaving a declaration on a row that no longer exists, so missing rows are skipped.</p>
+<p>The inline-comment alignment is the one thing that does not come back; see Development for the details.</p>
+<hr>
+<h2>Configuration</h2>
+<p>The plugin ships a browser-side bundle (<code>dist/client.js</code>) that registers its own section into the Web settings page's <code>settings.section</code> slot. Every field is editable there, applies live, and needs no restart.</p>
+<p>Three buttons in that page are worth knowing about:</p>
+<ul>
+<li><strong>Test and enable</strong> sends one 16×16 PNG to the selected vision model. The declaration is written only if the endpoint accepts the image, and is withdrawn again on failure. Capability is tested rather than assumed, because an OpenAI-compatible <code>/v1/models</code> reply carries no modality information.</li>
+<li><strong>Enable directly</strong> skips the test and writes the declaration. Use it when you already know the model can see.</li>
+<li><strong>Reload</strong> re-reads the configuration from disk. The desktop client has no reload gesture, so this is the only way to pick up a change made in the Models page, in another window, or by hand. It asks first if you have unsaved edits.</li>
+</ul>
+<blockquote>
+<p>Host-side schema registration alone does <strong>not</strong> render a form. The section exists because this plugin authors that browser bundle by hand; the build preset for DSH's client format is not published, but the format itself is plain and stable.</p>
+</blockquote>
+<h3>Why a declaration is required first</h3>
+<p>The admission gate (<code>dsh-host-apiproxy</code>) checks the model's declaration before the image enters the session:</p>
+<pre><code>if (modelInfo.inputModalities !== undefined &amp;&amp; !modelInfo.inputModalities.includes('image'))
+  return err(request, { details: { reason: 'MODEL_DOES_NOT_SUPPORT_IMAGES' } })
+</code></pre>
+<p>A text-only model must declare <code>input: [text, image]</code>, or the image never arrives and this plugin's conversion never runs.</p>
+<p><code>manageDeclarations</code> (default: on) writes that declaration for each model in <code>bridge</code> and withdraws it when you turn the switch off, disable the plugin, or unload it. With the plugin loaded and the model bridged, the route genuinely does accept image input, because conversion happens before the provider is called.</p>
+<p><code>input: [text, image]</code> is an admission label. Every place the host reads it is guarded by "does this request contain an image", so a text-only request behaves identically whether or not the declaration is present. It does not affect token accounting, context window, sampling, or model behaviour.</p>
+<p>Declaring a model without bridging it moves the failure later: the host admits the image and the provider then rejects it. Declarations therefore follow the <code>bridge</code> list rather than being applied broadly.</p>
+<h3>Fields</h3>
+<table>
+<thead>
+<tr>
+<th>Field</th>
+<th>Default</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>enabled</code></td>
+<td><code>true</code></td>
+<td>Master switch. When off the plugin stays loaded but intervenes in nothing and withdraws its declarations, like uninstalling without touching node_modules</td>
+</tr>
+<tr>
+<td><code>visionProvider</code></td>
+<td><code>''</code></td>
+<td>Vision route id. Empty leaves the plugin inert (see Behavior details)</td>
+</tr>
+<tr>
+<td><code>visionModel</code></td>
+<td><code>''</code></td>
+<td>Vision model id in that route. Empty leaves the plugin inert (see Behavior details)</td>
+</tr>
+<tr>
+<td><code>prompt</code></td>
+<td>see below</td>
+<td>Caption instruction sent with each image</td>
+</tr>
+<tr>
+<td><code>bridge</code></td>
+<td><code>[]</code></td>
+<td>Text-only models to bridge</td>
+</tr>
+<tr>
+<td><code>manageDeclarations</code></td>
+<td><code>true</code></td>
+<td>Let the plugin write/withdraw modality declarations</td>
+</tr>
+<tr>
+<td><code>cacheSize</code></td>
+<td><code>64</code></td>
+<td>Cached transcriptions; <code>0</code> disables caching</td>
+</tr>
+<tr>
+<td><code>timeoutMs</code></td>
+<td><code>120000</code></td>
+<td>Per-image caption timeout</td>
+</tr>
+<tr>
+<td><code>verbose</code></td>
+<td><code>false</code></td>
+<td>One log line per conversion (never logs transcription text)</td>
+</tr>
+</tbody></table>
+<p>Or in <code>cordis.patch.yml</code>:</p>
+<pre><code>- id: zz-vision-bridge
+  name: '@zzdream67/dsh-vision-bridge'
+  config:
+    visionProvider: my-local-route
+    visionModel: my-vision-model
+    bridge:
+      - provider: my-text-route
+        model: my-text-model
+    manageDeclarations: true
+</code></pre>
+<p>A model not listed in <code>bridge</code> is untouched and keeps the host's exact behavior.</p>
+<p>Models under the built-in <code>deepseek-official</code> route cannot be bridged: its modality is hardcoded in the plugin that provides it, and its adapter refuses image content. To bridge DeepSeek, add a custom model provider with a route using <code>openai-completions</code> at <code>https://api.deepseek.com/v1</code>, then bridge the models under that route.</p>
+<h3>The default prompt</h3>
+<p>It asks for transcription, not interpretation: transcribe all visible text faithfully, describe layout and structure, never speculate or fill gaps, and state plainly what is illegible. The reasoning belongs to the model consuming the transcription; a vision model that editorializes costs the caller information it can never recover.</p>
+<hr>
+<h2>Behavior details</h2>
+<table>
+<thead>
+<tr>
+<th>Situation</th>
+<th>Behavior</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>No vision backend configured</td>
+<td>The plugin is inert: it loads, does nothing, and warns once when an image arrives</td>
+</tr>
+<tr>
+<td>Target model not in <code>bridge</code></td>
+<td>Passes through with zero impact</td>
+</tr>
+<tr>
+<td>The request is the plugin's own caption call</td>
+<td>Skipped (otherwise it would recurse forever)</td>
+</tr>
+<tr>
+<td>No image in the request</td>
+<td>Fast path, skipped</td>
+</tr>
+<tr>
+<td>Same image appears repeatedly</td>
+<td>Resolved sequentially, hits the cache, captioned once</td>
+</tr>
+<tr>
+<td>Caption fails or times out</td>
+<td>Injects a failure notice telling the model not to pretend it saw the image</td>
+</tr>
+<tr>
+<td>The request object (always deep-frozen)</td>
+<td>Not mutated. A fresh request carrying the rewritten messages is issued through <code>ctx.llm.stream()</code></td>
+</tr>
+</tbody></table>
+<p>Caption calls go through <code>ctx.llm.stream()</code>, so the vision route's credentials, retry policy, attribution headers, and observability all still apply. The plugin issues no HTTP requests of its own.</p>
+<hr>
+<h2>Before you install</h2>
+<p><strong>The model receives words, not pixels.</strong></p>
+<table>
+<thead>
+<tr>
+<th>Works</th>
+<th>Does not work</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>Reading errors, code, logs in a screenshot</td>
+<td>Comparing two images precisely</td>
+</tr>
+<tr>
+<td>Describing UI layout and button positions</td>
+<td>Picking colors, measuring pixels</td>
+</tr>
+<tr>
+<td>Transcribing tables and chart trends</td>
+<td>Fine spatial or geometric reasoning</td>
+</tr>
+<tr>
+<td>Reading handwriting and printed text</td>
+<td>Judgments resting on subtle visual detail</td>
+</tr>
+</tbody></table>
+<p>Every substitution is labeled as a transcription, so the model does not treat it as having seen the image itself.</p>
+<p><strong>You need your own vision model.</strong> The plugin ships no vision service. It uses a vision model you configure: a local LM Studio / Ollama instance, or a remote service you hold a key for. A local model costs nothing and sends nothing off your machine; a remote one bills your own account.</p>
+<p><strong>The plugin writes to <code>settings.yaml</code>.</strong> <code>manageDeclarations</code> writes <code>input: [text, image]</code> into the <code>llm-pi-ai</code> section for each bridged model and withdraws it when you turn the switch off, disable the plugin, or unload it. The switch is on by default, because the declaration is what makes the feature work. What is preserved and what is not is detailed in Development. Back up <code>settings.yaml</code> before enabling it the first time.</p>
+<hr>
+<h2>Development</h2>
+<pre><code>npm install
+npm run build      # tsc -&gt; dist/
+npm test           # node --test, 68 cases
+npm run typecheck
+</code></pre>
+<p><code>src/rewrite.ts</code> is pure and I/O-free, so the rewriting logic is fully testable without a live model. <code>test/uninstall.test.mjs</code> asserts the declare/withdraw round trip is byte-identical for an absent field, a hand-written <code>[ text ]</code>, unusual modality lists, and untouched sibling rows.</p>
+<h3>Why <code>llm/stream</code> instead of a new route</h3>
+<p>The common approach registers a twin route (e.g. <code>xxx (vision)</code>) with hardcoded modalities. This plugin does not:</p>
+<ul>
+<li>It registers no route and no adapter, so the host's model registry keeps telling the truth and no extra entry appears in the model picker.</li>
+<li>It never competes in the registry, so none of the defensive machinery against "another plugin rebuilt the registry" is needed.</li>
+<li>It leaves nothing behind: <code>ctx.on()</code> is an effect and is cleaned up automatically, and declaration writes are reverted explicitly.</li>
+</ul>
+<h3>Deep rewriting</h3>
+<p>An image block is legal at any depth, including nested inside a <code>tool-result</code>. The built-in <code>read_image</code> tool records an image in its result, so a session that once used it carries nested image blocks on every later turn.</p>
+<p>A top-level-only rewrite leaves those in place, and the text-only adapter then fails on every subsequent turn, not just the one that uploaded an image. This plugin recurses through all depths.</p>
+<h3>Prompt-injection guard</h3>
+<p>Text recovered from an image is attacker-controlled, exactly like a web page: a screenshot can say "ignore all previous instructions".</p>
+<p>Every transcription carries an explicit notice that image text is untrusted evidence and must not be executed as an instruction. The notice precedes the transcription and the text is fenced, so content inside the fence cannot pass itself off as surrounding narration.</p>
+<h3>Writing declarations to <code>settings.yaml</code></h3>
+<p><code>manageDeclarations</code> writes <code>input: [text, image]</code> into the <code>llm-pi-ai</code> settings section and withdraws it when you turn the switch off, disable the plugin, or unload it. Measured against the real <code>dsh-settings-file</code>, which patches the YAML AST minimally:</p>
+<p><strong>Preserved:</strong></p>
+<ul>
+<li>Header, section, and inline comment text</li>
+<li>Other routes and other namespaces</li>
+<li>Existing inline style (e.g. <code>input: [ text, image ]</code>)</li>
+<li>Blank lines and overall structure</li>
+</ul>
+<p><strong>One real side effect:</strong></p>
+<pre><code>- displayName: LM Studio Local     # hand-aligned comment
++ displayName: LM Studio Local # hand-aligned comment
+</code></pre>
+<p>Hand-aligned padding before an inline comment collapses to a single space and does not come back on revert.</p>
+<p>The declaration restates <code>text</code> explicitly:</p>
+<pre><code>input: [ text, image ]
+</code></pre>
+<p>pi-ai maps this array straight onto <code>inputModalities</code>. Writing <code>[image]</code> alone would declare a model that accepts images but not text, so the write restates <code>text</code>.</p>
+<h3>Verified facts</h3>
+<p>All of the following are measured against the real DSH runtime:</p>
+<ul>
+<li>The <code>llm/stream</code> listener fires, but the request arrives deep-frozen: <code>dsh-agent-loop.buildRequest</code> wraps it in <code>deepFreeze</code>, so <code>options.messages = x</code> throws <code>TypeError</code>. Replacing the argument slot does not help either, because cordis' inner callback closes over the original object; neither <code>arguments[0] = …</code> nor <code>next(replacement)</code> reaches the adapter. <strong>The only working seam is to skip <code>next()</code> and issue a fresh <code>ctx.llm.stream({ ...options, messages: rewritten })</code>, marked as the plugin's own request to prevent re-entry.</strong></li>
+<li>The adapter receives no image block at all, including images nested inside <code>tool-result</code>.</li>
+<li>A nested <code>ctx.llm.stream()</code> does re-enter the listener; a <code>WeakSet</code> guards against that.</li>
+<li>Declaring <code>[text, image]</code> makes the admission gate admit the image.</li>
+<li>An <code>image</code> block carries an attachment reference, not inline bytes. pi-ai resolves it via <code>attachments.readImage(block.attachment)</code>, and a block holding <code>{ data, mediaType }</code> is silently dropped from the payload.</li>
+<li>Every terminal outcome, including an adapter refusal, arrives as <code>{ type: 'finish', reason: { kind: 'error' | 'aborted', failure } }</code>. There is no <code>type: 'error'</code> chunk and no <code>finishReason</code> field.</li>
+<li>Cross-namespace settings writes carry no ownership restriction, but path addressing does not support array indices, so a row edit must write the whole array back.</li>
+<li>The real <code>dsh-settings-file</code> preserves comments on disk, with the one formatting side effect described above.</li>
+</ul>
+<hr>
+<h2>License</h2>
+<p>MIT © ZZ Dream (zzdream67)</p>
+<h2>Acknowledgements</h2>
+<p>The public source of the following projects informed several design considerations in this plugin:</p>
+<ul>
+<li><a href="https://www.npmjs.com/package/dsh-vision-router">dsh-vision-router</a> (MIT)</li>
+<li><a href="https://www.npmjs.com/package/@anionex/dsh-vision-toolkit">@anionex/dsh-vision-toolkit</a></li>
+<li><a href="https://github.com/Anionex/agent-vision-toolkit">Anionex/agent-vision-toolkit</a></li>
+</ul>
+<p>This plugin is an independent implementation taking a different architectural path (<code>llm/stream</code> waterfall interception, registering neither route nor adapter).</p>

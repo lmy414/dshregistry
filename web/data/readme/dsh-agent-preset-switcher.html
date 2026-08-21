@@ -1,0 +1,101 @@
+<h1>dsh-agent-preset-switcher</h1>
+<p><a href="https://github.com/aefuimn/dsh-agent-preset-switcher/blob/HEAD/README.zh-CN.md">中文文档</a></p>
+<p>Hot-switch <strong>agent presets (working modes)</strong> inside a running DSH session, instead of choosing a preset only when a session is created.</p>
+<h2>What it solves</h2>
+<p>A DSH agent preset (Standard / Minimal / PTC / any custom preset) decides a session agent's <strong>tool catalog, system prompt, and capabilities</strong>. Officially the preset is fixed once a session starts (<code>turn/start</code> exists):</p>
+<ul>
+<li>the browser RPC <code>agentPresets.select</code> checks <code>sessionBlank(agent.session)</code> and returns <code>agent-preset-locked</code> for started sessions;</li>
+<li>the reason: history transcripts were generated under the old tool set, and swapping tools mid-conversation would leave logged tool calls that the new composition cannot make.</li>
+</ul>
+<p>This plugin turns that channel into <strong>hot-switching at any stage</strong>: a switch is applied only at a <strong>step boundary</strong> (after one model request finishes, before the next one is assembled), reusing the exact official mechanism — <code>AgentPresets.recompose()</code> (single-flight standing preset mounts + the scope-parent binding re-link held by the roster).</p>
+<h2>Quick start</h2>
+<h3>Install from GitHub (recommended for everyone else)</h3>
+<p>The repo ships build artifacts (<code>lib/</code>), so no local build is needed. Install it as a plugin bundle with <code>dsh plugin</code>:</p>
+<pre><code># SSH (clone/install over SSH; requires your GitHub SSH key)
+dsh plugin --profile web add "git+ssh://git@github.com/aefuimn/dsh-agent-preset-switcher.git"
+
+# or HTTPS (no SSH key needed; a read token may be required for private repos)
+dsh plugin --profile web add "git+https://github.com/aefuimn/dsh-agent-preset-switcher.git"
+</code></pre>
+<p>Then restart the dsh web process and refresh the page:</p>
+<pre><code># restart your dsh web server, then hard-refresh the browser tab
+</code></pre>
+<h3>Install from a local checkout (developing this plugin)</h3>
+<pre><code>dsh plugin --profile web add link:/absolute/path/to/dsh-agent-preset-switcher
+# restart dsh web and refresh the browser tab
+</code></pre>
+<h3>Verify</h3>
+<ul>
+<li>any session accepts <strong><code>/mode list</code></strong> and <strong><code>/mode &lt;preset-id&gt;</code></strong> slash commands;</li>
+<li><code>dsh plugin --profile web ls</code> should list <code>dsh-agent-preset-switcher</code> among the installed packages.</li>
+</ul>
+<h2>Layout</h2>
+<pre><code>dsh-agent-preset-switcher/
+├── package.json               # dsh plugin manifest (host only)
+├── cordis.patch.yml           # bundle patch that inserts the plugin row
+├── src/
+│   ├── index.ts               # host half: service registration, /mode command, announcement
+│   └── switcher.ts            # hot-switch core (armed -&gt; step-boundary recompose)
+├── lib/
+│   └── index.js / switcher.js # tsc output
+└── test/
+    └── switcher.test.mjs      # unit tests
+</code></pre>
+<h2>How it works</h2>
+<h3>Triggering</h3>
+<p>Everything funnels into <code>ctx.modeSwitcher.request(sessionId, presetId)</code>. The current entry is the <strong><code>/mode</code> slash command</strong>:</p>
+<ul>
+<li><code>/mode list</code> shows the current preset and the full roster;</li>
+<li><code>/mode &lt;preset-id&gt;</code> requests a switch.</li>
+</ul>
+<p>A request <strong>arms</strong> the switch (emitting <code>mode-switcher/requested</code> after resolving the target preset) rather than applying it immediately.</p>
+<h3>Applying (step boundary)</h3>
+<pre><code>request(sessionId, targetId)
+  └─ armed (latest wins; repeat requests overwrite)
+       │
+       ▼  agent/pre-step (before the next model request is assembled)
+  └─ pop armed
+       ├─ target == current   → no-op (no log event, no re-link)
+       ├─ agentPresets.recompose(agent.ctx, targetId)
+       │     └─ ensureStanding(target) (single-flight) → binding.rebind(standing.key)
+       ├─ agent.session.append('agent-preset/selected', …)   # official log event
+       ├─ mode-switcher/switched event
+       └─ delegate to the default step (new sections/tools apply to the next request)
+</code></pre>
+<p>Key points:</p>
+<ul>
+<li><strong>Not an unmount/remount</strong>: standing mounts are permanent and shared; the switch only moves the agent scope's parent link.</li>
+<li><strong>Honest logging</strong>: <code>agent-preset/selected</code> is appended together with the re-link, so resume/fork rebuild the same composition via <code>resolveSessionPreset</code>, and existing browser <code>agent-preset/selected</code> listeners refresh.</li>
+<li><strong>Failure semantics</strong>: if <code>recompose</code> throws, nothing changes; <code>mode-switcher/switch-failed</code> is emitted and the step proceeds with the old composition.</li>
+<li><strong>Idempotency &amp; concurrency</strong>: switches for one session are serialized through a per-session promise chain; same-target requests are no-ops.</li>
+<li><strong>Subagents</strong>: host rules are preserved — subagent sessions cannot be switched (their composition follows the parent).</li>
+</ul>
+<h2>Host API</h2>
+<pre><code>declare module '@deepseek-ai/cordis' {
+  interface Context {
+    modeSwitcher: ModeSwitcherService
+  }
+}
+</code></pre>
+<ul>
+<li><code>modeSwitcher.request(sessionId, presetId)</code> → <code>{accepted:true,pending:true} | {accepted:false,reason}</code></li>
+<li>Events: <code>mode-switcher/requested</code>, <code>mode-switcher/switched</code>, <code>mode-switcher/switch-failed</code></li>
+</ul>
+<h2>Consistency with the official recompose path</h2>
+<p>The official blank-session switch (<code>agentPresets.select</code>) does:</p>
+<pre><code>presets.recompose(agent.ctx, id)  // ensureStanding + binding.rebind
+agent.session.append('agent-preset/selected', { agentPreset: preset.id })
+</code></pre>
+<p>This plugin performs the exact same two steps for a non-blank session — it only moves the moment from "when the request arrives" to inside the <code>agent/pre-step</code> waterfall (between model requests). The <code>recompose</code> docs explicitly state <em>the CALLER owns the blank check</em>: the official RPC chooses the blank check, this plugin chooses the step boundary; the mechanism is the same.</p>
+<h2>Build</h2>
+<pre><code>npm install            # dev dependencies (host types)
+npm run build          # tsc for the host half
+</code></pre>
+<h2>Limitations &amp; follow-ups</h2>
+<ul>
+<li><strong>Step-boundary semantics</strong>: a switch never interrupts the current model request; the longest wait is until the current step finishes.</li>
+<li><strong>Transcript consistency</strong>: switching happens between model requests; tool schemas/prompt sections change at the step boundary while history stays as-is (that is the value — and the boundary — of hot switching).</li>
+<li>Future: the service in <code>src/index.ts</code> can gain a browser RPC (Typert/remote face) so future surfaces can call it directly; the current entry goes through the <code>/mode</code> slash command, so the host adds zero new wire.</li>
+</ul>
+<h2>License</h2>
+<p><a href="https://github.com/aefuimn/dsh-agent-preset-switcher/blob/HEAD/LICENSE">MIT</a></p>

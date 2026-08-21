@@ -1,0 +1,698 @@
+<h1>场记 / Continuity</h1>
+<p>A <a href="https://github.com/deepseek-ai/deepseek-harness">DeepSeek Harness</a> plugin that gives an
+agent local image / speech / music / SFX generation <strong>and remembers what it made</strong> — the same
+character stays the same character across every call, and a failed generation is never allowed
+to pass as a success.</p>
+<p>Runs locally. Models are lazy-loaded per request and released when idle, so <strong>when you are
+not using it the GPU is untouched</strong> — 0.21 GiB resident, measured. You can play a game on
+the same card.</p>
+<blockquote>
+<p>场记 is the continuity supervisor on a film set. Their entire job is two things: make sure
+the costume, hair and props match between takes, and catch the mistake on set before it is
+cut into the film. That is exactly this plugin's job.</p>
+</blockquote>
+<h2>Install</h2>
+<pre><code>uvx --from dsh-continuity continuity-setup
+</code></pre>
+<p>That one command does the whole backend: preflight → build the engines → fetch only the weights
+this machine can use → start them.</p>
+<blockquote>
+<p>The PyPI distribution is <a href="https://pypi.org/project/dsh-continuity/"><strong><code>dsh-continuity</code></strong></a>
+(the import name stays <code>continuity_mcp</code>). It is <em>not</em> <code>continuity-mcp</code> — that name on PyPI
+belongs to an unrelated project, so do not <code>uvx continuity-mcp</code>.</p>
+<p>To run from source instead: <code>uvx --from git+https://github.com/linxuhao/Deepseek-Continuity continuity-setup</code></p>
+</blockquote>
+<p>Then add the plugin to your dsh profile. <strong><code>dsh plugin</code> shells out to pnpm</strong>, so install that
+first if you have not (<code>corepack enable pnpm</code>); without it the command stops at
+<code>pnpm not found on PATH</code>:</p>
+<pre><code>dsh plugin --profile &lt;your-profile&gt; add dsh-plugin-continuity
+</code></pre>
+<p>Add it to a profile that already has an app bundle. If you point it at a <em>new</em> profile, <code>dsh</code>
+creates one containing only <code>@deepseek-ai/dsh-base</code> plus this plugin — no app, so booting it
+does nothing and hangs. Add the app yourself in
+<code>~/.dsh/profiles/&lt;name&gt;/package.json</code>:</p>
+<pre><code>"dsh": { "profile": { "bundles": [
+  "@deepseek-ai/dsh-base", "@deepseek-ai/dsh-headless", "dsh-plugin-continuity"
+] } }
+</code></pre>
+<p>The bundle reads its settings from the environment, so export what <code>continuity-setup</code> printed
+for your machine before booting the profile:</p>
+<pre><code>export CONTINUITY_STATE_DIR=~/.continuity
+export CONTINUITY_SD_SERVER=http://127.0.0.1:9020
+export CONTINUITY_AUDIO_SERVER=http://127.0.0.1:9021
+</code></pre>
+<p>To wire it by hand instead — <code>continuity-setup</code> prints this block filled in for your machine:</p>
+<pre><code>- insert:
+    - id: continuity
+      name: '@deepseek-ai/dsh-mcp-client'
+      config:
+        serverName: continuity
+        transport: stdio
+        command: uvx
+        args: ['--from', 'dsh-continuity', 'continuity-mcp']
+        env:
+          CONTINUITY_STATE_DIR: !!js process.env.CONTINUITY_STATE_DIR ?? ''
+          SD_SERVER: !!js process.env.CONTINUITY_SD_SERVER ?? ''
+          AUDIO_SERVER: !!js process.env.CONTINUITY_AUDIO_SERVER ?? ''
+</code></pre>
+<p>(the complete row, with every passthrough documented: <a href="https://github.com/linxuhao/Deepseek-Continuity/blob/main/cordis.patch.yml"><code>bundle/cordis.patch.yml</code></a>)</p>
+<p><code>continuity-setup</code> checks the machine before it downloads anything, and sizes the install to
+what it finds. Run <code>continuity-setup --check</code> first to see what it would do — that reads
+hardware and changes nothing:</p>
+<pre><code>体检结果:
+  GPU     AMD Radeon RX 7800 XT (RADV NAVI32)  (16.0 GiB, 此刻可用 15.8 GiB, DISCRETE_GPU, vulkan device 1)
+          未选 AMD Radeon RX 7900 XTX (RADV NAVI31) (24.0 GiB, 此刻可用 1.4 GiB)
+          跳过 llvmpipe —— 软件渲染, 不是真显卡
+  内存    30.9 GiB
+  磁盘    3118.4 GiB 可用 / 需要 30 GiB
+  生图    启用
+  音频    启用
+  抠图默认档  best
+</code></pre>
+<p>Two details in there that exist because the naive version is wrong:</p>
+<ul>
+<li><strong>It skips <code>llvmpipe</code>.</strong> The software rasterizer advertises 30.9 GiB of "VRAM" (it is your
+system RAM) and would win any "pick the biggest card" contest. Everything would then run on
+the CPU — working, looking completely normal, and unusably slow.</li>
+<li><strong>It picks by free VRAM, gates by total VRAM.</strong> On the machine above the 24 GiB card has
+1.4 GiB actually free because another process holds it; picking by size would select it and
+then OOM. But "is this card good enough" is a hardware question, so that one uses the total —
+otherwise a 16 GiB card would be rejected for having a game open.</li>
+</ul>
+<h2>Minimum requirements</h2>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>Minimum</th>
+<th>Notes</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong>GPU</strong></td>
+<td><strong>8 GiB VRAM</strong></td>
+<td>Peak is 6.80 GiB (measured). Requests are serialized, so peak is one model, not the sum.</td>
+</tr>
+<tr>
+<td><strong>GPU API</strong></td>
+<td><strong>Vulkan 1.2+</strong></td>
+<td><strong>No CUDA, no ROCm.</strong> Kernels are SPIR-V compiled at runtime.</td>
+</tr>
+<tr>
+<td><strong>Disk</strong></td>
+<td><strong>30 GiB during install</strong>, 19.5 GiB after</td>
+<td>17.4 weights + 2.1 runtime image + 8.5 build layers (reclaimable).</td>
+</tr>
+<tr>
+<td><strong>Host RAM</strong></td>
+<td><strong>16 GiB</strong> (8 GiB workable — see below)</td>
+<td>Driven by transient peaks, not idle.</td>
+</tr>
+<tr>
+<td><strong>CPU</strong></td>
+<td>any x86-64</td>
+<td>Background removal runs on CPU.</td>
+</tr>
+</tbody></table>
+<p>Audio-only installs (see below) need <strong>20 GiB during install, 9.5 GiB after</strong>.</p>
+<p>All VRAM/RAM figures on this page are <strong>GiB</strong> (2³⁰ bytes), which is what <code>rocm-smi</code> and
+<code>vulkaninfo</code> report. An earlier version of this README labelled them GB; that was wrong and
+made the headroom look tighter than it is.</p>
+<p>Vulkan instead of CUDA is not a preference — it is why this runs at all. ROCm miscomputes
+VAE decode on this GPU class (<a href="https://github.com/ROCm/ROCm/issues/6633">ROCm#6633</a>):
+five decodes of identical input returned five mutually uncorrelated results. Vulkan/RADV
+compiles SPIR-V at runtime instead of looking up a per-arch kernel table, and is correct
+and faster here. The side effect is portability across all three vendors.</p>
+<h3>GPU vendors</h3>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>How the container gets the GPU</th>
+<th>Status</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong>AMD</strong></td>
+<td><code>/dev/dri</code> + mesa RADV inside the image</td>
+<td><strong>Tested</strong> (RX 7800 XT, RX 7900 XTX)</td>
+</tr>
+<tr>
+<td><strong>Intel</strong></td>
+<td><code>/dev/dri</code> + mesa ANV inside the image — same mechanism</td>
+<td>Untested</td>
+</tr>
+<tr>
+<td><strong>NVIDIA</strong></td>
+<td><code>nvidia-container-toolkit</code> injects the host driver (<code>docker-compose.nvidia.yml</code>)</td>
+<td>Untested</td>
+</tr>
+</tbody></table>
+<p>I only have AMD cards, so I will not claim more than that. Nothing in the code is
+AMD-specific — no CUDA, no ROCm, no HIP, no <code>/dev/kfd</code>, no <code>gfx</code> targets — and ggml's Vulkan
+backend is widely run on NVIDIA. But "widely run" is not "I verified it".</p>
+<p>The NVIDIA path is a genuinely different wiring, not just a different card: NVIDIA's Vulkan
+ICD lives in the host driver and must be injected by <code>nvidia-container-toolkit</code>, with
+<code>NVIDIA_DRIVER_CAPABILITIES</code> including <code>graphics</code> — the default <code>compute,utility</code> gives you
+working CUDA and an empty device list in Vulkan. <code>continuity-setup</code> detects NVIDIA, uses the
+right compose overlay, and tells you the path is unverified. Reports either way are welcome.</p>
+<h3>Host RAM in detail</h3>
+<p>Idle is negligible; the peaks are what sizes the machine.</p>
+<table>
+<thead>
+<tr>
+<th>operation</th>
+<th>peak RSS</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>idle</td>
+<td>0.52 GiB</td>
+</tr>
+<tr>
+<td>music</td>
+<td>0.50 GiB</td>
+</tr>
+<tr>
+<td>speech</td>
+<td>1.63 GiB</td>
+</tr>
+<tr>
+<td>image (1024²)</td>
+<td>4.94 GiB</td>
+</tr>
+<tr>
+<td><code>remove_bg</code> <code>quality="best"</code></td>
+<td><strong>7.74 GiB</strong></td>
+</tr>
+<tr>
+<td><code>remove_bg</code> <code>quality="fast"</code></td>
+<td>1.33 GiB</td>
+</tr>
+</tbody></table>
+<p>Background removal is the ceiling, and its cost is <strong>independent of input size</strong> — 256 / 512 /
+1024 px all peak at ~6.8 GiB, because BiRefNet runs at a fixed internal resolution.</p>
+<p><strong>On 16 GiB everything works.</strong> Below 12 GiB, <code>continuity-setup</code> sets the default to
+<code>quality="fast"</code> (u2netp): peak drops to 1.33 GiB and it runs in 0.6 s instead of 7.2 s. On a
+typical game sprite the two are hard to tell apart by eye — checked side by side over a magenta
+backdrop with the edges zoomed. <code>best</code> remains the default where there is room, because the
+models do differ in principle on fine edges (hair, semi-transparent fringes), but treat <code>fast</code>
+as a legitimate choice rather than a degraded fallback.</p>
+<h2>One rule, not a tier list</h2>
+<p>Jobs are serialized, so <strong>at any moment exactly one model is needed</strong>. Everything else is
+released before the job starts. That is the whole VRAM policy. (The one exception is a split
+deployment: if the image backend is on a different host from the audio one, they are not
+competing for a card, so nothing is released — freeing local VRAM for a remote job buys
+nothing and costs a reload.)</p>
+<p>It buys a property worth more than a few saved seconds: <strong>peak VRAM is a constant 6.80 GiB
+regardless of what you call, in what order.</strong> Measured over an alternating
+speech→image→speech→image sequence:</p>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>peak</th>
+<th>speech</th>
+<th>image</th>
+<th>6 calls</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>keep models resident</td>
+<td><strong>10.94 GiB</strong></td>
+<td>2.8 s avg</td>
+<td>11.5 s</td>
+<td>42.9 s</td>
+</tr>
+<tr>
+<td>release what isn't needed</td>
+<td><strong>6.79 GiB</strong></td>
+<td>4.8 s</td>
+<td>11.6 s</td>
+<td>49.2 s</td>
+</tr>
+</tbody></table>
+<p>Keeping them resident is 16% faster and <strong>does not fit an 8 GiB card</strong> — and "voice a line,
+then draw something" is the most ordinary sequence there is. An earlier version of this README
+quoted 7.84 GiB for that overlap; that came from a lighter sequence I happened to test, and
+using it as the ceiling was wrong. A cloned voice keeps its reference audio resident too, which
+is where the rest comes from.</p>
+<p><strong>What the reload actually costs:</strong> 4.8 s instead of 1.2 s, and only on the first call after
+switching away. Ten dialogue lines in a row pay it once:</p>
+<pre><code>第 1 句 4.63s   之后九句平均 1.19s   十句合计 15.4s
+</code></pre>
+<p>So there is no VRAM tier list, and no 12 GiB threshold. Above 8 GiB every card behaves
+identically. Below 8 GiB the installer explains why image generation will not fit and asks
+whether to install the audio half alone — it does not quietly substitute a different product:</p>
+<pre><code>  生图    显存不足
+          Fake GTX 1060 只有 6.0 GiB, 而生图实测峰值 6.80 GiB, 需要 8 GiB。
+          换更小的生图模型省不下这部分 (Q4 与 Q8 峰值相同 6.60 / 6.59), 降分辨率也不行
+          —— 瓶颈是那个 8 GiB 不量化的文本编码器。
+          音频那半仍然可以装: 铸声/配音/音乐/音效/抠图都能用, 4 GiB 就够。
+
+  ⚠️ 这张卡装不了生图那半。
+     只装音频那半 (铸声/配音/音乐/音效/抠图)? [y/N]
+</code></pre>
+<p>The audio-only install is a real product, not a consolation prize: casting voices, dialogue,
+music, SFX and cutout all work in 4 GiB.</p>
+<p><strong>What does not adapt at all: the image model.</strong> Quantizing it does not move VRAM —
+Q4_0 (2.29 GiB of weights) peaks at 6.60 GiB, Q8_0 (4.01 GiB) at 6.59 GiB, identical. Lowering
+resolution does not help either (512 / 768 / 1024 all peak the same; only time changes). The
+bottleneck is the <strong>8 GiB unquantized 4B text encoder</strong>. So there is no "medium" image tier to
+offer, only installed or not. (Q4_0 ships anyway — same VRAM, 1.7 GiB less disk.)</p>
+<p>Going below 8 GiB for images means changing the text encoder or the model family. That is
+possible, but it moves identity pinning from native <code>ref_images</code> to IP-Adapter, which is
+<strong>not verified here</strong> — and identity pinning is the whole point.</p>
+<p>The one thing that does still key off a resource is host RAM, and it is a different resource:
+below 12 GiB RAM the cutout default drops to <code>quality="fast"</code> (see above).</p>
+<h2>Zero residency</h2>
+<p>Measured on an RX 7800 XT with nothing else on the card:</p>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>GPU</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>idle</td>
+<td><strong>0.21 GiB</strong></td>
+</tr>
+<tr>
+<td>during image generation</td>
+<td>6.80 GiB</td>
+</tr>
+<tr>
+<td>2 s after it finishes</td>
+<td><strong>0.21 GiB</strong></td>
+</tr>
+<tr>
+<td>during TTS</td>
+<td>2.39 GiB</td>
+</tr>
+<tr>
+<td>120 s after TTS</td>
+<td><strong>0.21 GiB</strong></td>
+</tr>
+</tbody></table>
+<p>Images are free: the engine streams weights per request and never keeps them resident.
+Audio is released by an idle timer (<code>AUDIO_IDLE_UNLOAD_S</code>, default 120 s) — not immediately,
+because someone voicing ten lines in a row should not pay a reload each time. Reload costs
+nothing measurable: the same TTS request took 3.0 s both cold and warm, because weights are
+mmap'd and sit in page cache.</p>
+<p>Requests are serialized and everything unneeded is released first, so peak = the single largest
+model, always. The idle timer covers the one case the rule cannot: after the <em>last</em> job there is
+no next job to trigger a release, so the timer does it. Closing the agent releases the VRAM too —
+the MCP server unloads on exit rather than leaving the engines holding it.</p>
+<h2>Two things it actually does</h2>
+<p><strong>1. Identity survives across calls.</strong> Generation backends are stateless: ask for the same
+character twice and you get two people who merely resemble each other. Measured on
+Qwen3-TTS as pitch spread across four lines of one character — same voice description,
+same lines, the only variable being whether a reference was pinned:</p>
+<table>
+<thead>
+<tr>
+<th>voice under test</th>
+<th>straight to the model</th>
+<th>through Continuity</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>a bright narrator</td>
+<td>125 Hz</td>
+<td><strong>5 Hz</strong></td>
+</tr>
+<tr>
+<td>an elderly gravelly voice</td>
+<td>74 Hz</td>
+<td><strong>29 Hz</strong></td>
+</tr>
+</tbody></table>
+<p>Two different voices, two different magnitudes, same direction. <strong>Read the ratio, not the
+headline number</strong> — how far a description drifts depends on the description. And treat f0
+spread as a proxy, not the verdict: autocorrelation pitch tracking makes octave errors on low
+gravelly voices (an earlier run of the table above reported 76 Hz where the octave-corrected
+figure is 29), so the numbers above anchor each line's search range to the reference. The real
+acceptance test is listening to the audition clip, which is why <code>create_actor</code> hands you one.</p>
+<p>What the number cannot show is the part that matters most: <strong>the drift is not random.</strong></p>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>pitch spread across 4 lines</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>default sampling</td>
+<td>125 Hz</td>
+</tr>
+<tr>
+<td><strong>greedy decoding</strong></td>
+<td><strong>242 Hz — worse</strong></td>
+</tr>
+<tr>
+<td>pinned reference</td>
+<td>5 Hz</td>
+</tr>
+</tbody></table>
+<p>Under greedy decoding the seed is provably inert — seeds 5 / 99 / 777 produced one identical
+sha256 — so randomness was fully eliminated, and it still drifted 242 Hz. <strong>Identity is a
+function of the input text, not of the random draw.</strong> <code>temperature=0</code> and <code>top_k=1</code> cannot fix
+it. Only pinning to a reference artifact can.</p>
+<pre><code>create_actor(name, voice)          -&gt; audition clip; listen before you commit
+actor_tts(actor, text)             -&gt; same timbre every line
+
+create_character / create_animal / create_object (name, appearance)
+subject_image(subject, scene)      -&gt; same look, new scene / angle / outfit
+</code></pre>
+<p>Identity and wardrobe are separate: pin the face and build, then change clothes in the scene
+prompt. A reference in an indigo robe, asked for <code>wearing heavy red armor</code>, comes back in
+armor with the same face.</p>
+<p><strong>Already cast your character somewhere else?</strong> <code>import_actor</code> and <code>import_subject</code> pin an
+artifact you supply — a real voice recording, an ElevenLabs clip, a character sheet from
+another tool — and everything downstream behaves identically. Audio is normalized to 24 kHz
+mono for you (44.1 kHz stereo in, verified: reference f0 identical, and an imported actor
+tracks a natively-cast one to 11 Hz).</p>
+<h3>Looking at what it made</h3>
+<p>The pinning tools tell the agent to <em>look at the reference before committing to it</em>. So they
+return the image, not just its path — a 512 px JPEG (~35 KB) alongside the text, as MCP image
+content. <strong>There is no VLM in this plugin and there will not be one:</strong> a vision model wants its
+own VRAM, which would destroy the property that peak = the single largest model, and the 8 GiB
+floor rests on that. The harness already has a model; hand it the picture instead of running a
+second one.</p>
+<p>Verified end to end on dsh <code>0.1.1-rc.1</code> with the vision model — plain <code>deepseek-v4-flash</code>
+does <strong>not</strong> accept images and answers <code>INVALID_REQUEST: This model does not support image</code>:</p>
+<pre><code>- id: agent-default-model
+  config:
+    provider: deepseek-official
+    model: deepseek-v4-flash-vision-exp
+</code></pre>
+<p>Asked to pin <em>"a square metal lantern with EXACTLY FIVE blue glass panels and a green
+handle"</em> and then check the render against that description item by item, the agent answered:</p>
+<blockquote>
+<p><strong>面板数量 — 不符合。</strong> 图中实际可见的是 4 块蓝色面板(正面 2 + 右侧面 2)，并非 5 块。
+而且从"每面 2 块"的网格规律看，若其余两面同规格，总数应为 8 块。</p>
+</blockquote>
+<p>It counted, it disagreed with the prompt it had just been given, and it said what it actually
+saw. That is the loop the statistical checks cannot close: they catch a grey PNG, this catches
+<em>"that is not the thing I asked for."</em></p>
+<p>On a model without image input the block degrades to <code>[image unavailable]</code> and the run
+continues normally — observed on dsh, not assumed; the agent then says it received no image
+rather than guessing from <code>appearance</code>. <code>CONTINUITY_INLINE_IMAGES=0</code> sends text only.</p>
+<p>One older caveat, corrected: an earlier experiment here had a self-hosted 27B VLM score 9/9/10
+on chest renders whose lids were visibly the wrong shape, and I had written that off as "VLM
+judges are blind to geometry". The panel-counting result above is evidence that was a
+statement about <em>that</em> model, not a general law. Writing geometry explicitly into <code>appearance</code>
+is still the cheaper fix, but the check is now worth running.</p>
+<p><strong>2. Degenerate output is refused.</strong> A backend that miscomputes returns a perfectly
+well-formed all-zero WAV, or a flat grey PNG, with HTTP 200. Every artifact is checked
+(image standard deviation, audio RMS, non-finite samples) and the call fails loudly rather
+than reporting success over garbage. Cutouts additionally get a quality report — mostly
+transparent, nothing removed, subject shattered into fragments, holes eaten through the
+subject — each with a specific warning instead of a silent pass.</p>
+<p>Plus <code>remove_bg</code>: diffusion models draw "transparent background" as an opaque checkerboard;
+this turns it into a real RGBA cutout, which sprites require. And <code>gen_sfx</code>, which synthesizes
+sfxr-style game SFX procedurally — bit-identical for a given seed, milliseconds, no GPU —
+because a diffusion model is the wrong instrument for a 40 ms coin pickup.</p>
+<h2>Tools</h2>
+<p>19 tools. Everything returns <strong>absolute local file paths</strong>, not URLs — the agent and the
+engines are on the same machine, so a path can go straight into your game project without a
+download step, and there is no file server to run or misconfigure.</p>
+<table>
+<thead>
+<tr>
+<th></th>
+<th></th>
+</tr>
+</thead>
+<tbody><tr>
+<td>voice</td>
+<td><code>create_actor</code> <code>import_actor</code> <code>actor_tts</code> <code>list_actors</code> <code>delete_actor</code> <code>generate_speech</code></td>
+</tr>
+<tr>
+<td>look</td>
+<td><code>create_character</code> <code>create_animal</code> <code>create_object</code> <code>import_subject</code> <code>subject_image</code> <code>list_subjects</code> <code>delete_subject</code> <code>generate_image</code></td>
+</tr>
+<tr>
+<td>audio</td>
+<td><code>generate_music</code> <code>gen_sfx</code></td>
+</tr>
+<tr>
+<td>post</td>
+<td><code>remove_bg</code> <code>slice_sheet</code></td>
+</tr>
+<tr>
+<td>meta</td>
+<td><code>continuity_status</code></td>
+</tr>
+</tbody></table>
+<p><code>generate_image</code> and <code>generate_speech</code> exist for one-offs and say so in their own descriptions:
+they explicitly tell the agent that what they produce will not come back on the next call, and
+point at the pinning tools for anything recurring.</p>
+<h3>Two audiences per result</h3>
+<p>Every tool returns <strong>two descriptions of the same call</strong>:</p>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>who reads it</th>
+<th>what it is</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>content</code></td>
+<td>the LLM</td>
+<td>the Chinese prose, <code>⚠️</code> warnings and all — unchanged, it <em>is</em> the prompt</td>
+</tr>
+<tr>
+<td><code>structuredContent</code></td>
+<td>your program</td>
+<td>a typed object; the model is in <a href="https://github.com/linxuhao/Deepseek-Continuity/blob/HEAD/src/continuity_mcp/results.py"><code>results.py</code></a>, its JSON Schema is the tool's <code>outputSchema</code></td>
+</tr>
+</tbody></table>
+<pre><code>// generate_image
+{"ok": true, "error": null, "warnings": [],
+ "path": "/home/you/.continuity/generated/img_1787322514_9a3f.png",
+ "width": 1024, "height": 1024, "seed": null, "clamped": false}
+
+// remove_bg, on a bad cutout — the ⚠️ is in both halves, never only in the prose
+{"ok": true, "warnings": ["抠图结果很可能不对: 被去掉的区域细节密度是主体的 68% …"],
+ "path": "…/cut_1787322526_5381.png", "mode_used": "rembg", "model": "u2netp",
+ "transparent_ratio": 0.551}
+
+// any failure — the prose stays the instructive Chinese message that tells the LLM what to do next
+{"ok": false, "error": "actor '郭靖' 不存在 —— 先调 create_actor(…) 铸声, 再用它说台词。", "warnings": []}
+</code></pre>
+<p><strong>Do not regex the prose for paths.</strong> That prose is a prompt: it gets reworded whenever the
+agent's behaviour needs it to be, and a regex that stops matching fails <em>silently</em> — you get an
+empty path, not an error. <code>ok</code> and <code>path</code> are the contract; the Chinese is not.</p>
+<p>The shape is uniform. <code>ok</code> is always present and is the only field worth branching on first:
+when it is <code>false</code>, only <code>ok</code> / <code>error</code> / <code>warnings</code> are meaningful and everything else is null.
+Every <code>⚠️</code> in the prose has a matching string in <code>warnings</code>. Paths are always absolute.</p>
+<p>Casting and pinning (<code>create_character</code> / <code>create_animal</code> / <code>create_object</code> / <code>import_subject</code>)
+return the reference image inline <em>and</em> structured content — those four are annotated
+<code>Annotated[CallToolResult, …]</code>, which is the one form mcp 2.0 accepts for "several content
+blocks plus a declared output schema". The models are validated on every call, so a field that
+drifts away from what the prose says raises instead of shipping.</p>
+<h2>Limits, and why each one exists</h2>
+<p>Every number here is a measured failure boundary, not a policy.</p>
+<table>
+<thead>
+<tr>
+<th>limit</th>
+<th>value</th>
+<th>what happens past it</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>line length</td>
+<td>200 chars</td>
+<td>600 chars wedged the GPU: <code>amdgpu GPU reset(6)</code>, device lost, an unrelated process on the <em>other</em> card killed. 200 is half the largest known-safe value.</td>
+</tr>
+<tr>
+<td>reference audio</td>
+<td>15 s</td>
+<td>~0.19 GiB VRAM per second: 15 s → 6.59 GiB, 30 s → 9.04 GiB. 15 s is the last value that stays under the image peak, so voice never becomes the ceiling. One value for every card — 3–10 s is already enough to pin a timbre, so a bigger cap on bigger cards would only mean "this clip imports on my machine and not on yours".</td>
+</tr>
+<tr>
+<td>casting script</td>
+<td>45 chars</td>
+<td>It produces the reference audio, which is then re-read on every later line. Char count is a bad proxy (60 chars measured 19.1 s, not the 13.7 s the ratio predicts), so the real duration is checked after casting and reported.</td>
+</tr>
+<tr>
+<td>image size</td>
+<td>1024 px</td>
+<td>1280 pushed VRAM to 14.5/16.4 GiB; 2048 sent the driver into <code>restore_userptr_worker</code> thrashing with the process stuck in uninterruptible <code>D</code> state — worse than a clean OOM.</td>
+</tr>
+<tr>
+<td>music length</td>
+<td>120 s</td>
+<td>Not a safety limit: the engine silently truncates at 120 s and reports success. The limit turns that into an explicit <code>clamped</code> field.</td>
+</tr>
+</tbody></table>
+<p>Imported audio below 24 kHz is accepted but flagged: upsampling cannot restore the octave
+that was thrown away, so the clone comes out duller than the file you gave it. That is worth
+a warning rather than a silent pass — it is the same failure shape as everything else this
+plugin exists to catch.</p>
+<p><strong>Oversized inputs are handled differently by type, on purpose.</strong> An image that is too large is
+resized and the result is reported back to you (<code>原图 2400x1600 → 存为 1024x682</code>) — a scaled
+picture still depicts the same thing. Reference audio that is too long is <strong>rejected, not
+trimmed</strong>: cutting the tail off the audio would leave the transcript describing something the
+audio no longer says, and that alignment is exactly what the cloning depends on. Trimming it
+silently would hand you an actor that imported successfully and sounds like someone else.</p>
+<h2>How dsh runs it</h2>
+<p>Not lazily on first tool call — <strong>at profile boot</strong>. <code>dsh-mcp-client</code>'s <code>apply()</code> awaits the
+connection <em>and</em> the tool listing before the fiber activates, so the tools exist the moment the
+agent starts. Two consequences worth knowing:</p>
+<ul>
+<li><strong><code>failOnStartupError</code> defaults to <code>false</code>.</strong> If the MCP server cannot start, the boot
+succeeds with <strong>zero tools registered</strong> and nothing draws attention to it — the agent simply
+reports that the tools do not exist. (Ask me how I know.) Set it to <code>true</code> in the row if you
+would rather the profile refuse to boot.</li>
+<li><strong>Reconnect is on by default</strong>: 500 ms, doubling to a 30 s cap, 10 attempts, then it gives up
+and unregisters the tools. Each attempt spawns a <em>fresh</em> server process.</li>
+</ul>
+<p>Shutdown is a three-step ladder owned by the MCP SDK, and it is why the VRAM claim above holds:</p>
+<table>
+<thead>
+<tr>
+<th>step</th>
+<th>budget</th>
+<th>what we do</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>close our stdin</td>
+<td>2 s</td>
+<td>server loop ends, normal exit, <code>atexit</code> releases the models</td>
+</tr>
+<tr>
+<td><code>SIGTERM</code></td>
+<td>2 s</td>
+<td>signal handler releases, then <code>os._exit</code> — Python would not run <code>atexit</code> here</td>
+</tr>
+<tr>
+<td><code>SIGKILL</code></td>
+<td>—</td>
+<td>nothing runs; the idle timer in the engine still frees it later</td>
+</tr>
+</tbody></table>
+<p>Measured: 0.16 s on the stdin path, 0.11 s on SIGTERM, both releasing. The unload call is
+capped at 1.5 s precisely because the budget is 2 — a slow engine must not push us into the
+SIGTERM step, where the release would not happen at all. And it fires unconditionally rather
+than consulting this process's own bookkeeping: VRAM belongs to the engine, which outlives any
+one server generation, so a reconnected generation has an empty ledger and would otherwise
+skip the release entirely.</p>
+<h2>Running it without dsh (streamable-http)</h2>
+<p>Default transport is <strong>stdio</strong> and nothing about the dsh path changes — <code>continuity-mcp</code> with no
+arguments behaves exactly as before. For a caller that is not spawning the process itself (an
+HTTP shell, a second machine, several clients sharing one loaded model), run it as a
+long-lived streamable-http server:</p>
+<pre><code>continuity-mcp --http                                   # 127.0.0.1:9030/mcp
+continuity-mcp --http --host 127.0.0.1 --port 9030 --path /mcp   # same, spelled out
+CONTINUITY_TRANSPORT=streamable-http continuity-mcp     # env instead of flags
+</code></pre>
+<table>
+<thead>
+<tr>
+<th>flag</th>
+<th>env</th>
+<th>default</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>--transport {stdio,sse,streamable-http}</code> (<code>--http</code> is shorthand for the last)</td>
+<td><code>CONTINUITY_TRANSPORT</code></td>
+<td><code>stdio</code></td>
+</tr>
+<tr>
+<td><code>--host</code></td>
+<td><code>CONTINUITY_HTTP_HOST</code></td>
+<td><code>127.0.0.1</code></td>
+</tr>
+<tr>
+<td><code>--port</code></td>
+<td><code>CONTINUITY_HTTP_PORT</code></td>
+<td><code>9030</code></td>
+</tr>
+<tr>
+<td><code>--path</code></td>
+<td><code>CONTINUITY_HTTP_PATH</code></td>
+<td><code>/mcp</code></td>
+</tr>
+</tbody></table>
+<p>Point an MCP client at <code>http://127.0.0.1:9030/mcp</code>.</p>
+<p><strong>It binds loopback by default and you should leave it there.</strong> There is no authentication of any
+kind, and the tools write files to this machine's disk and delete actors and subjects. Binding
+<code>0.0.0.0</code> hands that to anyone on the segment — put a reverse proxy in front if you need it
+reachable. Port 9030 stays clear of the two engines (9020 / 9021).</p>
+<p>The VRAM guarantee is unchanged over HTTP: image generation and TTS still share one process-wide
+lock, so several clients connecting at once means they queue, not that two models sit on the card
+together. What HTTP <em>does</em> change is the shutdown ladder above — a long-lived server is not being
+reaped by dsh, so the models stay loaded until <code>AUDIO_IDLE_UNLOAD_S</code> (default 120 s idle) frees
+them, or until you stop the process.</p>
+<h2>Bring your own backend (optional)</h2>
+<p>There are two independent backend URLs, so <strong>you can move one capability off-box and keep the
+other local</strong>:</p>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>env var</th>
+<th>what it must be</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>image</td>
+<td><code>SD_SERVER</code></td>
+<td>a <strong>stable-diffusion.cpp <code>sd-server</code></strong> (<code>/sdcpp/v1/img_gen</code> + poll, accepts <code>ref_images</code>)</td>
+</tr>
+<tr>
+<td>audio</td>
+<td><code>AUDIO_SERVER</code></td>
+<td>an <strong>audio.cpp <code>audiocpp_server</code></strong> (<code>/v1/tasks/run</code>, <code>/v1/tasks/unload_models</code>)</td>
+</tr>
+</tbody></table>
+<p>Tell the installer which half is yours and it skips that half entirely — no weights, no engine,
+no VRAM gate — while the tools stay registered:</p>
+<pre><code>continuity-setup --sd-server http://your-box:9020      # 生图你自己供; 本地只装音频
+continuity-setup --audio-server http://your-box:9021   # 反过来
+</code></pre>
+<p>That matters more than it sounds: without it, BYO-ing the image half still downloaded <strong>10.1 GiB</strong>
+of image weights and started a local <code>sd-server</code> nobody would ever call, then refused to enable
+image tools because the local card was too small. On a 5.3 GiB integrated GPU, <code>--sd-server</code>
+turns "生图 显存不足" into "生图(BYO)" and downloads nothing.</p>
+<p>Note the deliberate split from <code>--no-image</code>: that one means <em>"I don't want this capability"</em>
+(tools unregistered); <code>--sd-server</code> means <em>"I supply this capability"</em> (tools work normally).</p>
+<p>Either half also works when set purely at runtime via the two env vars, whether you installed
+from PyPI or wired the dsh plugin — the cordis row passes them straight through.
+<code>continuity_status</code> names whichever side is unreachable. <code>gen_sfx</code> needs no backend at all.</p>
+<p><strong>Be clear about what "your own backend" means here: the same engine, elsewhere.</strong> It is not a
+provider abstraction. The client speaks sd.cpp's and audio.cpp's specific HTTP shapes, so you
+cannot point <code>SD_SERVER</code> at an OpenAI-compatible endpoint, a ComfyUI instance, or a bare
+IP-Adapter server and expect it to work. What it <em>is</em> good for: running the engines on a
+beefier box, or sharing one backend between several agents. (An earlier version of this README
+implied any reference-image-capable backend would do. That was never true of the code.)</p>
+<p>One constraint if you go remote: identity pinning needs the image backend to accept a
+reference image. sd.cpp's <code>ref_images</code> is what the code uses; without it there is no pinning,
+which is the whole point.</p>
+<p>Reference <em>audio</em> used to be a second constraint — the engine was handed a filesystem path and
+opened the file itself, so a remote audio backend meant casting succeeded and every line after
+it failed. That was not an engine limitation, it was the wrong endpoint: <code>/v1/audio/speech</code>
+takes the reference inline as base64 (5 MiB cap; a 15 s reference is ~720 KB), exactly the way
+the image path had always passed <code>ref_images</code>. Both halves are symmetric now and nothing has to
+share a directory.</p>
+<h2>Prior art</h2>
+<p>A survey of the current MCP ecosystem — MiniMax-MCP, openrouter-mcp-multimodal, AtlasCloud,
+the dsh vision/draw plugins, and four game-asset servers — found voice cloning in several,
+<strong>visual subject pinning in none, and output verification in none</strong>.</p>
+<h2>Layout</h2>
+<pre><code>package.json + cordis.patch.yml   the dsh bundle (npm) — one plugin row, at the repo root
+                                  so `dsh plugin add github:...` works, not just the npm name
+src/continuity_mcp/               the MCP server: pinning, guardrails, verification, cutout,
+                                  VRAM lifecycle
+src/continuity_mcp/deploy/        compose + engine Dockerfile + weight manifest
+pyproject.toml                    the PyPI distribution (dsh-continuity)
+</code></pre>
+<h2>License</h2>
+<p>MIT</p>

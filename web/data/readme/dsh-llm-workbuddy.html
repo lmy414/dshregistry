@@ -1,0 +1,336 @@
+<h1>dsh-llm-workbuddy</h1>
+<p>在 DeepSeek Harness 中使用你的 <strong>WorkBuddy / CodeBuddy</strong> 账号模型的 LLM 适配器插件。</p>
+<p>它把 <code>workbuddy</code> 这个 provider 路由指向本地运行的
+<a href="https://github.com/hawklithm/workbuddy2api">workbuddy2api</a> 代理
+（默认 <code>http://127.0.0.1:8787/v1</code>）。workbuddy2api 把 CodeBuddy/WorkBuddy 的
+私有协议转成标准 OpenAI chat-completions 格式，并用本地保存的登录态完成认证，
+因此本插件<strong>不需要任何 API Key</strong>。</p>
+<p>装好并启动后提供两件事：</p>
+<ol>
+<li><strong>模型能力</strong>：Web 界面的模型选择器（composer 模型菜单或 <code>/model</code> 命令）会多出
+一个 <strong>WorkBuddy</strong> 分组，模型（DeepSeek-V4、GLM-5.x、Kimi-K2.x、MiniMax-M3、
+Hy3、Hunyuan…）随账号可用列表实时同步，点一下即可切换。</li>
+<li><strong>Web 登录状态小组件</strong>：在 Web GUI 右下角常驻一个状态胶囊，<strong>实时显示登录/
+代理状态</strong>，未登录时一键在新标签页打开 WorkBuddy 登录页，登录完成后自动变绿。
+无需再回到终端手动跑登录脚本。</li>
+</ol>
+<hr>
+<h2>架构一览</h2>
+<pre><code>┌──────────────────────────── DeepSeek Harness Web GUI ───────────────────────────┐
+│                                                                                  │
+│   [ 模型选择器 (WorkBuddy 分组) ]            [ WorkBuddy 状态胶囊 (右下角) ]      │
+│        │                                            │                            │
+│        │ GET /v1/models (代理发现)                  │ GET  /api/workbuddy/status │
+│        ▼                                            │ POST /api/workbuddy/login │
+│   lib/index.js (WorkBuddyAdapter)                  ▼                            │
+│        │ fetch                                       lib/index.js               │
+│        ▼  POST /chat/completions                     (registerWorkbuddyRoutes)  │
+│   workbuddy2api 代理 (127.0.0.1:8787)  ──health──▶   ├─ 读 .workbuddy/session.json│
+│        │                                            ├─ 探测代理 /health          │
+│        ▼                                            └─ spawn login_workbuddy.py │
+│   WorkBuddy / CodeBuddy 云端                                            │        │
+│                                                                          ▼        │
+│                                                       login_workbuddy.py ──▶ 写回 │
+│                                                            (设备流)        session │
+└──────────────────────────────────────────────────────────────────────────────────┘
+</code></pre>
+<ul>
+<li><strong>后端路由</strong>（<code>lib/index.js</code> 的 <code>registerWorkbuddyRoutes</code>）运行在 <code>dsh web</code> 的
+HTTP 服务上，通过 Cordis 的 <code>webServer</code> 服务注册（用 <code>ctx.get("webServer")</code>
+探测，<code>webServer</code> 不列入 <code>inject</code>），headless profile 下自动跳过。</li>
+<li><strong>前端胶囊</strong>（<code>lib/client.js</code>）是零依赖的原生浏览器 JS，由 DSH 的 <code>dsh.client</code>
+双端机制在 <code>window.__DSH_BOOT__</code> 中注入，serve 于
+<code>/plugins/dsh-llm-workbuddy/client.js</code>。</li>
+<li><strong>登录脚本</strong>（<code>login_workbuddy.py</code>，仓库根）实现与官方 CodeBuddy 插件一致的
+device flow（<code>platform=CLI</code> + codebuddy.cn 请求头）。</li>
+</ul>
+<hr>
+<h2>前置条件（重要）</h2>
+<ol>
+<li><strong>代理必须独立安装并运行</strong>：本插件<strong>不打包</strong>第三方代理 workbuddy2api。
+请在你的机器上单独安装并启动它（见下方「安装代理」），它把 WorkBuddy/CodeBuddy
+的私有协议转成标准 OpenAI chat-completions 格式。</li>
+<li>代理必须跑在 <strong>workbuddy2api 主分支源码</strong>上，不能用 PyPI 的 2.0.3：
+旧版缺少 <code>X-Product-Code</code> / Genie-IDE 等请求头，登录会在最后一步 401。</li>
+<li>登录使用<strong>插件内置的 <code>login_workbuddy.py</code></strong>（本包自带，依赖系统 <code>python3</code>，
+纯标准库，Python 3.7+ 即可），<strong>不需要</strong>代理自带的 <code>--login</code>（VSCode platform
+会 401）。</li>
+<li>插件装入 profile 后需要<strong>重启 <code>dsh web</code></strong> 才能加载新的 bundle（包括本小部件）。</li>
+</ol>
+<hr>
+<h2>安装插件</h2>
+<p>在插件包目录（本仓库 <code>dsh-llm-workbuddy/</code>）执行：</p>
+<pre><code>dsh plugin --profile web add ./dsh-llm-workbuddy
+</code></pre>
+<p>从 npm 发布版安装（正式发布后，朋友或你自己在任何机器上）：</p>
+<pre><code>dsh plugin add dsh-llm-workbuddy
+</code></pre>
+<p>CLI 会把依赖写进 profile 并把 <code>dsh-llm-workbuddy</code> 追加到 <code>dsh.profile.bundles</code>，
+同时在 <code>package.json</code> 的 <code>dsh.client</code> 声明里登记浏览器入口（见下文「Web 小部件
+工作原理」）。然后<strong>重启</strong> <code>dsh web</code>。</p>
+<blockquote>
+<p>本插件<strong>没有构建步骤</strong>：<code>lib/client.js</code> 是浏览器原生 JS 直接被 serve；登录脚本
+<code>login_workbuddy.py</code> 已打进包内，用系统 <code>python3</code> 运行（纯标准库，无需 uv）。
+唯一需要自己装的是第三方代理 workbuddy2api。</p>
+</blockquote>
+<hr>
+<h2>安装代理（先决条件，第三方）</h2>
+<p>插件只提供模型路由与登录；真正的协议转换由 <strong>workbuddy2api</strong>（第三方开源项目）完成。
+它<strong>不在本插件包里</strong>，需要单独安装并启动在 <code>127.0.0.1:8787</code>。分两种情况：</p>
+<h3>全新机器 / 标准安装（任何能跑 Python 的机器）</h3>
+<p>别人或你自己在<strong>新机器</strong>上用 npm 版插件时，按以下 3 步装代理：</p>
+<pre><code># 1. 安装 uv（本机 Python 工具，若已装可跳过）
+curl -LsSf https://astral.sh/uv/install.sh | sh
+
+# 2. 拉取 workbuddy2api 主分支源码
+git clone https://github.com/hawklithm/workbuddy2api.git
+cd workbuddy2api
+
+# 3. 启动代理（监听 127.0.0.1:8787；先完成下方「登录」后再真正调用模型）
+uv run python -u -m codebuddy_proxy --desensitize \
+  --session-file ~/.codebuddy-session.json \
+  --log-file ~/.codebuddy-proxy.jsonl
+</code></pre>
+<blockquote>
+<p>之后任何时候想重启代理，就在 <code>workbuddy2api</code> 目录里重跑上面第 3 条命令。
+若提示 <code>address already in use</code>，先停掉旧代理：
+<code>lsof -tiTCP:8787 -sTCP:LISTEN | xargs kill</code>，再重跑。</p>
+</blockquote>
+<h3>本仓库本地开发（可选快捷方式）</h3>
+<p>仓库根目录提供 <code>start-workbuddy.sh</code>，它会用仓库固定的 <code>main</code> 分支源码 + 本地
+<code>.tools/uv</code> 工具链 + 仓库内的 <code>.workbuddy/session.json</code> 启动代理。它<strong>不随 npm
+包发布</strong>，仅面向本仓库开发时方便：</p>
+<pre><code>cd /path/to/dsh-workbuddy
+./start-workbuddy.sh
+</code></pre>
+<h3>验证代理是否真的能用</h3>
+<pre><code>curl http://127.0.0.1:8787/health    # {"status":"ok","authenticated":true,...}
+curl http://127.0.0.1:8787/v1/models # 模型列表（含 glm-5.2 / deepseek-v4-pro ...）
+</code></pre>
+<blockquote>
+<p>⚠️ <code>/health</code> 只证明<strong>代理进程活着</strong>，不能证明模型能真正出字（代理进程指向旧
+路径/文件缺失时 <code>/health</code> 仍返回 <code>authenticated: true</code>，但所有模型请求 500）。
+想确认"模型真能用"，用右下角胶囊的 <strong>🔍 诊断</strong> 按钮，它会真实发一次模型请求。</p>
+</blockquote>
+<blockquote>
+<p>登录态过期时 <code>authenticated</code> 变回 <code>false</code>，重跑登录即可，代理无需重启
+（会话按请求读取）。</p>
+</blockquote>
+<hr>
+<h2>登录：两种方式</h2>
+<h3>方式 A（推荐）：在 Web GUI 里点一下</h3>
+<ol>
+<li>浏览器打开 <code>dsh web</code>（默认 <code>http://127.0.0.1:3080</code>）。</li>
+<li>看<strong>右下角</strong>的状态胶囊：<ul>
+<li>🟢 <code>WorkBuddy · &lt;账号昵称&gt;</code> —— 已登录，无需操作。</li>
+<li>🔴 <code>WorkBuddy · 未登录</code> 或带 <code>代理未运行</code> 提示 —— 点胶囊里的 <strong>「登录」</strong> 按钮。</li>
+</ul>
+</li>
+<li>点击后，后端 <code>POST /api/workbuddy/login</code> 会 <code>spawn</code> 运行 <code>login_workbuddy.py</code>，
+解析它打印的设备流链接（<code>authUrl</code>）返回给前端；前端用 <code>window.open</code> 在<strong>新标签页</strong>
+打开该登录页。</li>
+<li>在新标签页用 WorkBuddy / CodeBuddy 账号（腾讯账号）完成扫码/授权。</li>
+<li>胶囊会自动从每 5 秒轮询加快到每 2 秒（最多 30 次），一旦检测到
+<code>.workbuddy/session.json</code> 的 <code>auth.expiresAt</code> 未过期且含 <code>accessToken</code>，
+就切回 🟢 绿态，显示账号昵称。</li>
+</ol>
+<p>整个过程<strong>不需要离开浏览器、不需要回终端</strong>。</p>
+<h3>方式 B（传统）：在终端手动跑</h3>
+<p>使用本包内置的登录脚本（纯标准库，依赖系统 <code>python3</code>）：</p>
+<pre><code>python3 node_modules/dsh-llm-workbuddy/login_workbuddy.py --session-file ~/.codebuddy-session.json
+# 浏览器打开打印的链接，用 WorkBuddy/CodeBuddy 账号登录
+# 完成后自动保存会话到 ~/.codebuddy-session.json
+</code></pre>
+<blockquote>
+<p>仓库根目录也有 <code>./login-workbuddy.sh</code> 包装脚本（面向本地开发，走 <code>.tools/uv</code>）；
+发布版插件直接用系统 <code>python3</code> 运行同款脚本即可。</p>
+</blockquote>
+<p>两种方式写的是同一个会话文件，可混用：终端登录后 Web 胶囊会自动变绿，
+Web 登录后终端脚本也读得到同一份会话。</p>
+<hr>
+<h2>Web 小部件工作原理</h2>
+<h3>后端路由（<code>lib/index.js</code>）</h3>
+<p>插件在 <code>apply(ctx, config)</code> 里用 <code>ctx.get("webServer")</code> 探测 HTTP 服务（不在
+<code>inject</code> 里，headless profile 无 <code>webServer</code> 时返回 <code>undefined</code>、自动跳过），
+然后通过 <code>webServer.register({ kind: 'exact', path, handler })</code> 注册两条精确
+路由，并用 <code>ctx.effect</code> 包裹以便热重载自动清理。HTTP 方法过滤在 handler 内自行
+判断（<code>req.method</code>），因为路由 API 本身不含方法字段：</p>
+<table>
+<thead>
+<tr>
+<th>方法 + 路径</th>
+<th>行为</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>GET /api/workbuddy/status</code></td>
+<td>读取会话文件（默认 <code>~/.codebuddy-session.json</code>，或配置的 <code>sessionFile</code>）的 <code>auth.expiresAt</code> 判断会话是否有效，并 <code>fetch</code> 代理 <code>/health</code> 判断 <code>proxyUp</code>；返回 JSON：<code>{ sessionFile, authenticated, expiresAt, account, proxyUp, tokenValid, loginScriptAvailable }</code>；非 GET 返回 405</td>
+</tr>
+<tr>
+<td><code>POST /api/workbuddy/login</code></td>
+<td>若已有有效会话则直接返回 <code>alreadyLoggedIn</code>；否则用系统 <code>python3</code> <code>spawn</code> 包内 <code>login_workbuddy.py --session-file &lt;sessionFile&gt;</code>，从子进程 stdout 解析出 <code>authUrl</code> 立即返回 <code>{ authUrl, pending:true }</code>（设备流在后台继续，前端轮询 status 感知完成）；非 POST 返回 405</td>
+</tr>
+<tr>
+<td><code>POST /api/workbuddy/diagnose</code></td>
+<td><strong>一键诊断</strong>：真实探测健康状态，返回 <code>{ ok, session, health, chat, loginScriptAvailable, restartCommand }</code>。与 <code>/status</code> 不同，它除了探 <code>/health</code>，还会<strong>真实发一次最小模型请求</strong>（<code>chat.chatWorking</code>），能戳穿"胶囊显示成功但模型全 500"的假象；<code>ok:false</code> 时附带 <code>restartCommand</code>（自动区分本地 monorepo 布局与标准安装）；非 POST 返回 405</td>
+</tr>
+</tbody></table>
+<blockquote>
+<p>会话文件与登录脚本路径的解析顺序：</p>
+<ol>
+<li>配置里显式指定的 <code>sessionFile</code> / <code>loginScript</code>；</li>
+<li>包内 <code>login_workbuddy.py</code> + <code>~/.codebuddy-session.json</code>；</li>
+<li>旧仓库布局（向上两级 <code>dsh-workbuddy/</code> 的 <code>.workbuddy/session.json</code>）自动兼容。</li>
+</ol>
+</blockquote>
+<h3>前端胶囊（<code>lib/client.js</code>）</h3>
+<ul>
+<li>作为经典 <code>&lt;script&gt;</code> 被 DSH 注入页面，IIFE 内直接操作 DOM，<strong>零依赖</strong>。</li>
+<li>启动时在 <code>document.body</code> 末尾挂一个 <code>position:fixed</code> 的胶囊（右下角）。</li>
+<li>每 <strong>5 秒</strong> <code>GET /api/workbuddy/status</code>；点「登录」后加快到每 <strong>2 秒</strong>轮询、
+最多 30 次，直到 <code>authenticated:true</code>。</li>
+<li>胶囊里有个 <strong>🔍 诊断</strong> 按钮：点它 <code>POST /api/workbuddy/diagnose</code>，弹出一个面板
+显示<strong>真实健康状态</strong>（登录、会话文件、代理进程、登录令牌、模型能否出字），
+发现问题时附带<strong>可复制的重启命令</strong>（一键复制到终端执行）。</li>
+<li>状态映射：<ul>
+<li><code>authenticated &amp;&amp; proxyUp</code> → 🟢 绿，显示 <code>WorkBuddy · &lt;昵称&gt;</code></li>
+<li>否则 → 🔴 红，显示「登录」按钮；<code>proxyUp</code> 为 false 时额外提示 <code>代理未运行</code></li>
+</ul>
+</li>
+</ul>
+<blockquote>
+<p><strong>关于 UI 挂载位置（临时做法说明）</strong></p>
+<p>当前状态胶囊用 <code>position:fixed</code> 直接注入 <code>document.body</code>。DSH 官方的 UI
+组合机制是 <strong>slot 系统</strong>（<code>@deepseek-ai/dsh-client-ui-slots</code>，<code>ctx.slots.register</code>
+注册 React 组件进声明的 slot）。按官方「组合优先、不要假设/覆盖其他插件内部实现」
+的原则，理想做法是注册进官方 slot，而非直接改产品外壳。</p>
+<p>评估结论：<strong>当前 shell 声明的 slot 里没有专门的「右下角状态位」</strong>；最接近的
+<code>sidebar.footer.action</code>、<code>conversation.session.header.actions</code>、
+<code>conversation.input.overlay</code> 都是 <strong>React 组件位</strong>，迁移意味着要把本插件从
+「零依赖原生 JS」改造成 <strong>React + 构建流程</strong>，并依赖 shell 暴露 <code>ctx.slots</code>
+服务。因此现阶段保留 DOM 注入（机制允许），<strong>待官方 shell 提供合适的状态胶囊
+slot 后再迁移</strong>。以下是已知的迁移路径（供后续参考）：</p>
+<pre><code>ctx.slots.inject("sidebar.footer.action", () =&gt; ctx.slots.register({
+  name: "sidebar.footer.action",
+  id: "workbuddy-status",
+  locale: NS,
+  inject: () =&gt; ({ /* 轮询句柄 / 登录回调 */ })
+}, WorkBuddyStatusPill /* React 组件 */));
+</code></pre>
+</blockquote>
+<h3>为什么不需要构建</h3>
+<p>DSH 的 <code>dsh.client</code> 机制只要求 <code>package.json</code> 里：</p>
+<pre><code>{
+  "dsh": { "client": { "platform": "web" } },
+  "exports": { "./client": "./lib/client.js" }
+}
+</code></pre>
+<p><code>dsh web</code> 会自动把 <code>exports["./client"]</code> 指向的文件 serve 到
+<code>/plugins/&lt;package-name&gt;/client.js</code> 并注入引导清单，<strong>不要求打包器</strong>。</p>
+<hr>
+<h2>配置</h2>
+<p>插件入口配置（profile 的 <code>cordis.patch.yml</code> 或用户设置文档的 <code>llm-workbuddy:</code>
+分节）。注意：状态小组件使用的代理地址取自这里的 <code>baseURL</code>（去掉 <code>/v1</code> 后探
+<code>/health</code>）。</p>
+<pre><code>- id: llm-workbuddy
+  name: 'dsh-llm-workbuddy'
+  config:
+    baseURL: http://127.0.0.1:8787/v1   # workbuddy2api 端点（小组件据此探 /health）
+    # apiKey: ''                        # 代理一般不需要；如代理以 --api-key 启动则填写
+    # maxTokens: 32000                  # 单请求输出上限
+    # defaultContextWindow: 200000      # 未在目录中标明容量的模型使用
+    # discovery: true                   # 实时拉取代理的 /v1/models（30s 缓存）
+    # models: [...]                     # 静态目录（代理不可达时的兜底）
+    # loginScript: ''                   # 登录脚本绝对/相对路径；默认用包内 login_workbuddy.py
+    # sessionFile: ~/.codebuddy-session.json  # 会话文件路径；默认同上
+</code></pre>
+<p>模型列表默认取插件内置目录；代理可达时改为实时拉取 <code>/v1/models</code>（支持
+<code>{"models": [...]}</code> / <code>{"data": [...]}</code> 两种返回），未列出的模型 id 仍可原样
+传递。</p>
+<hr>
+<h2>排错</h2>
+<table>
+<thead>
+<tr>
+<th>现象</th>
+<th>可能原因 / 解决</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>右下角没有胶囊</td>
+<td><code>dsh web</code> 没重启加载新 bundle → 重启 <code>dsh web</code>；或 <code>curl /plugins/dsh-llm-workbuddy/client.js</code> 应返回 200</td>
+</tr>
+<tr>
+<td>胶囊一直 <code>…</code>（加载中）</td>
+<td><code>GET /api/workbuddy/status</code> 失败 → 确认 <code>dsh web</code> 在跑、端口正确</td>
+</tr>
+<tr>
+<td>胶囊红 + <code>代理未运行</code></td>
+<td>workbuddy2api 代理没起或挂了 → 按「安装代理」章节启动</td>
+</tr>
+<tr>
+<td>胶囊显示登录成功但模型用不了</td>
+<td>典型的"代理进程活着但指向旧路径/文件缺失"假象（<code>/health</code> 仍显示 ok）。点胶囊 <strong>🔍 诊断</strong>，看 <code>模型出字</code> 是否失败；按面板给出的重启命令重启代理</td>
+</tr>
+<tr>
+<td>点「登录」没反应 / 按钮灰</td>
+<td><code>loginScriptAvailable:false</code> → 包内 <code>login_workbuddy.py</code> 缺失或系统无 <code>python3</code>；检查安装</td>
+</tr>
+<tr>
+<td>新标签页打开后登录完成，胶囊仍是红</td>
+<td>会话文件（默认 <code>~/.codebuddy-session.json</code>）未刷新或 <code>expiresAt</code> 已过期 → 刷新页面或重跑登录</td>
+</tr>
+<tr>
+<td>启动 <code>dsh web</code> 报 <code>EPERM ... cordis.yml</code></td>
+<td><code>.dsh</code> 所在系统卷受保护（<code>/System/Volumes/Data</code> 带 <code>protect</code>）。解决：<code>sudo chown -R $(whoami) /Users/jiyunyang/.dsh</code>，或 <code>export DSH_HOME=$HOME/dsh-home</code> 后重新 <code>dsh plugin --profile web add</code> 并把插件链接进新 home</td>
+</tr>
+<tr>
+<td>模型请求 <code>TRANSPORT</code> 错误</td>
+<td>代理未运行或端口不对（连接被拒绝）</td>
+</tr>
+</tbody></table>
+<hr>
+<h2>限制</h2>
+<ul>
+<li>当前为纯文本适配器：图片输入会以 <code>UNSUPPORTED_CONTENT</code> 拒绝（后续可加）。</li>
+<li>不公布 reasoning effort 选择器；模型按平台默认强度运行。</li>
+<li>代理未运行时，模型请求会以 <code>TRANSPORT</code> 错误快速失败（连接被拒绝）；但状态
+小组件本身不依赖代理——代理挂了它仍能显示「代理未运行」并允许触发登录。</li>
+<li>登录态有效期由 WorkBuddy 云端决定；过期后胶囊变红，重新点「登录」即可，
+代理无需重启。</li>
+</ul>
+<hr>
+<h2>文件索引</h2>
+<table>
+<thead>
+<tr>
+<th>路径</th>
+<th>作用</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>lib/index.js</code></td>
+<td>Cordis 插件主体：LLM 适配器 <code>WorkBuddyAdapter</code> + <code>/api/workbuddy/*</code> 路由（status / login / <strong>diagnose</strong>）</td>
+</tr>
+<tr>
+<td><code>lib/client.js</code></td>
+<td>零依赖浏览器小部件（状态胶囊 + 登录流程 + <strong>🔍 诊断</strong>），被 <code>dsh.client</code> 注入</td>
+</tr>
+<tr>
+<td><code>login_workbuddy.py</code></td>
+<td>设备流登录脚本（随包发布，被后端路由用系统 <code>python3</code> spawn）</td>
+</tr>
+<tr>
+<td><code>cordis.patch.yml</code></td>
+<td>本包的 Cordis bundle 挂载声明（<code>id: llm-workbuddy</code>）</td>
+</tr>
+<tr>
+<td><code>package.json</code></td>
+<td>包元数据、<code>dsh.client</code> 浏览器入口声明、<code>llm-workbuddy</code> peer 依赖</td>
+</tr>
+</tbody></table>
+<blockquote>
+<p>第三方 workbuddy2api 代理<strong>不在包内</strong>，需单独安装（见「安装代理」章节）。
+仓库根目录的 <code>start-workbuddy.sh</code> / <code>login-workbuddy.sh</code> / <code>.workbuddy/</code> 是本地
+开发用的配套文件，不随 npm 包发布。</p>
+</blockquote>

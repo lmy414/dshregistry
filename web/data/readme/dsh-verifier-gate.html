@@ -1,0 +1,229 @@
+<h1>dsh-verifier-gate</h1>
+<p>An LLM-as-a-verifier plugin for <a href="https://github.com/deepseek-ai/deepseek-harness">DeepSeek Harness</a> (<code>dsh</code>). It adds a quality gate that runs at the end of every agent turn, plus three tools the agent can call to check its own work.</p>
+<p>The scoring method is a port of <a href="https://github.com/llm-as-a-verifier/llm-as-a-verifier">llm-as-a-verifier</a> by Kwok et al. (project site <a href="https://llm-as-a-verifier.com/">llm-as-a-verifier.com</a>, paper arXiv 2607.05391, MIT). That repo selects the best of N agent trajectories. This plugin takes the same math and wires it into a running harness.</p>
+<h2>How it fits together</h2>
+<p>Two pictures. The first is the plugin inside one agent turn: where it reads, where it speaks, and what it costs. The second is the skill <code>graph-verified-coding</code>, the working method that decides when the agent calls the tools.</p>
+<pre><code>flowchart TD
+    subgraph turn["One agent turn in dsh"]
+        S["agent steps 1..n&lt;br/&gt;read, edit, bash, browser, tests"]
+        S --&gt;|"every 40 steps"| P["progress reading&lt;br/&gt;low, one call, background&lt;br/&gt;A..T letter"]
+        P --&gt;|"fell by 0.25, or stalled&lt;br/&gt;twice under 0.30"| A["assessment with findings&lt;br/&gt;three calls, the step waits"]
+        A --&gt;|"[dsh-verifier-gate checkpoint]&lt;br/&gt;into the same step"| S
+        S --&gt;|"12 file edits without&lt;br/&gt;a verifier call"| D["reminder, no model call&lt;br/&gt;[dsh-verifier-gate] 12 edits since..."]
+        D --&gt; S
+        S --&gt;|"the agent calls verifier_assess,&lt;br/&gt;verifier_select, verifier_compare"| T["tool verdict&lt;br/&gt;score, pass, findings"]
+        T --&gt; S
+        S --&gt; E{"turn stopping"}
+    end
+    E --&gt;|"gate: three calls at high over the&lt;br/&gt;whole turn plus the goal objective"| G{"score ≥ 0.6 ?"}
+    G --&gt;|"yes"| C["turn closes"]
+    G --&gt;|"no, once"| R["[dsh-verifier-gate] findings&lt;br/&gt;the agent repairs, then the turn closes"]
+    R --&gt; S
+    subgraph backend["verifier backend"]
+        V["same model, OpenAI-compatible&lt;br/&gt;streamed, logprobs top 20&lt;br/&gt;score = expectation over the letter distribution"]
+    end
+    P -.-&gt; V
+    A -.-&gt; V
+    T -.-&gt; V
+    E -.-&gt; V
+</code></pre>
+<pre><code>flowchart TD
+    C["1 Contract&lt;br/&gt;acceptance criteria with an observable artifact each"] --&gt; K["2 Cut false edges&lt;br/&gt;nodes; parallel only where no output flows&lt;br/&gt;children write .graph/&amp;lt;node&amp;gt;.md"]
+    K --&gt; W["3 Work node&lt;br/&gt;implement, run the proving command, keep the output"]
+    W --&gt; G["4 Gate&lt;br/&gt;tests, lint, build&lt;br/&gt;ui_snapshot + analyze_image for anything rendered&lt;br/&gt;verifier_assess(criteria coding) with contract + evidence"]
+    G --&gt;|"pass"| J{"competing candidates?"}
+    G --&gt;|"fail"| Y["6 Cycle with a stop&lt;br/&gt;repair, re-gate, two rounds, then report what is open"]
+    Y --&gt; G
+    J --&gt;|"yes"| V["5 Join&lt;br/&gt;verifier_select / verifier_compare&lt;br/&gt;merge the winner, gate the merge"]
+    J --&gt;|"no"| N{"more nodes?"}
+    V --&gt; N
+    N --&gt;|"yes"| W
+    N --&gt;|"no"| R["7 Report with evidence&lt;br/&gt;commands, tests, snapshots, every verifier call with score"]
+    R --&gt; Z["turn ends: the plugin gate scores the whole turn"]
+</code></pre>
+<h2>Why a verifier</h2>
+<p>The method comes from the llm-as-a-verifier authors. Their framework (source: <a href="https://llm-as-a-verifier.com/">llm-as-a-verifier.com</a>): probability over the logits instead of a sampled token, a fine-grained scoring token, repetition, and decomposition into simpler criteria, aggregated as R(x, tau) = 1/(C K) sum over criteria, repeats and scale values of p(v | x, c, tau) phi(v).</p>
+<p><img src="https://raw.githubusercontent.com/DevRico003/dsh-verifier-gate/HEAD/docs/images/llm-as-a-verifier-framework.png" alt="LLM-as-a-Verifier framework: uncertainty, granularity, repetition, decomposition"></p>
+<p>What that buys with the same model this plugin runs on (chart from the llm-as-a-verifier README; Terminal-Bench 2.1, mini-swe-agent, DeepSeek V4 Flash as generator and verifier, costs at OpenRouter prices of 2026-08-17): best-of-3 lifts DeepSeek V4 Flash from 78.7% to 86.5%, best-of-5 to 88.0%, at roughly a quarter of the cost per task of GPT-5.6 Sol in Codex.</p>
+<p><img src="https://raw.githubusercontent.com/DevRico003/dsh-verifier-gate/HEAD/docs/images/terminal-bench-2.1-cost-vs-success.png" alt="Terminal-Bench 2.1: success rate against cost per task, DeepSeek V4 Flash with LLM-as-a-Verifier versus Codex and Claude Code"></p>
+<p>The gate in this plugin is the cheaper cousin of that best-of-N selection: one trajectory, scored once, repaired once. <code>verifier_select</code> is the best-of-N itself.</p>
+<h2>What it does</h2>
+<p><strong>The gate.</strong> When an agent is about to end a turn, the plugin serializes the turn (the task, the assistant messages, every tool call and its observed output) and asks a verifier model to score it per criterion on a 20-letter scale. The score is not the sampled letter. It is the expectation over the logprob distribution of the score token, so the verdict is continuous in [0, 1]. If the mean falls below <code>gate.threshold</code>, the verifier's findings go back to the agent as a plugin message and the harness runs another step. The agent sees text like this:</p>
+<pre><code>[dsh-verifier-gate] Automatic verification of your last turn scored 0.28 / 1.00 (pass threshold 0.60). Round 1 of 1.
+Per-criterion rewards: Empirical verification &amp; error signals=0.13, Specification adherence=0.21, Code quality &amp; root cause=0.50.
+
+Verifier findings, Empirical verification &amp; error signals (0.13):
+The agent launched three background subagents ... There is zero observed verification in the trajectory: no npm test run, no curl of the service endpoints, no screenshot ...
+</code></pre>
+<p>That example is from a real run. The agent answered "Fair criticism, let me check what's actually on disk now instead of trusting narration" and went back to work. Continuations are capped per turn (<code>gate.maxRounds</code>, default 1). Turns that end with a question to the user are never forced on.</p>
+<p><strong>The tools.</strong></p>
+<table>
+<thead>
+<tr>
+<th>Tool</th>
+<th>What it does</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>verifier_assess(task, answer)</code></td>
+<td>Scores one result per criterion and returns the findings. By default it also hands the verifier the observed trajectory of the current turn, so the verdict rests on tool output rather than on the agent's summary.</td>
+</tr>
+<tr>
+<td><code>verifier_select(task, candidates[])</code></td>
+<td>Best-of-N. Pairwise comparisons with slot swapping, then a probabilistic pivot tournament picks the winner in N + k(N-k) comparisons instead of N².</td>
+</tr>
+<tr>
+<td><code>verifier_compare(task, a, b)</code></td>
+<td>One directed pairwise reward.</td>
+</tr>
+<tr>
+<td><code>ui_snapshot(url)</code></td>
+<td>Evidence for visual work: headless screenshots of one URL across viewports (default 1440x900 and 390x844) in light and dark mode, written as PNGs under <code>$DSH_HOME/verifier/snapshots/&lt;label&gt;/</code>, plus the console errors, page errors and failed requests seen while loading. Runs Playwright against the installed Google Chrome (then Playwright's Chromium); nothing opens on screen. Pair it with a vision tool such as <code>analyze_image</code> for the verdict.</td>
+</tr>
+</tbody></table>
+<p><strong>The backend.</strong> <code>openai-compatible</code> calls any chat-completions endpoint with <code>logprobs</code> and <code>top_logprobs</code> (vLLM, SGLang, the DeepSeek API). That is what makes the fine-grained score possible. <code>harness</code> routes through the harness LLM seam instead, which carries no logprobs, so scores fall back to the literal letter. Use the direct endpoint when you can.</p>
+<h2>Prompts</h2>
+<p>The verifier-facing text is the reference's. The pairwise prompt (<code>build_prompt</code>), the progress prompt (<code>build_progress_prompt</code>, one checkpoint), the two scale descriptions and the ground-truth notes are verbatim. The <code>coding</code> criteria are <code>specification</code> from <code>criteria/terminal_bench.md</code> plus <code>code_review</code> and <code>verification</code> from <code>criteria/swe_bench.md</code> ("issue" read as "task", and the patch defined as diff output or the file contents written through tools, because a harness trajectory carries edits as tool calls); <code>terminal</code> is <code>criteria/terminal_bench.md</code>; <code>general</code> is this plugin's own set for prose and answers. The single-trajectory assessment prompt behind <code>verifier_assess</code> and the gate is the progress prompt reduced to the final state and extended with one criterion guideline and a request to name what is missing, because that analysis is what the agent gets back. The agent-facing texts (tool descriptions, gate and checkpoint messages) are this plugin's own.</p>
+<h2>What is ported, and where</h2>
+<table>
+<thead>
+<tr>
+<th>Reference concept</th>
+<th>File</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>20-letter scale, pairwise orientation (A = best) and progress orientation (T = best)</td>
+<td><code>src/core/scale.ts</code></td>
+</tr>
+<tr>
+<td>Reward as logprob expectation, last-tag match, fused <code>&gt;A</code> tokens, whitespace skip, literal-letter fallback</td>
+<td><code>src/core/scoring.ts</code></td>
+</tr>
+<tr>
+<td>Criteria × repeats with slot swap on odd repeats; <code>compare</code>, <code>select</code>, <code>assess</code></td>
+<td><code>src/core/verifier.ts</code></td>
+</tr>
+<tr>
+<td>Pivot tournament: ring pass, top-k pivots, pivot round, Bradley-Terry argmax</td>
+<td><code>src/core/tournament.ts</code></td>
+</tr>
+<tr>
+<td>Prompts with the invariant part first and the criterion last (prefix-cache friendly); criteria sets <code>general</code>, <code>coding</code>, <code>terminal</code></td>
+<td><code>src/core/prompts.ts</code></td>
+</tr>
+<tr>
+<td>Trajectory serialization from the harness session log</td>
+<td><code>src/trajectory.ts</code></td>
+</tr>
+</tbody></table>
+<p>Things the reference repo does not have: the turn gate (<code>src/gate.ts</code>), the tools (<code>src/tools.ts</code>), hot-reloadable settings, and the handling of unscored verdicts described below.</p>
+<h2>Install</h2>
+<pre><code>git clone https://github.com/DevRico003/dsh-verifier-gate
+dsh plugin --profile web add /path/to/dsh-verifier-gate
+dsh plugin --profile headless add /path/to/dsh-verifier-gate
+dsh plugin --profile desktop add /path/to/dsh-verifier-gate    # DSH Desktop
+</code></pre>
+<p><code>lib/</code> is committed, so no build step is needed to install. Restart <code>dsh web</code> or the desktop app afterwards.</p>
+<h2>Configure</h2>
+<p>Defaults live in <code>cordis.patch.yml</code>. The shipped <code>backend.baseURL</code> is the placeholder <code>http://YOUR_SPARK_HOST:8000/v1</code>; until you set a real endpoint the plugin loads but every verifier call fails with a message naming this setting (the gate then closes turns unverified and logs a warning, <code>verifier_assess</code> returns <code>scoredCriteria: 0</code> with the message in <code>findings</code>). Set at least <code>backend.baseURL</code> and <code>backend.model</code>. Everything is a hot-reloadable <code>verifier:</code> section in <code>$DSH_HOME/settings.yaml</code>; no restart.</p>
+<pre><code>verifier:
+  backend:
+    kind: openai-compatible        # or: harness
+    baseURL: http://YOUR_SPARK_HOST:8000/v1
+    model: deepseek-v4-flash-0731
+    apiKeyEnv: SPARK_API_KEY       # env var or credential reference; empty = no Authorization header
+    reasoningEffort: high          # the reference setting; low is ~3x faster with close verdicts, none is a one-shot reading
+    maxTokens: 65536               # reasoning shares the budget; room so a long think still ends in an answer
+    temperature: 1.0               # the reference default; keeps the logprob distribution informative
+    topLogprobs: 20
+    concurrency: 8                 # a node gate is 6 calls, a select about 30; they fan out together
+    retriesOnFallback: 1
+    warmPrefix: false              # true = first call per prompt prefix alone, then the rest (saves prefill, doubles wall-clock)
+    toolReasoningEffort: low       # effort for the verifier_* tools (node gates); empty = reasoningEffort
+    timeoutMs: 3600000             # last-resort cap per call
+    idleTimeoutMs: 900000          # abort when the stream delivers nothing for this long (a queued request is silent until scheduled)
+  gate:
+    enabled: true
+    threshold: 0.6
+    maxRounds: 1
+    evaluations: 1                 # repeats per criterion
+    criteriaMode: auto             # coding when the turn used tools, else general
+    criteria: general
+    skipWhenAskingUser: true
+    skipSubagents: true            # child agents are not gated; their parent turn is
+    minSteps: 1
+    minToolCallsWithoutOwnTask: 8  # a turn opened only by a subagent report or notice is gated only with real work in it
+    feedbackMaxChars: 2500
+    timeoutMs: 4200000
+  select:
+    evaluations: 2                 # for the tools; 2 or more cancels slot bias
+    pivots: 1
+    seed: 0
+    criteria: general
+  trajectory:
+    maxStepChars: 6000             # per tool output / message excerpt
+    maxTotalChars: 300000          # whole turn; over the cap the middle is elided, the opening and the most recent steps stay
+    continuationTurns: 1           # a turn opening with "Continue." gets this many earlier turns prepended
+    toolMaxTotalChars: 80000       # trajectory cap for the verifier_* tools
+  checkpoint:
+    enabled: true                  # mid-turn verification, see below
+    minSteps: 40
+    everySteps: 40
+    evaluations: 1
+    threshold: 0.3                 # steer when progress is below this
+    drop: 0.25                     # or fell by this much since the last checkpoint
+    minRise: 0.05                  # below threshold and rising less than this = stalled
+    stallReadings: 2               # consecutive stalled readings before a steer; a fall steers at once
+    maxSteers: 3                   # per turn
+    steerBelow: 0                  # deliver a triggered checkpoint only when its assessment scores below this (0 = gate.threshold)
+    deliver: blocking              # assess a triggered checkpoint while the agent waits (fresh findings); background = asynchronous
+    reasoningEffort: low           # checkpoints think at low (frequent, and they block when triggered); gate and tools keep backend.reasoningEffort
+    gateDebtEdits: 12              # remind after this many file edits without a verifier_* call (0 = off)
+    editTools: [write, edit, str_replace_editor, apply_patch, notebook_edit]
+    timeoutMs: 3600000
+  snapshot:
+    enabled: true                  # the ui_snapshot tool
+    channels: [chrome, chromium]   # tried in order; chrome = installed Google Chrome
+    headless: true
+    viewports: ["1440x900", "390x844"]
+    settleMs: 500
+    navigationTimeoutMs: 30000
+    dir: ""                        # empty = $DSH_HOME/verifier/snapshots
+  tools: true
+  toolEvaluations: 1               # repeats per criterion for verifier_assess; the tool's evaluations argument overrides
+  verbose: false
+</code></pre>
+<p><code>gate.enabled: false</code> keeps the tools and drops the gate. <code>enabled: false</code> turns the plugin off.</p>
+<h2>One long turn</h2>
+<p>An unattended coding run is often a single turn of several hundred steps, and an end-of-turn gate verifies that turn once, at the end. Two mechanisms make one turn verifiable while it runs, both hooked into <code>agent/pre-step</code>:</p>
+<p><strong>Progress checkpoints.</strong> Every <code>checkpoint.everySteps</code> steps (from <code>minSteps</code> on) the turn so far is scored with the reference progress prompt, verbatim, one checkpoint (the current state), letter only, <code>evaluations</code> repeats. That is the reference's <code>ProgressTracker.update</code>. Checkpoints think at <code>checkpoint.reasoningEffort</code> (<code>low</code> by default): they run often and block the agent when they trigger, and <code>low</code> gave verdicts within 0.06 of <code>high</code> on this setup at a third of the time; the end-of-turn gate and the tools keep <code>backend.reasoningEffort</code>. The progress reading runs in the background; the agent keeps working. When a reading triggers, the assessment with findings runs at the next step boundary while the agent waits (<code>deliver: blocking</code>), so the findings describe the state the agent is in when it reads them instead of a state several minutes old; <code>background</code> keeps the old asynchronous steer. The first checkpoint sets the baseline (a long goal reads low early, by design). From the second on, a fall by <code>drop</code>, or <code>stallReadings</code> consecutive readings below <code>threshold</code> that did not rise by <code>minRise</code> (the reference's regression and plateau patterns), gets the turn assessed with findings, and the agent receives a <code>[dsh-verifier-gate checkpoint]</code> message at its next step boundary, capped at <code>maxSteers</code> per turn. The message is delivered only when that assessment scores below <code>steerBelow</code> (the gate threshold by default): progress readings are one letter each and fluctuate, and a fall the full assessment does not confirm (0.95 to 0.63 in one run, assessed at 0.75) would only distract. A run that keeps climbing costs one cheap call per checkpoint and no steer.</p>
+<p><strong>Gate debt.</strong> When the agent has made <code>gateDebtEdits</code> file edits since its last <code>verifier_*</code> call, it receives a reminder to gate the node (no model call), repeated every <code>gateDebtEdits</code> further edits with sharper wording (the anime run made 44 edits in one turn after ignoring a single reminder). The <code>graph-verified-coding</code> skill asks for one <code>verifier_assess</code> per completed multi-file node; this is what catches an agent that forgot.</p>
+<p>Turn ends still get the full gate. A goal that runs in phases (one turn per phase) gets a gate per phase on top. Some hosts open a new turn for every subagent report; such a turn usually holds an acknowledgement and nothing else, and judging it against the goal would fail it for everything the goal still lacks, so a turn without its own task message is gated only when it made at least <code>gate.minToolCallsWithoutOwnTask</code> tool calls. A turn that opens with "Continue." (auto-continue after an interruption, a resumed goal round) holds little of the work, so the trajectory handed to the verifier prepends the previous turn (<code>trajectory.continuationTurns</code>); otherwise a gate right after a restart would see commands but no code.</p>
+<h2>Cost</h2>
+<p>One gate pass is <code>criteria × evaluations</code> verifier calls, three by default, fanned out together. <code>warmPrefix: true</code> runs the first call alone so the server caches the prompt prefix (task, trajectory, scale; the criterion sits at the tail) before the rest go out; that is the reference's 3.4× saving in uncached input tokens, worth it on a priced API or a slow prefill. On a local vLLM that prefills at over 10k tokens per second it only doubles the wall-clock of every gate, so it ships off.</p>
+<p>The verifier thinks at <code>high</code>, the reference's setting for its DeepSeek-V4-Flash numbers (best-of-3 86.5% against 79.4% pass@1 on Terminal-Bench 2.1), and it gets room: <code>maxTokens</code> 65536, no thinking budget, calls stream. On a local DGX Spark pair a <code>high</code> call over a long trajectory takes two to twelve minutes; an earlier build lost such calls to a 300 s transport timeout, which looked like a hang. Now every call is a streamed response: tokens arrive while the model thinks, so no header timeout fires, an idle timer (<code>idleTimeoutMs</code>) aborts only a stream that goes silent, and <code>timeoutMs</code> is a last-resort cap of an hour. A gate over a long turn may therefore take ten minutes; it will end with a verdict, and the agent's harness imposes no tool timeout on the verifier tools. If you want speed over the reference setting, <code>reasoningEffort: low</code> gave verdicts within 0.06 of <code>high</code> on an A/B here at about a third of the time; <code>none</code> is a one-shot reading for chat sessions.</p>
+<p>With thinking on, vLLM returns the reasoning tokens inside <code>logprobs.content</code> as well; the score reader walks the token stream and takes the letter after the last <code>&lt;score&gt;</code> tag, so that is handled. A reply that spends the whole budget on reasoning carries no answer and is reported as a failed call (retried once, then unscored), never as a 0.5.</p>
+<p>The <code>verifier_*</code> tools are the node gates the agent calls itself, several per turn, and the agent waits for each one. They run at <code>toolReasoningEffort: low</code>, three calls fanned out, the end-of-turn gate keeps <code>high</code>. Measured in one run on the Spark pair with a 27k-token trajectory: <code>high</code> took five to eight minutes per node gate; <code>low</code> with <code>toolEvaluations: 2</code> (six concurrent calls) 4.3 minutes, each call 140 to 257 s because the six share the GPUs; <code>low</code> with one repeat about three minutes. The findings at <code>low</code> named the same gaps (an unobserved cache hit, an endpoint never called live) as the <code>high</code> gates had, so one repeat is the default and <code>toolEvaluations: 2</code> is there for a second reading. <code>verifier_select</code> with three candidates is 5 pairs × 3 criteria, 15 calls with one repeat. The calls are short prompts and long answers, so they are generation-bound and share the GPUs: at <code>low</code> with 2 repeats (30 calls) a design-direction select took 12 minutes on the Spark pair, at <code>high</code> on four slots 22; one repeat halves that.</p>
+<p>When a turn outgrows the trajectory cap, the opening steps stay and the middle is elided, so every gate of one turn sends the same prefix and a prefix-caching server (vLLM) prefills only the tail.</p>
+<h2>Unscored verdicts</h2>
+<p>A verifier reply sometimes carries no parseable score tag. The plugin retries such a call (<code>backend.retriesOnFallback</code>, default 1). What still has no verdict is excluded from every mean and reported as <code>scored: false</code>, never counted as a neutral 0.5. A gate pass with zero scored criteria closes the turn unverified and logs it instead of steering the agent on noise.</p>
+<h2>Skill</h2>
+<p><code>skills/graph-verified-coding/SKILL.md</code> is a dsh skill (also usable by Claude Code or Codex from <code>~/.agents/skills</code>) that tells the agent how to use the verifier inside a graph-engineered coding process. Seven steps, each with a done-condition: contract (acceptance criteria with observable artifacts), cut false edges (independent nodes in parallel, dependent ones in sequence), work node (keep the proving output), gate (tests, browser loop for rendered output, <code>verifier_assess</code> when evidence is ambiguous), join (<code>verifier_select</code> over competing candidates), cycle with a stop (repair and re-gate, bounded rounds), report with evidence. A reference block lists the tools and their cost so the agent places gates where they pay: before merges and before the final answer. Link it into a skill root dsh scans:</p>
+<pre><code>ln -s /path/to/dsh-verifier-gate/skills/graph-verified-coding ~/.dsh/skills/graph-verified-coding
+</code></pre>
+<h2>Development</h2>
+<p>Typechecking needs a DeepSeek Harness checkout next to this repo (the <code>link:</code> devDependencies point at <code>../deepseek-harness</code>). The published <code>@deepseek-ai/dsh-*</code> packages on npm are an older generation and do not typecheck against the current harness.</p>
+<pre><code>pnpm install
+pnpm run build      # tsc -&gt; lib/
+pnpm test           # node:test unit tests
+</code></pre>
+<h2>Limitations</h2>
+<ul>
+<li>Logprobs need a direct endpoint. <code>kind: harness</code> degrades to a 20-level letter judge.</li>
+<li>Score caching exists only inside one <code>select</code> call. There is no on-disk cache across calls.</li>
+<li>Criteria sets are built in. Custom criteria files are not loaded yet.</li>
+<li>No custom session events are appended, so session logs stay readable by processes without this plugin. Outcomes are visible through the steered message and the harness logger.</li>
+</ul>
+<h2>License</h2>
+<p>MIT. The scoring method and prompt texts are ported from <a href="https://github.com/llm-as-a-verifier/llm-as-a-verifier">llm-as-a-verifier</a> (<a href="https://llm-as-a-verifier.com/">llm-as-a-verifier.com</a>, MIT); see <code>LICENSE</code>. Thank you to the authors for publishing the method, the prompts and the benchmarks.</p>

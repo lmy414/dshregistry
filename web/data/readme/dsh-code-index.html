@@ -1,0 +1,132 @@
+<h1>dsh-code-index</h1>
+<p>Semantic repo index — a <a href="https://github.com/deepseek-ai/deepseek-harness">DeepSeek Harness</a> (<code>dsh</code>) plugin that gives the agent a <strong>codebase map</strong>: a tree-sitter symbol index, ranked symbol search, and a bounded auto-updating repo map in the system prompt.</p>
+<p>Fills a real ecosystem gap: search of the <code>dsh-plugin</code> topic (2026-08) shows git/voice/browser/memory plugins galore, but <strong>no native, model-usable code index / repo-map capability</strong> — the kind of thing aider's repo-map and Cursor's <code>@Codebase</code> do for their agents.</p>
+<h2>What the model gets</h2>
+<table>
+<thead>
+<tr>
+<th>Tool</th>
+<th>Purpose</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>code_index</code></td>
+<td>Status / (re)build the index for the current workspace</td>
+</tr>
+<tr>
+<td><code>code_symbols</code></td>
+<td>List symbols (functions, classes, interfaces, types, methods…) with file:line — filtered by name, path, kind, exported</td>
+</tr>
+<tr>
+<td><code>code_search</code></td>
+<td>Ranked lookup: exact &gt; prefix &gt; substring, exports first, relevance score + file:line</td>
+</tr>
+<tr>
+<td><code>code_map</code></td>
+<td>Bounded ranked repo map (top files by symbol density, key symbols + lines)</td>
+</tr>
+</tbody></table>
+<p>Plus an optional <strong>auto-injected system prompt section</strong> (<code>code-index:repo-map</code>, order 60): a compact ranked map of the default workspace, refreshed with a 60s TTL. Set <code>autoInject: false</code> to disable and rely on the <code>code_map</code> tool only.</p>
+<h2>Install</h2>
+<p>Requires <code>dsh</code> (any install path — npx, npm, or source) and Node ≥ 22.</p>
+<pre><code># from npm (prebuilt)
+npx @deepseek-ai/dsh plugin --profile web add dsh-code-index
+
+# or from a directory containing this checkout
+npx @deepseek-ai/dsh plugin --profile web add ./dsh-code-index
+</code></pre>
+<p>Restart the Web UI (<code>npx @deepseek-ai/dsh web</code>) — startup logs confirm each tool:</p>
+<pre><code>[dsh-code-index] plugin loaded
+[dsh-code-index] registered tool: code_index
+...
+</code></pre>
+<p>Verify the composed config without booting: <code>dsh --profile web --dump-config</code>.</p>
+<h2>Using it</h2>
+<p>In a workspace session, ask the agent:</p>
+<ul>
+<li>"Which repo are we in — run code_map first."</li>
+<li>"Find every function whose name contains <code>parse</code> and where it lives."</li>
+<li>"List the exported symbols in src/core."</li>
+<li>"Rebuild the code index."</li>
+</ul>
+<p>No API key is needed to <em>index</em>; the model must of course be configured to call the tools.</p>
+<h2>Example (input → output)</h2>
+<p>User prompt:</p>
+<blockquote>
+<p>Which repo are we in? Run <code>code_map</code> first, then find where <code>extractSymbols</code> is defined.</p>
+</blockquote>
+<p>The agent calls the tools in turn:</p>
+<pre><code>code_map
+# repo map
+## src/extract.ts (14)
+  function extractSymbols(code, id) :121
+  function languageForFile(filePath) :37
+  ...
+
+code_search { query: "extractSymbols" }
+export function extractSymbols(code, id) — src/extract.ts:121
+</code></pre>
+<p>The index builds lazily on first use; later calls are served from the on-disk cache with mtime-incremental refresh.</p>
+<h2>Configuration</h2>
+<p>Options are passed as the plugin row's <code>config</code> in the profile patch (or defaults are used if absent):</p>
+<pre><code># $DSH_HOME/profiles/&lt;name&gt;/cordis.patch.yml — a bare row overrides by id.
+- id: code-index
+  config:
+    excludeDirs: [generated, playground]
+    mapTopFiles: 30
+    mapMaxChars: 4000
+    autoInject: true
+</code></pre>
+<table>
+<thead>
+<tr>
+<th>Key</th>
+<th>Default</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>excludeDirs</code></td>
+<td><code>[]</code></td>
+<td>Extra dirs appended to the built-in excludes (<code>node_modules</code>, <code>.git</code>, <code>dist</code>, <code>build</code>, <code>out</code>, <code>coverage</code>, <code>.next</code>, <code>.nuxt</code>, <code>.cache</code>, <code>target</code>, <code>vendor</code>, …)</td>
+</tr>
+<tr>
+<td><code>mapTopFiles</code></td>
+<td><code>24</code></td>
+<td>Max files in a ranked map</td>
+</tr>
+<tr>
+<td><code>mapMaxChars</code></td>
+<td><code>3200</code></td>
+<td>Hard cap on rendered map characters</td>
+</tr>
+<tr>
+<td><code>autoInject</code></td>
+<td><code>true</code></td>
+<td>Register the system prompt section</td>
+</tr>
+</tbody></table>
+<h2>Supported languages</h2>
+<p>TypeScript + JavaScript (<code>.ts .tsx .mts .cts .js .jsx .mjs .cjs</code>) via tree-sitter WASM — pure parsing, no native build. The symbol provider seam (<code>src/extract.ts</code> + grammars) is where other languages/embeddings plug in later.</p>
+<h2>How it works</h2>
+<ul>
+<li><strong>Index build</strong> (<code>src/buildIndex.ts</code>): recursive scan (excludes applied), per-file tree-sitter extraction (<code>src/extract.ts</code>), JSON cache under <code>&lt;repo&gt;/.dsh-code-index/</code>, incremental refresh by mtime (only touched files re-parse).</li>
+<li><strong>Search</strong> (<code>src/search.ts</code>): pure scoring — exact <code>1</code> / prefix <code>0.8</code> / substring <code>0.5</code>, export boost, name order tiebreak.</li>
+<li><strong>Repo map</strong> (<code>src/repomap.ts</code>): density-aware file score (class/interface/function weighted, mild anti-bloat), top-N files, per-file symbol cap, hard char truncation.</li>
+<li><strong>Workspace resolution</strong>: each tool resolves the session cwd (<code>agent.session.header.cwd</code>) and walks up to the nearest <code>.git</code> (bounded — a directory without a repo marker is never indexed).</li>
+</ul>
+<h2>Known limitations</h2>
+<ul>
+<li><strong>web-tree-sitter pinned to <code>^0.20.8</code></strong> — newer releases expect dylinked grammar wasm while <code>tree-sitter-wasms</code> ships static builds; this pair is verified working under Node ≥ 22/24.</li>
+<li>Auto-injected section targets the <strong>default workspace</strong> (launch directory, matching headless/CLI mode). Multi-workspace Web UI sessions should use <code>code_map</code>/<code>code_symbols</code> (they resolve per-session cwd).</li>
+<li>Local variables are indexed too — recall over precision; <code>code_search</code> ranking keeps them low.</li>
+<li>Developer-preview harness: expect breaking harness/plugin API changes upstream.</li>
+</ul>
+<h2>Development</h2>
+<pre><code>pnpm install
+pnpm test        # vitest — extractor, scan, cache, search, repo map (35 tests)
+pnpm typecheck
+pnpm build       # tsup → dist/index.js (ESM, external deps)
+</code></pre>
+<h2>License</h2>
+<p>MIT. Not affiliated with DeepSeek; built on the public <code>dsh</code> plugin surface.</p>

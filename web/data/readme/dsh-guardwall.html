@@ -1,0 +1,217 @@
+<h1>dsh-guardwall</h1>
+<p>DeepSeek Harness 的安全插件：<strong>安装前体检 + 运行时护栏</strong>，装前把关、装后看门、全程留痕。</p>
+<ul>
+<li><strong>安装前体检</strong>：权限清单 · 静态风险扫描 · A–D 信任评分 · 安装门禁（D 级拒绝）</li>
+<li><strong>运行时拦截</strong>：危险工具调用直接拦截（破坏性命令、凭据、SSRF、反向 shell）</li>
+<li><strong>输出审计</strong>：密钥/内网 IP/数据库串泄露检测</li>
+<li><strong>防篡改审计</strong>：HMAC 链式哈希，篡改即暴露</li>
+<li><strong>热加载</strong>：自定义规则与阈值改完秒级生效，不用重启</li>
+<li><strong>零运行时依赖</strong>：仅 Node 内置模块，自身无供应链风险</li>
+</ul>
+<h2>安装</h2>
+<pre><code>dsh plugin --profile web add dsh-guardwall
+</code></pre>
+<p>验证挂载：</p>
+<pre><code>dsh --profile web --dump-config | grep -A2 'id: guardwall'
+</code></pre>
+<blockquote>
+<p>npm 尚未发布时可用 GitHub 通道：<code>dsh plugin --profile web add "github:iiiweiii/dsh-guardwall#main"</code></p>
+</blockquote>
+<h2>第一层 · 安装前体检</h2>
+<p><strong>"装这个插件 = 给了它什么权限？"</strong> —— 装之前先回答：</p>
+<pre><code>npx guardwall check &lt;spec&gt;              # 体检输出报告
+npx guardwall add &lt;spec&gt; [--force]      # 体检 → 门禁通过才安装
+# spec：本地路径 / npm 包名 / github:owner/repo
+</code></pre>
+<p>四步体检：</p>
+<ol>
+<li><strong>权限清单</strong> —— 静态分析源码，列出插件访问的<strong>文件路径</strong>（~/.ssh、.env、云凭据）、<strong>执行的命令</strong>（rm、curl、sudo）、<strong>连接的域名</strong>（正常 API / SSRF 元数据 / 遥测端点）</li>
+<li><strong>静态风险扫描</strong> —— 依赖树 + 危险模式（eval、动态执行、密钥读取、SSRF 目标、无约束递归删除、混淆载荷、安装脚本）</li>
+<li><strong>信任评分 A–D</strong> —— 维护活跃度 · 代码质量 · 已知漏洞（npm audit）· 来源可信度 · 运行时健康，五维加权（阈值：A≥78 / B 70–77 / C 50–69 / D&lt;50）</li>
+<li><strong>安装门禁</strong> —— D 级拒绝（<code>--force</code> 放行）、C 级警告、A/B 放行</li>
+</ol>
+<p>对话里问 Agent"这个插件安全吗"会调用 <code>guard_check</code> 工具；接口：<code>GET /plugins/dsh-guardwall/vet?spec=&lt;pkg&gt;</code>。</p>
+<h3>批量压测：前 120 高星插件</h3>
+<p>按 stars 取 awesome-dsh-plugin 前 120 个插件全量体检，覆盖率 91%（110/120），
+校准了评分阈值并修复多种误判（skill 类插件、提示注入、GitHub 元数据、源码未装依赖等）：</p>
+<img src="https://raw.githubusercontent.com/iiiweiii/dsh-guardwall/HEAD/assets/batch-vetting-report.svg" alt="dsh-guardwall 对 120 个高星插件的批量体检结果">
+
+<p>批量工具：<code>node scripts/batch-vet.mjs</code>（读 plugins.json，输出 batch-result.jsonl），
+体检汇总见 <a href="https://github.com/iiiweiii/dsh-guardwall/blob/HEAD/docs/batch-vetting-report.md">docs/batch-vetting-report.md</a>、
+评分校准记录见 <a href="https://github.com/iiiweiii/dsh-guardwall/blob/HEAD/docs/scoring-calibration.md">docs/scoring-calibration.md</a>。</p>
+<h2>第二层 · 运行时护栏</h2>
+<p>在工具调用执行前拦截高危参数（输入侧 <code>tools/execute</code>），监听输出泄露（输出侧 <code>tools/result</code>）。
+Agent 被诱导执行 <code>rm -rf /</code> 时，调用被替换为：</p>
+<pre><code>Error: dsh-guardwall 拦截了该调用（规则 SEC-001 · 风险 10/10）
+原因：破坏性删除/格式化/磁盘写入
+建议：禁止对根目录/家目录/系统盘执行删除或格式化；如确需清理，改用回收站或限定路径后二次确认
+如需放行，请用户明确确认后调用 guard_whitelist 临时放行（或调整策略阈值）。
+</code></pre>
+<blockquote>
+<p>与社区安全插件的差异：44/51 个是静态扫描（对运行时动态构造的命令全盲）；运行时拦截的 7 个依赖
+cordis/dsh-tools（与恶意插件同框架）。本插件零依赖 + 密码学链式审计收据。</p>
+</blockquote>
+<h2>热加载 · 改规则不用重启</h2>
+<ul>
+<li><p><strong>自定义规则</strong>：<code>~/.dsh/cache/dsh-guardwall/rules.d/*.json</code>，保存即生效</p>
+<pre><code>[
+  { "id": "MY-001", "direction": "input", "risk": 8,
+    "re": "internal\\.corp\\d+\\.com", "summary": "禁止访问内网域名", "advice": "确认授权后访问" }
+]
+</code></pre>
+</li>
+<li><p><strong>热配置</strong>：同目录 <code>config.json</code> 改阈值立即生效：<code>{ "blockThreshold": 6, "warnThreshold": 3 }</code></p>
+</li>
+<li><p>工具：<code>guard_reload</code> 手动刷新 · <code>guard_rules</code> 查看生效规则</p>
+</li>
+</ul>
+<h2>规则表</h2>
+<p>输入侧（可拦截）：</p>
+<table>
+<thead>
+<tr>
+<th>ID</th>
+<th>风险</th>
+<th>检测</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>SEC-001</td>
+<td>10</td>
+<td>破坏性删除/格式化/磁盘写入（rm -rf /、format、mkfs、dd 到块设备）</td>
+</tr>
+<tr>
+<td>SEC-002</td>
+<td>9</td>
+<td>访问凭据/密钥文件（~/.ssh、.aws、.env、.netrc 等）</td>
+</tr>
+<tr>
+<td>SEC-003</td>
+<td>9</td>
+<td>参数中出现疑似明文凭据（password=、sk-、AKIA、ghp_）</td>
+</tr>
+<tr>
+<td>SEC-004</td>
+<td>9</td>
+<td>SSRF：云元数据端点（169.254.169.254 / metadata 域名）</td>
+</tr>
+<tr>
+<td>SEC-005</td>
+<td>10</td>
+<td>反向 shell / 下载执行管道（bash -i、nc -e、/dev/tcp、curl|sh）</td>
+</tr>
+<tr>
+<td>SEC-006</td>
+<td>8</td>
+<td>命令链注入（;rm、&amp;&amp;rm、反引号执行）</td>
+</tr>
+<tr>
+<td>SEC-007</td>
+<td>8</td>
+<td>提权/权限变更（sudo su、chmod 777 /）</td>
+</tr>
+<tr>
+<td>SEC-008</td>
+<td>9</td>
+<td>系统关键文件/设备写入（/etc/passwd、/boot、SYSTEM32）</td>
+</tr>
+<tr>
+<td>SEC-009</td>
+<td>5</td>
+<td>对外发布操作（git push / npm publish，默认放行但审计）</td>
+</tr>
+</tbody></table>
+<p>输出侧（只读审计）：</p>
+<table>
+<thead>
+<tr>
+<th>ID</th>
+<th>风险</th>
+<th>检测</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>OUT-001</td>
+<td>10</td>
+<td>密钥/私钥泄露（sk-、AKIA、Bearer、BEGIN PRIVATE KEY）</td>
+</tr>
+<tr>
+<td>OUT-002</td>
+<td>6</td>
+<td>内网 IP 输出</td>
+</tr>
+<tr>
+<td>OUT-003</td>
+<td>8</td>
+<td>带口令数据库连接串</td>
+</tr>
+<tr>
+<td>OUT-004</td>
+<td>8</td>
+<td>环境变量密钥 dump</td>
+</tr>
+<tr>
+<td>OUT-005</td>
+<td>7</td>
+<td>公钥/证书/私密材料</td>
+</tr>
+</tbody></table>
+<h2>策略与配置</h2>
+<p>默认：<code>risk &gt;= 7</code> 拦截、<code>risk &gt;= 4</code> 告警、其余记录。可在 <code>cordis.patch.yml</code> 的 <code>config</code> 调整：</p>
+<pre><code>- insert:
+    - id: guardwall
+      name: dsh-guardwall
+      config:
+        blockThreshold: 7
+        warnThreshold: 4
+        dataDir: ~/.dsh/cache/dsh-guardwall
+</code></pre>
+<h2>工具</h2>
+<table>
+<thead>
+<tr>
+<th>工具</th>
+<th>用途</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>guard_check</code></td>
+<td>安装前体检（权限/风险/评分/门禁建议）</td>
+</tr>
+<tr>
+<td><code>guard_status</code></td>
+<td>拦截/告警/记录统计、审计链完整性、白名单</td>
+</tr>
+<tr>
+<td><code>guard_whitelist</code></td>
+<td>临时放行某规则（rule + tool + 分钟数）</td>
+</tr>
+<tr>
+<td><code>guard_reload</code></td>
+<td>手动重载热加载规则与配置</td>
+</tr>
+<tr>
+<td><code>guard_rules</code></td>
+<td>查看生效规则与热加载状态</td>
+</tr>
+</tbody></table>
+<p>审计接口：<code>GET /plugins/dsh-guardwall/audit</code>；体检接口：<code>GET /plugins/dsh-guardwall/vet?spec=&lt;pkg&gt;</code>。</p>
+<h2>审计</h2>
+<p>数据落在 <code>~/.dsh/cache/dsh-guardwall/</code>：<code>audit-YYYY-MM-DD.jsonl</code>（每条含 prevHash + HMAC hash）、
+<code>chain.key</code>（链密钥，0600 权限）。任何一条被篡改 → <code>verify()</code> 返回 <code>{ok:false, brokenAt:n}</code>。
+本地读写、无网络调用、无遥测；拦截只影响工具调用结果，不修改宿主配置。</p>
+<h2>兼容性</h2>
+<ul>
+<li>真机验证：<code>@deepseek-ai/dsh 0.1.0-rc.5</code>（web profile，拦截/审计/接口实测通过）</li>
+<li><code>tools/execute</code>（可拦截）、<code>tools/result</code>（只读）为宿主标准事件；接口走 <code>webServer.register</code></li>
+<li>预览版 API 可能变动，若失效先看 <code>--dump-config</code> 与宿主升级日志</li>
+</ul>
+<h2>路线图</h2>
+<ul>
+<li> 白名单按 agent/会话隔离</li>
+<li> 高敏操作二次确认（approval 集成）</li>
+<li> 审计导出 + 周报</li>
+<li> npm 发布（<code>dsh plugin add dsh-guardwall</code> 一键安装）</li>
+</ul>
+<h2>License</h2>
+<p>MIT</p>

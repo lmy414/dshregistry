@@ -1,0 +1,130 @@
+<h1>dsh-openai-server-compaction</h1>
+<p>A native DeepSeek Harness plugin that adds Codex-style server compaction to
+OpenAI Responses routes managed by DSH's built-in <code>llm-pi-ai</code> plugin.</p>
+<p>It uses an API key. OAuth and the ChatGPT Codex backend are not implemented.</p>
+<p><a href="https://github.com/ylxmf2005/dsh-openai-server-compaction/blob/HEAD/README.zh-CN.md">中文说明</a></p>
+<h2>How it works</h2>
+<p><code>llm-pi-ai</code> remains the single owner of provider connection and model data:</p>
+<ul>
+<li>provider route name and display name</li>
+<li><code>api: openai-responses</code></li>
+<li>API base URL and credential reference</li>
+<li>model IDs, context windows, output capabilities, and custom headers</li>
+</ul>
+<p>This plugin stores only per-route compaction policy. For each enabled,
+explicitly configured Responses route it:</p>
+<ul>
+<li>handles normal model requests through <code>POST /v1/responses</code></li>
+<li>sends manual, token-pressure, and overflow compaction through Codex Remote
+Compaction V2: it appends <code>{ "type": "compaction_trigger" }</code> to a normal
+<code>POST /v1/responses</code> request and enables the <code>remote_compaction_v2</code> feature</li>
+<li>retains up to 64,000 tokens of recent real user messages together with the
+single opaque <code>compaction</code> item returned by the server, stores that native
+replacement history outside session JSONL, and restores it after restart</li>
+<li>writes a portable text checkpoint into normal DSH history for other targets</li>
+</ul>
+<p>Enabled route requests are intentionally handled by this plugin's Responses
+adapter rather than passed to pi-ai. That is required to preserve and restore
+opaque Responses replay state that pi-ai does not understand. Disabled routes,
+non-Responses routes, and models not listed on an enabled route pass through to
+their normal adapter unchanged.</p>
+<p>There is no silent Chat Completions fallback. Missing credentials, ambiguous
+legacy configuration, unsupported route facts, malformed Responses streams,
+missing state, and unsupported content fail explicitly.</p>
+<h2>Install</h2>
+<pre><code>dsh plugin --profile web add dsh-openai-server-compaction
+</code></pre>
+<p>For a Git checkout:</p>
+<pre><code>dsh plugin --profile web add https://github.com/ylxmf2005/dsh-openai-server-compaction.git
+</code></pre>
+<p>If pnpm reports <code>ERR_PNPM_ADDING_TO_ROOT</code> for a workspace-style profile,
+repeat the command with <code>-w</code> immediately after <code>add</code>.</p>
+<p>The bundle replaces <code>compaction-basic</code>, but it does not create or enable an
+OpenAI route. It stays dormant until a route is configured in both namespaces.</p>
+<h2>Configure</h2>
+<h3>1. Create a Responses route</h3>
+<p>Open DSH <strong>Settings -&gt; Models</strong> and create or edit an <code>llm-pi-ai</code> provider
+route. The route must explicitly use <code>openai-responses</code> and declare every
+model that should support server compaction.</p>
+<p>Equivalent settings YAML:</p>
+<pre><code>llm-pi-ai:
+  providers:
+    openai:
+      displayName: OpenAI Responses
+      api: openai-responses
+      baseURL: https://api.openai.com/v1
+      apiKeyEnv: OPENAI_API_KEY
+      models:
+        - id: gpt-5.6
+          name: GPT-5.6
+          contextWindow: 1050000
+          maxTokens: 128000
+</code></pre>
+<p>Store <code>OPENAI_API_KEY</code> through DSH's credentials UI/service or export it in
+the environment that starts DSH. The key is never stored in this plugin's
+settings.</p>
+<p>An enabled route must provide an explicit <code>api: openai-responses</code>, a non-empty
+<code>baseURL</code> and <code>apiKeyEnv</code>, at least one model, and a positive
+<code>contextWindow</code> on each model (or an explicit provider
+<code>defaultContextWindow</code>). The plugin refuses to guess these facts because an
+incorrect context capacity would make the compaction threshold dishonest.</p>
+<h3>2. Enable compaction for the route</h3>
+<p>Open DSH <strong>Settings -&gt; Plugins -&gt; OpenAI Compaction</strong>. This native plugin tab
+lists routes already configured as <code>openai-responses</code>. Enable the desired
+route and choose its trigger threshold.</p>
+<p>Equivalent settings YAML:</p>
+<pre><code>openai-server-compaction:
+  routes:
+    openai:
+      enabled: true
+      thresholdRatio: 0.7
+</code></pre>
+<p>The route key, <code>openai</code> in this example, must exactly match the key under
+<code>llm-pi-ai.providers</code>.</p>
+<p>Compaction policy is restart-applied. Restart DSH after changing this section.
+The server compaction request does not send <code>max_output_tokens</code>, matching
+Codex. Separately, the plugin creates a portable text checkpoint capped at
+4,096 output tokens so a DSH session can still continue on another provider;
+this internal cap is not a server-compaction output limit.
+<code>stateFile</code> is operational composition configuration, not a user setting. The
+bundle defaults it to:</p>
+<pre><code>$DSH_HOME/openai-server-compaction/state.json
+</code></pre>
+<h2>Migrating from 0.2.x</h2>
+<p>The old <code>llm-openai-server-compaction</code> namespace mixed connection, model, and
+policy data. It is not migrated silently because the destination route name is
+ambiguous.</p>
+<ol>
+<li>Move <code>baseURL</code>, <code>apiKeyEnv</code>, and <code>models</code> into
+<code>llm-pi-ai.providers.&lt;route&gt;</code>.</li>
+<li>Add <code>api: openai-responses</code> to that provider profile.</li>
+<li>Move <code>thresholdRatio</code> into <code>openai-server-compaction.routes.&lt;route&gt;</code>, set
+<code>enabled: true</code>, and remove the obsolete route-level <code>maxTokens</code> value.</li>
+<li>Remove the complete <code>llm-openai-server-compaction</code> section.</li>
+</ol>
+<p>The plugin refuses startup with these instructions while a non-empty legacy
+section remains.</p>
+<h2>Persistence</h2>
+<p>DSH's compaction contract has no public field for adapter-private opaque
+compaction items. The plugin therefore writes encrypted provider state to
+<code>stateFile</code> and embeds only a UUID marker in the portable checkpoint.</p>
+<p>Keep this file with the DSH session store and treat it as private application
+data. If it is lost, compatible OpenAI replay fails explicitly, while the
+portable summary remains usable by another provider. Opaque state is bound to
+the provider route and model that created it.</p>
+<h2>Development</h2>
+<pre><code>npm install
+npm test
+npm run check
+npm run build
+npm pack --dry-run
+</code></pre>
+<p>Automated tests use stubbed HTTP responses and never call a paid API. The live
+smoke test is separate, explicit, and billable:</p>
+<pre><code>OPENAI_API_KEY=... OPENAI_MODEL=... npm run smoke:live
+</code></pre>
+<p><code>docs/marketplace-entry.yml</code> is a draft for <code>awesome-dsh-plugin</code>. Registry
+submission still requires its repository-age, commit-count, and GitHub
+<code>dsh-plugin</code> topic rules.</p>
+<h2>License</h2>
+<p>MIT</p>

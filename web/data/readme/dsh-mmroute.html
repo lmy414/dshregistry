@@ -1,0 +1,271 @@
+<h1>dsh-mmroute — 多模态路由（全程交叉版）</h1>
+<p><a href="https://github.com/topics/dsh-plugin"><img src="https://img.shields.io/badge/topic-dsh--plugin-blue" alt="dsh-plugin"></a> <a href="https://github.com/jmxsxwyzjdwl/dsh-mmroute/blob/HEAD/.github/workflows/ci.yml"><img src="https://img.shields.io/badge/CI-smoke%20suites-green" alt="CI"></a></p>
+<p><strong>English summary</strong> — Multimodal router for <a href="https://github.com/deepseek-ai/deepseek-harness">DeepSeek Harness</a> (DSH). Text-only models (e.g. DeepSeek, GLM) can still handle visual tasks: every image in <strong>every step of the agent stream</strong> — user uploads, <code>read_image</code> results, MCP tool renders (Figma screenshots, …) — is transcribed into detailed text (verbatim OCR, chart data, visual detail) by a multimodal understander model before the request is dispatched, cached per attachment. Unmarked models are auto-classified by their adapter-declared modalities (overridable per model); image-related request failures self-recover by rerouting through the understander and retrying. Settings page: mark models multimodal/text-only, pick the understander, watch transcription/recovery stats. Works with PNG / JPEG / WebP / GIF.</p>
+<p>为 <a href="https://github.com/deepseek-ai/deepseek-harness">DeepSeek Harness</a>（DSH）里的每一条模型路由做<strong>图片模态调度</strong>，并且<strong>贯穿整个 agent 流程</strong>：</p>
+<ul>
+<li><strong>多模态模型 / 声明图片输入的模型</strong> —— 图片原样直发；</li>
+<li><strong>纯文本模型</strong>（显式标记，或「自动纯文本路由」判定）—— 每次请求里的每张图片，先由指定的<strong>多模态理解模型</strong>转述为详细文字（含图中文字逐字转录、图表数据转录、视觉细节），再连同对话一起交给纯文本模型作答；</li>
+<li><strong>报错自愈</strong> —— 纯文本模型（或网关实际拒图的"多模态"模型）一旦出现图片类失败，自动把该路由转入转述路径并让 agent loop 重试：<strong>两类模型在整条流程里交叉接手</strong>，而不是"第一次读完图就不再管"。</li>
+</ul>
+<p>这样，DeepSeek、GLM 等纯文本模型也能处理看图问答、截图分析、Figma 渲染审查等视觉任务。</p>
+<blockquote>
+<p>Multimodal router for DeepSeek Harness: text-only models get every image in every step transcribed to detailed text by a multimodal understander before the request is dispatched; image-related request failures auto-recover by rerouting through the understander and retrying. Works with image attachments (PNG / JPEG / WebP / GIF).</p>
+</blockquote>
+<h2>工作原理</h2>
+<pre><code>agent loop 的每一次模型调用（每个 step：用户首图、read_image 返回、
+MCP 工具（如 Figma get_screenshot）中途产生的新渲染图……）
+   │
+   ├─ ① 准入放宽：resolveModelInfo 遮蔽让「会被转述」的模型通过
+   │     harness 的图片准入检查（用户上传 / read_image / MCP 图片 alike）
+   │
+   ├─ ② llm/stream 拦截：按 attachmentId 收集本次请求的全部图片
+   │     （含 tool-result 嵌套形态），逐张交给理解模型做**全量结构化
+   │     转述**（≤12000 字符：图型判定 / 全部文字逐字转录 / 图表数据
+   │     / 布局 / 颜色 / 异常 / 不确定区域；内容寻址缓存，跨步骤 / 跨
+   │     重启有效；当前问题作为侧重参考注入，但完整性优先、绝不省略）
+   │
+   └─ ③ 改写后的纯文本请求交给原模型作答 —— 对话完全无感
+         转述末尾附 [提示] 行：作答模型可调用 vision_relook 工具对
+         任意已转述图片发起聚焦复看（「指挥与执行」协作）
+
+任何一步漏网（未标记、网关拒图……）导致适配器报图片类错误时：
+   └─ ④ agent/request-error 自愈：拉理解模型转述 → retry
+        （每条路由每进程最多自愈 2 次，杜绝重试风暴）
+</code></pre>
+<ul>
+<li><strong>自动纯文本路由</strong>（默认开启）：未标记的模型按适配器原生声明判定 —— 声明图片 → 直发；声明纯文本或未声明 → 自动按纯文本处理（先转述再作答）。关闭后未标记模型完全保持 harness 原生行为。</li>
+<li>显式标记优先于自动判定：「多模态」标记的模型请求（含图片）原样直发，适合适配器未声明图片能力、但网关实际支持的模型；「纯文本」标记的模型总是先转述。</li>
+<li><strong>单一理解模型，用户手选</strong>：理解模型即你 dsh 配置里的多模态模型（自动发现或手动指定），不内置免费端点、不借用任何外部登录态；并发转述同一张图自动合并为一次调用。</li>
+<li><strong>vision_relook 定点复看</strong>：作答的文本模型可对任意已转述图片发起聚焦核查（<code>attachmentId + 聚焦问题 + 可选区域</code>），由理解模型逐字精确作答、看不清就明说 —— 两个用户手选的模型形成「指挥与执行」协作。</li>
+<li><strong>准确性 + 完整性铁律</strong>（设计原则）：给纯文本模型的数据必须准确且完整 —— 逐字转录不翻译、全量覆盖不因侧重省略、宁声明「不确定区域」绝不猜测；单条转述上限 12000 字符（足以容纳密集截图的全量逐字转录）。</li>
+<li><strong>历史图摘要重放</strong>（默认开启）：同一张图在会话历史中再次出现时以 ≤1200 字符摘要重放，首次出现仍为全量转述 —— 长会话不因旧图全量重放而膨胀；可在设置页关闭。</li>
+<li>理解模型不可用 / 调用失败 / 返回空描述时，以说明性占位文字降级，<strong>不会中断对话轮次</strong>。</li>
+</ul>
+<h2>安装</h2>
+<pre><code>dsh plugin --profile web add dsh-mmroute
+</code></pre>
+<p>本地开发安装（<code>&lt;path&gt;</code> 为本仓库的检出路径）：</p>
+<pre><code>dsh plugin --profile web add &lt;path&gt;/dsh-mmroute
+</code></pre>
+<p><code>dsh plugin</code> 是 pnpm 转发器：会把依赖写入 profile 的 <code>package.json</code>，并把声明了 <code>dsh.bundle</code> 的包自动加入 <code>dsh.profile.bundles</code>。安装后<strong>重启 dsh web</strong> 生效。</p>
+<p>或手动加入 profile 的 <code>package.json</code>（路径相对 profile 目录）：</p>
+<pre><code>{
+  "dependencies": { "dsh-mmroute": "file:../dsh-mmroute" },
+  "dsh": { "profile": { "bundles": ["dsh-mmroute"] } }
+}
+</code></pre>
+<h2>使用</h2>
+<ol>
+<li>打开 <strong>设置 → 多模态路由</strong>（侧边栏底部设置面板内）。</li>
+<li>「自动路由与报错自愈」卡片：<ul>
+<li><strong>自动纯文本</strong>开关（默认开启）—— 未标记模型的自动判定与报错自愈总开关；</li>
+<li><strong>历史图摘要</strong>开关（默认开启）—— 旧图重放用截断摘要，节省上下文；</li>
+<li>运行统计（转述 / 自愈 / 复看次数）与已自动转入转述路径的路由列表。</li>
+</ul>
+</li>
+<li>在「多模态理解模型」下拉中选择：<ul>
+<li><strong>自动</strong> —— 使用发现的第一个原生多模态模型；</li>
+<li>或指定任一候选（含你手动标记为多模态的网关模型）。</li>
+</ul>
+</li>
+<li>（可选）在「模型模态标记」里为个别模型显式选择 <strong>默认 / 多模态 / 纯文本</strong>，覆盖自动判定。</li>
+<li>直接在对话里粘贴 / 上传图片，或让 agent 调 Figma 等 MCP 工具产生渲染图即可 —— 每一步的新图都会被处理。</li>
+</ol>
+<p>配置持久化在本机 <code>$DSH_HOME/mmroute.json</code>（默认 <code>~/.dsh/mmroute.json</code>），重启后仍然生效；可在设置页一键清除图片转述缓存。</p>
+<h2>免费与本地理解模型</h2>
+<p>理解模型可以是任何声明图片输入的 provider —— 包括免费云模型与本地模型。以下片段合并进 <code>$DSH_HOME/settings.yaml</code> 的 <code>llm-pi-ai.providers</code> 段（注意：Web「添加自定义提供方」表单不会写入图片能力元数据，视觉模型请手写 <code>input: [text, image]</code>）：</p>
+<pre><code># 智谱 bigmodel.cn —— glm-4.6v-flash 永久免费（大陆直连）
+llm-pi-ai:
+  providers:
+    zhipu:
+      api: openai-completions
+      baseURL: https://open.bigmodel.cn/api/paas/v4
+      apiKeyEnv: ZAI_API_KEY
+      models:
+        - id: glm-4.6v-flash
+          name: "智谱: GLM-4.6V-Flash (永久免费)"
+          contextWindow: 131072
+          maxTokens: 8192
+          input: [text, image]
+</code></pre>
+<p>Key 写入 <code>~/.dsh/.credentials.yaml</code>（<code>ZAI_API_KEY: sk-...</code>）或导出同名环境变量，重启 <code>dsh web</code> 后该模型即可在「多模态理解模型」下拉中使用。其他免费渠道：阿里云百炼（新用户每系列 100 万 token/90 天，<code>qwen-vl-plus</code> 等）、硅基流动（Qwen2.5-VL 系列）。<strong>本地 Ollama</strong> 同样适用：把本地视觉模型配为 pi-ai provider（OpenAI 兼容端点 <code>http://127.0.0.1:11434/v1</code>，声明 <code>input: [text, image]</code>）即可完全离线转述。理解模型全量转述对小模型要求不高，免费额度通常足够。</p>
+<h2>边界行为（发布者自查清单）</h2>
+<table>
+<thead>
+<tr>
+<th>场景</th>
+<th>行为</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>agent 流程中途出现新图片（工具返回 / MCP 渲染）</td>
+<td>该步请求在发送前被拦截转述，含 tool-result 嵌套形态</td>
+</tr>
+<tr>
+<td>未标记模型 + 自动纯文本路由开启</td>
+<td>按适配器声明判定：声明图片直发，否则转述</td>
+</tr>
+<tr>
+<td>未标记模型 + 自动纯文本路由关闭</td>
+<td>完全保持 harness 原生行为（含原生拒绝）</td>
+</tr>
+<tr>
+<td>图片类请求失败（UNSUPPORTED_CONTENT / 网关拒图文案）</td>
+<td>自动转入转述路径并 retry；每路由每进程 ≤2 次</td>
+</tr>
+<tr>
+<td>自愈后再次请求</td>
+<td>命中内存 override，直接转述（重启后失效，可固定为标记）</td>
+</tr>
+<tr>
+<td>理解模型指向纯文本标记的模型自身</td>
+<td>理解调用失败 → 占位文字降级，无递归（WeakSet 放行自有请求）</td>
+</tr>
+<tr>
+<td>无任何多模态模型可用</td>
+<td>占位文字说明如何配置，对话继续；自愈不触发</td>
+</tr>
+<tr>
+<td>理解调用失败 / 空描述 / 中止 / 限流</td>
+<td>该图降级为占位文字，对话不中断，其余图片不受影响</td>
+</tr>
+<tr>
+<td>文本模型调用 vision_relook</td>
+<td>对已转述图片聚焦核查：逐字精确作答，看不清/未找到明确说明</td>
+</tr>
+<tr>
+<td>并发请求转述同一张图</td>
+<td>合并为一次理解调用（in-flight 去重）</td>
+</tr>
+<tr>
+<td>同一张图在会话历史中再次出现</td>
+<td>摘要重放（≤1200 字符，可关闭）；首次出现仍为全量；同一请求内全量始终在场，摘要不损失信息</td>
+</tr>
+<tr>
+<td>超长描述</td>
+<td>截断至 12000 字符并注明（完整性优先：足以容纳密集截图的全量逐字转录）</td>
+</tr>
+<tr>
+<td>缓存 / 标记数量</td>
+<td>转述缓存上限 300 条（FIFO 淘汰）；标记上限 2000 条</td>
+</tr>
+<tr>
+<td>状态文件损坏 / 字段异常</td>
+<td>按默认值重新开始，不阻断宿主启动</td>
+</tr>
+<tr>
+<td>会话已有图片时切换到会被转述的模型</td>
+<td>准入放行（这正是放宽的目的）</td>
+</tr>
+<tr>
+<td>会话已有图片时切换到原生拒图模型（自动路由关闭）</td>
+<td>harness 原生拒绝（行为不变）</td>
+</tr>
+<tr>
+<td>provider/model id 含 <code>/</code>、引号、Unicode</td>
+<td>精确字符串键 + JSON 编码，无解析歧义</td>
+</tr>
+<tr>
+<td>悬空标记（provider 已移除）</td>
+<td>不显示、不计数、不生效，但保留在状态文件中</td>
+</tr>
+<tr>
+<td>两个浏览器标签页同时写配置</td>
+<td>每个方法只触碰自己的键，落盘同步无交错</td>
+</tr>
+<tr>
+<td>跨站 / DNS-rebinding 攻击 API</td>
+<td>信任围栏：仅回环或 trustedHosts + 同源标记 + JSON Content-Type + 64KB 上限</td>
+</tr>
+<tr>
+<td>无头配置（无 webServer）</td>
+<td>拦截层照常工作，仅设置页不可用</td>
+</tr>
+</tbody></table>
+<h2>与其他视觉插件的对比</h2>
+<p>以下对比基于对各项目源码的实际阅读（2026-08），供按需选择；不同插件可共存，但<strong>同装多套视觉桥会互相短路，建议只启用一条图片通路</strong>。</p>
+<table>
+<thead>
+<tr>
+<th>插件</th>
+<th>路线</th>
+<th>拦截机制</th>
+<th>视觉引擎</th>
+<th>是否需要换模型/路由</th>
+<th>图片类报错自愈</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong>dsh-mmroute（本插件）</strong></td>
+<td>描述桥 + 定点复看</td>
+<td><code>llm/stream</code> 透明全拦（agent 循环外也覆盖）</td>
+<td>你在 dsh 里配置的任一多模态模型</td>
+<td><strong>否</strong>：原图发进原模型组即工作</td>
+<td>✅</td>
+</tr>
+<tr>
+<td>modlens</td>
+<td>描述桥 + 工具</td>
+<td><code>agent/pre-step</code> + 包装 provider + read_image 工具</td>
+<td>借用本机 CLI 登录态（Claude Code / Codex 等）+ API key</td>
+<td>需选「(modlens vision)」条目或依赖粘贴路由</td>
+<td>❌</td>
+</tr>
+<tr>
+<td>dsh-vision-router</td>
+<td>路由桥 + 像素工具集</td>
+<td><code>agent/pre-step</code> + <code>agent/request</code></td>
+<td>内置免费兜底链 + 预设</td>
+<td>需切孪生模型组</td>
+<td>❌</td>
+</tr>
+<tr>
+<td>dsh-vision-sidecar</td>
+<td>描述桥</td>
+<td>注册伪 provider 路由（零 hook）</td>
+<td>默认免费匿名端点（LLM7.io），可自定义</td>
+<td>需选伪路由（安装补丁还会改默认模型）</td>
+<td>❌</td>
+</tr>
+<tr>
+<td>dsh-vision-proxy</td>
+<td>描述桥</td>
+<td>包装 deepseek 官方 adapter（零 hook）</td>
+<td>外部直连端点 + 本地 Ollama 探测</td>
+<td>需选 <code>deepseek-vision</code> 路由</td>
+<td>❌</td>
+</tr>
+<tr>
+<td>dsh-vision-provider</td>
+<td>描述桥（组合菜单）</td>
+<td>注册复合 provider（零 hook）</td>
+<td>内置 OpenAI 端点 + 复用 dsh 已注册模型</td>
+<td>需选「DeepSeek + Vision」组合条目</td>
+<td>❌</td>
+</tr>
+<tr>
+<td>dsh-tool-vision</td>
+<td>工具桥</td>
+<td><code>tools.register</code>（15 个工具）+ <code>agent/pre-step</code> 指针</td>
+<td>你配置的 OpenAI 兼容端点</td>
+<td>模型需主动调工具读图</td>
+<td>❌</td>
+</tr>
+</tbody></table>
+<p>本插件的差异化定位：<strong>不内置任何免费端点、不借用任何外部登录态</strong>——视觉引擎就是你亲手配置的那个多模态模型；配合 <code>vision_relook</code> 定点复看与任务背景注入，让两个你手选的模型形成「指挥与执行」协作。代价是开箱前需要先有一个多模态 provider（参见上文「免费与本地理解模型」）。</p>
+<h2>安全与隐私说明</h2>
+<ul>
+<li>标记与自动判定是<strong>对端点能力的声明，不是检测</strong>：把实际不支持图片的模型标成「多模态」，请求会由供应商报错（与 pi-ai 官方 <code>input: [text, image]</code> 声明语义一致）—— 此类报错会被报错自愈捕获并自动降级为转述。</li>
+<li>理解模型调用会把图片发送给你指定的多模态模型 —— 请自行确认该模型的隐私条款。</li>
+<li><strong>防注入</strong>：图片内容对作答模型是不可信输入。转述系统指令含防注入铁律（图中指令性文字只逐字转录、绝不执行），转述块头部标注「未经核实的视觉证据」；<code>vision_relook</code> 复看同样适用。</li>
+<li>设置 API 仅接受本机同源请求；插件不上报任何数据。</li>
+<li><code>resolveModelInfo</code> 的遮蔽只影响图片准入与模型目录展示，不参与请求路由校验；插件停用后自动恢复原方法。</li>
+</ul>
+<h2>已知限制</h2>
+<ul>
+<li>当前 DSH 附件系统 v1 仅支持<strong>图片</strong>（PNG / JPEG / WebP / GIF）；视频不在支持范围内。</li>
+<li>理解模型的 token 消耗独立计费，不出现在主对话的用量统计中。</li>
+<li>报错自愈依赖失败文案 / 错误码的图片特征启发式（<code>UNSUPPORTED_CONTENT</code> + image 字样，或 message 含 image / multimodal / vision / 视觉 / 图片）；无法识别的文案不会触发自愈，但显式「纯文本」标记仍会全程转述。</li>
+</ul>
+<h2>许可</h2>
+<p>MIT</p>

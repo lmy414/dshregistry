@@ -1,0 +1,110 @@
+<h1>dsh-tool-result-guard</h1>
+<p>English | <a href="https://github.com/may3rr/dsh-tool-result-guard/blob/HEAD/README.zh.md">中文</a></p>
+<p><strong>Zero-loss tool-result pruning for the <a href="https://www.npmjs.com/package/@deepseek-ai/dsh">DeepSeek Harness (DSH)</a>.</strong> A <code>dsh-plugin</code>.</p>
+<p>Oversized plain-text tool results are <strong>spilled to a file first</strong>, then replaced with a bounded head/tail preview whose position-0 marker carries the exact elided span and the spill locator. The model can always recover the middle; nothing is ever dropped without a durable copy.</p>
+<pre><code>[pruned: kept chars [0, 4096) + [28976, 30000) of 30000; the elided middle
+[4096, 28976) is NOT lost — full output saved at: /tmp/dsh-spill/.../bash.txt.
+Recover any elided span with the read tool (offset/limit), grep, or sed on that file.]
+
+&lt;head: first 4096 chars&gt;
+
+[... middle elided ...]
+
+&lt;tail: last 1024 chars&gt;
+</code></pre>
+<h2>Why</h2>
+<p>DSH ships two built-in mechanisms:</p>
+<table>
+<thead>
+<tr>
+<th>mechanism</th>
+<th>trigger</th>
+<th>behavior</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>dsh-spill-policy</code></td>
+<td>result &gt; <code>maxInlineBytes</code> (default 50000 <strong>bytes</strong>) at post-execute</td>
+<td>full text to <code>ctx.spillStore</code>, bounded preview + locator returned — <strong>zero-loss</strong></td>
+</tr>
+<tr>
+<td><code>dsh-compaction-tool-result-pruner</code></td>
+<td>text &gt; 8192 chars, only <strong>when compaction pressure qualifies</strong></td>
+<td>head 4096 + <code>[... tool result middle pruned ...]</code> + tail 1024. The original event stays in the append-only session log for replay, but the model gets <strong>no locator, no offsets, and no tool to read the log</strong> — the middle is unrecoverable for the model</td>
+</tr>
+</tbody></table>
+<p>The gap: results between ~8K chars and 50K bytes that survive until compaction are pruned <strong>with no model-facing recovery path</strong>. This plugin closes the gap by pruning earlier (at <code>tools/post-execute</code>), always spilling the full text first, and embedding the exact elided span <code>[head, total-tail)</code> plus the locator in the marker.</p>
+<p>If you install this plugin, the built-in pruner finds nothing over 8K chars on the surface and becomes a no-op; you may keep or remove its row. Same for <code>spill-policy</code> (its cap is never reached). Keeping both is harmless.</p>
+<h2>Install</h2>
+<p>One command:</p>
+<pre><code>dsh plugin --profile web add dsh-tool-result-guard
+</code></pre>
+<p>Restart DSH. Done — it now applies to every agent preset in that profile. Remove with <code>dsh plugin --profile web remove dsh-tool-result-guard</code>.</p>
+<p>Tune the budgets by id in your profile's <code>~/.dsh/profiles/web/cordis.patch.yml</code>:</p>
+<pre><code>- id: tool-result-guard
+  config:
+    thresholdChars: 16384
+</code></pre>
+<details>
+<summary>Alternative: preset-level install without pnpm (single agent preset instead of the whole profile)</summary>
+
+<pre><code>npx dsh-tool-result-guard install --preset my-preset --from standard
+</code></pre>
+<p>copies the shipped <code>standard</code> preset to <code>~/.dsh/.agent-presets/my-preset/</code>, drops <code>dsh-tool-result-guard.js</code> beside its <code>agent.cordis.yml</code>, and appends the plugin row; start a <strong>new</strong> session on <code>my-preset</code>. Patch an existing user preset with <code>--preset &lt;id&gt;</code> (no <code>--from</code>), undo with <code>remove --preset &lt;id&gt;</code>, print the snippet with <code>--print</code>. Manual equivalent — copy <code>index.js</code> next to the preset's <code>agent.cordis.yml</code> and append:</p>
+<pre><code>- id: tool-result-guard
+  name: './dsh-tool-result-guard.js'
+</code></pre>
+</details>
+
+<h2>Config</h2>
+<p>Unknown keys fail at load. All budgets are Unicode code points (surrogate pairs never split).</p>
+<table>
+<thead>
+<tr>
+<th>Key</th>
+<th>Default</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>thresholdChars</code></td>
+<td><code>8192</code></td>
+<td>Prune when the flattened plain-text result exceeds this many code points.</td>
+</tr>
+<tr>
+<td><code>headChars</code></td>
+<td><code>4096</code></td>
+<td>Leading code points kept inline.</td>
+</tr>
+<tr>
+<td><code>tailChars</code></td>
+<td><code>1024</code></td>
+<td>Trailing code points kept inline.</td>
+</tr>
+<tr>
+<td><code>excludeTools</code></td>
+<td><code>["read"]</code></td>
+<td>Tools whose results always pass through. <code>read</code> is excluded by default to prevent a <code>read spill file → prune → read again</code> loop. Add e.g. <code>["read", "subagent", "memory_search"]</code>.</td>
+</tr>
+<tr>
+<td><code>spillDir</code></td>
+<td><em>(unset)</em></td>
+<td>Override the local fallback spill directory (default: a private dir under the OS temp dir).</td>
+</tr>
+</tbody></table>
+<p><code>headChars + tailChars</code> must be below <code>thresholdChars</code> so the marker always fits.</p>
+<h2>Behavior contract</h2>
+<ul>
+<li><strong>Fail-open.</strong> No session owner, no reachable spill backend, a write failure, or a replacement that wouldn't be smaller/in-budget → the original inline result is kept, unchanged. A prune never hides output and never turns a successful call into an error.</li>
+<li><strong>Spill first, prune second.</strong> The full text is durable (via the deployment's <code>ctx.spillStore</code> when loaded, else a private per-process local directory) before the middle leaves the model-facing result.</li>
+<li><strong>Pass-through.</strong> Non-accept decisions, value replacements, nested composite sub-calls, excluded tools, results containing non-text blocks (images are never touched), and at/under-threshold results are returned byte-identical.</li>
+<li><strong>Composable.</strong> Runs as a prepended <code>tools/post-execute</code> waterfall listener and delegates via <code>next()</code>, so tool-owned projection and other hooks run first; their replaced content is what gets pruned. <code>additionalContexts</code> survive.</li>
+<li><strong>Idempotent.</strong> A replacement is always within <code>thresholdChars</code>, so a second pass never re-prunes.</li>
+</ul>
+<h2>How the model recovers the middle</h2>
+<p>The marker names the spill file and the exact char span. Models recover with <code>read</code> (offset/limit), <code>grep -n</code>, or <code>sed -n 'X,Yp'</code> on that file — the <code>read</code> exclusion prevents recovery reads from being pruned themselves.</p>
+<h2>Development</h2>
+<pre><code>npm test          # node:test, zero dependencies
+</code></pre>
+<h2>License</h2>
+<p>MIT</p>

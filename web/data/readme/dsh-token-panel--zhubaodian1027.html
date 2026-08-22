@@ -1,0 +1,114 @@
+<h1>dsh-token-panel</h1>
+<p>DSH Web GUI 右侧 Token 面板（双面插件，host + client）。</p>
+<p><strong>自 v0.2 起内置 Token Harbor 额度查询引擎</strong>，额度数据在 DSH 宿主进程内直接查询，
+不再需要额外启动 <code>127.0.0.1:4173</code> 的独立 Token Harbor 服务。</p>
+<ul>
+<li><strong>上栏 · 额度剩余</strong>（<code>GET /token-panel/quota</code>）：内置引擎直查，只展示查询成功的 provider：<ul>
+<li>Kimi Coding（<code>api.kimi.com/coding/v1/usages</code>，支持多账号）</li>
+<li>DeepSeek 官方余额</li>
+<li>Codex Plus（读取 macOS Keychain <code>Codex Auth</code> 或 <code>~/.codex/auth.json</code> 的 ChatGPT OAuth 登录态）</li>
+</ul>
+</li>
+<li><strong>下栏 · Token 已使用</strong>（<code>GET /token-panel/usage?range=today|7d|30d|all</code>）：合并多路数据，按模型分类、按时间截取、无价格：<ul>
+<li>cc-switch <code>~/.cc-switch/cc-switch.db</code> 中 <code>data_source='proxy'</code> 的真实代理流量；</li>
+<li>Codex / Kimi Code / Pi 本地日志增量同步（<code>lib/usage_tool.py</code>，参考 cc-switch 的 <code>codex_session</code> 构建法）；</li>
+<li>Hermes Agent <code>~/.hermes/state.db</code> 的 <code>session_model_usage</code> 累计行差分同步（只读打开，WAL 下与运行中的 hermes 共存）；</li>
+<li>DSH 自身用量实时记录（<code>llm/stream</code> 模型归属 + <code>session/event</code> 落盘）。</li>
+</ul>
+</li>
+</ul>
+<h2>安装</h2>
+<pre><code>dsh plugin --profile web add github:zhubaodian/dsh-token-panel
+</code></pre>
+<p>前置条件：本机有 <code>python3</code>（用量同步助手）、<code>sqlite3</code>（读取 cc-switch 库）和 <code>zstd</code>
+（解压 DSH 历史会话回填；macOS 需 <code>brew install zstd</code>，Linux 一般自带或用包管理器安装）。
+运行环境需 Node.js ≥ 18（用到全局 <code>fetch</code> / <code>structuredClone</code>）。</p>
+<p>安装后重启 DSH。面板注册在 <code>shell.overlay</code>，可收起为右侧边缘小标签。</p>
+<h2>配置（额度查询）</h2>
+<p>配置文件在 <strong><code>~/.dsh/token-panel/config.json</code></strong>（用户数据目录，插件重装/升级不会丢失），
+首次启动自动播种默认配置。字段模板见 <a href="https://github.com/zhubaodian1027/dsh-token-panel/blob/HEAD/data/config.example.json"><code>data/config.example.json</code></a>。</p>
+<ul>
+<li>填入各 provider 的 <code>apiKey</code> 并把 <code>enabled</code> 设为 <code>true</code> 即可；</li>
+<li>Kimi Coding 支持多账号（<code>kimiCodings</code> 数组）；</li>
+<li>Codex Plus 不需要 API Key，直接读本机 OAuth 登录态；</li>
+<li>密钥也可以用环境变量提供（<code>KIMI_CODING_API_KEY</code> / <code>DEEPSEEK_API_KEY</code>）。</li>
+</ul>
+<p>也可以通过接口管理配置（密钥回显为掩码，回传掩码不会覆盖真实值）：</p>
+<pre><code>curl http://127.0.0.1:3080/token-panel/config            # 读取（掩码）
+curl -X POST http://127.0.0.1:3080/token-panel/config \
+  -H 'content-type: application/json' -d '{"providers":{"deepseek":{"apiKey":"sk-...","enabled":true}}}'
+</code></pre>
+<h2>数据文件</h2>
+<table>
+<thead>
+<tr>
+<th>路径</th>
+<th>内容</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>~/.dsh/token-panel/config.json</code></td>
+<td>额度查询配置（含 API Key，勿提交）</td>
+</tr>
+<tr>
+<td><code>~/.dsh/token-usage/records.jsonl</code></td>
+<td>DSH 实时记录（每次模型调用一行）</td>
+</tr>
+<tr>
+<td><code>~/.dsh/token-usage/codex-records.jsonl</code></td>
+<td>Codex rollout 增量同步（token_count 差分）</td>
+</tr>
+<tr>
+<td><code>~/.dsh/token-usage/kimi-records.jsonl</code></td>
+<td>Kimi Code wire.jsonl 增量同步（usage.record）</td>
+</tr>
+<tr>
+<td><code>~/.dsh/token-usage/pi-records.jsonl</code></td>
+<td>Pi 会话转录增量同步（assistant usage 事件）</td>
+</tr>
+<tr>
+<td><code>~/.dsh/token-usage/hermes-records.jsonl</code></td>
+<td>Hermes session_model_usage 累计行差分同步</td>
+</tr>
+<tr>
+<td><code>~/.dsh/token-usage/usage_tool.py</code></td>
+<td>同步/聚合助手（随包携带，启动时自动更新）</td>
+</tr>
+</tbody></table>
+<p>命令行也可直接查账：<code>python3 ~/.dsh/token-usage/usage_tool.py query 30d</code>。</p>
+<h2>HTTP 接口（DSH web 端口，仅 loopback）</h2>
+<table>
+<thead>
+<tr>
+<th>路由</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>GET /token-panel/quota</code></td>
+<td>面板额度数据（只含查询成功的 provider），白名单 CORS</td>
+</tr>
+<tr>
+<td><code>GET /token-panel/usage?range=today|7d|30d|all</code></td>
+<td>合并 token 用量，白名单 CORS</td>
+</tr>
+<tr>
+<td><code>GET /token-panel/refresh</code></td>
+<td>Tab Harbor 浏览器插件兼容端点（与旧 4173 <code>/api/refresh</code> 同形，返回全部 provider，不含 localUsage），白名单 CORS</td>
+</tr>
+<tr>
+<td><code>GET /token-panel/config</code></td>
+<td>读取配置（密钥掩码）</td>
+</tr>
+<tr>
+<td><code>POST /token-panel/config</code></td>
+<td>更新配置（要求 <code>content-type: application/json</code>，请求体上限 1 MB）</td>
+</tr>
+</tbody></table>
+<p>CORS 白名单：仅本机 loopback 页面和浏览器扩展（<code>chrome-extension://</code> 等）的 Origin 会被允许跨源读取；
+其他网站不会收到 CORS 头，浏览器层面读不到数据。额外的精确 Origin 可用环境变量
+<code>TOKEN_PANEL_ALLOWED_ORIGINS</code>（逗号分隔）追加。</p>
+<h3>Tab Harbor 浏览器插件迁移</h3>
+<p>旧架构中 Tab Harbor 通过 <code>http://127.0.0.1:4173/api/refresh</code> 取额度。合并后只需把
+<code>token-quota.js</code> 中的地址改为 DSH web 端口（默认 <code>http://127.0.0.1:3080/token-panel/refresh</code>），
+即可继续展示额度卡片；独立的 4173 服务可以退役。</p>

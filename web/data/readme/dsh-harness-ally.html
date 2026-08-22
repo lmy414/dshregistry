@@ -1,0 +1,117 @@
+<h1>Harness联盟模式（DSH Agent Preset）</h1>
+<p>让 DeepSeek Harness、Claude Code 和 Codex 共享同一个 DSH 会话生命周期，并与 DSH 原生模型选择器自由组合。</p>
+<ul>
+<li><strong>模型</strong>仍由 DSH 原生模型选择器决定，自动使用当前已配置的全部 provider/model。</li>
+<li><strong>Harness</strong>由独立的「选择Harness」控件决定，每个回合可切换 DeepSeek Harness、Claude Code 或 Codex。</li>
+<li>DSH 始终拥有 history、turn、step、checkpoint、权限、取消和最终结果；外部 CLI 只负责执行当前 Agent 模型步骤。</li>
+</ul>
+<h2>功能</h2>
+<ul>
+<li><strong>不替换原生 composer/model selector</strong>：模型目录与现有 DSH 配置保持单一真源。</li>
+<li><strong>严格模式隔离</strong>：Harness 选择器只在「Harness联盟模式」出现，Standard 模式完全不显示。</li>
+<li><strong>真实外部执行</strong>：选择 Claude Code/Codex 后，由对应 CLI 实际执行；提示会明确区分外部执行 Harness 与 DSH 宿主。</li>
+<li><strong>完整实时输出</strong>：Claude Code 使用 partial messages，Codex 使用 app-server <code>item/agentMessage/delta</code>，正文不再等待进程结束后一次性出现。</li>
+<li><strong>可见执行过程</strong>：外部回合立即显示 <code>Claude Code/Codex · 正在执行</code>；thinking、reasoning summary、<code>Bash</code>、文件修改、WebSearch、MCP 等活动实时显示在只读 <code>Think</code> 过程区。</li>
+<li><strong>不会重复执行工具</strong>：外部活动绝不伪装成 DSH tool call，因此 Standard Agent 不会把同一命令再执行一次。</li>
+<li><strong>CLI 自动检测与托管安装</strong>：优先使用 <code>PATH</code> 中的全局 CLI；缺失时在 Harness 菜单内显示「安装」，安装到 DSH 自有目录，不使用 sudo。</li>
+<li><strong>并行委派</strong>：preset 同时提供 <code>subagent_claude_code</code> 与 <code>subagent_codex</code>。</li>
+</ul>
+<h2>环境要求</h2>
+<ul>
+<li>DSH（DeepSeek Harness）Web 部署</li>
+<li>Node.js 与 pnpm（DSH Web Profile 已使用 pnpm）</li>
+<li>Claude Code / Codex CLI 二者均为可选：可以预先全局安装，也可以在「选择Harness」菜单中按需安装</li>
+<li>macOS、Linux、Windows</li>
+</ul>
+<h2>安装</h2>
+<pre><code># 1. 克隆到固定 preset id（Host 的隔离规则依赖 harness-ally）
+git clone https://github.com/BaronCyrus/dsh-harness-ally.git ~/.dsh/.agent-presets/harness-ally
+# Windows PowerShell:
+# git clone https://github.com/BaronCyrus/dsh-harness-ally.git "$env:USERPROFILE\.dsh\.agent-presets\harness-ally"
+
+# 2. 把同一仓库以 link 方式注册到 Web Profile
+node ~/.dsh/.agent-presets/harness-ally/setup/install.mjs
+</code></pre>
+<p>如果设置了 <code>DSH_HOME</code>，将上面的 <code>~/.dsh</code> 替换为对应目录。</p>
+<p>安装后重启现有 <code>dsh web</code> 进程，然后新建「Harness联盟模式」会话。不要另起替代 Web server；已经打开的 GUI 只会连接原来的 DSH 进程。</p>
+<h2>使用</h2>
+<ol>
+<li>继续使用 DSH 原生模型选择器选择 provider/model。</li>
+<li>打开「选择Harness」，选择 DeepSeek Harness、Claude Code 或 Codex。</li>
+<li>正常发送消息。回合进行中 Harness 会锁定，停止仍由原生 composer 控制。</li>
+<li>外部回合会先出现 <code>Think · Claude Code/Codex · 正在执行</code>；后续 thinking 和工具活动实时更新。</li>
+<li>最终消息下方显示 <code>Harness · model</code> 徽标。</li>
+</ol>
+<p>缺失的 Claude Code/Codex 不可直接选择，只会显示「安装」按钮；安装完成后即可选择。CLI 解析顺序是“全局 <code>PATH</code> 优先，DSH 托管目录兜底”。</p>
+<h2>架构</h2>
+<table>
+<thead>
+<tr>
+<th>平面</th>
+<th>职责</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>Host bundle</td>
+<td>Harness selection、CLI 检测/托管安装、LLM waterfall router、本地模型协议 bridge、Claude partial/Codex app-server adapters、DSH sandbox、provider registry</td>
+</tr>
+<tr>
+<td>Agent preset</td>
+<td>联盟提示、标准编码工具、<code>subagent_claude_code</code> / <code>subagent_codex</code>；不发布跨会话 Service</td>
+</tr>
+<tr>
+<td>Client bundle</td>
+<td>Harness chip、菜单内安装、回合锁定与 additive <code>Harness · model</code> 徽标；不替换 composer/model selector</td>
+</tr>
+</tbody></table>
+<h3>模型桥</h3>
+<p>每次前台外部运行都会创建短期、带随机凭据的 loopback route：</p>
+<ul>
+<li>Claude Code 使用 Anthropic Messages；</li>
+<li>Codex 使用 OpenAI Responses；</li>
+<li>bridge 把请求转换成 DSH <code>llm.stream</code>，保留当前模型选择器给出的精确 <code>provider + model</code> 及 reasoning/sampling 参数；</li>
+<li>运行结束立即撤销 route，Host 停止时关闭 loopback server。</li>
+</ul>
+<p>外部 Harness 不需要复制 DSH provider key，也不需要维护第二份模型列表。</p>
+<h3>实时过程与安全边界</h3>
+<ul>
+<li>Claude <code>thinking_delta</code> 和 Codex <code>item/reasoning/summaryTextDelta</code> 映射为标准 DSH reasoning。</li>
+<li>外部工具活动映射为 reasoning 中的只读状态行，不产生 <code>tool-call-delta</code>。</li>
+<li>Agent signal 会终止整个外部进程树；Codex 会先尝试 <code>turn/interrupt</code>。</li>
+<li>非 <code>danger-full-access</code> 模式由 DSH 外层 <code>sandbox.confine()</code> 包裹。</li>
+<li>prompt 通过 stdin/app-server RPC 传输，不出现在 argv。</li>
+<li>bridge 仅监听 <code>127.0.0.1</code>，每个 route 使用随机 bearer token。</li>
+<li>错误诊断不会回传 CLI 原始 stderr、route token 或环境变量。</li>
+<li>当前前台外部 Harness 只接受文本上下文；包含图片时会明确提示切回 DeepSeek Harness，不会静默丢图。</li>
+</ul>
+<h2>目录结构</h2>
+<pre><code>├── preset.yml / agent.cordis.yml  # preset 元数据与 agent-plane composition
+├── ally-prompt.mjs                # 联盟会话提示 section
+├── cordis.patch.yml               # Web Profile 的 Host bundle patch
+├── lib/
+│   ├── index.js                   # Host wiring、transport 与 teardown
+│   ├── runtime.js                 # Agent-loop router、实时 reasoning/activity 与最终校准
+│   ├── harness.js                 # Claude partial-message adapter
+│   ├── codex-app-server.js        # Codex app-server、delta、ephemeral thread、interrupt
+│   ├── bridge.js                  # Messages/Responses → DSH LLM loopback bridge
+│   ├── cli-manager.js             # 全局优先/托管兜底的 CLI 生命周期
+│   ├── state.js                   # Session 日志外的选择与 badge 状态
+│   └── client.js                  # Harness selector、安装按钮与徽标
+├── test/                          # Node 回归测试
+├── setup/install.mjs              # 跨平台、幂等的 Web Profile link 安装器
+└── docs/DEVELOPMENT.md            # 开发、安全边界与版本约定
+</code></pre>
+<h2>开发</h2>
+<p>仓库通过 <code>link:</code> 接入 Web Profile，因此同事可以直接在 clone 内迭代：</p>
+<pre><code>npm test
+node --check lib/runtime.js
+node --check lib/harness.js
+node --check lib/codex-app-server.js
+</code></pre>
+<p>Host/preset/client 的生产部署变更都需要重启现有 <code>dsh web</code>。只有同时在 DSH checkout 运行 <code>pnpm run dev:web</code> 时，client-plugin HMR 才会自动重建。</p>
+<p>详细约定见 <a href="https://github.com/BaronCyrus/dsh-harness-ally/blob/HEAD/docs/DEVELOPMENT.md"><code>docs/DEVELOPMENT.md</code></a>。</p>
+<h2>隐私</h2>
+<p>仓库不包含 API Key、OAuth token、CLI 登录态、DSH state、用户目录、项目路径或运行日志。模型凭据继续由本机 DSH/CLI 管理，不会写入本仓库。</p>
+<p>如果贡献 issue/log，请先删除 Authorization header、环境变量、用户名路径、bridge token 和原始 CLI stderr。</p>
+<h2>许可</h2>
+<p><a href="https://github.com/BaronCyrus/dsh-harness-ally/blob/HEAD/LICENSE">MIT</a> © 2026 BaronCyrus</p>

@@ -1,0 +1,159 @@
+<h1>dsh-mnemon-gc</h1>
+<p>Mnemon 记忆体 GC 治理插件。基于 <a href="https://github.com/omdsh-dev/dsh-mnemon">dsh-mnemon</a> 的公共 API（<code>createRunner</code> / <code>resolveConfig</code>），把「冲突驱动的正确性纠错」接入 DSH：检测记忆间新事实取代旧事实、默认标记 superseded、仅在显式确认后软删除。自动巡检只报告、绝不删除。</p>
+<blockquote>
+<p><strong>声明</strong>：本插件基于 dsh-mnemon 的公共 API（<code>createRunner</code> / <code>resolveConfig</code>）开发，是独立的正交扩展，不 fork、不改动 dsh-mnemon。定位为「可向上游提 PR 的原型」。</p>
+</blockquote>
+<h2>背景</h2>
+<p>dsh-mnemon 的三层记忆里，第三层（记忆体）由 mnemon CLI 引擎支撑。mnemon 自身并不直接对「记忆内容是否已被更新的记忆取代」做纠错，过时记忆会与新事实并存积累。本插件把这套冲突检测能力接出来，作为独立的治理入口。</p>
+<h2>治理模型（0.2.0：正确性纠错，不再是时间衰减）</h2>
+<p>gc 的判据是「记忆是否被更新的记忆取代（superseded）」，<strong>不是</strong>「多久没被访问」。久未引用的历史记忆只要仍正确就不会被建议清理。</p>
+<p>冲突检测：同 category 的记忆两两配对（免疫候选除外），由 LLM 子代理判断「新事实是否覆盖旧事实」。命中后默认<strong>标记 superseded</strong>（以 causal edge 记录取代关系与理由），旧记忆保留可追溯。</p>
+<h2>分级</h2>
+<table>
+<thead>
+<tr>
+<th>tier</th>
+<th>含义</th>
+<th>会删除吗</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>immune</code></td>
+<td>importance&gt;=4 或 access_count&gt;=3，或已标记 immune</td>
+<td>绝不</td>
+</tr>
+<tr>
+<td><code>superseded</code></td>
+<td>冲突检测命中（被更新的记忆取代）</td>
+<td>仅显式确认后</td>
+</tr>
+<tr>
+<td><code>watch</code></td>
+<td>其余全部（含久未访问但正确）</td>
+<td>绝不</td>
+</tr>
+</tbody></table>
+<p>新鲜度字段（创建时间/引用次数/有效重要性）仅用于排序与人工审阅，绝不单独作为删除依据。</p>
+<h2>设置界面</h2>
+<p>「设置 → Mnemon GC」卡片（client settings.section slot）提供可视化编辑，即时热更新，并内嵌「记忆新鲜度」面板（只读列表 + 关键词搜索 + 状态筛选 + 排序/分页 + 详情查看 + 受监督的单条/批量删除）：</p>
+<ul>
+<li>巡检策略：threshold / maxAgeDays / intervalMs / limit（数字，其中 threshold 与 maxAgeDays 仅为辅助字段）</li>
+<li>运行位置：cliPath / dataDir（文本，留空表示默认）</li>
+</ul>
+<p>卡片通过 host 侧 <code>/dsh-mnemon-gc-settings</code> RPC 通道读写 settings namespace；新鲜度面板通过 <code>/dsh-mnemon-gc-freshness</code> RPC 通道读写记忆列表与删除动作。</p>
+<h2>触发方式</h2>
+<table>
+<thead>
+<tr>
+<th>方式</th>
+<th>行为</th>
+<th>默认</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>自动巡检</td>
+<td><code>agent/turn-stopping</code> 后，距上次巡检 <code>&gt;= intervalMs</code> 触发</td>
+<td>开，24h，<strong>只报告</strong></td>
+</tr>
+<tr>
+<td>工具 <code>mnemon_gc_inspect</code></td>
+<td>只读巡检，返回 immune/superseded/watch 三级</td>
+<td>模型可调</td>
+</tr>
+<tr>
+<td>工具 <code>mnemon_gc_mark_superseded</code></td>
+<td>标记一条记忆被另一条取代（写 causal edge，不删除）</td>
+<td>模型可调（显式）</td>
+</tr>
+<tr>
+<td>工具 <code>mnemon_gc_purge_superseded</code></td>
+<td>批量删除<strong>已标记 superseded</strong> 的记忆（未标记的自动拒绝）</td>
+<td>模型可调（显式）</td>
+</tr>
+<tr>
+<td>命令 `/mnemon-gc inspect</td>
+<td>conflicts</td>
+<td>mark</td>
+</tr>
+</tbody></table>
+<p><strong>安全边界</strong>：巡检带 <code>--readonly</code> 绝不写库；purge 走 <code>mnemon forget</code>（软删除，可恢复）且只删「已标记 superseded」的记忆；自动巡检<strong>只报告，绝不删除</strong>（无 autoPurge 配置项）。</p>
+<h2>配置</h2>
+<p>插件注册了 DSH settings namespace <code>dsh-mnemon-gc</code>，配置持久化在 <code>~/.dsh/settings.yaml</code>，支持热更新（修改后无需重启）。同时提供 <strong>Web 设置卡片</strong>（「设置 → Mnemon GC」）可在 GUI 里直接改这些字段。</p>
+<pre><code>dsh-mnemon-gc:
+  threshold: 0.5          # 有效重要性阈值（仅辅助排序/审阅）
+  maxAgeDays: 30          # 无访问 N 天（仅辅助信号，不构成删除依据）
+  intervalMs: 86400000    # 自动巡检间隔（默认 24h）
+  limit: 500              # 每个 store 的候选上限
+  cliPath: ""             # 可选，显式覆盖 mnemon CLI 路径（默认交给 dsh-mnemon 解析）
+  dataDir: ""             # 可选，覆盖数据目录（设了它 storageScope 会切到 custom）
+</code></pre>
+<p>字段说明：</p>
+<table>
+<thead>
+<tr>
+<th>字段</th>
+<th>默认</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>threshold</code></td>
+<td>0.5</td>
+<td>有效重要性阈值（辅助排序/审阅，不单独决定删除）</td>
+</tr>
+<tr>
+<td><code>maxAgeDays</code></td>
+<td>30</td>
+<td>无访问 N 天（辅助信号，不构成删除依据）</td>
+</tr>
+<tr>
+<td><code>intervalMs</code></td>
+<td>86400000</td>
+<td>自动巡检间隔（最小 60s，最大 30 天）</td>
+</tr>
+<tr>
+<td><code>limit</code></td>
+<td>500</td>
+<td>每个 store 的候选上限（1–1000）</td>
+</tr>
+<tr>
+<td><code>cliPath</code></td>
+<td>空</td>
+<td>显式覆盖 mnemon CLI 路径；空则交给 dsh-mnemon 的 findMnemonCommand 解析</td>
+</tr>
+<tr>
+<td><code>dataDir</code></td>
+<td>空</td>
+<td>显式覆盖数据目录；非空时 storageScope 自动切 custom</td>
+</tr>
+</tbody></table>
+<blockquote>
+<p>删除只由「superseded 标记」决定：阈值与 maxAgeDays 仅用于新鲜度视图的排序/审阅，绝不单独作为删除依据。</p>
+</blockquote>
+<p><code>cordis.patch.yml</code> 里的 <code>config</code> 是 base 层（默认值）；<code>settings.yaml</code> 的 <code>dsh-mnemon-gc</code> 段是 user 层（覆盖）。两者合并后生效。</p>
+<h2>安装</h2>
+<h3>方式 A：源码目录安装（本地开发）</h3>
+<pre><code>cd dsh-mnemon-gc
+pnpm install
+dsh plugin --profile web add "link:/root/proj/dsh-proj/dsh-mnemon-gc"
+dsh web
+</code></pre>
+<blockquote>
+<p><code>link:</code> 安装不会自动把插件自身依赖（<code>dsh-mnemon</code> / <code>schemastery</code>）装进 profile，可能报 <code>ERR_MODULE_NOT_FOUND</code>。本地自测建议先确认 <code>pnpm install</code> 在插件目录内完整跑过；正式分发优先用方式 B（对齐蓝本插件 <code>dsh-tencent-token-dashboard</code> 的已验证模式）。</p>
+</blockquote>
+<h3>方式 B：发布包 .tgz 直链安装（推荐）</h3>
+<pre><code>pnpm pack   # 生成 dsh-mnemon-gc-&lt;version&gt;.tgz
+dsh plugin --profile web add ./dsh-mnemon-gc-&lt;version&gt;.tgz
+</code></pre>
+<p>已安装旧版本时，用同样的 <code>add</code> 命令安装新 tarball 即可覆盖更新。</p>
+<p>重启 <code>dsh web</code> 后，「设置 → Mnemon GC」出现设置卡片。</p>
+<h2>测试</h2>
+<pre><code>node --test test/*.test.mjs
+</code></pre>
+<p>seam：<code>engine</code>（冲突驱动分级纯函数）、<code>conflict-detector</code>（初筛 + LLM prompt + 结果解析）、<code>superseded</code>（causal edge 标记/收集/过滤）、<code>cli-adapter</code>（gc JSON 解析）、<code>orchestrator</code>（巡检/清理编排，注入 fake runner）、<code>config</code>（settings 值解析）、<code>settings-rpc</code> / <code>freshness</code> / <code>freshness-rpc</code>（settings 通道与新鲜度视图纯逻辑）。</p>
+<h2>版本与发布</h2>
+<p>版本号遵循 <a href="https://semver.org/lang/zh-CN/">语义化版本</a>，变更记录见 <a href="https://github.com/Zn-Dk/dsh-mnemon-gc/blob/HEAD/CHANGELOG.md">CHANGELOG.md</a>（格式遵循 <a href="https://keepachangelog.com/zh-CN/1.1.0/">Keep a Changelog</a>）。每次面向用户的变更按 <code>新增</code>（feature）/ <code>修复</code>（fix）/ <code>变更</code>（chore/breaking）分级记录，并同步递增 <code>package.json</code> 的 <code>version</code>。</p>
+<h2>与方案 A 的关系</h2>
+<p>本插件是把已验证的<a href="https://github.com/Zn-Dk/dsh-mnemon-gc/blob/HEAD/.mnemon-gc/README.md">方案 A 巡检脚本</a>（阈值、幂等、软删除策略）固化为 DSH 插件的形态。方案 A 仍是独立可用的 CLI 巡检器。</p>
+<h2>License</h2>
+<p>MIT</p>

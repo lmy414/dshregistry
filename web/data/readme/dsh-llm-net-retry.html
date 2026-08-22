@@ -1,0 +1,91 @@
+<h1>dsh-llm-net-retry</h1>
+<p><a href="https://github.com/fan56/dsh-llm-net-retry/blob/HEAD/README.en.md">English</a></p>
+<p><a href="https://github.com/deepseek-ai/deepseek-harness">DeepSeek Harness</a>（dsh）插件：重试网关以
+<code>finish_reason: "network_error"</code> 上报的模型请求失败——这类失败被 dsh 原生重试策略归为不可重试，
+导致整个 turn 直接硬失败。</p>
+<h2>背景</h2>
+<p>一些 OpenAI 兼容网关（如 <a href="https://opencode.ai/zen">OpenCode Zen</a>）把自身上游连接的瞬时失败
+作为流的终止 <code>finish_reason</code> 上报，而不是走 HTTP/传输层错误。截至 dsh <code>0.1.1-rc.2</code>，两条
+adapter 路径都把它误分类：</p>
+<table>
+<thead>
+<tr>
+<th>路径</th>
+<th>产出的失败</th>
+<th>原生分类</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>llm-pi-ai</code>（<code>openai-completions</code>）</td>
+<td><code>Provider finish_reason: network_error</code></td>
+<td><code>PI_AI_ERROR</code>——不可重试</td>
+</tr>
+<tr>
+<td><code>llm-deepseek</code></td>
+<td><code>model stopped: network_error</code>，code <code>NETWORK_ERROR</code></td>
+<td>不可重试</td>
+</tr>
+</tbody></table>
+<p><code>dsh-llm-retry</code> 只重试 provider <code>retryableCodes</code> 里的码（<code>TRANSPORT</code>、<code>RATE_LIMIT</code>、<code>SERVER</code>、
+<code>TIMEOUT</code>、<code>EMPTY_RESPONSE</code>），于是没人重试，turn——包括 subagent turn——直接失败。
+而这类故障立即重试几乎总能成功。</p>
+<p>opencode 在上游修过同样的问题：
+<a href="https://github.com/anomalyco/opencode/commit/40282c1d4d5476e6b536a72c0baf3a27bcf0e4df">40282c1</a>、
+<a href="https://github.com/anomalyco/opencode/commit/e0b9e68a68a8bc8367d84e305efd114d0445348a">e0b9e68</a>。</p>
+<p>dsh 本体的修复已备好并充分测试（fork 分支
+<a href="https://github.com/fan56/deepseek-harness/tree/fix/network-error-retryable"><code>fix/network-error-retryable</code></a>；
+dsh 目前不接受外部 PR，已按官方渠道报告至
+<a href="https://github.com/deepseek-ai/deepseek-harness/discussions/3949">Discussions #3949</a>）。
+在修复合入前，本插件就是解决方案；合入后它也无害：只在整个 <code>agent/request-error</code>
+waterfall 弃权时才行动，且绝不触碰 llm-retry 自身的重试计数。</p>
+<h2>工作原理</h2>
+<p>插件挂在 <code>agent/request-error</code> waterfall 的<strong>末端</strong>：</p>
+<ol>
+<li>先调用 <code>next()</code>——provider 的策略执行器（<code>dsh-llm-retry</code>）先决策。任何一方决定重试，
+该决策原样透传。</li>
+<li>只有当所有 listener 都弃权，且失败消息命中漏网的 network 变体——<code>network_error</code> /
+<code>network-error</code> / <code>network error</code>，或 pi-ai 对未识别网关 stop reason 的
+<code>Provider finish_reason:</code> 渲染——才调度本插件自己的有界重试。</li>
+<li>重试持久化且可见：<code>llm/retry</code> / <code>llm/retry-started</code> session 事件，schema 与 llm-retry
+兼容，TUI 无需改动即可展示。计数使用本插件自己的 policy key（<code>net-retry:v1…</code>），
+绝不污染 llm-retry 的计数。</li>
+</ol>
+<p>已被分类为 <code>TRANSPORT</code> 的失败（ECONNRESET、<code>terminated</code>、流截断、超时、HTTP 5xx）由原生
+策略重试，本插件刻意不再重复匹配。</p>
+<h2>安装</h2>
+<pre><code>dsh plugin --profile tui add @aiwayds/dsh-llm-net-retry
+</code></pre>
+<p>包内的 <code>cordis.patch.yml</code> 会以插件 id <code>dsh-llm-net-retry</code> 挂载。</p>
+<blockquote>
+<p>⚠️ 所有 <code>@deepseek-ai/*</code> 包都是 peerDependencies（由 dsh 闭包解析）——绝不要把它们当普通
+dependencies 装进插件，否则会出现第二份 cordis 闭包和诡异的崩溃。</p>
+</blockquote>
+<h2>配置</h2>
+<pre><code>dsh-llm-net-retry:
+  mode: on            # 'off' 完全摘除 listener
+  maxRetries: 5
+  backoff:
+    initialDelayMs: 500
+    maxDelayMs: 10000
+    jitterRatio: 0.1
+</code></pre>
+<p>（<code>~/.dsh/settings.yaml</code> 里按插件 id 加段，与其他插件同机制。）</p>
+<p>未知 key 报错。默认值对齐 llm-retry 原生策略（5 次重试、500 ms→10 s 指数退避、对称抖动 0.1）。</p>
+<h2>验证</h2>
+<ul>
+<li>单测：匹配表（正/负例）、注入随机数的退避计算、配置校验、真实 cordis context 上的决策链
+（透传/重试/计数/abort/mode off/下游异常韧性）。</li>
+<li>e2e：真实 agent loop + 真实 <code>llm-pi-ai</code> <code>openai-completions</code> adapter，打脚本化本地网关
+（前两次请求回 <code>finish_reason: "network_error"</code>）——第三次请求完成 turn、<code>llm/retry</code>
+事件落盘；负向对照（无插件）一次请求后 turn 即硬失败。</li>
+<li>真实宿主：已在 dsh 0.1.0-rc.8 的 <code>--profile tui</code>（dsh-tui-pi）上实测，重试链
+（指数退避、稳定 retryId、事件落盘、TUI 展示）全部正确。</li>
+</ul>
+<pre><code>npm test        # 先构建：npm run build
+</code></pre>
+<p>e2e 在隔离的临时 <code>$HOME</code> 下运行，绝不触碰 <code>~/.dsh</code>。</p>
+<h2>兼容性</h2>
+<p>面向 dsh <code>0.1.1-rc.x</code> 的 <code>agent/request-error</code> waterfall 与 <code>llm/retry</code> 事件 schema。插件对
+dsh 本体零侵入：无 monkey-patch、不替换服务，dispose 即干净移除。</p>
+<h2>许可证</h2>
+<p>MIT</p>

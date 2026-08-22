@@ -1,0 +1,43 @@
+<h1>dsh-ds-vision-auto-route</h1>
+<p>English | <a href="https://github.com/litianshuo110/dsh-ds-vision-auto-route/blob/HEAD/README.zh.md">中文</a></p>
+<p>Function plugin that routes image-bearing requests to a configurable image-capable model through the agent loop's <code>agent/request</code> waterfall. It does not change the selected model: every text-only request keeps the selection, and only a request whose turn introduced an image is replaced with the vision fallback. The loop logs the replacement as the <code>request/header</code>, so every routed call stays reconstructable, and the plugin appends a non-surface <code>llm-vision-route/route</code> record naming the turn, step, policy, and fallback route.</p>
+<h2>Compatibility with the published DeepSeek Harness release</h2>
+<p>This plugin routes on the agent loop's <code>agent/request</code> waterfall, which runs <strong>after</strong> the host's prompt-admission step. The image-admission gate lives in the Web and ACP entry layers, not in this plugin.</p>
+<ul>
+<li>In the <strong>source harness</strong> (running <code>pnpm dsh web</code> from the checkout), that admission consults this plugin's <code>llm-vision-route</code> service before accepting image input, so an image prompt on a text-only main model is admitted and the request is routed to the vision fallback automatically.</li>
+<li>In the <strong>published npm release</strong> (<code>@deepseek-ai/dsh</code> installed globally, <code>dsh web</code>), the admission still rejects image prompts for a text-only model <strong>before this plugin's waterfall can act</strong>. Installing this plugin alone does not change that host behavior, so a stock npm host will <strong>not</strong> auto-route images on a text-only main model — the image is rejected and you would need to switch the model to the vision model manually.</li>
+</ul>
+<p>The plugin takes effect out of the box on a source build, or on any host whose admission consults the vision-route service (the service-aware host admission is planned to ship in a future official release). Manual model selection always works either way.</p>
+<p>The routing decision is a pure function of the durable log. <code>routePolicy: turn-image</code> (default) inspects only the open turn — events after the latest <code>turn/start</code> — so a text-only follow-up returns to the selected model while the historical image remains in the log; those later requests reach the selected model's ordinary negative-capability projection, which replaces the historical image with a stable placeholder text. <code>any-image</code> routes whenever the log contains any image, and <code>off</code> disables routing.</p>
+<p>A request routes only when the selected model's exact metadata does not declare image input; a selected model that already accepts images is never replaced. The fallback route must declare image input, or the request fails with <code>INVALID_REQUEST</code> naming the fallback — a deployment pointing at a broken fallback fails loud instead of silently dropping pixels. A routed request drops <code>reasoningEffort</code>, which the fallback model may not support; sampling values pass through unchanged.</p>
+<p>The plugin provides the <code>llm-vision-route</code> service (<code>VISION_ROUTE_SERVICE</code>), whose <code>routesImagesFor(agent)</code> answers whether an image-bearing prompt on one agent reaches an image-capable model, either directly or through routing. The Web prompt admission and the ACP content bridge consult it before accepting image input, so image prompts are admitted exactly when the router will serve them; without the service both surfaces keep their existing text-only rejection. <code>available()</code> answers the same question for initialization-time capability advertising (ACP <code>promptCapabilities.image</code>) and answers false on any unknown fact.</p>
+<p>The separately published <code>./invariant</code> companion checks that every routing record sits inside an open turn and step, names the configured fallback, carries a valid policy, and follows image-bearing input in the inspected range (the open turn under <code>turn-image</code>, the whole prior log under <code>any-image</code>).</p>
+<pre><code>- name: 'dsh-ds-vision-auto-route'
+  config:
+    visionProvider: deepseek-official
+    visionModel: deepseek-v4-flash-vision-exp
+    routePolicy: turn-image
+</code></pre>
+<p>All three keys are optional: the defaults are the official provider route, the shipped vision model, and <code>turn-image</code>.</p>
+<h2>Installation</h2>
+<pre><code>dsh plugin --profile web add github:litianshuo110/dsh-ds-vision-auto-route
+</code></pre>
+<p><code>dsh plugin add</code> forwards to pnpm, and this package's <code>dsh.bundle.patch</code> wires the <code>llm-vision-route</code> row into the profile automatically. Manual alternative: clone the repository and add <code>dsh-ds-vision-auto-route</code> to the profile, or append the row from <code>cordis.patch.yml</code> to <code>$DSH_HOME/profiles/&lt;profile&gt;/cordis.patch.yml</code>.</p>
+<h2>Development</h2>
+<p>The plugin is developed in the <a href="https://github.com/deepseek-ai/deepseek-harness">DeepSeek Harness repository</a> at <code>packages/llm/llm-vision-route</code>, where its unit, REAL-composition, invariant, and keyless snapshot tests live; this repository mirrors the shipped package. Rebuild the committed <code>lib/</code> artifacts with <code>pnpm install &amp;&amp; pnpm run build</code>.</p>
+<h2>Model Experience</h2>
+<h3>Vision routing</h3>
+<h4>What the model sees</h4>
+<p>An image-bearing turn sees the complete image content on the routed vision model, preceded by the stable attachment handle text the provider adapter adds. Text-only turns see no routing artifacts; under <code>turn-image</code>, historical images reach the selected text model as the standard placeholder text instead of pixels. The non-surface routing record is log-only.</p>
+<h4>Token effect</h4>
+<p>Routing itself adds no tokens. The routed turn bills under the fallback model's pricing; each request image costs at most 384 tokens after the provider's automatic resize. The two exact-model metadata resolutions per request are catalog lookups, not model calls.</p>
+<h4>KV Cache effect</h4>
+<p>The routed request runs on a different model, so its cache identity differs from the selected model's. Under <code>turn-image</code>, alternating between the selected model and the fallback across turns resets the prefix cache at each switch boundary; a session that never sends images keeps one uninterrupted cache prefix.</p>
+<h2>Known Limitations and Deferred Work</h2>
+<ul>
+<li><strong>The selection itself never changes</strong> — the Web model selector keeps showing the selected model; a routed turn runs on the fallback without moving the selection. A session that has never picked a model explicitly inherits the last logged header, so after an image turn its next request follows the routed route until a selection is made.</li>
+<li><strong>Turn-local routing projects historical images</strong> — after the image turn, later text-model contexts replace the durable image with placeholder text; the pixels return only when the image is attached again (which re-triggers routing) or when a tool reads it on a routed turn.</li>
+<li><strong>Catalog metadata decides capability</strong> — a model whose exact metadata omits <code>inputModalities</code> is treated as text-only and gets routed when images appear; declare image input on unlisted pass-through models that accept images to keep them un-routed.</li>
+<li><strong><code>any-image</code> stays routed</strong> — once the log contains an image, every later request whose proposal is not image-capable routes again until compaction or a selection change; choose it when image context should never degrade.</li>
+<li><strong>No provider failover</strong> — the fallback must be a registered, image-capable route on the same or another provider; a missing or non-image fallback fails the image-bearing request loudly.</li>
+</ul>

@@ -1,0 +1,248 @@
+<h1>dsh-group-chat</h1>
+<p>DSH 原生多 AI 群聊插件：用户作为「群主」，在 DSH WebUI 中管理一组可配置的 AI
+角色，让它们围绕共享上下文进行多模型轮流发言。纯 Node.js / Cordis 实现，
+<strong>不使用 Tauri / Rust</strong>。</p>
+<blockquote>
+<p>仓库主页: </p>
+</blockquote>
+<h2>阶段状态</h2>
+<table>
+<thead>
+<tr>
+<th>阶段</th>
+<th>内容</th>
+<th>状态</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>阶段 1</td>
+<td>基础设施：包清单、核心接口、Cordis 注册与 <code>ctx.groupChat</code> Service 暴露</td>
+<td>✅ 已完成</td>
+</tr>
+<tr>
+<td>阶段 2</td>
+<td>编排器引擎：消息拦截、多模型轮流生成、主动/被动发言、共享上下文</td>
+<td>✅ 已完成</td>
+</tr>
+<tr>
+<td>阶段 3</td>
+<td>WebUI：输入框旁群聊开关 + 群聊设置页（React + slot 注入）</td>
+<td>✅ 已完成（本仓库当前状态）</td>
+</tr>
+</tbody></table>
+<h2>架构</h2>
+<pre><code>src/
+├── index.ts       插件入口（class plugin）：name / Config / 默认导出 GroupChatService
+├── service.ts     GroupChatService (extends Service)：暴露 ctx.groupChat（配置注册 + 轮次门面 + API 挂载 + 模型目录 + 消息视图）
+├── orchestrator.ts GroupChatEngine：独立群聊页的消息通道、轮次循环、主动发言调度（阶段 2 核心）
+├── api.ts         主机端 WebUI API 路由（/api/group-chat/*，webServer 注册）
+├── context.ts     共享上下文构建：[AI名称]: &lt;内容&gt; 转写 + system prompt 协议（纯函数）
+├── speakers.ts    群主规则 → 发言者选择（提及/触发/主动/默认，禁言跳过）（纯函数）
+├── config.ts      DEFAULTS（唯一权威默认值）+ schemastery schema + assertGroupConfig 校验
+├── error.ts       GroupChatError（稳定机器码）
+├── types.ts       纯类型契约：GroupConfig / AgentConfig / HostRules / 轮次结果 / 模型目录 / 消息气泡类型
+└── client/        WebUI（React，经 tsdown 打包为 lib/client.js）
+    ├── index.ts                   客户端插件入口：apply(ctx) 注册 slot
+    ├── api.ts                     类型化 fetch 客户端（镜像主机路由）
+    ├── GroupChatToggle.tsx        群聊开关（conversation.input.left）：开/关独立群聊页面
+    ├── GroupChatOverlay.tsx       群聊页面容器（约 2/3 居中，右上 ✕ 关闭，左上 ⚙ 设置）
+    ├── GroupChatChatView.tsx      微信式聊天视图（AI 左 / 用户右气泡，文本+图片发送，轮询）
+    ├── ModelPicker.tsx            Model ID 级联选择器（提供方 → 模型，同步 DSH 模型目录）
+    ├── GroupChatSettingsPanel.tsx 设置面板内容（角色管理/群主规则/共享上下文/用户名称显示）
+    ├── GroupChatSettingsSection.tsx 设置面板中的“群聊设置”页（settings.section）
+    └── styles.ts                  共享内联样式
+build/           tsdown 客户端打包预设（平台 externals + 纯净化 gate + __ModuleLoader__ 交接）
+</code></pre>
+<h3>阶段 3：WebUI（slot 注入 + 独立群聊页）</h3>
+<p>浏览器端是一个标准 DSH 客户端插件：<code>lib/client.js</code> 通过
+<code>window.__ModuleLoader__.load({id, factory})</code> 交接（与官方 dsh-web-ui 管线一致），
+<code>factory</code> 导出 <code>apply(ctx)</code> / <code>name</code> / <code>inject</code>，收到客户端 cordis 根上下文。</p>
+<p><strong>产品形态</strong>：群聊是<strong>独立页面</strong>，与工作区原生对话完全隔离（原生输入框/模型选择/
+读写权限等继续为工作流服务，群聊不接管、不混淆）：</p>
+<table>
+<thead>
+<tr>
+<th>Slot</th>
+<th>内容</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>conversation.input.left</code></td>
+<td>输入卡工具栏左端的<strong>群聊开关</strong>：点击开启/关闭独立群聊页面（状态点 + 开/关，持久化到 <code>enabledSessions</code>，全局开关自动联动）</td>
+</tr>
+<tr>
+<td><code>settings.section</code> (id <code>group-chat</code>)</td>
+<td>设置面板导航中的<strong>群聊设置</strong>页（<code>GroupChatSettingsPanel</code>）</td>
+</tr>
+</tbody></table>
+<p><strong>独立群聊页面</strong>（<code>GroupChatOverlay</code>，约覆盖原生对话区域 2/3、居中）：</p>
+<ul>
+<li>左上角 <strong>⚙</strong> 切换群聊设置（同一面板）；右上角 <strong>✕</strong> 关闭页面 —— 关闭后
+输入框旁的群聊开关同步回到“关”（<code>enabledSessions</code> 移除，主动发言定时器停止）；</li>
+<li>聊天视图（<code>GroupChatChatView</code>，微信式布局）：AI 成员消息在<strong>左</strong>、用户在<strong>右</strong>，
+气泡上方显示名称、下方显示内容；独立输入框支持 Enter 发送、Shift+Enter 换行、
+<strong>发送图片</strong>（PNG/JPEG/WebP/GIF，经 DSH attachment 服务持久化后作为 image block
+进入模型请求并在气泡内显示）；页面打开期间轮询消息视图；</li>
+<li>用户侧名称来自群聊设置里的 <strong>用户名称显示</strong>（<code>GroupConfig.userName</code>，身份默认
+“群主”），同时作为共享上下文转写中用户行的前缀。</li>
+</ul>
+<p><strong>群聊设置页</strong>包含：</p>
+<ul>
+<li>群聊状态：全局开关、群聊名称、<strong>用户名称显示</strong>；</li>
+<li>AI 角色管理：成员列表（名称、模型、主动/被动、禁言徽标）、添加/编辑（角色卡
+System Prompt、初始上下文、Provider/Model、发言模式、主动发言策略、@别名、
+触发词、禁言/启用权限）、删除、快捷禁言；</li>
+<li><strong>Model ID 级联选择器</strong>（<code>ModelPicker</code>）：点击后先列出 DSH 已接入的模型提供方
+（<code>ctx.llm.listProviders()</code>），点击提供方再列出该提供方通告的模型
+（<code>listModels(provider)</code>）—— 与 DSH 模型接入/模型选择 UI 的数据完全一致；
+无目录或需要手填时保留 <code>provider/model</code> 手动输入；</li>
+<li>群主规则：禁言全体、主动发言总开关、单轮回复上限、单轮发言者上限、并行生成、
+超时、@ 语法；</li>
+<li>共享上下文：转写窗口、转写模板、角色卡注入开关。</li>
+</ul>
+<p>数据通道：浏览器 <code>fetch</code> → 主机 <code>ctx.webServer</code> 路由（<code>src/api.ts</code>，
+同源 POST 防护，错误统一 <code>{ok:false, code, message}</code>）→ <code>ctx.groupChat</code> 门面
+→ 编排器/配置存储。客户端 <code>src/client/api.ts</code> 提供类型化封装并把非 ok 响应
+转为 <code>GroupChatClientError</code>。</p>
+<p>构建：<code>npm run build</code> = <code>tsc</code>（主机 lib）+ <code>tsdown</code>（浏览器 client.js）。
+客户端 bundle 只允许：平台模块（react、cordis、ui-slots 等，运行时由 shell 的
+模块表解析）与内联安全层；任何其他 <code>@deepseek-ai</code> 值导入会被 build 期纯度
+gate 拒绝（跨插件协作必须走 cordis 服务）。</p>
+<h3>阶段 2：编排器引擎</h3>
+<h4>1. 消息通道</h4>
+<p>群聊是独立页面，所有消息都走显式通道：
+<code>ctx.groupChat.submitMessage(sessionId, text, images?)</code> —— 独立群聊页的输入框
+调用；创建 <code>user/message</code> 事件（可含 image block）、运行群聊轮次。要求群聊已
+启用且该会话在 <code>enabledSessions</code> 中。原生工作区输入框不会被接管（不再注册
+<code>agent/pre-step</code> 拦截），群聊与工作流对话完全隔离。</p>
+<h4>2. 发言者选择（<code>selectSpeakers</code>，依据 HostRules）</h4>
+<pre><code>候选池 = agents.filter(enabled &amp;&amp; !muted)        # 禁言/移除直接跳过
+优先级：mentioned（@名字/别名）→ triggered（触发词）→ active（主动发言成员）
+      → default（无人触发时由第一个可用成员兜底）
+截断：maxAgentsPerTurn；muteAll → 不生成（但用户消息仍落盘）
+</code></pre>
+<h4>3. 共享上下文（统一 Session Log，<code>context.ts</code>）</h4>
+<ul>
+<li>每个发言者看到同一份转写：<code>session.deriveMessages()</code> 投影为
+<code>[AI名称]: &lt;内容&gt;</code> 行（宿主行使用群聊设置里的 <strong>用户名称显示</strong>，默认 <code>群主</code>），
+按 <code>sharedContext.transcriptTemplate</code> 渲染，滚动窗口 <code>maxMessages</code> 行。</li>
+<li>system prompt = 角色卡（<code>systemPrompt</code>）+ 群聊协议（回复模式或主动发言模式），
+协议在最后（最近的指令权重最高）。</li>
+<li>顺序模式下，后发言者能看到本轮先发言者的<strong>最新回复</strong>（每步重新派生转写）。</li>
+</ul>
+<h4>4. 轮次循环（会话日志事件与官方 agent-loop 完全同构）</h4>
+<pre><code>turn/start → user/message → 每发言者: step/start → assistant/chunk* →
+assistant/message → step/end → turn/end
+</code></pre>
+<ul>
+<li>群聊 turn 编号使用偏移空间（<code>GROUP_TURN_BASE = 1_000_000</code> 起），与
+agent-loop 的计数器永不冲突；恢复会话时扫描日志续号。</li>
+<li>流式：每个 chunk 先落 <code>assistant/chunk</code>，用官方 <code>BlockAssembler</code> 组装后写
+<code>assistant/message</code>（含 <code>source: {provider, model}</code> provenance 与 usage），
+WebUI 按 <code>step/start</code>+<code>assistant/message</code> 契约正常渲染。</li>
+<li>每会话串行队列；<code>parallelSpeak</code> 时同轮发言者并行生成。</li>
+<li>失败语义：单发言者失败被记录（<code>GroupTurnStepResult.failure</code>）不影响他人；
+全部失败 → <code>turn/end(error)</code>；取消 → <code>aborted</code>。</li>
+</ul>
+<h4>5. 主动发言（主动模式定时器）</h4>
+<ul>
+<li>每个 <code>active</code> 模式的 agent 按 <code>[minIntervalMs, maxIntervalMs]</code> 随机间隔
+挂起一次性定时器（<code>ctx.timer</code> 服务，fiber 自动清理）。</li>
+<li>触发条件：群聊启用、<code>activeSpeakEnabled</code> 开、未 <code>muteAll</code>、该 agent 未禁言
+且 <code>active.enabled</code>、会话无进行中的轮次、距离上次活动 ≥ <code>idleTriggerMs</code>。</li>
+<li>不满足（临时）→ 30s 后重试；agent 被移除/改模式 → 停止调度。</li>
+<li>配置变更（<code>group-chat/config-updated</code>）会重置全部主动定时器，使策略即时生效。</li>
+</ul>
+<h3>已暴露的 Service API</h3>
+<pre><code>ctx.groupChat
+  // 读取
+  .getConfig(): GroupConfig
+  .getAgent(id): AgentConfig | undefined
+  .listAgents(): AgentConfig[]
+  .getStatus(): GroupChatStatus
+  .watch(cb): () =&gt; void
+  // AI 角色管理
+  .addAgent(input: AgentInput): Promise&lt;AgentConfig&gt;
+  .updateAgent(id, patch): Promise&lt;AgentConfig&gt;
+  .removeAgent(id): Promise&lt;AgentConfig&gt;
+  .setMuted(id, muted)          // 禁言/解禁
+  .setMode(id, mode)            // 被动回复 / 主动发言
+  .setEnabled(id, enabled)
+  // 群主控制面板
+  .setMuteAll(muted)            // 禁言全体
+  .setActiveSpeakEnabled(on)    // 主动发言总开关
+  .updateHostRules(patch)
+  .updateSharedContext(patch)
+  .setGroupEnabled(on)          // 群聊开关
+  .setGroupName(name)
+  // 阶段 2：轮次引擎
+  .submitMessage(sessionId, text): Promise&lt;GroupTurnResult&gt;
+  .enableSession(sessionId) / .disableSession(sessionId)   // 群聊开关（持久化）
+  .isSessionEnabled(sessionId) / .listEnabledSessions()
+  .cancelSession(sessionId)     // 中止进行中的群聊轮次
+  .getEngine()                  // GroupChatEngine
+  .listModelCatalog()           // 模型目录（ctx.llm.listProviders + listModels）
+</code></pre>
+<p>WebUI API 路由（<code>/api/group-chat/*</code>）：<code>state</code>、<code>config</code>、<code>models</code>（模型目录，供
+ModelPicker 同步 DSH 已接入的提供方与模型）、<code>messages</code>（独立群聊页的消息气泡
+视图）、<code>attachment</code>（图片字节，按完整 ref 校验后返回）、<code>toggle</code>、<code>submit</code>
+（文本 + base64 图片）、<code>cancel</code>、<code>agents</code>（增删改/禁言/模式）、<code>host</code>
+（群主规则/共享上下文/全局开关/名称/用户名称显示）。</p>
+<p>Cordis 事件（供 Phase 3 / 其他插件订阅）：
+<code>group-chat/config-updated</code>、<code>agent-added/updated/removed</code>、
+<code>turn-start</code>、<code>agent-speaking</code>、<code>agent-spoken</code>、<code>turn-end</code>、
+<code>orchestrator-attached/detached</code>。</p>
+<h3>数据流</h3>
+<p>插件以 class plugin 形式加载（与 <code>@deepseek-ai/dsh-agent-default-model</code> 同一模式）：</p>
+<ul>
+<li><code>static Config = GroupConfigSchema</code> —— 组合入口配置（<code>cordis.patch.yml</code> 的
+<code>config:</code> 或空值）由插件注册表校验。</li>
+<li><code>installSettingsSection(ctx, NS, GroupConfigSchema, entry, hooks)</code> —— 在
+<code>group-chat</code> 用户设置命名空间上注册同一 schema，以入口配置为 <code>base</code>；
+解析值 = schema 默认值 → 入口 base → <code>~/.dsh/settings.yaml</code> 用户层。</li>
+<li>写入路径：<code>ctx.settings.update(NS, patch)</code>（无 settings 服务时抛
+<code>GroupChatError</code> 码 <code>NO_SETTINGS</code>，读取仍可用入口配置降级）。</li>
+<li>每次提交经 <code>group-chat/config-updated</code> 事件广播 <code>(next, prev)</code>，
+编排器据此重置主动发言定时器。</li>
+</ul>
+<h3>核心接口摘要（<code>src/types.ts</code>）</h3>
+<ul>
+<li><code>GroupConfig</code> —— <code>enabled</code>（群聊开关）、<code>name</code>、<code>enabledSessions</code>（开启群聊的会话）、
+<code>agents</code>、<code>hostRules</code>、<code>sharedContext</code>。</li>
+<li><code>AgentConfig</code> —— <code>id</code>、<code>name</code>、<code>provider</code>/<code>model</code>（DSH 模型路由）、
+<code>systemPrompt</code>（角色卡）、<code>userPrompt</code>（初始上下文）、<code>mode</code>（<code>passive</code>/<code>active</code>）、
+<code>muted</code>（禁言）、<code>enabled</code>、<code>active</code>（主动发言策略）、<code>mentionAliases</code>、<code>triggerKeywords</code>。</li>
+<li><code>HostRules</code> —— <code>muteAll</code>、<code>activeSpeakEnabled</code>、<code>maxRoundsPerTurn</code>、
+<code>maxAgentsPerTurn</code>、<code>parallelSpeak</code>、<code>turnTimeoutMs</code>、<code>mention</code>（@ 语法）。</li>
+<li><code>SharedContextConfig</code> —— <code>maxMessages</code>（统一 Session Log 滚动窗口）、
+<code>transcriptTemplate</code>（<code>[{name}]: {content}</code>）、<code>includeRoleCards</code>。</li>
+<li><code>GroupTurnResult</code> / <code>GroupTurnStepResult</code> —— 轮次与单发言者结果
+（<code>status</code>、<code>cause</code>、<code>failure</code>、<code>messageId</code>）。</li>
+</ul>
+<h2>开发</h2>
+<pre><code>npm install --legacy-peer-deps  # devDependencies（peer 全部由 DSH profile 运行池提供，
+                                # 因此跳过 peer 自动安装；版本与池内 0.1.0-rc.6 对齐）
+npm run typecheck    # tsc 主机 + tsc 客户端（tsconfig.client.json）
+npm run build        # tsc → lib/（ESM + .d.ts）；tsdown → lib/client.js（WebUI bundle）
+npm run smoke        # 裸 Cordis Context 全链路冒烟测试（注册/配置写入/群聊轮次/
+                     #   提及·触发·禁言选择/共享上下文/主动发言/WebUI API 路由/
+                     #   消息气泡视图/图片发送/用户名称显示）
+</code></pre>
+<h2>安装到 web profile</h2>
+<h3>端用户（从 GitHub 一键安装，推荐）</h3>
+<pre><code>dsh plugin --profile web add https://github.com/Qx002/dsh-group-chat.git#v0.1.0
+</code></pre>
+<p>该命令在 profile 目录里执行 <code>pnpm add</code>：克隆仓库 → 直接使用仓库内<strong>预构建的
+<code>lib/</code></strong>（宿主产物与浏览器 bundle 均已提交，无需在安装时构建）→ 自动把声明了
+<code>dsh.bundle</code> 的包并入 <code>dsh.profile.bundles</code>。装完重启 <code>dsh web</code> 即生效，
+<code>group-chat</code> 命名空间出现在设置面板。</p>
+<h3>开发者（本地 link 方式，改代码即时生效）</h3>
+<ol>
+<li>克隆本仓库到本地，在 <code>~/.dsh/profiles/web/package.json</code> 的 <code>dependencies</code>
+中加入 <code>"dsh-group-chat": "link:&lt;本地仓库路径&gt;"</code>。</li>
+<li>在 <code>dsh.profile.bundles</code> 中加入 <code>"dsh-group-chat"</code>（其 <code>dsh.bundle.patch</code>
+指向 <code>cordis.patch.yml</code>，自动插入 <code>group-chat</code> 行）。</li>
+<li>重启 <code>dsh web</code>。</li>
+</ol>
+<h2>许可</h2>
+<p>MIT</p>

@@ -1,0 +1,388 @@
+<h1>dsh-completion-gate</h1>
+<p><strong>Completion Gate</strong> is a DeepSeek Harness plugin that prevents a coding agent from successfully ending a changed task until there is evidence that the work is actually ready.</p>
+<p>It combines two related safeguards:</p>
+<ol>
+<li><strong>Premature Stop Guard</strong> — if a model naturally stops while its own latest output clearly says that work is still pending, the plugin schedules a fresh DSH follow-up turn that resumes the unfinished task.</li>
+<li><strong>Production Readiness Gate</strong> — once code has changed, the root agent must produce machine evidence and a structured final review before the turn is allowed to close normally.</li>
+</ol>
+<p>The goal is not to make the model <em>say</em> that tests passed. The goal is to make DSH execute the available checks, bind the result to the current repository state, and reject stale or incomplete completion evidence.</p>
+<hr>
+<h2>Why this plugin exists</h2>
+<p>LLM coding agents frequently stop in one of these states:</p>
+<pre><code>"Now I need to inspect the call site..."
+→ tool call
+→ reasoning
+→ model naturally stops
+</code></pre>
+<p>or:</p>
+<pre><code>"Implemented. Looks good."
+</code></pre>
+<p>without having actually run the repository's tests, build, lint, typecheck, or reviewed every changed file.</p>
+<p>Completion Gate adds a host-side boundary around those failure modes.</p>
+<pre><code>Agent works
+   │
+   ├── model stops while clearly unfinished
+   │       └── Premature Stop Guard → continue
+   │
+   └── model appears genuinely finished
+           │
+           └── Completion Gate
+                  ├── repository changed?
+                  ├── tests
+                  ├── build
+                  ├── lint
+                  ├── typecheck
+                  ├── TODO/FIXME regression scan
+                  ├── security regression tripwires
+                  ├── changed-file review
+                  └── acceptance criteria → evidence
+                           │
+                     PASS ─┴─ BLOCK
+</code></pre>
+<hr>
+<h2>Core behavior</h2>
+<h3>1. Premature Stop Guard</h3>
+<p>DSH exposes <code>agent/turn-stopping</code> when a model has naturally stopped and no tool call or queued continuation is still keeping the turn alive.</p>
+<p>Completion Gate inspects the latest turn for strong evidence that the model itself said work remained, for example:</p>
+<ul>
+<li><code>Now I need to inspect...</code></li>
+<li><code>Next I will run...</code></li>
+<li><code>I still need to...</code></li>
+<li><code>Let me trace...</code></li>
+<li><code>...and in parallel...</code></li>
+<li>reasoning-only output after tool work with no user-facing completion</li>
+</ul>
+<p>When detected, the plugin queues a waking <code>agent.followup()</code> for a fresh turn such as:</p>
+<pre><code>PREMATURE STOP RECOVERY:
+Continue the unfinished task.
+Execute the pending investigation or implementation now.
+Do not summarize or claim completion yet.
+</code></pre>
+<p>The recovery chain is bounded by <code>prematureStopMaxContinuations</code>, so repeated premature/empty recovery turns cannot create an infinite follow-up loop.</p>
+<p>Generic phrases such as <code>Let me know if you want changes</code> are not treated as unfinished work.</p>
+<h3>2. Root-agent completion authority</h3>
+<p>By default:</p>
+<pre><code>gateSubagents: false
+</code></pre>
+<p>Only the root agent owns final production readiness. Spawned DSH subagents are allowed to complete their delegated jobs normally.</p>
+<p>This is the recommended setting when using autonomous orchestration, Phoenix/model failover, AI Council, critics, or large subagent teams. The root agent remains responsible for integrating the work and passing the final gate.</p>
+<p>You can explicitly enable subagent gating from the control center if a project really needs it.</p>
+<h3>3. Workspace fingerprint</h3>
+<p>Completion evidence is tied to a SHA-256 fingerprint of the current repository state.</p>
+<p>The fingerprint accounts for:</p>
+<ul>
+<li>session baseline Git HEAD;</li>
+<li>commits created during the agent session;</li>
+<li>staged changes;</li>
+<li>unstaged changes;</li>
+<li>untracked files.</li>
+</ul>
+<p>This matters because a clean worktree does <strong>not</strong> prove the agent made no changes: the agent may already have committed them.</p>
+<p>If the code changes after a successful check or attestation, the fingerprint changes and the old evidence is no longer valid.</p>
+<h3>4. Machine evidence</h3>
+<p>Completion Gate can auto-detect and execute common project checks.</p>
+<table>
+<thead>
+<tr>
+<th>Ecosystem</th>
+<th>Detection / checks</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>Node.js</td>
+<td>package scripts such as <code>test</code>, <code>build</code>, <code>lint</code>, <code>typecheck</code></td>
+</tr>
+<tr>
+<td>npm / pnpm / Yarn / Bun</td>
+<td>package manager selected from project lockfiles</td>
+</tr>
+<tr>
+<td>Python</td>
+<td>pytest when tests/config are present; Ruff and Mypy when configured</td>
+</tr>
+<tr>
+<td>Go</td>
+<td><code>go test ./...</code>, <code>go vet ./...</code></td>
+</tr>
+<tr>
+<td>Rust</td>
+<td><code>cargo test --all-targets</code>, <code>cargo check --all-targets</code></td>
+</tr>
+<tr>
+<td>Composer / PHP</td>
+<td><code>composer test</code>, <code>composer lint</code> when scripts exist</td>
+</tr>
+<tr>
+<td>Any project</td>
+<td>operator-defined custom checks</td>
+</tr>
+</tbody></table>
+<p>When <code>requireTests</code> is enabled, a project with <strong>no executable test command detected</strong> is considered blocked rather than silently treated as tested.</p>
+<p>Successful machine results are cached for the exact workspace fingerprint. This avoids rerunning a ten-minute suite merely because the agent needs one extra turn to submit its final review.</p>
+<h3>5. Added-code tripwires</h3>
+<p>The gate can inspect newly added lines for:</p>
+<pre><code>TODO
+FIXME
+HACK
+XXX
+</code></pre>
+<p>and a deliberately narrow set of obvious security-regression patterns such as:</p>
+<ul>
+<li>likely hard-coded credentials;</li>
+<li>disabled TLS certificate verification;</li>
+<li><code>eval(...)</code> / dynamic <code>Function</code> construction;</li>
+<li><code>chmod 777</code>;</li>
+<li>shell execution enablement requiring review;</li>
+<li>raw HTML injection surfaces.</li>
+</ul>
+<p>This is a <strong>regression tripwire</strong>, not a replacement for dedicated SAST/security tooling.</p>
+<h3>6. Completion attestation</h3>
+<p>Machine checks cannot prove every requirement. Before final completion, the agent can be required to call the <code>completion_gate</code> tool with an attestation bound to the current workspace fingerprint.</p>
+<p>Example:</p>
+<pre><code>{
+  "action": "attest",
+  "reviewed_files": [
+    "src/engine.ts",
+    "tests/engine.test.ts"
+  ],
+  "review_summary": "Reviewed the complete diff, error paths, state transitions and backwards compatibility.",
+  "acceptance_criteria": [
+    {
+      "criterion": "Risk sizing uses ATR",
+      "evidence": "Unit tests cover ATR-derived risk sizing and the full test suite passes."
+    },
+    {
+      "criterion": "Existing behavior remains compatible",
+      "evidence": "Regression tests and typecheck pass; changed call sites were reviewed."
+    }
+  ],
+  "unresolved_issues": []
+}
+</code></pre>
+<p>In strict mode the gate verifies that:</p>
+<ul>
+<li>every changed file is listed in <code>reviewed_files</code>;</li>
+<li>a changed-file review summary exists;</li>
+<li>at least one acceptance criterion is supplied;</li>
+<li>every criterion has concrete evidence;</li>
+<li><code>unresolved_issues</code> is empty;</li>
+<li>the attestation fingerprint still matches the repository.</li>
+</ul>
+<hr>
+<h2>Control Center</h2>
+<p>Open:</p>
+<p><strong>Settings → Completion Gate</strong></p>
+<p>The control center is both a runtime dashboard and a persistent configuration editor.</p>
+<h3>Behavior</h3>
+<ul>
+<li><strong>Enable Completion Gate</strong> — master switch.</li>
+<li><strong>Mode</strong><ul>
+<li><code>Strict</code>: a failed gate steers the agent back and prevents normal completion.</li>
+<li><code>Advisory</code>: evidence is collected, but failure does not force another step.</li>
+</ul>
+</li>
+<li><strong>Gate subagents</strong> — include DSH child/subagent stop boundaries. Off is recommended for autonomous teams.</li>
+<li><strong>Premature-stop guard</strong> — recover natural stops that clearly leave pending work by scheduling a fresh follow-up turn.</li>
+<li><strong>Max recovery follow-ups</strong> — safety cap across one consecutive premature-stop recovery chain.</li>
+</ul>
+<h3>Machine evidence</h3>
+<ul>
+<li><strong>Auto-detect checks</strong></li>
+<li><strong>Require tests</strong></li>
+<li><strong>Require build when available</strong></li>
+<li><strong>Require lint when available</strong></li>
+<li><strong>Require typecheck when available</strong></li>
+<li><strong>Block new TODO/FIXME markers</strong></li>
+<li><strong>Security regression scan</strong></li>
+</ul>
+<h3>Completion evidence</h3>
+<ul>
+<li><strong>Require final attestation</strong></li>
+<li><strong>Gate only changed workspaces</strong></li>
+<li><strong>Maximum changed files</strong></li>
+</ul>
+<h3>Execution limits</h3>
+<ul>
+<li><strong>Check timeout</strong> — maximum time per individual command.</li>
+<li><strong>Stored command output</strong> — maximum sanitized failure output retained per check.</li>
+</ul>
+<h3>Custom checks</h3>
+<p>The UI can add arbitrary operator-defined checks:</p>
+<pre><code>Name: integration-tests
+Category: test
+Command: npm run test:integration
+Required: yes
+</code></pre>
+<p>Custom commands execute in the project's workspace on the DSH host. Only configure commands you trust.</p>
+<h3>Saving settings</h3>
+<p><code>Save settings</code> applies changes immediately and persists them across <code>dsh web</code> restarts.</p>
+<p>Configuration precedence is:</p>
+<pre><code>built-in defaults
+      ↓
+profile / cordis.patch.yml configuration
+      ↓
+settings saved from the Completion Gate UI
+</code></pre>
+<p>Whenever gate policy changes, cached machine evidence, attestations, and operator overrides are invalidated. A previous PASS is never reused under a newly changed policy.</p>
+<p><code>Reset to profile defaults</code> removes the saved UI overlay and immediately returns to the plugin configuration supplied by the active DSH profile.</p>
+<p>The host-side settings file is intentionally not exposed in the browser UI or gate reports.</p>
+<hr>
+<h2>Commands</h2>
+<h3><code>/gate</code></h3>
+<p>Run the gate immediately for the active root session.</p>
+<pre><code>/gate
+</code></pre>
+<p>Useful when you want to inspect readiness before the model tries to finish.</p>
+<h3><code>/gate-status</code></h3>
+<p>Show the latest report for the active session.</p>
+<pre><code>/gate-status
+</code></pre>
+<h3><code>/gate-reset</code></h3>
+<p>Discard cached machine evidence, attestation, and operator override for the active session.</p>
+<pre><code>/gate-reset
+</code></pre>
+<h3><code>/gate-override &lt;reason&gt;</code></h3>
+<p>Explicit operator override for the <strong>exact current workspace fingerprint</strong>.</p>
+<pre><code>/gate-override accepted temporary compatibility risk
+</code></pre>
+<p>If any file or commit changes afterward, the override no longer applies.</p>
+<p>This is intended for the human operator, not as an escape hatch for the agent.</p>
+<hr>
+<h2>Agent tool</h2>
+<p>The plugin registers:</p>
+<pre><code>completion_gate
+</code></pre>
+<p>Actions:</p>
+<ul>
+<li><code>run</code> — execute readiness checks now;</li>
+<li><code>status</code> — return the latest/current report;</li>
+<li><code>attest</code> — submit the final changed-file and acceptance-criteria review.</li>
+</ul>
+<p>Completion Gate also adds a system-prompt section telling coding agents that the gate is authoritative before they claim completion.</p>
+<hr>
+<h2>Header status</h2>
+<p>The conversation header shows a compact status:</p>
+<pre><code>Gate · ready
+Gate · 1 blocked
+Gate · off
+</code></pre>
+<p>This is only an operator summary. The authoritative result remains the workspace-bound gate report.</p>
+<hr>
+<h2>Default configuration</h2>
+<p>The bundled profile patch starts with:</p>
+<pre><code>- insert:
+    - id: completion-gate
+      name: dsh-completion-gate
+      config:
+        enabled: true
+        mode: strict
+        gateSubagents: false
+        preventPrematureStops: true
+        prematureStopMaxContinuations: 3
+        autoDetectChecks: true
+        requireTests: true
+        requireBuildWhenAvailable: true
+        requireLintWhenAvailable: true
+        requireTypecheckWhenAvailable: true
+        blockNewTodos: true
+        securityScan: true
+        requireAttestation: true
+        gateOnlyChangedWorkspaces: true
+        commandTimeoutMs: 600000
+        maxOutputChars: 12000
+        maxChangedFiles: 500
+        customChecks: []
+</code></pre>
+<p>Everything above can be changed from the control center. Profile configuration remains the baseline that <code>Reset to profile defaults</code> returns to.</p>
+<hr>
+<h2>Installation</h2>
+<ol>
+<li>Extract or clone the source repository to a permanent local directory.</li>
+<li>Add that source directory to the DSH Web profile.</li>
+<li>Restart DSH Web.</li>
+</ol>
+<p>Example from the parent directory containing the plugin source:</p>
+<pre><code>dsh plugin --profile web add .\dsh-completion-gate
+dsh web
+</code></pre>
+<p>Then open <strong>Settings → Completion Gate</strong> and review the defaults before relying on strict mode for a production repository.</p>
+<p>No dependency installation is required by this plugin.</p>
+<hr>
+<h2>Updating</h2>
+<p>Replace the plugin source with the newer source revision and restart <code>dsh web</code>.</p>
+<p>UI-saved Completion Gate settings are stored separately from the plugin source, so replacing the source directory does not intentionally reset operator preferences. Use <strong>Reset to profile defaults</strong> if you want the new profile defaults instead.</p>
+<hr>
+<h2>Interaction with model failover / Phoenix</h2>
+<p>Completion Gate is session/workspace scoped, not model scoped.</p>
+<p>If a model fails:</p>
+<pre><code>Model A
+  ↓ 429 / timeout / provider failure
+Phoenix / DSH failover
+  ↓
+Model B continues same session
+  ↓
+Completion Gate still owns the same baseline and workspace evidence
+</code></pre>
+<p>A replacement model can continue remediation without restarting the task. If the replacement changes code, the workspace fingerprint changes and stale gate evidence is invalidated naturally.</p>
+<p><code>gateSubagents: false</code> is recommended with autonomous failover/team orchestration so child jobs are not unnecessarily blocked by the root production-readiness policy.</p>
+<hr>
+<h2>What happens when the gate blocks</h2>
+<p>In strict mode DSH receives a steering message similar to:</p>
+<pre><code>COMPLETION GATE BLOCKED. Do not claim completion.
+
+- Node test: test failed.
+- Changed files not reviewed: src/engine.ts
+- Acceptance-criteria evidence is missing.
+
+Fix the failures, review every changed file, then call completion_gate
+with action=attest and concrete acceptance-criteria evidence.
+</code></pre>
+<p>The agent continues from the existing task/workspace state.</p>
+<hr>
+<h2>Important limits</h2>
+<h3>Premature recovery uses a fresh turn</h3>
+<p>The Premature Stop Guard intentionally uses <code>agent.followup()</code> rather than <code>agent.steer()</code>. A follow-up lets the naturally stopped turn close and immediately wakes a new turn with the unfinished-work instruction. This composes better with provider retry/failover and avoids same-turn recovery steps that can visibly inject context and then fall idle.</p>
+<p>The actual Production Readiness Gate still uses <code>agent.steer()</code> because blocking a failed readiness check must veto the current natural completion boundary.</p>
+<h3>DSH records assistant output before the final stop hook</h3>
+<p>DSH can record an <code>assistant/message</code> before <code>agent/turn-stopping</code> runs. Therefore Completion Gate can prevent the turn from closing and force another step, but it cannot retroactively erase premature prose already emitted by a non-compliant model.</p>
+<p>The Premature Stop Guard and system-prompt instructions are intended to make the normal path continue before the task is treated as complete.</p>
+<h3>Tests are only as good as the project</h3>
+<p>Passing tests do not prove correctness. The gate proves that configured checks passed for a specific repository fingerprint.</p>
+<h3>Attestation is structured model evidence</h3>
+<p>The gate verifies completeness and freshness of the attestation structure; it cannot mathematically prove that an LLM's semantic review was insightful. Independent review plugins, Council, security tooling, and human review still add value.</p>
+<h3>Security scanning is intentionally narrow</h3>
+<p>The built-in scanner catches obvious newly added risky patterns. It is not a comprehensive vulnerability scanner.</p>
+<h3>Custom checks execute shell commands</h3>
+<p>A custom check is operator-controlled code execution on the DSH host. Treat it with the same care as adding a command to a CI configuration.</p>
+<hr>
+<h2>Recommended configuration for an autonomous developer team</h2>
+<pre><code>enabled: true
+mode: strict
+gateSubagents: false
+preventPrematureStops: true
+prematureStopMaxContinuations: 3
+autoDetectChecks: true
+requireTests: true
+requireBuildWhenAvailable: true
+requireLintWhenAvailable: true
+requireTypecheckWhenAvailable: true
+blockNewTodos: true
+securityScan: true
+requireAttestation: true
+gateOnlyChangedWorkspaces: true
+</code></pre>
+<p>This leaves implementation freedom to subagents and model failover while keeping one hard readiness boundary at the root agent.</p>
+<hr>
+<h2>Privacy and security</h2>
+<ul>
+<li>Gate reports expose the repository/workspace <strong>basename</strong>, not the absolute local filesystem path.</li>
+<li>Captured command output is sanitized before it is retained or displayed.</li>
+<li>Common credential/token patterns and absolute local paths are redacted from stored failure output.</li>
+<li>Browser settings endpoints require same-origin requests.</li>
+<li>UI-saved settings are persisted host-side; the persistence path itself is not sent to the browser.</li>
+<li>The model cannot add custom check commands through the <code>completion_gate</code> attestation tool.</li>
+</ul>
+<p>See <a href="https://github.com/AGSQ11/dsh-completion-gate/blob/HEAD/SECURITY.md">SECURITY.md</a> for the concise security model.</p>
+<hr>
+<h2>License</h2>
+<p>MIT. See <a href="https://github.com/AGSQ11/dsh-completion-gate/blob/HEAD/LICENSE">LICENSE</a>.</p>

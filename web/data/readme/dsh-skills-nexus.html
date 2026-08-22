@@ -1,0 +1,397 @@
+<h1>dsh-skills-nexus</h1>
+<p><a href="https://github.com/xiaxi626/dsh-skills-nexus/actions/workflows/ci.yml"><img src="https://github.com/xiaxi626/dsh-skills-nexus/actions/workflows/ci.yml/badge.svg" alt="CI"></a></p>
+<p>A universal DSH skill adapter. Install <strong>once</strong>, then register <strong>any</strong> GitHub
+repo that contains a <code>SKILL.md</code> as a DSH skill — one command at a time. The
+skill repo itself stays pure: no Cordis plugin code, no <code>package.json</code>, no
+<code>cordis.patch.yml</code> required.</p>
+<p>This generalizes the "thin wrapper" pattern from a single hardcoded skill to
+<strong>N dynamically discovered skills</strong> — one provider carries many skills,
+discovered and registered at runtime by scanning directories.</p>
+<h2>Architecture overview</h2>
+<pre><code>flowchart LR
+    subgraph User CLI
+        A["&lt;b&gt;dsh-skills-nexus CLI&lt;/b&gt;&lt;br/&gt;add · update · remove"]
+    end
+
+    subgraph Local storage
+        M["&lt;b&gt;manifest.json&lt;/b&gt;&lt;br/&gt;state backend"]
+        S["&lt;b&gt;~/.dsh/skills-nexus/skills/&lt;/b&gt;&lt;br/&gt;repo-a/ SKILL.md&lt;br/&gt;repo-b/ SKILL.md"]
+    end
+
+    subgraph DSH runtime
+        P["&lt;b&gt;nexusProvider&lt;/b&gt;&lt;br/&gt;list() · get(name)"]
+        C["ctx.skills&lt;br/&gt;(DSH skill catalog)"]
+    end
+
+    G[("GitHub&lt;br/&gt;SKILL.md repos")]
+
+    A -- "git clone" --&gt; G
+    A -- "reads/writes" --&gt; M
+    M -- "read on start" --&gt; P
+    S -- "read SKILL.md" --&gt; P
+    P -- "registers" --&gt; C
+
+    style A fill:#e8f4fd,stroke:#3b82f6,stroke-width:2px,color:#000
+    style P fill:#f0fdf4,stroke:#22c55e,stroke-width:2px,color:#000
+    style M fill:#fffbeb,stroke:#f59e0b,stroke-width:2px,color:#000
+    style S fill:#f5f3ff,stroke:#8b5cf6,stroke-width:2px,color:#000
+    style C fill:#fce7f3,stroke:#ec4899,stroke-width:2px,color:#000
+    style G fill:#f1f5f9,stroke:#64748b,stroke-width:2px,color:#000
+</code></pre>
+<ul>
+<li><strong>CLI writes</strong>: <code>add</code> / <code>update</code> / <code>remove</code> commands operate git and update <code>manifest.json</code></li>
+<li><strong>Provider reads</strong>: <code>list()</code> scans all cloned dirs on DSH start; <code>get()</code> returns skill body</li>
+<li><strong>Decoupled</strong>: CLI and provider communicate through manifest.json, no direct dependency</li>
+</ul>
+<h2>Why</h2>
+<p><code>dsh plugin --profile &lt;name&gt; add "github:owner/repo"</code> forwards to pnpm and
+<strong>only activates packages that declare <code>dsh.bundle.patch</code></strong>. A repo that is just
+<code>SKILL.md</code> + <code>references/</code> + <code>scripts/</code> has no Cordis wrapper, so it cannot be
+installed that way. <code>dsh-skills-nexus</code> fills that gap:</p>
+<table>
+<thead>
+<tr>
+<th>command</th>
+<th>installs</th>
+<th>requires <code>dsh.bundle.patch</code>?</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>dsh plugin add github:owner/dsh-skills-nexus</code></td>
+<td>the nexus itself (once)</td>
+<td>yes</td>
+</tr>
+<tr>
+<td><code>dsh-skills-nexus add github:owner/any-skill</code></td>
+<td>pure SKILL.md content</td>
+<td><strong>no</strong></td>
+</tr>
+</tbody></table>
+<blockquote>
+<p><strong>Not sure which command fits your repo?</strong> Read
+<strong><a href="https://github.com/xiaxi626/dsh-skills-nexus/blob/HEAD/docs/nexus-vs-plugin.md">nexus vs <code>dsh plugin</code> — when to use which</a></strong>.
+Short version: repo has <code>SKILL.md</code> → nexus; repo is a pure plugin
+(<code>cordis.patch.yml</code> / <code>dsh.bundle.patch</code>, no <code>SKILL.md</code>) → <code>dsh plugin</code>;
+has both → your choice (nexus = content, plugin = code).</p>
+</blockquote>
+<h2>Install the nexus</h2>
+<pre><code>dsh plugin --profile web add "github:xiaxi626/dsh-skills-nexus"
+</code></pre>
+<p>Restart the profile once. From now on the nexus provider is active in
+<code>ctx.skills</code>. The compiled <code>lib/</code> is shipped with the repo — no build needed.</p>
+<h2>Usage</h2>
+<pre><code># register a skill repo (cloned under ~/.dsh/skills-nexus/skills/&lt;name&gt;/)
+dsh-skills-nexus add github:owner/repo
+dsh-skills-nexus add github:owner/repo#dev          # pick a branch/tag
+dsh-skills-nexus add https://github.com/owner/repo
+dsh-skills-nexus add owner/repo                     # shorthand
+dsh-skills-nexus add github:owner/repo --yes         # skip the "wrapped repo?" prompt
+
+# inspect / maintain
+dsh-skills-nexus list                               # all registered skills
+dsh-skills-nexus update [name]                      # git pull (all, or one)
+dsh-skills-nexus enable  &lt;name&gt;                     # show in catalog (default)
+dsh-skills-nexus disable &lt;name&gt;                     # hide without deleting
+dsh-skills-nexus remove &lt;name&gt;                      # delete clone + unregister
+</code></pre>
+<p>Accepted repo forms: <code>github:owner/repo[#ref]</code>, full <code>https://</code> URL (incl.
+<code>/tree/&lt;ref&gt;/...</code> subpaths), <code>git+https://</code>, <code>git@</code>/<code>ssh://</code>, and bare
+<code>owner/repo</code> shorthand.</p>
+<p>When you <code>add</code> a repo, nexus inspects the clone before registering it:</p>
+<ul>
+<li><strong>Plain SKILL.md repo</strong> — registered directly.</li>
+<li><strong>SKILL.md + DSH plugin wrapper</strong> — nexus asks whether to ignore the wrapper
+and manage it as a plain SKILL.md repo. Answer <code>y</code> to continue, or <code>n</code> to
+abort and install it as a DSH plugin instead. Use <code>--yes</code> to skip the prompt
+and always continue.</li>
+<li><strong>Pure DSH plugin (no SKILL.md)</strong> — nexus prints a message telling you to use
+that repo's own DSH plugin installation flow, then exits without registering.</li>
+<li><strong>Neither</strong> — nexus reports that no SKILL.md or DSH plugin marker was found
+and exits with an error.</li>
+</ul>
+<h2>SKILL.md discovery (per cloned repo)</h2>
+<ol>
+<li><code>&lt;repoRoot&gt;/SKILL.md</code> — authoritative; repo treated as a single skill.</li>
+<li><code>&lt;repoRoot&gt;/&lt;name&gt;/SKILL.md</code> — repo bundles one skill per subdirectory (single-level only, matching the official filesystem provider; nested <code>**/SKILL.md</code> is excluded).</li>
+<li><code>&lt;repoRoot&gt;/&lt;name&gt;.md</code> — flat markdown (no bundled resources).</li>
+</ol>
+<p><code>README.md</code> / <code>CHANGELOG.md</code> / <code>LICENSE.md</code> are skipped in the flat scan.</p>
+<h3>Frontmatter fields honored</h3>
+<p>Required: <code>name</code>, <code>description</code>. Optional, respected by the provider:
+<code>disable-model-invocation</code> (bool), <code>user-invocable</code> (bool). Any other fields
+(<code>whenToUse</code>, <code>metadata</code>, …) are parsed and available but not interpreted by
+the nexus.</p>
+<h2>Filesystem layout</h2>
+<pre><code>~/.dsh/skills-nexus/
+├── manifest.json          # state backend (CLI writes, provider reads)
+└── skills/
+    ├── repo-a/            # full git clones, untouched
+    │   ├── SKILL.md
+    │   └── references/…
+    └── repo-b/
+</code></pre>
+<p>Override the root with <code>DSH_HOME</code> (defaults to <code>~/.dsh</code>) or
+<code>DSH_SKILLS_NEXUS_HOME</code> (defaults to <code>&lt;DSH_HOME&gt;/skills-nexus</code>).</p>
+<h2>Uninstall</h2>
+<p>There are two levels of uninstall — pick whichever fits:</p>
+<h3>Remove individual skills</h3>
+<pre><code># list what you have
+dsh-skills-nexus list
+
+# remove one (deletes the clone and unregisters it)
+dsh-skills-nexus remove &lt;skill-name&gt;
+</code></pre>
+<p>The skill disappears from the DSH catalog on the next reload. All other
+registered skills are unaffected.</p>
+<h3>Uninstall the nexus itself</h3>
+<pre><code># 1. (optional) remove all managed skills first — cleans up ~/.dsh/skills-nexus/
+dsh-skills-nexus list | awk 'NR&gt;1 &amp;&amp; $2 {print $2}' | xargs -I{} dsh-skills-nexus remove {}
+
+# 2. uninstall the plugin from your DSH profile
+dsh plugin --profile web remove dsh-skills-nexus
+
+# 3. (optional) delete any leftover state
+rm -rf ~/.dsh/skills-nexus
+</code></pre>
+<p>Restart the DSH profile. The <code>dsh-skills-nexus</code> provider and all its skills
+will be gone.</p>
+<h2>Local testing steps</h2>
+<p>You can fully test the nexus on your machine without pushing to GitHub or
+publishing to npm. Follow these five steps.</p>
+<h3>Step 1 — build the project</h3>
+<p>Inside the <code>dsh-skills-nexus/</code> directory:</p>
+<pre><code>cd dsh-skills-nexus
+npm install
+npm run build      # generates lib/
+</code></pre>
+<blockquote>
+<p>If you've made changes and want to verify types before building, run
+<code>npm run typecheck</code> (type-check only, no output).</p>
+</blockquote>
+<h3>Step 2 — create a local overlay</h3>
+<p>Create <code>overlay.yml</code> in the project root (<strong>do NOT commit this to git</strong> — it's
+for local development only):</p>
+<pre><code># overlay.yml
+- insert:
+    - id: dsh-skills-nexus
+      # Windows: '/C:/your/path/dsh-skills-nexus/lib/index.js'
+      # macOS:   '/Users/your/path/dsh-skills-nexus/lib/index.js'
+      # Linux:   '/home/your/path/dsh-skills-nexus/lib/index.js'
+      name: '/your/absolute/path/dsh-skills-nexus/lib/index.js'
+</code></pre>
+<blockquote>
+<p>Replace <code>name</code> with the <strong>absolute path</strong> to <code>lib/index.js</code> on your machine.
+Windows <strong>must</strong> prepend <code>/</code> before the drive letter, e.g. <code>'/C:/dev/dsh-skills-nexus/lib/index.js'</code>; macOS / Linux uses the absolute path directly, e.g. <code>'/home/user/dsh-skills-nexus/lib/index.js'</code>.</p>
+</blockquote>
+<p><strong>Or generate it with a one-liner</strong> (make sure you've cd'd into the project directory):</p>
+<p><strong>Windows (Git Bash / MINGW):</strong></p>
+<pre><code>cat &gt; overlay.yml &lt;&lt;EOF
+- insert:
+    - id: dsh-skills-nexus
+      name: '/$(pwd -W)/lib/index.js'
+EOF
+</code></pre>
+<blockquote>
+<p><code>pwd -W</code> outputs a Windows-style absolute path (e.g. <code>C:/Users/xxx/dsh-skills-nexus</code>); the leading <code>/</code> <strong>must</strong> be prepended, resulting in <code>/C:/Users/xxx/dsh-skills-nexus/lib/index.js</code>.
+Node.js ESM loader on Windows does not accept a bare <code>C:/...</code> path (it treats <code>C:</code> as a URL scheme), so you must write <code>/C:/...</code> or <code>file:///C:/...</code>.</p>
+</blockquote>
+<p><strong>macOS / Linux:</strong></p>
+<pre><code>cat &gt; overlay.yml &lt;&lt;EOF
+- insert:
+    - id: dsh-skills-nexus
+      name: '$(pwd)/lib/index.js'
+EOF
+</code></pre>
+<blockquote>
+<p><code>pwd</code> outputs a Unix-style absolute path (e.g. <code>/Users/xxx/dsh-skills-nexus</code>) — it already starts with <code>/</code>, resulting in <code>/Users/xxx/dsh-skills-nexus/lib/index.js</code>. No extra leading <code>/</code> needed.</p>
+</blockquote>
+<p>This creates <code>overlay.yml</code> at the project root with the correct path auto-filled.</p>
+<h3>Step 3 — start DSH in patch mode</h3>
+<pre><code>npx @deepseek-ai/dsh web --patch overlay.yml
+</code></pre>
+<p>This mounts the nexus as a temporary layer in the current profile, so the
+provider gets registered. <strong>After each code change, run <code>npm run build</code> and
+restart DSH for changes to take effect.</strong></p>
+<h3>Step 4 — add a skill with the CLI</h3>
+<blockquote>
+<p><strong>Important:</strong> do <strong>not</strong> move the project folder during local testing. If you
+move it after <code>npm link</code>, running <code>npm link</code> again will fail with
+<code>EEXIST: file already exists</code> because the old symlink is still registered
+globally. See the fix below.</p>
+</blockquote>
+<p>Open another terminal:</p>
+<pre><code># link the CLI globally so you can type `dsh-skills-nexus` directly
+cd dsh-skills-nexus
+npm link
+
+# add a real skill repo to test with
+dsh-skills-nexus add github:xiaxi626/theme-port-skill
+
+# verify it was registered
+dsh-skills-nexus list
+</code></pre>
+<p><strong>If you moved the folder and <code>npm link</code> fails with EEXIST:</strong></p>
+<pre><code># remove the stale global links (Git Bash on Windows)
+rm -f ~/AppData/Roaming/npm/dsh-skills-nexus
+rm -f ~/AppData/Roaming/npm/dsh-skills-nexus.cmd
+
+# then re-link
+npm link
+</code></pre>
+<blockquote>
+<p>The paths above are for Windows + Git Bash. On macOS or Linux, global links
+are usually under <code>/usr/local/bin/</code>.</p>
+</blockquote>
+<h3>Step 5 — verify inside DSH</h3>
+<blockquote>
+<p><strong>Important</strong>: the DSH process started in Step 3 with <code>--patch</code> was launched
+<strong>before</strong> you added the skill in Step 4, so simply asking "what skills do you
+have" in the existing DSH session won't show the new skill — the provider
+hasn't loaded it yet.</p>
+<p><strong>You must stop and restart it</strong>: go back to the terminal where DSH is running
+(Step 3), press <code>Ctrl+C</code> to stop the process, then re-run the same command:</p>
+<pre><code>npx @deepseek-ai/dsh web --patch overlay.yml
+</code></pre>
+<p>On restart, DSH reloads the provider and <code>list()</code> picks up the skill you just
+added via the CLI.</p>
+</blockquote>
+<p>After restarting, go into the DSH session and ask something like "what skills do
+you have" to trigger the skill catalog. Check that <code>theme-port-skill</code> appears in
+the list.</p>
+<hr>
+<h2>Lighter check (core logic, no DSH needed)</h2>
+<p>If you only want to verify the "clone + parse + provider list/get" pipeline
+without running the full DSH, you can write a short Node script that calls the
+provider directly:</p>
+<pre><code>// test-provider.mjs
+import { nexusProvider } from './lib/provider.js'
+
+const list = await nexusProvider.list()
+console.log('list:', list.map(s =&gt; s.name))
+
+const skill = await nexusProvider.get('theme-port-skill')
+console.log('get:', skill.description.slice(0, 60))
+console.log('content length:', skill.content.length)
+</code></pre>
+<pre><code>node test-provider.mjs
+</code></pre>
+<blockquote>
+<p>Prerequisite: you've already added at least one skill with <code>dsh-skills-nexus add</code>.
+If <code>list()</code> returns the expected skill and <code>get()</code> returns the body, the
+entire thin-wrapper seam is working.</p>
+</blockquote>
+<hr>
+<h2>How it works</h2>
+<pre><code>dsh-skills-nexus add github:owner/repo
+   └─ git clone --depth 1 →  ~/.dsh/skills-nexus/skills/&lt;name&gt;/
+   └─ append entry          →  ~/.dsh/skills-nexus/manifest.json
+
+DSH starts / reloads
+   └─ apply(ctx) → ctx.skills.registerProvider(() =&gt; nexusProvider)
+        └─ list()   reads manifest, scans each clone, returns SkillCandidate[]
+        └─ get(name) reads SKILL.md, returns { content: body, resourceBase }
+</code></pre>
+<p>The provider implements the standard thin-wrapper seam:</p>
+<ul>
+<li><code>list()</code> returns an <strong>array</strong> of <code>SkillCandidate</code> — one provider carries many skills.</li>
+<li><code>parseFrontmatter()</code> reads <code>SKILL.md</code> at runtime (no duplicate description in code); uses the <code>yaml</code> package like the official <code>dsh-skill-filesystem</code>.</li>
+<li><code>resourceBase</code> is built <strong>per skill</strong> and points at that skill's own clone directory, so relative paths (<code>references/</code>, <code>scripts/</code>, <code>assets/</code>) resolve correctly.</li>
+<li>The skill name is taken from each <code>SKILL.md</code>'s frontmatter <code>name</code> (falling back to the manifest key), so multi-skill repos surface correctly.</li>
+</ul>
+<h2>Project layout</h2>
+<pre><code>src/
+├── index.ts          # Cordis plugin entry: apply(ctx) → registerProvider
+├── provider.ts       # nexusProvider: list() / get(name)
+├── resolve.ts        # manifest entries → parsed skills
+├── manifest.ts       # read/write/find/add/remove/toggle manifest.json
+├── locator.ts        # locate SKILL.md inside a clone (3 discovery layouts)
+├── frontmatter.ts    # yaml-based frontmatter + body parser
+├── git.ts            # parseGitSpec / cloneRepo / pullRepo (execFile, no shell)
+├── paths.ts          # home/skills/manifest path constants
+├── types.ts          # Manifest / SkillCandidate / SkillDefinition / Context
+└── cli/
+    ├── index.ts      # dispatcher
+    ├── args.ts       # tiny argv parser
+    └── commands/     # add · list · update · remove · toggle
+</code></pre>
+<p>Runtime dependency is just <code>yaml</code>. <code>@deepseek-ai/cordis</code> and
+<code>@deepseek-ai/dsh-skill</code> are optional peer deps (the SDK provides the real
+<code>Context</code> at runtime; the local structural types in <code>types.ts</code> keep the project
+typecheckable without them).</p>
+<h2>Development: testing &amp; CI</h2>
+<p>Quality gates, all runnable locally:</p>
+<pre><code>npm run typecheck   # tsc --noEmit (strict)
+npm run lint        # ESLint 9 + typescript-eslint (flat config)
+npm test            # unit tests — node:test + tsx, no extra framework
+npm run build       # tsc → lib/
+</code></pre>
+<p>The test suite lives in <code>test/</code> and targets the pure-logic modules:</p>
+<table>
+<thead>
+<tr>
+<th>module</th>
+<th>covered by</th>
+<th>what is verified</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>src/git.ts</code></td>
+<td><code>test/git.test.ts</code></td>
+<td><code>parseGitSpec</code> (all accepted repo forms), <code>repoSlug</code>, <code>sanitizeName</code></td>
+</tr>
+<tr>
+<td><code>src/frontmatter.ts</code></td>
+<td><code>test/frontmatter.test.ts</code></td>
+<td>frontmatter + body split, malformed YAML, block scalars, CRLF, <code>flag()</code></td>
+</tr>
+<tr>
+<td><code>src/locator.ts</code></td>
+<td><code>test/locator.test.ts</code></td>
+<td>the 3 SKILL.md discovery layouts, skipped files, hidden dirs</td>
+</tr>
+<tr>
+<td><code>src/repo-kind.ts</code></td>
+<td><code>test/repo-kind.test.ts</code></td>
+<td>repo classification: plain / wrapped / plugin / unknown</td>
+</tr>
+<tr>
+<td><code>src/cli/args.ts</code></td>
+<td><code>test/args.test.ts</code></td>
+<td>the tiny argv parser</td>
+</tr>
+<tr>
+<td><code>src/manifest.ts</code></td>
+<td><code>test/manifest.test.ts</code></td>
+<td>manifest read/write round-trips against a temp <code>DSH_HOME</code></td>
+</tr>
+<tr>
+<td><code>src/resolve.ts</code></td>
+<td><code>test/resolve.test.ts</code></td>
+<td>manifest → parsed skills pipeline (multi-skill, flags, name fallback)</td>
+</tr>
+</tbody></table>
+<p><code>npm run test:build</code> compiles <code>src/</code> + <code>test/</code> to <code>test-dist/</code> for a
+loader-free run (<code>node --test test-dist/test/</code>), useful where tsx's loader
+is unavailable.</p>
+<p>CI (<code>.github/workflows/ci.yml</code>) runs on push/PR across Node 18/20/22:
+typecheck, lint, unit tests, build, and a check that the committed <code>lib/</code>
+still matches a fresh build (the published package ships <code>lib/</code>, so a stale
+build would drift from <code>src/</code>).</p>
+<h2>Notes &amp; limitations</h2>
+<ul>
+<li><strong><code>add</code> then visibility</strong>: whether a newly added skill appears immediately in
+the catalog depends on whether DSH caches provider <code>list()</code> results. If the
+profile was started before <code>add</code>, reload it (or rely on the nexus's read-on-
+every-<code>list</code> design, which picks up changes on the next catalog refresh).</li>
+<li><strong>Default branch detection</strong>: when no <code>#ref</code> is given, the CLI detects the
+remote's default branch via <code>git ls-remote --symref</code> (falls back to <code>main</code>).
+Pin a ref with <code>#branch</code>, <code>#tag</code>, or <code>#commit-sha</code> to override.</li>
+<li><strong>Skill content repos only</strong>: this is <em>not</em> a replacement for <code>dsh plugin add</code>
+of real Cordis plugins. If a repo already ships a <code>dsh.bundle.patch</code>, install
+it the normal way — nexus is for repos that don't. See
+<a href="https://github.com/xiaxi626/dsh-skills-nexus/blob/HEAD/docs/nexus-vs-plugin.md">nexus vs <code>dsh plugin</code></a> for the full decision guide.</li>
+<li><strong>Build scripts</strong>: because nexus clones content repos itself (not via pnpm),
+it sidesteps pnpm <code>allowBuilds</code> interception entirely.</li>
+</ul>
+<h2>License</h2>
+<p>MIT</p>

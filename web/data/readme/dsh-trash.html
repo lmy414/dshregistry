@@ -1,0 +1,121 @@
+<h1>dsh-trash</h1>
+<p><strong>English</strong> | <a href="https://github.com/LeonSone/dsh-trash/blob/HEAD/README.zh-CN.md">中文</a></p>
+<p>A <a href="https://github.com/deepseek-ai/dsh">DeepSeek Harness</a> plugin that turns <strong>every delete operation into a recoverable trash move</strong> — even under the highest permission (<code>danger-full-access</code>). Accidentally deleted something? Restore it in one call.</p>
+<ul>
+<li>Intercepts delete commands in the <code>pwsh</code> / <code>bash</code> / <code>run_code</code> tools (<code>Remove-Item</code>, <code>rm</code>, <code>del</code>, <code>rd</code>, <code>rmdir</code>, <code>unlink</code>, <code>[System.IO.*]::Delete</code>, <code>fs.unlink/rm/rmdir</code>, <code>os.remove</code>, <code>shutil.rmtree</code>, …) at the tool pipeline's <code>tools/pre-execute</code> gate, denies them, and guides the model to the trash tools.</li>
+<li>Ships 4 tools: <code>trash</code> (delete = move to trash), <code>trash-list</code> (inspect), <code>trash-restore</code> (recover), <code>trash-purge</code> (confirmed permanent cleanup — the <strong>only</strong> path that truly deletes).</li>
+<li>Zero runtime dependencies (Node built-ins only), installable from anywhere (registry / <code>file:</code> / <code>link:</code> / GitHub).</li>
+</ul>
+<h2>How it works</h2>
+<table>
+<thead>
+<tr>
+<th>Layer</th>
+<th>What happens</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong>Interceptor</strong></td>
+<td>A <code>tools/pre-execute</code> listener (prepended, so it runs first) scans <code>pwsh.command</code>, <code>bash.command</code>, and <code>run_code.code</code> for delete patterns. On a hit it returns <code>{ kind: "deny" }</code> — denials are monotonic, so no later stage (approval, guard, dispatch) can let the call through. The model sees an actionable message telling it to use <code>trash</code> instead.</td>
+</tr>
+<tr>
+<td><strong>Trash store</strong></td>
+<td>Each "delete" becomes one entry under the trash root (default <code>$DSH_HOME/trash</code>): <code>data/</code> keeps the original names, <code>meta.json</code> records original paths, timestamps, sizes, and an optional reason. Cross-volume moves degrade to copy-then-clean.</td>
+</tr>
+<tr>
+<td><strong>Tools</strong></td>
+<td><code>trash</code> / <code>trash-list</code> / <code>trash-restore</code> / <code>trash-purge</code> — see below.</td>
+</tr>
+</tbody></table>
+<pre><code>&lt;trashRoot&gt;/
+  &lt;entryId&gt;/
+    data/...        the "deleted" files &amp; directories (original names preserved)
+    meta.json       original path, deleted-at, size, reason
+</code></pre>
+<h2>Installation</h2>
+<pre><code># From a local checkout (dev / link mode — edits to the source take effect immediately)
+dsh plugin --profile web add link:D:/path/to/dsh-trash
+
+# Or straight from GitHub (requires git + a GitHub token on this machine)
+dsh plugin --profile web add github:LeonSone/dsh-trash
+</code></pre>
+<p><code>dsh plugin add</code> adds the package to the profile's <code>dependencies</code>; because the package declares <code>dsh.bundle</code>, it is automatically appended to <code>dsh.profile.bundles</code>. Restart <code>dsh web</code> (or the headless runner) for the plugin to load.</p>
+<blockquote>
+<p>Headless profile: <code>dsh plugin --profile headless add &lt;spec&gt;</code> — same flow.</p>
+</blockquote>
+<h2>Usage</h2>
+<p>Once installed, the model's behavior changes automatically:</p>
+<table>
+<thead>
+<tr>
+<th>Scenario</th>
+<th>Behavior</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>Model runs <code>Remove-Item</code> / <code>rm</code> / <code>del</code> / …</td>
+<td><strong>Blocked</strong> with a message explaining the trash workflow</td>
+</tr>
+<tr>
+<td>Model calls <code>trash(paths=[...])</code></td>
+<td>Files/dirs move into the trash (recoverable)</td>
+</tr>
+<tr>
+<td>Accidental delete</td>
+<td><code>trash-restore(entry_id=...)</code> restores to the original path; or <code>trash-restore(path="&lt;substring of original path&gt;")</code> finds the newest matching entry</td>
+</tr>
+<tr>
+<td>Permanent cleanup</td>
+<td><code>trash-purge(confirm: true)</code> — optionally scoped to specific <code>entry_ids</code></td>
+</tr>
+</tbody></table>
+<h3>Tool reference</h3>
+<table>
+<thead>
+<tr>
+<th>Tool</th>
+<th>Purpose</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>trash(paths, reason?)</code></td>
+<td>Move files/directories into the trash. Returns <code>entry_id</code>, <code>trash_root</code>, <code>moved</code>.</td>
+</tr>
+<tr>
+<td><code>trash-list(path?)</code></td>
+<td>List trash entries (deleted-at, size, reason, original paths). Optional substring filter on the original path.</td>
+</tr>
+<tr>
+<td><code>trash-restore(entry_id? | path?, target_path?, overwrite?)</code></td>
+<td>Restore an entry to its original location (or <code>target_path</code> for single-item entries). If the target exists, it refuses unless <code>overwrite: true</code> — in which case the existing content is <strong>first moved to the trash itself</strong>, then the restore proceeds. Nothing is ever lost.</td>
+</tr>
+<tr>
+<td><code>trash-purge(entry_ids?, confirm: true)</code></td>
+<td>Permanently delete trash entries. The only real deletion in the whole plugin.</td>
+</tr>
+</tbody></table>
+<h2>Configuration (optional)</h2>
+<p>Append to your profile's <code>cordis.patch.yml</code>:</p>
+<pre><code>- id: dsh-trash
+  config:
+    location: D:/data/dsh-trash   # trash root; same drive as the workspace = instant renames
+    interceptPwsh: true           # intercept deletes in pwsh (default true)
+    interceptBash: true           # intercept deletes in bash (default true)
+    interceptRunCode: true        # intercept fs.* deletes in run_code (default true)
+</code></pre>
+<h2>Security notes</h2>
+<ul>
+<li><strong>Fail-safe by design</strong>: the detector prefers false positives over letting a real delete through (e.g. a tutorial string mentioning <code>Remove-Item</code> is blocked too; the denial message explains why). Short aliases (<code>rm</code>/<code>del</code>/<code>rd</code>/<code>ri</code>) only match in <em>command position</em>, so <code>cat /tmp/rm</code>, <code>Test-Path C:\rd</code>, or <code>grep 'rm -rf' docs</code> are <strong>not</strong> flagged.</li>
+<li><strong>One true delete path</strong>: only <code>trash-purge(confirm: true)</code>, and it only touches the trash root.</li>
+<li><strong>Restore safety</strong>: <code>entry_id</code> is strictly validated (no path traversal); <code>target_path</code> may not point inside the trash root.</li>
+<li><strong>Overwrite safety</strong>: restoring over an existing file first backs that file up into the trash — every step is reversible.</li>
+</ul>
+<h2>Development</h2>
+<pre><code>node test/unit.test.mjs   # 48 cases: detector hit/miss matrix + full trash-store workflow
+</code></pre>
+<h2>Uninstall</h2>
+<pre><code>dsh plugin --profile web remove dsh-trash
+</code></pre>
+<p>The trash directory itself is left untouched; move it away first if you want to keep the data.</p>
+<h2>License</h2>
+<p><a href="https://github.com/LeonSone/dsh-trash/blob/HEAD/LICENSE">MIT</a></p>

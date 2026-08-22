@@ -1,0 +1,77 @@
+<h1>dsh-parallel-pool — 动态滚动窗口子代理任务池</h1>
+<p>把"整批独立任务"一次交给任务池，<strong>主对话始终不阻塞</strong>：提交后立即返回 job id，
+后台滚动窗口补位（任何子代理一结束立刻派发下一任务，不等整轮）；每个子任务
+结算时立即把该任务结果投递给主对话，整批结束后再投递完整汇总与时间线。</p>
+<h2>用法（模型可见工具）</h2>
+<pre><code>parallel_pool {
+  tasks: [{ prompt, description?, model? }, ...],   // ≤64 个独立任务
+  maxConcurrency?: 2,                                // 默认 4，范围 1..16
+  provider?: 'spawn' | 'fork',                       // 默认 'spawn'（全新子代理）
+  failFast?: false,                                  // 首个失败后停止补位
+  background?: true,                                 // 兼容参数；始终非阻塞，返回 job id 并增量推送
+}
+</code></pre>
+<ul>
+<li><strong>始终非阻塞</strong>：无论 <code>background</code> 是否为 false，都立即返回
+<code>{kind:'background', jobId}</code>（毫秒级），池在后台滚动调度；<strong>每个子任务结算
+时立即向主对话投递该任务结果</strong>，主对话无需等待整批结束即可及时处理。
+<strong><code>job_output</code> 实时返回每任务进度与终态富文本（v0.3.0）</strong>；<code>job_kill</code>
+中止批任务并投递部分结果。</li>
+<li>整批结束后仍会投递完整汇总（含每任务 <code>startedAt/endedAt</code> 时间线）。</li>
+<li>返回汇总：<code>total/completed/failed/aborted/skipped</code>、总耗时、峰值并发、
+<code>rollingRefill</code>（是否发生补位）、每任务结果与时间线。</li>
+<li>系统提示引导：对 2+ 独立任务整批交给 parallel_pool，而不是手动逐波派发
+subagent（引导段 order 110，早于官方 tool-subagent 的 116.5）。</li>
+<li><strong>宽松校验（v0.3.0）</strong>：<code>model</code>/<code>description</code> 为空字符串视为未提供。</li>
+</ul>
+<h2>设计</h2>
+<ul>
+<li><strong>工作器池（v0.4.0，性能优化）</strong>：持久子代理数 = 并发数而非任务数——
+每个 worker 串行处理任务（首任务随 <code>startContinuable</code> 创建派发，后续经
+<code>subagents.followup</code>），每任务一回合、<code>subagent/end</code> 逐回合结算。
+Web 会话回显与子代理目录的加载负载不再随任务数增长（实测：189 个子代理
+→ <code>listChildren</code> 13.6s，每冷子代理折叠 ~68ms；64 任务批次旧引擎产生 64 个
+子会话，新引擎仅 maxConcurrency 个）。</li>
+<li><strong>健壮性（v0.5.0）</strong>：<ul>
+<li><code>taskTimeoutMs</code>（默认 30min，0=不限）：单任务超时 → interrupt 子代理 +
+记 failed，防 worker 挂死导致整批永不结算；</li>
+<li><code>maxRetries</code>（默认 1，0..3）：失败自动重试（换新子代理执行，
+<code>retryDelayMs</code> 默认 5s），覆盖瞬态故障（配额抖动/网络）；</li>
+<li><code>tasksPerWorker</code>（默认 12）：每 worker 处理任务数上限，到点退役换新，
+防长批下上下文累积污染；</li>
+<li>per-run 事件监听：只登记本池在途子代理的结算事件，随 run 注销零噪音。</li>
+</ul>
+</li>
+<li><strong>job readOutput（v0.3.0）</strong>：每任务结算即更新进度文本（<code>N/M settled</code> +
+逐行结果），<code>job_output</code> 实时可见；终态输出完整汇总——模型自行轮询也能
+拿到富文本结果，不再只有裸状态串。</li>
+<li><strong>后台 job 无主注册</strong>（对齐 dsh-shell-callback）：tool-jobs 监听器对无主
+job 直接 return，本插件 onJobDone 回调成为唯一通知者；<code>attachController</code>
+使无主 start 通过前置检查；回调经 <code>agent.followup</code>/<code>agent.inject</code> 投递。</li>
+<li><strong>失败详情富化（v0.0.2）</strong>：子代理失败（如模型路由 402 余额不足）时，经
+<code>subagent/end</code> 事件定位子会话，回读 <code>turn/end</code> 底层错误并入结果 <code>error</code> 字段，
+避免外部故障被误判为插件问题。</li>
+<li>中止时停止派发并逐个 <code>interrupt</code> in-flight 子代理（1s 宽限期等待 worker
+记录已结算结果），未启动任务标记 <code>skipped</code>。</li>
+<li>所有注册挂 <code>ctx.effect</code>：卸载/热重载自动清理。</li>
+</ul>
+<h2>安装（npm / dsh plugin）</h2>
+<pre><code>dsh plugin --profile web add @stars-w/dsh-parallel-pool
+</code></pre>
+<p>包已发布到 npm（public），安装后会自动追加到 profile 的
+<code>dsh.profile.bundles</code>，作为标准 bundle 加载。</p>
+<h2>Web 插件配置</h2>
+<p>在 Web 插件配置页中可设置默认并发数：</p>
+<ul>
+<li><code>maxConcurrency</code>：默认 4，范围 1..16。</li>
+</ul>
+<p>修改后下一次调用 <code>parallel_pool</code> 即生效；单次调用仍可用参数 <code>maxConcurrency</code>
+临时覆盖该默认值。</p>
+<h2>本地开发 / 构建 / 注入</h2>
+<pre><code>bash scripts/build.sh   # 依赖落地 + 语法/导入链校验
+</code></pre>
+<p>依赖落地策略（loader 内部解析器实测只认包根 index.js、不读 package.json）：
+dsh-tools 走 junction；dsh-llm 及其传递闭包（cordis/cosmokit/schemastery/
+dsh-timeout）复制为真实目录副本并生成包根 index.js 再导出垫片。</p>
+<p>本地注入器工具：<code>dev_build_plugin</code> → <code>dev_inject_plugin</code> →
+<code>dev_uninject_plugin</code>（卸载）。</p>

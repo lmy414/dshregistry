@@ -1,0 +1,202 @@
+<h1>dsh-funasr-voice</h1>
+<p>DeepSeek Harness (DSH) Web GUI 的<strong>本地离线语音输入</strong>插件。浏览器采集麦克风 → host 半自动拉起本地 <strong>FunASR + SenseVoiceSmall</strong> 识别 → 文字实时填入输入框。全程离线、不联网、不上传。</p>
+<h2>特性</h2>
+<ul>
+<li><strong>点一下开始、再点一下停止</strong>：点按切换连续听写，VAD 自动断句，边说边出字。</li>
+<li><strong>录音计时</strong>：录音时按钮旁实时显示已录时长（<code>0:05</code>）。</li>
+<li><strong>完全离线</strong>：ASR 在本地 CPU 上跑（SenseVoice RTF ~0.07，约 10x 实时）。</li>
+<li><strong>自动填 / 自动发</strong>：识别文字自动填入草稿，可选「识别后自动发送」。</li>
+<li>句首/句尾的 SenseVoice 事件/情绪 emoji（👏🎼😊 等）会被自动剥掉。</li>
+</ul>
+<h2>截图</h2>
+<p><strong>语音输入</strong>（点话筒 → 说话 → 文字进输入框，按钮旁带计时）：</p>
+<p><img src="https://raw.githubusercontent.com/fenglin-ai/dsh-funasr-voice/HEAD/voice.png" alt="语音输入"></p>
+<p><strong>配置</strong>（设置 → 通用 → 语音输入，支持自动检测 / 手动填路径）：</p>
+<p><img src="https://raw.githubusercontent.com/fenglin-ai/dsh-funasr-voice/HEAD/config.png" alt="配置"></p>
+<h2>原理</h2>
+<pre><code>浏览器麦克风 ──AudioWorklet 采集──▶ VAD 断句 ──POST /funasr-voice/asr（原始 f32 PCM @16kHz）
+                                           │ host 半代理
+                                           ▼
+                              本地 FunASR Python 服务（SenseVoiceSmall）
+                                           │
+              输入框 ◀── 识别文字 ──────────┘
+</code></pre>
+<ul>
+<li>浏览器只做采集 + 端点检测，ASR 全部在 host 侧本地 Python 进程里跑。</li>
+<li>host 半<strong>懒加载</strong>拉起 FunASR 服务（首次识别约 2~3 秒加载模型，之后常驻复用）。</li>
+<li>客户端用 <strong>AudioWorklet</strong> 采音（不是已废弃的 ScriptProcessorNode）。</li>
+</ul>
+<h2>环境要求</h2>
+<table>
+<thead>
+<tr>
+<th>依赖</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>DeepSeek Harness Desktop</td>
+<td><strong>2.0.2</strong>（本插件的开发/测试版本）</td>
+</tr>
+<tr>
+<td>Python venv + FunASR 1.4.x + torch</td>
+<td>本地 ASR 引擎</td>
+</tr>
+<tr>
+<td>SenseVoiceSmall 模型</td>
+<td>本地离线加载</td>
+</tr>
+<tr>
+<td>Node ≥ 20</td>
+<td>插件 host 半</td>
+</tr>
+</tbody></table>
+<blockquote>
+<p>⚠️ <strong>DSH Desktop 2.0.2 存在麦克风权限 Bug</strong>，直接使用会拿到静音流、无法识别。
+详见下方「已知 Bug 与修复」，需要先给 DSH Desktop 打一个补丁。</p>
+</blockquote>
+<h2>安装 FunASR 环境</h2>
+<p>插件需要一个装好 FunASR 的 Python 环境 + SenseVoiceSmall 模型。以 macOS 为例：</p>
+<pre><code># 1. 创建独立 venv
+python3 -m venv ~/Documents/ASR/funasr/.venv
+source ~/Documents/ASR/funasr/.venv/bin/activate
+
+# 2. 安装 FunASR（会自动带上 torch、modelscope 等依赖，约数 GB 磁盘空间）
+pip install --upgrade pip
+pip install funasr
+
+# 3. 下载 SenseVoiceSmall 模型（约 1 GB，二选一）
+mkdir -p ~/Documents/ASR/funasr/models
+cd ~/Documents/ASR/funasr/models
+
+#    方式 A：ModelScope（国内更快）
+python -c "from modelscope import snapshot_download; snapshot_download('iic/SenseVoiceSmall', local_dir='SenseVoiceSmall')"
+
+#    方式 B：HuggingFace
+pip install huggingface_hub
+python -c "from huggingface_hub import snapshot_download; snapshot_download('FunAudioLLM/SenseVoiceSmall', local_dir='SenseVoiceSmall')"
+</code></pre>
+<p>装完后：</p>
+<ul>
+<li><code>python</code> 路径：<code>~/Documents/ASR/funasr/.venv/bin/python</code></li>
+<li>模型目录：<code>~/Documents/ASR/funasr/models/SenseVoiceSmall</code>（需包含 <code>model.pt</code> 和 <code>config.yaml</code>）</li>
+</ul>
+<p>把这两个填进插件的 <code>python</code> / <code>model</code> 配置（见下方「配置」）即可，也可以用插件设置里的
+「<strong>自动检测 Python 与模型</strong>」自动识别。</p>
+<h2>安装</h2>
+<ol>
+<li><p>准备好 FunASR 环境（venv + SenseVoiceSmall 模型目录）。</p>
+</li>
+<li><p>在你 profile 的 <code>cordis.patch.yml</code>（如 <code>~/.dsh/profiles/&lt;profile&gt;/cordis.patch.yml</code>）里配置 <code>python</code> / <code>model</code>（见下方「配置」）。</p>
+</li>
+<li><p>安装插件：</p>
+<pre><code>dsh plugin --profile &lt;你的profile&gt; add &lt;本插件目录或仓库地址&gt;
+</code></pre>
+</li>
+<li><p>重启 DSH，点输入框右侧的<strong>话筒图标</strong>即可。首次会请求麦克风权限，允许即可。</p>
+</li>
+</ol>
+<h2>配置</h2>
+<p>有两种方式配置 <code>python</code> / <code>model</code>：</p>
+<p><strong>① GUI（推荐）</strong>：DSH 设置 → 通用 → 语音输入，点「<strong>自动检测 Python 与模型</strong>」会自动
+识别本机 FunASR venv 和 SenseVoiceSmall 目录；也可手动填写。持久化到
+<code>~/.dsh/dsh-funasr-voice.json</code>，优先级高于 YAML 配置。</p>
+<p><strong>② YAML</strong>：插件源码不带个人路径（默认 <code>python: python3</code>、<code>model</code> 为空）。在你<strong>自己
+profile 的 <code>cordis.patch.yml</code></strong> 里覆盖：</p>
+<pre><code># ~/.dsh/profiles/&lt;你的profile&gt;/cordis.patch.yml
+- id: dsh-funasr-voice
+  config:
+    python: /你的/FunASR/.venv/bin/python
+    model: /你的/SenseVoiceSmall/模型目录
+</code></pre>
+<p>可配置字段：</p>
+<table>
+<thead>
+<tr>
+<th>字段</th>
+<th>默认</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>enabled</code></td>
+<td><code>true</code></td>
+<td>总开关</td>
+</tr>
+<tr>
+<td><code>basePath</code></td>
+<td><code>/funasr-voice</code></td>
+<td>HTTP 路由前缀（一般别改）</td>
+</tr>
+<tr>
+<td><code>python</code></td>
+<td><code>python3</code></td>
+<td>FunASR venv 的 python 解释器（<strong>必配</strong>）</td>
+</tr>
+<tr>
+<td><code>model</code></td>
+<td>（空）</td>
+<td>SenseVoiceSmall 模型目录（<strong>必配</strong>）</td>
+</tr>
+<tr>
+<td><code>port</code></td>
+<td><code>18765</code></td>
+<td>本地 ASR 服务端口</td>
+</tr>
+<tr>
+<td><code>language</code></td>
+<td><code>auto</code></td>
+<td><code>auto</code> | <code>zh</code> | <code>en</code> | <code>ja</code> | <code>ko</code> | <code>yue</code></td>
+</tr>
+<tr>
+<td><code>useItn</code></td>
+<td><code>true</code></td>
+<td>逆文本正则化</td>
+</tr>
+<tr>
+<td><code>autoSend</code></td>
+<td><code>false</code></td>
+<td>识别后自动发送</td>
+</tr>
+</tbody></table>
+<h2>已知 Bug 与修复：DSH Desktop 2.0.2 麦克风权限</h2>
+<p><strong>Bug 现象</strong>：DSH Desktop 2.0.2 的 Electron 主进程没有处理 <code>getUserMedia</code> 的
+<code>media</code> 权限。结果是浏览器拿到一条<strong>静音流</strong>，且 macOS 从不弹「想要访问麦克风」
+授权框——语音插件表现为「录音了但识别不出、输入框没反应、没有文字」。</p>
+<p><strong>根本原因</strong>：<code>dsh-plugin-desktop/src/main.ts</code> 缺少
+<code>session.setPermissionRequestHandler</code>，也从不调用
+<code>systemPreferences.askForMediaAccess('microphone')</code> 去触发 macOS 的系统授权弹窗。</p>
+<p><strong>修复方式</strong>：给 DSH Desktop 源码打补丁（<code>dsh-plugin-desktop/src/main.ts</code>，在
+<code>app.whenReady()</code> 之后）：</p>
+<pre><code>import { session, systemPreferences } from 'electron'
+
+session.defaultSession.setPermissionRequestHandler((_wc, permission, callback, details) =&gt; {
+  if (permission !== 'media') {
+    callback(true)
+    return
+  }
+  const mediaTypes = 'mediaTypes' in details ? details.mediaTypes : undefined
+  const checks: Promise&lt;boolean&gt;[] = []
+  if (!mediaTypes || mediaTypes.includes('audio')) checks.push(systemPreferences.askForMediaAccess('microphone'))
+  if (!mediaTypes || mediaTypes.includes('video')) checks.push(systemPreferences.askForMediaAccess('camera'))
+  void Promise.all(checks).then(results =&gt; callback(results.every(Boolean)))
+})
+</code></pre>
+<p>重新构建并启动后，点麦克风会弹出系统授权框，允许后即可正常识别。若不想改源码，也可
+等官方修复该 Bug 后升级 DSH Desktop。</p>
+<h2>目录结构</h2>
+<pre><code>.
+├── lib/index.js       # host 半：拉起/代理 FunASR + HTTP 路由
+├── lib/client.js      # client 半：话筒按钮 + VAD + 计时
+├── asr_server.py      # FunASR(SenseVoice) HTTP 服务，host 半自动拉起
+├── cordis.patch.yml   # 插件树插入补丁（配置）
+└── package.json
+</code></pre>
+<h2>排查</h2>
+<ul>
+<li>识别报错「server exited during startup」：<code>python</code> / <code>model</code> 路径不对，看 DSH 日志里的 stderr。</li>
+<li>录音但没文字、不弹授权框：见上方「DSH Desktop 的麦克风权限」。</li>
+<li>首次识别慢：模型加载 + torch 初始化约 2~3 秒，之后常驻。</li>
+</ul>
+<h2>License</h2>
+<p><a href="https://github.com/fenglin-ai/dsh-funasr-voice/blob/HEAD/LICENSE">MIT</a></p>

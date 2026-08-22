@@ -1,0 +1,91 @@
+<h1>MathModelingAgent for DSH</h1>
+<p>证据驱动的数学建模智能体插件：状态机编排 + 主张/义务/证据账本 + 独立验证协议 + MCM/ICM 终审。继承 MathModelingAgent v3.1 的"分解 + 迭代"方法论，把验证裁决权从 LLM 主观打分换成可复现证据。</p>
+<h2>继承与改良</h2>
+<ul>
+<li><strong>继承</strong>：数据探查、子问题分解、顺序求解、带接受/拒绝标准的建模-分析-修正循环、停滞检测（源自 <a href="https://github.com/lyang36/IMO25">IMO25</a> 的分解+迭代思想）。</li>
+<li><strong>改良</strong>：原项目的验证者是"分析者 LLM 打 1-5 分"；本插件改为<strong>义务账本 + 工具执行证据 + 独立审计</strong>——LLM 只负责提出主张和攻击，不再负责裁决正确性。旧仓库保持原样未动。</li>
+</ul>
+<h2>特性</h2>
+<ul>
+<li><strong>状态机</strong>：9 个可恢复终态（SOLVED / PARTIAL / CONDITIONAL / INCONCLUSIVE / REFUTED / INFEASIBLE / UNIDENTIFIABLE / BLOCKED / CANCELLED），每次转移必须引用证据或 issue。</li>
+<li><strong>证据账本</strong>：每个主张强制登记验证义务（数值→独立重算+误差界；最优性→KKT/对偶/精确搜索，否则只能声称"已找到最优"；预测→防泄漏划分+基线+校准……），证据强度不得弱于主张强度。</li>
+<li><strong>验证协议</strong>：固定攻击顺序 + PASS / FAIL / INCONCLUSIVE 三态裁决，INCONCLUSIVE 禁止升格。</li>
+<li><strong>崩溃恢复</strong>：原子快照 + 追加日志 + 跨进程锁，stale 锁与残留 guard 自动回收。</li>
+<li><strong>MCM/ICM 终审</strong>：一票否决与奖项封顶 + 七类 100 分 + 固定 14 节报告。</li>
+<li><strong>零运行时依赖</strong>：Python、Lean、Wolfram 全部可选，缺失时验证等级降级，绝不伪造执行。</li>
+</ul>
+<h2>工作流</h2>
+<pre><code>stateDiagram-v2
+    [*] --&gt; TRIAGE
+    TRIAGE --&gt; SCOPE_FROZEN
+    SCOPE_FROZEN --&gt; INPUT_PROFILED
+    INPUT_PROFILED --&gt; CLAIMS_REGISTERED
+    CLAIMS_REGISTERED --&gt; CANDIDATES_READY
+    CANDIDATES_READY --&gt; ATTEMPT
+    ATTEMPT --&gt; EXECUTE
+    EXECUTE --&gt; VERIFY
+    VERIFY --&gt; REVISE
+    VERIFY --&gt; RESEARCH
+    VERIFY --&gt; FORK
+    REVISE --&gt; ATTEMPT
+    RESEARCH --&gt; CANDIDATES_READY
+    FORK --&gt; ATTEMPT
+    VERIFY --&gt; SOLVED
+    VERIFY --&gt; PARTIAL
+    VERIFY --&gt; CONDITIONAL
+    VERIFY --&gt; INCONCLUSIVE
+    VERIFY --&gt; REFUTED
+    VERIFY --&gt; INFEASIBLE
+    VERIFY --&gt; UNIDENTIFIABLE
+    VERIFY --&gt; BLOCKED
+    VERIFY --&gt; CANCELLED
+</code></pre>
+<p>任意非终态可直达 BLOCKED / CANCELLED。ATTEMPT 永远不能直接跳到 SOLVED。</p>
+<h2>安装</h2>
+<p>固定 GitHub 版本（发布流程需先创建 v0.1.0 tag）：</p>
+<pre><code>dsh plugin --profile web add github:yohanchen1/MathModelingAgent#v0.1.0
+</code></pre>
+<p>npm 发布后，或本地 <code>npm pack</code> 生成的 tarball 路径：</p>
+<pre><code>dsh plugin --profile web add dsh-math-modeling-agent
+</code></pre>
+<p>不要用 <code>dsh plugin add .</code> 安装本地目录：它会按目录名安装且不激活 bundle。安装后验证组合配置并重启 host：</p>
+<pre><code>dsh --profile web --dump-config
+dsh web
+</code></pre>
+<h2>核心机制</h2>
+<h3>状态机与 SOLVED 门禁</h3>
+<p>每轮尝试有一个目标并记录：候选与假设增量、实际执行的命令或推导产物、新证据 ID、关闭的义务、打开/关闭的 issue、是否产生可审计进展、预算消耗、下一步行动。判定"进展"只认：关闭义务、新增可复现证据、反驳候选、收紧界或不确定区间、移除阻塞、正确弱化不支持的断言——重述、同参数重跑、更长的散文、工具 exit 0 都不算。连续两轮无进展进入停滞审查，第三轮无进展必须实质换方向（FORK）、交给用户决策，或以非 SOLVED 终态暂停。</p>
+<p>SOLVED 硬门禁：范围冻结 + 全部必选义务 PASS + 关键对抗检查通过 + 可复现材料齐全 + 局限已声明；High-Assurance 模式还必须通过一次只拿产物、不注入思维链的独立审计。</p>
+<h3>主张 / 义务 / 证据</h3>
+<ul>
+<li><strong>主张记录</strong>：ID、原文、类型、量词范围、假设、风险、验证义务、证据 ID、独立反查、状态、局限。</li>
+<li><strong>证据记录</strong>：方法、工具、时间戳、覆盖的主张、输入输出哈希、命令/环境、退出码、产物、容差、局限，以及六档等级：NOT_CHECKED / DERIVED / EXECUTED / VERIFIED / INDEPENDENTLY_VERIFIED / EXTERNALLY_VALIDATED。</li>
+<li><strong>强度匹配</strong>：训练集分数不能支撑泛化结论；单个优化器返回点不能支撑全局最优；形式化证明不能支撑未形式化的现实假设。不支持的断言只能弱化，不能放宽验证规则。</li>
+</ul>
+<h3>验证协议</h3>
+<p>冻结输入（哈希题目、数据、代码、配置、环境）→ 重建主张映射 → 按固定顺序攻击：任务覆盖与代理指标替换 → 单位/量纲/定义域/约束 → 推导与实现一致性 → 数据泄漏/标签/划分/后验参数 → 基线/不确定性/敏感性/外部效度 → 可复现性与引用真实性 → 反例/失败案例/更简单替代。裁决只允许 PASS（可复现证据支撑）、FAIL（矛盾/反例/无效方法/复现失败）、INCONCLUSIVE（证据不足），且 INCONCLUSIVE 不得因为"看起来合理"升格为 PASS。</p>
+<h3>崩溃恢复与并发</h3>
+<p>默认运行根目录 <code>math-modeling-runs/&lt;task-id&gt;/</code>。<code>run.json</code> 原子快照、<code>events.jsonl</code> 追加式转移日志、<code>ledger.json</code> 主张账本；<code>run-state.mjs</code> 提供 init / transition / validate / recover 四个命令。跨进程互斥锁带 ownerId 与 stale 回收（进程已死且超时自动接管），空锁文件与残留 reclaim guard 按 mtime 回收，Windows 共享冲突自动重试；恢复时校验日志并跳过哈希未变的已完成工作，任何 provider/解析器失败都保留原始产物与最佳候选。</p>
+<h3>MCM/ICM 终审</h3>
+<p><code>math-modeling-audit</code> Skill 内置模拟 100 分终审（非 COMAP 官方评分表）：Stage 1 一票否决与奖项封顶（14 项检查，逐项给出证据链封顶）；Stage 2 七类评分共 100 分（问题理解与分解 10、数据/证据/参数 12、模型构建 22、求解算法与可复现 16、结果验证与可信度 24、结论与推广 8、写作与图表 8）；Stage 3 模型逐个尸检；Stage 4 关键结果审计；Stage 5 按 MCM A/B/C 或 ICM D/E/F 启用专项检查；Stage 6 依据 93-100 Outstanding Candidate 等 band 判定奖项，输出固定 14 节报告。</p>
+<h3>工具与降级</h3>
+<p><code>capability-probe.mjs</code> 探测 PATH 并实测可用性。Python 可选但推荐：仅在需要计算时用 <code>python-environment.mjs</code> 在运行目录内创建隔离 uv/venv 环境，只安装所需 PyPI 包（VCS 依赖与任意索引需用户批准）；Lean 与 Wolfram 可选，永不自动安装，Lean 结果必须附无 sorry/admit 证明与自然语言-形式语句忠实性检查；缺失能力只降低证据等级（unverified / partially_verified），不伪造执行结果。</p>
+<h2>运行产物</h2>
+<pre><code>math-modeling-runs/&lt;task-id&gt;/
+├── run.json              # 原子状态快照
+├── ledger.json           # 范围、假设、主张、义务、子问题、候选、issue
+├── events.jsonl          # 追加式转移日志
+├── problem-brief.md      # 问题摘要
+├── inputs.json           # 输入与数据画像
+├── attempts/&lt;n&gt;/         # 每轮：report.md + 代码/产物（存在时）
+├── research/             # 文献检索与候选方法矩阵（发生研究时）
+├── walls/                # 放弃方向的突破备忘录（放弃时）
+├── reproducibility.json  # 数据/代码/配置版本、锁、种子、命令
+└── final-report.md       # 终态报告
+</code></pre>
+<h2>卸载</h2>
+<pre><code>dsh plugin --profile web remove dsh-math-modeling-agent
+</code></pre>
+<p>卸载后重启当前 host。</p>
+<h2>License</h2>
+<p>MIT</p>

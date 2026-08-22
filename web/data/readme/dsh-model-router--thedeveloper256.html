@@ -1,0 +1,116 @@
+<h1>dsh-model-router</h1>
+<p>A small plugin for the <a href="https://github.com/deepseek-ai/deepseek-harness">DeepSeek Harness</a> that stops treating every model call the same. It splits your session into two roles:</p>
+<ul>
+<li><strong>The planner</strong> — your main agent — always runs on <code>deepseek-v4-pro</code>. That's where the thinking happens: understanding what you want, designing the approach, reviewing results, writing the final answer.</li>
+<li><strong>The executors</strong> — every subagent it delegates to — always run on <code>deepseek-v4-flash</code>. That's where the work happens: writing code, running commands, iterating on builds.</li>
+</ul>
+<p>The idea is simple: pro is the better thinker, flash is fast and cheap at grinding through implementation. You get the careful planning of the big model without paying pro prices for every single tool call.</p>
+<h2>Install</h2>
+<p>Add it to a profile (this installs into the <code>web</code> profile; change the name for another one):</p>
+<pre><code>dsh plugin --profile web add dsh-model-router
+</code></pre>
+<p>That pulls it from npm, which ships prebuilt — no build step needed.</p>
+<p>Prefer the source? A git install works too, but pnpm clones and builds it on the spot and will ask you to approve the build script once (add the <code>allowBuilds</code> key it prints to the profile's <code>pnpm-workspace.yaml</code>, then re-run):</p>
+<pre><code>dsh plugin --profile web add git+https://github.com/thedeveloper256/dsh-model-router
+</code></pre>
+<p>Once it's in, restart the profile. You should see the row under <code>model-router</code> in <code>dsh web --dump-config</code>.</p>
+<h2>What it actually does</h2>
+<p>Three small surfaces, one rule:</p>
+<ol>
+<li><strong>Request routing</strong> — every model request gets stamped with a role. Root agents get <code>deepseek-v4-pro</code>; delegation children (<code>subagent</code>, <code>subagent_fork</code>, workflow workers, ralph rounds) get <code>deepseek-v4-flash</code>. The rewrite sits at the outermost layer of the request pipeline, so it wins — even over the harness's own default model (which is <code>deepseek-v4-flash</code> out of the box) and over whatever model you pick in the UI for the session. That's intentional: it's the "enforce" knob.</li>
+<li><strong>A prompt section</strong> — a short note that renders before the agent's persona, telling the planner: you're the thinker, delegate the implementation. Without this, the model tends to just do everything itself.</li>
+<li><strong>A skill</strong> — the <code>pro-flash-routing</code> skill shows up in the session's skill catalog and spells out the working rhythm: plan, delegate, review, report. Same convention, but loadable on demand when the agent wants details.</li>
+</ol>
+<h2>How the roles are decided</h2>
+<p>An agent is an <em>executor</em> if it carries either of the markers the harness stamps on delegation children:</p>
+<ul>
+<li><code>options.subagentDepth &gt;= 1</code>, or</li>
+<li><code>session.header.origin === "subagent"</code></li>
+</ul>
+<p>Everything else is a planner. That logic lives in <code>src/policy.ts</code> as a plain function, so it's easy to reason about and test.</p>
+<h3>What the router does and doesn't override</h3>
+<p>The router always stamps <code>provider</code> + <code>model</code>. <code>reasoningEffort</code> and <code>maxTokens</code> are <em>optional per role</em>: set them in the config and they're enforced for that role; leave them out and those fields inherit from your session's selection. So picking "max effort" in the UI but not pinning <code>reasoningEffort</code> in the config still gives you max-effort thinking — it just happens on the routed model.</p>
+<h2>Turning the router off</h2>
+<p>Routing is on by default. Two ways to switch it off:</p>
+<ul>
+<li><strong>GUI (Settings → Plugins → dsh-model-router):</strong> the plugin registers a live
+settings section; flip <code>enabled</code> off. It applies immediately (no restart),
+persists in <code>settings.yaml</code> under <code>model-router:</code>, and unregisters the prompt
+section and the skill too. Flip it back on and everything returns.</li>
+<li><strong>Patch row:</strong> set <code>enabled: false</code> in the profile's <code>cordis.patch.yml</code> row
+(takes effect on the next boot). <code>disabled: true</code> still skips the row entirely.</li>
+</ul>
+<p>With the router off, requests use the session's selected model (your
+<code>agent-default-model</code> setting or the base default) — the router is simply not
+rewriting them.</p>
+<h2>The GUI toggle (v0.5.0+)</h2>
+<p>Since v0.5.0 the package ships a browser half, and the harness serves it
+automatically — no extra config. After installing (or updating to) v0.5.0+
+and restarting the profile, <strong>Settings → Plugins</strong> shows a <strong>Model router</strong>
+card with a live <strong>Enabled</strong> switch, an "Overridden" badge and <strong>Reset to
+default</strong> button once you've changed it, and a read-only view of the current
+planner/executor routes and mode. Flipping the switch applies immediately (no
+restart) and persists in <code>settings.yaml</code> under <code>model-router:</code> — the same
+mechanism the GUI toggle described above uses.</p>
+<p>One harness-wide caveat (it applies to <strong>all</strong> settings pages — Models,
+Plugins, everything — not to this plugin specifically): the harness serves
+settings pages only to <strong>loopback</strong> browsers (<code>localhost</code> / <code>127.x</code>). A remote
+browser sees "settings are unavailable" instead of the card. Fallbacks that
+work everywhere:</p>
+<ul>
+<li><strong>Patch row</strong> — set <code>enabled: false</code> in the profile's <code>cordis.patch.yml</code>
+(takes effect on the next boot), or</li>
+<li><strong><code>settings.yaml</code></strong> — add <code>model-router: { enabled: false }</code> under the
+settings file the profile uses; this applies live, same as the GUI.</li>
+</ul>
+<h2>Tuning</h2>
+<p>All configuration lives on the plugin row. Patch it in the profile's <code>cordis.patch.yml</code>:</p>
+<pre><code>- patch:
+    - id: model-router
+      config:
+        planner:            # root-agent route
+          provider: deepseek-official
+          model: deepseek-v4-pro
+          reasoningEffort: high   # off | low | high | max (omit to inherit)
+          maxTokens: 8192         # output cap (omit to inherit)
+        executor:           # subagent route
+          provider: deepseek-official
+          model: deepseek-v4-flash
+          reasoningEffort: high
+          escalateOnError: true   # after a failed step…
+          escalateTo: max         #   …bump effort for the next request
+          recoverySteps: 2        #   …wearing off after N clean steps
+        mode: strict        # strict | plan (see below)
+        promptSection: true # register the always-on routing section
+        skill: true         # register the pro-flash-routing skill
+</code></pre>
+<p><code>mode</code> controls how the root agent is treated: <code>strict</code> keeps it on the planner route always; <code>plan</code> sends the root to the executor route unless plan mode is active, reserving pro for real planning.</p>
+<p><strong>Error-driven escalation</strong> (<code>escalateOnError</code>): when a route's agent hits a failed tool step, the <em>next</em> request bumps to <code>escalateTo</code> and wears off after <code>recoverySteps</code> clean steps. It's deterministic and stateless — the router folds the session log per request, so only prior steps are considered (a failure can't escalate the very request that caused it). It's a per-route knob: enable it on the executor to make flash think harder after a flubbed execution step, without touching the baseline.</p>
+<p>The defaults are exactly the table at the top of this page. To switch the router off for a session, disable the row (<code>disabled: true</code>) or remove the plugin — <code>dsh plugin --profile web remove dsh-model-router</code>.</p>
+<h2>Reduce pro token usage</h2>
+<p>The planner is the expensive model, so most of the savings come from shrinking its spend:</p>
+<ul>
+<li><strong>Lower <code>reasoningEffort</code>.</strong> The harness default runs pro at <code>max</code>, which produces a lot of reasoning tokens. <code>high</code> (or <code>low</code>) on the planner route keeps most of the quality at a fraction of the cost.</li>
+<li><strong>Cap output</strong> with <code>maxTokens</code> on the planner route so a verbose turn can't balloon.</li>
+<li><strong>Reserve pro for planning</strong> with <code>mode: plan</code> — trivial Q&amp;A and execution-style turns stop hitting pro at all.</li>
+<li><strong>Keep the planner's context lean.</strong> Input tokens dominate after reasoning. Delegate aggressively and trust the subagent's report; don't re-read big files or full transcripts on the planner. Use targeted reads and let auto-compaction (<code>/compact</code>) trim history.</li>
+<li><strong>Tune the host pruner.</strong> The tool-result pruner truncates oversized results before they reach the model (default ~8 KB); lowering <code>tool-result-pruner</code> → <code>thresholdChars</code> trims more planner input. That's harness config, not this plugin's row.</li>
+<li><strong>Exploit DeepSeek's context cache.</strong> Repeated prefixes are served from cache at a big discount, so keep the system prompt and conversation prefix stable between turns.</li>
+</ul>
+<p>The first three are one-line changes on this plugin's row; the last three are discipline and host tuning.</p>
+<h2>Does it work?</h2>
+<p>I verified it against a real session log. Run a task that makes the agent plan and delegate, then check which models actually made the requests:</p>
+<pre><code>zstd -d -c "$DSH_HOME"/sessions/&lt;workspace&gt;/&lt;session&gt;/session.jsonl.zstd \
+  | grep -o '"model":"deepseek-v4-[a-z]*"' | sort | uniq -c
+</code></pre>
+<p>Planner messages come back as <code>deepseek-v4-pro</code>; subagent messages as <code>deepseek-v4-flash</code>. In my test: 9 pro requests in the planner's session, 6 flash in the subagent's.</p>
+<h2>Development</h2>
+<p>It's a normal small TypeScript package — no framework magic:</p>
+<pre><code>npm install
+npm run typecheck
+npm test
+npm run build
+</code></pre>
+<p>The <code>prepare</code> script builds <code>lib/</code> automatically, which is what makes the git install work without shipping build artifacts in the repo. The <code>dsh.bundle</code> field in <code>package.json</code> is what tells <code>dsh plugin</code> how to compose the plugin into a profile.</p>
+<h2>License</h2>
+<p>MIT</p>

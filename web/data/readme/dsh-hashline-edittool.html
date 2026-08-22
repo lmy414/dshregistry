@@ -1,0 +1,681 @@
+<h1 align="center">dsh-hashline-edittool</h1>
+
+<p align="center">
+  <strong>Line-anchored edit tool for DeepSeek Harness<br>
+  Powered by <code>&lt;line&gt;#&lt;hash&gt;</code> positioning — chained edits skip the re-read, fewer tokens, more context space for real work.</strong>
+</p>
+
+<p align="center">
+  <strong>English</strong> ·
+  <a href="https://github.com/hyperion2144/dsh-hashline-edittool/blob/HEAD/README.zh.md">简体中文</a>
+</p>
+
+<p align="center">
+  <a href="#quick-start">Quick Start</a> •
+  <a href="#why-hashline">Why Hashline</a> •
+  <a href="#benchmark">Benchmark</a> •
+  <a href="#tools">Tools</a> •
+  <a href="#acknowledgments">Acknowledgments</a>
+</p>
+
+<p align="center">
+  <img src="https://img.shields.io/badge/version-0.1.9-blue.svg" alt="Version">
+  <img src="https://img.shields.io/badge/license-MIT-green.svg" alt="MIT License">
+  <img src="https://img.shields.io/badge/DeepSeek_Harness-Plugin-blueviolet.svg" alt="DeepSeek Harness Plugin">
+  <img src="https://img.shields.io/npm/v/dsh-hashline-edittool" alt="npm version">
+  <img src="https://img.shields.io/npm/dm/dsh-hashline-edittool" alt="npm downloads">
+  <img src="https://img.shields.io/github/stars/hyperion2144/dsh-hashline-edittool?style=social" alt="GitHub Stars">
+</p>
+
+<p align="center">
+  Forked from <a href="https://github.com/Rianico/dsh-better-edit">Rianico/dsh-better-edit</a> — maintained independently from here on.
+</p>
+
+<hr>
+<blockquote>
+<p><em>"The harness — not the model — is the bottleneck."</em>
+— Can Bölük, <a href="https://stencil.so/blog/the-harness-problem"><em>The Harness Problem</em></a></p>
+</blockquote>
+<p>Most edit tools ask the model to echo the old code <strong>token-for-token</strong> before it can change anything
+— and that's exactly where agents fail: 46–51% patch-format failure rates for several models with
+replace-style edits. <strong>dsh-hashline-edittool</strong> goes deeper. Every line of a file gets a
+unique <code>&lt;line&gt;#&lt;hash&gt;</code> marker (absolute line number + 3-char content hash), and edits target
+those markers. The old text is never echoed, the hash half survives edits above, and every
+resolved range is verified against exactly what the model saw — wrong-line edits cannot silently
+land, and the post-edit <code>Shift:</code> block lets the model chain the next edit without a re-read.</p>
+<h2>Why you need this</h2>
+<p><code>str_replace</code> makes the model re-type the code it's replacing — pure transcription cost (output tokens, billed ~5-6× input), and where agents fail most: 46–51% patch failures on real models, worse on bigger blocks, each failure costing a re-read and a retry.</p>
+<p>Hashline sends two <code>&lt;line&gt;#&lt;hash&gt;</code> anchors instead of the old text — <strong>26% fewer edit tokens</strong> (24–45% on multi-line ranges) — and verifies every range against what the model saw: an edit lands where you meant, or fails loudly with fresh anchors. Anchors are content addresses that survive edits above; chained edits skip the re-read by reading the post-edit <code>Shift:</code> block — and a leaner context keeps the model's attention on the code, not on re-transcribing it.</p>
+<p>Not for one-line touch-ups (near parity) or new files (<code>write</code>). It pays off in long sessions and structural edits — anywhere an edit must not land on the wrong line.</p>
+<h2>Quick Start</h2>
+<h3>Install</h3>
+<pre><code>npx @deepseek-ai/dsh plugin --profile web add github:hyperion2144/dsh-hashline-edittool   # from github
+npx @deepseek-ai/dsh plugin --profile web add dsh-hashline-edittool   # from npm
+npx @deepseek-ai/dsh plugin --profile web add /path/to/dsh-hashline-edittool   # from a local checkout
+</code></pre>
+<p>The profile's next session runs with the hashline tools installed. To verify the layer is active:</p>
+<pre><code>dsh --profile &lt;name&gt; --dump-config   # shows a "# == dsh-hashline-edittool" layer
+</code></pre>
+<table>
+<thead>
+<tr>
+<th>Requirement</th>
+<th></th>
+</tr>
+</thead>
+<tbody><tr>
+<td>Node</td>
+<td><code>^22.19.0 || &gt;=24.0.0</code> (dsh's requirement; the store uses <code>node:sqlite</code>)</td>
+</tr>
+<tr>
+<td>Profile</td>
+<td>a dsh profile (<code>dsh plugin</code> initializes one on first use)</td>
+</tr>
+<tr>
+<td>Backends</td>
+<td>sandboxed / remote filesystems supported (writes go through <code>ctx.fs</code>)</td>
+</tr>
+</tbody></table>
+<p><code>read</code> returns every line as <code>&lt;line&gt;#&lt;hash&gt;│&lt;content&gt;</code> — the absolute line number (1-indexed) plus a 3-char content-derived hash. The response opens with a <code>HASH IDENTIFIER │ FILE LINES</code> header that separates the marker column from the verbatim file content:</p>
+<pre><code>HASH IDENTIFIER │ FILE LINES
+ 3#ve7│function hello() {
+ 4#szJ│  console.log("world");
+ 5#kQm│}
+</code></pre>
+<p><code>edit</code> targets one or more ranges of <code>line#hash</code> anchors via an <code>edits:[]</code> array, each with an <code>op</code> semantic (<code>ins</code> / <code>del</code> / <code>replace</code>). A single-line replace:</p>
+<pre><code>{
+  "path": "src/main.ts",
+  "edits": [
+    { "op": "replace", "from": "4#szJ", "lines": ["  console.log('hi');"] }
+  ]
+}
+</code></pre>
+<p>and produces a diff with fresh anchors <strong>plus</strong> a <code>Shift:</code> block that describes how absolute line numbers below the edit moved — the next edit chains from there without a re-read:</p>
+<pre><code>HASH IDENTIFIER │ FILE LINES
++ 4#a3m│  console.log('hi');
+- 4#szJ│  console.log("world");
+
+Shift: lines &gt; 5 shift by +1. Use newLine=5#kQm to edit the next row without re-reading.
+</code></pre>
+<h2>Configuring Guidance per Preset</h2>
+<p>The <code>tool:read</code> / <code>tool:edit</code> / <code>tool:undo_last_edit</code> / <code>tool:grep</code> guidance sections are
+plain-markdown files, overridable per agent preset. Override files live in the plugin's shared
+home — never the workspace store:</p>
+<pre><code>$DSH_HOME/plugins/dsh-hashline-edittool/&lt;preset&gt;/&lt;section&gt;.md
+</code></pre>
+<p>(default home <code>~/.dsh</code>, so <code>~/.dsh/plugins/dsh-hashline-edittool/</code>). The section table:</p>
+<table>
+<thead>
+<tr>
+<th>File</th>
+<th>Section</th>
+<th>Default order</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>read.md</code></td>
+<td><code>tool:read</code></td>
+<td>130</td>
+</tr>
+<tr>
+<td><code>edit.md</code></td>
+<td><code>tool:edit</code></td>
+<td>131</td>
+</tr>
+</tbody></table>
+<p>| <code>undo_last_edit.md</code> | <code>tool:undo_last_edit</code> | 132 |</p>
+<p>On first boot the plugin seeds the four shipped presets — <code>standard/</code>, <code>code/</code>,
+<code>minimal/</code>, <code>cordis/</code> — each with the compiled guidance as editable files (plus
+<code>order</code> front-matter), so every preset's guidance starts editable rather than
+blank. A <code>README.md</code> at the plugin-home root documents the scheme. Files are
+seeded once and never rewritten, so your edits survive — a reset is the one
+exception (see <em>Reset / restore defaults</em> below). A preset directory may
+hold only the sections you want to override — the rest fall through to the
+compiled defaults.</p>
+<p>A file is pure prose unless it opens with an <code>order</code> front-matter fence, which moves the section in
+the assembled system prompt:</p>
+<pre><code>---
+order: 150
+---
+
+&lt;section text&gt;
+</code></pre>
+<p>Per section, resolution reads <code>&lt;preset&gt;/&lt;section&gt;.md</code>, else the compiled
+default. Files are read once per agent at session-start, so edits apply to new
+sessions — never mid-session. A preset with no seeded directory (e.g. a
+user-authored one) falls back to the compiled defaults unless you copy a seeded
+dir to its name. A deployment without the <code>agentPresets</code> service (no preset
+roster) keeps the compiled defaults and never touches these files; presets are
+never required.</p>
+<h3>Reset / restore defaults</h3>
+<p>Emptying or deleting an override file restores that section's compiled default
+guidance and order: the default renders at session-start, and the file re-seeds
+at next boot.</p>
+<ul>
+<li><strong>Reset = delete the file, or empty it AND remove the front-matter fence.</strong> A whitespace-only file with no fence means "I want the default" — the compiled default renders, and the file re-seeds at next boot for any preset dir, shipped or custom.</li>
+<li><strong>Blank on purpose = keep a valid fence.</strong> Any well-formed <code>---</code> fence — even a keyless <code>---\n---\n</code>, even an empty body — is a deliberate-intent signal: the file is explicit content and is never reset or re-seeded.</li>
+<li><strong>Broken fence = fast fail.</strong> A <code>---</code> fence that does not parse (missing closing <code>---</code>, non-integer <code>order</code>, unknown key) is rejected: the malformed text is never injected into the context, the compiled default renders, a warning names the file and the reason, and the file is left untouched on disk for repair.</li>
+<li><strong>Shipped vs custom.</strong> Shipped preset files (<code>standard</code>, <code>code</code>, <code>minimal</code>, <code>cordis</code>) re-seed at boot; a deleted custom-preset override stays absent — absence is no override. Deleting a whole <code>&lt;preset&gt;/</code> directory re-seeds all four section files at boot (shipped presets).</li>
+<li><strong>Reset restores the current bundle defaults</strong> — a plugin upgrade yields new defaults.</li>
+</ul>
+<p>Re-seeding happens at boot, never mid-session.</p>
+<h2>Why Hashline</h2>
+<p><strong>Token-saving.</strong> An edit call carries <code>remove_from</code> / <code>remove_to</code> (two <code>&lt;line&gt;#&lt;hash&gt;</code> markers)
+plus the replacement text — it never echoes the text being replaced. A <code>str_replace</code> call must
+reproduce that text verbatim. On a 12-edit session over a realistic file this is <strong>26% fewer output
+tokens</strong> (24–45% on multi-line ranges) — and these are <em>output</em> tokens, billed at ~5-6× the input
+rate. See the <a href="#benchmark">benchmark</a>.</p>
+<p><strong>But this was never about “fewest tokens.”</strong> Savings scale with the replaced text — near parity
+on the shortest one-line touch-ups — and a compact patch language like
+<a href="#how-it-compares">@oh-my-pi/hashline</a> can emit a lighter payload still (42–53% on the same
+session). The point is the <em>right</em> kind of edit call: no re-typing old code, and nothing for the
+model to track except two stable content addresses (the hash half stays the same across edits;
+the line half shifts in the <code>Shift:</code> block, with <code>newLine#oldHash</code> for the next anchor).</p>
+<p><strong>Correctness.</strong> Every resolved edit range is verified against the exact lines the model was shown.
+A stale, never-served, or ambiguous range is hard-rejected <strong>before anything is written</strong>, and the
+current range is echoed back as fresh anchors (reject-and-serve) — the retry needs no <code>read</code>.</p>
+<p><strong>A modern edit pattern for agents.</strong> Content-addressed anchors (the 3-char hash) survive edits
+above; the <code>line#hash</code> form additionally pins the line's absolute position. Edit one part of a
+file and the rest of the line#hash markers shift predictably — the post-edit response carries a
+<code>Shift:</code> block (<code>lines &gt; N shift by +K</code>) that lets the model chain the next edit via
+<code>newLine#oldHash</code> without a re-read.</p>
+<h3>How It Compares</h3>
+<table>
+<thead>
+<tr>
+<th></th>
+<th align="center">hashline <code>edit</code></th>
+<th align="center"><code>str_replace</code> (Claude Code / Codex)</th>
+<th align="center">@oh-my-pi/hashline patch</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>Replaced text never echoed in the call</td>
+<td align="center">✅ 2 hashes only</td>
+<td align="center">❌ verbatim</td>
+<td align="center">✅ <code>+</code> rows only</td>
+</tr>
+<tr>
+<td>Lines addressed by</td>
+<td align="center">line number + content hash</td>
+<td align="center">text match</td>
+<td align="center">number + file-content tag</td>
+</tr>
+<tr>
+<td>Verified against what the model saw</td>
+<td align="center">✅ every line</td>
+<td align="center">❌ first match wins</td>
+<td align="center">~ file version only</td>
+</tr>
+<tr>
+<td>Stale file detected</td>
+<td align="center">✅ rejects, fresh anchors</td>
+<td align="center">❌ may match wrong spot</td>
+<td align="center">✅ tag mismatch → refuse or 3-way merge</td>
+</tr>
+<tr>
+<td>Anchors survive edits above</td>
+<td align="center">✅ content-addressed (hash) + Shift block (line)</td>
+<td align="center">✅ content-based</td>
+<td align="center">❌ renumber + new tag</td>
+</tr>
+<tr>
+<td>Chained edits without re-reads</td>
+<td align="center">✅ Shift block + newLine#oldHash</td>
+<td align="center">~</td>
+<td align="center">~ via edit-response numbers</td>
+</tr>
+<tr>
+<td>Unambiguous when text repeats</td>
+<td align="center">✅ boundary anchors verified</td>
+<td align="center">❌ first occurrence</td>
+<td align="center">~ position, unverified per line</td>
+</tr>
+<tr>
+<td>Wrong-line edit never lands silently</td>
+<td align="center">✅ every line verified</td>
+<td align="center">❌ first match wins</td>
+<td align="center">~ possible in principle (tag checks version, not lines)</td>
+</tr>
+<tr>
+<td>Block ops / registers / <code>MV</code> / <code>REM</code></td>
+<td align="center">❌</td>
+<td align="center">❌</td>
+<td align="center">✅</td>
+</tr>
+<tr>
+<td>One document per change</td>
+<td align="center">❌ per-edit call</td>
+<td align="center">❌ per-edit call</td>
+<td align="center">✅ multi-hunk patch</td>
+</tr>
+<tr>
+<td>Runtime</td>
+<td align="center">✅ Node (dsh)</td>
+<td align="center">—</td>
+<td align="center">⚠️ Bun only</td>
+</tr>
+<tr>
+<td>Undo</td>
+<td align="center">✅ persisted</td>
+<td align="center">❌</td>
+<td align="center">❌ not in scope</td>
+</tr>
+</tbody></table>
+<blockquote>
+<p><code>~</code> = occasionally / inconsistently. <code>@oh-my-pi/hashline</code> is a compact line-anchored patch language
+(<a href="https://www.npmjs.com/package/@oh-my-pi/hashline">npm</a>, <a href="https://github.com/can1357/oh-my-pi/tree/main/packages/hashline">repo</a>):
+<code>[path#tag]</code> headers bind each hunk to a full-file content hash, <code>PUT N.=M:</code> addresses lines by
+number, and every edit renumbers — take the next numbers and tag from the edit response or a fresh <code>read</code>.</p>
+</blockquote>
+<p><strong>Different jobs, same lineage.</strong> Both descend from the
+<a href="https://stencil.so/blog/the-harness-problem">harness-problem</a> insight that the model should never
+re-type old code. <code>@oh-my-pi/hashline</code> is a <strong>patch-language library</strong> — payload-light (42% saved
+per edit, 53% in a single batch document, see <a href="#benchmark">benchmark</a>), with syntactic block ops
+(<code>PUT N*:</code>), registers, <code>REM</code>/<code>MV</code>, multi-hunk documents, a pluggable filesystem for any backend,
+and session-aware 3-way-merge recovery on stale tags. This plugin is a <strong>dsh tool pair</strong>: <code>read</code>
+hands the model 3-char content hashes, <code>edit</code> takes two of them, and every resolved line is verified
+against the served state — no line numbers to renumber, no tag to re-fetch, a wrong anchor can never
+land on the wrong line, and <code>undo_last_edit</code> survives restarts. Its trade-offs: a JSON envelope per
+edit costs a little payload, there are no block ops, and it lives inside dsh (Node) rather than as a
+standalone patcher (Bun). Pick hashline-the-library for a cross-backend patch format; pick
+hashline-the-tool for verified, content-addressed edits in your agent.</p>
+<h3>Correctness in edge cases</h3>
+<p>The token benchmark measures the payload the model emits — it assumes the model gets every
+address right, for free. Correctness is where the two hashline implementations actually diverge.
+These are the real failure modes from the harness-problem literature (wrong-line edits, drift,
+repeated text), and what each tool does when they hit:</p>
+<table>
+<thead>
+<tr>
+<th>Edge case</th>
+<th>hashline <code>edit</code> (this plugin)</th>
+<th>@oh-my-pi/hashline patch</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>Wrong address (off-by-one anchor / line number)</td>
+<td><strong>Impossible</strong> — anchors resolve to specific lines; every resolved line is verified against served state, rejected <strong>before</strong> anything is written</td>
+<td><strong>Possible</strong> — a wrong line number against a current tag applies <strong>silently</strong> at the wrong place; the tag proves the file version, never the lines</td>
+</tr>
+<tr>
+<td>File changed on disk after the model's view</td>
+<td>Hard reject + fresh anchors echoed (reject-and-serve); retry needs no <code>read</code></td>
+<td>Tag mismatch → refuse <strong>or best-effort 3-way merge</strong> onto unknown current content</td>
+</tr>
+<tr>
+<td>An edit above shifts the file</td>
+<td>Nothing shifts — anchors are content addresses; the diff serves fresh anchors</td>
+<td><strong>Every edit renumbers</strong> — “RE-GROUND AFTER EVERY EDIT” is the format's own #1 rule; the model carries the bookkeeping</td>
+</tr>
+<tr>
+<td>Repeated / identical text</td>
+<td>Per-line hashes are unique (collision-resolved); ambiguity → <code>[E_AMBIGUOUS_ANCHOR]</code></td>
+<td>Position-based, so repeats don't confuse it — but the position itself is unverified</td>
+</tr>
+<tr>
+<td>Lines never shown to the model</td>
+<td><code>[E_RANGE_UNSERVED]</code> — hard reject with fresh anchors</td>
+<td>Undisplayed hunks rejected — same reliance on the model knowing what it saw</td>
+</tr>
+<tr>
+<td>Mid-expression / wrong block node</td>
+<td>Irrelevant — any verified line range is valid</td>
+<td>Grammar rules + <code>PUT N*:</code> node choice; mispointing (anchoring <code>def</code> orphans its decorator) silently lands wrong; no syntax check</td>
+</tr>
+<tr>
+<td>Multi-edit batch fails mid-way</td>
+<td><code>edit</code>'s <code>edits</code> array — atomic, all-or-nothing; the failing item is echoed as fresh serves</td>
+<td>Multi-section patches preflighted up front — also atomic</td>
+</tr>
+</tbody></table>
+<blockquote>
+<p>The 42–53% oh-my-pi payload saving is a lighter wire format; the table above is what that
+format asks the model to hold in its head instead — renumbering, tag-chasing, node choice —
+the exact component that fails most (46–51% patch-failure rates on replace-style edits). This
+plugin's 26% is the price of a contract where a wrong edit cannot land, and any rejection
+needs no re-read.</p>
+</blockquote>
+<h2>Benchmark</h2>
+<p>Measured on the same 103-line file with the same 12 replacements (8 single-line, 4 multi-line of
+3/6/10/15 lines), tokenized with the pinned <code>js-tiktoken</code> <code>cl100k_base</code>. Three arms emit the same
+replacements: this plugin's <code>edit</code> (two <code>&lt;line&gt;#&lt;hash&gt;</code> anchors), a <code>str_replace</code> tool (old
+text echoed verbatim), and <a href="https://www.npmjs.com/package/@oh-my-pi/hashline"><code>@oh-my-pi/hashline</code></a>
+in both of its modes — one <code>[path#tag]</code> section per edit (<code>seq</code>) and one multi-hunk batch
+document (<code>batch</code>):</p>
+<table>
+<thead>
+<tr>
+<th>Criterion</th>
+<th align="center">hashline</th>
+<th align="center">str_replace</th>
+<th align="center">oh-my-pi seq / batch</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>Replaced text sent over the wire</td>
+<td align="center">✅ never</td>
+<td align="center">❌ every edit</td>
+<td align="center">✅ never</td>
+</tr>
+<tr>
+<td>Output tokens saved (12-edit session)</td>
+<td align="center">✅ <strong>26%</strong></td>
+<td align="center">❌ 0%</td>
+<td align="center">✅ <strong>42% / 53%</strong></td>
+</tr>
+<tr>
+<td>Multi-line range savings (3–15 lines)</td>
+<td align="center">✅ <strong>29–47%</strong></td>
+<td align="center">❌ 0%</td>
+<td align="center">✅ <strong>40–53%</strong></td>
+</tr>
+<tr>
+<td>Effective cost at 5× output pricing</td>
+<td align="center">✅ <strong>~1.4× less</strong></td>
+<td align="center">❌ 1×</td>
+<td align="center">✅ <strong>~1.7× / ~2.1× less</strong></td>
+</tr>
+<tr>
+<td>Ranges verified against served state</td>
+<td align="center">✅ 100%</td>
+<td align="center">❌ none</td>
+<td align="center">~ file version only</td>
+</tr>
+<tr>
+<td>Line numbers the model must track</td>
+<td align="center">✅ none — content anchors</td>
+<td align="center">✅ none — text match</td>
+<td align="center">❌ renumber every edit</td>
+</tr>
+<tr>
+<td>Deterministic, reproducible locally</td>
+<td align="center">✅ <code>npm run benchmark</code></td>
+<td align="center">—</td>
+<td align="center">—</td>
+</tr>
+</tbody></table>
+<h3>Reproducible</h3>
+<p>The numbers above are <strong>deterministic and you can reproduce them locally</strong> — <code>npm run benchmark</code>:</p>
+<table>
+<thead>
+<tr>
+<th>Scenario</th>
+<th align="center">Lines</th>
+<th align="center">hashline</th>
+<th align="center">str_replace</th>
+<th align="center">oh-my-pi seq</th>
+<th align="center">oh-my-pi batch</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>single-line ×8</td>
+<td align="center">1</td>
+<td align="center">341</td>
+<td align="center">324</td>
+<td align="center">241</td>
+<td align="center">—</td>
+</tr>
+<tr>
+<td>multi-line ×4</td>
+<td align="center">3–15</td>
+<td align="center">408</td>
+<td align="center">691</td>
+<td align="center">349</td>
+<td align="center">—</td>
+</tr>
+<tr>
+<td><strong>TOTAL ×12</strong></td>
+<td align="center"></td>
+<td align="center"><strong>749</strong></td>
+<td align="center"><strong>1015</strong></td>
+<td align="center"><strong>590</strong></td>
+<td align="center"><strong>480</strong></td>
+</tr>
+</tbody></table>
+<p>Saved vs <code>str_replace</code>: hashline <strong>266 (26%)</strong> · oh-my-pi per-edit <strong>425 (42%)</strong> · oh-my-pi batch <strong>535 (53%)</strong>.</p>
+<blockquote>
+<p>The <code>line#hash</code> contract trades <del>3 chars per anchor × 2 anchors × 12 edits (</del>+47 tokens total,
+~7%) vs the pre-<code>line#hash</code> numbers — 702 → 749. The qualitative conclusion holds: hashline wins
+comfortably on multi-line ranges (24–45%) and is comparable to <code>str_replace</code> on the shortest
+single-line edits, while remaining the only arm that verifies every resolved line against the
+served state and never lands a wrong-line edit silently. See <a href="https://github.com/hyperion2144/dsh-hashline-edittool/blob/HEAD/benchmark/README.md"><code>benchmark/README.md</code></a>
+for the per-scenario breakdown and methodology.</p>
+</blockquote>
+<p>The script is deterministic by construction: a frozen corpus, a content-addressed edit script that
+self-checks (a reformatted corpus throws instead of silently changing what's measured), a pinned
+tokenizer, and oh-my-pi payloads validated against the package's published grammar before counting.
+Because everything is fixed, <code>npm run benchmark</code> gives everyone the same result — the numbers in
+this README are a snapshot of that run; regenerate, don't trust.</p>
+<blockquote>
+<p><strong>Scope &amp; honesty.</strong> The benchmark measures <strong>request-payload tokens</strong> — what the model emits per
+edit call — with identical read traffic excluded (it cancels) and identical replacement text.
+It does <strong>not</strong> model transcription failure and retries, which is where the real-world gap is
+largest: the original <a href="https://stencil.so/blog/the-harness-problem">harness-problem</a> post reported
+a <strong>61% output-token reduction</strong> and patch-failure drops from 46–51% to near zero after switching
+to anchored edits. It also does <strong>not</strong> model what a line-numbered format costs the model <em>between</em>
+calls — renumbering and re-fetching the file tag after every edit — nor block-op power, nor the
+Bun-vs-Node runtime difference, nor the fact that <code>@oh-my-pi/hashline</code> is a standalone patcher
+while this plugin is a dsh tool pair with <code>read</code>/<code>edit</code>/<code>undo</code>. Full methodology, the per-edit
+table, and the complete limitation list in <a href="https://github.com/hyperion2144/dsh-hashline-edittool/blob/HEAD/benchmark/README.md"><code>benchmark/README.md</code></a>. The correctness gap behind those numbers is spelled out above in <a href="#correctness-in-edge-cases">Correctness in edge cases</a>.</p>
+</blockquote>
+<h2>Tools</h2>
+<table>
+<thead>
+<tr>
+<th>Tool</th>
+<th>What it does</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>read</code></td>
+<td>Returns a file as <code>HASH IDENTIFIER │ FILE LINES</code> header + <code>&lt;line&gt;#&lt;hash&gt;│&lt;content&gt;</code> rows. Parameters: <code>offset</code> (1-based), <code>limit</code>. Paged output ends with <code>[Showing lines N-M of T. Use offset=… to continue.]</code>. Lines &gt;200KB are shown as a marker with a <code>sed</code> hint — hash anchors need full lines.</td>
+</tr>
+<tr>
+<td><code>edit</code></td>
+<td>Applies one or more edits atomically via <code>{ path, edits: [{ op, from, to?, lines? }, …] }</code>. <code>op</code> is <code>ins</code> (insert after <code>from</code>), <code>del</code> (delete the from..to range), or <code>replace</code> (swap the from..to range with <code>lines</code>). Verifies <strong>every line</strong> of each resolved range against served state; <code>[E_RANGE_STALE]</code> / <code>[E_RANGE_UNSERVED]</code> / <code>[E_RANGE_UNVERIFIED]</code> reject-and-serve fresh anchors. The response carries a <code>Shift:</code> block per hunk describing how absolute line numbers below the edit moved. Replaces the legacy <code>batch_edit</code> tool (up to 32 edits per call, per-item <code>path</code> for multi-file).</td>
+</tr>
+<tr>
+<td><code>grep</code></td>
+<td>Search for a pattern in one or more files. Parameters: <code>path</code> · <code>pattern</code> (literal by default, regex with <code>regex: true</code>) · <code>-C N</code> (context rows) · <code>limit</code>. Output mirrors <code>read</code>: one section per file, header + <code>&lt;line&gt;#&lt;hash&gt;│&lt;content&gt;</code> rows. Grep is observed + recorded as served so a hit can be edited directly without a separate <code>read</code>.</td>
+</tr>
+<tr>
+<td><code>undo_last_edit</code></td>
+<td><code>{ path }</code> reverts the last hashline edit, only while the file still matches the stored post-edit content; survives restarts.</td>
+</tr>
+</tbody></table>
+<h3>Error codes</h3>
+<table>
+<thead>
+<tr>
+<th>Code</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>[E_ACCESS]</code></td>
+<td>File exists but is not readable/writable by the tool.</td>
+</tr>
+<tr>
+<td><code>[E_AMBIGUOUS_ANCHOR]</code></td>
+<td>A hash matches more than one current line; call <code>read</code> for fresh anchors.</td>
+</tr>
+<tr>
+<td><code>[E_BAD_OP]</code></td>
+<td>Range end precedes range start (autocorrected when the pair was reversed).</td>
+</tr>
+<tr>
+<td><code>[E_BAD_REF]</code></td>
+<td><code>from</code>/<code>to</code> is not a <code>&lt;line&gt;#&lt;hash&gt;</code> or 3-char hash.</td>
+</tr>
+<tr>
+<td><code>[E_BAD_SHAPE]</code></td>
+<td>Request/field shape is wrong (unknown fields, missing path, non-string text, …).</td>
+</tr>
+<tr>
+<td><code>[E_BARE_HASH_PREFIX]</code></td>
+<td><code>&lt;line&gt;#&lt;hash&gt;│</code> prefix pasted into <code>lines</code> (autocorrected).</td>
+</tr>
+<tr>
+<td><code>[E_BATCH_ABORT]</code></td>
+<td>A batch item failed; the whole batch was rejected, nothing written.</td>
+</tr>
+<tr>
+<td><code>[E_FILE_TOO_LARGE]</code></td>
+<td>File exceeds the hashline line ceiling; use <code>write</code> or another approach.</td>
+</tr>
+<tr>
+<td><code>[E_INVALID_PATCH]</code></td>
+<td>Diff-preview markers pasted into <code>lines</code> (autocorrected).</td>
+</tr>
+<tr>
+<td><code>[E_NOOP_LOOP]</code></td>
+<td>The exact same edit keeps producing no change; resubmitting is rejected.</td>
+</tr>
+<tr>
+<td><code>[E_OP_INS]</code></td>
+<td><code>op:"ins"</code> — inserted lines placed after the anchor; informational.</td>
+</tr>
+<tr>
+<td><code>[E_NOT_FOUND]</code></td>
+<td>File does not exist.</td>
+</tr>
+<tr>
+<td><code>[E_NOT_OBSERVED]</code></td>
+<td>The file has not been observed in this session (read-before-write policy); call <code>read</code> first.</td>
+</tr>
+<tr>
+<td><code>[E_NOT_TEXT]</code></td>
+<td>Path is a directory, binary, or non-UTF-8 file; hashline edits only text.</td>
+</tr>
+<tr>
+<td><code>[E_RANGE_STALE]</code></td>
+<td>A served line differs on disk since it was read; the range is echoed fresh.</td>
+</tr>
+<tr>
+<td><code>[E_RANGE_UNSERVED]</code></td>
+<td>The range includes lines never served to the model.</td>
+</tr>
+<tr>
+<td><code>[E_RANGE_UNVERIFIED]</code></td>
+<td>Boundary anchor cannot be verified against served state.</td>
+</tr>
+<tr>
+<td><code>[E_STALE_ANCHOR]</code></td>
+<td>Anchor(s) no longer resolve; call <code>read</code> for fresh anchors.</td>
+</tr>
+<tr>
+<td><code>[E_UNDO_STALE]</code></td>
+<td>Cannot undo: the file was modified (or deleted) after the edit.</td>
+</tr>
+<tr>
+<td><code>[E_UNDO_UNAVAILABLE]</code></td>
+<td>Undo history could not be persisted; the edit was not applied.</td>
+</tr>
+<tr>
+<td><code>[E_WOULD_EMPTY]</code></td>
+<td>An edit would empty a non-empty file; use <code>write</code> to clear it.</td>
+</tr>
+</tbody></table>
+<h2>How It Replaces the Built-in Tools</h2>
+<p>dsh's tool registry resolves per scope: an agent sees <code>agent → preset → global</code>, and its <strong>own</strong>
+layer always wins. The built-in <code>read</code>/<code>edit</code> live on the agent-preset layer, so a plain global
+registration cannot replace them. This plugin:</p>
+<ol>
+<li>Mounts as a host-plane Cordis plugin via its <code>cordis.patch.yml</code> bundle patch.</li>
+<li>On <code>agent/session-start</code>, registers the hashline tools <strong>and</strong> the <code>tool:read</code> / <code>tool:edit</code>
+prompt sections on the agent's own scope layer — they shadow the preset's built-ins for that
+agent and unwind automatically when the agent is disposed.</li>
+<li>Leaves the built-in <code>write</code> in place, but a scoped <code>tools/post-execute</code> listener appends the
+hashline auto-read to write results.</li>
+</ol>
+<h2>Store</h2>
+<p>Hash snapshots, served-state rows, and undo history live in one SQLite store <strong>co-located with the
+workspace being edited</strong> — one store per session cwd:</p>
+<pre><code>&lt;workspace&gt;/.dsh_hashline_edittool/hash-store.sqlite
+</code></pre>
+<p>Parallel sessions in different workspaces keep separate stores (the session cwd is carried through
+each tool call), so one project's anchors and undo history never leak into another's. Outside a tool
+call (tests, previews) the store falls back to the shared DeepSeek Harness home
+(<code>$DSH_HOME/plugins/dsh-hashline-edittool/hash-store.sqlite</code>).</p>
+<p>A 7-day TTL prunes served rows; missing-file snapshots are pruned at startup. Corrupt stores are
+quarantined and rebuilt automatically. Moving to the per-workspace layout does not migrate earlier
+undo history from the shared home — treat any pre-0.1.2 undo entries as gone.</p>
+<h2>Project Structure</h2>
+<pre><code>dsh-hashline-edittool/
+├── src/
+│   ├── hashline/        # hash + served-state core
+│   ├── tool-read.ts     # read  — line#hash│content, offset/limit paging
+│   ├── tool-edit.ts     # edit  — range-by-line#hash, reject-and-serve, Shift block
+│   ├── tool-batch-edit.ts
+│   ├── tool-grep.ts     # grep  — line#hash│content under header per file
+│   ├── tool-undo.ts     # undo_last_edit
+│   ├── sandbox.ts       # FsSandboxController mirror (sandbox_permissions/justification)
+│   ├── write-hook.ts    # auto-read appended to write results
+│   ├── served-store.ts  # per-workspace SQLite store (node:sqlite)
+│   └── workspace.ts     # session-cwd AsyncLocalStorage carrier
+├── benchmark/           # reproducible hashline-vs-str_replace-vs-oh-my-pi token benchmark
+│   └── corpus/          # frozen 103-line fixture
+├── test/                # 615 tests
+├── cordis.patch.yml     # bundle patch
+└── package.json         # dsh.bundle manifest
+</code></pre>
+<h2>Development</h2>
+<pre><code>npm install
+npm run typecheck   # tsc --noEmit
+npm test            # vitest run (615 tests)
+npm run build       # tsc → lib/
+npm run benchmark   # reproducible token-cost benchmark (benchmark/)
+</code></pre>
+<h3>Releasing (tag-first)</h3>
+<pre><code>npm run release -- 0.2.0                 # bump + CHANGELOG move + commit + tag + push → GitHub release
+npm publish --registry https://registry.npmjs.org   # blocked until the version is tagged
+</code></pre>
+<p><code>npm run release</code> bumps <code>package.json</code>/lockfile, moves the CHANGELOG <code>[Unreleased]</code> section to the
+version, commits, tags <code>vX.Y.Z</code>, and pushes — the tag push creates the GitHub release from the
+changelog. <code>npm publish</code> refuses to run until that tag exists (prepublishOnly gate), so every npm
+version is always already tagged and released.</p>
+<p>The test suite drives the dsh tool builders directly over a local filesystem bridge.</p>
+<h2>Roadmap</h2>
+<p><strong>Current state:</strong> line-anchored <code>line#hash</code> markers with chainable Shift blocks, <code>grep</code> tool,
+per-workspace store, sandbox policy participation, the served-tail truncation fix, reproducible
+benchmark, EN + 中文 READMEs, published on npm. Test count: 651 passing (35 pre-existing
+sqlite-environment failures excluded).</p>
+<details><summary>Next</summary>
+
+<ul>
+<li><strong>Close or justify the gap vs @oh-my-pi/hashline</strong> (reference: <a href="https://github.com/hyperion2144/dsh-hashline-edittool/blob/HEAD/oh-my-pi.md"><code>../oh-my-pi.md</code></a>). The sibling patch language is payload-lighter — 42%/53% vs our 26% vs <code>str_replace</code> on the benchmark, because a bare patch document skips the JSON envelope we pay per call — and offers four abilities we do not support: syntactic block ops (<code>PUT N*:</code>), registers + <code>REM</code>/<code>MV</code>, one multi-hunk document per change, and a pluggable filesystem. The counterweight is correctness: its line numbers are unverified (a wrong number on a current tag lands silently), every edit renumbers, stale tags trigger best-effort 3-way merge instead of verification, and the grammar raises the model skill floor. Decide each ability reject-or-adopt on its own merits — the payload gap alone is not a reason to switch formats.</li>
+<li>Verify 0.1.6 live in a dsh session after the served-tail fix.</li>
+<li>Re-check plugin wiring against the next dsh release (pinned to <code>0.1.0-rc.6</code>; dsh is in developer
+preview and promises breaking changes).</li>
+</ul>
+</details>
+
+<h2>Contributing</h2>
+<p>See <a href="https://github.com/hyperion2144/dsh-hashline-edittool/blob/HEAD/CONTRIBUTING.md">CONTRIBUTING.md</a> (or just open an <a href="https://github.com/hyperion2144/dsh-hashline-edittool/issues">issue</a>).
+The most valuable contributions right now are more benchmark scenarios and edge-case tests for the
+served-state verification.</p>
+<h2>License</h2>
+<p>MIT License — see <a href="https://github.com/hyperion2144/dsh-hashline-edittool/blob/HEAD/LICENSE">LICENSE</a> for details.</p>
+<h2>Acknowledgments</h2>
+<p>Hash-anchored editing descends from Can Bölük's
+<a href="https://stencil.so/blog/the-harness-problem"><em>The Harness Problem</em></a> — the post that showed the
+harness, not the model, is the bottleneck, and that anchored edits beat search-and-replace. This
+project stands on the shoulders of:</p>
+<ul>
+<li><a href="https://github.com/RimuruW/pi-hashline-edit"><strong>pi-hashline-edit</strong></a> by RimuruW — the original
+pi-coding-agent extension that introduced 3-character hashes and collision resolution.</li>
+<li><a href="https://github.com/YuGiMob/pi-hashline-edit-pro"><strong>pi-hashline-edit-pro</strong></a> by YuGiMob — the
+hardened fork the hashline core here is ported from.</li>
+</ul>
+<p>Related reading: <a href="https://dirac.run/posts/hash-anchors-myers-diff-single-token">Hash anchors + Myers diff + single-token anchors
+(dirac.run)</a> (a design review of the
+O(S+R) → O(R) edit-call saving) and an independent
+<a href="https://nwyin.com/blogs/hashline-vs-replace-edit-bench.html">hashline-vs-replace benchmark</a>.</p>
+<hr>
+<h2>Star History</h2>
+<p><a href="https://star-history.com/#hyperion2144/dsh-hashline-edittool&amp;Date"><img src="https://api.star-history.com/svg?repos=hyperion2144/dsh-hashline-edittool&amp;type=Date" alt="Star History Chart"></a></p>
+<hr>
+<p align="center">
+  <strong>⭐ If hashline editing made your agent edit better, give it a star!</strong>
+</p>

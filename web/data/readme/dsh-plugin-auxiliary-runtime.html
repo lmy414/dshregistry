@@ -1,0 +1,174 @@
+
+
+<h1>Auxiliary Runtime</h1>
+
+<p>Cancelable auxiliary model calls, durable limits, and provenance-preserving usage for DeepSeek Harness.</p>
+
+<p>
+  <a href="https://github.com/Hilbert-beinghappy/dsh-plugin-auxiliary-runtime/releases"><img src="https://img.shields.io/badge/Version-0.1.1-orange" alt="Version 0.1.1"></a>
+  <img src="https://img.shields.io/badge/DeepSeek%20Harness-0.1.1--rc.2-5B5BD6" alt="DeepSeek Harness 0.1.1-rc.2">
+  <img src="https://img.shields.io/badge/Host%20still%20supported-0.1.0--rc.8-0A7EA4" alt="Host 0.1.0-rc.8 still supported">
+  <img src="https://img.shields.io/badge/Usage-Official%20%7C%20Auxiliary%20%7C%20Combined-0A7EA4" alt="Official, Auxiliary, Combined usage">
+  <a href="https://github.com/Hilbert-beinghappy/dsh-plugin-auxiliary-runtime/actions/workflows/ci.yml"><img src="https://github.com/Hilbert-beinghappy/dsh-plugin-auxiliary-runtime/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="https://github.com/Hilbert-beinghappy/dsh-plugin-auxiliary-runtime/blob/HEAD/LICENSE"><img src="https://img.shields.io/badge/License-MIT-yellow" alt="MIT License"></a>
+</p>
+
+<p>
+  <a href="#project-overview">Project overview</a>
+  ·
+  <a href="#three-sourced-usage-views">Usage views</a>
+  ·
+  <a href="#runtime-design">Runtime design</a>
+  ·
+  <a href="#quick-start">Quick start</a>
+  ·
+  <a href="#service-contracts">Contracts</a>
+  ·
+  <a href="#compatibility-and-verification">Verification</a>
+</p>
+
+<p>English · <a href="https://github.com/Hilbert-beinghappy/dsh-plugin-auxiliary-runtime/blob/HEAD/README.zh.md">中文</a></p>
+
+
+
+<hr>
+<h2>Project overview</h2>
+<p><code>dsh-plugin-auxiliary-runtime@0.1.1</code> is a community Host plugin for <a href="https://github.com/deepseek-ai/deepseek-harness">DeepSeek Harness</a>. It binds cancelable, no-tools auxiliary model calls to an already-live Session, applies per-Session policy, and records usage in a dedicated ledger backed by the official <code>storageDomain</code> service. The current compile and metadata target is official Host <code>0.1.1-rc.2</code>; exact Host <code>0.1.0-rc.8</code> remains supported.</p>
+<p><a href="https://github.com/Hilbert-beinghappy/dsh-plugin-clarify">Clarify</a> uses Auxiliary Runtime's same-process <code>run</code> service to generate contextual questions, options, and evolving Draft previews outside the main Session transcript. <a href="https://github.com/Hilbert-beinghappy/seektty">SeekTTY</a> consumes the read-only snapshot and shows Official, Auxiliary, and Combined values in <code>/status</code> while the capability is healthy.</p>
+<pre><code>                       +----------------------+
+                       | DeepSeek Harness     |
+                       | live Session         |
+                       | official model route |
+                       +----------+-----------+
+                                  |
+                           llm.prepareCall
+                                  |
+                                  v
++----------------+       +----------------------+       +----------------+
+| Clarify        | ----&gt; | Auxiliary Runtime    | ----&gt; | Provider stream|
+| same-process   | run   | admission / cancel   |       | usage chunks   |
+| Draft preview  | &lt;---- | bounded live output  | &lt;---- | final status   |
++----------------+       +----------+-----------+       +----------------+
+                                  |
+                                  | durable rows
+                                  v
+                       +----------------------+
+                       | storageDomain        |
+                       | auxiliary_runtime v0 |
+                       | calls / policies     |
+                       +----------+-----------+
+                                  |
+                           read-only snapshot
+                                  v
+                       +----------------------+
+                       | SeekTTY /status      |
+                       | Official / Auxiliary |
+                       | Combined             |
+                       +----------------------+
+</code></pre>
+<h2>Three sourced usage views</h2>
+<table>
+<thead>
+<tr>
+<th>View</th>
+<th>Source and meaning</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong>Official</strong></td>
+<td>The official Host <code>tokenUsage</code> projection, owned by the Agent loop.</td>
+</tr>
+<tr>
+<td><strong>Auxiliary</strong></td>
+<td>This plugin's <code>auxiliary_runtime</code> ledger, aggregated from authoritative call rows.</td>
+</tr>
+<tr>
+<td><strong>Combined</strong></td>
+<td>A read-time, bucket-by-bucket sum of Official and Auxiliary values.</td>
+</tr>
+</tbody></table>
+<p>The four disjoint buckets are <code>uncachedInputTokens</code>, <code>outputTokens</code>, <code>cacheReadTokens</code>, and <code>cacheWriteTokens</code>. Combined values are derived for consumers and stay outside the official projection.</p>
+<h3>Main Session transcript</h3>
+<p>Auxiliary calls use the existing Session as an identity and routing fence. The main transcript receives formal messages through the normal Session flow, after the user submits an accepted Draft. Clarify questions, answers, and Draft previews remain in Clarify's temporary Host state.</p>
+<h3>Durable auxiliary ledger</h3>
+<p>Durable rows contain identifiers, purpose, status, the four token buckets, <code>usageRecorded</code>, normalized failure <code>{ category, code }</code>, and timestamps. Prompts, messages, system text, model output, custom answers, credentials, environment values, and filesystem paths remain outside storage. Failure records contain only the normalized <code>{ category, code }</code>; the official <code>LlmFailure.message</code> stays outside storage.</p>
+<h2>Runtime design</h2>
+<h3>Admission, usage, and replay</h3>
+<p><code>run</code> writes a durable <code>running</code> row before <code>llm.prepareCall</code> and <code>prepared.stream</code>. Prepared requests complete token-limit admission after provider metadata has been materialized and before streaming begins. The latest provider usage chunk replaces the four buckets on the authoritative row; <code>usageRecorded</code> distinguishes an observed all-zero report from a missing report. Recorded usage survives a later <code>error</code> or <code>aborted</code> finish.</p>
+<p>Successful live calls return model text ephemerally to the same-process caller, joined in stream order and bounded to 65,536 UTF-16 code units. Terminal replay returns the durable status and usage with <code>replayed: true</code> and <code>output: null</code>; a caller that needs new text uses a new <code>callId</code>. Active-id reuse, cross-Session reuse, and purpose changes are reported as conflicts.</p>
+<h3>Limits and cancellation</h3>
+<p>Per-Session policy covers <code>maxConcurrentCalls</code>, <code>maxCallsPerSession</code>, and <code>maxAuxiliaryTotalTokens</code>. Limits combine recorded usage with process-local reservations for in-flight calls. Provider-reported usage becomes authoritative after dispatch, including values above the initial reservation.</p>
+<p>Cancellation composes the caller signal and service signal through <code>AbortController</code>. Provider failures preserve official categories such as <code>QUOTA</code> and <code>CONTEXT_WINDOW_EXCEEDED</code>. Durable <code>running</code> rows found during the next initialization become <code>interrupted</code> without additional usage.</p>
+<h3>Persistence and Session fencing</h3>
+<p>The official storage domain is <code>auxiliary_runtime</code>, version <code>0</code>, with <code>calls</code> and <code>policies</code> tables. Call rows are authoritative; aggregates rebuild from rows during initialization and update after durable writes succeed.</p>
+<p>Records are fenced by Session id and <code>session.header.createdAt</code>, so a reused id starts with a new usage and policy identity. Uninstalling the Bundle leaves the official storage-domain file available for a later reinstall. Version <code>0</code> preserves its audit rows and refuses new calls at 10,000 rows. The supported deployment shape is one Host process per <code>DSH_HOME</code>.</p>
+<h3>Service lifecycle</h3>
+<p>The plugin waits for official <code>storageDomain</code> through Cordis child-context injection. Service withdrawal cancels active work and disposes stale references; restoration creates a fresh runtime. Missing Host services, a missing live Session, a domain version mismatch, and invalid stored records fail closed before provider dispatch.</p>
+<h2>Quick start</h2>
+<p>The last published Release remains Auxiliary Runtime <code>0.1.0</code>. Install that prebuilt tarball into an isolated Profile with the native <code>dsh plugin</code> command:</p>
+<pre><code>pnpm add --global @deepseek-ai/dsh@0.1.0-rc.8
+dsh plugin --profile tui add https://github.com/Hilbert-beinghappy/dsh-plugin-auxiliary-runtime/releases/download/v0.1.0/dsh-plugin-auxiliary-runtime-0.1.0.tgz
+</code></pre>
+<p>Source <code>0.1.1</code> targets official Host <code>0.1.1-rc.2</code> and is not a GitHub Release yet. Do not invent a <code>v0.1.1</code> download URL. Pack the local tree and add that tarball:</p>
+<pre><code>pnpm add --global @deepseek-ai/dsh@0.1.1-rc.2
+pnpm pack
+dsh plugin --profile tui add ./dsh-plugin-auxiliary-runtime-0.1.1.tgz
+</code></pre>
+<p>Host <code>0.1.0-rc.8</code> still admits this candidate tarball when you pack it locally. Current sibling Releases SeekTTY <code>1.2.0</code> and Clarify <code>0.2.1</code> remain the last published jointly accepted trio on exact Host <code>0.1.0-rc.8</code>. They are not a <code>0.1.1-rc.2</code> claim. Unpublished Auxiliary <code>0.1.1</code> with SeekTTY <code>1.2.1</code> and Clarify <code>0.2.2</code> has Lane A no-key PTY evidence and 2026-08-22 Lane B live-provider observations on <code>candidate4</code>. Not a Release or complete joint acceptance. See <a href="#compatibility-and-verification">Compatibility and verification</a>. You can still add those published tarballs beside this candidate:</p>
+<pre><code>dsh plugin --profile tui add https://github.com/Hilbert-beinghappy/seektty/releases/download/v1.2.0/seektty-1.2.0.tgz
+dsh plugin --profile tui add https://github.com/Hilbert-beinghappy/dsh-plugin-clarify/releases/download/v0.2.1/dsh-plugin-clarify-0.2.1.tgz
+dsh --profile tui
+</code></pre>
+<p>The Bundle patch inserts <code>id: auxiliary-runtime</code> / <code>name: dsh-plugin-auxiliary-runtime</code>. The consumer package contains no <code>workspace:</code> dependency and uses the official Host Context for Harness services.</p>
+<h2>Service contracts</h2>
+<h3>Same-process service</h3>
+<p><code>run</code> is available only to plugins in the same Host process:</p>
+<pre><code>const runtime = ctx.get('auxiliaryRuntime')
+
+const result = await runtime.run({
+  callId,          // caller-generated
+  sessionId,       // already-live Session
+  purpose,         // 'clarify' | 'compaction' | 'session-title'
+  config,          // official LlmCallConfig
+  prepareRequest,  // optional atomic prepared metadata =&gt; request + reservation
+  signal,          // optional caller AbortSignal
+})
+</code></pre>
+<p><code>run</code> accepts exactly one request mode:</p>
+<ul>
+<li>static <code>system</code> / <code>messages</code> with a mandatory four-bucket reservation;</li>
+<li>legacy same-process <code>buildRequest(preparedConfig)</code> with a mandatory reservation; or</li>
+<li><code>prepareRequest({ config, context, adapterDefaults })</code>, atomically returning <code>{ system?, messages, reservation }</code> from the same prepared metadata.</li>
+</ul>
+<p>Prepared callbacks receive detached, frozen structural data after <code>llm.prepareCall</code>. Callback functions and products remain process-local. <code>getPolicy(sessionId)</code> and <code>setPolicy(sessionId, policy)</code> manage the three per-Session limits.</p>
+<h3>Typert Host</h3>
+<p>The separate <code>auxiliary-runtime</code> Typert receiver exposes two methods:</p>
+<ul>
+<li><code>auxiliary-runtime/snapshot</code> — read-only <code>{ official, auxiliary, combined, capability }</code></li>
+<li><code>auxiliary-runtime/cancel</code> — abort an active call and report its stable state</li>
+</ul>
+<p>Model execution remains a same-process capability; HTTP consumers receive usage snapshots and cancellation only.</p>
+<h2>Compatibility and verification</h2>
+<p>The current compile and metadata target is official DeepSeek Harness <strong><code>0.1.1-rc.2</code></strong> with Node <code>^22.19.0 || &gt;=24</code>. Exact Host <strong><code>0.1.0-rc.8</code></strong> remains supported. Runtime integration uses these public Host services:</p>
+<ul>
+<li><code>storageDomain.open</code> / <code>KvTable</code></li>
+<li><code>sessions.get</code> and <code>header.createdAt</code></li>
+<li><code>llm.prepareCall</code> / <code>prepared.stream</code></li>
+<li><code>sessionProjections.snapshot</code> for read-only Official usage</li>
+<li>Typert Host <code>register</code> for snapshot and cancel</li>
+</ul>
+<p>The published rollback joint baseline remains exact Host <strong><code>0.1.0-rc.8</code></strong>. Auxiliary Runtime <code>0.1.1</code> compiles against and admits exact <code>0.1.1-rc.2</code>. Lane A (2026-08-21, unmodified stock <code>0.1.1-rc.2</code>, isolated <code>DSH_HOME</code>, real PTY, unpublished Auxiliary <code>0.1.1</code> + Clarify <code>0.2.2</code> + SeekTTY <code>1.2.1</code>): <code>/doctor</code> 0 error / 0 warning, 99 plugins running; <code>/status</code> healthy; <code>/clarify</code> routed through Auxiliary, returned <code>MISSING_CREDENTIAL</code> without a key, and kept the composer; Vision-Exp was visible and selectable; a PNG attachment restored after <code>/restart</code>. Missing-source restore: unit tests keep the failure copy to a basename, cover both notice orders, and keep absolute paths out of the text; a real-PTY hardcopy/visible scan found only the ASCII basename <code>vision-logo.png</code> and none of <code>private/tmp</code>, <code>/tmp</code>, <code>Users</code>, or <code>Volumes</code>. That does not prove the restore error stayed visible after dismissing the no-key onboarding modal (Esc also clears notices). Lane B (2026-08-22, unmodified stock <code>0.1.1-rc.2</code>, isolated <code>DSH_HOME</code>, <code>candidate4</code>): Vision-Exp was selected explicitly; a PNG image-only send succeeded, cleared attachments on send, and recognized the logo, but the image-only prompt with no question led the model to call <code>read_image</code> again; a real JFIF JPEG queued through SeekTTY was converted by the official Host to a PNG variant as usual, then OCR succeeded without tools; Clarify via Auxiliary completed 6 dynamic rounds, a 41-line full review, and a second-confirm accept back into the composer without auto-send; <code>/status</code> showed Official, Auxiliary, and Combined usage; an 895-file scan found 0 secret literals. This is not a Release or complete joint acceptance. It does not prove Web UI, GIF/WebP, over-limit rejection, JPEG original-byte passthrough, PNG without any tool use, this-round interruption recovery, or a cost/cache A/B. Clarify <code>0.2.1</code> preserves the six-method Remote, <code>clarify.wire/1</code>, and compatibility boundary of <code>0.2.0</code>.</p>
+<p>Clarify <code>0.2.0</code> live-provider joint acceptance covered model-generated clarification, multi-round Draft evolution, user-controlled submission, interruption recovery, usage provenance, and ledger privacy. Clarify <code>0.2.1</code> post-release no-key acceptance re-downloaded and verified all three Release assets, passed stock add/boot/remove/re-add and <code>/doctor</code> with 0 errors, 0 warnings, and 99 plugins on exact <code>0.1.0-rc.8</code>, then reached <code>running</code>, routed through Auxiliary, and returned the expected isolated-environment <code>MISSING_CREDENTIAL</code> result. Version <code>0.2.1</code> has not rerun live-provider multi-round acceptance or a cache/cost A/B.</p>
+<p>The published rollback stack is official <code>@deepseek-ai/dsh@0.1.0-rc.8</code>, Auxiliary Runtime <code>0.1.0</code>, Clarify <code>0.2.1</code>, and SeekTTY <code>1.2.0</code>.</p>
+<p><code>package.json#dshPlugin.testedHost</code> is the compile pin <code>0.1.1-rc.2</code>. <code>dshPlugin.testedHosts</code> lists the two exact admission pins <code>0.1.0-rc.8</code> and <code>0.1.1-rc.2</code>. Capability probing can boot when the Host exposes no version value and reports <code>hostConfirmed: false</code>; a known version outside those two pins is rejected.</p>
+<h2>Development</h2>
+<pre><code>pnpm install
+pnpm test
+pnpm typecheck
+pnpm build
+pnpm pack:check
+</code></pre>
+<p><code>pnpm typecheck</code> is the official type gate. The official-contract runtime test only pins installed package versions; the compile-time <code>Assert</code> aliases in that file are checked by <code>pnpm typecheck</code>.</p>
+<p>When a GitHub Release is published, assets include the tarball and <code>SHA256SUMS</code>.</p>
+<h2>License</h2>
+<p><a href="https://github.com/Hilbert-beinghappy/dsh-plugin-auxiliary-runtime/blob/HEAD/LICENSE">MIT</a></p>

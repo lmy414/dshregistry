@@ -1,0 +1,114 @@
+<h1>dsh-standard-toolkit</h1>
+<blockquote>
+<p><strong>dsh 标准工具插件（Standard ToolKit）——一个装进 <a href="https://github.com/deepseek-ai/deepseek-harness">dsh</a> 的"工具管家"：平时工具不占位，会话里需要什么自动取用，用完自动收走。省 token、保专注、能力自我进化。</strong></p>
+</blockquote>
+<p>dsh 生态默认只向模型暴露极简工具集，扩展工具全量启用又会让每轮对话背着全部 schema（占 token、模型易选错）。Standard ToolKit 把工具管理自动化：</p>
+<ul>
+<li><strong>省 token</strong>：工具默认收在仓库（暂存区），不加载不占 schema；被取用才"摆上桌面"</li>
+<li><strong>极简起步</strong>：每会话只暴露核心 6 工具（bash / read / write / edit / todo_write / subagent），界面清爽、模型专注</li>
+<li><strong>按需自动扩展</strong>：你说话提到"搜一下""算一下这两个日期隔几天"，自动匹配触发词、加载对应工具</li>
+<li><strong>会话隔离</strong>：动态工具注册在 agent 层，随会话销毁自动卸载——A 会话的专用工具绝不污染 B 会话</li>
+<li><strong>能力自我进化</strong>：模型可 <code>register_new_tool</code> 现场造工具，自动完成 规范审查 → 冒烟 → 分类 → 写盘入库 → 本会话立即可用；下次会话同类场景自动匹配，无需重做</li>
+</ul>
+<h2>工作原理</h2>
+<pre><code>启动扫描 ─→ 暂存区 stash（toolbox/&lt;分类&gt;/*.js，vetTool 审查 + 入库冒烟）
+雷达 ─→ 全局扩展工具索引（含中文触发词）
+会话启动 ─→ 白名单遮罩（只露核心6工具）+ 注册 load_tool / register_new_tool + 注入工具名录
+每轮请求 ─→ 触发词匹配 → tryRegister 自动加载（strong 命中≥1 / trigger 命中≥2）
+会话销毁 ─→ 自动卸载全部动态工具；文件删除 → 自动注销
+</code></pre>
+<h2>快速开始（clone 即插即用）</h2>
+<blockquote>
+<p><strong>发布策略（v1.1.0 起）</strong>：npm 包仅含<strong>插件核</strong>（index.js 框架 + skills/ + vendor/ + docs/）——工具（toolbox/）是独立资产，不随插件发布。工具来源：克隆本仓库自带开源工具集，或用 <code>register_new_tool</code> 现场造工具自动入库。</p>
+</blockquote>
+<pre><code>git clone https://github.com/&lt;you&gt;/dsh-standard-toolkit
+cd dsh-standard-toolkit
+./install.sh /path/to/dsh/runtime      # Linux/macOS/git-bash
+# 或 Windows：
+install.bat D:\path\to\dsh\runtime
+</code></pre>
+<p>install 脚本幂等：复制插件到 <code>&lt;runtime&gt;/standard-toolkit</code>、自动注入 <code>cordis.yml</code> 挂载（已挂载则跳过）、校验输出。重启 dsh bridge/runtime 后生效，日志应出现：</p>
+<pre><code>[standard-toolkit] 已启动 mode=auto 暂存区=N 雷达=M
+</code></pre>
+<p><code>mode</code> 可在 cordis.yml 中调整：<code>auto</code>（默认，自动匹配）| <code>manual</code>（仅 load_tool 手动加载）。</p>
+<h2>使用方式</h2>
+<p><strong>用户侧：无感。</strong> 正常跟 dsh 说话即可：</p>
+<pre><code>你：算一下2026-08-01到2026-08-16隔多少天
+dsh：→（命中触发词，自动加载 days_between）→ 返回 15 天
+</code></pre>
+<p><strong>模型侧：两个"钥匙"工具</strong>（名录已注入系统提示，模型可直接看到可用工具清单）：</p>
+<table>
+<thead>
+<tr>
+<th>工具</th>
+<th>作用</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>load_tool(name)</code></td>
+<td>按名加载工具到当前会话</td>
+</tr>
+<tr>
+<td><code>register_new_tool(def)</code></td>
+<td>现场创造新工具：审查→冒烟→自动分类→写盘 <code>toolbox/&lt;分类&gt;/&lt;name&gt;.js</code>→立即可用</td>
+</tr>
+</tbody></table>
+<p><code>register_new_tool</code> 支持参数：<code>name</code> / <code>execute</code>（源码字符串）/ <code>parameters</code> / <code>output</code> / <code>category</code> / <code>triggerKeywords</code> / <code>strongKeywords</code> / <code>dependencies</code> / <code>smoke</code> / <code>injectedServices</code>。</p>
+<h2>自定义工具</h2>
+<p><code>toolbox/&lt;分类&gt;/</code> 放工具定义文件（ESM 默认导出），目录名即分类：</p>
+<pre><code>export default {
+  name: 'days_between',
+  description: '计算两个日期（YYYY-MM-DD）之间相隔的自然日天数',
+  parameters: { type: 'object', properties: { date1: {type:'string'}, date2: {type:'string'} }, required: ['date1','date2'] },
+  output: { schema: { type: 'object' }, render: function(args, v){ return [{type:'text', text:v.text}] } },
+  execute: async function (args, exec) { /* 纯逻辑 */ },
+  metadata: { triggerKeywords: ['算','隔','天'], smoke: { date1:'2026-08-01', date2:'2026-08-16' } },
+}
+</code></pre>
+<p><strong>规则</strong>：丢文件=增加工具（重启扫描入库）；删文件=自动注销（无需重启）；<code>strongKeywords</code> 命中 ≥1 或 <code>triggerKeywords</code> 命中 ≥2 即自动匹配；不满足依赖预检不加载。</p>
+<h2>安全</h2>
+<ul>
+<li>工具纳入前必过规范审查（vetTool：字段/JSON Schema/命名/服务访问白名单）</li>
+<li>execute 访问未注入的 agent ctx 服务（web/fs/bash/llm…）即被拒绝</li>
+<li>入库冒烟只跑作者显式声明的 <code>smoke</code> 参数，避免误触真实副作用</li>
+<li>全链路异常捕获，归一化返回，绝不阻塞请求流</li>
+</ul>
+<h2>测试</h2>
+<pre><code>cd dsh-standard-toolkit &amp;&amp; npm test   # 或 node tests/verify.mjs
+</code></pre>
+<ul>
+<li><code>verify.mjs</code>：分类/审查/冒烟/名录逻辑</li>
+<li><code>verify-register.mjs</code>：register_new_tool 闭环（临时目录 + v2.6 feedback/intent/归一化/危险全局）</li>
+<li><code>verify-live.mjs</code>：真机路径——挂载真实插件 apply 驱动会话，直接调用真实 <code>register_new_tool.execute</code></li>
+<li><code>demo-closed-loop.mjs</code>：会话A自制 → 会话B自动匹配 → 调用端到端演示</li>
+</ul>
+<h2>更新日志</h2>
+<h3>v1.1.1（2026-08-23）</h3>
+<ul>
+<li><strong>发布策略修正（工具与插件解耦执行）</strong>：npm 包仅含插件核（index.js + skills/ + vendor/ + docs/），<code>toolbox/</code> 不随包发布；prepack-check 守卫反向断言（files 不得含 toolbox/）</li>
+<li><strong>说明</strong>：v1.1.0 初版误将 toolbox 一并打包发布；因发布 token 无 2FA 权限，registry 上 1.1.0（含工具版）无法撤回，以 1.1.1 修正。安装请使用 <code>npm i dsh-standard-toolkit@1.1.1</code>；1.1.0 仅本机自测使用</li>
+</ul>
+<h3>v1.1.0（2026-08-23）</h3>
+<ul>
+<li><strong>B站画像插件意图词接入</strong>：为外部扩展插件 <code>bili_login</code> / <code>bili_profiler</code> / <code>bili_recommend</code> 增补中文意图词（B站登录 / 画像分析 / 推荐视频等），与工具名一并进入雷达索引</li>
+<li><strong>强触发词机制</strong>：新增 <code>GLOBAL_STRONG_HINTS</code> 低歧义意图词表——命中 1 词即 pre-step 自动加载（仅注册可见性，不执行）；偏泛词（深挖 / MBTI / 推荐视频 / 扫码登录）降级到关键词提示表，需 ≥2 词命中才触发，控制误触发</li>
+<li><strong>本地工具管理</strong>：新增本地专用工具 <code>toolbox/custom/med_ppt.js</code>（医学 PPT 生成，本机 python-pptx 环境依赖），与 <code>bili_summary.js</code> 同样例：不进公开仓库、不进 npm 包（.gitignore + files 白名单双重排除），本机照常加载</li>
+<li><strong>发布策略调整（工具与插件解耦）</strong>：npm 包改为仅含插件核（index.js + skills/ + vendor/ + docs/），<code>toolbox/</code> 不再随包发布——工具是独立资产（含本机专用工具与个人环境依赖），不混入公开插件包；prepack-check 守卫同步反转（断言 files 不得包含 toolbox/）</li>
+</ul>
+<h3>v1.0.2（2026-08-19）</h3>
+<ul>
+<li>npm 发包通道修复（prepack-check 发版守卫、files 白名单校验），<code>npm test</code> 全绿（37+32+25+demo）</li>
+<li>v2.6：<code>register_new_tool</code> 增强——intent 骨架 / 扁平 schema 归一化 / dryRun 闸门 / 结构化 feedback / 危险全局拦截；新增作者指南 SKILL <code>skills/tool-authoring</code></li>
+</ul>
+<h3>v1.0.1（2026-08-17）</h3>
+<ul>
+<li>修复 repository 元数据（清除 npm init 模板占位残留），补 license/repository/homepage</li>
+<li>本地专用工具 <code>bili_summary.js</code> 移出公开仓库</li>
+</ul>
+<h2>文档</h2>
+<ul>
+<li>使用说明书：<a href="https://github.com/suanniniu/dsh-standard-toolkit/blob/HEAD/docs/%E4%BD%BF%E7%94%A8%E8%AF%B4%E6%98%8E%E4%B9%A6.md">dsh-standard-toolkit-使用说明书</a></li>
+<li>设计文档：<a href="https://github.com/suanniniu/dsh-standard-toolkit/blob/HEAD/docs/design-final.md">dsh-standard-toolkit-design-final</a></li>
+</ul>
+<h2>License</h2>
+<p><a href="https://github.com/suanniniu/dsh-standard-toolkit/blob/HEAD/LICENSE">MIT</a></p>

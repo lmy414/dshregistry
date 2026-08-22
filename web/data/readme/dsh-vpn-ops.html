@@ -1,0 +1,285 @@
+<h1>dsh-vpn-ops</h1>
+<p><a href="https://github.com/zootguru/dsh-vpn-ops/blob/HEAD/README.zh-CN.md">简体中文</a></p>
+<p>Safety-gated WireGuard and VLESS Reality operations for
+<a href="https://github.com/deepseek-ai/deepseek-harness">DeepSeek Harness</a> (DSH).</p>
+<p><code>dsh-vpn-ops</code> is a real DSH bundle: it ships <code>cordis.patch.yml</code>, exports a Cordis
+<code>apply(ctx, config)</code> lifecycle entry point, and registers eight typed tools. It
+turns a reviewed, allowlisted server definition into repeatable preflight,
+plan, apply, status, verification, rollback, and client-export operations.</p>
+<blockquote>
+<p>Status: <code>0.1.0</code> initial public release. The bundle load path is verified against
+DSH <code>0.1.1-rc.2</code>; production network rollout still requires an operator-owned
+staging server and acceptance test. See <a href="#compatibility">Compatibility</a> and
+<a href="#limitations">Limitations</a>.</p>
+</blockquote>
+<h2>Why this is not “SSH from the model”</h2>
+<p>The model can choose only a configured <code>targetId</code> and <code>clientId</code>. It cannot
+supply a host, credential, remote path, package URL, or shell command.</p>
+<ul>
+<li>Strict host-key checking and public-key-only SSH are mandatory.</li>
+<li>Every process is spawned with an argv array; no local shell is used.</li>
+<li>Remote work runs a fixed helper shipped in the reviewed package.</li>
+<li>Remote mutation defaults to off.</li>
+<li><code>vpn_apply</code> requires a fresh, persisted plan, an unchanged remote baseline,
+and the exact confirmation string returned by <code>vpn_plan</code>.</li>
+<li>Apply writes backups before the first managed-file change and automatically
+restores them if the transaction fails.</li>
+<li>Client secrets are never returned as tool values. Explicit export streams
+them into new local mode-<code>0600</code> files and returns only paths, sizes, and
+SHA-256 evidence.</li>
+<li>The npm package has no <code>preinstall</code>, <code>install</code>, <code>postinstall</code>, <code>prepare</code>, or
+<code>prepack</code> lifecycle script.</li>
+</ul>
+<p>Read the complete <a href="https://github.com/zootguru/dsh-vpn-ops/blob/HEAD/docs/THREAT_MODEL.md">threat model</a> before enabling changes.</p>
+<h2>Tools</h2>
+<table>
+<thead>
+<tr>
+<th>Tool</th>
+<th>Changes state</th>
+<th>Gate</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>vpn_targets</code></td>
+<td>No</td>
+<td>None</td>
+</tr>
+<tr>
+<td><code>vpn_preflight</code></td>
+<td>No</td>
+<td>Allowlisted target</td>
+</tr>
+<tr>
+<td><code>vpn_status</code></td>
+<td>No</td>
+<td>Allowlisted target</td>
+</tr>
+<tr>
+<td><code>vpn_plan</code></td>
+<td>Local non-secret plan file</td>
+<td>Preflight must pass</td>
+</tr>
+<tr>
+<td><code>vpn_apply</code></td>
+<td>Yes, remote</td>
+<td><code>allowMutations</code>, fresh plan, exact confirmation</td>
+</tr>
+<tr>
+<td><code>vpn_verify</code></td>
+<td>No</td>
+<td>Allowlisted target</td>
+</tr>
+<tr>
+<td><code>vpn_rollback</code></td>
+<td>Yes, remote</td>
+<td><code>allowMutations</code>, backup id, exact confirmation</td>
+</tr>
+<tr>
+<td><code>vpn_export_client</code></td>
+<td>Yes, local secret files</td>
+<td><code>allowSecretExport</code>, exact confirmation</td>
+</tr>
+</tbody></table>
+<h2>Target prerequisites</h2>
+<p>The first release intentionally does not install operating-system packages or
+download Xray. Supply-chain policy remains with the server operator.</p>
+<p>The target must be Debian or Ubuntu with systemd and these commands already
+available:</p>
+<pre><code>base64 flock install ip iptables jq mktemp openssl sha256sum ss sysctl systemctl
+uuidgen wg wg-quick xray
+</code></pre>
+<p>The configured <code>xrayBinary</code> may point to a non-PATH installation. The SSH user
+must be root, or <code>sudo: true</code> must provide non-interactive root authority.
+Treat either credential as root-equivalent and keep it dedicated.</p>
+<p>Before deployment, verify that:</p>
+<ol>
+<li>UDP <code>wireguardListenPort</code> and TCP <code>vlessPort</code> are allowed by the provider and
+host firewalls.</li>
+<li><code>publicInterface</code> is the actual egress interface.</li>
+<li>The REALITY <code>realityDestination</code> and <code>realityServerName</code> are suitable and
+under an acceptable abuse policy. Unauthenticated REALITY traffic is
+forwarded to the target; see the Xray documentation warning.</li>
+<li>Xray accepts <code>network: "raw"</code>, the <code>target</code> REALITY field, and
+<code>xtls-rprx-vision</code> in a dry-run configuration test.</li>
+<li>The operator has an independent recovery channel such as a cloud serial
+console.</li>
+</ol>
+<h2>Install</h2>
+<h3>GitHub release</h3>
+<p>Install a tagged release into an existing DSH profile:</p>
+<pre><code>dsh plugin --profile my-profile add github:zootguru/dsh-vpn-ops#v0.1.0
+</code></pre>
+<p>The repository commits built <code>lib/</code> artifacts, so a Git install does not run a
+build lifecycle hook.</p>
+<h3>Local, reproducible tarball</h3>
+<pre><code>pnpm install --frozen-lockfile
+pnpm verify
+pnpm pack --pack-destination ./artifacts
+dsh plugin --profile my-profile add ./artifacts/dsh-vpn-ops-0.1.0.tgz
+</code></pre>
+<h2>Configure</h2>
+<p>The bundle installs a disabled <code>vpn-ops</code> row. Override that row in the profile's
+user <code>cordis.patch.yml</code>:</p>
+<pre><code>- id: vpn-ops
+  config:
+    # Keep false until a reviewed vpn_plan is ready to execute.
+    allowMutations: false
+    # Enable only for an operator-approved client export session.
+    allowSecretExport: false
+    stateDirectory: /Users/operator/.local/state/dsh-vpn-ops
+    connectTimeoutSeconds: 10
+    commandTimeoutMs: 120000
+    maxOutputBytes: 65536
+    planTtlSeconds: 900
+    targets:
+      - id: la-edge
+        host: vpn.example.net
+        user: root
+        sshPort: 22
+        identityFile: /Users/operator/.ssh/dsh-vpn-ops_ed25519
+        knownHostsFile: /Users/operator/.ssh/dsh-vpn-ops_known_hosts
+        sudo: false
+        publicEndpoint: vpn.example.net
+        publicInterface: eth0
+        remoteStateDirectory: /var/lib/dsh-vpn-ops
+
+        wireguardInterface: wg0
+        wireguardAddress: 10.66.66.1/24
+        wireguardListenPort: 51820
+        wireguardConfigPath: /etc/wireguard/wg0.conf
+        wireguardService: wg-quick@wg0
+        clientDns: 1.1.1.1
+        clientMtu: 1420
+
+        vlessListenAddress: 0.0.0.0
+        vlessPort: 443
+        realityServerName: www.example.com
+        realityDestination: www.example.com:443
+        xrayBinary: /usr/local/bin/xray
+        xrayConfigPath: /usr/local/etc/xray/config.json
+        xrayService: xray
+        sysctlConfigPath: /etc/sysctl.d/99-dsh-vpn-ops.conf
+
+        clients:
+          - id: laptop
+            wireguardAddress: 10.66.66.2/32
+          - id: phone
+            wireguardAddress: 10.66.66.3/32
+</code></pre>
+<p><code>identityFile</code> must be a regular file inaccessible to group and others.
+<code>knownHostsFile</code> must be non-empty. Obtain the host key through the provider or
+another authenticated channel; do not trust an unverified <code>ssh-keyscan</code> result.</p>
+<p>No example contains a real server address, UUID, private key, or client config.</p>
+<h2>Operate</h2>
+<p>Use this order:</p>
+<ol>
+<li><code>vpn_targets</code></li>
+<li><code>vpn_preflight({ targetId: "la-edge" })</code></li>
+<li><code>vpn_status({ targetId: "la-edge" })</code></li>
+<li><code>vpn_plan({ targetId: "la-edge" })</code></li>
+<li>Review every change, the baseline deployment id, and the managed-state
+fingerprint. Any managed-file or service-state drift invalidates the plan.</li>
+<li>Set <code>allowMutations: true</code>, let DSH reload the plugin, and call <code>vpn_apply</code>
+with the exact plan id and confirmation returned in step 4.</li>
+<li>Read the returned backup id and verification result. A missing first
+handshake is informational; invalid configuration, inactive services, or
+closed listeners makes verification fail.</li>
+<li>Set <code>allowMutations: false</code> again.</li>
+</ol>
+<p>To export a configured client, temporarily enable <code>allowSecretExport</code>, obtain
+explicit operator approval for <code>EXPORT &lt;targetId&gt; &lt;clientId&gt;</code>, call
+<code>vpn_export_client</code>, move the generated files into an approved secret channel,
+then disable export and remove the local copies when no longer needed.</p>
+<p>Rollback requires the exact <code>backupId</code> and confirmation
+<code>ROLLBACK &lt;targetId&gt; &lt;backupId&gt;</code>.</p>
+<h2>What apply manages</h2>
+<ul>
+<li>WireGuard server and per-client X25519 keys.</li>
+<li>VLESS UUIDs and REALITY key material.</li>
+<li>WireGuard server configuration and client profiles.</li>
+<li>Xray VLESS + REALITY inbound configuration.</li>
+<li>IPv4 forwarding sysctl configuration.</li>
+<li>Service enable/restart for the configured WireGuard and Xray units.</li>
+<li>Per-apply backups and a current deployment marker under
+<code>remoteStateDirectory</code>.</li>
+</ul>
+<p>Keys are generated on the target and remain under
+<code>remoteStateDirectory/secrets</code> with restrictive permissions. Existing managed
+keys are reused so repeated applies do not silently invalidate clients.</p>
+<h2>Compatibility</h2>
+<table>
+<thead>
+<tr>
+<th>Component</th>
+<th>Verified contract</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>DeepSeek Harness</td>
+<td><code>0.1.1-rc.2</code></td>
+</tr>
+<tr>
+<td><code>@deepseek-ai/dsh-tools</code></td>
+<td><code>0.1.1-rc.2</code> exact peer</td>
+</tr>
+<tr>
+<td><code>@deepseek-ai/cordis</code></td>
+<td><code>4.0.1</code> exact peer</td>
+</tr>
+<tr>
+<td>Node.js</td>
+<td><code>^22.19.0</code> or <code>&gt;=24.0.0</code></td>
+</tr>
+<tr>
+<td>Remote OS</td>
+<td>Debian / Ubuntu with systemd</td>
+</tr>
+<tr>
+<td>Xray configuration</td>
+<td>Current <code>target</code>, <code>password</code>, and <code>raw</code> terminology; runtime preflight and dry-run required</td>
+</tr>
+</tbody></table>
+<p>DSH is a developer preview and may make breaking changes. Compatibility is an
+evidence statement, not a broad semver promise. The exact clean-profile
+procedure and results live in <a href="https://github.com/zootguru/dsh-vpn-ops/blob/HEAD/docs/VERIFICATION.md">Verification</a>.</p>
+<h2>Limitations</h2>
+<ul>
+<li>No package installation, firewall-provider API, DNS update, cloud console, or
+certificate management.</li>
+<li>IPv4 WireGuard topology only; no IPv6 forwarding.</li>
+<li>Full-tunnel clients only (<code>AllowedIPs = 0.0.0.0/0</code>).</li>
+<li>One WireGuard interface and one VLESS Reality inbound per target.</li>
+<li>Service health and local listeners are verified; an end-to-end test from an
+independent external network remains the operator's responsibility.</li>
+<li>Client export writes secret material to the DSH host. The plugin does not send
+it to email, chat, cloud storage, or the model.</li>
+<li>Rollback covers managed configuration, client artifacts, sysctl, and prior
+service activity. It cannot reverse external firewall, provider, DNS, or
+routing changes because it never performs them.</li>
+</ul>
+<h2>Uninstall</h2>
+<p>Disable mutations, remove the bundle, and inspect the target manually before
+deleting remote state:</p>
+<pre><code>dsh plugin --profile my-profile remove dsh-vpn-ops
+</code></pre>
+<p>Uninstall intentionally does not delete remote configuration, keys, backups, or
+client files.</p>
+<h2>Development and evidence</h2>
+<pre><code>pnpm install --frozen-lockfile
+pnpm test:coverage
+pnpm verify
+</code></pre>
+<p>The repository publishes:</p>
+<ul>
+<li>a lockfile and exact DSH compatibility peers;</li>
+<li>TypeScript declarations and built ESM;</li>
+<li>unit, failure-path, static security, transport, plan, and tool-surface tests;</li>
+<li>package and shell syntax gates;</li>
+<li>a CI matrix for supported Node lines;</li>
+<li><a href="https://github.com/zootguru/dsh-vpn-ops/blob/HEAD/SECURITY.md">security policy</a>, <a href="https://github.com/zootguru/dsh-vpn-ops/blob/HEAD/docs/THREAT_MODEL.md">threat model</a>,
+<a href="https://github.com/zootguru/dsh-vpn-ops/blob/HEAD/docs/VERIFICATION.md">verification evidence</a>, and
+<a href="https://github.com/zootguru/dsh-vpn-ops/blob/HEAD/docs/RELEASE.md">release checklist</a>.</li>
+</ul>
+<h2>License</h2>
+<p>MIT</p>

@@ -1,0 +1,237 @@
+<h1>dsh-plugin-workspace-skill</h1>
+<p><a href="#%E4%B8%AD%E6%96%87">中文</a> | <a href="#english">English</a></p>
+<p><a></a></p>
+<p>一个 <a href="https://www.npmjs.com/package/@deepseek-ai/dsh">DSH</a> Cordis 插件，提供两个能力：</p>
+<ol>
+<li><strong><code>skill-create</code> 技能</strong> —— 指导 Agent 在当前工作区创建、编写、审查和验证可复用 Skill（<code>SKILL.md</code> 格式规范、正文结构、发布前验证清单）。设计参考了 OpenAI Codex 的 <a href="https://github.com/openai/skills/blob/main/skills/.system/skill-creator/SKILL.md"><code>skill-creator</code></a> 与 <a href="https://github.com/openai/codex/blob/main/docs/skills.md">Skills 文档</a>，并结合 DSH 的技能注册机制做了适配。</li>
+<li><strong>工作区级 Skill 隔离</strong> —— 一个 <code>ctx.skills</code> provider，把 <code>&lt;workspace&gt;/.dsh/skills/</code> 目录作为"仅当前工作区可见"的技能来源。一个项目里的私有 Skill 不会泄漏到其他工作区，还能按名字覆盖全局技能。</li>
+</ol>
+<h2>工作区隔离如何工作</h2>
+<p>每次技能发现时，provider 会：</p>
+<ol>
+<li>用调用方的 <code>cwd</code> 在 <code>workspaceRegistry</code> 中找出<strong>包含它的最深注册工作区</strong>（通过 <code>fs.contains</code> 规范比较，兼容 Windows 路径分隔符）。</li>
+<li>扫描该工作区根目录下的 <code>.dsh/skills/</code>，支持两种布局：<ul>
+<li><code>.dsh/skills/&lt;skill-name&gt;/SKILL.md</code> —— 目录包，可携带 <code>references/</code>、<code>scripts/</code>、<code>assets/</code> 等资源；</li>
+<li><code>.dsh/skills/&lt;skill-name&gt;.md</code> —— 单文件扁平布局。</li>
+</ul>
+</li>
+<li>解析 YAML frontmatter（<code>name</code> / <code>description</code> / <code>whenToUse</code> / <code>disable-model-invocation</code> / <code>user-invocable</code>），以 <code>rank: 700</code> 注册候选。</li>
+</ol>
+<p>优先级：<strong>工作区技能 &gt; 用户级与内置来源</strong>。同名时工作区版本胜出，因此项目可以安全地覆盖全局技能；<code>cwd</code> 不属于任何注册工作区时，此 provider 不产生任何候选。</p>
+<h2>安装</h2>
+<h3>方式一：<code>dsh plugin add</code>（官方流程，推荐）</h3>
+<p>本包在 <code>package.json</code> 里声明了 <code>dsh.bundle.patch: ./cordis.patch.yml</code>（补丁清单就是下面的插件行），因此能被 dsh 识别为一个 profile 层：</p>
+<pre><code># 从 npm 安装（发布后）
+dsh plugin --profile web add dsh-plugin-workspace-skill
+
+# 或直接从 GitHub 安装
+dsh plugin --profile web add github:Sparrived/dsh-plugin-workspace-skill
+
+# 或从本地 checkout 安装（相对路径 spec 会被锚定为绝对路径）
+dsh plugin --profile web add D:\Code\dsh-plugin-workspace-skill
+</code></pre>
+<p><code>dsh plugin</code> 会在 profile 目录（<code>$DSH_HOME/profiles/&lt;name&gt;</code>）内转发 pnpm 完成安装，并把声明了 <code>dsh.bundle</code> 的依赖自动写入该 profile 的 <code>dsh.profile.bundles</code> 层列表。本包是纯 ESM、无构建步骤，无需 pnpm <code>allowBuilds</code> 放行。启动后可用 <code>dsh --profile web --dump-config</code> 确认 <code>workspace-skill</code> 行已进入组合树。</p>
+<h3>方式二：手动加插件行</h3>
+<p>不经过 bundle 机制时，直接在宿主 <code>cordis.yml</code> 或自定义 agent preset 的组合里写同一行：</p>
+<pre><code>- id: workspace-skill
+  name: dsh-plugin-workspace-skill
+  # 可选配置：
+  # config:
+  #   providerName: workspace-isolated
+  #   rootDir: .dsh/skills
+  #   source: workspace
+  #   rank: 700
+  #   registerGuideSkill: true
+</code></pre>
+<table>
+<thead>
+<tr>
+<th>配置项</th>
+<th>默认值</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>providerName</code></td>
+<td><code>workspace-isolated</code></td>
+<td>provider 名称</td>
+</tr>
+<tr>
+<td><code>rootDir</code></td>
+<td><code>.dsh/skills</code></td>
+<td>相对工作区根目录的技能目录</td>
+</tr>
+<tr>
+<td><code>source</code></td>
+<td><code>workspace</code></td>
+<td>候选的 source 标记</td>
+</tr>
+<tr>
+<td><code>rank</code></td>
+<td><code>700</code></td>
+<td>排序优先级（越大越优先）</td>
+</tr>
+<tr>
+<td><code>registerGuideSkill</code></td>
+<td><code>true</code></td>
+<td>是否同时注册 <code>skill-create</code> 指导技能</td>
+</tr>
+</tbody></table>
+<p>插件声明 <code>inject: ['skills', 'fs', 'workspaceRegistry']</code>；停止或卸载时，provider 与运行时技能随 Cordis Fiber 一并撤销。</p>
+<h3>方式三：动态插件（临时试用）</h3>
+<p>在 DSH 会话里用动态 Cordis 插件加载 <code>lib/index.js</code> 的等价代码（<code>cordis_define</code> → <code>cordis_run</code>），无需改任何组合文件。注意动态插件只存活于当前进程。</p>
+<h3>方式四：只要指导技能本身</h3>
+<p>不需要隔离 provider 的话，直接把 <a href="https://github.com/Sparrived/dsh-plugin-workspace-skill/blob/HEAD/skills/skill-create/SKILL.md"><code>skills/skill-create/SKILL.md</code></a> 复制到用户级 <code>~/.dsh/skills/skill-create/SKILL.md</code> 或某个项目的 <code>.dsh/skills/skill-create/</code>，DSH 内置文件系统 provider 即可发现它。</p>
+<h2>编写一个工作区 Skill</h2>
+<pre><code>&lt;workspace&gt;/
+└── .dsh/
+    └── skills/
+        └── api-review/
+            ├── SKILL.md
+            ├── references/
+            │   └── checklist.md
+            └── scripts/
+                └── check-breaking.sh
+</code></pre>
+<pre><code>---
+name: api-review
+description: Review API changes for compatibility, security, and test coverage.
+whenToUse: Use when reviewing a public API or endpoint change.
+---
+
+# API Review
+
+按下面的步骤执行……
+</code></pre>
+<p>要点：</p>
+<ul>
+<li><code>name</code> 必须是小写 kebab-case，并与目录名一致；</li>
+<li><code>description</code> 写清能力与适用场景；</li>
+<li>资源放同目录下，正文中用相对路径引用。</li>
+</ul>
+<h2>验证</h2>
+<ol>
+<li>在目标工作区内发起会话，确认 <code>skill-create</code> 出现在技能目录中；</li>
+<li>创建 <code>.dsh/skills/hello-isolation/SKILL.md</code>，确认它只在当前工作区可见，换到另一个工作区的会话后不可见；</li>
+<li>在用户级目录放置同名技能，确认工作区版本胜出；</li>
+<li>停用插件后确认以上技能全部消失（无残留副作用）。</li>
+</ol>
+<hr>
+<h2>English</h2>
+<p>A <a href="https://www.npmjs.com/package/@deepseek-ai/dsh">DSH</a> Cordis plugin with two capabilities:</p>
+<ol>
+<li><strong>The <code>skill-create</code> skill</strong> — guides an agent through creating, writing, reviewing, and validating reusable skills in the current workspace (<code>SKILL.md</code> format rules, body structure, pre-publish checklist). Inspired by OpenAI Codex's <a href="https://github.com/openai/skills/blob/main/skills/.system/skill-creator/SKILL.md"><code>skill-creator</code></a> and its <a href="https://github.com/openai/codex/blob/main/docs/skills.md">Skills docs</a>, adapted to DSH's skill registration mechanism.</li>
+<li><strong>Workspace-level skill isolation</strong> — a <code>ctx.skills</code> provider that treats <code>&lt;workspace&gt;/.dsh/skills/</code> as a skill source visible <strong>only to sessions inside that workspace</strong>. A project's private skills never leak into other workspaces, and can override global skills by name.</li>
+</ol>
+<h2>How workspace isolation works</h2>
+<p>On every skill discovery, the provider:</p>
+<ol>
+<li>Finds the <strong>deepest registered workspace containing the caller's <code>cwd</code></strong> in <code>workspaceRegistry</code> (canonical comparison via <code>fs.contains</code>, tolerant of Windows path separators).</li>
+<li>Scans <code>.dsh/skills/</code> under that workspace root, supporting two layouts:<ul>
+<li><code>.dsh/skills/&lt;skill-name&gt;/SKILL.md</code> — directory bundle with optional <code>references/</code>, <code>scripts/</code>, <code>assets/</code>;</li>
+<li><code>.dsh/skills/&lt;skill-name&gt;.md</code> — flat single-file layout.</li>
+</ul>
+</li>
+<li>Parses the YAML frontmatter (<code>name</code> / <code>description</code> / <code>whenToUse</code> / <code>disable-model-invocation</code> / <code>user-invocable</code>) and registers candidates with <code>rank: 700</code>.</li>
+</ol>
+<p>Precedence: <strong>workspace skills &gt; user-level and bundled sources</strong>. Same-named workspace skills win, so a project can safely override global ones; when <code>cwd</code> belongs to no registered workspace this provider contributes nothing.</p>
+<h2>Install</h2>
+<h3>Option 1: <code>dsh plugin add</code> (official flow, recommended)</h3>
+<p>The package declares <code>dsh.bundle.patch: ./cordis.patch.yml</code> in <code>package.json</code> (the patch list is the plugin row below), so dsh recognizes it as a profile layer:</p>
+<pre><code># from npm (once published)
+dsh plugin --profile web add dsh-plugin-workspace-skill
+
+# or straight from GitHub
+dsh plugin --profile web add github:Sparrived/dsh-plugin-workspace-skill
+
+# or from a local checkout (relative path specs are anchored to absolute paths)
+dsh plugin --profile web add D:\Code\dsh-plugin-workspace-skill
+</code></pre>
+<p><code>dsh plugin</code> forwards to pnpm inside the profile directory (<code>$DSH_HOME/profiles/&lt;name&gt;</code>), then automatically adds any dependency declaring <code>dsh.bundle</code> to that profile's <code>dsh.profile.bundles</code> layer list. This package is pure ESM with no build step, so no pnpm <code>allowBuilds</code> approval is needed. After booting, verify the <code>workspace-skill</code> row landed in the composed tree with <code>dsh --profile web --dump-config</code>.</p>
+<h3>Option 2: add the plugin row manually</h3>
+<p>Without the bundle mechanism, write the same row directly in a host <code>cordis.yml</code> or a custom agent preset composition:</p>
+<pre><code>- id: workspace-skill
+  name: dsh-plugin-workspace-skill
+  # Optional configuration:
+  # config:
+  #   providerName: workspace-isolated
+  #   rootDir: .dsh/skills
+  #   source: workspace
+  #   rank: 700
+  #   registerGuideSkill: true
+</code></pre>
+<table>
+<thead>
+<tr>
+<th>Option</th>
+<th>Default</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>providerName</code></td>
+<td><code>workspace-isolated</code></td>
+<td>Provider name</td>
+</tr>
+<tr>
+<td><code>rootDir</code></td>
+<td><code>.dsh/skills</code></td>
+<td>Skill directory relative to the workspace root</td>
+</tr>
+<tr>
+<td><code>source</code></td>
+<td><code>workspace</code></td>
+<td>Source tag on candidates</td>
+</tr>
+<tr>
+<td><code>rank</code></td>
+<td><code>700</code></td>
+<td>Sort precedence (higher wins)</td>
+</tr>
+<tr>
+<td><code>registerGuideSkill</code></td>
+<td><code>true</code></td>
+<td>Also register the <code>skill-create</code> guide skill</td>
+</tr>
+</tbody></table>
+<p>The plugin declares <code>inject: ['skills', 'fs', 'workspaceRegistry']</code>; on stop or uninstall the provider and the runtime skill unwind with the Cordis Fiber.</p>
+<h3>Option 3: dynamic plugin (quick trial)</h3>
+<p>Load equivalent code via a dynamic Cordis plugin inside a DSH session (<code>cordis_define</code> → <code>cordis_run</code>) without touching any composition file. Note dynamic plugins only live for the current process.</p>
+<h3>Option 4: just the guide skill</h3>
+<p>If you don't need the isolation provider, copy <a href="https://github.com/Sparrived/dsh-plugin-workspace-skill/blob/HEAD/skills/skill-create/SKILL.md"><code>skills/skill-create/SKILL.md</code></a> into user-level <code>~/.dsh/skills/skill-create/SKILL.md</code> or a project's <code>.dsh/skills/skill-create/</code> — DSH's built-in filesystem provider discovers it.</p>
+<h2>Authoring a workspace skill</h2>
+<pre><code>&lt;workspace&gt;/
+└── .dsh/
+    └── skills/
+        └── api-review/
+            ├── SKILL.md
+            ├── references/
+            │   └── checklist.md
+            └── scripts/
+                └── check-breaking.sh
+</code></pre>
+<pre><code>---
+name: api-review
+description: Review API changes for compatibility, security, and test coverage.
+whenToUse: Use when reviewing a public API or endpoint change.
+---
+
+# API Review
+
+Follow the steps below...
+</code></pre>
+<p>Key points:</p>
+<ul>
+<li><code>name</code> must be lowercase kebab-case and match the directory name;</li>
+<li><code>description</code> states the capability and when it applies;</li>
+<li>keep resources next to <code>SKILL.md</code> and reference them with relative paths.</li>
+</ul>
+<h2>Verify</h2>
+<ol>
+<li>Start a session inside the target workspace and confirm <code>skill-create</code> appears in the skill catalog;</li>
+<li>Create <code>.dsh/skills/hello-isolation/SKILL.md</code>, confirm it is visible only in this workspace and invisible from another workspace's session;</li>
+<li>Place a same-named skill at user level and confirm the workspace version wins;</li>
+<li>Stop the plugin and confirm all of the above disappear (no residual side effects).</li>
+</ol>
+<h2>License</h2>
+<p><a href="https://github.com/Sparrived/dsh-plugin-workspace-skill/blob/HEAD/LICENSE">MIT</a></p>

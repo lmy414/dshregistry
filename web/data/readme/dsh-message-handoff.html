@@ -1,0 +1,101 @@
+<h1>dsh-message-handoff</h1>
+<p>Per-message session handoff for <a href="https://github.com/deepseek-ai/deepseek-harness">DeepSeek Harness</a>.
+Inspired by <a href="https://github.com/WeiYe6/dsh-session-handoff"><code>dsh-session-handoff</code></a>. The trigger is a
+<strong>handoff icon next to each message's fork button</strong> (no slash command): forking back to an earlier
+point while staying informed about later progress — the child carries the copied history up to the
+selected message, and an LLM summary of everything that happened <strong>after</strong> it is injected on top.</p>
+<p>Each finalized assistant message's icon row renders <code>copy · ✋ handoff · fork</code>. Clicking handoff:</p>
+<ol>
+<li>copies the verbatim history <strong>up to that message</strong> into a fresh session (its whole completed
+turn — the same pipeline the web UI's own fork button uses);</li>
+<li>summarizes only what happened in the source session <strong>after</strong> that point with one auxiliary LLM
+call (byte-capped input, oldest entries dropped first); clicking the latest message skips the
+call entirely;</li>
+<li>appends the structured handoff document (task goal / progress / decisions / files / next steps /
+open questions) covering that post-fork activity on top of the copied history;</li>
+<li>attaches the child to the source's workspace, pins a <code>handoff: &lt;title&gt;</code>, and <strong>auto-opens it</strong>.</li>
+</ol>
+<p>The origin session stays untouched. Any summary failure (no route yet, stream error, timeout,
+empty output) leaves zero side effects — no session is created.</p>
+<blockquote>
+<p>⚠️ <strong>Privacy</strong>: the conversation text AFTER the selected message is sent to the configured model
+to produce the summary.</p>
+</blockquote>
+<h2>Install</h2>
+<pre><code># no build step needed — lib/client.js is prebuilt
+dsh plugin --profile web add /path/to/dsh-message-handoff
+dsh web
+dsh --profile web --dump-config | grep message-handoff
+</code></pre>
+<p><code>dsh plugin add</code> forwards to <code>pnpm add</code> inside the profile directory, so any install spec works: a directory checkout like above, a git URL once pushed, or the bare package name after publishing. Updating later means editing and re-running the same command.</p>
+<p>Zero runtime dependencies: the host half is plain ESM over public services, and the client half is
+the official prebuilt browser module (<code>lib/client.js</code>). <code>npm test</code> runs the pure-function unit
+suite with <code>node --test</code>.</p>
+<p><code>lib/client.js</code> is intentionally committed: dsh plugin installs run no registry-side build, so
+the checked-in module IS the shipped artifact and directory installs work with no toolchain. It
+is hand-maintained source (not generated output) — edit it directly; there is no separate build
+step to drift from.</p>
+<h2>Configuration</h2>
+<p>Optional <code>config:</code> on the cordis.yml row:</p>
+<pre><code>- id: message-handoff
+  name: dsh-message-handoff
+  config:
+    maxInputBytes: 24000   # UTF-8 byte cap for the summary input (oldest dropped first)
+    maxTokens: 10000       # summary output budget (reasoning-heavy routes need headroom)
+    timeoutMs: 120000      # summary call timeout
+</code></pre>
+<p>The summary model route is the source session's latest logged request route (the model that
+actually produced the history), falling back to the deployment's default model selection.</p>
+<h2>How it works</h2>
+<ul>
+<li><strong>Host half</strong> (<code>index.mjs</code>): registers <code>/message-handoff &lt;assistant-message-id&gt;</code> in the public
+command registry — resolves the fork cut for the addressed message (first completed <code>turn/end</code>
+at or after it, extended through trailing out-of-band appends, exactly like the api-proxy fork
+handler), summarizes via <code>ctx.llm.stream</code>, creates the child via
+<code>ctx.agents.create({ seed, seedLength, meta, setup })</code> with <code>agentPresets.resolve</code> → <code>mount</code>,
+then best-effort <code>workspaceRegistry</code> attach and <code>sessionTitle.rename</code>, and appends the handoff
+document with <code>surfaceOp: 'append'</code>. The success text names the child id in backticks.</li>
+<li><strong>Client half</strong> (<code>lib/client.js</code>): registers one additive entry in the
+<code>conversation.chat.assistant-actions</code> slot (rendered between the built-in copy and fork
+controls), dispatches <code>/message-handoff</code> through Remote <code>commands.execute</code>, extracts the child
+id from the result, polls <code>sessions.binding</code> until it is addressable, and opens it. A failed
+handoff turns the icon red with the error in its tooltip; clicking retries.</li>
+</ul>
+<h2>Model Experience</h2>
+<h3>Summary request (auxiliary model call)</h3>
+<h4>What the model sees</h4>
+<p>One auxiliary <code>llm.stream</code> request per handoff click with post-fork activity: this package's system prompt below plus a single user message whose text is a JSON array of the conversation turns AFTER the fork cut <code>[{"role":"user"|"assistant","text":"..."}]</code>, oldest entries dropped first until it fits <code>maxInputBytes</code>. Clicking the latest message runs no request.</p>
+<h5>Verbatim summary system prompt</h5>
+<pre><code>You are producing a handoff summary that gives a forked agent session the context it is missing.
+The transcript up to the chosen fork point was copied into the fresh session verbatim; your summary covers ONLY what happened in the source session AFTER that point, so the forked agent knows the later progress without carrying that later transcript.
+The user input is a JSON array of the post-fork conversation turns: {"role":"user"|"assistant","text":"..."}.
+Produce a concise structured handoff in Markdown with these sections:
+## Task goal
+## Current progress (what is done and what is not, concrete)
+## Key decisions (and their reasons)
+## Files involved (paths only)
+## Next steps (numbered)
+## Open questions / risks
+Write in the language of the conversation. Be concrete and factual; do not invent facts that are not in the conversation.
+Return only the handoff document, no preamble, no code fences.
+</code></pre>
+<h4>Token effect</h4>
+<p>Conditional and capped: zero tokens until a handoff runs. The one-shot request is bounded by the <code>maxInputBytes</code> input framing and the <code>maxTokens</code> output budget; reasoning effort follows the route default unless the route's adapter lists <code>off</code>, which the summary then pins.</p>
+<h4>KV Cache effect</h4>
+<p>Independent behavior: the summary is a separate one-shot call outside any session loop, so it neither reuses nor invalidates provider caches for the source or child conversations.</p>
+<h3>Handoff document injection</h3>
+<h4>What the model sees</h4>
+<p>In the forked child session, one appended <code>user/message</code> headed "📋 Session handoff": the source session id, an orientation line stating that the summary covers only post-fork activity, the generated summary, and a continuation note. The copied seed history precedes it unchanged.</p>
+<h4>Token effect</h4>
+<p>Append-only growth of the child's context: the copied prefix carries the same tokens as the source history up to the fork cut, plus the document, which scales with the post-fork conversation length under the same <code>maxInputBytes</code> cap.</p>
+<h4>KV Cache effect</h4>
+<p>Append-only: the seed replays identically from persistence, so the copied prefix stays prefix-stable across the child's later turns; the injected document sits after that prefix and never rewrites earlier request tokens.</p>
+<h2>Known Limitations and Deferred Work</h2>
+<ul>
+<li><strong>Assistant-turn-only trigger</strong> — the icon renders where the shipped fork control lives, on finalized assistant turns; user messages expose no per-message action strip to sit beside.</li>
+<li><strong>Preset read from the creation header</strong> — a session that switched agent presets mid-flight forks its child under the original composition instead of re-deriving the switch from the log.</li>
+<li><strong>No durable artifact</strong> — the handoff document lives only in the child session log; writing <code>HANDOFF.md</code> remains deferred work.</li>
+<li><strong>Text-only summarization</strong> — tool calls and attachments are excluded from the summary input; only <code>user/message</code> + <code>assistant/message</code> text blocks are extracted.</li>
+</ul>
+<h2>License</h2>
+<p><a href="https://github.com/antonkoatl/dsh-message-handoff/blob/HEAD/LICENSE">MIT</a></p>

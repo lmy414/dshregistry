@@ -1,0 +1,208 @@
+<h1>dsh-auto-evolve</h1>
+<p>A <strong>self-evolving plugin</strong> for <a href="https://github.com/deepseek-ai/deepseek-harness">DeepSeek Harness</a> (<code>dsh</code>). It observes how the agent runs, proposes improvements to <em>its own</em> assets via the LLM, validates each proposal inside a sandboxed trial agent, and applies only verified mutations — with a versioned ledger and automatic rollback on regression.</p>
+<p><a href="https://github.com/lispking/dsh-auto-evolve/blob/HEAD/README.zh.md">中文</a></p>
+<blockquote>
+<p><strong>The idea.</strong> Instead of shipping a static skill set, the plugin owns a small <em>genome</em> of evolvable assets (skills, tool-result post-processors, prompt sections, guard policies). Every runtime signal (tool failures, repeated calls, request errors) is collected; when a threshold crosses, a proposal cycle drafts a mutation, a sandboxed agent replays the failing episode with and without the change, and the change is applied only if the trial shows measurable improvement. Every mutation is versioned in a durable ledger and can be rolled back.</p>
+</blockquote>
+<h2>How it works</h2>
+<pre><code>Observe ──▶ Propose ──▶ Validate ──▶ Apply ──▶ (observe again, for regressions)
+  │             │            │            │
+  tools/result  ctx.llm      sandboxed    ctx.skills.register + ledger
+  request-error (stream)     sub-agent    disposer kept for rollback
+</code></pre>
+<h3>The evolution loop</h3>
+<table>
+<thead>
+<tr>
+<th>Layer</th>
+<th>Module</th>
+<th>What it does</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong>Observe</strong></td>
+<td><code>src/observe</code></td>
+<td>Listens on <code>tools/result</code> and <code>agent/request-error</code>; records deduplicated signals (tool failures, no-progress repeats, request errors) into the durable observations table; fires <code>onTrigger</code> when a threshold crosses.</td>
+</tr>
+<tr>
+<td><strong>Propose</strong></td>
+<td><code>src/propose</code></td>
+<td>A bounded cycle snapshots the genome + recent observations, calls <code>ctx.llm.stream()</code> with a strict prompt, and validates the model output against a closed mutation vocabulary (<code>add</code> / <code>patch</code> / <code>retire</code> over <code>skill</code> / <code>post-processor</code> / <code>prompt-section</code> / <code>guard-policy</code>). Anything that fails parsing or schema validation is discarded — never applied.</td>
+</tr>
+<tr>
+<td><strong>Validate</strong></td>
+<td><code>src/validate</code></td>
+<td>Replays the failing episode inside a fresh scoped sub-agent (<code>ctx.agents.create</code> + <code>setup</code>), once without the candidate mutations (baseline) and once with them (trial), then compares metrics: completion, tool failures, tool-call cost.</td>
+</tr>
+<tr>
+<td><strong>Apply</strong></td>
+<td><code>src/apply</code></td>
+<td>Promotes a validated candidate to the live genome: skills are registered on the plugin context via <code>ctx.skills.register</code> (immediately visible), the ledger records the apply with the previous content captured, and the disposer is kept for rollback.</td>
+</tr>
+<tr>
+<td><strong>Rollback</strong></td>
+<td><code>src/apply</code></td>
+<td>Unregisters the live contribution, restores the parent content as a fresh candidate, and writes a <code>rollback</code> ledger entry. On plugin disposal every live registration is torn down.</td>
+</tr>
+</tbody></table>
+<h3>Safety boundaries</h3>
+<ul>
+<li><strong>The mutation vocabulary is code, the content is model-generated.</strong> The LLM never invents asset kinds or operators; it only fills in payloads that pass the closed zod schema.</li>
+<li><strong>Validation is by execution, not by self-claim.</strong> A proposal is applied only when a sandboxed trial beats the baseline on observable metrics.</li>
+<li><strong>Rollback is first-class.</strong> Every applied mutation keeps its disposer and its parent content; regression reverts the exact previous state.</li>
+<li><strong>Observe-only is the default.</strong> In <code>observe</code> mode the plugin never proposes — it just collects signals and logs triggers.</li>
+</ul>
+<h2>Installation</h2>
+<p>The plugin is a <strong>dsh bundle</strong>: install it with the official CLI in one command — no manual <code>cordis.yml</code> editing required.</p>
+<pre><code># Install into the web profile (the default UI profile)
+dsh plugin --profile web add dsh-auto-evolve
+
+# Or into the TUI profile
+dsh plugin --profile tui add dsh-auto-evolve
+</code></pre>
+<p><code>dsh plugin add</code> initializes the profile if needed, installs the package, and automatically adds <code>dsh-auto-evolve</code> to the profile's bundle stack (<code>dsh.profile.bundles</code>). The bundled <code>cordis.patch.yml</code> registers the plugin row with the defaults below; restart <code>dsh</code> and the plugin is live.</p>
+<p>Local development / source build:</p>
+<pre><code>git clone https://github.com/lispking/dsh-auto-evolve.git
+cd dsh-auto-evolve
+pnpm install
+pnpm build
+# Install your local checkout into a profile
+dsh plugin --profile web add /absolute/path/to/dsh-auto-evolve
+</code></pre>
+<h3>Custom configuration</h3>
+<p>The bundle applies a default config; to change it, override the row in your own profile patch (applied after every bundle layer):</p>
+<pre><code># ~/.dsh/profiles/web/cordis.patch.yml
+- id: self-evolve
+  config:
+    mode: auto-apply        # observe | propose | auto-apply
+    observation:
+      toolFailureThreshold: 3
+      repeatThreshold: 3
+      requestErrorThreshold: 3
+      windowMs: 300000
+    proposal:
+      maxProposalsPerTrigger: 1
+      maxEpisodesPerProposal: 5
+      maxPromptChars: 24000
+      maxTokens: 2000
+    validation:
+      maxTrialMs: 30000
+      maxToolCalls: 20
+      maxTrialSteps: 12
+      maxTrialTokens: 8000
+</code></pre>
+<blockquote>
+<p>Note: a patch <strong>replaces</strong> the row's whole config rather than merging into it, so specify every field you want to keep. The plugin's peer services (storage, LLM, tools, skills) come from the dsh-base/web bundles — no extra setup.</p>
+</blockquote>
+<h3>Modes</h3>
+<table>
+<thead>
+<tr>
+<th>Mode</th>
+<th>Behavior</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>observe</code></td>
+<td>Collect signals, fire triggers, <strong>never propose</strong>. Safe default.</td>
+</tr>
+<tr>
+<td><code>propose</code></td>
+<td>Generate and persist candidate mutations when thresholds cross. Candidates await validation/application (manual or via the exported API).</td>
+</tr>
+<tr>
+<td><code>auto-apply</code></td>
+<td>Run the full loop: observe → propose → validate → apply verified mutations automatically, with automatic rollback when the same failure key recurs after an apply (regression watch).</td>
+</tr>
+</tbody></table>
+<h3>Configuration</h3>
+<table>
+<thead>
+<tr>
+<th>Field</th>
+<th>Default</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>mode</code></td>
+<td><code>observe</code></td>
+<td>Evolution mode (see above).</td>
+</tr>
+<tr>
+<td><code>observation.toolFailureThreshold</code></td>
+<td><code>3</code></td>
+<td>Tool-failure burst count that triggers a cycle.</td>
+</tr>
+<tr>
+<td><code>observation.repeatThreshold</code></td>
+<td><code>3</code></td>
+<td>Identical-call count treated as a no-progress loop.</td>
+</tr>
+<tr>
+<td><code>observation.requestErrorThreshold</code></td>
+<td><code>3</code></td>
+<td>LLM request-error count that triggers a cycle.</td>
+</tr>
+<tr>
+<td><code>observation.windowMs</code></td>
+<td><code>300000</code></td>
+<td>Rolling window (ms) over which signal counts aggregate.</td>
+</tr>
+<tr>
+<td><code>proposal.maxProposalsPerTrigger</code></td>
+<td><code>1</code></td>
+<td>Max mutations per proposal.</td>
+</tr>
+<tr>
+<td><code>proposal.maxEpisodesPerProposal</code></td>
+<td><code>5</code></td>
+<td>Max observations rendered into the proposal prompt.</td>
+</tr>
+<tr>
+<td><code>proposal.maxPromptChars</code></td>
+<td><code>24000</code></td>
+<td>Prompt size cap (bounds cost).</td>
+</tr>
+<tr>
+<td><code>proposal.maxTokens</code></td>
+<td><code>2000</code></td>
+<td>Max output tokens for one proposal call.</td>
+</tr>
+<tr>
+<td><code>validation.maxTrialMs</code> / <code>maxToolCalls</code></td>
+<td><code>30000</code> / <code>20</code></td>
+<td>Trial wall-clock and tool-call caps.</td>
+</tr>
+<tr>
+<td><code>validation.maxTrialSteps</code> / <code>maxTrialTokens</code></td>
+<td><code>12</code> / <code>8000</code></td>
+<td>Trial model-step and per-request token caps.</td>
+</tr>
+</tbody></table>
+<h2>Programmatic API</h2>
+<pre><code>import { SelfEvolveStore, SelfEvolveApplier, runProposalCycle, validateMutations } from 'dsh-auto-evolve'
+
+// Run one proposal cycle (persists candidate assets).
+const materialized = await runProposalCycle(ctx, store, { provider, model, maxTokens: 2000 })
+
+// Validate a candidate: baseline vs trial replay, returns the verdict.
+const { baseline, trial, comparison } = await validateMutations(ctx, {
+  provider,
+  model,
+  episode: 'replay of the failing scenario',
+  mutations: [candidateAsset],
+  bounds: { maxTrialMs: 30_000, maxToolCalls: 20 },
+})
+
+// Apply a validated candidate (registers the skill live) or roll it back.
+await applier.applyCandidate(candidate.id, trialId, 'validated')
+await applier.rollback(candidate.id, 'regression observed')
+</code></pre>
+<h2>Development</h2>
+<pre><code>pnpm build   # tsc + tsdown → lib/
+pnpm test    # vitest (unit + integration over a memory storage backend)
+</code></pre>
+<p>The test suite covers the pure decision logic (metrics comparison, mutation schema, thresholds) and the full wiring (durable store, observation collector, proposal cycle with a scripted LLM adapter, apply/rollback with the real skill registry).</p>
+<h2>License</h2>
+<p><a href="https://github.com/lispking/dsh-auto-evolve/blob/HEAD/LICENSE">MIT</a></p>

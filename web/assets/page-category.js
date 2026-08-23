@@ -8,7 +8,7 @@
  * 进入页面即应用并渲染,搜索后写回地址栏(replaceState)。
  *
  * 纯函数全部来自 web/assets/search-core.js(与搜索主页共享);本文件只做 DOM 绑定与页面区块。
- * 依赖 window.DSHR(shared.js)提供 t/escapeHtml/badgeHtml/categoryLabel/relativeTime/loadData/
+ * 依赖 window.DSHR(shared.js)提供 t/escapeHtml/badgeHtml/categoryLabel/relativeTime/fetchJson/
  * assertLocalUrl/CATEGORIES/SVG_STAR 等。
  */
 'use strict'
@@ -18,7 +18,7 @@ import {
   pluginMatchesTerms, pageMatchesTerms, relevanceScore, suggestForQuery,
   fmtNum, highlight, growthLeaderboard, authorCounts, topAuthors,
   pickFeatured, displayUrl, pinFeatured,
-} from './search-core.js'
+} from './search-core.js?v=2'
 
 // ====================================================================
 // DOM 区(仅浏览器)
@@ -615,12 +615,12 @@ if (typeof document !== 'undefined' && typeof window !== 'undefined') {
     }
 
     // ---------- 启动 ----------
-    // 加载策略(优化 2026-08-18):plugins.json 先到先渲染(Facet 计数/分类浏览/榜单都不依赖其余文件);
+    // 加载策略:轻量索引 index.json(~3MB)先到先渲染(Facet 计数/分类浏览/榜单都不依赖其余文件);
     // search.json 后台并行补全(仅相关度排序/查询词需要);pages.json 懒加载(网页行只在有查询词时展示)。
     async function boot() {
       try {
-        const [plugins] = await DSHR.loadData()
-        state.plugins = plugins
+        const idx = await DSHR.fetchJson('index')
+        state.plugins = idx.plugins
       } catch (e) {
         console.error('[page-category] plugins load failed', e)
       }

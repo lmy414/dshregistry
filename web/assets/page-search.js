@@ -19,7 +19,7 @@ import {
   pluginSources, pageStars, featuredPlugins, pinFeatured, authorLeaderboard, starsLeaderboard,
   growthLeaderboard, parseQuery, applyFilters, applyPageFilters, pluginMatchesTerms,
   pageMatchesTerms, relevanceScore, suggestForQuery, fmtNum, highlight,
-} from './search-core.js'
+} from './search-core.js?v=2'
 
 export {
   pluginSources, pageStars, featuredPlugins, pinFeatured, authorLeaderboard, starsLeaderboard,
@@ -420,7 +420,7 @@ if (typeof document !== 'undefined' && typeof window !== 'undefined') {
     function zeroStateHtml() {
       const popular = growthLeaderboard(state.trending, 5).map((it) => it.name || it.slug).filter(Boolean)
       return `<div class="zero-state">
-  <img src="/assets/mascot/Q7_think_思考.png" alt="思考">
+  <img src="/assets/mascot/Q7_think_思考.png" alt="思考" loading="lazy" decoding="async">
   <div class="zero-title">${DSHR.escapeHtml(DSHR.t('zero.title'))}</div>
   <div class="zero-desc">${DSHR.escapeHtml(DSHR.t('zero.desc'))}</div>
   ${popular.length ? `<div class="zero-chips">${popular.map((n) => `<button type="button" class="chip" data-zero="${DSHR.escapeHtml(n)}">${DSHR.escapeHtml(n)}</button>`).join('')}</div>` : ''}
@@ -594,32 +594,40 @@ if (typeof document !== 'undefined' && typeof window !== 'undefined') {
     }
 
     // ---------- 启动 ----------
+    // 五路并行拉取(旧版串行 await,首屏等待为各文件耗时之和);
+    // 列表数据走轻量索引 index.json(~3MB),全量明细只在详情页按需加载。
     async function boot() {
-      try {
-        const [plugins, meta] = await DSHR.loadData()
-        state.plugins = plugins
-        state.meta = meta
-      } catch (e) {
-        console.error('[page-search] plugins/meta load failed', e)
+      const [idxR, metaR, searchR, pagesR, trendR] = await Promise.allSettled([
+        DSHR.fetchJson('index'),
+        DSHR.fetchJson('meta'),
+        DSHR.fetchJson('search'),
+        DSHR.fetchJson('pages'),
+        DSHR.fetchJson('trending'),
+      ])
+      if (idxR.status === 'fulfilled') {
+        state.plugins = idxR.value.plugins
+        state.meta = metaR.status === 'fulfilled' ? metaR.value : {}
+      } else {
+        console.error('[page-search] index/meta load failed', idxR.reason)
       }
-      try {
-        state.search = await DSHR.fetchJson('search')
+      if (searchR.status === 'fulfilled') {
+        state.search = searchR.value
         for (let i = 0; i < (state.search.docs || []).length; i++) {
           const d = state.search.docs[i]
           if (d.type === 'plugin' && !state.docIdxOf.has(d.slug)) state.docIdxOf.set(d.slug, i)
         }
-      } catch (e) {
-        console.error('[page-search] search.json load failed', e)
+      } else {
+        console.error('[page-search] search.json load failed', searchR.reason)
       }
-      try {
-        state.pages = (await DSHR.fetchJson('pages')).pages || []
-      } catch (e) {
-        console.error('[page-search] pages.json load failed', e)
+      if (pagesR.status === 'fulfilled') {
+        state.pages = pagesR.value.pages || []
+      } else {
+        console.error('[page-search] pages.json load failed', pagesR.reason)
       }
-      try {
-        state.trending = await DSHR.fetchJson('trending')
-      } catch (e) {
-        console.error('[page-search] trending.json load failed', e)
+      if (trendR.status === 'fulfilled') {
+        state.trending = trendR.value
+      } else {
+        console.error('[page-search] trending.json load failed', trendR.reason)
       }
       state.maxStars = Math.max(1, ...state.plugins.map((p) => p.stars || 0))
       wireSearch()

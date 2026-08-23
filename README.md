@@ -24,6 +24,7 @@ dshregistry/
 │   ├── i18n/           #   zh.json / en.json(界面双语,内容原文)
 │   └── data/           #   索引产物(爬虫生成,提交进仓库)
 │       ├── plugins.json    #   插件索引(全量,type/source/listedOn/external)
+│       ├── index.json      #   轻量插件索引(列表页专用字段白名单,lib/search-index.js 生成)
 │       ├── search.json     #   倒排索引(前端检索)
 │       ├── changelog.json  #   增量变更流(added/updated/removed)
 │       ├── trending.json   #   24h star 增长榜

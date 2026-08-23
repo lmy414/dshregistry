@@ -16,6 +16,9 @@ const mkRow = (slug, opts = {}) => ({
     state: opts.state ?? 'unreviewed',
     stars: opts.stars ?? 0,
     external: opts.grade ? { dshfind: { grade: opts.grade, score: opts.score ?? 70 } } : undefined,
+    ...(opts.featured ? { featured: true } : {}),
+    ...(opts.featured ? { featured: true } : {}),
+    ...(opts.featured ? { featured: true } : {}),
   },
   score: opts.score ?? 0,
 })
@@ -63,18 +66,17 @@ test('authorCounts / topAuthors: 计数降序 + 子串过滤 + limit', () => {
   assert.equal(authorCounts([], []).size, 0)
 })
 
-test('pickFeatured: community + dshfind.grade 中按相关度最高取 1,无候选返回 null', () => {
+test('pickFeatured: 只认站长手动 featured 行,命中取首个,否则 null', () => {
   const rows = [
-    mkRow('x', { state: 'community', grade: 'B', score: 40 }),
-    mkRow('y', { state: 'unreviewed', grade: 'A', score: 99 }), // 非 community → 排除
-    mkRow('z', { state: 'community', score: 200 }),             // 无 grade → 排除
-    mkRow('w', { state: 'community', grade: 'S', score: 60 }),
+    mkRow('x', { state: 'community', grade: 'B', score: 99 }),          // 分最高但未精选
+    mkRow('y', { state: 'unreviewed', featured: true, score: 10 }),     // 站长精选(手动,状态不限)
+    mkRow('z', { state: 'community', featured: true, score: 5 }),       // 第二个精选不参与(取首个)
   ]
   const pick = pickFeatured(rows)
   assert.ok(pick)
-  assert.equal(pick.item.slug, 'w') // community+grade 中相关度最高(60 > 40)
+  assert.equal(pick.item.slug, 'y') // 手动精选优先,与相关度/星级无关
   assert.equal(pickFeatured([]), null)
-  assert.equal(pickFeatured([mkRow('n', { state: 'unreviewed', grade: 'S' })]), null)
+  assert.equal(pickFeatured([mkRow('n', { state: 'community', grade: 'S' })]), null) // 无 featured → null
 })
 
 test('displayUrl: 去协议去尾斜杠', () => {

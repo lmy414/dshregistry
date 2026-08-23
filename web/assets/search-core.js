@@ -14,9 +14,16 @@
 // 来源 / 星数
 // ====================================================================
 
-/** 插件来源集合:github 恒在,叠加 listedOn 各源。 */
+/** 插件来源集合:github 恒在,叠加 listedOn 各源。
+ *  兼容轻量索引(index.json 的 srcs 预计算数组)与全量 plugins.json(listedOn 明细)。 */
 export function pluginSources(p) {
   const out = ['github']
+  if (Array.isArray(p && p.srcs)) {
+    for (const s of p.srcs) {
+      if (s && !out.includes(s)) out.push(s)
+    }
+    return out
+  }
   for (const l of (p && p.listedOn) || []) {
     if (l && l.source && !out.includes(l.source)) out.push(l.source)
   }

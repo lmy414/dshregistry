@@ -3,7 +3,7 @@ import { readFile } from 'node:fs/promises'
 import { mkdir, rename, writeFile } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { buildIndex, assertBudget, pageSlugOf } from './lib/search-index.js'
+import { buildIndex, assertBudget, pageSlugOf, toLitePlugin } from './lib/search-index.js'
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..')
 const DATA = join(ROOT, 'web', 'data')
@@ -24,8 +24,17 @@ const meta = docs.map((d, i) => {
 })
 const out = JSON.stringify({ v: 1, generatedAt: new Date().toISOString(), fields: { name: 3, author: 2, tags: 2, desc: 1 }, docs: meta, index })
 const bytes = assertBudget(out)
+
+// 轻量索引:字段白名单见 lib/search-index.js 的 toLitePlugin。
+const lite = plugins.map(toLitePlugin)
+
 const file = join(DATA, 'search.json')
 await mkdir(dirname(file), { recursive: true })
 await writeFile(`${file}.tmp`, out, 'utf8')
 await rename(`${file}.tmp`, file)
 console.log(`[search-index] 完成:${docs.length} 文档,${Object.keys(index).length} 词,${(bytes / 1048576).toFixed(2)}MB`)
+const liteFile = join(DATA, 'index.json')
+const liteOut = JSON.stringify({ v: 1, generatedAt: new Date().toISOString(), plugins: lite })
+await writeFile(`${liteFile}.tmp`, liteOut, 'utf8')
+await rename(`${liteFile}.tmp`, liteFile)
+console.log(`[search-index] 轻量索引:${lite.length} 条,${(Buffer.byteLength(liteOut) / 1048576).toFixed(2)}MB → index.json`)

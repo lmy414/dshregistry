@@ -103,6 +103,7 @@
     'by-cat': (cat) => `/data/by-cat/${encodeURIComponent(cat)}.json`,
     search: () => '/data/search.json',
     pages: () => '/data/pages.json',
+    index: () => '/data/index.json',   // 轻量插件索引(列表页专用)
     trending: () => '/data/trending.json',
     featured: () => '/data/featured.json',
   }
@@ -110,29 +111,48 @@
     const build = DATA_ROUTES[key]
     if (typeof build !== 'function') throw new Error(`[dshregistry] 未知数据源: ${String(key)}`)
     const url = assertLocalUrl(build(arg))
-    return fetch(url).then((res) => {
-      if (!res.ok) throw new Error(`${url}: HTTP ${res.status}`)
-      return res.json()
-    })
+    return cachedFetch(url).then((res) => res.json())
   }
-  /** 带 sessionStorage 缓存的加载: 切换页面不重复下载 (首页数据 2.27MB 关键优化) */
-  const DATA_CACHE_KEY = 'dsh-data-v1'
-  function loadData() {
-    const cached = sessionStorage.getItem(DATA_CACHE_KEY)
-    if (cached) {
-      try {
-        const { t, plugins, meta } = JSON.parse(cached)
-        if (t && Date.now() - t < 10 * 60 * 1000) return Promise.resolve([plugins, meta])
-      } catch { /* 缓存损坏则重取 */ }
+  // ---- 数据缓存(Cache Storage):配额 GB 级、跨页面导航/会话生效。
+  // 旧版 sessionStorage(~5MB 配额)装不下已涨到 9.5MB 的 plugins.json,setItem 每次抛
+  // QuotaExceededError 被 catch 吞掉 —— 缓存从未生效,每次导航都重新下载。
+  const CACHE_NAME = 'dsh-data-v2'        // 数据 schema 变更时递增,旧缓存天然失效
+  const DATA_TTL_MS = 30 * 60 * 1000      // 爬虫每 6h 更新,30min 新鲜度足够
+  let cacheOpenP = null
+  function dataCache() {
+    if (!cacheOpenP) {
+      cacheOpenP = ('caches' in window) ? caches.open(CACHE_NAME) : Promise.reject(new Error('no cache api'))
     }
-    return Promise.all([fetchJson('plugins'), fetchJson('meta')]).then(([plugins, meta]) => {
-      try {
-        sessionStorage.setItem(DATA_CACHE_KEY, JSON.stringify({ t: Date.now(), plugins, meta }))
-      } catch { /* 存储满则忽略 */ }
-      return [plugins, meta]
-    })
+    return cacheOpenP
   }
-
+  /** 静态服务器普遍无 Cache-Control,用 last-modified/date 作为新鲜度锚点。 */
+  function respTime(res) {
+    const t = Date.parse(res.headers.get('last-modified') || res.headers.get('date') || '')
+    return Number.isFinite(t) ? t : 0
+  }
+  async function cachedFetch(url) {
+    let stale = null
+    try {
+      const hit = await (await dataCache()).match(url)
+      if (hit) {
+        if (Date.now() - respTime(hit) < DATA_TTL_MS) return hit.clone()
+        stale = hit.clone()                  // 过期:留作断网兜底
+      }
+    } catch { /* 无 Cache API(隐私模式/非安全上下文)→ 直连 */ }
+    try {
+      const res = await fetch(url)
+      if (!res.ok) throw new Error(`${url}: HTTP ${res.status}`)
+      try { await (await dataCache()).put(url, res.clone()) } catch { /* 配额满则忽略 */ }
+      return res
+    } catch (e) {
+      if (stale) return stale                // 断网/服务器故障 → 过期数据兜底
+      throw e
+    }
+  }
+  /** 兼容保留:列表页数据加载(签名不变,现返回轻量索引行)。 */
+  function loadData() {
+    return Promise.all([fetchJson('index'), fetchJson('meta')]).then(([idx, meta]) => [idx.plugins, meta])
+  }
   // ------------------------------------------------------------------ 渲染助手
   const SVG_USER = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"></path><circle cx="9" cy="7" r="4"></circle><path d="M22 21v-2a4 4 0 0 0-3-3.87"></path><path d="M16 3.13a4 4 0 0 1 0 7.75"></path></svg>'
   const SVG_STAR = '<svg viewBox="0 0 24 24" fill="currentColor" stroke="none"><polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"></polygon></svg>'

@@ -1,0 +1,445 @@
+<h1>subtitle-studio</h1>
+<p>A self-contained multilingual subtitle translation workflow plugin for <strong>dsh</strong>
+(DeepSeek Harness), built around the "everything is a plugin" idea. It parses
+and writes SRT/VTT subtitles, translates them sentence-by-sentence through a
+configurable LLM, merges bilingual outputs, validates alignment, and processes
+whole directories — exposed both as dsh tools (<code>ctx.tools</code>) and as a
+dependency-free CLI.</p>
+<blockquote>
+<p><code>subtitle-studio</code> is a new, self-contained implementation. Its subtitle
+parsers are written from scratch (no heavy subtitle libraries), its LLM layer
+speaks OpenAI-compatible HTTP out of the box (DeepSeek by default) and can
+plug into the harness's <code>ctx.llm</code> seam, and everything is UTF-8 on both ends.</p>
+</blockquote>
+<hr>
+<h2>Table of contents</h2>
+<ul>
+<li><a href="#features">Features</a></li>
+<li><a href="#installation">Installation</a></li>
+<li><a href="#using-subtitle-studio-as-a-dsh-bundle">Using subtitle-studio as a dsh bundle</a></li>
+<li><a href="#cli">CLI</a></li>
+<li><a href="#configuration">Configuration</a></li>
+<li><a href="#glossary-format">Glossary format</a></li>
+<li><a href="#library--service-api">Library &amp; service API</a></li>
+<li><a href="#testing">Testing</a></li>
+<li><a href="#limitations">Limitations</a></li>
+<li><a href="#license">License</a></li>
+</ul>
+<h2>Features</h2>
+<ol>
+<li><p><strong>Parsing &amp; writing</strong> — SRT and WebVTT with a tolerant state machine:</p>
+<ul>
+<li>accepts missing sequence numbers, missing blank separators, CRLF, and a UTF
+BOM (UTF-8 / UTF-16LE / UTF-16BE);</li>
+<li>keeps multi-line cue text and VTT identifiers/settings verbatim;</li>
+<li>skips junk lines and malformed timecode lines, reporting them as issues
+instead of aborting;</li>
+<li>output is always UTF-8 and round-trips preserve timing to the millisecond.</li>
+</ul>
+</li>
+<li><p><strong>Sentence-by-sentence translation</strong> — batched requests over a character
+budget, JSON payloads keyed by cue index for reliable alignment, bounded
+retries (with a corrective nudge on malformed JSON), timeouts, and glossary
+injection. Works with any OpenAI-compatible endpoint (DeepSeek is default)
+or the dsh <code>ctx.llm</code> seam.</p>
+</li>
+<li><p><strong>Bilingual subtitles</strong> — merge original + translation either <em>stacked</em>
+(translation lines under the original) or <em>interleaved</em> (alternating cues),
+with optional per-line tags and a separator. The timeline is copied verbatim
+from the source, so it is preserved by construction.</p>
+</li>
+<li><p><strong>Alignment validation</strong> — checks translation count vs. source, missing and
+extra cues, empty translations, overlong cues that should be split, and
+timeline overlaps.</p>
+</li>
+<li><p><strong>Batch processing</strong> — translate whole directories with a bounded concurrency
+pool, per-file retry with backoff, an atomic checkpoint file for pause/resume,
+and token/cost estimation (with approximate per-model rates that can be
+overridden).</p>
+</li>
+<li><p><strong>Two entry points</strong> — five dsh tools (<code>sub_parse</code>, <code>sub_translate</code>,
+<code>sub_merge</code>, <code>sub_export</code>, <code>sub_glossary</code>) plus a full CLI.</p>
+</li>
+</ol>
+<h2>Installation</h2>
+<p>Requirements: Node.js ≥ 18.18.</p>
+<pre><code># 1. install dev dependencies and build
+npm install
+npm run build
+
+# 2. run the CLI directly
+node bin/subtitle-studio.js --help
+
+# or install the bin globally (makes `subtitle-studio` available)
+npm link
+</code></pre>
+<p>The package ships <strong>zero runtime dependencies</strong>. TypeScript is only a dev
+dependency (build to <code>lib/</code> with <code>tsc</code>).</p>
+<h2>Using subtitle-studio as a dsh bundle</h2>
+<p>The package is a valid dsh <strong>bundle</strong>: <code>package.json</code> declares the bundle
+manifest, <code>cordis.patch.yml</code> inserts the plugin row into a profile, and
+<code>lib/index.js</code> exports the Cordis-style entry (<code>name</code> + <code>apply(ctx, config)</code>).</p>
+<h3>1. Add the bundle to a profile</h3>
+<pre><code>dsh plugin --profile &lt;name&gt; add subtitle-studio
+</code></pre>
+<p>This installs the package and appends <code>subtitle-studio</code> to the profile's
+<code>dsh.profile.bundles</code>. The profile loader then applies our patch (the
+<code>cordis.patch.yml</code> shipped by the bundle), which inserts a row:</p>
+<pre><code>- insert:
+    - id: subtitle-studio
+      name: subtitle-studio
+      config:
+        targetLanguages: []
+        sourceLanguage: ''
+</code></pre>
+<h3>2. What the plugin registers</h3>
+<ul>
+<li><p><strong>Tools</strong> on <code>ctx.tools</code> (registered when the <code>tools</code> service is available):</p>
+<table>
+<thead>
+<tr>
+<th>tool</th>
+<th>purpose</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>sub_parse</code></td>
+<td>parse a subtitle file into structured cues (JSON output)</td>
+</tr>
+<tr>
+<td><code>sub_translate</code></td>
+<td>translate a subtitle file into one or more languages (LLM call)</td>
+</tr>
+<tr>
+<td><code>sub_merge</code></td>
+<td>combine a source subtitle with a translation payload (stacked/interleaved)</td>
+</tr>
+<tr>
+<td><code>sub_export</code></td>
+<td>convert/export a subtitle to SRT or VTT (UTF-8), optionally bilingual</td>
+</tr>
+<tr>
+<td><code>sub_glossary</code></td>
+<td>manage the JSON terminology glossary (list/add/remove/merge)</td>
+</tr>
+</tbody></table>
+</li>
+<li><p><strong>Service</strong> <code>subtitleStudio</code> (when <code>ctx.provide</code> exists) exposing
+<code>parse</code>, <code>translate</code>, <code>merge</code>, <code>validate</code>, <code>glossary</code>, <code>cost</code>, <code>stringify</code>,
+<code>convert</code> — a convenient library surface for other plugins.</p>
+</li>
+</ul>
+<h3>3. Plugin configuration</h3>
+<p>The plugin reads the <code>config</code> object of its patch row (and any profile
+override). Keys:</p>
+<table>
+<thead>
+<tr>
+<th>key</th>
+<th>type</th>
+<th>default</th>
+<th>meaning</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>llm.provider</code></td>
+<td><code>"openai"|"dsh"</code></td>
+<td><code>"openai"</code></td>
+<td>HTTP backend vs. harness <code>ctx.llm</code> seam</td>
+</tr>
+<tr>
+<td><code>llm.baseUrl</code></td>
+<td>string</td>
+<td><code>https://api.deepseek.com/v1</code></td>
+<td>OpenAI-compatible endpoint</td>
+</tr>
+<tr>
+<td><code>llm.apiKey</code></td>
+<td>string</td>
+<td>—</td>
+<td>API key; supports <code>${ENV_VAR}</code> expansion</td>
+</tr>
+<tr>
+<td><code>llm.model</code></td>
+<td>string</td>
+<td><code>deepseek-chat</code></td>
+<td>model name</td>
+</tr>
+<tr>
+<td><code>llm.timeoutMs</code></td>
+<td>number</td>
+<td><code>120000</code></td>
+<td>per-request timeout</td>
+</tr>
+<tr>
+<td><code>llm.maxRetries</code></td>
+<td>number</td>
+<td><code>2</code></td>
+<td>retries on transient failures</td>
+</tr>
+<tr>
+<td><code>llm.jsonMode</code></td>
+<td>boolean</td>
+<td><code>true</code></td>
+<td>request a JSON object response</td>
+</tr>
+<tr>
+<td><code>llm.chunkChars</code></td>
+<td>number</td>
+<td><code>3500</code></td>
+<td>cue-character budget per request</td>
+</tr>
+<tr>
+<td><code>sourceLanguage</code></td>
+<td>string</td>
+<td><code>""</code> (auto)</td>
+<td>source language tag</td>
+</tr>
+<tr>
+<td><code>targetLanguages</code></td>
+<td>string[]</td>
+<td><code>[]</code></td>
+<td>target languages for translation</td>
+</tr>
+<tr>
+<td><code>glossary.paths</code></td>
+<td>string[]</td>
+<td><code>[]</code></td>
+<td>glossary JSON files (merged)</td>
+</tr>
+<tr>
+<td><code>output.layout</code></td>
+<td><code>stacked|interleaved</code></td>
+<td><code>stacked</code></td>
+<td>bilingual merge layout</td>
+</tr>
+<tr>
+<td><code>output.separator</code></td>
+<td>string</td>
+<td><code>""</code></td>
+<td>line between original &amp; translated blocks</td>
+</tr>
+<tr>
+<td><code>output.tagTarget</code></td>
+<td>string</td>
+<td>—</td>
+<td>per-line tag prefix for translated lines</td>
+</tr>
+<tr>
+<td><code>output.format</code></td>
+<td><code>srt|vtt</code></td>
+<td>keep source</td>
+<td>output container format</td>
+</tr>
+<tr>
+<td><code>output.utf8Bom</code></td>
+<td>boolean</td>
+<td><code>false</code></td>
+<td>write a UTF-8 BOM</td>
+</tr>
+<tr>
+<td><code>batch.concurrency</code></td>
+<td>number</td>
+<td><code>2</code></td>
+<td>parallel files during batch</td>
+</tr>
+<tr>
+<td><code>batch.maxRetries</code></td>
+<td>number</td>
+<td><code>2</code></td>
+<td>per-file retries</td>
+</tr>
+<tr>
+<td><code>batch.checkpoint</code></td>
+<td>string</td>
+<td><code>subtitle-studio.checkpoint.json</code></td>
+<td>checkpoint path</td>
+</tr>
+<tr>
+<td><code>validation.maxChars</code></td>
+<td>number</td>
+<td><code>160</code></td>
+<td>CJK over-long cue threshold</td>
+</tr>
+<tr>
+<td><code>validation.maxWords</code></td>
+<td>number</td>
+<td><code>40</code></td>
+<td>Latin over-long cue threshold</td>
+</tr>
+</tbody></table>
+<p>Example patch override (in the profile's own <code>cordis.patch.yml</code>, whole-row
+config replacement — see the dsh docs on patch layer semantics):</p>
+<pre><code>- id: subtitle-studio
+  config:
+    llm:
+      provider: openai
+      baseUrl: https://api.deepseek.com/v1
+      apiKey: ${DEEPSEEK_API_KEY}
+      model: deepseek-chat
+    sourceLanguage: en
+    targetLanguages: [zh, ja]
+    output:
+      layout: stacked
+</code></pre>
+<blockquote>
+<p>To use the harness's own LLM provider (e.g. the DeepSeek adapter configured in
+the harness), set <code>llm.provider: dsh</code>. The plugin then calls <code>ctx.llm.stream</code>.</p>
+</blockquote>
+<h3>4. Notes for harness authors</h3>
+<ul>
+<li>The entry never imports <code>@deepseek-ai/cordis</code>; the context is consumed
+structurally, so the same source compiles with or without the harness
+installed. Type-augmentation fans can add
+<code>declare module '@deepseek-ai/cordis' { interface Context { subtitleStudio: ... } }</code>
+themselves.</li>
+<li>Tools are registered through <code>ctx.inject(['tools'], sub =&gt; …)</code> so the plugin
+starts even in a minimal profile; nothing hard-requires <code>ctx.llm</code> unless
+<code>provider: dsh</code> is set.</li>
+</ul>
+<h2>CLI</h2>
+<pre><code>subtitle-studio &lt;command&gt; [options]
+</code></pre>
+<p>All commands accept <code>--config &lt;file.json&gt;</code> to load the plugin-shaped config,
+plus per-command flags (which override config).</p>
+<h3>parse</h3>
+<pre><code>subtitle-studio parse movie.srt
+subtitle-studio parse movie.vtt --pretty       # full JSON
+</code></pre>
+<h3>translate</h3>
+<pre><code># one target language -&gt; bilingual stacked SRT
+subtitle-studio translate movie.srt \
+  --target zh --source en \
+  --glossary glossary.json \
+  --output movie.zh.srt
+
+# multiple targets -&gt; fmt: &lt;stem&gt;.&lt;target&gt;.bilingual.&lt;ext&gt;
+subtitle-studio translate movie.vtt --target zh --target fr --output movie.bilingual.vtt
+
+# interleaved layout + shownote line tags
+subtitle-studio translate movie.srt --target zh --layout interleaved --tag "[zh] " --output out.srt
+
+# API key from environment
+subtitle-studio translate movie.srt --target zh --api-key ${DEEPSEEK_API_KEY} --output out.srt
+
+# persist a mid-run partial checkpoint
+subtitle-studio translate movie.srt --target zh --output out.srt --save-partial partial.json
+</code></pre>
+<p>Flow: parse → validate timeline → print cost estimate → translate → validate
+alignment → merge → write bilingual subtitle + <code>&lt;name&gt;.translation.json</code>.</p>
+<h3>merge</h3>
+<pre><code># from a translation JSON file
+subtitle-studio merge movie.srt translation.json --layout interleaved --output merged.srt
+
+# or inline JSON
+subtitle-studio merge movie.srt '{"entries":[{"index":1,"text":"你好"}]}' --layout stacked
+</code></pre>
+<h3>export</h3>
+<pre><code># convert srt -&gt; vtt preserving timestamps
+subtitle-studio export movie.srt --output movie.vtt
+
+# bilingual export
+subtitle-studio export movie.srt --output movie.vtt --translation translation.json --layout interleaved
+</code></pre>
+<h3>validate</h3>
+<pre><code>subtitle-studio validate movie.srt                    # timeline sanity + overlaps
+subtitle-studio validate movie.srt --compare translation.json  # alignment against a translation
+subtitle-studio validate movie.srt --overlong         # over-length cue report
+subtitle-studio validate movie.srt --no-overlap       # skip overlap checks
+</code></pre>
+<h3>glossary</h3>
+<pre><code>subtitle-studio glossary list --path glossary.json
+subtitle-studio glossary add --path glossary.json --source "DeepSeek Harness" --target "深度求索工具链" --scope zh
+subtitle-studio glossary remove --path glossary.json --source "DeepSeek Harness"
+subtitle-studio glossary merge --path glossary.json --with other.json
+</code></pre>
+<h3>batch</h3>
+<pre><code># dry-run cost estimate
+subtitle-studio batch ./movies --output-dir ./out --target zh --estimate
+
+# real run with 3 parallel workers and resume-capable checkpoint
+subtitle-studio batch ./movies --output-dir ./out \
+  --target zh --glossary glossary.json \
+  --concurrency 3 --checkpoint cp.json --layout interleaved
+
+# resume after an interruption (skips done files, retries failed)
+subtitle-studio batch ./movies --output-dir ./out --target zh --checkpoint cp.json --resume
+</code></pre>
+<p>Batch notes:</p>
+<ul>
+<li>The output directory <strong>mirrors the input tree</strong>, so two files that share a
+basename (e.g. <code>a/clip.srt</code> and <code>b/clip.srt</code>) never collide
+(<code>out/a/clip.bilingual.srt</code>, <code>out/b/clip.bilingual.srt</code>).</li>
+<li>The output directory itself is excluded from scanning, so a batch never
+re-translates its own artifacts (<code>out/x.bilingual.bilingual.srt</code> can't
+happen).</li>
+<li><code>--resume</code> re-queues files left <code>processing</code> by a crash, skips <code>done</code> files,
+and (with <code>--retry-failed</code>, the default) retries <code>failed</code> files with a fresh
+attempt budget. The checkpoint is written atomically after every file.</li>
+</ul>
+<h3>cost</h3>
+<pre><code>subtitle-studio cost movie.srt --target zh
+subtitle-studio cost ./movies --target zh --target fr --model deepseek-chat --rate-in 0.27 --rate-out 1.10
+</code></pre>
+<h2>Configuration</h2>
+<p>The CLI mirrors the dsh plugin configuration (see the table above) through
+<code>--config</code> or flags. API keys can reference environment variables:</p>
+<pre><code>node bin/subtitle-studio.js translate a.srt --target zh --api-key "${env:DEEPSEEK_API_KEY}"
+</code></pre>
+<p>Prices in the cost estimator are approximate list prices keyed by model
+(<code>deepseek-chat</code>, <code>deepseek-reasoner</code>) and are always overridable with
+<code>--rate-in</code>/<code>--rate-out</code> (or <code>llm</code> config equivalents).</p>
+<h2>Glossary format</h2>
+<p>A glossary is a JSON document:</p>
+<pre><code>{
+  "name": "sample-glossary",
+  "entries": [
+    { "source": "DeepSeek Harness", "target": "深度求索工具链", "scope": "zh", "note": "official product name" },
+    { "source": "hello", "target": "bonjour", "scope": "fr" },
+    { "source": "bilingual", "target": "双语" }
+  ]
+}
+</code></pre>
+<ul>
+<li><code>source</code> → <code>target</code> map a term to its mandated translation.</li>
+<li><code>scope</code> restricts an entry to one target language; entries without a scope
+apply to every language. This is how one glossary serves multiple targets.</li>
+<li>During translation the applicable entries are injected into the system prompt
+as mandatory terminology. The entry identity is <code>(source, target, scope)</code> —
+upserting the same key replaces it, different keys coexist.</li>
+<li>See <code>examples/glossary.json</code> and run <code>subtitle-studio glossary list</code>.</li>
+</ul>
+<h2>Library &amp; service API</h2>
+<p>The public entry <code>lib/index.js</code> re-exports the engine pieces directly as
+functions:</p>
+<pre><code>import {
+  parseSubtitle, stringifySubtitle, convertSubtitle, detectFormat,
+  translateCues, translateDocument,
+  mergeBilingual, mergeWithEntries,
+  validateSubtitle, validateTranslationAlignment,
+  loadGlossaryFile, mergeGlossaries, buildGlossaryPrompt,
+  createLlmClient, estimateCost,
+} from 'subtitle-studio'
+</code></pre>
+<p>All timestamps are integer milliseconds; all file I/O is UTF-8.</p>
+<h2>Testing</h2>
+<pre><code>npm test
+</code></pre>
+<p>Runs <code>tsc</code> then the Node built-in test runner over <code>test/*.test.js</code>
+(122 tests covering time parsing, SRT/VTT tolerance, encoding/BOM, merge,
+validation, glossary, translation with a mocked HTTP backend, batch/checkpoint,
+and the CLI + dsh tool/plugin surface).</p>
+<h2>Limitations</h2>
+<ul>
+<li>The token counter is a heuristic; use <code>--rate-in/--rate-out</code> for accurate
+billing, and treat cost prints as estimates.</li>
+<li>Interleaved bilingual output intentionally reuses the exact source timings
+for both cues, so the overlap validator flags them — validate the <em>source</em>
+document for overlaps, or exclude bilingual docs from overlap checks.</li>
+<li><code>jsonMode</code> requires an endpoint that supports <code>response_format</code>; the client
+automatically retries without it if the provider rejects it with HTTP 400.</li>
+<li>The <code>dsh</code> LLM provider path assumes the harness <code>ctx.llm.stream</code> chunk shape;
+other chunk layouts degrade to generic text extraction.</li>
+</ul>
+<h2>License</h2>
+<p>MIT — see <a href="https://github.com/JohnXu22786/subtitle-studio/blob/HEAD/LICENSE">LICENSE</a>.</p>

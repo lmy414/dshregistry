@@ -1,0 +1,156 @@
+<h1>dsh-gateway-plugin</h1>
+<p>DeepSeek Harness Web 的<strong>访问密码网关插件</strong>：网关端口上<strong>不存在任何未认证可达的内容面</strong>——除登录/首次设置页外，一切请求（页面、静态资源、<code>/api</code>、WebSocket 升级）必须先通过验证；首次使用在登录页直接设置密码；密码可在设置页<strong>独立的"安全"页</strong>中修改。</p>
+<h2>为什么要用网关，而不是改 harness</h2>
+<p>DeepSeek Harness 的 Web 应用<strong>有意不提供鉴权</strong>（webserver 与 client-connection 包的已知限制里明确写出）：官方 web 启动器甚至拒绝 <code>--host 0.0.0.0</code>，<code>/api</code> 的 browser-trust fence 只是防 DNS 重绑（注释白纸黑字：<em>explicitly not authentication</em>）。官方推荐的加固方式就是<strong>在前方放置真正的反向代理</strong>。</p>
+<p>本插件把这道"反向代理"以 harness 插件形式实现，直接装进 profile：</p>
+<pre><code>浏览器 ──&gt; dsh-gateway（自己的监听端口，唯一对外入口）── 反代 ──&gt; harness webserver（保持 127.0.0.1 回环绑定）
+            ├─ 未认证的任何请求（页面/静态/API/WS）──&gt; 拒绝：页面 302 到 /gateway/login，/api 401
+            ├─ /gateway/login GET ──&gt; 唯一未认证放行面：已配置密码 → 登录页；未配置 → 首次设置密码页
+            ├─ /gateway/login POST ──&gt; 密码校验（常量时间）→ 签发 HttpOnly 签名会话 cookie
+            ├─ /api/* + /api/events.* WebSocket ──&gt; 会话 cookie 或 Authorization: Bearer &lt;密码&gt;
+            └─ 认证后全部反代到 harness（改写 Host/Origin 使内部信任围栏放行）
+</code></pre>
+<p>安全要点：</p>
+<ul>
+<li><strong>绝对门禁</strong>：网关监听端口上只有 <code>/gateway/login</code>（GET 页面 + POST 登录/设密）是未认证可达的；没有 health 端点、没有其他例外。未通过验证的请求<strong>什么内容都拿不到</strong>（页面与静态资源 302 到登录页，<code>/api</code> 直接 401，WebSocket 升级拒绝）。</li>
+<li><strong>首次设置密码</strong>：部署还没有密码时，登录页呈现"设置访问密码"表单（两次输入），首个访问者设置成功后立即获得会话——这是唯一的引导信任路径。之后所有人用该密码登录。</li>
+<li><strong>修改密码</strong>：设置 → <strong>安全</strong>（独立页面，不在"插件配置"里）→ 当前密码 + 新密码 ×2；旧密码在 Host 侧校验。修改成功后<strong>所有已登录会话立即失效</strong>（会话签名密钥轮换）。</li>
+<li><strong>防爆破</strong>：密码比对为 SHA-256 后 <code>timingSafeEqual</code>（恒定时间）；登录失败按来源地址限流（默认连续 5 次失败冷却 30 秒）。</li>
+<li><strong>会话令牌</strong>：HMAC-SHA256 签名的无状态 cookie（<code>HttpOnly</code>、<code>SameSite=Lax</code>），签名密钥每次进程启动随机生成——<strong>重启即全员重新登录</strong>，有意 fail-closed。</li>
+<li><strong>信任边界</strong>：代理改写 Host/Origin 为回环上游，harness 内部围栏与其回环受限特权方法（<code>settings.*</code>、<code>credentials.*</code> 等）接受请求；harness 本身应保持绑 <code>127.0.0.1</code>（默认如此，且官方禁止 <code>0.0.0.0</code>）。<strong>边界说明</strong>：dsh 本机回环端口上的直连等同于本机管理员（他们本就能读磁盘、改配置），不属于远程攻击面。</li>
+</ul>
+<h2>从 GitHub 安装</h2>
+<p>前提：<code>dsh</code> CLI 已安装（或用源码检出，从仓库根执行 <code>pnpm dsh ...</code>）。</p>
+<pre><code>
+dsh plugin --profile web add github:laoin114514/dsh-gateway
+</code></pre>
+<p>推荐固定到具体 commit（防止仓库后续推送悄悄改变安装时拿到的代码）：</p>
+<pre><code>dsh plugin --profile web add github:laoin114514/dsh-gateway#&lt;commit-sha&gt;
+</code></pre>
+<p><strong>构建产物已经随仓库提交</strong>（<code>lib/</code> 目录），git 安装拉取后<strong>无需运行任何构建脚本、无需放行 build 权限</strong>，安装即用。首次安装/升级后启动 <code>dsh web</code>：</p>
+<pre><code>dsh-gateway: http://127.0.0.1:3088 (gateway, password required) -&gt; harness http://127.0.0.1:3080
+</code></pre>
+<p><strong>打开网关地址（而不是 harness 地址）使用</strong>。首次访问时登录页会引导你设置访问密码；之后每次访问输入该密码。</p>
+<h3>安装失败排查</h3>
+<p>如果 <code>dsh plugin add github:...</code> 报 <code>ERR_PNPM_ENOENT ... importPackage ..._tmp_...</code>（常见于之前失败安装留下的半装目录），先清理再重装：</p>
+<pre><code>dsh plugin --profile web remove dsh-gateway-plugin   # 或手动删除
+#   删除 $DSH_HOME/profiles/web/node_modules/dsh-gateway-plugin 后：
+rm -rf "$DSH_HOME/profiles/web/node_modules/dsh-gateway-plugin"
+dsh plugin --profile web add github:laoin114514/dsh-gateway
+</code></pre>
+<h3>暴露到网络</h3>
+<p>默认网关只绑本机（<code>gatewayHost: '127.0.0.1'</code>）。在 profile 的 <code>cordis.patch.yml</code>（<code>$DSH_HOME/profiles/web/cordis.patch.yml</code>）里覆盖：</p>
+<pre><code>- id: dsh-gateway
+  config:
+    gatewayHost: '0.0.0.0'
+</code></pre>
+<h3>源码检出下的本地开发</h3>
+<p>依赖本仓库源码联动时（改 harness 本地包），在仓库根执行 <code>pnpm dsh web --patch &lt;dsh-gateway&gt;/cordis.dev.yml --no-open --port 3082</code>（注意：该 overlay 方式下浏览器侧的"安全"页不会加载——只有 profile 行才能被客户端模块系统发现）。</p>
+<h2>配置（<code>cordis.patch.yml</code> 中 <code>dsh-gateway</code> 行）</h2>
+<table>
+<thead>
+<tr>
+<th>字段</th>
+<th>默认</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>gatewayHost</code></td>
+<td><code>'127.0.0.1'</code></td>
+<td>网关监听地址；对外暴露设为 <code>'0.0.0.0'</code>（harness 本体仍保持回环）</td>
+</tr>
+<tr>
+<td><code>gatewayPort</code></td>
+<td><code>0</code></td>
+<td>网关监听端口；<code>0</code> 由系统分配（启动日志打印实际地址）</td>
+</tr>
+<tr>
+<td><code>sessionTtlHours</code></td>
+<td><code>24</code></td>
+<td>会话 cookie 有效期（小时）；密码修改或进程重启也会使所有会话失效</td>
+</tr>
+<tr>
+<td><code>minKeyLength</code></td>
+<td><code>8</code></td>
+<td>密码最短长度</td>
+</tr>
+<tr>
+<td><code>maxLoginFailures</code></td>
+<td><code>5</code></td>
+<td>连续失败多少次后进入冷却</td>
+</tr>
+<tr>
+<td><code>loginCooldownSeconds</code></td>
+<td><code>30</code></td>
+<td>冷却窗口（秒）</td>
+</tr>
+<tr>
+<td><code>accessKey</code></td>
+<td>（空）</td>
+<td>初始密码；为空即进入"首次设置"模式（此时配置此字段等价于预先指定密码）。设置服务就绪时该值作为<strong>组合 base 层</strong>，可被安全页覆盖</td>
+</tr>
+</tbody></table>
+<p>密码本身存放在设置命名空间 <code>dsh-gateway</code>（字段 <code>accessKey</code>，用户设置文件），声明为 <code>role('secret')</code>，任何 wire 响应都不会携带它。</p>
+<h2>已知取舍</h2>
+<ul>
+<li><strong>不提供 TLS</strong>：如需公网/跨网段传输，请在网关前再放一个终结 TLS 的反向代理，或把网络限制在内网。</li>
+<li>密码以明文存于用户设置文件（与 harness 其他 <code>role('secret')</code> 字段一致）；请按机密文件的权限管理该文件。</li>
+<li>会话在进程重启后全部失效（签名密钥随机生成），属有意行为。</li>
+</ul>
+<h2>开发</h2>
+<pre><code>pnpm install &amp;&amp; pnpm run build   # esbuild 打包 + 两个 tsc 声明产物
+pnpm test                        # node:test 集成冒烟（真实 Cordis Context + 假上游）
+pnpm run typecheck
+</code></pre>
+<p>产物：</p>
+<ul>
+<li><code>lib/index.js</code> — Host 侧网关插件（ESM，仅 <code>@deepseek-ai/*</code> 保持外部解析）</li>
+<li><code>lib/client.js</code> — 浏览器侧"安全"设置页（dsh 客户端模块系统的 lazy-CJS factory 格式）</li>
+<li><code>lib/types/</code> — 两侧的声明文件</li>
+</ul>
+<h2>结构</h2>
+<table>
+<thead>
+<tr>
+<th>文件</th>
+<th>职责</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>src/index.ts</code></td>
+<td>网关插件本体：独立监听、反代、WebSocket 隧道、登录/设密/改密端点、设置命名空间接线</td>
+</tr>
+<tr>
+<td><code>src/session.ts</code></td>
+<td>签名会话 cookie（签发/校验/轮换签名密钥）</td>
+</tr>
+<tr>
+<td><code>src/key.ts</code></td>
+<td>恒定时间密码比对</td>
+</tr>
+<tr>
+<td><code>src/lockout.ts</code></td>
+<td>登录失败的按地址限流</td>
+</tr>
+<tr>
+<td><code>src/pages.ts</code></td>
+<td>登录/首次设置页 HTML（零外部资源、内联 CSS/JS）</td>
+</tr>
+<tr>
+<td><code>src/client/</code></td>
+<td>"安全"设置页（<code>settings.section</code> 槽位，id <code>security</code>）</td>
+</tr>
+<tr>
+<td><code>cordis.patch.yml</code></td>
+<td>bundle 层：插入 <code>dsh-gateway</code> 行（Host 插件 + <code>dsh.client</code> 浏览器贡献）</td>
+</tr>
+<tr>
+<td><code>cordis.dev.yml</code></td>
+<td>本地开发 overlay（<code>file://</code> 行，直接 <code>--patch</code> 使用）</td>
+</tr>
+<tr>
+<td><code>tests/gateway.smoke.mjs</code></td>
+<td>集成冒烟：首次设密、无认证面断言、302/401、cookie 会话、Bearer、限流、密码轮换</td>
+</tr>
+</tbody></table>

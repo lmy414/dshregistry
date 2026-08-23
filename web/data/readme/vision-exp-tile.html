@@ -1,0 +1,357 @@
+<h2>写在前面</h2>
+<p>这个插件是我用 <strong>DeepSeek Harness</strong> 写的——我本人没有写代码相关的知识，这个插件只是提供一个思路，外加自用。</p>
+<p><strong>DeepSeek-v4-flash-vision-exp</strong> 发布后，官方会把大图压缩到 <strong>800×800</strong> 像素，为了不丢失图片细节，就让 DeepSeek 帮我写了这个插件。</p>
+<p>各位随意取用：有问题可以提交 <strong>Issue</strong>（如果能自己改的话就更好了——你提交了 Issue，我也只能给 DeepSeek 看然后让他自己改；我本人尝试过多次，均未学会任何写代码的能力，也是乘上 <strong>AI</strong> 的东风，让我有了开发插件的能力）。</p>
+<blockquote>
+<p><strong>本次更新（v0.4.1）完全由 DeepSeek Harness 自主完成</strong>，内容：
+① <strong>慢机测试自适应（解决"较差机型全量测试时 OCR 池超时导致测试不通过"）</strong>：新增设备档位自动识别（CPU 核数/内存/GPU）与「测试前确认 + 慢机放宽超时」机制——较差机型（slow 档）自动放宽 OCR 池单请求超时（120s→240s）、降低池并发（4→2）、关停 GPU，并把测试超时判定倍率 ×4（性能较好机器用 ×2 不足以体现慢机差异；×4 给慢机留足余量，可手动到最保守的 ×8），消除慢机因时序抖动导致的偶发失败；
+② <strong>设置项增强</strong>：新增 <code>ocr_pool_timeout_ms</code>（OCR 池单请求超时，可调）、<code>performance_tier</code>（auto/fast/normal/slow，auto=自动探测）、<code>test_timeout_factor</code>（测试超时倍率 1..8，推荐 4=slow 档默认，手动最保守 8）、<code>test_skip_timing</code>（跳过时序敏感断言）+ 只读设备画像 <code>device_profile</code>；用户显式值 &gt; 档位推荐 &gt; 默认；
+③ <strong>安装即优化 + 自检入口</strong>：安装脚本 <code>install-to-web-profile.ps1</code> 自动识别设备，slow 档自动把调优键写入 settings.yaml 的 <code>vision-exp-tile</code> 分区（仅未显式设置的键，幂等 + 备份 + 可 <code>-NoDeviceTune</code> 跳过）；新增 <code>npm run selfcheck</code>（<code>node scripts/self-check.mjs</code>）——测试前先问是否运行（一般推荐运行），按设备档位注入超时/倍率，慢机仍超时可设置页调高 <code>ocr_pool_timeout_ms</code> 或开启 <code>test_skip_timing</code> 声明跳过时序断言；
+④ <strong>其余</strong>：<code>client.js</code>/设置页同步 4 新字段 + 只读画像；OCR 池超时统一由 <code>DSH_OCR_POOL_TIMEOUT</code> 控制（<code>gpuPoolTimeoutMs</code> 与 pipeline 的写死 120s 一并收敛）；新增 <code>device.test.js</code>/<code>suite-env.test.js</code>（含慢机注入验证）。
+⑤ <strong>设备微基准算力评级（A）</strong>：新增纯 JS 轻量基准（约 0.4s，归一化 0..2、1.0=参考机）修正档位——只按核数不准（小核/降频/云主机/VM 配额）；基准 &lt;0.5 不判 fast、&lt;0.3 且无 GPU 判 slow。设置项 <code>device_benchmark</code> 可关。
+⑥ <strong>电池/低功耗探测（B）</strong>：检测是否电池放电；放电中且档位 fast/normal 自动应用省电推荐（OCR 池并发降到 2、测试倍率×2、不自动开 GPU；slow 推荐不变）。设置项 <code>device_power_probe</code> 可关。
+⑦ <strong>ARM/WSL/容器降级（C）</strong>：检测 arch/WSL/容器；这些受限环境自动用保守默认（块格式 jpeg、OCR 池并发 2、不自动开 GPU）。设置项 <code>platform_fallback</code>=auto/on/off。
+⑧ <strong>慢网适配（D）</strong>：slow 档自动把兴趣点并发降到 1、视觉 API 单请求超时放大到 600s（默认 300s×2）。设置项 <code>slow_net_adapt</code> 可关。</p>
+</blockquote>
+<h1>vision-exp-tile ◆ 为 deepseek-v4-flash-vision-exp 定制的大图智能识图插件</h1>
+<blockquote>
+<p><strong>简介</strong>：DSH（DeepSeek Harness）插件——大图智能识别：整图预检 → 本地 OCR + 像素网格转录文字 → 兴趣点区域按比例切块（最长边 800）让视觉模型精读 → 自动汇总；支持模型编排（smart）/ 全自动（pipeline）/ 全图网格（full）三种策略。为 deepseek-v4-flash-vision-exp 量身定制，识别大图"看不清"的最后一公里。</p>
+</blockquote>
+<p><a href="https://github.com/Nicholas023/vision-exp-tile/blob/HEAD/LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT License"></a>
+<a href="https://nodejs.org"><img src="https://img.shields.io/badge/node-%3E%3D20-green.svg" alt="node"></a>
+<a href="#"><img src="https://img.shields.io/badge/vision--exp--tile-v0.4.1-orange.svg" alt="version"></a>
+<a href="#"><img src="https://img.shields.io/badge/DeepSeek%20Harness-plugin-purple.svg" alt="DSH"></a></p>
+<blockquote>
+<p>独立 DSH 插件：<strong>零依赖任何第三方 DSH 插件</strong>（picturereader 等均未使用，仅用纯官方 DSH 服务 + 可选开源 OCR 环境）。把大图切成 <strong>800×800 无损小块</strong>（官方缩放规则的"甜蜜点"：块在模型侧<strong>不被降采样</strong>、每块**≤384 token**），携带<strong>坐标标注 + 分块聚合逻辑</strong>直接调用 DeepSeek 视觉 API 完成识别与聚合，返回结构化答案（<strong>不统计 token、不计算费用</strong>）。</p>
+</blockquote>
+<h2>🎬 宣传片（v0.4.0）</h2>
+<blockquote>
+<p><a href="https://github.com/Nicholas023/vision-exp-tile/releases/download/v0.4.0/vision-exp-tile-v0.4.0-promo-bgm.mp4">▶️ 观看宣传片（128 秒 · 带 BGM · 含致谢页）</a>
+视频背景音乐：《春景故人来》—— 铁痕电台-MSR × Kirara Magic；DeepSeek 官方鲸鱼形象（deepseek.com）。</p>
+</blockquote>
+<h2>一、为什么要 800×800</h2>
+<p>官方文档（api-docs.deepseek.com/guides/vision）规定：每张图进模型前自动缩放——总像素 &lt; ~384×384 放大，更大的图按长宽比缩小到 <strong>≈800×800 总像素</strong>，<strong>每张图 token 封顶 384</strong>。</p>
+<ul>
+<li>块边长 800 → 处于"不缩放"边界：<strong>细节零损失</strong>，且每块恰好 ≤384 token；</li>
+<li>原图 ≤800×800 → 不切分，原样识别；</li>
+<li>原图更大 → 切成 800×800 网格（边缘块取实际尺寸，不补白不放大），全部 1:1 进模型。</li>
+</ul>
+<h2>二、安装与挂载</h2>
+<pre><code># 1. 复制/链接插件到 DSH 插件目录（与 picturereader 同款形态）
+#    安装方式 = link 依赖安装到插件目录：把插件源码放到 DSH 插件目录，再在目标 profile 以 link: 依赖挂载
+
+# 2. 在目标 profile 的 package.json 中：
+#    "dsh": { "profile": { "bundles": [ ..., "vision-exp-tile" ] } }
+#    "dependencies": { "vision-exp-tile": "link:C:/Users/HP/.dsh/plugins/vision-exp-tile" }
+
+# 3. 在 profile 目录运行（建立 node_modules 链接）
+#    pnpm install
+
+# 4. 重启 DSH 生效
+</code></pre>
+<p><strong>隔离测试</strong>（推荐）：不要直接改正式 web profile，新建测试 profile：</p>
+<pre><code># 测试 profile：~/.dsh/profiles/vision-test（bundles = dsh-base + dsh-web-app + vision-exp-tile）
+dsh --profile vision-test --port 3081
+# 浏览器打开 http://127.0.0.1:3081 即可测试；正式 profile 与本次改动零关联。
+</code></pre>
+<h3>纯净 DSH 快速上手（无任何其它插件，纯官方 DSH）</h3>
+<p>本插件<strong>不依赖</strong> picturereader / paddle / rapid / 任何第三方插件；纯净 DSH 三步即可用：</p>
+<pre><code># ① 安装依赖（在插件目录）
+npm install
+
+# ② 配置 API key（必做！）——插件从"系统环境变量"读取；DSH 凭据界面存的 key 不进环境变量
+setx DEEPSEEK_API_KEY "sk-你的key"        # Windows；Linux/macOS 写入 ~/.bashrc 等
+
+# ③ 新开终端重启 DSH（新终端才会加载 setx 的环境变量）
+dsh web
+</code></pre>
+<ul>
+<li>纯净 DSH 上：<code>vision_tile_split</code> / <code>vision_region_crop</code> / <code>full</code> / <code>pipeline</code> <strong>全功能可用</strong>（pipeline 无 OCR 环境时自动降级：Windows 用系统 OCR，非 Windows 转交视觉 API 转录）；</li>
+<li><code>smart</code>（默认）同样可用：文字区域自动走视觉直读（本插件自带能力），零依赖第三方插件；</li>
+<li>可选增强（非必需）：装 <code>paddle</code>/<code>rapid</code> 本地 OCR 环境后，pipeline 的中文转录质量最佳（自动探测 <code>$HOME/paddle_venv</code> 等，路径可用 <code>DSH_PADDLE_PYTHON</code>/<code>DSH_RAPID_PYTHON</code> 覆盖）。</li>
+</ul>
+<h2>三、工具用法（模型调用）</h2>
+<h3>1. <code>vision_tile_split</code> —— 只切图 + 标注 + 聚合逻辑</h3>
+<pre><code>{
+  "file_path": "D:\\img\\截图.png",
+  "block_size": 800,
+  "cut_threshold": 800,
+  "overlap": 0,
+  "out_dir": ""
+}
+</code></pre>
+<p>返回（模型可见文本）：切块结果 → 块目录 → 坐标清单（编号/行列/原图坐标/尺寸）→ 全局布局参考图（overview）→ <strong>分块聚合逻辑</strong>（识别顺序、坐标定位、跨块合并、禁止编造、输出要求）。块文件名自带坐标：<code>截图_r0_c1_x800_y0_800x800.png</code>。</p>
+<ul>
+<li><code>cut_threshold=800</code>：长边 ≤800 直接返回"无需切分"，满足"小图不裁"；</li>
+<li><code>overlap=64</code>：推荐用于文字/表格密集图（防跨块切断）；</li>
+<li><code>format=png</code>（默认无损）/<code>jpeg</code>；</li>
+<li><code>rotate=0/90/180/270</code>：识别前先顺时针旋转整图（默认 0）。<strong>图片横倒/倒置、模型"误判方向"时使用</strong>——切图、坐标与 overview 均基于旋转后的图像（需 sharp）。</li>
+</ul>
+<h3>2. <code>vision_tile_recognize</code> —— 智能识图（v0.1 多方案结合）</h3>
+<pre><code>{
+  "file_path": "D:\\img\\大图.png",
+  "strategy": "smart",
+  "question": "这张图里有什么内容？请完整描述"
+}
+</code></pre>
+<p><strong><code>strategy</code> 三种模式：</strong></p>
+<ul>
+<li><strong><code>smart</code>（默认·模型编排）</strong>：先<strong>整图预检</strong>（<code>detail:'low'</code> 512×512 缩略，≈0.005 元）→ 返回：<code>有无文字 / 文字区域(1~3 个 0..1 相对矩形) / 兴趣点区域(模型判断的重点) / 整图概要</code>。模型按流程继续：重点不明确→先问用户；<strong>有文字</strong>→<code>vision_region_crop(recognize=true)</code> 视觉直读转录（本插件自带能力）；<strong>兴趣点</strong>→<code>vision_region_crop(recognize=true)</code> 逐点识别；最后汇总。<strong>无文字</strong>→整图概要 + 兴趣点区域识别，不做 OCR（注：本插件不调用任何第三方 DSH 插件的工具）。</li>
+<li><strong><code>pipeline</code>（插件全自动）</strong>：一次调用完成预检 → 本地 OCR（<code>ocr_engine</code>：auto/paddle/rapid/windows，默认 auto 自动降级）+ 像素网格 → 兴趣点按比例裁剪（最长边 800）识别 → 模板汇总 → 全部明细落盘系统临时目录（precheck.json / ocr.txt / pixel-grids.txt / 区域 PNG / answer.md）。无交互：重点不明时结果中说明。</li>
+<li><strong><code>full</code>（原全网格）</strong>：先 overview 整图缩略图 → 800×800 全图切块识别（<code>mode=auto/single/layered</code>、<code>block_size</code>、<code>json</code>、<code>out_dir</code> 等原参数），用于整页材料逐块完整转录。</li>
+</ul>
+<p>其它通用参数：<code>rotate</code>（0/90/180/270 转正）、<code>max_tokens</code>；
+<strong>健壮性</strong>：模型只思考未输出正文（content 为空）时自动放大 max_tokens 重试一次；仍为空报出 finish_reason 与思考摘要。
+<strong>返回</strong>：预检清单/答案 + 统计；不统计 token、不计算费用。</p>
+<h3>3. <code>vision_region_crop</code> —— 兴趣点/文字区域裁剪识别</h3>
+<ul>
+<li>参数：<code>file_path</code>（必填）、<code>rect</code>（必填 <code>[x0,y0,x1,y1]</code>，支持 0..1 相对或像素坐标自动识别）、<code>rotate</code>、<code>max_edge</code>（默认 800，<strong>最长边 800 保比例</strong>（4:3→800×600）；<code>0</code>=1:1 不缩放供本地 OCR）、<code>recognize</code>（默认 true=视觉 API 识别该区域；false=仅落盘 PNG，供本地 OCR 工具处理）、<code>question</code>、<code>out_dir</code>（默认系统临时目录）；</li>
+<li>返回：区域图路径、输出尺寸、原图裁剪矩形（像素）、（recognize=true 时）区域描述。</li>
+</ul>
+<h3>4. 配置项（插件级）</h3>
+<table>
+<thead>
+<tr>
+<th>配置</th>
+<th>默认</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>apiKeyEnv</code></td>
+<td><code>DEEPSEEK_API_KEY</code></td>
+<td>API key 环境变量名（<strong>密钥不落配置</strong>）</td>
+</tr>
+<tr>
+<td><code>baseURL</code></td>
+<td><code>https://api.deepseek.com</code></td>
+<td>OpenAI 兼容端点</td>
+</tr>
+<tr>
+<td><code>model</code></td>
+<td><code>deepseek-v4-flash-vision-exp</code></td>
+<td>模型名</td>
+</tr>
+<tr>
+<td><code>blockSize</code> / <code>cutThreshold</code></td>
+<td>800 / 800</td>
+<td>块边长 / 切分阈值</td>
+</tr>
+<tr>
+<td><code>overlap</code></td>
+<td>0</td>
+<td>相邻块交叠像素</td>
+</tr>
+<tr>
+<td><code>groupSize</code></td>
+<td>40</td>
+<td>分层聚合每组的块数</td>
+</tr>
+<tr>
+<td><code>mode</code> / <code>json</code></td>
+<td>auto / false</td>
+<td>识别模式 / 输出格式</td>
+</tr>
+<tr>
+<td><code>format</code> / <code>quality</code></td>
+<td>png / 90</td>
+<td>块编码</td>
+</tr>
+<tr>
+<td><code>ocrPoolTimeoutMs</code></td>
+<td><code>120000</code></td>
+<td>OCR 池单请求超时（ms，20000..1200000；慢机可调大）</td>
+</tr>
+<tr>
+<td><code>performanceTier</code></td>
+<td><code>auto</code></td>
+<td>性能档位：auto=自动探测（默认）/fast/normal/slow（非 auto=用户强制，不应用自动推荐）</td>
+</tr>
+<tr>
+<td><code>testTimeoutFactor</code></td>
+<td><code>1</code></td>
+<td>测试超时判定倍率（1..8；推荐 4=slow 档默认，手动最保守 8；慢机可调大，降低时序抖动失败）</td>
+</tr>
+<tr>
+<td><code>testSkipTiming</code></td>
+<td><code>false</code></td>
+<td>是否跳过时序敏感断言（用户声明跳过测试）</td>
+</tr>
+<tr>
+<td><code>deviceBenchmark</code></td>
+<td><code>true</code></td>
+<td>设备微基准算力评级（A）；false=跳过基准，档位只按 CPU/内存/GPU</td>
+</tr>
+<tr>
+<td><code>devicePowerProbe</code></td>
+<td><code>true</code></td>
+<td>电池/低功耗探测（B）；false=不探测（不应用省电推荐）</td>
+</tr>
+<tr>
+<td><code>platformFallback</code></td>
+<td><code>auto</code></td>
+<td>ARM/WSL/容器平台降级（C）：auto=按环境自动降级 / on=强制降级 / off=关闭</td>
+</tr>
+<tr>
+<td><code>slowNetAdapt</code></td>
+<td><code>true</code></td>
+<td>慢网适配（D）；false=slow 档不降兴趣点并发/不放大 API 超时</td>
+</tr>
+</tbody></table>
+<h2>四、成本参考（仅供了解，插件本身不计算）</h2>
+<p>每块 800×800 = 384 token（封顶，官方规则）。以下按官方价（输入命中 0.1 / 未命中 3 / 输出 9 元·百万 tokens）估算，<strong>实际计费以 DeepSeek API 平台账单为准</strong>：</p>
+<table>
+<thead>
+<tr>
+<th>原图尺寸</th>
+<th>网格</th>
+<th>块数</th>
+<th>图片输入 token</th>
+<th>输出 token(估)</th>
+<th><strong>费用(约)</strong></th>
+</tr>
+</thead>
+<tbody><tr>
+<td>≤800×800</td>
+<td>1×1</td>
+<td>1</td>
+<td>384</td>
+<td>400</td>
+<td><strong>≈0.005 元</strong></td>
+</tr>
+<tr>
+<td>1600×1600</td>
+<td>2×2</td>
+<td>4</td>
+<td>1,536</td>
+<td>700</td>
+<td><strong>≈0.011 元</strong></td>
+</tr>
+<tr>
+<td>2400×1600</td>
+<td>3×2</td>
+<td>6</td>
+<td>2,304</td>
+<td>900</td>
+<td><strong>≈0.015 元</strong></td>
+</tr>
+<tr>
+<td>4000×3000</td>
+<td>5×4</td>
+<td>20</td>
+<td>7,680</td>
+<td>1,600</td>
+<td><strong>≈0.035 元</strong></td>
+</tr>
+<tr>
+<td>6000×4500</td>
+<td>8×6</td>
+<td>48</td>
+<td>18,432</td>
+<td>2,400</td>
+<td><strong>≈0.075 元</strong></td>
+</tr>
+<tr>
+<td>8000×6000</td>
+<td>10×8</td>
+<td>80</td>
+<td>30,720</td>
+<td>3,200</td>
+<td><strong>≈0.12 元</strong></td>
+</tr>
+</tbody></table>
+<h2>五、验证清单（功能自测）</h2>
+<blockquote>
+<p><strong>推荐用 <code>npm run selfcheck</code></strong>（即 <code>node scripts/self-check.mjs</code>）：先自动识别设备（CPU/内存/GPU → 档位），再问"是否运行全量测试？"（一般推荐运行，因为要根据实测确认插件可用性），并按设备档位自动注入超时/倍率跑测试。慢机仍超时？在设置页「图像识别→高级」调高 <code>ocr_pool_timeout_ms</code>（或设 <code>performance_tier=slow</code>），或开启 <code>test_skip_timing</code> 声明跳过时序敏感断言（对应环境变量 <code>VISION_TEST_SKIP_TIMING=1</code>）。</p>
+</blockquote>
+<ol>
+<li><code>npm test</code>：网格/坐标/提示模板/mock API 全部通过（新增 device/suite-env 纯逻辑测试）；</li>
+<li><code>dsh --profile vision-test --dump-config</code>：输出树中应出现 <code>vision-exp-tile</code> 行；</li>
+<li>启动 <code>dsh --profile vision-test --port 3081</code> → 新会话 → 工具列表出现 <code>vision_tile_split</code> / <code>vision_tile_recognize</code>；</li>
+<li>上传一张 4000×3000 测试图 → 调 <code>vision_tile_split</code> → 检查输出目录 20 块 + overview + 坐标清单；</li>
+<li>调 <code>vision_tile_recognize</code>（需环境变量 <code>DEEPSEEK_API_KEY</code> 有值）→ 检查结构化识别答案与统计（不显示 token/费用）。</li>
+</ol>
+<h2>六、开发与测试工作流（双环境）</h2>
+<p>插件的任何改动都先在<strong>隔离测试实例</strong>验证，确认无误后再让<strong>正式实例</strong>生效——两者共用同一份源码（junction），互不干扰。</p>
+<table>
+<thead>
+<tr>
+<th>端口</th>
+<th>实例</th>
+<th>用途</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong>3080</strong></td>
+<td><code>web</code> profile（正式）</td>
+<td>日常使用（生产环境）</td>
+</tr>
+<tr>
+<td><strong>3081</strong></td>
+<td><code>vision-test</code> profile（隔离测试）</td>
+<td>改动验证、实验，零风险</td>
+</tr>
+</tbody></table>
+<h3>标准流程（改插件源码时）</h3>
+<ol>
+<li><strong>在 3081 验证</strong>（改动后）：<pre><code># 一键：校验挂载 + 启动测试实例（自动拆建 junction）
+powershell -ExecutionPolicy Bypass -File .\scripts\run-test-profile.ps1
+# 浏览器打开 http://127.0.0.1:3081 → 新会话问"列出工具" → 真实跑一张图
+</code></pre>
+</li>
+<li>3081 通过后，<strong>重启 3080 让正式实例加载新代码</strong>（<code>dsh web</code> 重启即可；宿主插件不热重载）；</li>
+<li>改动即时性：源码经 junction 直连 → <strong>重启对应实例即生效</strong>，无需重新安装/构建。</li>
+</ol>
+<h3>依赖版本约束（重要）</h3>
+<ul>
+<li>插件的 <code>sharp</code> 版本必须与 DSH 内置 sharp <strong>一致</strong>（当前两者均为 <strong>0.35.3</strong>）；</li>
+<li>若不一致，同进程会出现两个 sharp 原生库，报 <code>colourspace: parameter space not set</code> 类错误；</li>
+<li>升级 DSH 后如遇该错误：<code>npm install sharp@&lt;DSH的sharp版本&gt;</code>（DSH 版本见 <code>node_modules\@deepseek-ai\dsh\node_modules\sharp\package.json</code>）。</li>
+</ul>
+<h3>环境重置</h3>
+<ul>
+<li>关闭 3081：<code>Ctrl+C</code>（或联系杀掉进程）；</li>
+<li>彻底清理测试环境：删除 <code>~/.dsh/profiles/vision-test</code> 与 <code>~/.dsh/plugins/vision-exp-tile</code>（正式 profile 不受影响）；</li>
+<li>正式环境卸载/回滚：<code>powershell -File .\scripts\install-to-web-profile.ps1 -Rollback</code>（自动还原 package.json 备份）。</li>
+</ul>
+<h2>七、依赖与适配（对其他用户环境）</h2>
+<p><strong>最低要求（人人可跑）</strong>：DSH 基础环境（<code>tools</code>/<code>fs</code> 服务，官方 dsh-base 自带）· Node ≥ 20 · DeepSeek API key（环境变量 <code>DEEPSEEK_API_KEY</code>）· <code>npm install</code>（sharp/pngjs/jpeg-js，sharp 有全平台预编译二进制）。</p>
+<table>
+<thead>
+<tr>
+<th>能力</th>
+<th>依赖</th>
+<th>缺失时的表现</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>切块 / 预检 / 兴趣点识别 / 像素网格</td>
+<td>插件自带（<strong>pixelgrid 自实现，不依赖任何其它插件</strong>）</td>
+<td>✅ 始终可用</td>
+</tr>
+<tr>
+<td>pipeline 本地 OCR</td>
+<td>探测本机 <strong>paddle_venv / rapid_venv</strong>（<code>$HOME</code> 下，路径可用 <code>DSH_PADDLE_PYTHON</code>/<code>DSH_RAPID_PYTHON</code> 覆盖）→ 无则用 <strong>Windows OCR</strong>（WinRT，零依赖）</td>
+<td>✅ 自动降级；仍无 OCR（如 Linux 未装 venv）→ <strong>自动转交视觉 API 转录该区域</strong>，pipeline 不中断</td>
+</tr>
+<tr>
+<td>smart 模式文字识别</td>
+<td>本插件自带（<code>vision_region_crop</code> 视觉直读转录）</td>
+<td>✅ 始终可用，零依赖第三方插件</td>
+</tr>
+</tbody></table>
+<p><strong>结论</strong>：本插件<strong>零依赖任何第三方 DSH 插件</strong>（picturereader 等均未使用）；paddle/rapid 是用户可选安装的开源 OCR 环境（Apache-2.0，仅环境探测，非插件依赖），装了中文转录质量最好，不装也完全可用。</p>
+<h2>八、已知边界</h2>
+<ul>
+<li>插件直连官方 API，不受 DSH 内置 deepseek 适配器 text-only 限制；结果以<strong>文本</strong>回流会话；</li>
+<li>官方限制：图片仅可在 user 消息（已遵守）；单请求 ≤600 图（本插件默认 ≤240 更保守）；base64 请求体 ≤48MiB（超预算自动提示分批/转 JPEG）；</li>
+<li>"完美识别"是质量目标：块数越多难度越高，分层聚合显著缓解；跨块被切断的细线级元素仍可能合并出错（建议 <code>overlap=64</code>）；</li>
+<li>全自动 pipeline 无交互通道：预检"重点不明确"时会在结果中说明，可改用 smart（模型先问你）或 <code>vision_region_crop</code> 指定坐标；</li>
+<li><strong>arm64/WSL/容器环境</strong>建议开启保守预设（默认已 <code>platform_fallback=auto</code> 自动降级：块格式 jpeg、OCR 池并发 2、不自动开 GPU）；如确需更强算力可设 <code>platform_fallback=off</code> 或显式覆盖。</li>
+</ul>
+<h3>用户如何安装发布版</h3>
+<p>下载 Release 里的 <code>vision-exp-tile-vX.Y.Z.zip</code>，解压后按前面"二、安装与挂载"步骤操作（放到 <code>~/.dsh/plugins/vision-exp-tile</code> + profile 挂 <code>link:</code> 依赖），或直接从源码仓库 <code>git clone</code> 后同样挂载。</p>
+<h2>许可</h2>
+<p>MIT © vision-exp-tile contributors</p>
+<hr>
+<p>如果这个插件对你有帮助，欢迎点个 ⭐ <strong>Star</strong> 支持一下～（你的支持就是持续更新的动力）</p>

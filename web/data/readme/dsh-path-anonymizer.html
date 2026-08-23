@@ -1,0 +1,175 @@
+<h1>dsh-path-anonymizer</h1>
+<p>English | <a href="https://github.com/yzhangjy/dsh-path-anonymizer/blob/HEAD/README.zh.md">中文</a></p>
+<p>A DeepSeek Harness plugin that detects workspace-external file paths in user messages before model requests, replaces them with numbered placeholders (<code>[PATH_n]</code>), and prompts the user to confirm whether the real paths should be sent to the model.</p>
+<h2>Installation</h2>
+<pre><code>dsh plugin --profile web add github:yzhangjy/dsh-path-anonymizer
+</code></pre>
+<p>Then restart the web profile.</p>
+<h2>How It Works</h2>
+<ol>
+<li><p><strong>Detection</strong> — regular expressions scan each user message for file paths.</p>
+</li>
+<li><p><strong>Anonymization</strong> — each detected path is replaced with a numbered placeholder:</p>
+<pre><code>/Users/alice/Documents/project/src/main.ts  →  [PATH_1]
+/etc/nginx/nginx.conf                      →  [PATH_2]
+~/secrets/.env                             →  [PATH_3]
+</code></pre>
+<p><strong>Workspace awareness</strong> — paths that resolve <em>inside</em> the agent's working
+directory (<code>cwd</code>) are left untouched: the model already sees <code>cwd</code> in the
+system prompt and can explore the workspace itself, so anonymizing those
+would break coding with no privacy gain. Only paths <em>outside</em> the workspace
+(<code>~/...</code>, <code>/etc/...</code>, other projects, …) are anonymized. Set
+<code>anonymizeWorkspacePaths: true</code> to revert to anonymize-everything.</p>
+</li>
+<li><p><strong>Confirmation</strong> — before the model request proceeds, a dialog appears listing every detected path and its placeholder. The user chooses:</p>
+<ul>
+<li><strong>Send anonymized placeholders</strong> (recommended) — the model sees <code>[PATH_n]</code></li>
+<li><strong>Send real paths</strong> — original paths are restored</li>
+<li><strong>Cancel this request</strong> — the step is rejected</li>
+</ul>
+</li>
+<li><p><strong>Session memory</strong> — the dialog includes a "remember" option so the same choice applies for the rest of the session.</p>
+</li>
+</ol>
+<h3>Effect on tool calls</h3>
+<p>Anonymization redacts <strong>only the user-message text</strong>. That does affect tool calls
+in one specific way:</p>
+<ul>
+<li>When an external path is anonymized, the model sees <code>[PATH_n]</code> instead of the
+real path, so it <strong>cannot call <code>read</code> / <code>edit</code> / <code>bash</code> on that path</strong> — it does
+not know the real path. It will usually ask you to reveal it instead.</li>
+<li>Choosing <strong>"send real paths"</strong> in the dialog sends the path verbatim, so the
+model can access that external path normally.</li>
+</ul>
+<p>This plugin is <strong>message redaction, not a security sandbox</strong>. It does not filter
+the model's own tool calls, tool arguments, or tool results, and it does not
+restrict filesystem access (DSH's sandbox governs that separately). A path the
+model learns from a tool result or from its own exploration is <strong>not</strong> anonymized.</p>
+<p>Workspace paths are untouched, so reading and editing files inside the workspace
+works as usual.</p>
+<h2>Configuration</h2>
+<table>
+<thead>
+<tr>
+<th>Key</th>
+<th>Default</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>enabled</code></td>
+<td><code>true</code></td>
+<td>Enable path detection and anonymization</td>
+</tr>
+<tr>
+<td><code>confirmEveryTime</code></td>
+<td><code>true</code></td>
+<td>Show the confirmation dialog for every request</td>
+</tr>
+<tr>
+<td><code>maxPathsPerPrompt</code></td>
+<td><code>10</code></td>
+<td>Max paths displayed in the confirmation dialog</td>
+</tr>
+<tr>
+<td><code>autoAnonymize</code></td>
+<td><code>false</code></td>
+<td>Silently replace paths without showing a dialog</td>
+</tr>
+<tr>
+<td><code>anonymizeWorkspacePaths</code></td>
+<td><code>false</code></td>
+<td>Also anonymize paths inside <code>cwd</code> (default keeps them for coding)</td>
+</tr>
+<tr>
+<td><code>detector.maxPaths</code></td>
+<td><code>50</code></td>
+<td>Max distinct paths to detect in one batch</td>
+</tr>
+<tr>
+<td><code>detector.excludePatterns</code></td>
+<td><code>[]</code></td>
+<td>Extra regex patterns for paths to ignore</td>
+</tr>
+<tr>
+<td><code>detector.includeSystemPaths</code></td>
+<td><code>false</code></td>
+<td>Also detect system paths (<code>/usr/lib/</code>, <code>/etc/</code>, etc.)</td>
+</tr>
+<tr>
+<td><code>anonymizer.placeholderFormat</code></td>
+<td><code>[PATH_{n}]</code></td>
+<td>Placeholder format; <code>{n}</code> is the match index</td>
+</tr>
+</tbody></table>
+<h3>Example: auto-anonymize mode</h3>
+<pre><code>- id: path-anonymizer
+  config:
+    enabled: true
+    autoAnonymize: true   # never shows a dialog
+</code></pre>
+<h3>Example: exclude additional patterns</h3>
+<pre><code>- id: path-anonymizer
+  config:
+    detector:
+      excludePatterns:
+        - '^/nix/store/'
+        - '^/home/ci/'
+</code></pre>
+<h2>Path Detection Details</h2>
+<h3>Matched patterns</h3>
+<table>
+<thead>
+<tr>
+<th>Pattern</th>
+<th>Example</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>Unix absolute</td>
+<td><code>/Users/alice/project/src/index.ts</code></td>
+</tr>
+<tr>
+<td>Windows absolute</td>
+<td><code>C:\Users\alice\Documents\file.txt</code></td>
+</tr>
+<tr>
+<td>Home directory</td>
+<td><code>~/.ssh/config</code></td>
+</tr>
+<tr>
+<td>Relative (<code>./</code>)</td>
+<td><code>./src/components/App.tsx</code></td>
+</tr>
+<tr>
+<td>Relative (<code>../</code>)</td>
+<td><code>../../config/database.yml</code></td>
+</tr>
+<tr>
+<td>Windows relative</td>
+<td><code>.\lib\utils.js</code></td>
+</tr>
+<tr>
+<td>Env variable</td>
+<td><code>%APPDATA%\MyApp\settings.json</code></td>
+</tr>
+<tr>
+<td>WSL</td>
+<td><code>\\wsl$\Ubuntu\home\user\file.txt</code></td>
+</tr>
+</tbody></table>
+<h3>Excluded by default</h3>
+<ul>
+<li>URLs (<code>https://</code>, <code>ftp://</code>, <code>file://</code>)</li>
+<li>Shell redirects (<code>/dev/null</code>, <code>/dev/stdout</code>)</li>
+<li>System paths (<code>/usr/lib/</code>, <code>/etc/</code>, <code>/proc/</code>, <code>/sys/</code>, <code>C:\Windows\</code>) when <code>includeSystemPaths</code> is false</li>
+<li>Protocol-relative URLs (<code>//</code>)</li>
+<li>Lone slash (<code>/</code>)</li>
+</ul>
+<h2>Known Limitations</h2>
+<ul>
+<li><strong>Regex-only detection</strong> — paths embedded in complex code syntax may be missed or falsely matched. The patterns balance recall against false positives for natural-language chat messages.</li>
+<li><strong>No filesystem validation</strong> — a string that looks like a valid path is treated as one; the plugin does not check whether the file actually exists.</li>
+<li><strong>Message content only</strong> — detection operates on text blocks within messages; non-text content blocks (images, tool calls) are not scanned.</li>
+<li><strong>One dialog per request</strong> — a batch with paths in several messages shows one combined dialog, not one per path.</li>
+</ul>

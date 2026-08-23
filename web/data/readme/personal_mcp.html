@@ -1,0 +1,301 @@
+<h1>memory-mcp-server</h1>
+<p>一个给 LLM Agent(如 Claude Code)用的<strong>分层长期记忆 MCP 服务器</strong>。把对话沉淀成可语义检索的三层记忆,回答"我们上次聊到哪了"时能带出完整上下文。</p>
+<blockquote>
+<p>当前版本:<strong>0.9.1</strong></p>
+</blockquote>
+<ul>
+<li><strong>本地优先,可选 API</strong>:默认用本地 <code>@xenova/transformers</code>(多语言 MiniLM,384 维,零云依赖);也可切换到 <strong>OpenAI 兼容嵌入 API</strong>(<code>MEMORY_EMBED_PROVIDER=api</code>,免下载本地模型,见下文)。</li>
+<li><strong>分层回溯</strong>:命中片段(L1)时自动回填当天总结(L2)和主题脉络(L3)。</li>
+<li><strong>优雅降级</strong>:本地模型加载失败或 API 不可用时退回关键词(Jaccard)检索,并在 stderr <strong>明确告警</strong>——不会假装正常。</li>
+</ul>
+<hr>
+<h2>记忆分层</h2>
+<pre><code>memory/                     # 存储根,相对「服务器进程的工作目录(CWD)」
+├── raw/&lt;date&gt;/turns.jsonl  # 原始对话,一字不改,全量保留
+├── fragments/&lt;date&gt;/       # L1 任务→结果片段 (.md + .embedding 向量)
+├── daily/&lt;date&gt;.md         # L2 每日总结
+└── topics/&lt;topic&gt;.md       # L3 跨天主题索引
+</code></pre>
+<p>写入顺序:<code>store_turn</code>(逐轮) → <code>create_fragment</code>(打包几轮为一个片段,自动算 embedding) → <code>create_daily_summary</code> / <code>upsert_topic</code>(汇总)。</p>
+<blockquote>
+<p><strong>重要:存储根是相对 CWD 的</strong>(<code>path.resolve("memory/...")</code>)。服务器进程以哪个目录为工作目录,记忆就写在那个目录的 <code>memory/</code> 下。让宿主(Claude Code 等)以「你想要记忆的项目根」为 CWD 启动本服务器。</p>
+</blockquote>
+<hr>
+<h2>安装 &amp; 构建</h2>
+<p>下载安装到某个路径</p>
+<pre><code>npm install
+npm run build      # tsc → dist/
+</code></pre>
+<p>（注意，CherryStudio用户可能由于该GUI的路径问题或管道问题无法直接使用，请谨慎安装）</p>
+<p>要求 Node ≥ 20(开发用 22 验证)。</p>
+<h3>从 npm 安装</h3>
+<pre><code>npm install -g @bingo_touth/memory-mcp-server   # 全局安装
+memory-mcp                                      # 直接以 stdio 启动
+# 或临时运行：npx @bingo_touth/memory-mcp-server
+</code></pre>
+<blockquote>
+<p>本包发布名：<strong><code>@bingo_touth/memory-mcp-server</code></strong>（npm 裸名 <code>memory-mcp-server</code> / <code>memory-mcp</code> 均已被他人占用，故用 scoped 名）。</p>
+</blockquote>
+<h2>各 harness 接入片段（参数化）</h2>
+<p><strong>数据根约定（最重要）</strong>：记忆库存储在<strong>服务器进程 CWD</strong> 下的 <code>memory/</code> 目录。以你想让记忆归属的项目根作为 <code>cwd</code> 启动——下面两个配置的 <code>cwd</code> 字段都是关键。</p>
+<h3>DeepSeek Harness（DSH）：<code>~/.dsh/profiles/&lt;profile&gt;/cordis.patch.yml</code></h3>
+<pre><code>- id: mcp-memory
+  name: '@deepseek-ai/dsh-mcp-client'
+  config:
+    serverName: memory
+    transport: stdio
+    command: node
+    args:
+      - '&lt;安装路径&gt;/dist/index.js'   # 或全局安装后：["npx", "memory-mcp"]
+    cwd: '&lt;项目根&gt;'                  # 记忆库落在这里的 memory/ 下
+    toolCallTimeoutMs: 120000
+    failOnStartupError: true
+</code></pre>
+<h3>作为 DSH 插件安装（推荐，0.9.2+）</h3>
+<p>本包自带 DSH bundle 声明（<code>dsh.bundle.patch</code>），可省去手写整段接入配置：</p>
+<pre><code>npm i -g pnpm                        # dsh plugin 依赖 pnpm（一次性）
+dsh plugin --profile web add @bingo_touth/memory-mcp-server
+</code></pre>
+<blockquote>
+<p><strong>pnpm 10 提示 <code>ERR_PNPM_IGNORED_BUILDS</code>（Ignored build scripts: protobufjs, sharp）时</strong>：这是 pnpm 10 默认拦截依赖构建脚本，会让 <code>dsh plugin add</code> 以非零退出、登记不生效。文本嵌入用不到这两个构建产物——编辑 <code>~/.dsh/profiles/web/pnpm-workspace.yaml</code>（pnpm 已自动写好占位符），把 <code>protobufjs</code> / <code>sharp</code> 的 <code>allowBuilds</code> 置为 <code>false</code>，然后<strong>重跑一次</strong> <code>dsh plugin add</code> 即可。</p>
+</blockquote>
+<p>安装后 bundle 已注册 <code>mcp-memory</code> 行（默认 <code>MEMORY_SKIP_INJECT=1</code>、<code>cwd</code>=DSH 启动目录、<code>failOnStartupError=false</code> 不阻断启动）。<strong>唯一要做的</strong>：把服务器绝对路径换成你的——在你自己的 <code>~/.dsh/profiles/&lt;profile&gt;/cordis.patch.yml</code> 里用同 id 覆盖（用户层覆盖 bundle 层）：</p>
+<pre><code>- id: mcp-memory
+  name: '@deepseek-ai/dsh-mcp-client'
+  config:
+    serverName: memory
+    transport: stdio
+    command: node
+    args: ['C:/&lt;你的绝对路径&gt;/dist/index.js']   # npm i -g 后可用 `npm root -g` 查
+    cwd: '&lt;你的项目根&gt;'                          # 记忆库落在这里的 memory/ 下
+    toolCallTimeoutMs: 120000
+    failOnStartupError: true
+</code></pre>
+<blockquote>
+<p>为什么不能全自动：DSH 以 <code>shell:false</code> 启动 MCP 子进程，Windows 上 <code>npx</code>/<code>.cmd</code> 直启不可用（实测 ENOENT/EINVAL），必须 <code>node + 绝对路径</code>，而绝对路径只有你本机知道——所以保留这一行替换。</p>
+<p>⚠️ 覆盖行必须是上面的普通 <code>- id:</code> 形式，<strong>不要</strong>再用 <code>- insert:</code> 包同一个 id——bundle 已插入该行，再 insert 会产生重复条目，DSH 启动直接报错 <code>duplicate loader entry id: mcp-memory</code>（实测踩坑）。卸载插件后这一行会因找不到条目而自动跳过（告警无害）。</p>
+<p>卸载：<code>dsh plugin --profile web remove @bingo_touth/memory-mcp-server</code>。</p>
+</blockquote>
+<h3>Claude Code：项目根的 <code>.mcp.json</code></h3>
+<pre><code>{
+  "mcpServers": {
+    "memory": {
+      "type": "stdio",
+      "command": "node",
+      "args": ["&lt;安装路径&gt;/dist/index.js"],
+      "env": {}
+    }
+  }
+}
+</code></pre>
+<p>或直接给 Claude Code 文件已安装的路径，让其智能注册，然后重启 Claude Code。</p>
+<blockquote>
+<p><strong>发布友好开关</strong>：服务器启动时会向 CWD 项目的 harness 规则文件（AGENTS.md 等）注入「记忆使用规范」。对他人机器这是侵入性行为——设 <code>MEMORY_SKIP_INJECT=1</code>（或 <code>true</code>/<code>yes</code>）可跳过；本机不设则保留现状。</p>
+</blockquote>
+<hr>
+<h2>⚠ Embedding 模型:首次运行需要它,离线环境要手动放</h2>
+<p>语义检索默认用 <code>Xenova/paraphrase-multilingual-MiniLM-L12-v2</code>(quantized,约 118MB,多语言，中文检索排序正确)。<strong>联网</strong>时 transformers.js 首次运行会自动下载到:</p>
+<pre><code>node_modules/@xenova/transformers/.cache/Xenova/paraphrase-multilingual-MiniLM-L12-v2/
+</code></pre>
+<blockquote>
+<p>想换模型：设环境变量 <code>MEMORY_EMBED_MODEL=&lt;repo/model&gt;</code> 即可覆盖默认（见 <code>src/embedding/provider.ts</code> 的 <code>MODEL_ID</code>）。若换成非 384 维的模型，务必回填历史片段（见下文），新旧维度/模型的向量不可混用。</p>
+<p>早期版本用的是 <code>Xenova/all-MiniLM-L6-v2</code>(英文模型,约 23MB)——它对中文语义排序会<strong>倒挂</strong>(无关闲聊的 cosine 会压过正确答案),已弃用。</p>
+</blockquote>
+<p><strong>如果网络访问 huggingface.co 受阻</strong>(常见于国内/隔离网络),自动下载会以 <code>TypeError: fetch failed</code> 失败,服务器会退回关键词检索(召回质量明显下降)。此时<strong>手动放置模型</strong>即可,用镜像下载:</p>
+<pre><code>BASE="https://hf-mirror.com/Xenova/paraphrase-multilingual-MiniLM-L12-v2/resolve/main"
+DEST="node_modules/@xenova/transformers/.cache/Xenova/paraphrase-multilingual-MiniLM-L12-v2"
+mkdir -p "$DEST/onnx"
+curl -sL "$BASE/config.json"           -o "$DEST/config.json"
+curl -sL "$BASE/tokenizer.json"        -o "$DEST/tokenizer.json"
+curl -sL "$BASE/tokenizer_config.json" -o "$DEST/tokenizer_config.json"
+curl -sL "$BASE/onnx/model_quantized.onnx" -o "$DEST/onnx/model_quantized.onnx"
+</code></pre>
+<p>验证离线可加载:</p>
+<pre><code>node --input-type=module -e '
+import { pipeline, env } from "@xenova/transformers";
+env.allowRemoteModels = false;   // 强制只用本地缓存
+const ex = await pipeline("feature-extraction","Xenova/paraphrase-multilingual-MiniLM-L12-v2",{quantized:true});
+const r = await ex("你好",{pooling:"mean",normalize:true});
+console.log("OK dim=", r.data.length);   // 期望 384
+'
+</code></pre>
+<p>放好后<strong>重启 MCP 服务器</strong>(常驻进程,不热更新;在 Claude Code 里即重启客户端)。</p>
+<h3>怎么判断当前跑在哪种模式</h3>
+<p>看服务器 <strong>stderr</strong> 与 <code>create_fragment</code> 返回的 <code>embedding_mode</code> 字段(取值为 <code>api</code> / <code>transformers</code> / <code>fallback</code>):</p>
+<ul>
+<li><code>embedding_mode: "api"</code> → 走 OpenAI 兼容嵌入 API。</li>
+<li><code>embedding_mode: "transformers"</code> → 本地 MiniLM 语义模式正常。</li>
+<li><code>embedding_mode: "fallback"</code> → 模型没加载 / API 不可用,在用关键词检索,按上面步骤修。</li>
+<li><code>memory_search</code> 返回分数普遍在 <strong>0.2+</strong>(且同义改写也能命中)→ 语义模式正常。</li>
+</ul>
+<hr>
+<h2>嵌入模型 API 后端(可选,免下载本地模型)</h2>
+<p>不想下载/运行本地 384 维模型时,设 <code>MEMORY_EMBED_PROVIDER=api</code> 即可切到 OpenAI 兼容的 <code>/v1/embeddings</code>(覆盖 OpenAI、智谱、通义、月之暗面、Ollama、PPInfra 等):</p>
+<pre><code>MEMORY_EMBED_PROVIDER=api
+MEMORY_EMBED_API_URL=https://api.openai.com/v1   # 必填,含 /v1 的 base URL
+MEMORY_EMBED_API_KEY=sk-xxxx                     # 必填
+MEMORY_EMBED_API_MODEL=text-embedding-3-small    # 可选,默认这个
+MEMORY_EMBED_API_MAX_TOKENS=8191                 # 可选,文档预算上限
+MEMORY_EMBED_API_DIM=1536                        # 可选,固定维度;缺省则首次编码自动探测
+MEMORY_EMBED_API_MAX_RETRIES=4                   # 可选,429/5xx/网络异常的退避重试次数
+MEMORY_EMBED_API_RETRY_BASE_MS=2000              # 可选,重试退避基数(指数增长,上限 60s)
+MEMORY_EMBED_API_DELAY_MS=0                      # 可选,相邻请求最小间隔;严格限流档(如 5/min)设 12000+
+</code></pre>
+<p>要点:</p>
+<ul>
+<li><strong>API 模式不做本地分词</strong>:文档预算截断用字符近似计数(<code>tokenizer_id = char-approx-v1</code>),不下载任何模型文件。</li>
+<li><strong>API 模型与本地 MiniLM 的向量不可混用</strong>:切换模型后 <code>representation_identity_hash</code> 变化,必须 <code>migrate_embeddings.mjs build/validate/switch</code> 重建;建议用 <code>--representation single</code>(multiview 证据门阈值是按 MiniLM 384 校准的,不随 API 迁移)。</li>
+<li><strong>失败语义分层</strong>:检索路径(编码失败)快速回退关键词,不等待重试;构建/迁移路径严格失败,绝不出半成品向量。429/5xx/网络异常自动指数退避重试(优先 <code>Retry-After</code> 头)。</li>
+<li><strong>免费档限流</strong>:如 PPInfra 免费档 5 请求/分钟,建库必须配 <code>MEMORY_EMBED_API_DELAY_MS=12000+</code>(76 片段 ≈ 16 分钟)。</li>
+</ul>
+<hr>
+<h2>回填历史片段</h2>
+<p>如果某段时间跑在降级模式,那期间的片段没有向量(或为空),且<strong>当前存在 active embedding generation 时不能直接运行旧回填脚本</strong>。D0 会保护性拒绝对 active generation 的写入，避免把不可变快照当作可写目录。</p>
+<pre><code>cd &lt;记忆库所在的项目根&gt;          # 必须,存储根相对 CWD
+node &lt;绝对路径&gt;/backfill_embeddings.mjs
+</code></pre>
+<p>脚本仅在没有 active generation 时回填 legacy <code>.embedding</code>；如果检测到 active generation，会以非零状态退出并提示使用：</p>
+<pre><code>node &lt;绝对路径&gt;/migrate_embeddings.mjs build --generation gen_YYYYMMDD_xxx
+node &lt;绝对路径&gt;/migrate_embeddings.mjs validate --generation gen_YYYYMMDD_xxx
+node &lt;绝对路径&gt;/migrate_embeddings.mjs switch --generation gen_YYYYMMDD_xxx
+</code></pre>
+<p>当前简化模型下，服务器启动不会自动做 orphan reconcile 或后台修复；如果你怀疑 delta/base 状态不一致，直接走手动 rebuild + switch。</p>
+<h2>Multiview evidence calibration（离线维护者流程）</h2>
+<p>多窗口 evidence gate 只允许使用通过 development 与 hold-out 验证的、版本化 fixture calibration artifact；不能把 <code>src/search/retriever.ts</code> 中的旧候选阈值当作 production policy。评测工具只读取 <code>bench/datasets/</code>，不会读取或修改任何 <code>memory/</code> root；它不切 active pointer，也不生成真实 generation。</p>
+<pre><code>node bench/run-multiview-eval.mjs calibrate \
+  --max-fpr 0 \
+  --min-evidence-recall 1 \
+  --output &lt;candidate-report.json&gt;
+
+# 从 candidate-report.json 提取 candidate_artifact 后，使用 untouched hold-out：
+node bench/run-multiview-eval.mjs validate \
+  --artifact &lt;candidate-artifact.json&gt; \
+  --output &lt;holdout-report.json&gt;
+
+node bench/run-multiview-eval.mjs evaluate \
+  --threshold &lt;validated-threshold&gt; \
+  --output &lt;shadow-report.json&gt;
+</code></pre>
+<p><code>validate</code> 只有在 hold-out 满足冻结目标时才会输出 <code>validated</code> artifact；失败时报告 <code>no_go</code>，不得手动把 candidate 标为 validated。artifact 绑定 model/tokenizer、recipe、窗口策略、aggregation/raw-similarity mode、development/hold-out dataset hash 和 canonical artifact hash。</p>
+<p>新的 multiview generation、activation、delta 写入与 compaction 都必须携带并校验该 immutable validated snapshot；compaction 的 artifact 还必须与 active generation 的 snapshot 完全一致。历史 policy-less multiview generation 仍可读取，并在 search 中保持 summary-only shadow；它们不能重新激活或创建/重置/写入 delta。</p>
+<p>本项目采用简单、手动维护优先的落地策略，不把大规模生产级 calibration、长时间 shadow observation 或复杂自动运维作为首次启用的前置条件。真实库首次启用时只需在维护窗口完成 multiview build → validate → switch，保留旧 generation，并用少量真实查询做 sanity check；必要时手动回切旧 generation。fixture artifact 不能冒充真实生产阈值，但不再阻塞首次使用。</p>
+<h2>Compaction 日常维护流程（手动维护）</h2>
+<p>日常写入走 <strong>delta 增量层</strong>（generation 是不可变快照，写入只更新 <code>memory/embedding_delta/</code>）。delta 条目数 D 增长后：① 每次 <code>create_fragment</code> 重写 <code>delta_index.json</code> 的写放大 ≈ O(D²)；② 检索多一层校验。<strong>compaction</strong> 把 base + delta 合并进一个全新 generation 并清空 delta（两层变一层）。</p>
+<p><strong>什么时候做</strong>：delta 条目数（<code>memory/embedding_delta/delta_index.json</code> 的键数）≥ 100~300、<code>create_fragment</code>/<code>memory_search</code> 明显变慢、或按使用强度定期（如每月/每 200 片段）。<strong>全程在维护窗口执行，先备份 memory 根</strong>。</p>
+<pre><code>cd &lt;记忆库所在的项目根&gt;          # 存储根相对 CWD，必须
+node &lt;绝对路径&gt;/compact_embeddings.mjs preflight --generation gen_YYYYMMDD_compaction --representation multiview --evidence-policy &lt;validated-artifact.json&gt;
+node &lt;绝对路径&gt;/compact_embeddings.mjs build --generation gen_YYYYMMDD_compaction
+node &lt;绝对路径&gt;/compact_embeddings.mjs validate --generation gen_YYYYMMDD_compaction
+node &lt;绝对路径&gt;/compact_embeddings.mjs switch --generation gen_YYYYMMDD_compaction
+</code></pre>
+<ul>
+<li><code>--representation</code> 必须与当前 active generation 一致；multiview 时必须携带 <strong>validated</strong> evidence policy（<code>run-multiview-eval.mjs validate</code> 产出，candidate 不可用）。</li>
+<li>preflight 会<strong>上 compaction 锁 + 封存 delta + 写 merge contract</strong>；validate 不通过<strong>不得 switch</strong>；异常中断先用 <code>compact_embeddings.mjs unlock</code> 确认解锁，不要把 unlock 当通用恢复手段。</li>
+<li>switch 后旧 generation 保留在 <code>previous_generation_id</code>，可手动回切。</li>
+<li>换模型/换表示请用 <code>migrate_embeddings.mjs</code>，不要用 compaction 顶替。</li>
+<li>详细判定信号、故障处理与操作前检查清单见《项目维护/memory-mcp-server_compaction维护手册_20260809.md》；archive 恢复场景见下一节。</li>
+</ul>
+<h2>Compaction archive recovery（维护者手动流程）</h2>
+<p>此流程只用于恢复一个 <strong>C3-3B v2 compaction archive</strong>：把 archive 中的 sealed delta 和记录的 base active pointer 原样恢复。它不是通用 JSON 修复、<code>migrate_embeddings.mjs</code> 的 rollback、orphan reconcile，也不是面向日常用户的操作。</p>
+<p>当前没有公开的 restore CLI 或 MCP tool；仅维护者可在受控环境中调用内部 API：<code>verifyArchivedDelta(archivePath)</code>、<code>restoreArchivedDelta(archivePath)</code>、<code>recoverDeltaRestoreTransaction()</code>。<strong>不要</strong>手动复制 archive 文件、改写 <code>embedding_active.json</code>、删除 transaction，或把 <code>compact_embeddings.mjs unlock</code> 当作通用恢复手段。</p>
+<p>恢复前按顺序完成：</p>
+<ol>
+<li>停止 MCP server 和全部写入方，记录绝对 memory root、候选 archive 路径、当前 active pointer、delta manifest/index 摘要、compaction lock，以及 <code>memory/embedding_delta/transactions/restore-*</code> 目录。</li>
+<li>对整个 memory root 做独立的字节级备份；恢复流程不会替代这一份操作前备份。</li>
+<li>只选择 <code>memory/embedding_delta/archive/&lt;delta-id&gt;-into-&lt;target-generation-id&gt;/</code> 下的 archive。它必须包含 <code>merge_receipt.json</code>、<code>merge_contract.json</code>、<code>manifest.json</code>、<code>delta_index.json</code>；有 materialized record 时还必须有对应 <code>vectors/</code> payload。</li>
+<li>先执行 <code>verifyArchivedDelta(archivePath)</code>，只有返回 <code>valid: true</code> 才能继续。v1 receipt、任意 payload/receipt/contract/pointer 校验失败都必须停止，不能尝试“修好” archive 后继续。</li>
+<li><code>restoreArchivedDelta(archivePath)</code> 会再次拒绝 source inventory 漂移、active pointer 不等于 receipt target pointer、非空的 post-compaction target delta、或已有未完成 restore transaction。满足条件后它才会恢复 archive 的 sealed delta，并最后写入 receipt base pointer。</li>
+<li>成功后确认：active pointer 等于 <code>receipt.pointer_snapshots.base</code>；live delta 的 ID/payload 等于 archive、状态为 <code>sealed</code>、兼容性正常；target generation 与 archive 均仍存在；没有遗留 <code>restore-*</code> transaction。</li>
+</ol>
+<p>正常调用返回 <code>{ restored: true, idempotent: false }</code>；若已经完全处于 archive 记录的 base+sealed-delta 状态，会返回 <code>{ restored: false, idempotent: true }</code>。若出现 <code>recovery_failed: true</code>，保留其 <code>transaction_path</code>、archive、pointer/manifest 快照和错误输出，<strong>不要重跑 restore 或手动清理</strong>；由维护者先调用一次 <code>recoverDeltaRestoreTransaction()</code>。多个 restore transaction、未知 transaction schema、archive 验证失败或 recovery 再次失败都属于停止并人工检查的条件，不能 force-unlock。</p>
+<p>当没有有效 archive、source 已变化或 pointer 状态不满足恢复前提时，走受控 rebuild：</p>
+<pre><code>node &lt;绝对路径&gt;/migrate_embeddings.mjs build --generation gen_YYYYMMDD_xxx
+node &lt;绝对路径&gt;/migrate_embeddings.mjs validate --generation gen_YYYYMMDD_xxx
+node &lt;绝对路径&gt;/migrate_embeddings.mjs switch --generation gen_YYYYMMDD_xxx
+</code></pre>
+<p>对真实 memory root 的复制副本演练、自动启动恢复、公开 restore CLI 和 MCP restore tool 都是后续独立授权事项；本文档不启用它们。</p>
+<hr>
+<h2>MCP 工具一览</h2>
+<table>
+<thead>
+<tr>
+<th>工具</th>
+<th>作用</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>memory_store_turn</code></td>
+<td>追加一轮对话到 raw(全量原文)</td>
+</tr>
+<tr>
+<td><code>memory_create_fragment</code></td>
+<td>把若干轮打包成 L1 片段,自动算 embedding</td>
+</tr>
+<tr>
+<td><code>memory_create_daily_summary</code></td>
+<td>写 L2 每日总结</td>
+</tr>
+<tr>
+<td><code>memory_upsert_topic</code></td>
+<td>创建/更新 L3 跨天主题索引</td>
+</tr>
+<tr>
+<td><code>memory_search</code></td>
+<td>语义检索 → 命中 L1 并回填 L2/L3 上下文</td>
+</tr>
+<tr>
+<td><code>memory_get_fragment</code> / <code>memory_get_daily</code> / <code>memory_get_topic</code></td>
+<td>按 ID 读取完整内容</td>
+</tr>
+<tr>
+<td><code>memory_list_dates</code></td>
+<td>列出所有有记录的日期</td>
+</tr>
+<tr>
+<td><code>memory_get_raw_turns</code></td>
+<td>按 exact/range/recent/all 四种互斥模式读取 L0 逐轮原文，可先按 <code>agent_id</code> 过滤</td>
+</tr>
+<tr>
+<td><code>memory_consolidate_topics</code></td>
+<td>检测中文相似 Topic；经审阅后支持 dry-run、整批预检、执行合并与 fragment 回指修复</td>
+</tr>
+</tbody></table>
+<h3>Topic 合并说明</h3>
+<p><code>memory_consolidate_topics(action="execute")</code> 会先做整批校验。任一 active 合并组存在 source/target 冲突、非法 fragment ID、路径越界、fragment 缺失或旧 Topic 回指不唯一时，整批返回 <code>validated: false</code> 和 MCP <code>isError: true</code>，不会改写 live 文件。</p>
+<p><code>dry_run: true</code> 使用与正式执行相同的计划和预检，只返回 <code>changes</code>，不写文件。正式执行会更新 target、改写 fragment 回指，并把 source 主题备份到 <code>.trash</code> 后删除。</p>
+<p>这是面向个人项目的简化维护模型：优先保证行为直白、出问题后可人工检查；不承诺工业级自动恢复或复杂维护编排。</p>
+<hr>
+<h2>和宿主自带记忆的分工(避免双写)</h2>
+<p>很多 Agent 宿主(如 Claude Code)自身已有一套"始终加载进上下文"的轻量记忆。本 MCP 与它<strong>职责不同,不要重复存</strong>:</p>
+<ul>
+<li><strong>宿主自带记忆</strong> = 蒸馏后的常驻规则/偏好,需要<strong>每个会话都在上下文里</strong>、无需检索。少而精,一条一行。</li>
+<li><strong>本 MCP</strong> = 可检索的<strong>情节档案</strong>:完整对话、任务片段、每日/主题脉络。<strong>按需 <code>memory_search</code> 取用</strong>,不常驻。</li>
+</ul>
+<p>一条经验值得记时问自己:<em>它需要每个会话都在场,还是只在我去翻的时候才要?</em> 前者进宿主记忆(一行),后者进本 MCP(带证据的片段)。宿主里的那一行可以引用 MCP 的主题名做下钻,但不要复制正文。</p>
+<hr>
+<h2>仓库卫生</h2>
+<p><code>memory/</code> 里是<strong>原始对话逐字记录</strong>。若把本服务器的记忆库放在某个 git 项目内,记得在该项目 <code>.gitignore</code> 忽略它,别把对话原文和向量提交进版本库:</p>
+<pre><code>/memory/
+</code></pre>
+<hr>
+<h2>记忆重要性评分</h2>
+<p>新建 fragment 时请保守填写 <code>importance</code>，不要把普通记忆默认评为 0.7 以上：</p>
+<ul>
+<li><code>0.35~0.4</code>：临时、局部、低复用信息</li>
+<li><code>0.5</code>：普通可复用记忆</li>
+<li><code>0.6~0.7</code>：持续有帮助或明确重要</li>
+<li><code>0.8</code>：关键架构、重要约束</li>
+<li><code>0.9~1.0</code>：核心事实，错误代价高，应该很少使用</li>
+</ul>
+<p>历史 fragment 的 importance 不因这次规则调整而批量改写。P3 Phase 1c 检索时使用 <code>max(importance, earned_importance)</code>，earned 只提升有效重要性，不会降低已有权重。</p>
+<h2>已知取舍</h2>
+<ul>
+<li>MiniLM 的相似度整体偏低,<strong>0.2–0.35 就是可靠命中</strong>,不要按 0.8 的直觉设阈值。</li>
+<li>检索质量高度依赖<strong>写入方</strong>给的 <code>task_desc</code>/<code>result_desc</code>/片段浓缩质量——工具负责结构与召回,浓缩得好不好看用的人。</li>
+<li>embedding 文本 = <code>task_desc + result_desc + turns_text</code>(查询多针对结论,纳入后召回更准)。</li>
+</ul>
+<h2>开发</h2>
+<pre><code>npm run dev      # tsx 直跑 src/index.ts
+npm run check    # tsc --noEmit 类型检查
+npm run watch    # 文件监听(如启用 watcher)
+</code></pre>

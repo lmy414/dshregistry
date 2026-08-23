@@ -1,0 +1,281 @@
+<h1>dsh-llama-responses</h1>
+<p>DeepSeek Harness(dsh)的本地大模型适配器插件:<strong>OpenAI Responses 协议</strong>(<code>/v1/responses</code>),对接本地 llama.cpp <code>llama-server</code>。</p>
+<p>用途:dsh 主代理继续用 DeepSeek 官方 API,<strong>子代理(spawn/fork)路由到本地模型</strong>,省 API 成本。</p>
+<p><strong>隔离设计(重要)</strong>:所有子代理<strong>不继承父对话</strong>——<code>subagent_fork</code> 已通过 patch 重定向到 spawn 提供方
+(<code>provider: spawn</code>),两个委派工具的子代理都只看到父代理下发的指令文本,父会话任何内容
+(含已完成轮次)都不会进入子代理上下文,避免上下文膨胀与信息泄漏。父代理要传递背景,
+必须显式写进委派指令。(已实测:父对话中的信息子代理明确回答"看不到"。)</p>
+<h2>重要提示(子代理走本地模型的前置操作)</h2>
+<p>已知坑:每次启动必须先在 DeepSeek Harness 中<strong>手动选择一次本地的 qwen3.8-27b 并提问一次</strong>,然后把主代理
+<strong>换回 DeepSeek V4 模型</strong>——之后子代理才会正常走本地的 qwen3.8-27b。不做这一次"本地提问再切回",
+子代理不会正常路由到本地模型。</p>
+<h2>安装(生态方式)</h2>
+<pre><code># 方式一:dsh 官方插件命令(推荐)
+dsh plugin --profile web add git+https://github.com/SnowRikka/dsh-llama-responses.git
+
+# 方式二:手动软链(便于改源码)
+git clone https://github.com/SnowRikka/dsh-llama-responses.git ~/dsh-llama-responses
+ln -sfn ~/dsh-llama-responses ~/.dsh/profiles/web/node_modules/dsh-llama-responses
+</code></pre>
+<p>包内自带 <code>cordis.patch.yml</code>(bundle 层,注册默认适配器)与 <code>skill/</code>(委派规范 skill,
+<code>package.json</code> 的 <code>dsh.skills</code> 声明)。装好后按下文 patch 把子代理路由到
+<code>provider: llama-responses</code> 即可。npm 未发布前,以上两种方式等效。</p>
+<h2>文件</h2>
+<table>
+<thead>
+<tr>
+<th>文件</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>index.js</code></td>
+<td>插件入口:Config schema + <code>ctx.llm.registerAdapter(['llama-responses'], ...)</code></td>
+</tr>
+<tr>
+<td><code>adapter.js</code></td>
+<td>适配器本体:GenerateOptions → Responses 请求、Responses SSE → dsh StreamChunk(文本/工具调用流式/用量/finish)</td>
+</tr>
+<tr>
+<td><code>test_adapter.mjs</code></td>
+<td>单元测试(不经 dsh 直连 llama-server:多轮、工具调用、工具结果回传)</td>
+</tr>
+<tr>
+<td><code>node_modules/</code></td>
+<td>指向 dsh 自带依赖的符号链接(dsh-llm、schemastery)</td>
+</tr>
+</tbody></table>
+<h2>已验证(2026-08-23,Qwen3.8-27B)</h2>
+<ul>
+<li>单元测试:多轮记忆、function_call 流式、function_call_output 回传,全部通过</li>
+<li>端到端(DeepSeek 主代理 + 本地子代理):<ul>
+<li><code>subagent</code>(spawn/可继续后台)✅</li>
+<li><code>subagent_fork</code>(one-shot 前台,已重定向 spawn=完全不继承父对话)✅ 隔离已实测</li>
+<li><code>send_message</code>(追问排队下一回合)✅</li>
+<li><code>list_agents</code>(显示 running/ready 状态)✅</li>
+<li><code>interrupt_agent</code>(中断成功,子代理转 ready)✅</li>
+<li><code>report</code>/结算通知(运行时通知链路)✅</li>
+</ul>
+</li>
+</ul>
+<h2>如何启用 DeepSeek Harness 自带的子代理功能(前置条件)</h2>
+<p>本插件挂载在 dsh 的子代理体系上,先把 dsh 自带的子代理功能启用(这是必要前置):</p>
+<h3>现状:哪些默认开、哪些默认关</h3>
+<table>
+<thead>
+<tr>
+<th>Profile</th>
+<th>子代理引擎(spawn/fork 提供方、继续执行管理器)</th>
+<th>模型侧工具(subagent 等)</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>headless</code></td>
+<td>默认启用</td>
+<td><strong>默认启用</strong></td>
+</tr>
+<tr>
+<td><code>web</code></td>
+<td>默认启用</td>
+<td><strong>默认禁用</strong>(web-app 组合包有意禁用,需 patch 开启)</td>
+</tr>
+</tbody></table>
+<p>确认方法:</p>
+<pre><code>dsh --profile web --dump-config | grep -B1 -A4 "id: tool-subagent"   # 看 disabled 字段
+</code></pre>
+<h3>web profile 启用 patch</h3>
+<p>在 <code>~/.dsh/profiles/web/cordis.patch.yml</code> 加入(不带 config 的覆盖型条目):</p>
+<pre><code>- id: tool-subagent-control        # send_message / interrupt_agent
+  disabled: false
+
+- id: tool-subagent-list-agents    # list_agents
+  disabled: false
+
+- id: tool-subagent                # 委派工具(可继续后台子代理)
+  disabled: false
+
+- id: tool-subagent-fork           # 委派工具(one-shot,已重定向 spawn=无父对话)
+  disabled: false
+</code></pre>
+<p>启用后模型会看到 5 个工具:<code>subagent</code>、<code>subagent_fork</code>、<code>send_message</code>、<code>interrupt_agent</code>、<code>list_agents</code>
+(子代理内部另有 <code>report</code> 回报通道,自动生效)。</p>
+<h3>验证子代理功能本身(未挂本插件也能测,子代理会走默认 DeepSeek 模型)</h3>
+<pre><code>dsh --profile headless "用 subagent 工具委派一个子代理回答:1+1等于几?转述它的答案"
+</code></pre>
+<hr>
+<h2>如何启用本插件(本地模型路由)</h2>
+<p>前置:本地模型服务已运行(例:<code>~/qwen/start_server.sh</code>,监听 <code>127.0.0.1:8080</code>),
+且建议加 <code>--reasoning off</code> 避免思考占用子代理输出预算。</p>
+<h3>1. 放置插件(软链到 profile)</h3>
+<pre><code># 对每个要用它的 profile 执行(web / headless)
+ln -sfn /home/lmj/zi-dai-deep ~/.dsh/profiles/web/node_modules/dsh-llama-responses
+ln -sfn /home/lmj/zi-dai-deep ~/.dsh/profiles/headless/node_modules/dsh-llama-responses
+</code></pre>
+<p>(依赖符号链接 <code>node_modules/@deepseek-ai/{dsh-llm,schemastery}</code> 已就位,一般无需动)</p>
+<h3>2. 配置 patch(<code>~/.dsh/profiles/&lt;profile&gt;/cordis.patch.yml</code>)</h3>
+<pre><code># 注册适配器
+- insert:
+    - id: llm-responses-local
+      name: dsh-llama-responses
+      config:
+        baseURL: http://127.0.0.1:8080/v1
+        providerName: llama-responses
+        apiKeyEnv: DSH_LOCAL_LLM_KEY
+        models:
+          - id: qwen3.8-27b            # 与 llama-server 加载的模型对应
+            name: Qwen3.8-27B IQ4_XS (local)
+            contextWindow: 163840
+        defaultContextWindow: 163840
+        defaultMaxTokens: 8192
+
+# 子代理固定本地模型(已含完整示例见两个 profile 里的现成 patch)
+- id: tool-subagent
+  config:
+    provider: spawn
+    toolName: subagent
+    backgroundMode: continuable
+    agentOptions:
+      provider: llama-responses       # 关键:路由到本地
+      model: qwen3.8-27b
+      maxTokens: 8192
+</code></pre>
+<p>web profile 还需要 <code>- id: tool-subagent(-control/-list-agents/-fork)  disabled: false</code>(web-app 默认禁用这些工具,headless 默认启用)。</p>
+<h3>3. 环境变量</h3>
+<pre><code># ~/.bashrc 已有;本地服务不校验鉴权,占位即可
+export DSH_LOCAL_LLM_KEY=local-no-auth
+</code></pre>
+<h3>4. 验证</h3>
+<pre><code>dsh --profile web --dump-config | grep -A3 llm-responses-local   # 应看到插件条目
+dsh --profile headless "用 subagent 工具委派子代理回答:1+1等于几?"  # 子代理答案应回传
+</code></pre>
+<h2>协议细节(踩过的坑)</h2>
+<ul>
+<li>历史消息条目<strong>必须带顶层 <code>type:'message'</code></strong>,assistant 内容用 <code>output_text</code>
+(裸 role 条目会报 "Cannot determine type of 'item'")</li>
+<li>工具:<code>{type:'function', name, description, parameters}</code> 扁平格式;
+结果回传用 <code>{type:'function_call_output', call_id, output}</code></li>
+<li>SSE 事件:<code>response.output_text.delta</code> / <code>response.function_call_arguments.delta</code> /
+<code>response.output_item.done</code> / <code>response.completed</code>(usage 在 completed 里)</li>
+<li>Node fetch 不走系统代理,本地 <code>127.0.0.1</code> 直连无碍</li>
+</ul>
+<h2>配置项参考</h2>
+<table>
+<thead>
+<tr>
+<th>字段</th>
+<th>默认</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>baseURL</td>
+<td><code>http://127.0.0.1:8080/v1</code></td>
+<td>适配器自动拼接 <code>/responses</code></td>
+</tr>
+<tr>
+<td>providerName</td>
+<td><code>llama-responses</code></td>
+<td>注册到 <code>ctx.llm</code> 的路由名</td>
+</tr>
+<tr>
+<td>apiKeyEnv</td>
+<td><code>DSH_LOCAL_LLM_KEY</code></td>
+<td>读该环境变量作 Bearer</td>
+</tr>
+<tr>
+<td>models</td>
+<td>qwen3.8-27b/160K</td>
+<td>模型目录(id 须与服务端一致)</td>
+</tr>
+<tr>
+<td>defaultContextWindow</td>
+<td>163840</td>
+<td>上下文窗口(与服务端 llama-server 的 <code>--ctx-size</code> 一致)</td>
+</tr>
+<tr>
+<td>defaultMaxTokens</td>
+<td>8192</td>
+<td>单请求输出上限</td>
+</tr>
+</tbody></table>
+<h2>附带 SKILL:local-subagent-delegation</h2>
+<p><code>skill/local-subagent-delegation/SKILL.md</code> — 面向主代理的子代理委派规范:</p>
+<ul>
+<li>子代理 = 160K 上下文本地代码模型(身份自称不可信,忽略之)</li>
+<li>指令必须自包含且详尽(六要素自查:目标/输入/约束/输出格式/验收标准/输出规模(由主代理判断,无固定上限))</li>
+<li>硬性红线:同一时刻最多 1 个子代理(委派前 <code>list_agents</code> 检查)</li>
+<li>默认一次性使用;仅同任务紧邻小追问且上下文 &lt;80K 时允许 <code>send_message</code> 复用</li>
+<li>何时不该委派(直接做/密集上下文交互/超长输出)</li>
+</ul>
+<p>安装方式(已完成):软链到 <code>~/.dsh/skills/local-subagent-delegation</code>;
+web profile 需 patch 启用 <code>tool-skill</code>(<code>disabled: false</code>),headless 默认启用。
+已实测:模型能发现并加载该 skill,委派行为完全符合规范(六要素齐备、先查单实例、声明一次性)。</p>
+<h2>如何启用 skill 功能(tool-skill,前置条件)</h2>
+<p>skill 的发现与加载由 <code>@deepseek-ai/dsh-tool-skill</code> 插件提供,各 profile 默认状态不同:</p>
+<table>
+<thead>
+<tr>
+<th>Profile</th>
+<th>tool-skill 默认状态</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>headless</code></td>
+<td><strong>默认启用</strong></td>
+</tr>
+<tr>
+<td><code>web</code></td>
+<td><strong>默认禁用</strong>(web-app 组合包禁用),需 patch 开启</td>
+</tr>
+</tbody></table>
+<h3>web profile 启用方法</h3>
+<p>在 <code>~/.dsh/profiles/web/cordis.patch.yml</code> 加入:</p>
+<pre><code># 启用 skill 工具(模型发现/加载 SKILL.md)
+- id: tool-skill
+  disabled: false
+</code></pre>
+<p>(本机已配置;生效需要重启 <code>dsh web</code>,patch 热更新对工具启停不总是即时。)</p>
+<h3>验证</h3>
+<pre><code># 1. 配置树确认条目已启用(应显示 disabled: false)
+dsh --profile web --dump-config | grep -A2 "id: tool-skill"
+
+# 2. 运行时确认模型能发现 skill(应列出 local-subagent-delegation)
+dsh --profile headless "你现在有哪些可用的 skill?只列名称和描述"
+</code></pre>
+<h3>skill 的安装位置(发现优先级,供排错参考)</h3>
+<table>
+<thead>
+<tr>
+<th>优先级</th>
+<th>来源</th>
+<th>目录</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>100</td>
+<td>项目级</td>
+<td><code>&lt;项目根&gt;/.dsh/skills/&lt;name&gt;/SKILL.md</code></td>
+</tr>
+<tr>
+<td>200</td>
+<td>项目级</td>
+<td><code>&lt;项目根&gt;/.agents/skills/</code></td>
+</tr>
+<tr>
+<td>300</td>
+<td>自定义</td>
+<td><code>Config.customSkillDirs</code></td>
+</tr>
+<tr>
+<td>400</td>
+<td>用户级</td>
+<td><code>~/.dsh/skills/&lt;name&gt;/SKILL.md</code>(本 skill 装在这里)</td>
+</tr>
+<tr>
+<td>500</td>
+<td>用户级</td>
+<td><code>~/.agents/skills/</code></td>
+</tr>
+</tbody></table>
+<p>同名 skill 低 rank 值优先;仅目录包 <code>&lt;name&gt;/SKILL.md</code> 与扁平 <code>&lt;name&gt;.md</code> 两种形式,
+不支持嵌套递归发现。</p>

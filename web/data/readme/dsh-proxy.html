@@ -1,0 +1,114 @@
+<h1>dsh-proxy</h1>
+<p><a href="https://github.com/BuLongY/dsh-proxy/blob/HEAD/README_EN.md">English</a> | 简体中文</p>
+<p><strong>为 DeepSeek Harness 注入自定义 HTTP 代理</strong> —— 让 DSH 宿主进程的全部 fetch 流量（LLM 请求、模型发现、插件市场、web 搜索）走你指定的代理（Clash / mihomo / v2ray 等），<strong>无需开启 TUN 模式</strong>，也不依赖系统代理。</p>
+<h2>为什么需要它</h2>
+<p>DSH 桌面端 / Web 端的 LLM 请求由宿主 Node 进程发出，走的是 Node 全局 <code>fetch</code>（undici）：</p>
+<ul>
+<li><strong>不读系统代理</strong>：Windows 设置里的代理、Clash 的"系统代理"开关对它无效。</li>
+<li><strong>不读代理环境变量</strong>：<code>HTTPS_PROXY</code> 等环境变量对 Node 全局 fetch 无效。</li>
+<li><strong>没有内置代理设置</strong>：DSH 的设置界面与提供方配置里都没有代理选项。</li>
+</ul>
+<p>于是当某个 API 端点被 Cloudflare 按 IP 拦截（国内宽带段很常见）、或你必须经代理才能访问时，唯一的选择曾是 Clash 的 TUN 模式。本插件提供了另一条路：<strong>在宿主进程内把全局 fetch 的 dispatcher 换成 ProxyAgent</strong>，所有请求经你的代理出站，由 Clash 的规则模式继续负责分流（国内直连、国外走节点），互不冲突。</p>
+<h2>效果对比</h2>
+<table>
+<thead>
+<tr>
+<th>使用前（被 Cloudflare 按 IP 拦截，403）</th>
+<th>使用后（正常拉出模型列表）</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><img src="https://raw.githubusercontent.com/BuLongY/dsh-proxy/HEAD/docs/images/before-403.png" alt="使用前：获取模型返回 403"></td>
+<td><img src="https://raw.githubusercontent.com/BuLongY/dsh-proxy/HEAD/docs/images/after-success.png" alt="使用后：成功获取模型列表"></td>
+</tr>
+</tbody></table>
+<h2>工作原理</h2>
+<p>插件与 DSH 的 LLM 适配器运行在同一个宿主 Node 进程中。加载时：</p>
+<ol>
+<li>保存当前全局 dispatcher；</li>
+<li>用 <code>undici</code> 的 <code>ProxyAgent</code> 构造一个带绕过名单的路由 dispatcher，并通过 <code>setGlobalDispatcher</code> 安装；</li>
+<li>之后进程内<strong>所有</strong>全局 fetch（模型发现 <code>GET /models</code>、OpenAI SDK 聊天请求、插件市场、web 搜索等）都经代理出站；</li>
+<li>卸载插件或在设置中关闭开关，即恢复原来的 dispatcher，无需重启。</li>
+</ol>
+<p>绕过名单（<code>noProxy</code>）默认包含 <code>localhost</code>、<code>127.0.0.1</code>、<code>::1</code>，本地回环请求永远直连。</p>
+<h2>安装</h2>
+<h3>方式一：把下面这段提示词直接粘贴到 DSH 对话里（推荐）</h3>
+<p>复制以下整段文字，发送给你正在使用的 DSH Agent，它会代为完成安装与配置：</p>
+<pre><code>请帮我安装并启用 dsh-proxy 插件（DeepSeek Harness 的自定义 HTTP 代理插件）。步骤：
+1. 执行：dsh plugin --profile desktop add github:BuLongY/dsh-proxy
+   （DSH 桌面端用 desktop profile；纯 Web 部署则把 desktop 换成 web。
+    如果提示有挂起的安装恢复事务 "another plugin install recovery transaction is pending"，
+    先把 %APPDATA%\DSH Desktop\plugin-install-recovery\state.json 重命名为 state.json.bak 隔离，再重试。
+    如果报 ERR_PNPM_GIT_DEP_PREPARE_NOT_ALLOWED，按报错提示把完整的 allowBuilds 键加入
+    %UserProfile%\.dsh\profiles\desktop\pnpm-workspace.yaml 后重试。）
+2. 安装完成后提醒我重启 DSH Desktop 使插件生效。
+3. 重启后插件默认启用代理 127.0.0.1:7890（Clash 混合端口）。
+   如果我的代理地址或端口不同，请在 设置 → 插件 → 插件配置 → dsh-proxy 中直接修改，保存即生效，无需重启。
+4. 用一个需要代理的 API 提供方（点"获取可用模型"）验证是否成功。
+</code></pre>
+<h3>方式二：命令行手动安装</h3>
+<pre><code>dsh plugin --profile desktop add github:BuLongY/dsh-proxy
+</code></pre>
+<p>然后<strong>重启 DSH Desktop</strong>。插件默认启用 <code>127.0.0.1:7890</code>（Clash/mihomo 混合端口）。</p>
+<p>发布到 npm 后也可直接 <code>dsh plugin --profile desktop add dsh-proxy</code>（无需构建放行步骤）。</p>
+<h2>配置</h2>
+<p>安装后在 <strong>设置 → 插件 → 插件配置 → dsh-proxy</strong> 中直接编辑（保存即时生效，无需重启）：</p>
+<table>
+<thead>
+<tr>
+<th>字段</th>
+<th>默认值</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>enabled</code></td>
+<td><code>true</code></td>
+<td>总开关。关闭即恢复直连，无需卸载。</td>
+</tr>
+<tr>
+<td><code>host</code></td>
+<td><code>127.0.0.1</code></td>
+<td>代理服务器地址。</td>
+</tr>
+<tr>
+<td><code>port</code></td>
+<td><code>7890</code></td>
+<td>代理服务器端口（1–65535）。</td>
+</tr>
+<tr>
+<td><code>noProxy</code></td>
+<td><code>localhost, 127.0.0.1, ::1, [::1]</code></td>
+<td>绕过名单：精确匹配主机名；以 <code>.</code> 开头匹配域名后缀（如 <code>.lan</code>）；<code>*</code> 表示全部直连。</td>
+</tr>
+</tbody></table>
+<p>也可以直接编辑 <code>%UserProfile%\.dsh\settings.yaml</code> 中的 <code>dsh-proxy</code> 配置节。仅支持 HTTP 代理；SOCKS5 用户请使用 Clash/mihomo 的混合端口。</p>
+<h2>验证</h2>
+<ol>
+<li>确认 Clash/mihomo 正在运行且混合端口为 7890；</li>
+<li>打开一个需要代理才能访问的 API 提供方配置页，点 <strong>获取可用模型</strong>；</li>
+<li>能拉出模型列表即成功。失败时查看 <code>%APPDATA%\DSH Desktop\logs\</code> 中当天日志里 <code>dsh-proxy</code> 的行。</li>
+</ol>
+<h2>平台支持</h2>
+<ul>
+<li><strong>Windows 10/11</strong>：主要开发与测试平台。</li>
+<li><strong>macOS / Linux</strong>：插件本身是纯 Node 网络层代码，与平台无关；任何运行 DSH 的平台均可使用（欢迎反馈实测结果）。</li>
+</ul>
+<h2>常见问题</h2>
+<p><strong>Q: 开了 Clash 系统代理，为什么 DSH 还是直连？</strong>
+A: 系统代理只对遵循它的应用有效（浏览器等）。DSH 的 LLM 请求在 Node 宿主进程里用 undici fetch 发出，不读系统代理——这正是本插件存在的原因。</p>
+<p><strong>Q: 和 Clash TUN 模式冲突吗？</strong>
+A: 不冲突。两者任选其一即可；同时开也没问题（请求会经代理端口再进 Clash，规则分流依然生效）。</p>
+<p><strong>Q: 会影响插件市场、web 搜索吗？</strong>
+A: 会——进程内所有全局 fetch 都走代理。在 Clash 规则模式下这正是期望行为：国内站点依然直连。</p>
+<p><strong>Q: 支持 SOCKS5 吗？</strong>
+A: 不支持。undici 的 ProxyAgent 只接受 HTTP/HTTPS 代理。Clash/mihomo 的混合端口同时提供 HTTP 代理能力，填它即可。</p>
+<h2>开发</h2>
+<pre><code>npm install
+npm run build      # tsc -&gt; lib/
+npm test           # node --test test/
+# 带真实代理的 live 测试：
+$env:DSH_PROXY_LIVE='1'; npm test
+</code></pre>
+<h2>License</h2>
+<p><a href="https://github.com/BuLongY/dsh-proxy/blob/HEAD/LICENSE">MIT</a></p>

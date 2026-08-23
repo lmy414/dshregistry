@@ -1,0 +1,104 @@
+<h1>dsh-git-ai</h1>
+<p>English | <a href="https://github.com/NiuZhuang/dsh-git-ai/blob/HEAD/README.zh.md">中文</a></p>
+<p><a href="https://github.com/NiuZhuang/dsh-git-ai">GitHub</a> · <a href="https://www.npmjs.com/package/dsh-git-ai">npm</a> · <a href="https://github.com/NiuZhuang/dsh-git-ai/issues">Issues</a></p>
+<p>A <a href="https://github.com/deepseek-ai/deepseek-harness">DeepSeek Harness</a> plugin that records which files the agent edited, with which model, and in which session into <a href="https://github.com/git-ai-project/git-ai">git-ai</a>. It listens on the harness's <code>tools/pre-execute</code> / <code>tools/post-execute</code> interception points, translates each relevant tool call into git-ai's generic <a href="https://usegitai.com/docs/cli/add-your-agent"><code>agent-v1</code></a> checkpoint payload, and invokes <code>git-ai checkpoint &lt;preset&gt; --hook-input stdin</code> with that JSON on stdin. git-ai itself is never modified; after the agent commits, git-ai writes the attribution into git notes and reports <code>ai_additions</code>/<code>ai_accepted</code> per tool-model pair.</p>
+<h2>Preview</h2>
+<p>Hover over a line of code in VS Code to see who wrote it, with which model, and in which DeepSeek Harness session it was generated:</p>
+<p><img src="https://raw.githubusercontent.com/NiuZhuang/dsh-git-ai/main/docs/image.png" alt="Git AI attribution popover"></p>
+<h2>Requirements</h2>
+<ul>
+<li>DeepSeek Harness installed via npm (<code>npx @deepseek-ai/dsh@latest</code>) — the plugin peer-depends on the official <code>@deepseek-ai/*</code> packages it ships with.</li>
+<li><a href="https://github.com/git-ai-project/git-ai">git-ai</a> installed and on <code>PATH</code> (or point <code>gitAiPath</code> at it).</li>
+</ul>
+<h2>Install</h2>
+<p>The package ships as a profile bundle: installing it and activating the patch is one command.</p>
+<pre><code>dsh plugin --profile web add dsh-git-ai
+</code></pre>
+<blockquote>
+<p><strong>pnpm ≥ 10 note:</strong> <code>dsh plugin add</code> forwards to pnpm, and pnpm 10+ rejects adding to a
+workspace root with <code>ERR_PNPM_ADDING_TO_ROOT</code>. dsh profiles are pnpm workspace roots by
+design, so on machines with pnpm ≥ 10 use <code>-w</code> (or add <code>ignore-workspace-root-check: true</code>
+to <code>~/.dsh/profiles/&lt;profile&gt;/pnpm-workspace.yaml</code> once):</p>
+<pre><code>dsh plugin --profile web add -w dsh-git-ai
+</code></pre>
+</blockquote>
+<p><code>dsh plugin</code> forwards to pnpm inside your profile directory and auto-activates the bundle because the package declares <code>dsh.bundle</code>. Without the bundle mechanism (or to load it in a custom profile), add the row to your profile's <code>cordis.patch.yml</code>:</p>
+<pre><code>- dsh-git-ai:
+    gitAiPath: git-ai
+    agentName: deepseek-harness
+</code></pre>
+<h2>Config</h2>
+<pre><code>import type { Config } from 'dsh-git-ai'
+const config: Config = {
+  gitAiPath: 'git-ai',                  // optional: git-ai executable (bare name resolves through PATH)
+  agentName: 'deepseek-harness',        // optional: `agent_name` stamped on every checkpoint
+  model: '',                            // optional: explicit model; empty falls back to agent.options.model
+  checkpointPreset: 'agent-v1',         // optional: the git-ai generic-integration preset
+  timeoutMs: 10_000,                    // optional: git-ai invocation timeout
+  trackBash: true,                      // optional: emit pre/post shell checkpoints for bash/pwsh
+}
+</code></pre>
+<h2>Checkpoint mapping</h2>
+<table>
+<thead>
+<tr>
+<th>Harness point</th>
+<th>Tool</th>
+<th>git-ai payload</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>tools/post-execute</code> (success)</td>
+<td><code>write</code>, <code>edit</code></td>
+<td><code>ai_agent</code> with <code>edited_filepaths</code> from <code>file_path</code></td>
+</tr>
+<tr>
+<td><code>tools/post-execute</code> (success)</td>
+<td><code>str_replace_editor</code> (not <code>view</code>)</td>
+<td><code>ai_agent</code> with <code>edited_filepaths</code> from <code>path</code></td>
+</tr>
+<tr>
+<td><code>tools/pre-execute</code></td>
+<td><code>bash</code>, <code>pwsh</code></td>
+<td><code>pre_shell_command</code> with <code>command</code> and <code>tool_use_id</code></td>
+</tr>
+<tr>
+<td><code>tools/post-execute</code></td>
+<td><code>bash</code>, <code>pwsh</code></td>
+<td><code>post_shell_command</code> with <code>command</code> and <code>tool_use_id</code></td>
+</tr>
+</tbody></table>
+<p>Payload identity fields: <code>repo_working_dir</code> is the session cwd (falling back to the process cwd), <code>agent_name</code> is <code>config.agentName</code>, <code>model</code> is <code>config.model</code> when set else <code>agent.options.model</code> (else <code>''</code>), and <code>conversation_id</code> is the session id. Relative <code>file_path</code> / <code>path</code> values are resolved against the session cwd into absolute paths; absolute values pass through unchanged. <code>str_replace_editor</code> <code>view</code> commands are read-only and never attributed.</p>
+<p>A failed edit (<code>result.isError === true</code>) emits nothing; a failed bash command still emits its <code>post_shell_command</code> so the before/after pair closes. Bash tracking keys on the tool <code>callId</code>, so pre and post checkpoints share <code>tool_use_id</code>.</p>
+<h2>Failure containment</h2>
+<p>git-ai is an optional external dependency. A missing binary, nonzero exit, timeout, or executor rejection is logged as a warning and never propagated: the tool call and the agent turn proceed exactly as if the plugin were absent.</p>
+<h2>Verification</h2>
+<pre><code># 1. start the harness with the plugin loaded
+dsh web
+# 2. have the agent edit files in a git repository
+# 3. check git-ai received the checkpoints
+git-ai status --json
+# 4. commit
+git add -A &amp;&amp; git commit -m "test"
+# 5. check attribution
+git-ai stats HEAD --json
+</code></pre>
+<h2>Development</h2>
+<pre><code>pnpm install
+pnpm test          # vitest, 100% coverage on src/
+pnpm typecheck
+pnpm build         # emits lib/ for publishing
+</code></pre>
+<h2>Publishing</h2>
+<pre><code>pnpm build
+pnpm publish --access public
+</code></pre>
+<h2>Known Limitations and Deferred Work</h2>
+<ul>
+<li><strong>File-edit tools emit only the post-edit <code>ai_agent</code> checkpoint.</strong> git-ai attributes a file's changed lines against HEAD or the last checkpointed value, so uncommitted edits made to the same file before the agent's edit (e.g. by the user) are also attributed to the agent. A pre-edit <code>human</code> checkpoint before each edit tool would isolate them; the bash pre/post pair already provides this isolation for shell commands.</li>
+<li><strong>An unmatched <code>pre_shell_command</code> is possible.</strong> If a bash tool is denied or canceled between pre and post, the pre snapshot stays open and later changes to the same files are treated as untracked by git-ai until the next checkpoint.</li>
+<li><strong>Synchronous invocation latency.</strong> Each tracked tool call awaits its git-ai checkpoint (bounded by <code>timeoutMs</code>) before the tool result settles.</li>
+<li><strong>Bash output attribution is snapshot-based.</strong> git-ai infers changed files from file snapshots, so a command that edits files outside the repo tree is not attributed.</li>
+</ul>
+<h2>License</h2>
+<p>MIT</p>

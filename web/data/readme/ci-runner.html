@@ -1,0 +1,328 @@
+<p><a href="https://github.com/JohnXu22786/ci-runner/blob/HEAD/README.zh.md">简体中文</a></p>
+<h1>ci-runner</h1>
+<p>Trigger your CI and get it fixed — a dsh plugin bundle that runs GitHub
+Actions workflows and local test pipelines, streams their logs back, tracks
+their status, and when something fails hands the tail of the log to DeepSeek
+for a Markdown root-cause report with fix steps.</p>
+<ul>
+<li><strong>Two sources, one interface</strong>: GitHub Actions via <code>workflow_dispatch</code>
+(+ check-run APIs) and local command pipelines (<code>npm test</code>, <code>pytest</code>, …)
+through the platform shell.</li>
+<li><strong>Bounded log reading</strong>: GitHub job logs streamed back per job and
+tail-truncated; local output captured with a per-stream cap so a runaway
+process can't blow up the agent context.</li>
+<li><strong>DeepSeek diagnosis</strong>: on failure, the tail log plus a heuristic error
+classification is sent to the harness <code>ctx.llm</code> (or any configured
+OpenAI-compatible endpoint) to produce a report covering failure stage,
+error classification, most likely root cause, suggested fix steps and
+related files.</li>
+<li><strong>Status tracking</strong>: poll runs to completion (<code>queued</code> / <code>in_progress</code> /
+<code>completed</code>) with configurable interval and a hard timeout.</li>
+<li><strong>Credentials by environment only</strong>: the GitHub token is read from an
+environment variable at call time, never logged and never persisted; every
+returned log and report is masked against known secrets.</li>
+<li><strong>Zero runtime dependencies</strong>: <code>fetch</code> + <code>node:child_process</code>, plain
+Node.js ESM, ships with five tools (<code>ci_trigger</code>, <code>ci_status</code>, <code>ci_logs</code>,
+<code>ci_watch</code>, <code>ci_diagnose</code>) and a matching CLI.</li>
+</ul>
+<h2>How it works</h2>
+<pre><code>your repo / your machine
+   │   workflow_dispatch + check-run APIs      shell (npm test, pytest, …)
+   ▼                                          ▼
+GitHubApi (fetch)                    LocalRunner (child_process)
+   │                                          │
+   └──────────────► CiService ◄────────────────┘
+        │    trigger · status · logs · watch · diagnose
+        ├─► dsh adapter: five ci_* tools on ctx.tools (ctx.llm for analysis)
+        ├─► CLI:        ci-runner trigger|status|logs|watch|diagnose
+        └─► report:     Markdown with the five canonical sections
+</code></pre>
+<p>All state (stored local runs, config, secret-masking) lives in one
+<code>CiService</code> instance, so tools and CLI behave identically. The dsh adapter
+and the CLI are two thin entry points over it.</p>
+<h2>Requirements</h2>
+<ul>
+<li>Node.js &gt;= 18.17 (global <code>fetch</code>)</li>
+<li>For the dsh integration: a working DeepSeek Harness install providing the
+<code>tools</code> service (and, for model-powered diagnosis, the <code>llm</code> service).</li>
+<li>A GitHub token in the environment (<code>GITHUB_TOKEN</code> by default) with
+<code>actions:write</code> scope for dispatch and <code>actions:read</code> for status/logs.</li>
+</ul>
+<h2>Installation into dsh</h2>
+<h3>As a dsh bundle (recommended)</h3>
+<p>A bundle is an npm package that contributes a configuration layer. From the
+profile you want to use:</p>
+<pre><code>dsh plugin --profile demo add ./path/to/ci-runner
+</code></pre>
+<p>This links the checkout and appends <code>dsh-ci-runner</code> to the profile's bundle
+list because <code>package.json</code> declares <code>dsh.bundle</code>. Verify and boot:</p>
+<pre><code>dsh --profile demo --dump-config   # shows the "# == dsh-ci-runner" layer
+dsh --profile demo
+</code></pre>
+<p>The contributed patch layer (<code>cordis.patch.yml</code>) inserts one plugin row
+mounting the adapter entry (a package subpath resolved through the package's
+<code>exports</code> map):</p>
+<pre><code>- insert:
+    - id: ci-runner
+      name: dsh-ci-runner/adapter
+</code></pre>
+<h3>As a patch overlay (no packaging)</h3>
+<p>Point the plugin row directly at the adapter source. Create an overlay file
+<code>ci-runner-patch.yml</code>:</p>
+<pre><code>- insert:
+    - id: ci-runner
+      name: '&lt;abs-path&gt;/src/adapter.js'
+</code></pre>
+<p>and pass it to the harness:</p>
+<pre><code>dsh --patch ./ci-runner-patch.yml
+</code></pre>
+<h3>Applying plugin config</h3>
+<p>When installed as a bundle, plugin configuration is set through the profile
+config (the layer contributed by the bundle) — every field is optional and
+defaulted:</p>
+<pre><code># profile/config.yml
+ci-runner:
+  github:
+    defaultRepo: acme/app
+    defaultBranch: main
+  diagnosis:
+    llm:
+      baseUrl: https://api.deepseek.com/v1
+      apiKey: sk-...
+      model: deepseek-chat
+</code></pre>
+<p>Without <code>diagnosis.llm</code>, analysis routes through the harness <code>ctx.llm</code>
+service (preferred — matches the harness's configured provider). If neither
+exists, diagnosis still produces a deterministic report (stage +
+classification + log tail) with a note about the missing model.</p>
+<h2>Configuration</h2>
+<table>
+<thead>
+<tr>
+<th>Field</th>
+<th>Default</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>github.tokenEnv</code></td>
+<td><code>GITHUB_TOKEN</code></td>
+<td>Env var holding the GitHub token (read at call time, never logged)</td>
+</tr>
+<tr>
+<td><code>github.defaultRepo</code></td>
+<td><code>''</code></td>
+<td>Default <code>owner/repo</code> for GitHub calls</td>
+</tr>
+<tr>
+<td><code>github.defaultBranch</code></td>
+<td><code>main</code></td>
+<td>Ref used when a trigger doesn't specify one</td>
+</tr>
+<tr>
+<td><code>github.apiBase</code></td>
+<td><code>https://api.github.com</code></td>
+<td>REST base (GitHub Enterprise override)</td>
+</tr>
+<tr>
+<td><code>github.pollIntervalMs</code></td>
+<td><code>5000</code></td>
+<td>Poll interval for status tracking</td>
+</tr>
+<tr>
+<td><code>github.pollTimeoutMs</code></td>
+<td><code>600000</code></td>
+<td>Hard cap for waiting on a run</td>
+</tr>
+<tr>
+<td><code>github.dispatchWindowMs</code></td>
+<td><code>20000</code></td>
+<td>How long a dispatch may take to surface a run id</td>
+</tr>
+<tr>
+<td><code>github.requestTimeoutMs</code></td>
+<td><code>30000</code></td>
+<td>Per-request HTTP timeout</td>
+</tr>
+<tr>
+<td><code>github.readLogChars</code></td>
+<td><code>30000</code></td>
+<td>Default tail cap for <code>ci_logs</code></td>
+</tr>
+<tr>
+<td><code>local.cwd</code></td>
+<td><code>.</code></td>
+<td>Working directory for command runs</td>
+</tr>
+<tr>
+<td><code>local.timeoutMs</code></td>
+<td><code>120000</code></td>
+<td>Hard timeout per command</td>
+</tr>
+<tr>
+<td><code>local.maxOutputChars</code></td>
+<td><code>40000</code></td>
+<td>Per-stream output cap</td>
+</tr>
+<tr>
+<td><code>local.templates</code></td>
+<td><code>[{name: 'npm test', command: 'npm test'}, {name: 'pytest', command: 'pytest'}]</code></td>
+<td>Named command templates</td>
+</tr>
+<tr>
+<td><code>diagnosis.llm</code></td>
+<td><code>null</code></td>
+<td>OpenAI-compatible endpoint override <code>{baseUrl, apiKey, model}</code></td>
+</tr>
+<tr>
+<td><code>diagnosis.provider</code></td>
+<td><code>''</code></td>
+<td><code>ctx.llm</code> provider route (<code>''</code> = auto)</td>
+</tr>
+<tr>
+<td><code>diagnosis.model</code></td>
+<td><code>''</code></td>
+<td><code>ctx.llm</code> model (<code>''</code> = auto)</td>
+</tr>
+<tr>
+<td><code>diagnosis.maxTailChars</code></td>
+<td><code>12000</code></td>
+<td>Chars of the log tail sent to the model</td>
+</tr>
+<tr>
+<td><code>diagnosis.timeoutMs</code></td>
+<td><code>120000</code></td>
+<td>Hard budget for the analysis call</td>
+</tr>
+<tr>
+<td><code>diagnosis.temperature</code></td>
+<td><code>0.2</code></td>
+<td>Sampling temperature</td>
+</tr>
+<tr>
+<td><code>diagnosis.providerLabel</code></td>
+<td><code>OpenAI-compatible</code></td>
+<td>Label recorded in reports when the endpoint override is used</td>
+</tr>
+</tbody></table>
+<p>Templates let the model and the CLI reference pipelines by name
+(<code>ci_trigger {source: local, command: 'npm test'}</code>). Any value that doesn't
+match a template name is treated as a raw shell command line.</p>
+<h2>Tools</h2>
+<table>
+<thead>
+<tr>
+<th>Tool</th>
+<th>Purpose</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>ci_trigger</code></td>
+<td>Dispatch a GitHub <code>workflow_dispatch</code> (returns the run id) or run a local pipeline to completion</td>
+</tr>
+<tr>
+<td><code>ci_status</code></td>
+<td>Single poll: status, conclusion, failed stage, jobs and steps</td>
+</tr>
+<tr>
+<td><code>ci_logs</code></td>
+<td>Read logs, masked and tail-truncated; <code>job</code> selects one job</td>
+</tr>
+<tr>
+<td><code>ci_watch</code></td>
+<td>(Optionally trigger and) wait until a run finishes; failed runs include the log tail</td>
+</tr>
+<tr>
+<td><code>ci_diagnose</code></td>
+<td>End-to-end: run/wait, then send the failure tail to the analysis provider and return the Markdown report</td>
+</tr>
+</tbody></table>
+<h3>Report structure</h3>
+<p><code>ci_diagnose</code> (and the CLI <code>diagnose</code> command) always emit the canonical
+sections:</p>
+<pre><code># CI Failure Report
+## Failure Stage          ← first failing job/step (or "Unknown")
+## Error Classification   ← heuristic rule-based pre-analysis
+## Most Likely Root Cause ← model analysis (or a note when no model is available)
+## Suggested Fix Steps    ← model analysis
+## Related Files          ← model analysis (or "None identifiable from the log")
+## Timeline               ← start/end/duration when known
+## Failure Log Tail       ← masked, tail-truncated
+</code></pre>
+<p>When a model is available, its free-form Markdown is parsed back into these
+sections before rendering, so the structure is stable even as the model's
+wording varies.</p>
+<h2>CLI</h2>
+<pre><code>ci-runner trigger  [--source github|local] [--repo owner/repo] [--workflow F]
+                   [--ref R] [--inputs k=v ...] [--command CMD] [--template T]
+                   [--cwd DIR]
+ci-runner status   [--source s] --run ID [--repo r]
+ci-runner logs     [--source s] --run ID [--job J] [--tail N] [--repo r]
+ci-runner watch    [--source s] [--run ID | trigger flags] [--timeout-ms N]
+                   [--interval-ms N] [--no-logs] [--json]
+ci-runner diagnose [--source s] [--run ID | trigger flags] [--save PATH]
+                   [--llm-base-url URL] [--llm-model M] [--llm-api-key K]
+</code></pre>
+<p>Global: <code>--config PATH</code> (JSON config file), <code>--json</code>, <code>--help</code>, <code>--version</code>.</p>
+<p>For <code>diagnose</code> without a config file, pass <code>--llm-base-url</code> (+ <code>--llm-model</code>
+and optionally <code>--llm-api-key</code>; keys can also come from <code>CI_RUNNER_LLM_API_KEY</code>
+or <code>OPENAI_API_KEY</code>).</p>
+<blockquote>
+<p>Local run ids are process-local: <code>status</code>/<code>logs</code> on a local run work with a
+run id captured inside the same invocation. Across CLI invocations, drive
+local pipelines with <code>watch</code>/<code>diagnose</code> + <code>--command</code> (or use GitHub runs,
+whose state lives server-side). Inside dsh, all five tools share one
+process, so captured run ids stay valid for the plugin's lifetime.</p>
+</blockquote>
+<h2>Examples</h2>
+<pre><code># GitHub: dispatch ci.yml on main with inputs and print the run id
+ci-runner trigger --workflow ci.yml --repo acme/app --ref main --inputs env=prod
+
+# Local: run the "pytest" template (or any raw command)
+ci-runner trigger --source local --template pytest --cwd ./api
+
+# Wait for run 123456789, show the tail if it failed
+ci-runner watch --run 123456789 --repo acme/app --timeout-ms 600000
+
+# Local failure → DeepSeek diagnosis (markdown report, also saved to disk)
+ci-runner diagnose --source local --command "npm test" \
+  --llm-base-url https://api.deepseek.com/v1 --llm-model deepseek-chat \
+  --save report.md
+</code></pre>
+<h2>Security notes</h2>
+<ul>
+<li>The GitHub token is read from <code>process.env[github.tokenEnv]</code> on every call
+and exists only in memory; it is never written to logs, reports or disk.</li>
+<li>All returned log text is masked against the GitHub token and any configured
+analysis API key (<code>***</code> substitution).</li>
+<li>Local commands run in the configured <code>cwd</code> only and are killed as a process
+tree on timeout — no orphaned grandchildren keep running.</li>
+<li>Diagnosis payloads contain the log tail only; the token never reaches the
+model.</li>
+</ul>
+<h2>Project layout</h2>
+<pre><code>bin/ci-runner.mjs        CLI launcher
+cordis.patch.yml         bundle patch layer (mounts the adapter row)
+src/
+  adapter.js             Cordis plugin entry: name / inject / Config / apply
+  index.js               public package surface (harness-free)
+  config.js              canonical config, defaults, validation
+  github.js              GitHub REST client (dispatch, runs, jobs, logs, checks)
+  local.js               child_process runner (timeout, tree-kill, capped capture)
+  logs.js                bounded buffers, tailing, ANSI cleanup, secret masking
+  classify.js            rule-based failure classification
+  llm.js                 prompt building + OpenAI-compatible client (harness-free)
+  dsh-llm.js             ctx.llm stream adapter (harness-side)
+  diagnose.js            run metadata + Markdown report assembly
+  service.js             cross-source orchestration (tools and CLI share it)
+  tools.js               the five ci_* tool definitions
+  cli.js                 CLI implementation
+test/                    node:test suites (mock GitHub API, temp scripts, diagnosis flow)
+examples/                config + profile overlay examples
+</code></pre>
+<h2>Test</h2>
+<pre><code>npm install   # peer deps (schemastery, dsh-llm) for the adapter tests
+npm test      # node --test
+</code></pre>
+<h2>License</h2>
+<p>MIT</p>

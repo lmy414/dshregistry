@@ -1,0 +1,86 @@
+<h1>dsh-llm-api-pool</h1>
+<blockquote>
+<p>为 <strong>opencode go</strong> 设计的 API 池:根据余额热管理切换不同 API key。</p>
+</blockquote>
+<p>把多个 opencode go 订阅(每个 = 一个 <code>{baseUrl, apiKey}</code>)收进一个池,实时掌握每个 key 的官方用量/余额,并按"余量最大者优先"自动路由模型请求;一个 key 用满或失败时,自动热切换到下一个。</p>
+<h2>核心能力</h2>
+<ul>
+<li><strong>多 API key 池</strong>:条目主键 = <code>{baseUrl, apiKey}</code>。同一个 key 重复添加 = 原地更新配置;不同 key = 新订阅。同时管理任意多个 opencode go 订阅,无需命名约定。</li>
+<li><strong>官方余额/用量查询(纯 API Key,无需 org token)</strong>:对每个 opencode 条目调用网关原生 <code>GET https://opencode.ai/zen/go/v1/usage</code>,返回<strong>官方</strong> rolling(5h)/weekly(周)/monthly(月)三重限额的用量百分比与精确重置时刻。美元数值 = <code>百分比 × 限额</code> 的换算供参考,不是 opcode 官方返回的原始金额。</li>
+<li><strong>余额驱动热切换</strong>:路由决策优先使用官方用量压力(<code>remotePressure</code>,<code>usageRemote</code> 缓存 5 分钟 TTL);模型请求前若官方用量过期则非阻塞刷新,选出<strong>余量最大</strong>的订阅;失败(429/5xx/超时)冷却该 key 60 秒并自动尝试下一个。</li>
+<li><strong>设置页 UI</strong>:设置 →「LLM API 池」:添加/删除/启停条目、探查模型、每张卡片独立展示官方限额(进度条 + 换算美元 + 重置时刻)、路由预览。</li>
+</ul>
+<h2>安装</h2>
+<pre><code>dsh plugin --profile web add dsh-llm-api-pool
+</code></pre>
+<p>包声明了 <code>dsh.bundle.patch</code> + <code>dsh.client</code>,<code>dsh plugin add</code> 会:</p>
+<ol>
+<li>把包加入 profile 依赖;</li>
+<li>发现 <code>dsh.bundle.patch</code> → 自动把 <code>dsh-llm-api-pool</code> 追加进 <code>dsh.profile.bundles</code>;</li>
+<li>启动时合成 <code>cordis.patch.yml</code>:host 半(池管理 + <code>/llm-pool/api</code> JSON 路由 + <code>/llm-pool/v1</code> OpenAI 兼容端点 + <strong>DSH 原生模型 provider 自动注册</strong>)挂进 host 组合;<code>dsh.client</code> 声明让 client 半(设置页)被 web shell 装载。</li>
+</ol>
+<blockquote>
+<p>安装/挂载的机制引用自 dsh 官方 CLI 协调流程;发布包自身通过 <code>test/smoke-static.mjs</code> 守护 host 半的注册与路由回路,完整 Web 挂载与重启后的设置页渲染请在首次安装后核对。</p>
+</blockquote>
+<h2>使用</h2>
+<ol>
+<li>打开 <strong>设置 → LLM API 池</strong>;</li>
+<li><strong>+ 添加 API</strong>:预设选 OpenCode Go(自动填入 <code>https://opencode.ai/zen/go/v1</code> 与 5h $12 / 周 $30 / 月 $60 限额),粘贴 <code>OPENCODE_API_KEY</code> → 添加并自动探查模型列表;</li>
+<li>卡片上 <strong>「刷新限额 / 查询余额」</strong> 调用官方 <code>/usage</code> 端点,显示 <code>[官方] $x.xx / $cap (p%) · 重置 HH:MM:SS</code>(p% 为官方百分比,$ 为换算值);</li>
+<li>添加第二个订阅(不同 key)→ 第二张卡片,各自独立余额;模型请求自动优先路由到余量最大的订阅,失败自动切换。</li>
+</ol>
+<p>模型也可直接调用池工具:<code>llm_pool_list</code> / <code>llm_pool_add</code> / <code>llm_pool_remove</code> / <code>llm_pool_update</code> / <code>llm_pool_probe</code> / <code>llm_pool_usage</code> / <code>llm_pool_limits</code> / <code>llm_pool_route</code> / <code>llm_pool_chat</code> / <code>llm_pool_balance</code>。</p>
+<h2>作为 DSH 原生 provider 使用(0.1.6,零配置)</h2>
+<p>装载后插件<strong>自动</strong>向 DSH 注册一个名为 <strong>LLM API Pool (余额热切换)</strong> 的模型 provider:</p>
+<ul>
+<li><strong>模型选择器自动出现</strong>:模型列表 = 池内所有条目探查到的模型并集,选中任何一个即走池路由(余额热切换自动接管);</li>
+<li><strong>模型设置页自动显示该 provider 行</strong>:显示为已就绪,没有任何需要填写的字段(baseUrl/apiKey 都来自池,不在模型设置里);</li>
+<li>池为空时 provider 的模型列表为空,添加第一个 key 后自动出现。</li>
+</ul>
+<p>无需手动添加 provider、无需填 baseUrl/apiKey。</p>
+<h2>作为 OpenAI 兼容 provider 接入(0.1.5)</h2>
+<p>池本身暴露了 OpenAI 兼容端点,复用 DSH Web 服务端口(默认 <code>127.0.0.1:3080</code>),任何 OpenAI 客户端把 baseUrl 指过来即可透明享受余额热切换——apiKey 任意(路由由池内的条目决定):</p>
+<ul>
+<li><code>GET  http://127.0.0.1:3080/llm-pool/v1/models</code> — 池内所有条目探查到的模型并集;</li>
+<li><code>POST http://127.0.0.1:3080/llm-pool/v1/chat/completions</code> — OpenAI chat 输入 → 池路由 → OpenAI 输出;<code>stream:true</code> 时返回 SSE 流。</li>
+</ul>
+<p><strong>DSH 自身</strong>:模型设置中新增自定义 provider,baseUrl = <code>http://127.0.0.1:3080/llm-pool/v1</code>,apiKey 任意,模型名填池内已探查的模型(如 <code>deepseek-chat</code>)。</p>
+<p><strong>opencode CLI</strong>(官方做法:自定义 provider 覆写 baseURL,参考 <a href="https://opencode.ai/docs/providers/">opencode providers 文档</a>):</p>
+<pre><code>// opencode.json
+{
+  "provider": {
+    "dsh-pool": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "DSH LLM API Pool",
+      "options": {
+        "baseURL": "http://127.0.0.1:3080/llm-pool/v1",
+        "apiKey": "any-value"
+      },
+      "models": {
+        "deepseek-chat": { "name": "DeepSeek Chat (pooled)" }
+      }
+    }
+  }
+}
+</code></pre>
+<p><strong>任意 OpenAI SDK</strong>:<code>baseURL</code> 指向 <code>http://127.0.0.1:3080/llm-pool/v1</code>,<code>apiKey</code> 填任意值,<code>chat.completions.create({ model, messages })</code> 即走池路由。</p>
+<blockquote>
+<p>端口跟随 DSH Web 服务(<code>webStartup.port</code>,默认 3080);若改动过 Web 端口,请同步替换上文 URL。</p>
+</blockquote>
+<h2>卸载</h2>
+<pre><code>dsh plugin --profile web remove dsh-llm-api-pool
+</code></pre>
+<p>移除后池文件(见下)保留在磁盘,如不再需要可手动删除。</p>
+<h2>数据与安全</h2>
+<ul>
+<li>条目持久化在 <code>sandboxPolicy.workspaceRoot/.dsh-llm-api-pool.json</code>:含 <strong>API key 明文</strong>(本机文件权限保护)、官方用量缓存、本地账本。请勿将该文件提交到版本库。</li>
+<li>插件在 host 进程内会向 <code>opencode.ai</code> / <code>console.opencode.ai</code> 发起只读的用量查询请求,并在你主动调用 <code>llm_pool_chat</code> 时向条目 baseUrl 发送模型请求。</li>
+</ul>
+<h2>开发与测试</h2>
+<pre><code>npm test          # 静态包冒烟:mock ctx 下跑通 10 工具注册 + /llm-pool/api + /llm-pool/v1 OpenAI 端点 + DSH 原生 provider 注册/stream(20 项断言)
+node ../llm-pool-test/e2e.test.mjs             # 完整 E2E:39 项(T1 host / T1c provider 注册 / T1b 多订阅路由 / T2 client 渲染 / T3 live 端点 / T4 真实 key)
+LLM_POOL_TEST_KEY=sk-... node ../llm-pool-test/e2e.test.mjs   # 真实 key 全生命周期(增查改删 + 真实余额 + 真实 chat)
+</code></pre>
+<p>E2E 套件位于仓库外(<code>../llm-pool-test/</code>),守护的动态逻辑与发布包 host 半逐字一致(发布包已静态化转换并单独冒烟)。</p>
+<h2>License</h2>
+<p>MIT</p>

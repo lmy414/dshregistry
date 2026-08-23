@@ -1,0 +1,119 @@
+<h1>dsh-provider-rate-limit</h1>
+<p>English | <a href="https://github.com/jyao-SUSE-power-group/dsh-provider-rate-limit/blob/HEAD/README.zh-CN.md">简体中文</a></p>
+<p>Per-provider <strong>&amp;</strong> per-model rate limiting for <a href="https://github.com/deepseek-ai/dsh">DeepSeek Harness</a> LLM traffic, plus gateway identity rules (client spoofing) for restricted free-tier gateways.</p>
+<p>适用于 DeepSeek Harness 的按供应商/模型粒度 LLM 限速插件，附带网关身份规则（客户端伪装）能力。</p>
+<h2>Features</h2>
+<ul>
+<li><strong>Token-bucket rate limiting</strong> per <code>(provider, model)</code> route — smooth refill with burst support, idle-time recovery</li>
+<li><strong>Two modes</strong> when the bucket is empty:<ul>
+<li><code>wait</code> — hold the request up to <code>maxWaitMs</code>, then let it through (transparent queueing)</li>
+<li><code>reject</code> — short-circuit immediately with a synthetic <code>RATE_LIMIT</code> response carrying <code>providerRetryAfterMs</code></li>
+</ul>
+</li>
+<li><strong>Strict FIFO</strong> — reservation-based design guarantees same-order admission without polling</li>
+<li><strong>Gateway identity rules</strong> — rewrite <code>User-Agent</code> / inject static headers for URLs matching a pattern (e.g. gateways that validate client identity), with a one-click <strong>OpenCode Zen</strong> preset</li>
+<li><strong>Master switch</strong> — flip <code>enabled</code> off to pass all traffic instantly, no listener re-registration</li>
+<li><strong>Settings UI card</strong> — full configuration from the Harness settings page, zh/en localized</li>
+<li><strong>Stats Dashboard</strong> — live panel below the settings card showing rejected/queued counts, avg wait time, active routes (auto-refreshes every 5s)</li>
+<li><strong>Stats Service</strong> — exposes <code>provider-rate-limit/stats</code> for cross-plugin telemetry (getStats, getAllStats, getAggregateStats, resetStats)</li>
+<li><strong>O(1) route lookup</strong> — pre-built Map for rule matching instead of linear scan</li>
+<li><strong>Standard ULID</strong> — 26-char Crockford base-32 IDs (48-bit big-endian time + 80-bit random)</li>
+</ul>
+<h2>Install</h2>
+<p>From the DSH plugin market (search <code>dsh-provider-rate-limit</code>), or manually:</p>
+<pre><code>git clone https://github.com/jyao-SUSE-power-group/dsh-provider-rate-limit.git ~/.dsh/plugins/dsh-provider-rate-limit
+cd ~/.dsh/plugins/dsh-provider-rate-limit &amp;&amp; pnpm install --prod
+</code></pre>
+<p>Then restart DeepSeek Harness. The plugin registers itself into the <code>llm</code> service via its cordis patch.</p>
+<h2>Configuration</h2>
+<p>Open <strong>Settings → 插件 → Provider Rate Limit</strong>. All options hot-reload — no restart needed.</p>
+<table>
+<thead>
+<tr>
+<th>Option</th>
+<th>Default</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>enabled</code></td>
+<td><code>true</code></td>
+<td>Master switch; <code>false</code> passes everything untouched</td>
+</tr>
+<tr>
+<td><code>requestsPerMinute</code></td>
+<td><code>20</code></td>
+<td>Global steady-state rate (applies when no route rule matches)</td>
+</tr>
+<tr>
+<td><code>burst</code></td>
+<td><code>4</code></td>
+<td>Bucket capacity — how many requests may fire back-to-back</td>
+</tr>
+<tr>
+<td><code>mode</code></td>
+<td><code>wait</code></td>
+<td><code>wait</code> = queue up to <code>maxWaitMs</code>; <code>reject</code> = fail fast</td>
+</tr>
+<tr>
+<td><code>maxWaitMs</code></td>
+<td><code>30000</code></td>
+<td>Longest queue time in <code>wait</code> mode before falling back to <code>reject</code> behavior</td>
+</tr>
+<tr>
+<td><code>models</code></td>
+<td><code>[]</code></td>
+<td>Per-route overrides: match by provider/model substring, each with its own RPM/burst</td>
+</tr>
+</tbody></table>
+<h3>Route rules</h3>
+<p>Route rules match on substrings of the resolved provider id and model name, e.g. provider <code>opencode</code> + model <code>claude-*</code>. The most specific matching rule wins; unmatched traffic uses the global limits.</p>
+<h3>Identity rules</h3>
+<p>Some free-tier gateways (e.g. OpenCode Zen) reject clients whose requests don't look like their official tooling. Identity rules let selected outbound URLs carry a different identity:</p>
+<ul>
+<li><code>urlPattern</code> — substring match against the request URL</li>
+<li><code>userAgent</code> — replacement <code>User-Agent</code></li>
+<li><code>dynamicIds</code> — adds the per-request <code>x-opencode-client/project/session/request</code> header set</li>
+<li><code>headers</code> — arbitrary static headers (<code>Name: Value</code> pairs), applied last so they can override everything above</li>
+</ul>
+<p>The fetch patch is ref-counted and unwinds cleanly: when the plugin deactivates, native <code>fetch</code> is restored exactly once, and a patch layered above ours in the meantime is never clobbered.</p>
+<blockquote>
+<p>⚠️ Only spoof identities for services you are legitimately entitled to use, and in accordance with their terms.</p>
+</blockquote>
+<h2>How it works</h2>
+<p>Every outbound LLM stream passes through one <code>llm/stream</code> hook (a waterfall choke point covering agent loops, title generation, and compaction). Each call synchronously <em>reserves</em> a slot in the route's token bucket:</p>
+<pre><code>waitMs = bucket.reserve()        // exact wait, computed from a monotonic floor
+if waitMs === 0                  → pass through immediately
+else if mode=wait &amp;&amp; ≤ maxWaitMs → sleep(waitMs), then pass
+else                             → yield RATE_LIMIT finish (+ Retry-After hint)
+</code></pre>
+<p>The bucket floor is <code>now − (capacity − 1) × interval</code>, which gives classic burst-and-recover semantics: after idle time the bucket is implicitly full again, and resizing capacity/rate at runtime never mints a free burst.</p>
+<h2>Cross-Plugin Stats API</h2>
+<p>Other plugins can query rate-limit statistics:</p>
+<pre><code>// In a plugin's apply(ctx):
+const stats = ctx.get("provider-rate-limit/stats");
+
+// Per-route stats
+const routeStats = stats.getStats("opencode", "deepseek-v4-flash-free");
+// → { reserved, waited, totalWaitMs, rejected, avgWaitMs, peekWaitMs }
+
+// All routes
+const all = stats.getAllStats();
+// → { "opencode\u0000deepseek-v4-flash-free": {...}, ... }
+
+// Aggregate across all routes
+const agg = stats.getAggregateStats();
+// → { reserved, waited, totalWaitMs, rejected, avgWaitMs, routes }
+
+// Reset counters (for per-window accounting)
+stats.resetStats();              // all routes
+stats.resetStats("opencode", "v3"); // specific route
+</code></pre>
+<h2>Development</h2>
+<pre><code>pnpm install
+npm test   # 19 tests: bucket behavior, FIFO, abort/reject, identity patch,
+           # dispose, master switch, ULID format, stats service, multi-provider,
+           # maxWaitMs timeout, hot-update retune, error handling
+</code></pre>
+<h2>License</h2>
+<p><a href="https://github.com/jyao-SUSE-power-group/dsh-provider-rate-limit/blob/HEAD/LICENSE">MIT</a></p>

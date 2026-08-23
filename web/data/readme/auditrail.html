@@ -1,0 +1,514 @@
+<h1>dsh-audit-trail</h1>
+<p>Security auditing &amp; session forensics for <a href="https://github.com/deepseek-ai/deepseek-harness">DeepSeek Harness</a> (dsh).</p>
+<p>A dsh <strong>bundle</strong> (plugin) that records every tool-invocation across the harness
+session stream and the tool pipeline, flags high-risk operations, persists a
+redacted, hash-chained audit trail to SQLite, and gives you query, export,
+policy, and plain-text replay tools — plus a standalone CLI that works on the
+same database without starting the harness.</p>
+<blockquote>
+<p><strong>Fills a gap:</strong> the dsh ecosystem has observability plugins for <em>performance</em>
+(OTel / Prometheus). Nobody was doing a <em>security</em> audit trail — complete
+tool-invocation-chain recording with sensitive-operation marking, privacy
+masking, query/export, and text-terminal replay. That is what this bundle is.</p>
+</blockquote>
+<hr>
+<h2>Table of contents</h2>
+<ul>
+<li><a href="#what-it-does">What it does</a></li>
+<li><a href="#how-it-works">How it works</a></li>
+<li><a href="#install--integrate-with-dsh">Install &amp; integrate with dsh</a></li>
+<li><a href="#configuration">Configuration</a></li>
+<li><a href="#model-facing-tools">Model-facing tools</a></li>
+<li><a href="#cli">CLI</a></li>
+<li><a href="#replay">Replay</a></li>
+<li><a href="#compliance-export-format">Compliance export format</a></li>
+<li><a href="#sensitive-operation-rules">Sensitive-operation rules</a></li>
+<li><a href="#privacy--redaction">Privacy &amp; redaction</a></li>
+<li><a href="#sqlite-schema">SQLite schema</a></li>
+<li><a href="#project-layout">Project layout</a></li>
+<li><a href="#development">Development</a></li>
+<li><a href="#license">License</a></li>
+</ul>
+<hr>
+<h2>What it does</h2>
+<ol>
+<li><strong>Complete audit chain recording</strong> — subscribes to the append-only
+<code>session/event</code> stream and the live tool pipeline (<code>tools/result</code>,
+<code>tools/change</code>) and records, for every event: <em>who</em> (session/actor), <em>when</em>
+(timestamp + sequence), <em>which command</em> (tool name + masked argument
+digest), <em>which files</em> were touched, <em>which outbound network destinations</em>
+were targeted, <em>result status</em>, and <em>duration</em>.</li>
+<li><strong>Sensitive-operation marking</strong> — a configurable rule table detects
+high-risk patterns (<code>rm -rf</code>, <code>curl | sh</code>, key/secret material, destructive
+git/db operations, outbound exfil-style requests, privilege escalation, …)
+and attaches severity + rule tags to the affected records.</li>
+<li><strong>SQLite (WAL) persistence with privacy</strong> — all stored content is masked
+and truncated by default; nothing raw is persisted unless you relax the
+redaction config. An append-only hash chain ties each row to the previous
+one, so tampering is detectable with <code>auditrail chain verify</code>.</li>
+<li><strong>Query &amp; export</strong> — filter records by time window, session, tool, minimum
+severity, sensitive-rule tag, and kind; export JSON reports, Markdown
+reports, or the fixed-format compliance JSONL (with optional hash chain).</li>
+<li><strong>Session replay</strong> — render the audit trail as a plain-text terminal
+timeline and slow-play it with pause / step / seek / speed controls. No
+browser involved.</li>
+<li><strong>Compliance output</strong> — a versioned, fixed-format JSONL (<code>schema: dsh-audit-trail/compliance/1</code>) that third parties can validate with the
+bundled verifier or their own tooling.</li>
+<li><strong>Tool chain</strong> — four model-facing tools (<code>audit_query</code>, <code>audit_export</code>,
+<code>audit_playback</code>, <code>audit_policy</code>) plus a standalone CLI (<code>auditrail</code>).</li>
+</ol>
+<hr>
+<h2>How it works</h2>
+<pre><code> ┌────────────── dsh harness ──────────────┐
+ │ session/event  (append-only durable log) │
+ │ tools/result   (live tool dispatch)      │
+ │ tools/change   (registry changes)        │
+ └──────────────┬──────────────────────────-┘
+                │  Recorder (contained, never throws)
+                ▼
+        Normalize → RuleEngine (flag) → Redact/mask/truncate
+                │
+                ▼
+        AuditStore (SQLite, WAL, hash chain, tags)
+                │
+        ┌───────┴───────────┐
+        ▼                   ▼
+   audit_query / export   auditrail CLI
+   /playback / policy      (same database)
+</code></pre>
+<h3>Record kinds</h3>
+<table>
+<thead>
+<tr>
+<th>Kind</th>
+<th>Source event</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>user_message</code></td>
+<td><code>session/event</code> <code>user/message</code></td>
+<td>user/synthetic input</td>
+</tr>
+<tr>
+<td><code>assistant_message</code></td>
+<td><code>session/event</code> <code>assistant/message</code></td>
+<td>model output</td>
+</tr>
+<tr>
+<td><code>assistant_chunk</code></td>
+<td><code>session/event</code> <code>assistant/chunk</code></td>
+<td>token-level (opt-in)</td>
+</tr>
+<tr>
+<td><code>turn_start</code> / <code>turn_end</code></td>
+<td><code>turn/start</code> / <code>turn/end</code></td>
+<td>turn brackets</td>
+</tr>
+<tr>
+<td><code>step_start</code> / <code>step_end</code></td>
+<td><code>step/start</code> / <code>step/end</code></td>
+<td>step brackets</td>
+</tr>
+<tr>
+<td><code>todo_update</code></td>
+<td><code>todo/write</code></td>
+<td>todo snapshot</td>
+</tr>
+<tr>
+<td><code>request_header</code> / <code>request_context</code></td>
+<td><code>request/header</code> / <code>request/context</code></td>
+<td>model routing</td>
+</tr>
+<tr>
+<td><code>tool_call</code></td>
+<td><code>tool/call</code></td>
+<td>the durable command record (args digest, files, network, flags)</td>
+</tr>
+<tr>
+<td><code>tool_result</code></td>
+<td><code>tool/result</code></td>
+<td>the durable outcome (status, error, duration)</td>
+</tr>
+<tr>
+<td><code>tool_dispatch</code></td>
+<td><code>tools/result</code></td>
+<td>the live precise outcome (status, structured error, duration)</td>
+</tr>
+<tr>
+<td><code>tool_registered</code></td>
+<td><code>tools/change</code></td>
+<td>registry add/remove deltas</td>
+</tr>
+<tr>
+<td><code>session_live</code></td>
+<td><code>session/end-seed</code></td>
+<td>live history begins</td>
+</tr>
+</tbody></table>
+<p><code>audit_query --chains</code> merges <code>tool_call</code> + <code>tool_result</code> + <code>tool_dispatch</code>
+(correlated by <code>callId</code> / session+turn+step) into one <strong>invocation chain</strong> per
+tool call — a single row with status, duration, files, network, severity, and
+flags.</p>
+<h3>Ordering &amp; determinism</h3>
+<p>The recorder ingests synchronously in arrival order and the store assigns a
+monotonic <code>AUTOINCREMENT</code> id, so identical input streams produce byte-identical
+trails (verified by a dedicated determinism test). Within a session the durable
+event stream is already ordered; cross-source ordering (session log vs. live
+tool pipeline) is the harness's emission order, and the query layer re-joins
+the two sources deterministically by correlation keys.</p>
+<hr>
+<h2>Install &amp; integrate with dsh</h2>
+<p>The bundle follows the <a href="https://deepseek-harness.github.io/deepseek-harness/en/develop/basic/publish">official dsh bundle
+spec</a>:</p>
+<ul>
+<li><code>package.json</code> declares <code>dsh: { bundle: { patch: "./cordis.patch.yml" } }</code></li>
+<li><code>cordis.patch.yml</code> mounts the plugin row</li>
+<li>the entry module exports <code>name</code>, <code>inject</code>, and <code>apply(ctx, config)</code></li>
+</ul>
+<h3>Local development bundle (link)</h3>
+<pre><code># from a dsh profile directory (a profile's package.json has "dsh": {"profile": {...}})
+dsh plugin --profile &lt;name&gt; add /path/to/dsh-plugin/auditrail
+dsh --profile &lt;name&gt;
+</code></pre>
+<p><code>dsh plugin add</code> links the package into the profile's dependencies and appends
+it to <code>dsh.profile.bundles</code>, which activates the <code>cordis.patch.yml</code> layer.</p>
+<h3>From a tarball / npm</h3>
+<pre><code>npm pack            # produces dsh-audit-trail-0.1.0.tgz
+dsh plugin --profile &lt;name&gt; add ./dsh-audit-trail-0.1.0.tgz
+</code></pre>
+<p>On boot the patch layer inserts one row:</p>
+<pre><code>- insert:
+  - id: audit-trail
+    name: 'dsh-audit-trail'
+</code></pre>
+<p>You normally need <strong>no configuration</strong> — every field defaults in code. To tune
+a single profile, override that row (<code>id: audit-trail</code>) from the profile's own
+<code>cordis.patch.yml</code> (a patch replaces the whole <code>config</code> block — restate every
+field you keep).</p>
+<h3>Requirements</h3>
+<ul>
+<li>Node.js <code>&gt;= 22.13</code> (uses the built-in <code>node:sqlite</code>, no native deps).</li>
+<li>A harness that emits <code>session/event</code> and <code>tools/*</code> events (everything in the
+current <code>@deepseek-ai/dsh-*</code> set does).</li>
+</ul>
+<hr>
+<h2>Configuration</h2>
+<p>All fields optional. Defaults shown.</p>
+<pre><code>interface AuditConfig {
+  storage: {
+    /** null =&gt; &lt;dshHome&gt;/audit-trail/audit.sqlite
+     *  dshHome = $DSH_HOME || ~/.dsh; AUDITRAIL_DB overrides for the CLI */
+    path: string | null;
+  };
+  redact: {
+    /** Mask known secret patterns before storing (default true). */
+    maskSecrets: boolean;
+    /** Tool-argument digest cap in chars.            */ truncateArgs: number;   // 512
+    /** Summary cap in chars.                         */ truncateSummary: number; // 240
+    /** Detail JSON cap in chars.                     */ truncateDetail: number;  // 4096
+    /** Max file paths captured per record.           */ maxFiles: number;        // 16
+    /** Max outbound destinations captured per record.*/ maxNetwork: number;      // 16
+    /** Extra secret regex patterns (regex source).   */ extraSecretPatterns: string[];
+  };
+  rules: {
+    /** Built-in rule ids to disable, e.g. ["net:plaintext-http"]. */
+    disabledIds: string[];
+    /** Operator rules added to (not replacing) the default table. */
+    custom: Array&lt;{
+      id: string; severity: 'info'|'low'|'medium'|'high'|'critical';
+      pattern: string; scope: 'args'|'result'|'files'|'network'|'all'|'tool';
+      flags?: string; tool?: string[]; description?: string;
+    }&gt;;
+  };
+  capture: {
+    chunks: boolean;        // false — record assistant_chunk per token?
+    turnEvents: boolean;    // true
+    stepEvents: boolean;    // true
+    toolDispatch: boolean;  // true — record live tool_dispatch rows
+    toolRegistered: boolean;// true — record tools/change deltas
+  };
+}
+</code></pre>
+<p>Example (<code>cordis.patch.yml</code> override):</p>
+<pre><code>- insert:
+  - id: audit-trail
+    name: 'dsh-audit-trail'
+    config:
+      storage:
+        path: '/srv/audit/audit.sqlite'
+      redact:
+        truncateArgs: 256
+        extraSecretPatterns:
+          - '\\bCUSTOM_SECRET_[A-Z0-9]{20,}\\b'
+      rules:
+        disabledIds:
+          - 'net:plaintext-http'
+        custom:
+          - id: 'my:purge'
+            severity: 'critical'
+            pattern: '\\bpurgelogs\\b'
+            scope: 'args'
+      capture:
+        chunks: false
+</code></pre>
+<hr>
+<h2>Model-facing tools</h2>
+<p>All four are registered on <code>ctx.tools</code> when the plugin loads.</p>
+<h3><code>audit_query</code></h3>
+<p>Query the stored trail.</p>
+<ul>
+<li>Parameters: <code>session_id</code>, <code>tool_name</code>, <code>min_severity</code>
+(<code>info|low|medium|high|critical</code>), <code>flag</code> (rule tag, e.g. <code>shell:rm-rf</code>),
+<code>kind</code>, <code>from</code>, <code>to</code> (ISO date or epoch ms), <code>limit</code> (≤ 10000),
+<code>chains</code> (merge into invocation chains), <code>format</code> (<code>json</code> | <code>markdown</code>).</li>
+<li>Returns: <code>{ count, total?, format, records | chains | text }</code>
+(privacy-redacted; <code>total</code> is present on the raw-record path).</li>
+</ul>
+<h3><code>audit_export</code></h3>
+<p>Export filtered records.</p>
+<ul>
+<li>Parameters: <code>format</code> (<code>json</code> | <code>markdown</code> | <code>jsonl</code>), optional <code>path</code> (writes
+the file), the query filters above, <code>hash_chain</code> (jsonl only), <code>chains</code>.</li>
+<li>Returns: <code>{ format, count, path?, bytes?, hash_chain, content? }</code>.</li>
+</ul>
+<h3><code>audit_policy</code></h3>
+<p>Inspect / change the sensitive-rule table at runtime.</p>
+<ul>
+<li><code>action: list</code> returns every rule with its enabled state.</li>
+<li><code>action: show|enable|disable</code> on a <code>rule_id</code>.</li>
+<li><code>action: add</code> with <code>id</code>, <code>pattern</code>, <code>severity</code>, <code>scope</code>, <code>description</code>.</li>
+<li>Runtime-only: persist changes via the plugin config.</li>
+</ul>
+<h3><code>audit_playback</code></h3>
+<p>Render the trail as a plain-text timeline (one line per event: timecode, id,
+kind, tool, severity, flags, redacted summary, duration).</p>
+<ul>
+<li>Parameters: query filters + <code>limit</code>, <code>cap</code> (max lines), <code>chains</code> (collapse to
+invocation-chain lines).</li>
+<li>Returns: <code>{ count, totalLines, truncated, text }</code>. For interactive
+pause/step/speed replay use the <code>auditrail playback</code> CLI.</li>
+</ul>
+<hr>
+<h2>CLI</h2>
+<p><code>auditrail</code> reads the <strong>same SQLite database</strong> the plugin writes to, so you can
+operate on a live trail without starting the harness.</p>
+<pre><code>auditrail help
+auditrail stats [--db P]
+auditrail query [--db P] [--from D] [--to D] [--session S] [--tool T]
+                [--severity LVL] [--flag TAG] [--kind K] [--limit N] [--offset N]
+                [--order asc|desc] [--sort id|time] [--json|--markdown] [--chains]
+auditrail export --format json|markdown|jsonl [--out PATH] [--hash-chain] [--chains] [filters]
+auditrail playback [--session S] [--speed N] [--interactive] [--cap N] [--colors] [--chains]
+auditrail policy list | show &lt;id&gt; | enable &lt;id&gt; | disable &lt;id&gt; | add --id X --pattern RE [--severity S] [--scope ARG]
+auditrail chain verify [--db P]
+auditrail verify-compliant --file PATH
+</code></pre>
+<p>Database resolution: <code>--db P</code> → <code>$AUDITRAIL_DB</code> → <code>&lt;dshHome&gt;/audit-trail/audit.sqlite</code>.
+(<code>--db :memory:</code> opens an in-memory store.)</p>
+<blockquote>
+<p><strong>Note:</strong> <code>auditrail policy</code> mutations are <strong>runtime-only for that process</strong> —
+every CLI invocation is a fresh process, so a rule added by one command is
+gone by the next. Toggle/add persistent rules through the dsh plugin's
+<code>audit_policy</code> tool (long-lived process) or via the plugin configuration.</p>
+</blockquote>
+<p>Examples:</p>
+<pre><code>auditrail query --session sess-42 --min-severity high --markdown
+auditrail export --format jsonl --hash-chain --out trail.jsonl --flag shell:rm-rf
+auditrail verify-compliant --file trail.jsonl
+auditrail playback --session sess-42 --interactive --speed 2 --colors
+auditrail chain verify
+</code></pre>
+<hr>
+<h2>Replay</h2>
+<p><code>renderTimeline()</code> produces a deterministic plain-text line per event:</p>
+<pre><code>09:00:05.000  #000002  user_message     -           [INFO]   fetch the deployment script and run it
+09:00:10.000  #000003  tool_call        bash        [CRITICAL] shell:pipe-to-shell  curl -sSL ... | sh
+09:00:15.000  #000004  tool_result      -           [INFO]   ok in 5000ms
+</code></pre>
+<p><code>PlaybackController</code> slow-plays the lines with pause / step / seek / speed;
+<code>runInteractive()</code> binds it to a raw TTY. Keys (interactive):</p>
+<pre><code>space  pause / resume      s  step one line       + / -  speed up / down
+g      jump to start        q  (or Ctrl-C) quit
+</code></pre>
+<p>Non-TTY (<code>--interactive</code> omitted, or piped) renders the whole timeline at once.</p>
+<hr>
+<h2>Compliance export format</h2>
+<p>Fixed, versioned, line-oriented JSON:</p>
+<pre><code>{"schema":"dsh-audit-trail/compliance/1","generatedAt":1750000000000,"count":2,"hashChain":true}
+{"recordId":1,"prevHash":null,"payload":{"id":1,"sessionId":"sess-42","ts":1750000000000,"kind":"tool_call","turn":1,"step":1,"toolName":"bash","callId":"call-1","argsDigest":"{\"command\":\"curl ...\"}","status":"pending","durationMs":null,"severity":"critical","flags":["shell:pipe-to-shell"],"filesRead":[],"filesWritten":[],"network":["https://..."],"actor":null,"sourceType":"tool/call","sourceSeq":1,"summary":"bash"},"hashSelf":"a1b2..."}
+</code></pre>
+<ul>
+<li>Line 1 is a header (<code>schema</code>, <code>generatedAt</code>, <code>count</code>, <code>hashChain</code>).</li>
+<li>Each data line is a single JSON object; the payload uses one fixed field set
+(see <code>compliancePayload</code> in <code>src/query.ts</code>).</li>
+<li>With <code>hashChain: true</code>, <code>hashSelf</code> is <code>sha256(prevHash + "\n" + canonical line + "\n")</code> and <code>prevHash</code> echoes the previous line's <code>hashSelf</code>, forming a
+chain. <code>auditrail verify-compliant</code> and <code>verifyComplianceJsonl()</code> validate it
+(and will report any tampered or reordered line).</li>
+</ul>
+<hr>
+<h2>Sensitive-operation rules</h2>
+<p>Built-in table (rules can be disabled / extended; each has a dedicated test in
+<code>test/rules.test.ts</code>):</p>
+<table>
+<thead>
+<tr>
+<th>id</th>
+<th>severity</th>
+<th>scope</th>
+<th>pattern (abridged)</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>shell:rm-rf</code></td>
+<td>high</td>
+<td>args</td>
+<td><code>rm -rf</code> / <code>-fr</code> / <code>--recursive --force</code> / <code>-r -f</code> variants</td>
+</tr>
+<tr>
+<td><code>shell:pipe-to-shell</code></td>
+<td>critical</td>
+<td>args</td>
+<td><code>curl|wget|nc … | sh|bash</code> (first-pipe)</td>
+</tr>
+<tr>
+<td><code>shell:base64-to-shell</code></td>
+<td>high</td>
+<td>args</td>
+<td><code>base64 -d | sh</code></td>
+</tr>
+<tr>
+<td><code>file:key-material</code></td>
+<td>critical</td>
+<td>files</td>
+<td><code>.ssh</code>, <code>id_rsa*</code>, <code>.pem/.key/.p12/.pfx</code>, <code>.env</code>, <code>credentials</code>, <code>.aws/.azure</code></td>
+</tr>
+<tr>
+<td><code>secret:inline</code></td>
+<td>high</td>
+<td>args</td>
+<td><code>api_key=</code>, <code>token=</code>, <code>password=</code>, <code>Authorization: Bearer …</code></td>
+</tr>
+<tr>
+<td><code>git:force-push</code></td>
+<td>high</td>
+<td>args</td>
+<td><code>git push --force</code> / <code>-f</code></td>
+</tr>
+<tr>
+<td><code>git:history-rewrite</code></td>
+<td>medium</td>
+<td>args</td>
+<td><code>reset --hard</code>, <code>filter-branch</code>, <code>branch -D</code></td>
+</tr>
+<tr>
+<td><code>db:destructive</code></td>
+<td>high</td>
+<td>args</td>
+<td><code>drop table/database</code>, <code>truncate table</code></td>
+</tr>
+<tr>
+<td><code>net:exfil-literal-ip</code></td>
+<td>high</td>
+<td>network</td>
+<td>outbound to a literal IP</td>
+</tr>
+<tr>
+<td><code>net:plaintext-http</code></td>
+<td>medium</td>
+<td>network</td>
+<td>outbound <code>http://</code></td>
+</tr>
+<tr>
+<td><code>priv:root</code></td>
+<td>critical</td>
+<td>args</td>
+<td><code>sudo su</code>, <code>sudo -u root</code></td>
+</tr>
+<tr>
+<td><code>fs:world-writable</code></td>
+<td>medium</td>
+<td>args</td>
+<td><code>chmod 777/666</code></td>
+</tr>
+<tr>
+<td><code>fs:system-dir-write</code></td>
+<td>high</td>
+<td>files</td>
+<td>access under <code>/etc</code>, <code>/usr</code>, <code>System32</code>, …</td>
+</tr>
+<tr>
+<td><code>proc:kill-force</code></td>
+<td>medium</td>
+<td>args</td>
+<td><code>kill -9</code>, <code>pkill -9</code></td>
+</tr>
+</tbody></table>
+<p>Matched rule ids are stored as <strong>tags</strong> on the record (and in the <code>audit_tags</code>
+table), the record severity becomes the highest matched severity, and both can
+be queried (<code>--flag</code>, <code>--severity</code> / <code>min_severity</code>).</p>
+<hr>
+<h2>Privacy &amp; redaction</h2>
+<ul>
+<li>Only <strong>redacted</strong> content is persisted by default: argument digests are
+masked (private keys, bearer/basic tokens, <code>key=value</code> secrets, long
+high-entropy runs) and truncated; summaries and details are capped.</li>
+<li><code>digestArgs</code> also understands structure: an object value whose key looks like
+a secret (<code>password</code>, <code>token</code>, <code>api_key</code>, <code>authorization</code>, …) is replaced
+entirely while its key (a label) is kept.</li>
+<li>The audit trail itself records <em>that</em> sensitive operations happened (the
+forensic value); it does not store their secret values.</li>
+<li>Disable masking with <code>redact.maskSecrets: false</code> only if you fully trust the
+store location — this is not recommended.</li>
+</ul>
+<hr>
+<h2>SQLite schema</h2>
+<p>One store, a handful of tables (WAL journal, <code>synchronous = NORMAL</code>):</p>
+<pre><code>audit_meta     key/value metadata (schema_version)
+audit_events   the append-only trail
+   id, session_id, ts, kind, turn, step, tool_name, call_id, args_digest,
+   status, duration_ms, severity, severity_rank, summary, detail,
+   files_read, files_written, network, actor, source_type, source_seq,
+   hash_prev, hash_self, created_at
+audit_tags     (event_id, tag) — sensitive-rule tags, indexed
+</code></pre>
+<p>Indexes cover <code>ts</code>, <code>session_id</code>, <code>tool_name</code>, <code>severity_rank</code>, <code>kind</code>, <code>tag</code>.
+<code>chain verify</code> walks rows by <code>id</code> and recomputes every hash.</p>
+<hr>
+<h2>Project layout</h2>
+<pre><code>auditrail/
+  package.json        dsh bundle manifest (dsh.bundle.patch) + scripts
+  cordis.patch.yml    bundle patch layer mounting the plugin
+  tsconfig.json       TypeScript → lib/ (NodeNext ESM)
+  bin/auditrail.mjs   CLI launcher (calls lib/cli.js)
+  src/
+    index.ts          bundle entry: name / inject / apply + programmatic exports
+    config.ts         config types, defaults, tolerant normalization
+    types.ts          domain types (severity, kinds, records, filters)
+    rules.ts          sensitive-rule table + deterministic matcher (RuleEngine)
+    redact.ts         secret masking, truncation, argument digesting
+    scan.ts           heuristic file-path / network extraction + attribution
+    store.ts          node:sqlite WAL store, queries, hash chain, stats
+    recorder.ts       event subscription + normalization + correlation
+    query.ts          chain merging + JSON/Markdown/compliance reports + verify
+    playback.ts       plain-text timeline renderer + playback controller + TTY
+    tools.ts          audit_query / audit_export / audit_policy / audit_playback
+    service.ts        facade shared by tools and CLI
+    cli.ts            standalone CLI
+  test/               node:test suite (record completeness, flagging, query,
+                      export, playback, redaction, plugin contract, CLI)
+  examples/           usage.mjs + generator + committed sample artifacts
+  README.md / README.zh.md / LICENSE
+</code></pre>
+<hr>
+<h2>Development</h2>
+<pre><code>npm install
+npm run build        # tsc → lib/
+npm run typecheck    # tsc --noEmit
+npm test             # build + node --test test/*.test.ts
+node bin/auditrail.mjs help
+node examples/generate-examples.mjs    # refresh examples/*.jsonl|*.md
+node examples/usage.mjs                # programmatic API demo
+</code></pre>
+<h2>License</h2>
+<p>MIT — see <a href="https://github.com/JohnXu22786/auditrail/blob/HEAD/LICENSE">LICENSE</a>.</p>

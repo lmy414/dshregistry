@@ -1,0 +1,112 @@
+<h1>dsh-editor-selection</h1>
+<p>让 DSH 理解"用户此刻在编辑器里看着什么"。当你在编辑器中选中某个文件或行区间,后续对话自动聚焦于它——通过 <code>@path:10-25</code> 的环境知会行注入,而不是把文件内容塞进上下文。</p>
+<blockquote>
+<p>本插件是<strong>通用编辑器选区服务</strong>:协议与客户端种类无关,VS Code 桥只是第一个接入者(未来可接入 GoLand 等 IDE,见 DESIGN §13)。设计文档见 <code>DESIGN.md</code>(§0 决策记录 → §13 多客户端通用化)。本 README 只讲安装、使用与验证。</p>
+</blockquote>
+<h2>它做什么 / 不做什么</h2>
+<table>
+<thead>
+<tr>
+<th>✅</th>
+<th>❌</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>捕获主选区的<strong>绝对路径 + 行区间</strong>(1-based)</td>
+<td>读取或上传任何文件内容</td>
+</tr>
+<tr>
+<td>在 agent 每步之前注入一行环境知会(<code>agent/pre-step</code>,prepend)</td>
+<td>把选区"附加"进对话历史</td>
+</tr>
+<tr>
+<td>DSH 侧边栏 🔔 配对审批 + 设备吊销</td>
+<td>任何云服务——全部本机回环</td>
+</tr>
+<tr>
+<td>输入框下方环境 chip:<code>[👁] @C:\...\app.ts:10-25</code>,眼睛即隐私开关</td>
+<td>反向导航(协议帧已保留,未实现)</td>
+</tr>
+</tbody></table>
+<h2>架构(30 秒版)</h2>
+<pre><code>VS Code 扩展 ──WebSocket /editor-selection/ws──▶ 插件 Node 半部
+ (绝对路径+行区间)     token 配对/认证              │ ManualApprovalPolicy(人审)
+                                                  │ FocusState(状态机)
+浏览器半部 ◀──────── HTTP /editor-selection/api ──┤ FocusState.view(只读投影)
+ chip + 🔔                                        │
+                                                  ▼
+                              agents: agent/pre-step → createUserMessage(source.kind=plugin)
+</code></pre>
+<p>信任策略与通知呈现是两个可替换接口(<code>ConnectionPolicy</code> / <code>NotificationSink</code>)——未来 DSH UI 嵌入 VS Code 时,"安装即信任",配对仪式整体退场。</p>
+<h2>构建</h2>
+<pre><code>powershell -ExecutionPolicy Bypass -File scripts\link-deps.ps1   # junction harness 依赖(离线)
+node node_modules\typescript\lib\tsc.js --noEmit                 # 类型检查
+node node_modules\tsdown\dist\run.mjs                            # lib\index.js + lib\client.js(+testkit)
+
+# 兼容性冒烟:驱动【构建产物】过 5 组共 20 项断言
+$env:DSH_EDITORSEL_ROOT = "$env:TEMP\dshe-smoke"; node scripts\compat-smoke.mjs
+</code></pre>
+<p>冒烟覆盖:产物形状(loader banner、双席位注册)、真实 TCP 回环上的 RFC6455 双端帧数学(掩码/126 长度/close 码)、经 <code>registerUpgrade</code> 的完整配对流(坏 token→4401、批准→一次性 token→干净交接、拒绝→4403)、焦点状态机(active/paused/stale/offline + 变更驱动抑制)、注入消息契约(time-context 同形、plugin 归因、deep-frozen)。</p>
+<h2>安装到本地 DSH</h2>
+<pre><code>powershell -ExecutionPolicy Bypass -File scripts\install.ps1
+# 重启 dsh web 后生效;卸载用 scripts\uninstall.ps1
+</code></pre>
+<p>脚本做三件事:junction 包目录到 <code>~/.dsh/profiles/web/node_modules/dsh-editor-selection</code>、写入 profile <code>package.json</code> 依赖、登记 <code>dsh.profile.bundles</code>。</p>
+<h2>VS Code 侧</h2>
+<p>见 <code>../dsh-editor-selection-vscode/README.md</code>。要点:首次连接触发配对请求 → DSH 🔔 里确认 → token 入 SecretStorage,之后静默。</p>
+<h2>使用</h2>
+<ul>
+<li><strong>眼睛开关(chip 上)</strong>:关=暂停共享(向 agent 注入一条一次性"已暂停"知会后保持沉默);开=恢复。状态持久化。</li>
+<li><strong>选中即聚焦</strong>:有真实选区 → <code>@绝对路径:起-止</code>;光标停放无选择 → <code>@绝对路径</code>(整个文件即焦点);光标不在任何文件里 → 焦点清空。缓冲区未保存会标注"(缓冲区未保存)"。</li>
+<li><strong>右键「解释代码」</strong>(VS Code 编辑区,先选中代码):选区发给 DSH,DSH 在最近活跃的会话里<strong>自动开始解释</strong>该段代码,无需手动输入。</li>
+<li><strong>多窗口</strong>:每窗口一个实例,行尾注明来源实例;30s 心跳,90s 无心跳判离线。</li>
+<li><strong>路径可读性由 DSH 权限系统裁决</strong>:插件不再做工作区映射门槛;工作区外的文件在 agent 实际读取时按 DSH 既有权限流程索权。</li>
+</ul>
+<h2>兼容性与降级(DSH 早期预览)</h2>
+<table>
+<thead>
+<tr>
+<th>情形</th>
+<th>行为</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>agents</code> 服务缺席</td>
+<td>注入不挂载,chip/通知照常</td>
+</tr>
+<tr>
+<td>注入缝隙签名变化</td>
+<td>pre-step 注册 try/catch,警告后跳过</td>
+</tr>
+<tr>
+<td>WS 路由不可用</td>
+<td>API/chip 正常,扩展侧退避重连</td>
+</tr>
+<tr>
+<td>状态文件不可写</td>
+<td>内存模式运行,提示一条警告</td>
+</tr>
+<tr>
+<td>席位被占用/改名</td>
+<td>对应贡献跳过,console.warn,不破坏组合</td>
+</tr>
+</tbody></table>
+<p>逃生舱:<code>DSH_EDITORSEL_ROOT</code> 重定位状态目录;<code>dshEditorSelection.enabled=false</code> 总闸。</p>
+<h2>安全模型摘要</h2>
+<p>token 仅存 SHA-256 哈希;配对请求 60s TTL、同 instanceId 去重;close 语义 4401 未授权 / 4403 配对过期或被拒 / 4408 限流(20 帧/s);WS 层不做 Origin/sec-fetch 校验(token 即身份),浏览器 API 层沿用 git-plugin 同款 trusted-host 栅栏;focus 帧解析拒绝 <code>..</code> 段与超长路径;路径可读性交由 DSH 权限系统在读取时裁决(v2)。</p>
+<h2>目录</h2>
+<pre><code>src/
+  protocol.ts        协议常量 + 严格帧校验
+  focus.ts           renderFocusLine(纯函数) + FocusState(变更驱动状态机)
+  injector.ts        agent/pre-step 注入器(time-context 同形消息)
+  trust-policy.ts    ConnectionPolicy 接口 + ManualApprovalPolicy 实现
+  ws-route.ts        registerUpgrade 路由(hello→admit→会话)
+  api-http.ts        浏览器 API(state/approve/deny/revoke/share.set)
+  platform/          ws-server(RFC6455)、tokens、browser-fence、state-file
+  client/            chip、🔔、store、locales、styles(零依赖 React)
+  testkit.ts         冒烟专用内面出口
+scripts/
+  link-deps.ps1      junction 离线依赖
+  compat-smoke.mjs   20 项构建产物冒烟
+  install.ps1 / uninstall.ps1
+</code></pre>

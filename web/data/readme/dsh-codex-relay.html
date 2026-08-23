@@ -1,0 +1,63 @@
+<h1>dsh-codex-relay</h1>
+<p><code>@necokeine/dsh-codex-relay</code> 是一个可安装的 DeepSeek Harness 模型提供方插件。安装后，模型设置页和会话模型选择器会出现 <strong>Codex</strong>；DSH 通过本机 <code>codex app-server --stdio</code> 的 JSON-RPC 接口读取当前 Codex 账号可用的模型，并把每次模型请求交给 Codex 原生 agent loop。</p>
+<p>Codex 的工具调用、命令执行和文件修改都在原生 Codex turn 内完成。DSH 不向 Codex 发送自己的工具 schema，也不会重复执行 Codex 已完成的工具调用；DSH 只记录请求和最终回答。</p>
+<h2>前置条件</h2>
+<ul>
+<li>Node.js <code>^22.19.0</code> 或 <code>&gt;=24.0.0</code></li>
+<li>DeepSeek Harness <code>0.1.1-rc.2</code></li>
+<li>本机已经通过 Codex CLI 登录；插件固定使用 <code>@openai/codex@0.147.0</code> 提供的 binary，不依赖 <code>PATH</code> 中的其他 <code>codex</code> 版本</li>
+</ul>
+<h2>安装</h2>
+<p>从 npm 安装：</p>
+<pre><code>dsh plugin --profile default add @necokeine/dsh-codex-relay
+dsh --profile default --dump-config
+dsh --profile default
+</code></pre>
+<p>从源码安装时，本地目录使用 pnpm <code>link:</code>，不会代替源码目录安装依赖。先克隆仓库并安装依赖；<code>prepare</code> 会同时生成 <code>lib/</code>：</p>
+<pre><code>git clone https://github.com/necokeine/dsh-codex-relay.git
+cd dsh-codex-relay
+pnpm install
+dsh plugin --profile default add "$PWD"
+dsh --profile default --dump-config
+dsh --profile default
+</code></pre>
+<p><code>package.json</code> 的 <code>dsh.bundle</code> 声明会把 <code>cordis.patch.yml</code> 加入 profile。该层使用稳定行 ID <code>llm-codex</code>：若当前 DSH 版本内置了同名原型行，插件层会替换它；否则会直接插入。启动 Web 界面后，在模型设置页选择 <strong>Codex</strong>，再选择 Codex 原生账号公开的模型和推理强度。</p>
+<p>从 Git 仓库安装源码时，pnpm 会要求显式允许该包的 <code>prepare</code> 构建脚本。发布到 npm 或使用 <code>pnpm pack</code> 生成的 tarball 会携带预构建的 <code>lib/</code>，无需安装时构建。</p>
+<h2>配置</h2>
+<p>插件设置保存在 <code>dsh-codex-relay</code> namespace：</p>
+<pre><code>dsh-codex-relay:
+  permissionMode: inherit
+  disposeGraceMs: 3000
+  env: {}
+</code></pre>
+<ul>
+<li><code>permissionMode</code>：<code>inherit</code>（默认）、<code>never</code>、<code>approve-for-me</code> 或 <code>dangerously-bypass-approvals-and-sandbox</code></li>
+<li><code>disposeGraceMs</code>：Codex app-server 进程树终止宽限时间，单位为毫秒</li>
+<li><code>env</code>：显式传给 Codex 子进程的环境变量；原生登录和账号状态仍由 Codex home 管理</li>
+<li><code>retryPolicy</code>：DSH LLM provider 的失败重试策略</li>
+</ul>
+<p><code>inherit</code> 会按每个 DSH 会话的实时审批策略决定 Codex 权限：</p>
+<ul>
+<li>DSH 界面为 <code>ask</code> 时，Codex 使用 <code>workspace-write</code> 和 <code>approvalPolicy: on-request</code>。命令沙箱提升、额外文件写入与权限扩展请求会进入同一个 DSH 审批界面；单次允许只映射为 Codex 的单次 <code>accept</code>，不会静默升级为整场会话授权。这使 <code>git commit</code> 创建 <code>.git/index.lock</code> 等需要提升权限的操作可以由用户批准。</li>
+<li>DSH 界面为 <code>never</code> 时，Codex 仍可在普通工作区内写文件，但所有需要提升权限的操作都会被拒绝，也不会弹出审批。</li>
+</ul>
+<p>其余三个值是插件级覆盖：<code>never</code> 固定拒绝提升权限，<code>approve-for-me</code> 交给 Codex 原生自动审查器，<code>dangerously-bypass-approvals-and-sandbox</code> 则关闭沙箱与交互审批。最后一个选项风险最高，只应在已隔离且完全可信的工作区使用。</p>
+<p><code>session-title</code> 和 <code>compaction</code> 辅助请求不继承普通会话权限，始终强制使用 <code>approvalPolicy: never</code> 和 <code>sandbox: read-only</code>，并要求 Codex 不使用工具或修改外部状态。</p>
+<h2>运行机制</h2>
+<p>每次目录读取或模型调用都会启动一个临时 app-server 进程。模型调用在当前 DSH Session 的工作目录创建 ephemeral Codex thread，注入持久的 user/assistant 历史，随后执行一个原生 Codex turn。插件等待 terminal notification，只把 final answer 转成一个 DSH text block；完成、失败或取消后会终止并等待整个子进程树退出。</p>
+<p>固定 bridge instruction 为：</p>
+<pre><code>You are running as the selected Codex model provider inside DeepSeek Harness. Use only your native Codex tools and agent loop. Do not emit DeepSeek Harness tool calls; the host records your final answer.
+</code></pre>
+<h2>开发</h2>
+<pre><code>pnpm install
+pnpm run check
+pnpm run test:coverage
+pnpm pack
+</code></pre>
+<h2>已知限制</h2>
+<ul>
+<li>当前只向 DSH 声明文本输入；图片会在调用前投影为稳定的省略提示。</li>
+<li>插件等待 Codex terminal notification 后一次性输出最终文本，不投影增量文本或 token usage。</li>
+<li>Codex 原生工具轨迹不会转换为 DSH <code>tool/call</code> 和 <code>tool/result</code> 事件；DSH Session 记录请求和最终回答，不记录 Codex 私有轨迹。</li>
+<li><code>temperature</code>、<code>maxTokens</code>、<code>stop</code> 和 DSH 工具 schema 没有映射到该集成。</li>
+</ul>

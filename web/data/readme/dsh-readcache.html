@@ -1,0 +1,74 @@
+<h1>dsh-readcache</h1>
+<p>⚡ <strong>给 DSH <code>read</code> 工具的版本令牌校验结果缓存。</strong></p>
+<p>长会话会反复重读未变更的文件——上下文压缩后的恢复、并行子代理、编辑前后的对比，每一次重复都要重新做文件 I/O 和行号渲染，读到的却是字节完全相同的内容。<code>dsh-readcache</code> 包装了 <code>tools/execute</code> 事件瀑布，让这些重复读取直接命中进程内缓存，<strong>且每一次命中都对照文件系统自己的版本令牌重新校验</strong>。</p>
+<h2>为什么它是安全的</h2>
+<p>朴素的缓存会吐旧内容，这个插件不会：</p>
+<table>
+<thead>
+<tr>
+<th>性质</th>
+<th>机制</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong>绝不吐旧内容</strong></td>
+<td>每次命中都重新 stat 文件，要求版本令牌精确匹配（本地后端为 <code>dev:ino:size:mtimeNs:ctimeNs</code>）。任何写路径——<code>edit</code>/<code>write</code> 工具、<code>bash</code>、外部编辑器——都会改变令牌并立即失效对应条目。</td>
+</tr>
+<tr>
+<td><strong>无写入竞态</strong></td>
+<td>未命中时，执行结果只有在二次 stat 仍报告执行前令牌的情况下才会入缓存（双 stat 防护）。</td>
+</tr>
+<tr>
+<td><strong>保留"先读后改"约束</strong></td>
+<td>缓存键包含代理 id。文件系统的观察门（fs-observation-policy）要求每个代理编辑前必须自己读过该文件；按代理隔离键值保证每次命中都以该代理自己的先前观察为凭据。</td>
+</tr>
+<tr>
+<td><strong>内存有界</strong></td>
+<td>LRU 上限：300 条 / 总量 16 MiB / 单条 4 MiB。</td>
+</tr>
+</tbody></table>
+<p>只有 <code>read</code> 工具的成功、非中止、可无损 JSON 序列化的结果才会入缓存；失败结果原样透传。</p>
+<h2><code>readcache</code> 工具</h2>
+<p>插件注册一个模型可见的工具：</p>
+<ul>
+<li><code>readcache</code>（action：<code>"stats"</code> | <code>"clear"</code>）— 汇报命中/未命中等计数与已节省字符数、条目数；或清空缓存。</li>
+</ul>
+<p>stats 输出示例：</p>
+<pre><code>{
+  "hits": 2,
+  "misses": 4,
+  "hitRatio": 33.3,
+  "stale": 1,
+  "stores": 4,
+  "evictions": 0,
+  "savedChars": 1210,
+  "clearedEntries": 0,
+  "entries": 3,
+  "cachedChars": 1662,
+  "maxEntries": 300
+}
+</code></pre>
+<h2>安装</h2>
+<pre><code>dsh plugin --profile web add dsh-readcache
+</code></pre>
+<p>或从本地检出安装：</p>
+<pre><code>cd dsh-readcache &amp;&amp; npm pack
+dsh plugin --profile web add ../dsh-readcache/dsh-readcache-1.0.1.tgz
+</code></pre>
+<p>安装后重启 DeepSeek Harness 生效。</p>
+<h2>设计说明</h2>
+<ul>
+<li><strong>拦截点</strong>：<code>tools/execute</code> 的 around 分发瀑布——官方超时策略用的同一条缝。调用身份保持不变，只有结果被复用。</li>
+<li><strong>声明 <code>inject</code>，不和加载器赛跑</strong>：插件导出 <code>inject = ["fs", "tools"]</code>，Cordis 会把它保持在等待态，直到基础 bundle 提供这两个服务。若用软性 <code>ctx.get("fs")</code> 提前返回，可能在启动竞态中抢跑并让整个缓存静默失效——这正是 1.0.1 修复的 bug。</li>
+<li><strong>为什么用 stat 而不是 fs 观察事件</strong>：<code>fs.stat</code> 是无副作用的纯探测；观察事件依赖触发顺序，且命中时无法复核。</li>
+<li><strong>仅宿主侧</strong>：缓存完全活在宿主进程里。客户端仪表盘（经 Remote service）在 v1.1 路线图上。</li>
+<li>入缓存的对象是冻结的 <code>ToolExecutionResult</code>；一次无损 JSON 往返（<code>JSON.parse(JSON.stringify(...))</code>）保证存下的副本不持有任何指向运行时的活引用。</li>
+</ul>
+<h2>已验证行为</h2>
+<ul>
+<li>同参数重读未变更文件 → <code>hits +1</code>，省掉 I/O。</li>
+<li>两次读取之间文件被外部修改 → 返回新内容（不吐旧内容），<code>stale +1</code>。</li>
+<li>另一个代理首次读取已缓存文件 → <code>misses +1</code>（按代理隔离成立）。</li>
+</ul>
+<h2>许可证</h2>
+<p>MIT</p>

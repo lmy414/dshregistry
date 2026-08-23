@@ -1,0 +1,251 @@
+<h1>dsh-pi-review</h1>
+<p>为 <a href="https://github.com/deepseek-ai/deepseek-harness">DeepSeek Harness</a> 提供隔离、只读的 <a href="https://github.com/earendil-works/pi">Pi Agent</a> Git 改动审查。它注册一个根 Agent 工具 <code>pi_review_diff</code>，冻结确定性的 Git 快照，在 Harness 的只读沙箱中启动独立 Pi SDK Worker，并返回带分类、严重度策略和 Pi 用量统计的可验证结构化 finding。</p>
+<blockquote>
+<p>[!IMPORTANT]
+只读沙箱保护的是本地文件不被 Worker 修改，不是数据保密边界。被选中的 diff 与变更文件内容会发送给配置的模型 Provider。不要用未经授权的外部 Provider 审查私有、敏感或受监管代码。</p>
+</blockquote>
+<p>当前版本针对并锁定：</p>
+<ul>
+<li>DeepSeek Harness <code>0.1.1-rc.2</code></li>
+<li><code>@earendil-works/pi-coding-agent</code> <code>0.84.2</code></li>
+<li>Node.js <code>&gt;=22.19.0</code></li>
+</ul>
+<p>DeepSeek Harness 仍处于 developer preview。升级 Harness 或 Pi 前，应重新运行本仓库的完整检查、真实沙箱测试和真实模型冒烟测试。</p>
+<h2>为什么做成专用工具</h2>
+<pre><code>Root Agent 的 pi_review_diff 调用
+  -&gt; 固定 argv 的 Git 快照（HEAD/base/merge-base/commit/diff SHA-256）
+  -&gt; Harness read-only sandbox
+  -&gt; 独立 Node Worker + Pi SDK in-memory Session
+  -&gt; read / grep / find / ls / review_diff / submit_review
+  -&gt; 严格 JSON envelope
+  -&gt; 宿主复算快照并标记 stale
+</code></pre>
+<p>插件没有开放 Pi 的 <code>bash</code>、<code>write</code>、<code>edit</code>、扩展、Skill、Prompt 模板、上下文文件或持久化 Session。Pi 只能读取快照中的当前变更文件；<code>staged</code>、<code>branch</code> 和 <code>commit</code> 是 frozen-only scope，只能读取固定 diff。删除文件和重命名旧路径也只能通过固定 diff 审查。高危 finding 是成功的业务结果，不会被误报成工具故障。</p>
+<h2>安装</h2>
+<h3>从本地 checkout 安装</h3>
+<pre><code>git clone https://github.com/win4r/dsh-pi-review.git
+cd dsh-pi-review
+pnpm install --frozen-lockfile
+pnpm run check
+
+dsh plugin --profile web add -w .
+dsh --profile web --dump-config
+</code></pre>
+<h3>从 GitHub 安装</h3>
+<p>建议固定已审计的 commit：</p>
+<pre><code>dsh plugin --profile web add -w github:win4r/dsh-pi-review#&lt;commit-sha&gt;
+</code></pre>
+<p>rc.2 的 Profile 本身是 pnpm workspace root，因此这里显式传 <code>-w</code>；省略时，pnpm 10 可能以 <code>ERR_PNPM_ADDING_TO_ROOT</code> 拒绝安装。</p>
+<p>Git 安装会从源码执行本包的 <code>prepare</code> 构建。pnpm 10 默认禁止依赖构建；首次失败时，把 dsh 输出的准确包名加入该 Profile 的 <code>pnpm-workspace.yaml</code>：</p>
+<pre><code>allowBuilds:
+  "@charlesqin/dsh-pi-review": true
+</code></pre>
+<p>然后重新执行 <code>plugin add</code>。这等于授权安装阶段在 Agent 沙箱外运行本仓库的构建脚本；只应对可信源码授权。若不希望授权 Git 构建，可在可信 checkout 中执行 <code>pnpm pack</code>，再安装生成的 <code>.tgz</code>。</p>
+<p>安装、移除或更新 Bundle 后，重启对应 Profile。<code>--dump-config</code> 只验证最终组合配置，不会启动插件。</p>
+<h2>配置 Pi 认证与模型</h2>
+<p>默认以只读快照方式加载 Pi 的 <code>~/.pi/agent/auth.json</code> 和 <code>~/.pi/agent/models.json</code>；认证刷新和模型目录更新只保存在 Worker 内存中，不会写锁文件或回写 Pi 目录。可先在交互式 Pi 中执行 <code>/login</code>：</p>
+<pre><code>npx -y @earendil-works/pi-coding-agent@0.84.2
+</code></pre>
+<p>建议在 <code>cordis.patch.yml</code> 中显式配置 <code>provider/model-id</code>：</p>
+<pre><code>- insert:
+    - id: pi-review
+      name: '@charlesqin/dsh-pi-review'
+      config:
+        authority: direct-human
+        model: kimi-coding/k3
+        modelProfiles:
+          fast: kimi-coding/k3
+          deep: openai/gpt-5.3-codex
+        thinkingLevel: high
+        timeoutMs: 300000
+        maxDiffBytes: 524288
+        maxFiles: 200
+        maxOutputBytes: 524288
+        maxDiagnosticBytes: 65536
+        disposeGraceMs: 3000
+        requireFullSandbox: true
+</code></pre>
+<p>Bundle patch 的同 ID <code>config</code> 是整对象替换语义。覆盖 <code>pi-review</code> 行时，应重写希望保留的完整配置。</p>
+<p>优先使用 Pi <code>auth.json</code> 中的字面 API key、OAuth，或显式环境变量引用，避免把密钥直接写入 Harness 配置。Worker 不执行 Pi 配置中的 <code>!command</code>：命令型认证 Provider 会被标记为不可用，其他安全 Provider 仍可使用；<code>models.json</code> 的 <code>apiKey</code>、header 或 env 中出现命令值则整个模型配置 fail closed。若认证或模型必须引用环境变量，可通过 <code>forwardEnvironment</code> 显式传入变量名；默认一个也不传。不要转发无关凭据。</p>
+<p>自定义 Pi 目录可以用绝对路径配置：</p>
+<pre><code>agentDir: /absolute/path/to/pi-agent-dir
+forwardEnvironment:
+  - MY_MODEL_API_KEY
+</code></pre>
+<p>例如，可在 <code>auth.json</code> 使用 <code>"key": "$MY_MODEL_API_KEY"</code>，再只转发 <code>MY_MODEL_API_KEY</code>。Worker 固定设置 <code>PI_OFFLINE=1</code>，关闭 Pi 的启动更新、包更新和遥测网络操作；模型请求本身仍需要访问所配置的 Provider。Windows 上当前仍可使用内置 Pi 模型和认证，但 v0.2 不加载自定义 <code>models.json</code>。</p>
+<h2>使用</h2>
+<p>安装并重启 Profile 后，在顶层对话中要求 Agent 调用 <code>pi_review_diff</code>。例如：</p>
+<pre><code>请调用 pi_review_diff，以 working-tree 范围审查当前仓库全部未提交改动，
+重点检查并发与错误处理，只返回 high 及以上 finding，并明确结果是否 stale。
+</code></pre>
+<p>工具参数：</p>
+<table>
+<thead>
+<tr>
+<th>参数</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>scope: unstaged</code></td>
+<td>工作区相对 index 的未暂存改动，并包含 untracked 文件</td>
+</tr>
+<tr>
+<td><code>scope: staged</code></td>
+<td>index 相对 <code>HEAD</code> 的已暂存改动，不包含 untracked 文件；为避免混入未暂存内容，只开放冻结 diff，不开放当前文件读取/搜索</td>
+</tr>
+<tr>
+<td><code>scope: working-tree</code></td>
+<td>整个工作区相对 <code>HEAD</code>，包含 staged、unstaged 与 untracked 文件</td>
+</tr>
+<tr>
+<td><code>scope: base</code></td>
+<td>工作区相对解析后的 <code>base_ref</code> commit；必须提供 <code>base_ref</code></td>
+</tr>
+<tr>
+<td><code>scope: branch</code></td>
+<td><code>base_ref</code> 与 <code>head_ref</code>（默认 <code>HEAD</code>）唯一 merge base 到 head 的提交差异；不包含 index、worktree 或 untracked 内容</td>
+</tr>
+<tr>
+<td><code>scope: commit</code></td>
+<td><code>commit_ref</code>（默认 <code>HEAD</code>）相对其唯一父提交的差异；root commit 和 merge commit fail closed</td>
+</tr>
+<tr>
+<td><code>paths</code></td>
+<td>可选、非空的仓库相对路径过滤列表；只缩小所选 diff，不会读取任意未修改文件</td>
+</tr>
+<tr>
+<td><code>focus</code></td>
+<td>可选、最多 2048 UTF-8 bytes 的本次审查重点；不能改变权限、工具、scope 或 Sandbox</td>
+</tr>
+<tr>
+<td><code>severity_floor</code></td>
+<td>返回 finding 的最低严重度：<code>critical</code>、<code>high</code>、<code>medium</code> 或 <code>low</code>，默认 <code>low</code></td>
+</tr>
+<tr>
+<td><code>model_profile</code></td>
+<td>可选的部署级模型别名；必须在 <code>modelProfiles</code> 中预先映射，未知别名会在 Git/Worker/Provider 启动前失败</td>
+</tr>
+</tbody></table>
+<p><code>base_ref</code>、<code>head_ref</code> 和 <code>commit_ref</code> 只接受普通 ref 或对象 ID，不接受 <code>HEAD~2</code>、<code>A..B</code> 等 revision expression。每个 ref 都先解析为不可变 commit。<code>branch</code> 要求 <code>git merge-base --all</code> 恰好返回一个结果；无共同祖先或多个最佳 merge base 都会失败，绝不回退到未经证明的比较基准。</p>
+<p>Pi 必须先提交所有通过严格结构、路径、side 与 line 校验的 actionable findings；Host 再确定性应用 <code>severity_floor</code>。如果只发现低于阈值的问题，结果是 <code>below-threshold-only</code>，不会误称为 <code>clean</code>。</p>
+<p>成功结果包含：</p>
+<ul>
+<li><code>verdict</code>: <code>clean</code>、<code>findings</code> 或 <code>below-threshold-only</code></li>
+<li><code>assessment</code> 与按严重度排序、带 <code>category</code> 的结构化 <code>findings</code></li>
+<li><code>snapshot.head</code>、可选 <code>base</code>、<code>diffHash</code>、变更路径与 <code>stale</code></li>
+<li><code>policy.severityFloor</code>、可选 <code>focus</code> 与被抑制 finding 数</li>
+<li>实际沙箱 enforcement、Provider/模型、input/output/cache token、Pi 估算成本与耗时</li>
+</ul>
+<p>若审查期间仓库发生变化，插件仍返回冻结快照上的结果，但把 <code>snapshot.stale</code> 标为 <code>true</code>；应在新快照上重新审查。</p>
+<h2>配置参考</h2>
+<table>
+<thead>
+<tr>
+<th>字段</th>
+<th>默认值</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>authority</code></td>
+<td><code>direct-human</code></td>
+<td>只允许由当前顶层人类消息驱动；<code>root-turn</code> 可放行插件/定时来源的顶层轮次</td>
+</tr>
+<tr>
+<td><code>model</code></td>
+<td>Pi 当前可用默认模型</td>
+<td>可选的 <code>provider/model-id</code></td>
+</tr>
+<tr>
+<td><code>modelProfiles</code></td>
+<td><code>{}</code></td>
+<td>允许本次调用选择的别名到精确 <code>provider/model-id</code> 映射；默认关闭逐次模型选择</td>
+</tr>
+<tr>
+<td><code>thinkingLevel</code></td>
+<td><code>high</code></td>
+<td><code>off</code> 至 <code>xhigh</code></td>
+</tr>
+<tr>
+<td><code>timeoutMs</code></td>
+<td><code>300000</code></td>
+<td>整个快照与审查事务的截止时间</td>
+</tr>
+<tr>
+<td><code>maxDiffBytes</code></td>
+<td><code>524288</code></td>
+<td>diff 上限；超限直接失败，不截断</td>
+</tr>
+<tr>
+<td><code>maxFiles</code></td>
+<td><code>200</code></td>
+<td>变更文件上限</td>
+</tr>
+<tr>
+<td><code>maxOutputBytes</code></td>
+<td><code>524288</code></td>
+<td>Worker stdout 上限</td>
+</tr>
+<tr>
+<td><code>maxDiagnosticBytes</code></td>
+<td><code>65536</code></td>
+<td>Worker stderr 上限</td>
+</tr>
+<tr>
+<td><code>disposeGraceMs</code></td>
+<td><code>3000</code></td>
+<td>子进程终止宽限期</td>
+</tr>
+<tr>
+<td><code>requireFullSandbox</code></td>
+<td><code>true</code></td>
+<td>平台只能提供 partial enforcement 时拒绝运行；设为 <code>false</code> 会允许较弱隔离，是不安全的部署级 opt-out</td>
+</tr>
+<tr>
+<td><code>agentDir</code></td>
+<td><code>~/.pi/agent</code></td>
+<td>可选绝对 Pi 配置目录</td>
+</tr>
+<tr>
+<td><code>forwardEnvironment</code></td>
+<td><code>[]</code></td>
+<td>显式传给 Worker 的环境变量名</td>
+</tr>
+</tbody></table>
+<p><code>authority: root-turn</code> 会让 Cron、Plugin 等非人类来源的顶层轮次也能触发默认模型审查，适用于自动化，但扩大了调用权限。逐次 <code>model_profile</code> 选择仍要求同一开放轮次中存在宿主认证的人类输入；自动化如需固定另一模型，应由部署者修改默认 <code>model</code>。子 Agent、过期 Agent、无活动 driver、空闲状态或已结束轮次仍然不能调用。</p>
+<h2>安全边界与限制</h2>
+<ul>
+<li>默认要求 Harness 报告 <code>full</code> 的 read-only enforcement；实际 macOS 测试证明 Worker 子进程创建文件会被拒绝。</li>
+<li>Git 命令使用固定 argv、关闭 pager/textconv/ext-diff/交互提示、lazy fetch 与 ambient trace/SSH/helper 控制变量，并对路径、ref、输出字节数与文件数 fail-closed。</li>
+<li>v0.2 只支持带物理 <code>.git/</code> 目录的独立普通 worktree；linked worktree、<code>.git</code> indirection file、<code>commondir</code>、object alternates 和仓库级 clean/process/smudge filter 配置会在获取 diff 前被拒绝。普通 <code>.git/</code> 元数据属于宿主信任边界，工作树内容仍按不可信数据处理。</li>
+<li>会从 live worktree 进入审查的 tracked/untracked 当前路径必须是稳定、单链接的普通文件；符号链接、硬链接、submodule 和其他特殊文件会被拒绝。<code>staged</code>、<code>branch</code> 与 <code>commit</code> 审查不会打开 live worktree 文件，以免把快照外内容带入模型请求。</li>
+<li>Worker 只使用内存 Session，严格校验单个 stdin 请求、单个 stdout envelope、diff SHA-256、finding 路径/side/line 和输出大小。</li>
+<li>仓库内容被视为不可信数据，并有 prompt-injection 指令隔离；LLM 仍可能犯错，finding 必须由人复核。</li>
+<li>当前文件读取仅覆盖变更路径，可能漏掉依赖于未变更文件的跨文件缺陷。</li>
+<li>插件不提供任意完整文件审查：让模型自行选择未修改文件会扩大外部 Provider 数据披露权限；这需要独立的显式路径授权设计。</li>
+<li>二进制路径不开放额外文件读取；模型只能依据 Git binary patch/元数据，不能完成语义级二进制审计。</li>
+<li>需要至少一个有效 <code>HEAD</code> commit；全新且尚未提交的仓库会失败。</li>
+<li>只读沙箱不阻止模型网络请求，也不保证 Provider 不保留输入。数据治理取决于所选 Provider。</li>
+<li>插件不会运行测试或编译目标仓库，也不会自动修复代码；它只审查被冻结的改动。</li>
+</ul>
+<p>更多披露与报告方式见 <a href="https://github.com/win4r/dsh-pi-review/blob/HEAD/SECURITY.md">SECURITY.md</a>。</p>
+<h2>开发与验证</h2>
+<pre><code>pnpm run typecheck
+pnpm run test
+pnpm run build
+pnpm audit --prod --audit-level moderate
+pnpm pack
+</code></pre>
+<p>真实模型冒烟测试是显式 opt-in，会把故意构造的临时代码 diff 发送给指定 Provider。脚本不会执行 Pi <code>auth.json</code> 中的 <code>!command</code>；需要环境凭据时必须显式列出转发变量：</p>
+<pre><code>PI_REVIEW_SMOKE_FORWARD_ENV=OPENAI_API_KEY \
+  pnpm run test:real -- openai/gpt-5.3-codex
+</code></pre>
+<p>也可以临时构造一个不落盘到仓库的 OpenAI-compatible 自定义 Pi Provider：</p>
+<pre><code>PI_REVIEW_SMOKE_FORWARD_ENV=MY_PROVIDER_KEY \
+PI_REVIEW_SMOKE_CUSTOM_KEY_ENV=MY_PROVIDER_KEY \
+PI_REVIEW_SMOKE_CUSTOM_BASE_URL=https://provider.example/v1 \
+  pnpm run test:real -- smoke-provider/model-id
+</code></pre>
+<p>脚本要求本机 Harness 沙箱达到 <code>full</code> enforcement，并验证 Pi 对故意引入的授权回归返回 finding、目标文件及临时模型配置没有变化、Worker 没有创建工作区或 Pi 目录文件。普通 <code>pnpm test</code> 不访问模型 Provider。</p>
+<p>许可证：MIT。</p>

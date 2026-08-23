@@ -1,0 +1,498 @@
+<h1>dsh web manager</h1>
+<p>Windows 侧常驻托盘的 <strong>DeepSeek Harness WebUI 管理器</strong>：负责启动 dsh web、拉起 Edge 应用窗口、守护服务进程、常驻系统托盘，并接管窗口图标与窗口尺寸记忆。</p>
+<ul>
+<li><strong>跨 Windows / WSL2</strong>：管理器本体只运行在 Windows；WSL 内的 dsh web 由管理器通过 <code>wsl.exe</code> 托管（v2.1）。</li>
+<li><strong>窗口只是视图</strong>：关闭浏览器窗口不会结束 dsh web；点托盘图标随时重新唤起窗口。</li>
+<li><strong>图标与尺寸</strong>：以官方 <code>DeepSeek Harness.ico</code> 通过 <code>WM_SETICON</code> 设置到应用窗口并持续维持；窗口尺寸按记忆复现。</li>
+</ul>
+<blockquote>
+<p>与旧项目的关系：本仓库为 v2.0+ 的独立实现（独立交付），旧项目
+<code>FYHC1/dsh-webui-installer</code>（v1.4.x 脚本链路）收尾于 v1.4.2，不再大改。</p>
+</blockquote>
+<h2>原汁原味的独立浏览器窗口</h2>
+<p>管理器打开的不是"浏览器里的一个标签页"，而是 <strong>Edge 应用窗口（<code>--app</code>）</strong>——一套独立的、
+无地址栏/标签页/扩展干扰的 DeepSeek Harness 专用窗口，从观感到行为都像原生桌面应用：</p>
+<ul>
+<li><strong>官方鲸鱼图标</strong>：任务栏与窗口图标均为官方 <code>DeepSeek Harness.ico</code>
+（<code>WM_SETICON</code> 32/16px + AUMID 任务栏身份），与 dsh 官方 WebUI 完全一致；</li>
+<li><strong>专属浏览器数据目录</strong>：每个实例一个独立 Edge profile
+（<code>%LOCALAPPDATA%\dsh-web-manager-browser-&lt;port&gt;</code>），与日常浏览器彻底隔离，互不干扰；</li>
+<li><strong>记住你的窗口</strong>：尺寸/位置按实例记忆（<code>Window.Size/Position</code>），关闭再打开原样复现；</li>
+<li><strong>弹出即是正确尺寸</strong>：几何钩子（WinEventHook）在窗口<strong>显示之前</strong>完成尺寸设置——实测
+从第一帧起就是记忆尺寸、全程零跳变（Edge 本身只认自己的默认 945×1020，<code>--window-size</code>/
+<code>--start-minimized</code>/Preferences 全部无效，排除法矩阵见 docs/TESTING.md）；</li>
+<li><strong>快速唤起</strong>：关窗后预热驻留热进程，重开窗口 ~0.7–1.1s；无 URL 门控，窗口立即打开；</li>
+<li><strong>浏览器回退（v3.7）</strong>：默认使用 Edge；本机未安装 Edge 时自动改用 <strong>Google Chrome</strong>，
+再不行用开源 <strong>Chromium</strong>（三者同为 Chromium 内核，<code>--app</code> 独立窗口、几何钩子、
+图标与隔离 profile 行为完全一致）；</li>
+<li><strong>窗口只是视图</strong>：关窗不停服务，托盘/快捷方式随时一键重新唤起。</li>
+</ul>
+<h2>快速打开窗口</h2>
+<table>
+<thead>
+<tr>
+<th>入口</th>
+<th>操作</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>Windows 桌面快捷方式</td>
+<td><code>DeepSeek Harness WebUI (win).lnk</code> / <code>(wsl).lnk</code>（dsh 插件自动创建/维护，双击即开对应后端独立窗口）</td>
+</tr>
+<tr>
+<td>WSL 命令行</td>
+<td><code>dsh-webui</code>（默认 WSL 端）/ <code>dsh-webui windows</code>（详见下文「WSL 命令：dsh-webui」）</td>
+</tr>
+<tr>
+<td>托盘</td>
+<td>左键单击图标、菜单「打开窗口」、实例子菜单「打开窗口」</td>
+</tr>
+<tr>
+<td>命令行动作</td>
+<td><code>dsh-web-manager.exe open</code> / <code>open windows</code> / <code>open wsl</code></td>
+</tr>
+</tbody></table>
+<p>所有入口都<strong>按需启动</strong>：只拉起目标后端的服务与窗口（v3.6 起不再顺带启动另一端）；
+某后端<strong>尚未配置实例</strong>时（从未添加或已被删除），入口会自动生成一个默认实例并启动，
+无需先手动「添加实例」。</p>
+<h2>用法</h2>
+<h3>方式一：作为 dsh 插件安装（推荐）</h3>
+<p>本仓库本身就是一个可安装的 dsh 插件包 <strong><code>dsh-web-manager</code></strong>（运行时桥 + Windows 托盘
+exe + WSL 伴生脚本打包在一起）。一条命令装入 dsh profile，之后 dsh 每次启动都会自动
+确保托盘 exe 与桌面快捷方式（详见「Runtime Bridge」与「桌面快捷方式与托盘共享」两节）：</p>
+<pre><code># 从 GitHub 安装（推荐）
+dsh plugin --profile web add github:FYHC1/dsh-web-manager
+# 或从本地仓库安装（开发/离线场景）
+dsh plugin --profile web add file:/path/to/dsh-web-manager
+</code></pre>
+<p>装完<strong>重启 dsh</strong>（重新运行 <code>dsh web</code>）即生效：托盘随 dsh 常驻；桌面上自动出现
+<code>DeepSeek Harness WebUI (win)/(wsl).lnk</code> 快捷方式与 WSL 端 <code>dsh-webui</code> 命令，
+双击/执行即可快速打开独立窗口。</p>
+<h3>方式二：Windows 手动安装（不装插件）</h3>
+<p>Windows PowerShell：</p>
+<pre><code>powershell -ExecutionPolicy Bypass -File scripts\Install.ps1
+</code></pre>
+<p>安装内容：</p>
+<ul>
+<li>编译或复制 <code>dist\dsh-web-manager.exe</code>（.NET Framework 4.8，Win10/11 自带运行时）到 <code>%LOCALAPPDATA%\dsh-web-manager\app\</code></li>
+<li>创建桌面/开始菜单快捷方式（指向 <code>dsh-web-manager.exe open</code>）</li>
+<li>冒泡式初始化共享配置 <code>%USERPROFILE%\.dsh-webui\config.json</code>（Windows 与 WSL 两侧可见）</li>
+<li>可选：开机自启（仅托盘、不弹窗）</li>
+</ul>
+<p>首次双击快捷方式 → 管理器以单实例启动：</p>
+<ol>
+<li>探测端口（默认 3080，被非 dsh 进程占用时自动顺延 3080+n，可配置关闭）</li>
+<li>未监听 → 隐藏拉起 <code>dsh web --port N</code> 并接管（managed）；已监听 → 附着（attached，不抢不杀）</li>
+<li>打开 Edge <code>--app=http://127.0.0.1:N</code>（沿用记忆的窗口尺寸/位置，独立浏览器数据目录）</li>
+<li>常驻托盘：关窗不结束服务，点托盘/菜单「打开窗口」随时重新唤起</li>
+<li>心跳循环：端口健康、图标维持（<code>WM_SETICON</code> 32/16px）、窗口尺寸采集、崩溃检测与退避重启</li>
+</ol>
+<p>托盘右键菜单：打开窗口 / 重启服务 / 后端（Windows 本机 ⇄ WSL）/ 退出（停服务）/ 开机自启 / 状态。</p>
+<h2>WSL 后端（v2.1）</h2>
+<p>菜单「后端 → WSL」或 <code>dsh-web-manager.exe "backend wsl"</code> 即可把 dsh web 托管进 WSL：</p>
+<ul>
+<li><strong>wsl-start.sh</strong>：WSL 侧自愈启动器（物化到 <code>~/.dsh-webui/</code>），自带崩溃循环 + pidfile + TERM 陷阱</li>
+<li><strong>发行版自动探测</strong>：<code>wsl --list</code> 过滤辅助发行版（Docker/Rancher/Podman），
+优先级：配置 <code>wslDistro</code> &gt; 唯一候选 &gt; 运行中 &gt; 默认 &gt; 名称打分</li>
+<li><strong>所有权模型</strong>：管理器拉起的 = managed（完整生命周期/守护/退避重启）；
+外部已在跑的 WSL dsh = attached（只监控，不抢不杀）</li>
+<li><strong>端口策略</strong>：每后端独立端口记忆（<code>Port</code> / <code>WslPort</code>），非 dsh 占用自动顺延并写回</li>
+<li><strong>健康探测</strong>：Windows 端口探测 + WSL 侧 <code>ss</code> 解析双通道 —— 即使 localhostForwarding
+关闭，守护/状态也不误判（dsh 出于安全拒绝 <code>--host 0.0.0.0</code>，故服务只绑 127.0.0.1，
+forwarding 关闭时 Windows 无法访问，打开窗口会给出明确提示）</li>
+<li><strong>systemd 托管（v3.0）</strong>：托盘「后端 → WSL 服务模式 → systemd」或 <code>wslmode systemd</code>。
+管理器生成 <code>~/.config/systemd/user/dsh-web-&lt;port&gt;.service</code>（Restart=on-failure 自愈、
+journald 日志、随登录拉起），前台运行 dsh；<code>systemd</code> 不可用（未开
+<code>/etc/wsl.conf [boot] systemd=true</code>）时自动回退 wrapper 模式。</li>
+<li><strong>双向互装</strong>：<code>wsl-bootstrap.sh</code>（WSL→Windows）检测 manager 未运行则静默拉起，
+未安装则经共享目录 <code>~/.dsh-webui/wsl-bootstrap/Install.ps1</code> 静默安装；
+安装器会把 WSL 伴侣脚本物化进默认发行版（bootstrap.lock 先到先得防竞态）</li>
+</ul>
+<p>测试沙箱：设置环境变量 <code>DSH_WEB_MANAGER_HOME=&lt;目录&gt;</code> 可把 config/日志/mutex/管道整体隔离，
+用于并行验证而不影响真实安装。</p>
+<h2>多实例（v3.0）</h2>
+<p><code>config.json</code> 的 <code>Instances</code> 数组可同时托管多个独立实例（Windows 与 WSL 混用、不同端口）。
+数组留空则回退到传统单实例字段（<code>Port</code> / <code>WslPort</code> / <code>BackendType</code> 等）。</p>
+<pre><code>{
+  "Instances": [
+    { "Id": "windows", "BackendType": "windows", "Port": 3081, "Profile": "web", "Enabled": true },
+    { "Id": "wsl", "BackendType": "wsl", "WslPort": 3080, "WslDistro": "FedoraLinux",
+      "WslServiceMode": "systemd", "Profile": "web", "Enabled": true }
+  ]
+}
+</code></pre>
+<p>每个实例独立管理：端口、窗口尺寸/位置、图标、崩溃守护、Runtime Bridge 状态。
+托盘「实例」菜单列出全部实例（打开窗口 / 重启服务 / 状态），并支持<strong>添加实例</strong>与<strong>删除实例</strong>
+（添加对话框可下拉选择 WSL 发行版，自动探测真实发行版，无需手填）。</p>
+<h2>Runtime Bridge（v3.0 → 可安装的 dsh 插件包）</h2>
+<p>本仓库本身就是一个可安装的 dsh 插件包 <strong><code>dsh-web-manager</code></strong>：它把运行时的桥插件
+（<code>lib/index.js</code> + <code>cordis.patch.yml</code>）和 Windows 托盘 exe、WSL 伴生脚本打包在一起。
+管理器借桥拿到 dsh 的<strong>权威状态</strong>（版本、node、运行时长、pid、端口）并做<strong>优雅停止</strong>
+（先 SIGTERM 再 kill），而不是只看端口猜测。</p>
+<p>协议（line-delimited JSON，监听 <code>127.0.0.1:&lt;webPort+100&gt;</code>）：
+<code>ping</code> / <code>getStatus</code> / <code>getRuntimeInfo</code> / <code>shutdown</code>，请求形如
+<code>{"v":1,"method":"getRuntimeInfo","token":"&lt;BridgeToken&gt;"}</code>。</p>
+<p><strong>安装</strong>（命令同「用法 · 方式一」；WSL 与 Windows 两侧 profile 各自执行一次）：</p>
+<pre><code># 从本地仓库安装
+dsh plugin --profile web add file:/path/to/dsh-web-manager
+# 或从 GitHub 安装
+dsh plugin --profile web add github:FYHC1/dsh-web-manager
+</code></pre>
+<p>该命令会：</p>
+<ol>
+<li>用 pnpm 把 <code>dsh-web-manager</code> 装入 profile 的 <code>node_modules/</code>，并因
+<code>package.json</code> 的 <code>dsh.bundle.patch</code> <strong>自动追加到 <code>dsh.profile.bundles</code></strong>，
+桥插件随之自动参与组合（不再需要手动拷贝目录 + 改 <code>cordis.patch.yml</code>）。</li>
+<li>托盘 exe 为<strong>显式一步</strong>（避开 pnpm 对构建脚本的默认拦截）：Windows 侧在 profile
+目录跑一次
+<code>node node_modules\dsh-web-manager\scripts\install-tray.mjs</code>（等价于
+<code>powershell -ExecutionPolicy Bypass -File &lt;profile&gt;\node_modules\dsh-web-manager\dist\Install.ps1</code>：
+安装托盘 exe 到 <code>%LOCALAPPDATA%\dsh-web-manager\app</code>、初始化配置、拉起托盘）。</li>
+</ol>
+<p><strong>从旧的手动注入迁移</strong>：若 profile 之前手动拷过 <code>node_modules/dsh-runtime-bridge</code>
+并在 <code>cordis.patch.yml</code> 里手动 <code>insert</code> 了 <code>dsh-runtime-bridge</code>，安装后请删除那段
+insert 与手拷目录，避免出现两套桥（双桥会抢同一个 <code>DSH_BRIDGE_PORT</code>）。</p>
+<p>管理器启动 dsh 时会自动注入 <code>DSH_BRIDGE_PORT</code>（=port+100）、<code>DSH_BRIDGE_TOKEN</code>
+（config 的 <code>BridgeToken</code>，首次自动生成）、<code>DSH_PROFILE</code>、<code>DSH_WEB_PORT</code>。
+托盘状态随之显示 <code>运行中 (…) · dsh &lt;版本&gt; · node &lt;版本&gt; · 运行 &lt;时长&gt;</code>。</p>
+<h2>桌面快捷方式与托盘共享（自动）</h2>
+<p>插件 <code>apply()</code> 时（dsh web 每次启动）会<strong>幂等</strong>地做两件事：</p>
+<ol>
+<li><p><strong>确保共享托盘</strong>：若 <code>%LOCALAPPDATA%\dsh-web-manager\app\dsh-web-manager.exe</code>
+已存在则直接复用（共用同一个托盘，不再装第二份）；否则把随包的
+<code>dist/dsh-web-manager.exe</code> + 图标拷贝过去。用户配置/状态在
+<code>%USERPROFILE%\.dsh-webui\</code>，不会被覆盖。</p>
+</li>
+<li><p><strong>创建/修正桌面快捷方式</strong>（按安装平台区分）：</p>
+<ul>
+<li>Windows 端 dsh 安装 → <code>DeepSeek Harness WebUI (win).lnk</code> → 管理器 <code>open windows</code></li>
+<li>WSL 端 dsh 安装 → Windows 桌面 <code>DeepSeek Harness WebUI (wsl).lnk</code> → 管理器 <code>open wsl</code></li>
+</ul>
+<p>快捷方式目标都是同一个共享托盘 exe；若发现旧版遗留的 <code>wscript.exe</code>/<code>.vbs</code>
+快捷方式（dsh-webui-installer 时代产物）会自动替换为指向托盘的新快捷方式。</p>
+</li>
+</ol>
+<p>管理器新增控制动作 <code>open windows</code> / <code>open wsl</code>（<code>dsh-web-manager.exe open windows</code>
+或 <code>open wsl</code>）：打开指定后端的窗口，与快捷方式一致。双击快捷方式时若托盘未运行会
+先冷启动托盘，再打开对应后端窗口；若托盘已在运行则直接转发。</p>
+<p><strong>按需启动（v3.6）</strong>：快捷方式只拉起目标后端——<code>open wsl</code> 不会顺带启动 Windows
+端服务，反之亦然；托盘启动（开机自启）本身不启动任何服务，已在运行的服务由心跳
+自动附着（如 systemd 单元），未运行的服务在打开其窗口时才启动。某后端<strong>尚未配置
+实例</strong>时（例如实例被删除或从未添加），快捷方式会自动按后端记忆端口生成一个默认
+实例并启动，无需手动「添加实例」。</p>
+<h2>更新机制（v3.1）</h2>
+<p>托盘「更新」菜单同时管理 <strong>dsh</strong> 与 <strong>dsh web manager</strong> 两个软件，互不影响：</p>
+<ul>
+<li><strong>检查 dsh 更新</strong>：24 小时节流，经 npmmirror 查询 <code>@deepseek-ai/dsh</code> 最新版，与运行中 dsh 版本
+（优先取 Runtime Bridge 的 <code>dshVersion</code>）比对，有新版才弹通知。</li>
+<li><strong>更新 dsh</strong>：一键 <code>npm install -g @deepseek-ai/dsh@latest</code>（走 npmmirror），完成后提示新版本号。</li>
+<li><strong>检查管理器更新</strong>：查询 GitHub Releases（<code>FYHC1/dsh-web-manager/releases/latest</code>），与当前
+管理器版本比对，弹通知告知结果（无发布 / 已最新 / 发现新版）。</li>
+<li><strong>更新 dsh web manager</strong>（自更新）：下载最新 release 中的 <code>dsh-web-manager.exe</code> →
+校验文件版本 → 生成脱离式更新脚本 → 退出托盘（<strong>不停止任何 dsh 服务</strong>）→ 脚本等 exe
+解锁后替换并自动以托盘模式重启 → 管理器重新附着各实例。全程 dsh 保持运行。<ul>
+<li>更新包下载到 <code>%LOCALAPPDATA%\dsh-web-manager\update\</code>，更新过程记录在
+<code>%LOCALAPPDATA%\dsh-web-manager\logs\manager-update.log</code>。</li>
+<li>启动时也会做一次 24h 节流的管理器版本检查，发现新版才弹通知。</li>
+</ul>
+</li>
+<li><strong>更新 dsh 插件包</strong>：一键刷新 dsh profile 里的 <code>dsh-web-manager</code> 插件（bridge + 快捷方式
+脚本）。自动读取 profile <code>package.json</code> 中记录的安装来源（如 <code>file:/home/.../dsh-web-manager</code>），
+执行 <code>dsh plugin --profile &lt;p&gt; remove</code> + <code>add &lt;spec&gt;</code>，重启 dsh 后生效。来源可通过配置
+<code>PluginUpdateSpec</code> 覆盖。</li>
+</ul>
+<h3>发布新版本（给维护者）</h3>
+<p>自更新依赖 GitHub Release 附带 <code>dsh-web-manager.exe</code> 资产（tag 形如 <code>v3.0.1</code>，跳过 prerelease）：</p>
+<pre><code># 在仓库根目录（WSL 或 Windows 均可，需要 gh 已登录）
+gh release create v3.0.1 dist/dsh-web-manager.exe --title "dsh web manager v3.0.1" --notes "更新说明"
+</code></pre>
+<p>发布后，用户点托盘「更新 dsh web manager」即可自动升级。</p>
+<h2>状态与配置</h2>
+<p><code>config.json</code> 关键字段（<code>%USERPROFILE%\.dsh-webui\config.json</code>）：</p>
+<table>
+<thead>
+<tr>
+<th>字段</th>
+<th>说明</th>
+<th>默认</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>Port</code></td>
+<td>Windows 后端首选端口</td>
+<td><code>3080</code></td>
+</tr>
+<tr>
+<td><code>AutoFallback</code></td>
+<td>非 dsh 占用时自动顺延空闲端口</td>
+<td><code>true</code></td>
+</tr>
+<tr>
+<td><code>WindowBackend</code></td>
+<td>v3.8 窗口后端：<code>auto</code>（有 WebView2 运行时即内嵌，否则 Edge）/ <code>webview2</code>（强制内嵌，缺失时回退并气泡提示）/ <code>edge</code>（原 Edge <code>--app</code> 路径）</td>
+<td><code>auto</code></td>
+</tr>
+<tr>
+<td><code>DshCommand</code></td>
+<td>dsh 命令绝对路径覆盖（离线包用；留空走 PATH/常见布局探测）</td>
+<td><code>""</code></td>
+</tr>
+<tr>
+<td><code>DataDir</code></td>
+<td>Edge 独立浏览器数据目录（留空用默认）</td>
+<td><code>""</code></td>
+</tr>
+<tr>
+<td><code>CloseStopsService</code></td>
+<td>关闭窗口时同时停止服务（旧行为开关）</td>
+<td><code>false</code></td>
+</tr>
+<tr>
+<td><code>ExitKeepService</code></td>
+<td>退出托盘时保留服务</td>
+<td><code>false</code></td>
+</tr>
+<tr>
+<td><code>StopAttached</code></td>
+<td>「关闭实例/退出」是否停止附着的外部服务；<code>false</code> = 纯窗口管理模式（只解除附着）</td>
+<td><code>true</code></td>
+</tr>
+<tr>
+<td><code>AutoStart</code></td>
+<td>开机自启（托盘不弹窗）</td>
+<td><code>false</code></td>
+</tr>
+<tr>
+<td><code>BackendType</code></td>
+<td><code>windows</code> / <code>wsl</code></td>
+<td><code>windows</code></td>
+</tr>
+<tr>
+<td><code>WslPort</code></td>
+<td>WSL 后端首选端口</td>
+<td><code>3080</code></td>
+</tr>
+<tr>
+<td><code>WslDistro</code></td>
+<td>指定 WSL 发行版（留空自动）</td>
+<td><code>""</code></td>
+</tr>
+<tr>
+<td><code>WslServiceMode</code></td>
+<td>WSL 服务模式：<code>wrapper</code>（自愈脚本）/ <code>systemd</code>（unit）</td>
+<td><code>wrapper</code></td>
+</tr>
+<tr>
+<td><code>Profile</code></td>
+<td>dsh profile 名</td>
+<td><code>web</code></td>
+</tr>
+<tr>
+<td><code>Window.Size</code> / <code>Window.Position</code></td>
+<td>记忆的窗口尺寸与位置</td>
+<td>空（Edge 默认）</td>
+</tr>
+<tr>
+<td><code>Instances</code></td>
+<td>v3.0 多实例列表（Id/Profile/BackendType/Port/WslPort/WslDistro/WslServiceMode/Enabled）；空 = 单实例回退</td>
+<td><code>null</code></td>
+</tr>
+<tr>
+<td><code>BridgeToken</code></td>
+<td>Runtime Bridge 共享密钥（首次自动生成）</td>
+<td><code>""</code></td>
+</tr>
+<tr>
+<td><code>LastWslDistro</code></td>
+<td>记忆上次成功使用的 WSL 发行版</td>
+<td><code>""</code></td>
+</tr>
+<tr>
+<td><code>LastVersionCheckUtc</code> / <code>LastKnownLatest</code></td>
+<td>dsh 更新检查节流时间戳 / 已知最新版本</td>
+<td><code>""</code></td>
+</tr>
+<tr>
+<td><code>LastManagerCheckUtc</code> / <code>LastKnownManagerLatest</code></td>
+<td>管理器更新检查节流时间戳 / 已知最新版本</td>
+<td><code>""</code></td>
+</tr>
+<tr>
+<td><code>ManagerUpdateApi</code></td>
+<td>管理器 Release API 覆盖地址（留空用官方 GitHub；测试/镜像用）</td>
+<td><code>""</code></td>
+</tr>
+<tr>
+<td><code>PluginUpdateSpec</code></td>
+<td>插件包安装来源覆盖（留空自动从 profile 的 package.json 探测）</td>
+<td><code>""</code></td>
+</tr>
+</tbody></table>
+<h2>WSL 命令：dsh-webui</h2>
+<p>Linux 端注册了 <code>dsh-webui</code> 命令（插件在 WSL 启动时自动安装到 <code>~/.local/bin/</code>），用于从
+WSL 里手动打开<strong>独立窗口</strong>——它把请求转发给共享的 Windows 托盘管理器，由管理器拉起
+Edge <code>--app</code> 独立窗口（无需记忆端口/URL）：</p>
+<pre><code>dsh-webui            # 打开 WSL 后端独立窗口（默认）
+dsh-webui wsl        # 同上
+dsh-webui windows    # 打开 Windows 后端独立窗口
+</code></pre>
+<p>未安装插件时手动注册：<code>install -D -m 755 scripts/dsh-webui ~/.local/bin/dsh-webui</code>。</p>
+<h2>开发</h2>
+<pre><code>powershell -ExecutionPolicy Bypass -File scripts\Build.ps1   # 系统 csc.exe 编译 + 测试程序
+</code></pre>
+<p>要求：任意 Windows 10/11（自带 .NET Framework 4.8 与 C# 编译器 <code>csc.exe</code>），无需安装 Visual Studio。</p>
+<h2>里程碑</h2>
+<ul>
+<li><strong>v3.8</strong>：WebView2 内嵌窗口后端（窗口归属管理器进程，任务栏鲸鱼图标不受
+「合并任务栏按钮」影响；<code>WindowBackend</code> 配置 + 运行时缺失自动回退 Edge）+
+离线安装包 <code>dsh-offline-bundle</code>（Build-Bundle / Install-Offline / Uninstall-Offline，
+便携 Node + dsh 包树 + 预烘焙 profile，断网首启验收）+ <code>DshCommand</code> 配置直连 ✅ 已交付</li>
+<li><strong>v2.0</strong>：Windows 后端全量——托盘、窗口、图标、尺寸、守护、配置、日志、迁移、A–I 验证</li>
+<li><strong>v2.1</strong>：WSL 后端（wsl-start.sh 自愈托管 + distro 自动探测 + attached/managed 所有权 +
+双向互装 bootstrap + 每后端端口记忆）✅ 已交付，J–Q 真机矩阵通过</li>
+<li><strong>v2.2</strong>：后端感知健康探测（forwarding 关闭时守护不误判）+ 窗口 URL 策略（不可达时提示
+而非打开打不开的窗口）+ Error/Starting 残留清理 + 可中断 sleep + 墙钟超时 ✅ 已交付，
+R–V 真机矩阵通过</li>
+<li><strong>v3.0</strong>：systemd 托管（W–Z 矩阵）+ Runtime Bridge 插件（权威状态/优雅停止，ping/
+getStatus/getRuntimeInfo/shutdown 协议）+ 多实例（Instances 数组，Windows+WSL 同开）+
+更新机制（24h 节流版本检查 + 托盘一键更新）✅ 已交付</li>
+<li><strong>v3.0 P1–P2 增强</strong>：Runtime Bridge 状态接入托盘（dsh/node 版本、运行时长显示；检查更新联动）+
+Windows 侧 Runtime Bridge + 多实例「添加/删除实例」托盘 UI + FindAppWindow WMI 卡死修复 ✅ 已交付</li>
+<li><strong>v3.0 P2 后续（UI 优化）</strong>：托盘顶部横向 Windows/WSL 激活按钮（记忆当前后端）+
+状态项两行显示（运行中 / 未启动·未知版本）+ 端口跨后端全局独占 +
+实例菜单「关闭窗口」+ 每实例独立浏览器 profile（多实例窗口不再合并）+
+菜单底部锚定（切换后端只伸缩顶部）+ 面板美化（浅色主题）✅ 已交付</li>
+<li><strong>浏览器标签页根因修复</strong>：dsh web 启动时默认调用系统浏览器打开 URL（日志提示
+<code>pass --no-open to disable</code>）→ 三处启动命令统一加 <code>--no-open</code>（Windows / wsl-start.sh /
+wsl-systemd-start.sh），浏览器不再冒 dsh 标签，只保留 manager 拉起的独立 <code>--app</code> 窗口 ✅ 已修复</li>
+<li><strong>默认启动后端</strong>：托盘「默认启动后端」子菜单（Windows 本机 / WSL）决定 manager 以
+<code>open</code> 启动时拉起的后端窗口；启动时自动关闭其他实例的残留窗口 ✅ 已交付</li>
+<li><strong>默认启动后端勾选指示修复</strong>：根因是 .NET Framework 4.8 的 <code>ShowCheckMargin</code> 默认关闭，
+且子菜单又设了 <code>ShowImageMargin=false</code> → 原生勾选符号永远不会绘制，「默认启动后端」与
+「WSL 服务模式」的当前选中项看起来与未选中完全一样。修复：仅对包含勾选项的子菜单开启
+<code>ShowCheckMargin</code>（原生勾选列），无勾选项的子菜单（实例/更新）保持紧凑；
+主菜单 256×423 布局、状态项两行高度均不变 ✅ 已修复</li>
+<li><strong>开机自启灰色标识</strong>：主菜单不开勾选列（会加宽所有项）——「开机自启」开启时该项背景
+改为灰色阴影（<code>#E6E6E6</code>），关闭时恢复白底；以 config 为准同步，<code>ToggleAutoStart</code> 失败
+也能自愈；悬停仍显示淡蓝高亮 ✅ 已交付</li>
+<li><strong>悬停高亮卡顿修复</strong>：点击顶部 Windows/WSL 切换按钮后，焦点被托管按钮夺走导致菜单
+不再跟踪悬停 → 切换后把焦点还给菜单（<code>RefocusMenu</code>），高亮恢复即时 ✅ 已修复</li>
+<li><strong>v3.1 管理器自更新</strong>：GitHub Releases 查询/比对（跳过 prerelease）+ 下载校验 +
+脱离式更新脚本（等 exe 解锁 → 替换 → 托盘重启，不停止 dsh）+ 托盘「检查管理器更新 /
+更新 dsh web manager」+ 启动时 24h 节流检查 + <code>updatemanager</code> 控制动作 ✅ 已交付</li>
+<li><strong>v3.1 插件包更新 + dsh-webui</strong>：托盘「更新 dsh 插件包」（自动探测 profile 安装来源，
+<code>dsh plugin remove/add</code> 一键刷新，提示具体包名@版本与来源）+ Linux 端 <code>dsh-webui</code>
+命令（转发给共享管理器打开独立窗口，插件自动注册到 <code>~/.local/bin</code>）✅ 已交付</li>
+<li><strong>v3.1 修复四连</strong>：①退出时立即隐藏托盘图标（<code>Exiting</code> 事件 → <code>NIM_DELETE</code>，不再出现
+幽灵图标/需点两次退出）；②独立窗口尺寸记忆修复（根因：<code>Launch</code> 读管理器级 <code>Window</code>，
+而 <code>CaptureSize</code> 写入实例级 <code>Window</code>，多实例下尺寸永不生效 → 改用实例级窗口配置）；
+③状态栏严格跟随顶部 Windows/WSL 切换按钮（切换即刷新，只显示所选端，无匹配显示
+「未选择后端」）；④插件包更新提示具体更新的包与来源 ✅ 已交付</li>
+<li><strong>v3.1 窗口尺寸记忆深度修复</strong>：实例级配置修复后仍不生效的<strong>真正根因</strong>——Edge 150
+完全忽略 <code>--window-size</code>（fresh profile 实证：<code>--window-size=1500x800</code> 仍开 945×1020
+默认尺寸），始终按自己保存的边界打开 <code>--app</code> 窗口。最终方案：<strong>正常启动（不最小化，
+窗口一出现即可见）→ 直接轮询启动进程 <code>MainWindowHandle</code>（150ms，无 WMI 缓存）→
+窗口出现后 ~0.2s 内 <code>SetWindowPos</code> 应用记忆尺寸</strong>——窗口弹出快（Launch→调整 ~1.0s，
+其中 ~0.8s 是 Edge 冷启动本身）、无最小化延迟、无隐藏闪烁；若窗口意外最小化则走
+隐藏→调整→显示兜底。另保留：启动时快照记忆几何、CaptureSize 启动后 6 秒保持期
+（阻断覆盖循环）、启动前清除残留后台进程。实测：打开/关窗重开均以记忆的
+1665×1020 出现，配置稳定 ✅ 已交付</li>
+</ul>
+<h2>许可</h2>
+<p>MIT</p>
+<h2>任务栏图标说明（Windows）</h2>
+<p><strong>v3.8 起，默认窗口后端为 WebView2 内嵌窗口</strong>：WebUI 窗口直接属于管理器进程
+（<code>WebViewForm</code>，每个实例一个 STA UI 线程），任务栏按钮的图标与分组都跟随管理器
+自带的鲸鱼图标——即使任务栏开启「合并任务栏按钮」也不会被 Edge 进程图标顶掉。
+每实例窗口仍写入独立 AUMID（<code>DeepSeekHarness.WebUI.&lt;port&gt;</code>，对自有窗口
+<code>SHGetPropertyStoreForWindow</code> 正常生效），多实例不会互相合并。</p>
+<ul>
+<li>需要WebView2 运行时（Win11 / 新 Win10 已内置；缺失时管理器自动回退 Edge 模式并气泡提示）。</li>
+<li>构建 WebView2 后端需要 <code>lib\</code> 下的 SDK 程序集，首次执行
+<code>powershell -ExecutionPolicy Bypass -File lib\Get-WebView2.ps1</code> 自动下载解包。</li>
+<li>强制走旧路径：<code>config.json</code> 里 <code>"WindowBackend": "edge"</code>。</li>
+</ul>
+<p><strong>Edge 模式的旧限制（回退时生效）</strong>：窗口图标由管理器通过 <code>WM_SETICON</code> 持续设置
+（32/16px，官方 <code>DeepSeek Harness.ico</code>），验证方式：<code>WM_GETICON</code> 像素采样与官方图标一致。
+但若任务栏启用了「合并任务栏按钮」（TaskbarGlomLevel 0/1，Win10 生效），多个同进程窗口
+（如 Edge 的多个 <code>--app</code> 窗口）会被合并成单个按钮并显示<strong>进程图标（Edge）</strong>，即使每个窗口
+自身的图标都是 DeepSeek 鲸鱼。Edge 模式下要显示鲸鱼图标，请将任务栏设置为「从不合并」：</p>
+<ul>
+<li>设置 → 个性化 → 任务栏 → 「合并任务栏按钮」→「从不合并」</li>
+<li>或注册表：<code>HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced</code> 下
+<code>TaskbarGlomLevel = 2</code>，然后重启资源管理器（explorer）生效。</li>
+</ul>
+<blockquote>
+<p>为什么 Edge 模式无法在代码层解决？Chromium 的 <code>--app</code> 窗口在 Windows 上
+不接受外部进程写入窗口 AppUserModelID（<code>SHGetPropertyStoreForWindow</code> 的
+<code>SetValue</code> 对 Chromium 窗口抛 <code>0x80070002</code>，普通窗口正常）。AUMID 由页面
+manifest 决定，外部无法覆盖。这正是 v3.8 引入 WebView2 内嵌窗口的原因：
+窗口归属管理器进程后，图标/分组问题从根上消失。</p>
+</blockquote>
+<h2>离线安装包（dsh-offline-bundle）</h2>
+<p>为无外网（或仅内网）的 Windows x64 目标机准备的一体化离线发行包：
+便携 Node（官方 win-x64 zip）+ <code>@deepseek-ai/dsh</code> npm 包树 + 预烘焙的 <code>~/.dsh</code>
+profile（已装本管理器插件）+ 管理器 dist。目标机一条命令完成安装，首次启动不联网。</p>
+<pre><code># 构建端（联网的 Windows 机器，仓库根目录）：
+powershell -ExecutionPolicy Bypass -File scripts\Build-Bundle.ps1
+#   产出 bundle-out\dsh-offline-bundle\（node\ dsh\ profile-web\ dsh-web-manager\
+#   + Install-Offline.ps1 + Uninstall-Offline.ps1 + bundle.json）
+#   profile 烘焙有硬性验收：断网（死代理）启动通过才打包，否则直接失败不出包。
+
+# 目标端（离线机器，解压后在该目录执行）：
+powershell -ExecutionPolicy Bypass -File Install-Offline.ps1              # 默认：装齐 + 启动托盘
+powershell -ExecutionPolicy Bypass -File Install-Offline.ps1 -AutoStart   # 另加开机自启
+powershell -ExecutionPolicy Bypass -File Uninstall-Offline.ps1            # 卸载（默认保留 ~/.dsh）
+powershell -ExecutionPolicy Bypass -File Uninstall-Offline.ps1 -PurgeProfile  # 连 profile 一起删
+</code></pre>
+<p>行为要点：</p>
+<ul>
+<li>安装位置：<code>%LOCALAPPDATA%\dsh-bundle\</code>（node + dsh 包树 + <code>bin\dsh.cmd</code> shim，
+shim 用绝对路径指向捆绑 node，不依赖全局 Node/npm）；管理器照常装到
+<code>%LOCALAPPDATA%\dsh-web-manager\app</code>，并写入 <code>config.json</code> 的 <code>DshCommand</code>
+直连捆绑 shim（PATH 仅作为补充，可用 <code>-NoPath</code> 跳过）。</li>
+<li>profile：拷贝预烘焙的 <code>~/.dsh</code>；已存在时只补缺文件，<strong>绝不覆盖</strong>
+<code>.credentials.yaml</code>（API Key 留占位，在 WebUI 里填）。</li>
+<li>WebView2 运行时缺失不阻塞安装：管理器自动回退 Edge 窗口模式（见上）。</li>
+<li>幂等升级：重跑新版 <code>Install-Offline.ps1</code> 即升级（robocopy 镜像 + 管理器版本比较
+不降级 + 配置保留）；离线机的升级 = 拿新版 bundle 重跑安装器。</li>
+<li><code>bundle.json</code> 记录各组件版本，供日志与升级比对（样例见仓库根 <code>bundle.example.json</code>）。</li>
+<li>测试：两个脚本都识别 <code>DSH_WEB_MANAGER_HOME</code> 沙箱（管理器文件、profile、共享配置
+全部落沙箱，不碰真实用户环境；见 TESTING.md 纪律）。</li>
+</ul>
+<h3>WSL 侧（bundle\wsl\ 载荷 + deb 包）</h3>
+<p>离线包可以内嵌 WSL 载荷（Linux 版便携 Node + dsh 树 + 预烘焙的 Linux <code>~/.dsh</code> profile，
+构建时同样过断网启动验收门）：</p>
+<pre><code># 构建端（Linux 机器 / CI ubuntu runner / 任意 WSL 发行版内）：
+bash scripts/Build-Bundle-Wsl.sh                 # -&gt; bundle-out/bundle-wsl/
+# Windows 侧构建时合入：
+powershell -File scripts\Build-Bundle.ps1 -WslPayloadDir bundle-out\bundle-wsl
+# 目标机：Install-Offline.ps1 检测到 bundle\wsl\ + wsl.exe 即自动装 WSL 侧
+#   （发行版自动探测：优先运行中的非辅助发行版；-WslDistro 显式指定，-SkipWsl 跳过）
+</code></pre>
+<p>WSL 侧落地内容（发行版内 <code>~/.dsh-bundle/</code> + <code>~/.local/bin/dsh</code> + profile 补缺 +
+<code>~/.dsh-webui/</code> 伴生脚本），由 <code>scripts/wsl/install-wsl.sh</code> 完成——它同时是 deb/rpm 包的
+post 脚本核心。<strong>两种 Linux 包都带 <code>-wsl</code> 后缀</strong>（<code>dsh-bundle-wsl</code>），与未来适配裸机
+Linux 的 <code>dsh-bundle</code>（原生包）区分：</p>
+<pre><code># deb（Debian/Ubuntu 系 WSL 发行版）：
+bash scripts/Build-Deb.sh --payload bundle-out/bundle-wsl   # -&gt; dsh-bundle-wsl_&lt;ver&gt;_amd64.deb
+sudo apt install ./dsh-bundle-wsl_*_amd64.deb               # /opt/dsh-bundle-wsl + postinst 接线默认用户
+dsh-bundle-wsl-install                                      # 任意用户重跑用户级安装
+
+# rpm（Fedora 系 WSL 发行版，本机即此场景；需 rpm-build）：
+bash scripts/Build-Rpm.sh --payload bundle-out/bundle-wsl   # -&gt; dsh-bundle-wsl-&lt;ver&gt;-1.x86_64.rpm
+sudo dnf install ./dsh-bundle-wsl-*.rpm                     # 同样 %post 接线默认用户
+</code></pre>
+<h3>CI：GitHub Actions 一键出安装包</h3>
+<p><code>.github/workflows/offline-bundle.yml</code>：打 tag（<code>v*</code>）触发（也可手动 dispatch）。</p>
+<ul>
+<li><strong>wsl-payload</strong>（ubuntu）：<code>Build-Bundle-Wsl.sh</code> 出 WSL 载荷；随后 <strong>deb</strong>（同 job，
+<code>dsh-bundle-wsl_&lt;ver&gt;_amd64.deb</code>）与 <strong>rpm</strong>（fedora 容器 job，
+<code>dsh-bundle-wsl-&lt;ver&gt;-1.x86_64.rpm</code>）分别打包</li>
+<li><strong>windows-installer</strong>（windows）：下载载荷合入 bundle → <code>Build-Bundle.ps1</code> → Inno Setup
+编译出<strong>单文件 setup EXE</strong>（<code>dsh-offline-bundle-setup_&lt;ver&gt;_x64_&lt;tag&gt;.exe</code>，内嵌全部载荷，
+安装完自动跑 <code>Install-Offline.ps1 -WithWsl</code>，卸载走 <code>Uninstall-Offline.ps1</code>）</li>
+<li><strong>release</strong>：tag 推送时自动发布 GitHub Release（exe + deb + rpm + bundle zip）</li>
+</ul>
+<p>本地也能出 EXE：装 <a href="https://jrsoftware.org/isinfo.php">Inno Setup 6</a> 后
+<code>ISCC /DBundleDir=..\bundle-out\dsh-offline-bundle /DMyVersion=3.8.0 packaging\windows-installer.iss</code>。</p>

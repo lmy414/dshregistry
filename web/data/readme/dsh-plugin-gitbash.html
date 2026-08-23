@@ -1,0 +1,157 @@
+<h1>dsh-plugin-gitbash</h1>
+<p><a href="https://github.com/Jinsight-gif/dsh-plugin-gitbash/actions/workflows/ci.yml"><img src="https://github.com/Jinsight-gif/dsh-plugin-gitbash/actions/workflows/ci.yml/badge.svg" alt="CI"></a></p>
+<p>Run commands on the <strong>Windows host's Git for Windows Bash</strong> from
+<a href="https://github.com/deepseek-ai/deepseek-harness">DeepSeek Harness</a> (DSH).</p>
+<p>A self-contained zero-dependency Cordis plugin that registers one model tool,
+<code>gitbash</code>. Typical use cases:</p>
+<ul>
+<li>Running git for Windows-native repositories (<code>git</code> from git-bash, not WSL).</li>
+<li>Executing Windows executables, cmd/PowerShell-free scripting, native
+Windows paths (<code>D:\...</code>, <code>C:\...</code>) while the harness runs under WSL.</li>
+<li>Anything that must touch the Windows side of a dual-boot / WSL setup,
+without leaving the agent session.</li>
+</ul>
+<blockquote>
+<p><a href="https://github.com/Jinsight-gif/dsh-plugin-gitbash/blob/HEAD/README.zh.md">中文说明</a></p>
+</blockquote>
+<h2>How it works</h2>
+<p>Each call spawns a fresh Git Bash process:</p>
+<pre><code>&lt;bash.exe&gt; -c '&lt;command&gt;'
+</code></pre>
+<p>with <code>stdin: 'ignore'</code> (fd 0 on <code>/dev/null</code>), so the shell always runs
+non-interactively and exits instead of hanging. No state (cwd, env vars,
+shell functions) persists between calls.</p>
+<p><strong>Path semantics inside <code>command</code>:</strong> the spawned executable is the <em>Windows</em>
+Git Bash, so use git-bash/Windows paths (<code>/d/tools</code>, <code>D:/tools</code>, <code>C:\...</code>).
+WSL <code>/mnt/...</code> paths are <strong>not</strong> valid inside the command.</p>
+<p><strong>Workdir semantics:</strong> a <code>workdir</code> argument (or the session workspace, used
+by default) is mapped for the spawning layer — <code>/mnt/X/...</code>, <code>/X/...</code> and
+<code>X:\...</code> forms all become <code>/mnt/X/...</code>, which WSL interop converts into the
+native Windows directory. An unmappable WSL-only path (e.g. <code>/home/...</code>)
+starts in the session working directory (reported as <code>//wsl.localhost/...</code>
+under WSL interop) instead of failing the call.</p>
+<h2>Requirements</h2>
+<ul>
+<li>A DSH profile running on:<ul>
+<li><strong>WSL / Linux</strong> with Git for Windows installed on a mounted Windows drive, or</li>
+<li><strong>native Windows</strong> with Git for Windows installed.</li>
+</ul>
+</li>
+<li>The harness host must reach the <code>bash.exe</code> (see resolution below).</li>
+</ul>
+<h2>Installation</h2>
+<h3>From npm (once published)</h3>
+<pre><code>dsh plugin --profile &lt;name&gt; add dsh-plugin-gitbash
+</code></pre>
+<p><code>dsh plugin</code> installs the package into the profile and — because the package
+declares <code>dsh.bundle</code> — automatically appends it to the profile's bundle
+stack (<code>dsh.profile.bundles</code>). Restart the profile (<code>dsh web</code> / <code>dsh --profile &lt;name&gt;</code>) to mount the <code>gitbash</code> tool.</p>
+<h3>From GitHub (before npm publishing)</h3>
+<pre><code>dsh plugin --profile &lt;name&gt; add https://github.com/&lt;owner&gt;/dsh-plugin-gitbash
+</code></pre>
+<p>or pin an immutable commit for reviewable installs (recommended for
+production):</p>
+<pre><code>dsh plugin --profile &lt;name&gt; add https://github.com/&lt;owner&gt;/dsh-plugin-gitbash#&lt;commit-sha&gt;
+</code></pre>
+<h3>Manual bundle edit</h3>
+<p>Add the dependency to the profile's <code>package.json</code> <code>dependencies</code>, append
+<code>dsh-plugin-gitbash</code> to <code>dsh.profile.bundles</code>, then run
+<code>dsh plugin --profile &lt;name&gt; install</code>.</p>
+<h3>Agent preset row (drop-in file)</h3>
+<p>The plugin intentionally imports nothing beyond the Node builtin <code>node:fs</code>,
+so it also works as a relative row file inside an agent preset composition —
+no package install needed. Copy <code>lib/index.js</code> into your preset directory and
+add:</p>
+<pre><code># agent.cordis.yml
+- id: tool-gitbash
+  name: ./index.js   # or ./gitbash.mjs — your copied file
+</code></pre>
+<h3>Verification</h3>
+<pre><code>node test/smoke.mjs
+</code></pre>
+<p>Runs the real plugin against the machine's actual Git Bash and prints
+<code>SMOKE: ALL PASS</code>; skips gracefully (exit 0) where no git-bash exists.</p>
+<h2>Configuration</h2>
+<p>Table row config for the bundle row (or your preset row):</p>
+<table>
+<thead>
+<tr>
+<th>Key</th>
+<th>Type</th>
+<th>Default</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>gitBashPath</code></td>
+<td>string</td>
+<td>—</td>
+<td>Explicit path to <code>bash.exe</code>. Trusted as-is, no detection.</td>
+</tr>
+<tr>
+<td><code>autoDetect</code></td>
+<td>boolean</td>
+<td><code>true</code></td>
+<td>Search well-known install locations when no explicit path is set.</td>
+</tr>
+<tr>
+<td><code>timeoutMs</code></td>
+<td>number</td>
+<td><code>120000</code></td>
+<td>Default per-call timeout; a single call can override with its <code>timeoutMs</code> argument.</td>
+</tr>
+<tr>
+<td><code>maxOutputChars</code></td>
+<td>number</td>
+<td><code>65536</code></td>
+<td>Tail-truncate captured stdout/stderr to this many characters per stream (the full capture still exists in the collector/spill).</td>
+</tr>
+</tbody></table>
+<p>Resolution order: <code>config.gitBashPath</code> → <code>DSH_GITBASH_PATH</code> env var →
+auto-detection (unless <code>autoDetect: false</code>). <strong>Self-healing:</strong> when no path
+resolves at mount time, every call re-runs the resolution — installing Git
+for Windows or mounting a drive takes effect without a DSH restart.</p>
+<p>Auto-detection candidates:</p>
+<ul>
+<li><strong>Windows host:</strong> <code>%ProgramFiles%\Git\bin\bash.exe</code>,
+<code>%ProgramFiles(x86)%\Git\bin\bash.exe</code>, then <code>bash</code> via PATH.</li>
+<li><strong>WSL / POSIX:</strong> <code>/mnt/&lt;c..z&gt;/Program Files/Git/bin/bash.exe</code> and the
+<code>(x86)</code> variant (checks every mounted drive letter).</li>
+</ul>
+<p>Example — explicit path as row config:</p>
+<pre><code>- id: tool-gitbash
+  name: 'dsh-plugin-gitbash'
+  config:
+    gitBashPath: '/mnt/e/Program Files/Git/bin/bash.exe'
+</code></pre>
+<p>No time to edit config? Set the environment variable:</p>
+<pre><code>export DSH_GITBASH_PATH='/mnt/e/Program Files/Git/bin/bash.exe'
+</code></pre>
+<h2>Troubleshooting</h2>
+<ul>
+<li><strong><code>No Git for Windows bash.exe found</code> / <code>Git Bash not found at ...</code></strong> —
+install Git for Windows, make sure the drive is mounted, then set
+<code>gitBashPath</code> or <code>DSH_GITBASH_PATH</code>.</li>
+<li><strong>Command hangs / never returns</strong> — git-bash runs with stdin from
+<code>/dev/null</code>, so interactive prompts cannot block it by design; a genuinely
+long command just needs a larger <code>timeoutMs</code>. It is always killable.</li>
+<li><strong><code>workdir</code> ignored</strong> — a WSL-only path (e.g. <code>/home/...</code>) cannot be a
+Windows process cwd; the call starts in the session working directory and
+the note explains it. Use <code>/mnt/X/...</code>, <code>/X/...</code> or <code>X:\...</code> forms to
+control it.</li>
+<li><strong>WSL path errors inside the command</strong> — inside <code>command</code> you are in
+<em>Windows</em> git-bash: use <code>/d/...</code>, <code>D:/...</code>, never <code>/mnt/d/...</code>.</li>
+<li><strong>State lost between calls</strong> — by design every call is a fresh process;
+chain commands in one call (<code>cd /d/tools &amp;&amp; git status</code>) when you need
+state.</li>
+</ul>
+<h2>Layout</h2>
+<pre><code>lib/index.js        the Cordis plugin (zero runtime dependencies)
+cordis.patch.yml    dsh.bundle patch — inserts the tool row
+dsh.plugin.json     DSH plugin manifest (tool discovery metadata)
+README.md / README.zh.md  bilingual docs
+test/smoke.mjs      standalone smoke test (Linux + Windows CI)
+.github/workflows   CI: Linux syntax/branch tests + Windows real git-bash run
+</code></pre>
+<h2>License</h2>
+<p>MIT — see <a href="https://github.com/Jinsight-gif/dsh-plugin-gitbash/blob/HEAD/LICENSE">LICENSE</a>.</p>

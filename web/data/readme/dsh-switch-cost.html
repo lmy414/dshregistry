@@ -1,0 +1,83 @@
+<h1>dsh-switch-cost</h1>
+<p>English | <a href="https://github.com/xyzs996/dsh-switch-cost/blob/HEAD/README.zh.md">中文</a></p>
+<p>Prices the current session twice: once on the route that actually ran it, and once on every other route in the shipped price table. It answers "what did this cost" like the other usage plugins do, and then the question they don't — "what would the same traffic have cost somewhere else."</p>
+<p>The session's usage is folded into token buckets keyed by route <strong>and by UTC hour</strong>, so a provider that bills different rates at different hours is priced hour by hour rather than at whichever rate happened to be in force when you asked. The fold records <em>when</em>; the price table decides what that hour costs.</p>
+<h2>Install</h2>
+<pre><code>dsh plugin add dsh-switch-cost
+</code></pre>
+<p>Composes into any assembly that provides <code>sessionProjections</code> and <code>tools</code>. Both registrations sit behind <code>ctx.inject(['sessionProjections'], …)</code> — an assembly that composes no projection registry gets neither the projection nor the tool, rather than a tool that always answers zero.</p>
+<h3>Config</h3>
+<pre><code>switch-cost:
+  alternatives: 8   # how many other routes to report, cheapest first
+</code></pre>
+<h2>Service surface</h2>
+<p>This plugin registers no service. It registers one projection unit and one tool.</p>
+<h3>Projection: <code>switchCost</code></h3>
+<p>Host-only (no <code>wire</code>), <code>stateVersion: 1</code>. State:</p>
+<pre><code>{
+  routes: { [`${provider}/${model}`]: { byHour: { [`${utcDay}-${utcHour}`]: Buckets } } },
+  route: string | null,
+  last: { turn, step, routeKey, hourKey, buckets } | null,
+}
+</code></pre>
+<p><code>Buckets</code> is <code>{ input, cacheRead, cacheWrite, output }</code>. Hour keys are sparse; <code>utcDay</code> is 0–6 with Sunday first.</p>
+<p>A step reports its usage twice — once as an <code>assistant/chunk</code> of type <code>usage</code>, once on the assembled <code>assistant/message</code>. The fold keeps last-wins per <code>(turn, step)</code>: the second sample <strong>replaces</strong> the first instead of adding to it, and the withdrawal is made from the hour the first sample was originally filed under, not the hour the replacement arrived in. A step that straddles an hour boundary therefore leaves no phantom bucket. Events the fold does not care about return the same state reference, as the projection drive requires.</p>
+<p>Usage that arrives before any <code>request/context</code> is filed under <code>unknown/unknown</code> rather than dropped.</p>
+<h3>Tool: <code>switch_cost</code></h3>
+<p>No parameters. Reads the projection state for the calling agent's session and returns:</p>
+<pre><code>{
+  tokens,            // whole-session bucket totals
+  actual: [{ route, tokens, cost, costText, ratesApplied, pricedAs, source, checkedAt, layer }],
+  actualTotal, actualTotalText,
+  alternatives: [{ route, cost, costText, versusActual, source, checkedAt, layer }],
+  unpriced?: [{ route, tokens }],
+  caveats: string[],
+}
+</code></pre>
+<p>A call with no owning agent session is rejected. A route with no price on file is reported under <code>unpriced</code> and left out of the total — it is never silently priced as zero.</p>
+<p>Sample rendered result:</p>
+<pre><code>Ran on deepseek-official/deepseek-v4-flash: $0.0416 (peak and off-peak hours both billed)
+
+Same tokens, other routes:
+  deepseek-official/deepseek-v4-flash-vision-exp  $0.0416  +0%
+  openai/gpt-5.6-luna  $0.0513  +23%
+  deepseek-official/deepseek-v4-pro  $0.1260  +203%
+  zhipuai/glm-4.7  $0.1446  +247%
+  anthropic/claude-haiku-4-5  $0.2452  +489%
+  moonshotai/kimi-k2.6  $0.2707  +550%
+</code></pre>
+<h2>The price table</h2>
+<p><code>dsh-switch-cost/prices</code> exports the table. Every row carries <code>source</code>, <code>checkedAt</code> and <code>layer</code>.</p>
+<p>Two layers, vendor first:</p>
+<ul>
+<li><code>layer: 'vendor'</code> — read off the provider's own pricing page on <code>checkedAt</code>.</li>
+<li><code>layer: 'models.dev'</code> — taken from the community catalog.</li>
+</ul>
+<p>Vendor wins because the catalog lags and, more importantly, because it has no representation of time-of-use pricing at all: <code>off_peak</code>, <code>peak</code> and <code>time_of_use</code> appear nowhere in its schema, and its <code>tiers</code> field carries context-size tiers only. A provider that bills two rates a day cannot be expressed there, so a plugin that mirrored the catalog would price those sessions at a single rate that is neither of the two.</p>
+<h3>Time-of-use</h3>
+<p>A row may carry a <code>tariff</code> instead of a single <code>flat</code> block. DeepSeek's is the one shipped:</p>
+<pre><code>{ peakWindowsUtc: [[1, 4], [6, 10]], peakWeekdaysUtc: [1, 2, 3, 4, 5] }
+</code></pre>
+<p>Those are the published Beijing windows 09:00–12:00 and 14:00–18:00, weekdays, with weekends fully off-peak. The rule is resolved in UTC, and for these particular windows that is exact rather than approximate: every hour they cover satisfies <code>hour + 8 &lt; 24</code>, so adding the Beijing offset never rolls the date over, and the UTC weekday equals the Beijing weekday for every hour that can be peak. A test asserts that property directly and fails if a future window ever reaches past 16:00 UTC — at which point resolving in UTC would stop being safe and the rule would need a real timezone.</p>
+<h2>Model Experience</h2>
+<h3>What the model sees</h3>
+<p>One tool with an empty parameter schema, described as reporting session cost and the cross-route comparison. The result text names each route, its cost, whether both tariffs were billed, and the alternatives cheapest-first with a signed percentage against what was actually spent. The closing line restates that the comparison is of published rates at equal token counts.</p>
+<h3>Token effect</h3>
+<p>One small fixed schema. The result grows with the number of routes that ran plus <code>alternatives</code> rows — roughly 200–400 tokens at the default of 8.</p>
+<h3>KV Cache effect</h3>
+<p>None. The plugin prices usage that has already been logged; it never assembles or sends a provider request, and it contributes nothing to the system prompt.</p>
+<h2>What this does not claim</h2>
+<p>These ship inside every result, not just here, because a result read by a model will otherwise be presented as a bill.</p>
+<ul>
+<li><strong>Token counts are the ones the model that actually ran produced.</strong> A different model tokenizes differently and would not produce these counts. This compares published rates at equal token counts; it does not predict the other model's invoice.</li>
+<li><strong>The cache read/write split is carried over unchanged.</strong> Prompt caching differs by provider in what it caches, how long it holds it, and what it charges to write. A route with a very different caching model is the least reliable row in the table.</li>
+<li><strong>Every rate is pay-as-you-go list price.</strong> Subscription plans, prepaid credit packages and free tiers are not modelled.</li>
+<li><strong>Prices are a dated snapshot.</strong> Each row reports its own source and date; check them before acting on a number.</li>
+</ul>
+<p>Where a provider publishes no separate cache-write price, those tokens are billed at the input rate — cache-write tokens are cache-miss tokens — and the result sets <code>cacheWriteBilledAtInputRate</code> so the imputation is visible rather than assumed.</p>
+<h2>Development</h2>
+<pre><code>pnpm install
+pnpm test
+</code></pre>
+<h2>License</h2>
+<p>MIT</p>

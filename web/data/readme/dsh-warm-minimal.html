@@ -1,0 +1,73 @@
+<h1>dsh-warm-minimal</h1>
+<p><a href="https://github.com/deepseek-ai/deepseek-harness"><img src="https://img.shields.io/badge/DSH-Plugin-4c7dff" alt="DSH Plugin"></a>
+<a href="https://github.com/sch246/dsh-warm-minimal/blob/HEAD/LICENSE"><img src="https://img.shields.io/badge/license-MIT-green" alt="license"></a></p>
+<p><strong>温暖极简模式（warm-minimal）</strong> 是 <a href="https://github.com/deepseek-ai/deepseek-harness">DeepSeek Harness (dsh)</a> 的实验性 agent preset：会话创建时即写入一条高质量首轮轨迹（<code>we</code> / <code>let's</code> 思维链、无 <code>let me</code>），用户的真实输入从第二轮开始——AGENTS.md、运行时上下文与技能目录因此自然注入第一次真实请求，开局保持极简。</p>
+<ul>
+<li>首轮推理以 <code>We need to confirm the current working directory first.</code> 开头；</li>
+<li>首轮唯一工具调用是 <code>pwsh Get-Location</code>，结果为会话真实工作目录；</li>
+<li>真实消息进入时模型已是"热身"状态，风格提示要求首句 <code>we need to ...</code>、避开 <code>let me</code>。</li>
+</ul>
+<h2>安装</h2>
+<p>前置：可运行的 dsh checkout（<code>dsh web</code>）、Node.js <code>^22.19.0 || &gt;=24.0.0</code>。</p>
+<h3>方式一：clone + setup 脚本（推荐）</h3>
+<pre><code>git clone https://github.com/sch246/dsh-warm-minimal.git
+cd dsh-warm-minimal
+bash scripts/setup.sh          # Windows PowerShell:
+                               # powershell -ExecutionPolicy Bypass -File scripts\setup.ps1
+</code></pre>
+<p>脚本做两件事：把 <code>presets/warm-minimal</code> 复制进 <code>&lt;dsh home&gt;/.agent-presets/</code>；若 <code>dsh</code> 在 PATH 上，自动执行 <code>dsh plugin --profile web add .</code> 把本包注册为 bundle。之后<strong>重启 dsh web</strong>。</p>
+<h3>方式二：分开手动装</h3>
+<pre><code># 1) 注册 bundle（挂载 boot 时机的 seed 插件，替代手工 patch 行）
+dsh plugin --profile web add github:sch246/dsh-warm-minimal
+
+# 2) 复制 preset 到用户根目录
+mkdir -p ~/.dsh/.agent-presets
+cp -r presets/warm-minimal ~/.dsh/.agent-presets/
+
+# 3) 重启 dsh web
+</code></pre>
+<p><code>DSH_HOME</code> / <code>DSH_PROFILE</code> 环境变量在两个方式里都生效。</p>
+<blockquote>
+<p>故障排查：如果 <code>github:</code> 安装卡在 <code>git ls-remote git@github.com:...</code>（pnpm 把 GitHub 解析成 SSH，而本机没有对应 SSH 通路），改用 HTTPS clone + 本地路径安装：</p>
+<pre><code>git clone https://github.com/sch246/dsh-warm-minimal.git
+cd dsh-warm-minimal
+dsh plugin --profile web add .
+</code></pre>
+</blockquote>
+<h2>使用</h2>
+<p>重启后新建会话，在 preset 选择器里选 <strong>「温暖极简模式」</strong>，直接发第一条消息即可。</p>
+<p>界面里不会出现一条"你发的"第一轮：种子的 user 消息来源是 <code>dsh-warm-minimal</code>，UI 按来源把它渲染成一条折叠的<strong>上下文注入行</strong>（点开可见 <code>Get ready. ...</code>），上方还有种子的 assistant 一步：折叠的 <code>we</code> / <code>let's</code> 推理、<code>Get-Location</code> 工具卡和一条 <code>Ready.</code>。</p>
+<h2>目录结构</h2>
+<pre><code>dsh-warm-minimal/
+├── package.json              # dsh.bundle.patch 声明；main -&gt; index.mjs
+├── cordis.patch.yml          # bundle 层：profile boot 挂载 bootstrap-seed-host
+├── index.mjs                 # host 半身：会话创建即写入首轮
+├── presets/warm-minimal/
+│   ├── preset.yml            # 选择器展示文案
+│   ├── agent.cordis.yml      # standard 底子 + reasoning-style 的组合
+│   └── reasoning-style.mjs   # oh-we-need 风格提示（system section order 0）
+├── scripts/
+│   ├── setup.sh              # 复制 preset + 自动注册 bundle
+│   └── setup.ps1
+└── tools/
+    └── mine-first-rounds.mjs # 从 session 日志挖掘高质量首轮模板
+</code></pre>
+<h2>工作原理</h2>
+<ul>
+<li><strong>bundle 行在 profile boot 挂载</strong>：<code>cordis.patch.yml</code> 把本包自身插为一行 <code>bootstrap-seed-host</code>。它必须在任何会话创建前就绪，因为 preset 自身的插件要到 agent 创建时才挂载，赶不上会话创建那一刻。</li>
+<li><strong>seed 写的是 durable session events</strong>：<code>turn/start → user/message → assistant/message（推理 + tool-call）→ tool/call → tool/result → "Ready." → step/end → turn/end</code>，并按事件类型要求携带 <code>surfaceOp</code>。模型上下文与 API transcript 都能看到这一轮；真实输入因此是第二轮，<code>agent-instructions</code>（AGENTS.md）、运行时上下文快照与 skill catalog 落在第二轮。</li>
+<li><strong>来源可辨</strong>：种子消息 <code>source = { kind: 'plugin', plugin: 'dsh-warm-minimal' }</code>，不伪装成真实用户消息；评估/回放可按 source 过滤。</li>
+<li><strong>风格提示</strong>：<code>reasoning-style.mjs</code> 以 <code>systemPrompt.section(order: 0)</code> 注入 <a href="https://github.com/scp3500/oh-we-need">oh-we-need</a> 规范（MIT，见 <a href="https://github.com/sch246/dsh-warm-minimal/blob/HEAD/THIRD_PARTY_NOTICES.md">THIRD_PARTY_NOTICES.md</a>）。</li>
+</ul>
+<h2>数据与隐私</h2>
+<p>仓库文件不含任何机器、用户名、项目路径或内部部署信息。种子模板是固定文本；唯一运行时值来自 <code>Get-Location</code>——它会把<strong>会话工作目录</strong>写进该会话的 transcript（本地日志），请勿直接外发完整 session 日志。</p>
+<h2>已知限制</h2>
+<ul>
+<li>原型阶段：只有 1 条通用开局模板；后续按任务类别（build / fix / weak）扩模板，<code>tools/mine-first-rounds.mjs</code> 已就绪：<pre><code>node tools/mine-first-rounds.mjs ~/.dsh/sessions --top 5
+</code></pre>
+质量门槛：<code>let me == 0</code>、<code>we + let's &gt;= 8</code>、至少一次工具调用、至少一条 assistant 消息、无 <code>tool/error</code>。</li>
+<li>伪首轮会进入 API transcript 与 token 计量；这是设计取舍，不是意外。</li>
+<li>preset 组合以官方 <code>standard</code> 为底子；升级 dsh 后如标准组合变化，可能需要同步更新 <code>presets/warm-minimal/agent.cordis.yml</code>。</li>
+</ul>
+<h2>License</h2>
+<p>MIT。首轮风格提示词来自 <a href="https://github.com/scp3500/oh-we-need">scp3500/oh-we-need</a>（MIT），版权声明见 <a href="https://github.com/sch246/dsh-warm-minimal/blob/HEAD/THIRD_PARTY_NOTICES.md">THIRD_PARTY_NOTICES.md</a>。</p>

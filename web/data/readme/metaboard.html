@@ -1,0 +1,169 @@
+<h1>MetaBoard</h1>
+<p><strong>Execution trajectories for work that isn't code.</strong></p>
+<p>English | <a href="https://github.com/SilasSolivagus/MetaBoard/blob/HEAD/README.zh-CN.md">简体中文</a></p>
+<p>Coding agents produce something most other tools don't: a durable, inspectable record of
+<em>how the work actually happened</em>. Every retrieval, every tool call, every retry lands as a
+structured event — because the executor emits it, not because anyone remembered to log it.</p>
+<p>Content creation has no such record. A task board tells you a draft moved from <code>todo</code> to
+<code>in_review</code>. It cannot tell you which twenty articles the outline was derived from, how long
+the second revision took, or what the editor's rejection actually said. Those are the facts
+you need when a piece underperforms and you want to know why.</p>
+<p>MetaBoard brings the agent trajectory to non-coding work, starting with content production.</p>
+<hr>
+<h2>Status</h2>
+<p><strong>Design complete. Implementation not started.</strong></p>
+<p>This repository currently contains no product code. What it does contain is a design grounded
+in verified constraints of the host system — see <a href="#whats-already-verified">What's already verified</a>.</p>
+<p>If you are looking for something to install today, come back later. If you are interested in
+how execution trajectories generalize beyond software, read on.</p>
+<hr>
+<h2>The idea</h2>
+<p>MetaBoard is a plugin for <a href="https://github.com/deepseek-ai/deepseek-harness">DeepSeek Harness</a>
+(<code>dsh</code>). It reuses the part of <code>dsh</code> that is genuinely hard and genuinely domain-neutral —
+the conversation node assembler — and replaces the part that is coding-specific.</p>
+<p>The assembler turns a raw event stream into materialized business objects: each registered
+definition extracts a stable business ID from a single event, folds state across matching
+events, and emits view nodes. When an older page of history loads, only the contexts whose
+answers changed are replayed. That incremental-replay behavior is what makes a long trajectory
+stay responsive, and it is the piece you would least want to reimplement.</p>
+<p>Nothing in that machinery knows about tokens, tool schemas, or TTFT. Those live one layer up,
+in the trajectory UI's own definitions. Swap that layer and the same engine renders a
+different domain.</p>
+<h3>What a content trajectory looks like</h3>
+
+  
+  <img alt="A content trajectory: two turns of tool calls with a human review between them, and blue derivation edges showing which sources each artifact came from" src="https://raw.githubusercontent.com/SilasSolivagus/MetaBoard/HEAD/docs/assets/trajectory-light.svg">
+
+
+<p>The vertical order is time. The blue edges are what a task board cannot express: which
+sources the draft came from, which draft the revision rewrote. They are not inferred — each
+tool records them on its own result.</p>
+<p>Selecting a row opens the full payload: the retrieved sources, the complete draft, what it was
+derived from, how long it took.</p>
+<hr>
+<h2>How it works</h2>
+
+  
+  <img alt="Architecture: MetaBoard tools and a review writer emit core session events; the shared conversation assembler feeds Chat, Trajectory, and MetaBoard definitions, each rendering its own tab" src="https://raw.githubusercontent.com/SilasSolivagus/MetaBoard/HEAD/docs/assets/architecture-light.svg">
+
+
+<p>MetaBoard ships as an ordinary out-of-repo npm package with two halves:</p>
+<p><strong>Host half</strong> registers content-production tools. Each call produces the core <code>tool/call</code> and
+<code>tool/result</code> events; the domain payload rides on <code>tool/result.meta</code>, a tool-private,
+core-opaque, durably persisted JSON channel that <code>dsh</code> already provides.</p>
+<p><strong>Client half</strong> registers its own conversation definitions and a view tab. Definitions claim
+only MetaBoard's own calls, assemble them into domain objects, and render them.</p>
+<p>No fork. No changes to the host. No new event types.</p>
+<p>That last constraint is not a stylistic preference — it is a boundary discovered by testing,
+and it shaped the entire design. See below.</p>
+<hr>
+<h2>What's already verified</h2>
+<p>Before writing product code, the feasibility boundary was probed directly against the upstream
+codebase, with a test that persists to a real JSONL log and reads it back through a freshly
+mounted stack. Six propositions, all confirmed:</p>
+<table>
+<thead>
+<tr>
+<th>#</th>
+<th>Proposition</th>
+<th>Result</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>1</td>
+<td>Does <code>Session.append</code> let a plugin mark its event ignorable?</td>
+<td><strong>No.</strong> The public write API cannot set the marker.</td>
+</tr>
+<tr>
+<td>2</td>
+<td>What happens to a log containing a plugin's own event type?</td>
+<td><strong>Whole log refused</strong> — <code>SessionFormatUnsupportedError</code>, not a skipped row.</td>
+</tr>
+<tr>
+<td>3</td>
+<td>Does the same event survive when marked ignorable?</td>
+<td><strong>Yes</strong>, byte-identical. The storage layer supports it; only the write path is closed.</td>
+</tr>
+<tr>
+<td>4</td>
+<td>Does a 50 KB <code>tool/result.meta</code> round-trip through a real file?</td>
+<td><strong>Yes.</strong> Not spilled, not truncated.</td>
+</tr>
+<tr>
+<td>5</td>
+<td>Does a plugin-appended <code>user/message</code> round-trip?</td>
+<td><strong>Yes</strong> — no model involvement required.</td>
+</tr>
+<tr>
+<td>6</td>
+<td>Do plugin event types enter model context?</td>
+<td><strong>No.</strong> They are not surface-eligible.</td>
+</tr>
+</tbody></table>
+<p>Probe 2 is why MetaBoard defines no event types of its own. Probes 4 and 5 are why it doesn't
+need to. Probe 3 documents an escape hatch that exists in storage but is deliberately closed at
+the write API — upstream records that <code>Session.append</code> gains that surface "with its first user."</p>
+<hr>
+<h2>Design</h2>
+<p>The full design document lives outside this repository for now. The decisions that matter:</p>
+<p><strong>Data placement is decided by one question — is it an event or a state?</strong></p>
+<table>
+<thead>
+<tr>
+<th>Kind</th>
+<th>Example</th>
+<th>Where it lives</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>Event, model-originated</td>
+<td>retrieved sources, draft text, revision diff</td>
+<td><code>tool/result.meta</code></td>
+</tr>
+<tr>
+<td>Event, human-originated</td>
+<td>editorial rejection, urgent instruction</td>
+<td><code>user/message</code> (plugin source)</td>
+</tr>
+<tr>
+<td>State</td>
+<td>topic status, assignee, board column, view counts</td>
+<td>MetaBoard's own store</td>
+</tr>
+</tbody></table>
+<p><strong>Context identity is the call, not the topic.</strong> One context per tool call keeps live appends
+<code>O(1)</code> and keeps a prepend from invalidating an entire topic's history. The topic ID rides in
+the node payload and grouping happens at snapshot assembly.</p>
+<p><strong>Failed calls must still write their envelope.</strong> A <code>tool/result</code> payload carries no tool name —
+only <code>tool/call</code> does — and matching cannot consult history. The envelope is the sole claim
+signal. A tool that omits it on failure leaves a row that reports "running" forever, and a
+reload will not fix it, because that is what the log says.</p>
+<p><strong>References resolve at render time, not through the dependency reader.</strong> Using the reader would
+record window-gap dependencies and replay chains on every prepend. Reference targets never
+change value — they are merely sometimes unloaded. Rendering an unresolved reference costs a
+moment of grey; the alternative costs scroll performance on every long trajectory.</p>
+<hr>
+<h2>Roadmap</h2>
+<p><strong>Phase 1 — feasibility slice.</strong> Three tools, two definitions, one tab, one plain row table.
+No inspector, no timeline, no board, no storage layer. The bar: hierarchy assembles, references
+resolve, a 50 KB payload survives a reopen, and a failed call renders as a complete failure
+rather than a stuck row.</p>
+<p><strong>Phase 2 — work items.</strong> The board view, its own store, cross-session aggregation, platform
+metrics ingestion.</p>
+<p><strong>Phase 3 — other domains.</strong> The data placement rules and the envelope are not specific to
+content production. Legal review, research synthesis, and design iteration have the same shape:
+a multi-step process whose intermediate artifacts matter more than its final state.</p>
+<hr>
+<h2>Prior art and credit</h2>
+<p>MetaBoard exists because of two projects:</p>
+<ul>
+<li><a href="https://github.com/deepseek-ai/deepseek-harness"><strong>deepseek-ai/deepseek-harness</strong></a> — the
+assembler, the event stream, the trajectory ledger this design learns from. MIT.</li>
+<li><a href="https://github.com/chuspeeism/dashi-taskboard"><strong>chuspeeism/dashi-taskboard</strong></a> — a
+local-first task board with a workflow graph and third-party publishing nodes. Its separation
+of field-level audit from AI session records is what made the missing layer obvious.</li>
+</ul>
+<p>MetaBoard is not affiliated with either project.</p>
+<hr>
+<h2>License</h2>
+<p>MIT</p>

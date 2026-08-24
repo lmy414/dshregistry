@@ -1,0 +1,215 @@
+<h1>dsh-skill-creator</h1>
+<blockquote>
+<p>[!IMPORTANT]
+<strong>依赖前置：相邻 <code>dsh-src</code> 检出（<code>link:</code> 依赖）</strong>
+本项目在开发形态下使用 <code>link:</code> 依赖指向相邻的 DeepSeek Harness 源码检出（<code>dsh-src</code>），
+与当前仓库保持同一父目录布局（<code>&lt;parent&gt;/dsh-src</code>）。克隆本仓库后：</p>
+<ol>
+<li>先把官方 <code>deepseek-ai/deepseek-harness</code> 检出到与本仓库同级的 <code>dsh-src/</code> 目录，并执行其 <code>pnpm install &amp;&amp; pnpm run build</code>；</li>
+<li>再按下方「安装」一节执行本仓库的 <code>pnpm install --offline &amp;&amp; pnpm build</code> 与测试。
+发布到 npm 的版本会尽量把 <code>link:</code> 依赖替换为 registry 真实版本；无法替换的内部包保持 <code>link:</code>，见各包 README 说明。</li>
+</ol>
+</blockquote>
+<p>一键生成 DSH 技能（SKILL.md）的 Cordis 插件：在 DeepSeek Harness 会话内，从一段对话/一份文档/一个流程描述自动生成符合 DSH 技能格式的 <code>SKILL.md</code>，并支持<strong>校验、打包分发、描述优化</strong>。</p>
+<blockquote>
+<p>参考与许可：功能与流程参考 anthropics/claude-plugins-official 的 <code>skill-creator</code>（其源码为 Proprietary），本项目<strong>仅移植行为与规则，代码独立重写</strong>；脚本与逻辑见下方"从上游移植的内容"。本项目采用 <a href="https://github.com/988hj7tczd-oss/dsh-skill-creator/blob/HEAD/LICENSE">MIT</a>。</p>
+</blockquote>
+<hr>
+<h2>1. 安装与挂载</h2>
+<p>本项目是一个 <strong>DSH bundle</strong>（组合包）：<code>package.json</code> 通过 <code>dsh.bundle.patch</code> 指向 <code>cordis.yml</code>，<code>cordis.yml</code> 插入一行 <code>skill-creator</code> 插件。</p>
+<pre><code># 在项目目录同级安装（dsh CLI）
+dsh plugin --profile &lt;name&gt; add ./dsh-skill-creator
+# 或直接加载本地元数据层
+dsh --profile &lt;name&gt; --patch ./cordis.yml
+</code></pre>
+<p><code>cordis.yml</code> 插件行可配置（均可省略）：</p>
+<pre><code>- insert:
+    - id: skill-creator
+      name: 'dsh-skill-creator'
+      config:
+        mountRuntimeProvider: true   # 是否把输出目录注册为运行期技能源
+        # outputDir: /abs/path       # 技能输出根；默认 $DSH_HOME/skills
+        # customSkillDirs: [...]     # 附加根；默认输出目录取首项
+</code></pre>
+<h3>插件行为</h3>
+<ul>
+<li><strong>4 个模型工具</strong>通过 <code>defineTool</code> 注册（<code>tools</code> 服务，effect 式注册，卸载自动清理）。</li>
+<li><strong>自带"输出目录挂载"</strong>：<code>apply</code> 时若 <code>skills</code> 注册表可用，将输出根（<code>outputDir</code> + <code>customSkillDirs</code>）注册为一个运行期 skill provider（<code>registerProvider</code>，rank 300 / source <code>custom</code>），因此 <code>skill_new</code> 写出的技能立即能被 <code>skill</code> 工具列出并加载，无需手工改配置。</li>
+<li>若注册表不可用（未安装 <code>@deepseek-ai/dsh-skill</code>），插件在日志与 <code>skill_new</code> 返回里给出 <strong>mountHint</strong>：在 profile 的 <code>skill-filesystem</code> 配置中增加 <code>customSkillDirs</code>。</li>
+</ul>
+<p>构建与测试：</p>
+<pre><code>pnpm install &amp;&amp; pnpm build      # tsc → dist/（rewrite .ts → .js）
+node tests/smoke.e2e.ts         # 离线冒烟测试（无外部依赖）
+</code></pre>
+<blockquote>
+<p>依赖说明：仅有 <code>src/index.ts</code> 引用 <code>@deepseek-ai/cordis</code>（仅类型）与 <code>@deepseek-ai/dsh-tools</code>。<code>src/lib</code>、<code>src/tools</code> 全部零 npm 依赖（只用 Node 内置模块），因此冒烟测试、Python 脚本与静态阅读均可在离线环境完成。</p>
+</blockquote>
+<hr>
+<h2>2. 四个工具</h2>
+<h3>2.1 <code>skill_new</code> — 捕获意图生成草稿</h3>
+<table>
+<thead>
+<tr>
+<th>参数</th>
+<th>类型</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>goal</code></td>
+<td>string (必填)</td>
+<td>要固化成技能的工作流描述：步骤、工具、输入/输出格式、边界</td>
+</tr>
+<tr>
+<td><code>fromSession</code></td>
+<td>boolean</td>
+<td>尽力从当前会话历史抽取上下文（session 服务不可用时降级）</td>
+</tr>
+<tr>
+<td><code>name</code> / <code>description</code></td>
+<td>string</td>
+<td>可选覆盖；默认由 goal 生成</td>
+</tr>
+<tr>
+<td><code>outputDir</code></td>
+<td>string</td>
+<td>输出根；默认 <code>插件 config.outputDir</code> → <code>customSkillDirs[0]</code> → <code>$DSH_HOME/skills</code></td>
+</tr>
+<tr>
+<td><code>confirm</code></td>
+<td>boolean</td>
+<td><code>false</code>（默认）= 干跑：返回意图抽取 + 澄清问题，不写盘；<code>true</code> = 写盘</td>
+</tr>
+</tbody></table>
+<p>流程（对齐上游 Capture Intent 迭代闭环的第 1–2 步）：</p>
+<ol>
+<li><code>confirm=false</code> 干跑 → 返回从 goal / 会话抽取的 <code>steps / tools / formats / gaps</code> 与<strong>澄清问题</strong>（缺口处让用户补）；</li>
+<li>确认后 <code>confirm=true</code> → 生成 <code>SKILL.md</code>（frontmatter <code>name</code> + <code>description</code> + 正文结构：<strong>Workflow / Inputs and outputs / Boundaries / Example</strong>）并写入，同时返回挂载提示。</li>
+</ol>
+<p>写盘遵守 DSH 读改写策略：覆盖已存在文件前先读取（见 <code>src/lib/fs-adapter.ts</code> 的 <code>serviceHostFs.writeText</code>）。</p>
+<h3>2.2 <code>skill_validate</code> — 校验已有技能目录</h3>
+<p>参数 <code>path</code>（必填）。逐项 PASS/FAIL 检查（报错文案对齐上游 <code>validate_skill()</code>）：</p>
+<ol>
+<li><code>SKILL.md exists</code> — 文件必须存在；</li>
+<li><code>SKILL.md readable</code> — 可读；</li>
+<li><code>frontmatter</code> — 必须有 <code>--- ... ---</code> 且能解析为 YAML mapping；</li>
+<li><code>name</code> / <code>description</code> — 必须为非空字符串；</li>
+<li><code>name</code> — 必须匹配 DSH kebab-case 命名 <code>^[a-z0-9]+(?:-[a-z0-9]+)*$</code>；</li>
+<li><code>body</code> — 正文非空（信息性检查）。</li>
+</ol>
+<p>返回：<code>{ ok, checks: [{ item, ok, message }], summary }</code>。</p>
+<h3>2.3 <code>skill_package</code> — 打包 <code>.skill</code>（zip）</h3>
+<p>参数：<code>path</code>（必填）、<code>outDir</code>（可选，默认技能目录的父目录）。<strong>打包前先跑 <code>skill_validate</code>，校验失败拒绝打包。</strong></p>
+<p>排除规则（移植自上游 <code>package_skill.py</code>）：<code>__pycache__/</code>、<code>node_modules/</code>（任意深度）、<code>*.pyc</code>（任意深度）、<code>.DS_Store</code>（任意深度）、技能根级 <code>evals/</code>（仅根级；深层 <code>evals</code> 保留）。</p>
+<p>产物结构：<code>&lt;skill-name&gt;/ + 内容</code>，输出 <code>&lt;outDir&gt;/&lt;skill-name&gt;.skill</code>。zip 使用 store 方式（<code>src/lib/zip.ts</code> 内建最小 ZIP 读写，零依赖，便于离线测试与验证）。</p>
+<h3>2.4 <code>skill_improve_description</code> — 改写 description 提高触发率</h3>
+<p>参数：<code>path</code>（必填）、<code>usage</code>（必填，触发场景样例）、<code>commit</code>（默认 <code>false</code>）。</p>
+<ul>
+<li><code>commit=false</code>：返回改写稿 <code>proposed</code> + 逐条 <code>reasons</code> + <code>preserved</code>（保留的原始触发词）/ <code>added</code>（新增场景词）。改写引擎<strong>保留原始触发场景覆盖</strong>（每个原始触发词仍出现在改写稿中）。</li>
+<li><code>commit=true</code>：把审核通过的改写稿写回 SKILL.md 的 frontmatter <code>description</code>（仅替换该行，其余字段与正文逐字节不变；写回前先读取）。</li>
+</ul>
+<p>配合 DSH 常规交互：模型先拿提案给用户确认，再以 <code>commit=true</code> 落盘。</p>
+<hr>
+<h2>3. 目录与交付物</h2>
+<pre><code>dsh-skill-creator/
+├── cordis.yml                  # bundle 层：插入 skill-creator 插件行
+├── package.json                # dsh.bundle 清单（patch: ./cordis.yml）
+├── tsconfig.json               # TypeScript 构建配置（rewrite .ts → .js）
+├── LICENSE                     # MIT
+├── src/
+│   ├── index.ts                # 插件装配：声明 Config/apply，注册 4 工具 + 输出目录挂载
+│   ├── tools/
+│   │   ├── skill-new.ts
+│   │   ├── skill-validate.ts
+│   │   ├── skill-package.ts
+│   │   └── skill-improve-description.ts
+│   └── lib/                    # 零依赖核心（工具与冒烟测试共用）
+│       ├── skill-name.ts       # kebab-case 校验与 slug
+│       ├── frontmatter.ts      # 最小 YAML frontmatter 解析/生成/字段原地替换
+│       ├── fs-adapter.ts       # HostFs：ctx.fs 服务优先，回退 Node；写前先读
+│       ├── tool-spec.ts        # 工具规格类型（defineTool 适配层）
+│       ├── validate-skill.ts   # skill_validate 核心
+│       ├── zip.ts              # 最小 ZIP 读写（store + CRC-32）
+│       ├── package-skill.ts    # skill_package 核心（排除规则）
+│       ├── draft.ts            # skill_new 核心（意图抽取/澄清问题/草稿生成）
+│       ├── improve.ts          # skill_improve_description 核心（改写+提交）
+│       ├── provider.ts         # 输出目录运行期 skill provider（挂载机制）
+│       └── tool-env.ts         # 输出根解析、mountHint、会话尾部抽取
+├── scripts/
+│   ├── quick_validate.py       # 移植自上游 quick_validate.py 的校验规则（PyYAML，权威校验）
+│   └── package_skill.py        # 移植自上游 package_skill.py 的打包规则（zipfile）
+├── tests/
+│   └── smoke.e2e.ts            # 离线冒烟测试：4 个工具主路径 + 验收标准
+└── README.md
+</code></pre>
+<p>TS 侧校验器 <code>src/lib/frontmatter.ts</code> 实现的是<strong>文档化 YAML 子集</strong>（块映射、嵌套缩进、引号标量、块标量、行内列表等），与 <code>scripts/quick_validate.py</code>（PyYAML 全量解析）检查项一致、互为印证；生成文件只使用该子集，故两者判定等价。</p>
+<hr>
+<h2>4. 验收标准对照</h2>
+<table>
+<thead>
+<tr>
+<th>验收标准</th>
+<th>落实位置</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>1. 生成技能可被 <code>ctx.skills</code> 列出并加载</td>
+<td><code>skill_new</code> 写盘 → 运行期 provider（<code>lib/provider.ts</code>）暴露给 <code>skills</code> 注册表；冒烟测试用 <code>OutputDirSkillSource.list()/get()</code> 验证</td>
+</tr>
+<tr>
+<td>2. <code>skill_validate</code> 对三类样本正确判定</td>
+<td><code>lib/validate-skill.ts</code> + 冒烟测试（缺文件/缺 frontmatter/非法名/正常）</td>
+</tr>
+<tr>
+<td>3. 打包 zip 不含排除项、结构 = 技能名/ + 内容</td>
+<td><code>lib/package-skill.ts</code> + <code>scripts/package_skill.py</code>；冒烟测试用内建 zip 读取回验，Python 侧用 <code>unzip -l</code> 验证</td>
+</tr>
+<tr>
+<td>4. 改写保留原始触发场景覆盖</td>
+<td><code>lib/improve.ts</code>（<code>preserved ⊆ proposed</code>）+ 冒烟测试逐词断言</td>
+</tr>
+<tr>
+<td>5. 冒烟测试覆盖 4 工具主路径</td>
+<td><code>tests/smoke.e2e.ts</code>（45 条断言，离线通过）</td>
+</tr>
+</tbody></table>
+<hr>
+<h2>5. 运维与限制</h2>
+<ul>
+<li><strong>最小 YAML 子集</strong>：<code>src/lib/frontmatter.ts</code> 不解析复杂 YAML（锚点、多文档、嵌套序列等会报 <code>invalid YAML frontmatter</code> 或保守解析）。权威校验以 <code>scripts/quick_validate.py</code>（PyYAML）为准。</li>
+<li><strong>挂载优先级</strong>：运行期 provider 的 rank=300（custom 层），项目根（rank 100/200）同名技能优先；与技能注册表默认行为一致。</li>
+<li><strong>二进制写盘</strong>：<code>.skill</code> 产物与目录创建走 Node（fs 服务为文本只写）；若部署环境限制插件写盘，请把 <code>outputDir</code> 指向允许的路径并配置 <code>skill-filesystem.customSkillDirs</code>。</li>
+<li><strong>fromSession</strong> 为尽力而为：读取不到 session 服务时仅按 <code>goal</code> 抽取并在结果中注明。</li>
+<li><strong>model 改写</strong>：本版本描述改写使用确定性规则引擎（离线可测、可复现）；对更强的语义改写，可在 <code>src/lib/improve.ts</code> 中注入模型完成器（当前不引入 LLM 运行时依赖）。</li>
+</ul>
+<hr>
+<h2>6. 上游移植说明</h2>
+<table>
+<thead>
+<tr>
+<th>上游（Proprietary）</th>
+<th>本项目（MIT）</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>scripts/quick_validate.py</code> 校验规则与报错风格</td>
+<td><code>scripts/quick_validate.py</code>（重写）+ <code>src/lib/validate-skill.ts</code>（TS 移植）</td>
+</tr>
+<tr>
+<td><code>scripts/package_skill.py</code> 排除规则与"先校验后打包"</td>
+<td><code>scripts/package_skill.py</code>（重写）+ <code>src/lib/package-skill.ts</code>（TS 移植）</td>
+</tr>
+<tr>
+<td>Capture Intent（步骤/工具/格式抽取 + 澄清问题）</td>
+<td><code>src/lib/draft.ts</code>（确定性启发式，行为对齐）</td>
+</tr>
+<tr>
+<td><code>improve_description.py</code> description 优化</td>
+<td><code>src/lib/improve.ts</code>（保留触发覆盖的改写引擎）</td>
+</tr>
+<tr>
+<td>迭代闭环（草稿→测试→评估→重写）</td>
+<td>由使用方（会话中的模型）通过 4 个工具编排复现</td>
+</tr>
+</tbody></table>
+<p><code>src/lib/zip.ts</code>、<code>src/lib/frontmatter.ts</code>、<code>src/lib/fs-adapter.ts</code>、<code>src/lib/provider.ts</code> 为本项目新增实现（无上游对应源码）。</p>

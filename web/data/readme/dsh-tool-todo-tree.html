@@ -1,0 +1,118 @@
+<h1>dsh-tool-todo-tree</h1>
+<p>嵌套（树形）<code>todo_write</code> 工具插件，用于 <a href="https://github.com/deepseek-ai/deepseek-harness">DeepSeek Harness</a> (DSH)。
+它是 <code>@deepseek-ai/dsh-tool-todo</code>（扁平列表）的<strong>互斥替代品</strong>：两者注册同一个工具名 <code>todo_write</code>，一个部署只能挂载其中一个。</p>
+<h2>安装</h2>
+<p>本包已发布到 npm：<a href="https://www.npmjs.com/package/dsh-tool-todo-tree"><code>dsh-tool-todo-tree</code></a>。
+它是可独立构建的 DSH bundle，依赖全部取自已发布的 <code>@deepseek-ai/*</code> npm 包，<strong>不需要 DSH 源码树</strong>。</p>
+<pre><code># 从 npm
+dsh plugin --profile &lt;名字&gt; add dsh-tool-todo-tree
+</code></pre>
+<p>registry 上的 tarball 自带 <code>lib/*.js</code> 与 <code>.d.ts</code>，安装时不跑构建（<code>prepare</code> 只在 git 安装时触发）。</p>
+<p>以下两条路径此前已实测：</p>
+<pre><code># 从本地 tarball
+pnpm pack
+dsh plugin --profile &lt;名字&gt; add ./dsh-tool-todo-tree-0.1.0.tgz
+
+# 或直接从 git（pnpm 会跑 prepare 构建，需在 profile 的 pnpm-workspace.yaml 放行）
+dsh plugin --profile &lt;名字&gt; add github:Chinesezjc/dsh-tool-todo-tree#&lt;sha&gt;
+</code></pre>
+<p><code>dsh plugin add</code> 会把包写进 profile 依赖，并把 <code>cordis.patch.yml</code> 注册为一层 bundle。该层挂载树形工具并禁用扁平工具：</p>
+<pre><code>- id: tool-todo
+  disabled: true
+
+- insert:
+    - id: tool-todo-tree
+      name: dsh-tool-todo-tree
+      config:
+        maxDepth: 3
+</code></pre>
+<p>必须显式禁用扁平工具。两者注册同名工具，注册表拒绝第二个注册者，其 entry 的 fiber settle 为 <code>FAILED</code>，而 <code>assertEntriesActivated</code> 审计该状态并让启动失败——选择形态要在组合层做，不能依赖挂载顺序。</p>
+<h2>这个包做什么</h2>
+<ul>
+<li><code>todo_write</code>：整棵任务树的全量替换写入，节点通过 <code>children</code> 嵌套</li>
+<li>每次调用向所属 agent 的 session 追加一条 <code>todo/tree</code> 事件快照，回放为 last-write-wins</li>
+<li><code>todoTree</code> projection：组合了 session-projection 接缝时发布当前整树，供 UI 读取（由下一个 <code>turn/start</code> 清空）</li>
+<li>全树范围内最多一个节点 <code>in_progress</code>；父节点只有在全部子节点 <code>completed</code> 时才可为 <code>completed</code></li>
+<li>同层兄弟节点 <code>content</code> 去重；空 <code>children</code> 归一化为省略该字段</li>
+<li><code>maxDepth</code>（默认 3）收窄接受的嵌套深度，上限为协议常量 <code>SCHEMA_DEPTH</code></li>
+</ul>
+<h2>Web 树形渲染需要打补丁</h2>
+<p><strong>npm 安装只提供 host 侧的工具与 projection。</strong> 浏览器端把树画出来需要把本仓装配进 DSH 源码树并打补丁，原因是结构性的：计划条组件 <code>TodoPanel</code> 是 <code>@deepseek-ai/dsh-client-ui-conversation</code> 的内部组件、未在该包 <code>exports</code> 中导出，而 <code>packages/client/AGENTS.md</code> 禁止跨包引用另一个插件的内部符号。</p>
+<pre><code>node scripts/assemble-into-harness.mjs &lt;dsh 源码树&gt;
+cd &lt;dsh 源码树&gt; &amp;&amp; git apply &lt;本仓&gt;/patches/*.patch
+pnpm install &amp;&amp; pnpm run build:lib:host
+pnpm run gen-persistence-catalog   # 必需：否则 todo/tree 进不了 KNOWN_SESSION_EVENT_TYPES
+pnpm run gen-tool-catalog &amp;&amp; pnpm run gen-config-catalog &amp;&amp; pnpm run gen-doc-graphs
+</code></pre>
+<p>装配脚本不是可选步骤：补丁会 <code>import '@deepseek-ai/dsh-tool-todo-tree/client'</code> 并给它加 tsconfig project reference，所以包必须先以<strong>scoped 身份</strong>存在于树内。同一份源码在两处身份不同——发布版是不带 scope 的 <code>dsh-tool-todo-tree</code>、peer 走 registry、tsdown 产出 <code>lib/*.js</code>；树内版是 <code>@deepseek-ai/dsh-tool-todo-tree</code>、peer 走 <code>workspace:^</code>、由 harness 的 <code>tsc -b</code> 产出 <code>lib/types/</code>。脚本负责写出后者。</p>
+<table>
+<thead>
+<tr>
+<th>补丁</th>
+<th>作用</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>web-tool-row-tree-counts.patch</code></td>
+<td><code>TodoRow</code> 单行摘要逐层统计 <code>children</code></td>
+</tr>
+<tr>
+<td><code>web-todo-panel-tree.patch</code></td>
+<td><code>TodoPanel</code> 按深度缩进渲染，并读 <code>todoTree</code> projection</td>
+</tr>
+<tr>
+<td><code>tool-todo-reciprocal-guard.patch</code></td>
+<td>扁平工具的对向 append 期拒绝（防止一条日志混两种形态）</td>
+</tr>
+<tr>
+<td><code>gen-tool-catalog.patch</code></td>
+<td>把新工具包加进目录生成器的 boot manifest（该门禁强制要求）</td>
+</tr>
+<tr>
+<td><code>gen-tool-catalog-spec.patch</code></td>
+<td>该生成器测试：<code>todo_write</code> 现有两个注册者</td>
+</tr>
+<tr>
+<td><code>root-package-json.patch</code></td>
+<td>根 devDependency，供生成器 import 本包</td>
+</tr>
+</tbody></table>
+<p>不做这些时，工具本身与 projection 正常工作，只是 Web 计划条不显示层级。</p>
+<h2>验证</h2>
+<p>以下均为实跑结果。</p>
+<p><strong>独立路径（无 monorepo）</strong>：<code>pnpm install</code> 只从 npm 取依赖；<code>pnpm run typecheck</code> 退出 0；<code>pnpm run test</code> <strong>81/81 通过</strong>；<code>pnpm run build</code> 成功（8 个产物，含 <code>lib/*.js</code> 与 <code>.d.ts</code>）。</p>
+<p><strong>真实安装链路</strong>：<code>pnpm pack</code> → <code>dsh plugin --profile ttdemo add ./*.tgz</code> 成功；profile 的 <code>dsh.profile.bundles</code> 出现 <code>dsh-tool-todo-tree</code>；随后从 profile 解析插件、从 profile 的 healed mirror 解析 harness 包，挂到真实 <code>ToolRuntime</code> 上读回工具：<code>todo_write</code> 已注册，节点字段为 <code>content,status,children</code>，且第二层仍公布 <code>children</code>（嵌套形状真实可见）。</p>
+<p><strong>registry 安装链路</strong>：0.1.0 已发布到 npm。从 registry 下载的 tarball 与本地构建 shasum 一致（<code>68829e6a</code>）；干净目录 <code>npm install dsh-tool-todo-tree</code> 成功（<code>prepare</code> 不触发，<code>zod</code> 随包装上）；运行时导出 <code>Config,SCHEMA_DEPTH,apply,inject,name</code>；<code>.</code> 与 <code>./invariant</code> 两个入口的类型解析均通过。</p>
+<p><strong>补丁路径</strong>：在公开镜像的干净 clone 上，<code>scripts/assemble-into-harness.mjs</code> + 6 个补丁全部成功；四个生成器与三个 <code>verify-*</code> 全绿；<code>typecheck</code>、<code>lint</code> 退出 0；<code>packages/todo</code> + <code>ui-tool</code> + <code>ui-conversation</code> + <code>gen-tool-catalog.spec.ts</code> 共 <strong>781/781</strong> 通过。本包在主仓 per-file 100% 覆盖率门禁下达标（语句 154/154、分支 104/104、函数 27/27、行 131/131）。</p>
+<p><strong>负例验证</strong>（断言能失败才算验证）：</p>
+<ul>
+<li>短路 <code>maxDepth</code> 深度检查 → <code>loader-composition</code> 的「maxDepth: 1 拒绝嵌套写入」转红。</li>
+<li>删掉 projection 的 fold 分支 → 3 个 last-wins 用例转红；整段删掉 <code>ctx.inject(['sessionProjections'], …)</code> → 7 个中 6 个转红。</li>
+<li>移除 <code>tests/projection.spec.ts</code> → <code>src/index.ts</code> 掉到 90.76% 行覆盖，未覆盖行正是 projection 注册块，覆盖率门禁 <code>exit=1</code>。</li>
+<li>把 <code>TodoRow</code> 的显式栈换回递归 → 20 万层嵌套用例以 <code>RangeError</code> 转红。</li>
+</ul>
+<h2>版本对齐的坑</h2>
+<p>npm 上 <code>@deepseek-ai/dsh-*</code> 的 <code>dist-tags.latest</code> 多数仍指向旧的 <code>0.0.1-rc.1</code>，而与 <code>@deepseek-ai/dsh@0.1.0-rc.6</code> 配套的是 <code>next</code> 标签下的 <code>0.1.0-rc.6</code>。混用会在运行期炸出缺失导出（例如 <code>dsh-agent-loop</code> 需要 <code>dsh-tools</code> 的 <code>TOOL_RUNTIME_SCHEDULER</code>，旧版没有）。本包的 peer 范围统一钉在 <code>^0.1.0-rc.6</code>。</p>
+<p><code>@deepseek-ai/dsh-session</code> 声明了未发布的 peer <code>@deepseek-ai/dsh-type-meta</code>，因此 <code>autoInstallPeers</code> 开启时安装会失败。本包关掉它并显式声明所需 peer；<code>dsh plugin add</code> 走 profile 的 healed mirror，不受影响。</p>
+<h2>已知缺口</h2>
+<ul>
+<li><strong>计划条只缩进、不可折叠</strong>：按深度缩进各行，没有按节点折叠，较宽的树依赖计划条自身滚动。</li>
+<li><strong><code>integration.spec.ts</code> 的对向守卫断言被收窄</strong>：那条拒绝在扁平工具的 <code>execute</code> 里，属上游代码，已发布版本不含该守卫。独立套件只断言「树快照仍是日志上唯一的 todo 形态」，并探测所装上游是否带守卫。</li>
+<li><strong>Web 快照门禁未在有沙箱的机器上验证</strong>：本机 <code>DSH_SNAPSHOT=replay pnpm run test:web</code> 的失败与干净 master 完全一致（缺沙箱后端，11 文件 / 15 用例），只能证明未引入新失败。</li>
+<li><strong><code>mock-adapter.ts</code> 是复制来的</strong>：harness 把它放在 <code>packages/core/agent-loop/tests/</code>，已发布包只含 <code>lib/</code>，任何发布产物都不暴露它，因此独立套件自带一份精简版。</li>
+</ul>
+<h2>从原 PR 移植时修掉的问题</h2>
+<p>源自 PR <a href="https://github.com/deepseek-harness/deepseek-harness/pull/668">#668</a>（分支 <code>feat/todo-tree-tool</code>，落后 master 约 3300 个 commit）：</p>
+<ul>
+<li><code>cordis</code> / <code>schemastery</code> / <code>@cordisjs/plugin-loader</code> → 已 rescope 的 <code>@deepseek-ai/*</code> 名称</li>
+<li>tsconfig reference <code>support/invariants</code> → <code>runtime-diagnostics/invariants</code></li>
+<li><code>agent/status</code> 监听签名 → 单一 payload 对象 <code>{ agent, status }</code></li>
+<li><code>turn/start</code> 负载去掉已删除的 <code>trigger</code> 字段</li>
+<li><code>new Session(...)</code> → <code>Session.create(...)</code>（构造函数已私有化）</li>
+<li><code>ctx.plugin(ToolTodo)</code> 补上现为必填的 <code>allowParallelInProgress</code></li>
+<li><code>declare module '@deepseek-ai/dsh-session'</code> → <code>'@deepseek-ai/dsh-session/types'</code>，否则 <code>gen-persistence-catalog</code> 扫不到该事件，<code>todo/tree</code> 进不了 <code>KNOWN_SESSION_EVENT_TYPES</code>，写过该事件的会话将无法加载</li>
+<li>Web 渲染：原 PR 改的 <code>todo-row.tsx</code> / <code>tool-call-model.ts</code> 已迁到 <code>packages/client/ui-tool/</code>，按新结构重写为 <code>planSummary</code> 的逐层统计</li>
+<li>TUI：原 PR 改的 <code>packages/ui/tui</code> 已被主仓在 <code>ed30088adb</code>（<code>cleanup: remove TUI package and legacy dsh entrypoints</code>）整包删除，该改动无处可移植，已丢弃</li>
+</ul>
+<h2>许可</h2>
+<p><a href="https://github.com/Chinesezjc/dsh-tool-todo-tree/blob/HEAD/LICENSE">MIT</a>，Copyright (c) 2026 Chinesezjc。</p>

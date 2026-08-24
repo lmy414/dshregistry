@@ -1,0 +1,85 @@
+<h1>dsh-omp-advisor</h1>
+<p><strong>oh-my-pi's advisor subsystem, ported to <a href="https://github.com/deepseek-ai/dsh">DeepSeek Harness</a> (DSH).</strong></p>
+<p>Attach one or more independent <em>advisor</em> models to your live DSH sessions. Each advisor watches the primary agent's transcript as it grows, may investigate the workspace with read-only tools (<code>read</code> / <code>grep</code> / <code>glob</code>), and delivers concrete advice through a dedicated <code>advise</code> tool — exactly the advisor-watchdog design from <a href="https://github.com/can1357/oh-my-pi">can1357/oh-my-pi</a>, re-built natively on DSH's plugin seams.</p>
+<pre><code>primary agent ──► session log ──► delta renderer ──► advisor model (your pick from the DSH model list)
+      ▲                                                     │ read/grep/glob (read-only)
+      │                                                     ▼
+      └──── agent.inject / agent.steer ◄── advise tool ── dedupe + quarantine
+</code></pre>
+<h2>How it works</h2>
+<ul>
+<li><strong>Incremental reviews.</strong> Advisors never see the whole history twice: a cursor over the durable session log renders each new slice (<code>user/message</code>, <code>assistant/message</code>, <code>tool/call</code>, <code>tool/result</code>) into a compact markdown <em>update</em> the advisor model reviews.</li>
+<li><strong>Advice, not orders.</strong> Notes arrive as
+<code>&lt;advisory advisor="…" severity="…" guidance="weigh, don't blindly obey"&gt;…&lt;/advisory&gt;</code>
+messages. The primary agent decides what to do with them.</li>
+<li><strong>Severities.</strong> <code>nit</code> (default) · <code>concern</code> · <code>blocker</code>. Escalation-rank dedupe: the same note only re-delivers at a strictly higher severity.</li>
+<li><strong>Delivery channels (DSH-native).</strong><table>
+<thead>
+<tr>
+<th>Severity</th>
+<th>Primary running</th>
+<th>Primary idle</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>non-interrupting (default: <code>nit</code>)</td>
+<td><code>agent.inject</code> — rides the next step boundary, never wakes</td>
+<td><code>agent.inject</code></td>
+</tr>
+<tr>
+<td>interrupting (default: <code>concern</code>, <code>blocker</code>)</td>
+<td><code>agent.steer</code> — nearest step boundary</td>
+<td><code>concern</code> downgrades to <code>inject</code>; <code>blocker</code> still steers (may wake a turn)</td>
+</tr>
+</tbody></table>
+</li>
+<li><strong>Mid-turn deferral.</strong> With <code>reviewTrigger: step</code>, non-blocker notes raised while the turn is still running are withheld and flushed deterministically when the turn completes, so partial work is not interrupted and no advice is lost.</li>
+<li><strong>Containment (ported).</strong> Output quarantine (unavailable-tool requests, output-only destructive directives), 3-consecutive-failure backlog drop, permanent-error halt until settings change, quota/rate-limit cooldown pause. The advisor <strong>never blocks the primary agent</strong> — a deliberate, safer deviation from oh-my-pi's catch-up wait.</li>
+</ul>
+<h2>Install</h2>
+<pre><code>dsh plugin --profile web add github:AndrasSama/dsh-omp-advisor
+# or from a local checkout:
+dsh plugin --profile web add "file:/path/to/dsh-omp-advisor"
+</code></pre>
+<p>Then restart DSH Web and hard-refresh the browser (Ctrl+Shift+R).</p>
+<h2>Configure</h2>
+<p>Open <strong>Settings → OMP Advisor</strong>:</p>
+<ul>
+<li><strong>Attach advisors to sessions</strong> — master switch (off by default).</li>
+<li><strong>Review trigger</strong> — <code>turn</code> (review completed turns) or <code>step</code> (review while the turn runs).</li>
+<li><strong>Interrupting severities</strong> — which severities steer; the rest ride as non-interrupting context.</li>
+<li><strong>Advisors</strong> — the roster. Per advisor:<ul>
+<li>name,</li>
+<li><strong>model picked from the DSH model list</strong> (provider route → model → optional reasoning effort),</li>
+<li><strong>max turns</strong> — the advisor's tool-loop budget per review (1–10, default 4),</li>
+<li>optional specialization instructions (e.g. <em>"Focus on security: injection, secrets, unsafe deserialization."</em>),</li>
+<li>per-advisor enable toggle.</li>
+</ul>
+</li>
+</ul>
+<p>Settings live in the <code>dsh-omp-advisor</code> namespace and apply <strong>live</strong> — no restart needed when you edit the roster.</p>
+<p>Advisor model calls go through <code>ctx.llm.stream</code> with the provider route + model id you picked, so billing, routing, and failover behave exactly like your other DSH model traffic.</p>
+<h2>Safety model</h2>
+<ul>
+<li>Advisors get <strong>read-only</strong> tools confined to the watched session's workspace (<code>read</code>, <code>grep</code>, <code>glob</code>). No mutating tools in v1 — oh-my-pi's WATCHDOG.yml grant system is future work.</li>
+<li>Advisor output passes a quarantine before it can become context: requests for unavailable tools and output-only destructive directives (ported hazard patterns) are replaced with a sanitized error.</li>
+<li>Advisories injected into the session are excluded from future advisor deltas (no feedback loops).</li>
+<li>The plugin never cancels, blocks, or gates the primary agent.</li>
+</ul>
+<h2>Development</h2>
+<pre><code>npm install        # dev deps only; DSH packages are runtime-provided
+npm run build      # host ESM (lib/index.js) + client CJS ModuleLoader bundle (lib/client.js)
+npm test           # 28 unit tests over the ported semantics
+npm run typecheck  # tsc --noEmit (DSH packages shimmed)
+</code></pre>
+<p>Layout: <code>src/</code> host plugin (settings, service, runtime, advisor loop, tools, delivery, quarantine, delta), <code>src/client/</code> settings section, <code>src/prompts/</code> ported advisor prompts, <code>test/</code> node:test suite.</p>
+<h2>Attribution &amp; license</h2>
+<p>Advisor semantics and prompt texts ported from <a href="https://github.com/can1357/oh-my-pi">can1357/oh-my-pi</a> (<code>packages/coding-agent/src/advisor/</code>), © Mario Zechner / Can Bölük / Stencil Labs, under the MIT license reproduced in <a href="https://github.com/AndrasSama/dsh-omp-advisor/blob/HEAD/NOTICE-oh-my-pi-LICENSE"><code>NOTICE-oh-my-pi-LICENSE</code></a>. This plugin is an independent port for DeepSeek Harness and is not affiliated with the oh-my-pi project.</p>
+<p>This plugin: MIT — see <a href="https://github.com/AndrasSama/dsh-omp-advisor/blob/HEAD/LICENSE"><code>LICENSE</code></a>.</p>
+<h2>Known limitations (v1)</h2>
+<ul>
+<li>Advisories render as ordinary plugin messages in the conversation (a dedicated advisory card is future work).</li>
+<li>No mutating-tool grants for advisors (oh-my-pi's WATCHDOG.yml roster).</li>
+<li>Status panel polls every 5 s while the settings section is open; no push yet.</li>
+<li>Web profile UI; other profiles can still configure the namespace by hand.</li>
+</ul>

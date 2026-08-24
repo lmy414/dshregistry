@@ -1,0 +1,114 @@
+<h1>dsh-dep-vuln-scan</h1>
+<blockquote>
+<p>[!IMPORTANT]
+<strong>依赖前置：相邻 <code>dsh-src</code> 检出（<code>link:</code> 依赖）</strong>
+本项目在开发形态下使用 <code>link:</code> 依赖指向相邻的 DeepSeek Harness 源码检出（<code>dsh-src</code>），
+与当前仓库保持同一父目录布局（<code>&lt;parent&gt;/dsh-src</code>）。克隆本仓库后：</p>
+<ol>
+<li>先把官方 <code>deepseek-ai/deepseek-harness</code> 检出到与本仓库同级的 <code>dsh-src/</code> 目录，并执行其 <code>pnpm install &amp;&amp; pnpm run build</code>；</li>
+<li>再按下方「安装」一节执行本仓库的 <code>pnpm install --offline &amp;&amp; pnpm build</code> 与测试。
+发布到 npm 的版本会尽量把 <code>link:</code> 依赖替换为 registry 真实版本；无法替换的内部包保持 <code>link:</code>，见各包 README 说明。</li>
+</ol>
+</blockquote>
+<p>DSH（DeepSeek Harness）原生依赖漏洞扫描工具：读取工作区内项目锁文件，调用 <strong>OSV 免费 API</strong>（<code>api.osv.dev</code>，无需 key）批量查询漏洞，输出「包 / 当前版本 / 漏洞 ID（CVE/GHSA 优先）/ 摘要 / CVSS / 修复版本」表格 + 汇总 + 修复命令，结果通过 <code>presentationMeta</code> 持久化到 <code>tool/result</code>，回放可复制。</p>
+<p><strong>只读分析</strong>：不写、不改、不装任何文件 —— 修复命令仅作建议，由用户确认后自行执行（与上游 remediation posture 一致）。</p>
+<h2>功能一览</h2>
+<table>
+<thead>
+<tr>
+<th>能力</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>生态支持</td>
+<td>npm（<code>package-lock.json</code>/<code>pnpm-lock.yaml</code>/<code>yarn.lock</code>）、PyPI（<code>requirements.txt</code>/<code>Pipfile.lock</code>/<code>poetry.lock</code>）、Go（<code>go.mod</code>）、crates.io（<code>Cargo.lock</code>）、Maven（<code>pom.xml</code>/<code>build.gradle*</code>）、NuGet（<code>packages.lock.json</code>）、RubyGems（<code>Gemfile.lock</code>）</td>
+</tr>
+<tr>
+<td>数据源</td>
+<td>OSV <code>POST /v1/querybatch</code>，零配置、免费、商用友好</td>
+</tr>
+<tr>
+<td>确认口径</td>
+<td>仅展示<strong>确认存在</strong>的漏洞：查询带 <code>version</code> 让 OSV 过滤 + 本地 <code>introduced ≤ version &lt; fixed</code> 区间复核（verifier 口径）</td>
+</tr>
+<tr>
+<td>修复信息</td>
+<td>取 affected ranges 中<strong>最早 fixed</strong>；有修复版标 <code>√ 有修复版 &lt;版本&gt;</code>，否则「无修复版」</td>
+</tr>
+<tr>
+<td>严重度</td>
+<td>CVSSv3 数值（≥9 critical / ≥7 high / ≥4 medium / &lt;4 low），无数值时用 OSV qualitative 关键词</td>
+</tr>
+<tr>
+<td>effort</td>
+<td><code>fast</code>（默认）：只查根锁文件、并发 4、无 SBOM；<code>full</code>：递归子目录（跳过 <code>node_modules</code> 等）、并发 16、生成 SBOM 摘要</td>
+</tr>
+<tr>
+<td>健壮性</td>
+<td>分块（250/批）批量查询、并发池、30s 超时、2 次重试退避、HTTP 429 按 <code>Retry-After</code> 等待；所有失败以结构化 <code>errors</code> 返回，不阻塞会话</td>
+</tr>
+<tr>
+<td>持久化</td>
+<td><code>output.presentationMeta</code> 投影整个报告 → <code>tool/result.meta</code>，UI 卡片回放可复制</td>
+</tr>
+</tbody></table>
+<h2>安装与使用</h2>
+<p>作为 DSH 插件 bundle 安装进 profile：</p>
+<pre><code># 1. 构建（产出 lib/，bundle 行引用 dsh-dep-vuln-scan/lib/index.js）
+pnpm install &amp;&amp; pnpm build
+
+# 2. 加入 profile（声明了 dsh.bundle，dsh 会把本包作为配置层挂载）
+dsh plugin --profile demo add ./dsh-dep-vuln-scan
+
+# 3. 验证挂载
+dsh --profile demo --dump-config | grep -A2 dep-vuln-scan
+</code></pre>
+<p>安装后，模型可直接调用工具（系统提示词已注册引导片段）：</p>
+<pre><code>dep_vuln_scan(path?: string, ecosystems?: string[], effort?: 'fast'|'full')
+</code></pre>
+<ul>
+<li><code>path</code>：项目目录或单个锁文件路径，省略 = 工作区根（自动发现根级锁文件）；</li>
+<li><code>ecosystems</code>：过滤（npm / pypi / go / crates / maven / nuget / rubygems，大小写不敏感，也接受别名如 <code>pip</code>/<code>cargo</code>/<code>java</code>）；</li>
+<li><code>effort</code>：默认 <code>fast</code>；<code>full</code> 时递归发现 + 并发 16 + SBOM 摘要段。</li>
+</ul>
+<h2>架构与文件</h2>
+<pre><code>dsh-dep-vuln-scan/
+├── cordis.yml            # dsh.bundle.patch 层：insert 插件行
+├── package.json          # dsh.bundle 声明 + exports（./lib/*）
+├── src/
+│   ├── index.ts          # 装配：注册工具 + systemPrompt 引导片段（name/inject/apply）
+│   ├── tools/dep-scan.ts # defineTool 定义 + 扫描编排（FsAdapter 注入 + ctx.fs 适配）
+│   ├── lockfile-parsers.ts # 各生态锁文件 → [(name, version)]（纯函数）
+│   ├── osv-client.ts     # querybatch 分块/并发/重试/超时/错误分类 + 漏洞归一化
+│   ├── report.ts         # 报告组装 + render（markdown 表格/汇总/修复命令）+ presentationMeta
+│   └── semver.ts         # 最小语义化比较（无运行时依赖）
+├── tests/
+│   ├── smoke.e2e.ts      # 27 项离线冒烟/E2E + 1 项 live（网络可用时）
+│   └── fixtures/         # npm/pip/go/clean/full 五个 fixture 项目 + 录制 OSV 响应
+└── tsconfig{,.build}.json
+</code></pre>
+<p>插件模块符合 Cordis 规范：<code>export const name</code> / <code>inject = ['tools','fs','systemPrompt']</code> / <code>apply(ctx)</code>；<code>ctx.tools.register(defineTool(...))</code> 与 <code>ctx.systemPrompt.section({...})</code> 均为 effect 注册，插件卸载自动清理。</p>
+<h2>为什么用全局 <code>fetch</code> 而不是 <code>ctx.web</code></h2>
+<p>PROMPT 建议走 <code>ctx.web</code> seam，但 <code>dsh-web</code> 的 fetch seam 只支持对单个 URL 的 GET 检索（返回 HTML/text 正文），不支持 OSV 需要的 <code>POST /v1/querybatch</code> + JSON body。因此默认 transport 使用宿主进程全局 <code>fetch</code> —— 与内置 <code>@deepseek-ai/dsh-web-fetch-http</code> provider 完全相同的传输层 —— 并遵循 seam 的约定：服从调用方 <code>AbortSignal</code>、超时合并、结构化错误。transport 本身可注入，测试用本地 stub 覆盖。</p>
+<h2>测试</h2>
+<pre><code>pnpm test          # 离线：解析器单测 + 录制 OSV 响应走真实客户端代码路径（分块/重试/解析/归一化）
+pnpm test:live     # 额外跑一次真实 api.osv.dev 查询（网络不可用时自动跳过）
+pnpm typecheck
+</code></pre>
+<ul>
+<li>三种生态 fixture（npm/pip/go）各自断言：命中漏洞、<code>fixed</code> 版本、修复命令（<code>npm install lodash@4.17.21</code> / <code>pip install pillow==9.0.0</code> / <code>go get golang.org/x/text@0.3.7</code>）；</li>
+<li>clean fixture 断言报告输出 <code>0 受影响</code>；</li>
+<li>无网络（transport 抛错）断言错误信息含「无法访问 OSV，检查网络或稍后重试」且不抛异常；</li>
+<li>fast/full 断言根扫描 1 个锁文件 vs 递归 2 个 + SBOM 差异。</li>
+</ul>
+<p>录制 fixture 为「快照式」响应：内容对齐已公开公告（CVE 编号与修复版本为稳定公开事实，测试只断言这些字段），离线可用；需要最新数据时以 <code>pnpm test:live</code> 结果为准。</p>
+<h2>已知限制</h2>
+<ul>
+<li><code>pnpm-lock.yaml</code> / <code>yarn.lock</code> 用行级解析（不引入 YAML 依赖）：pnpm 的 peer 后缀、yarn berry（v2+ <code>__metadata:</code>）会被跳过，仅覆盖常见形态；</li>
+<li><code>pom.xml</code>/gradle 只识别字面量版本，<code>${property}</code> 版本跳过；依赖树传递性不做解析（以锁文件记录为准）；</li>
+<li><code>requirements.txt</code> 仅精确 <code>==</code> 版本可查，<code>&gt;=</code>/<code>~=</code>/裸包名跳过；</li>
+<li>扫描上限：递归深度 8、锁文件 200 个，超大 monorepo 建议按子目录分别扫描。</li>
+</ul>
+<h2>License</h2>
+<p>MIT — 扫描逻辑按 OSV 口径自写；修复建议文案参考 wshobson/agents（MIT）的 remediation posture（只建议、不自动改动）。</p>

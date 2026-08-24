@@ -1,0 +1,86 @@
+<h1>dsh-realtime-voice</h1>
+<p>Provider-neutral full-duplex voice Agent capability for DeepSeek Harness.</p>
+<p>The public product abstraction is deliberately small: a consumer starts a <strong>voice conversation with an Agent</strong>, observes the conversation, lets the user interrupt naturally, supplies product-owned actions, and ends the conversation. Provider sessions, wire events, audio buffers, VAD, WebRTC, WebSocket, STT, LLM, and TTS are implementation details behind that boundary.</p>
+<p><code>dsh-multi-model-provider</code> owns model routes, credential references, and provider profiles. Product plugins own Agent identity, context, durable history, action policy, and authorization. This plugin owns only the live voice conversation: simultaneous listening and speaking, interruption, browser media lifetime, provider adaptation, normalized conversation events, and the neutral action-execution loop.</p>
+<h2>Product boundary</h2>
+<p>This release targets DeepSeek Harness <code>0.1.1-rc.2</code>. <code>dsh-multi-model-provider@^0.1.0-rc.11</code> is required and must be installed directly in the same profile. DSH does not auto-install, activate, or update peer plugins.</p>
+<pre><code>dsh plugin --profile web add dsh-multi-model-provider dsh-realtime-voice
+dsh plugin --profile web update dsh-multi-model-provider dsh-realtime-voice
+</code></pre>
+<pre><code>Agent (owned by the product)
+└── Voice conversation (owned here)
+    ├── start / observe / interrupt / end
+    └── action requests delegated back to the product
+</code></pre>
+<p>The plugin does not create a second Agent, own long-term memory, or decide whether an action is authorized. A Realtime provider session is strictly internal and must not become the consumer-facing object.</p>
+<h2>Host responsibilities</h2>
+<ul>
+<li>Registers the unchanged <code>openai-webrtc</code> and <code>doubao-realtime-duplex</code> adapters.</li>
+<li>Validates protocol, adapter, provider, scheme, endpoint, and trusted origin before credential resolution.</li>
+<li>Defaults to official upstream origins: <code>https://api.openai.com</code> and <code>wss://openspeech.bytedance.com</code>.</li>
+<li>Allows custom upstream origins only when explicitly listed in <code>trustedOpenAIOrigins</code> or <code>trustedDoubaoOrigins</code>.</li>
+<li>Keeps long-lived credentials on the host and sends them only to validated upstreams.</li>
+<li>Requires browser same-origin <code>Origin</code>/<code>Host</code>; billable POST routes use explicit marker headers, while the Doubao WebSocket uses the browser-compatible <code>dsh-realtime-voice-v1</code> subprotocol. <code>Sec-Fetch-Site</code> must be <code>same-origin</code> when supplied.</li>
+<li>Bounds and sanitizes Doubao frames, buffers a small startup event queue, emits <code>session.ready</code>, and accepts one result for each pending tool call.</li>
+<li>Owns every HTTP route, upgrade route, and WebSocket through Cordis lifecycle disposers.</li>
+</ul>
+<p>The package and canonical Host endpoints retain the stable realtime-voice name. The short-lived <code>/dsh-voice-agent</code> paths, marker, and WebSocket subprotocol remain temporary compatibility aliases for the 0.3 development migration:</p>
+<ul>
+<li><code>GET /dsh-realtime-voice/models</code>: public, non-billable model metadata.</li>
+<li><code>POST /dsh-realtime-voice/openai/session</code>: same-origin OpenAI WebRTC SDP exchange; requires <code>x-dsh-realtime-voice: 1</code>.</li>
+<li><code>POST /dsh-realtime-voice/doubao/probe</code>: same-origin Doubao connection probe; requires <code>x-dsh-model-probe: 1</code>.</li>
+<li><code>WS /dsh-realtime-voice/doubao</code>: same-origin Doubao Duplex proxy; requires WebSocket subprotocol <code>dsh-realtime-voice-v1</code>.</li>
+</ul>
+<h2>Client service</h2>
+<p>The packaged web Client publishes the Cordis service <code>voiceAgent</code>:</p>
+<pre><code>const service = ctx.get('voiceAgent')
+const conversation = await service.startConversation({
+  routeId: 'openai/gpt-realtime',
+  profileId: 'my-profile',
+  context: 'provider-neutral context',
+  ownerId: 'my-product:active',
+})
+const dispose = conversation.subscribe(event =&gt; {
+  // connection/activity, transcript, action, interruption, error, or end
+})
+</code></pre>
+<p>Primary service contract:</p>
+<ul>
+<li><code>capabilities()</code> reports whether a duplex conversation can start and whether audio input is already owned.</li>
+<li><code>startConversation({ routeId, profileId, context, ownerId })</code> returns a <code>VoiceConversation</code>. The provider protocol is inferred from the selected route; callers do not need to model OpenAI or Doubao sessions.</li>
+<li><code>registerActions(ownerPrefix, actions)</code> connects model-requested actions to product-owned executors. The product remains responsible for authorization and side-effect policy.</li>
+</ul>
+<p>During the 0.3 migration, <code>open</code>, <code>registerTools</code>, <code>resolveTool</code>, <code>close</code>, <code>models</code>, <code>recognize</code>, and <code>readAloud</code> remain compatibility APIs. New product code should use the conversation vocabulary above.</p>
+<p><code>VoiceConversation</code> contract:</p>
+<ul>
+<li><code>id</code></li>
+<li><code>subscribe(listener)</code></li>
+<li><code>updateContext(context)</code></li>
+<li><code>resolveAction(callId, result, { continueResponse? })</code></li>
+<li><code>interrupt()</code></li>
+<li><code>end()</code></li>
+</ul>
+<p>The Host also serves the same implementation at <code>/dsh-realtime-voice/client.js</code> for product-owned standalone pages. It publishes <code>window.DSHRealtimeVoice</code>; a product may pass a bounded same-origin <code>gateway</code> to <code>startConversation</code> so its own short-lived authorization, versioned start event, and readiness event remain on the product route. The shared Client still owns microphone capture, playback, interruption, cleanup, and normalized events. Doubao output additionally emits bounded <code>{ type: "audio-level", source: "output", level: 0..1 }</code> events for avatar animation without exposing raw PCM to the consumer.</p>
+<p>The Client service owns <code>RTCPeerConnection</code>, data channels, microphone tracks, media/audio elements, WebSockets, <code>AudioContext</code>, <code>AudioWorklet</code> PCM capture and playback, <code>SpeechRecognition</code>, <code>speechSynthesis</code>, listeners, late-callback guards, and the neutral tool-execution loop. It does not know drafts, Agent submission, knowledge bases, pets, or any product business semantics. The Doubao input worklet is loaded from the same Host base path; no deprecated <code>ScriptProcessorNode</code>, Blob module, or production microphone bypass is retained.</p>
+<p>Every microphone consumer supplies a bounded <code>ownerId</code>. Audio input is an exclusive lease: a competing conversation fails with <code>code: "audio_input_busy"</code> and the current owner id. Ending a conversation or failing during startup releases the lease.</p>
+<p><code>voiceAgent.recognize()</code> is the low-cost standby primitive used by product plugins. It never opens a Realtime Provider session itself. Products remain responsible for matching a wake phrase and calling <code>startConversation()</code> only after a match. Browser speech recognition is not described as on-device unless the user agent explicitly guarantees local processing.</p>
+<p>For same-utterance wake-up, a product calls <code>recognize({ captureAudio: true })</code>. The runtime keeps at most 30 seconds of PCM audio in browser memory; the product discards that buffer after every finalized non-match. On a match it passes both the complete original transcript as bounded <code>initialUserText</code> and the captured PCM as <code>initialAudio</code>. After Provider readiness, the runtime replays the full audio as the first real user turn, including the wake phrase. The buffer is never persisted, and unmatched audio never reaches a Realtime Provider.</p>
+<p>Browser media failures are normalized to stable, consumer-localizable codes on the rejected error (and on <code>recognize()</code> error events): <code>mic_not_found</code> (no input device), <code>mic_permission_denied</code>, <code>mic_unreadable</code>, and <code>mic_aborted</code>. The raw DOMException message is replaced with one canonical English sentence per code; consumers translate <code>error.code</code> into their own language and fall back to the message for unknown codes.</p>
+<h2>Runtime integration</h2>
+<p>Business plugins register profiles with <code>realtimeModelRuntime</code>, then pass only the selected route, profile, Agent context, and owner identity to <code>voiceAgent.startConversation</code>. They register product actions under the same owner prefix. They never supply credentials or provider events, and this plugin never sees drafts, knowledge policy, submission policy, or delegation authorization.</p>
+<h2>Live browser voice verification</h2>
+<p>The maintained live E2E case sends generated speech through a browser-owned virtual microphone, the real packaged Client, the local DSH Host, a real Doubao Realtime route, normalized conversation events, the automatic action-execution loop, response audio, and microphone-lease cleanup. Product actions are recorded by an isolated executor, so the case does not submit to or mutate a real Session.</p>
+<p>Live Realtime calls may incur Provider charges and are skipped by the normal test suite. Install the Playwright browser once, start the configured DSH Web profile, and opt in explicitly:</p>
+<pre><code>pnpm exec playwright install chromium
+pnpm test:e2e:live
+</code></pre>
+<p>On macOS the case creates a deterministic Chinese WAV with <code>say</code> and <code>afconvert</code>. To exercise a separate speech-generation model, generate the same utterance as a WAV and pass its path without putting credentials in the command or repository:</p>
+<pre><code>DSH_VOICE_E2E_WAV=/absolute/path/from-speech-model.wav pnpm test:e2e:live
+</code></pre>
+<p>Defaults target <code>http://127.0.0.1:3080</code>, the first built-in Doubao voice route, and the <code>session-assistant</code> profile. The maintained case can be pointed at another installed product profile without changing source:</p>
+<pre><code>DSH_VOICE_E2E_PROFILE_ID=pet-assistant \
+DSH_VOICE_E2E_EXPECTED_ACTION=delegate_to_agent \
+DSH_VOICE_E2E_UTTERANCE='请把语音端到端验证七三一九明确提交给当前 Agent。' \
+pnpm test:e2e:live
+</code></pre>
+<p>Supported overrides are <code>DSH_VOICE_E2E_BASE_URL</code>, <code>DSH_VOICE_E2E_ROUTE_ID</code>, <code>DSH_VOICE_E2E_PROFILE_ID</code>, <code>DSH_VOICE_E2E_EXPECTED_ACTION</code>, <code>DSH_VOICE_E2E_PROBE_TOKEN</code>, <code>DSH_VOICE_E2E_UTTERANCE</code>, <code>DSH_VOICE_E2E_WAV</code>, and <code>DSH_VOICE_E2E_TIMEOUT_MS</code>. The proxy refuses non-loopback targets, and the test never reads or forwards a credential value itself.</p>

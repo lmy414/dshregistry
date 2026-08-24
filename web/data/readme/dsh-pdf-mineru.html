@@ -1,0 +1,129 @@
+<h1>dsh-pdf-mineru</h1>
+<p>DSH MinerU 文档解析插件。模型通过统一工具接口使用自托管 MinerU v2 或 MinerU 官方云 v4；Provider 差异、上游任务 ID、预签名地址和 ZIP 结果不会暴露给模型。</p>
+<h2>能力</h2>
+<ul>
+<li>自托管 v2：<code>GET /health</code>、multipart <code>POST /tasks</code>、任务轮询和 JSON 结果收集。</li>
+<li>官方 v4：<code>POST /file-urls/batch</code>、裸 PUT 上传、<code>GET /extract-results/batch/{batch_id}</code>、安全 ZIP 收集。</li>
+<li>会话 Job：每次提交创建独立 <code>job_id</code>，只能由创建它的 DSH Session 查询。</li>
+<li>全局结果缓存：按源 SHA-256、规范解析语义、产物集合、Provider compatibility key 和 schema 版本寻址。</li>
+<li>单进程请求合并：相同 CacheKey 只提交一次上游解析，每个会话仍保留独立 Job；单个等待者取消不取消 producer。</li>
+<li>持久恢复：上游接受任务后立即持久化不含秘密的 ProviderJobRef，重启后可继续轮询和收集。</li>
+<li>staging、完整校验、原子 rename 发布、损坏缓存隔离和 storageRoot 进程锁。</li>
+<li>安全网络重试：幂等 GET 与官方裸 PUT 使用有界 backoff/Retry-After；模糊提交 POST 不重放。</li>
+<li>loopback 存储运维：统计、只读完整性扫描、GC preview、quarantine 列表和二次确认清理。</li>
+<li>结构化诊断只记录 Job/operation、Provider、阶段、耗时、字节、重试计数和标准错误码。</li>
+</ul>
+<p>当前模型工具每次只接受一个文件。领域请求和 Provider 接口保留文件数组，以支持后续按文件缓存的批量 fan-out/fan-in。</p>
+<h2>安装</h2>
+<pre><code>dsh plugin --profile web add dsh-pdf-mineru
+
+# 本地 checkout
+dsh plugin --profile web add link:/absolute/path/to/dsh-pdf-mineru
+</code></pre>
+<p>从 git 安装且使用 pnpm 10+ 时，在 profile 的 <code>pnpm-workspace.yaml</code> 允许该包的构建脚本。</p>
+<h2>配置</h2>
+<p>配置通过 DSH Settings 的 <code>dsh-pdf-mineru</code> namespace 持久化。<code>cordis.patch.yml</code> 只提供首次启动默认值。API Token 只保存于 DSH credentials 或环境变量中，配置仅保存 credential reference。</p>
+<h3>自托管 v2</h3>
+<pre><code>schemaVersion: 1
+activeProvider: mp_self_hosted
+providers:
+  - id: mp_self_hosted
+    type: self-hosted-v2
+    baseURL: http://localhost:18000
+    apiKeyEnv: MINERU_API_KEY
+    allowInsecureHttp: true
+    modelMap:
+      pipeline: pipeline
+      vlm: vlm-engine
+defaults:
+  model: pipeline
+  ocr: false
+  parseMethod: auto
+  language: ch
+  formula: true
+  table: true
+  artifacts: [markdown]
+retry:
+  maxAttempts: 3
+  baseDelayMs: 500
+  maxDelayMs: 10000
+</code></pre>
+<p><code>modelMap</code> 是显式映射。<code>hybrid-engine</code> 等值可以配置为统一 <code>vlm</code> 的后端，但 Service 不会猜测或静默降级。HTTP 只允许在自托管配置显式启用 <code>allowInsecureHttp</code> 时使用。</p>
+<h3>官方 v4</h3>
+<pre><code>schemaVersion: 1
+activeProvider: mp_official
+providers:
+  - id: mp_official
+    type: official-v4
+    baseURL: https://mineru.net/api/v4
+    apiKeyEnv: MINERU_API_KEY
+    models: [pipeline, vlm]
+    configuredVersion: v4
+defaults:
+  model: vlm
+  ocr: false
+  parseMethod: auto
+  language: ch
+  formula: true
+  table: true
+  artifacts: [markdown]
+</code></pre>
+<p>官方 v4 当前限制为单文件不超过 200 MB、200 页。官方 Provider 不支持自托管专用的 <code>parseMethod: txt</code>，配置或请求会明确失败。</p>
+<h3>存储与限制</h3>
+<p>默认 storageRoot 为 <code>$DSH_HOME/dsh-pdf-mineru/v1</code>，布局如下：</p>
+<pre><code>jobs/&lt;session-id&gt;/&lt;job-id&gt;.json
+results/sha256/&lt;prefix&gt;/&lt;cache-key&gt;/manifest.json
+staging/&lt;operation-id&gt;/
+quarantine/&lt;timestamp_reason_id&gt;/
+.process.lock
+</code></pre>
+<p>一个 storageRoot 只能由一个 DSH 进程使用。修改 <code>storageRoot</code> 后需重启；Provider、默认参数、轮询、重试和输出限制对新任务热生效。</p>
+<p>可配置限制包括源文件大小、API 响应大小、ZIP 下载大小、entry 数、单 entry 解压字节、总解压字节和压缩比。</p>
+<p>Settings 的“存储运维”区域按需执行，不会自动扫描磁盘：</p>
+<ul>
+<li>统计 results、jobs、staging 和 quarantine 的字节与条目。</li>
+<li>完整性扫描默认只读；显式隔离无效结果需要确认。</li>
+<li>GC 只生成引用保留策略下的 preview，不删除已发布结果；Job 扫描不完整或结果扫描截断时 <code>eligible=false</code>。</li>
+<li>quarantine 删除默认 dry-run，只删除显式选中的安全 entry ID；实际删除需要二次确认。</li>
+</ul>
+<h2>模型工具</h2>
+<p>所有工具都要求 <code>exec.agent.session</code>。模型只看到插件 <code>job_id</code>，不会看到上游 <code>task_id</code>、<code>batch_id</code>、上传 URL、CDN URL 或状态 URL。</p>
+<ul>
+<li><code>mineru_health</code>：探测当前 Provider 的连通性、鉴权和协议版本。</li>
+<li><code>mineru_submit_parse_job</code>：创建会话 Job，返回 <code>source: cache | shared-operation | provider</code>。</li>
+<li><code>mineru_get_parse_status</code>：返回统一 Job 状态和逐文件状态。</li>
+<li><code>mineru_get_parse_result</code>：返回受限 Markdown preview、manifest 路径和产物路径。</li>
+<li><code>mineru_parse_document</code>：submit、等待、result 的组合工具；等待超时保留 Job，可稍后继续查询。</li>
+</ul>
+<p>工具仅接受 <code>file_paths/model/ocr/language/formula/table/pages/artifacts</code>；状态和结果查询仅接受插件 <code>job_id</code>。旧 flat config 与旧工具参数不再解析，传入时会由闭合 schema 或配置校验直接拒绝。</p>
+<h2>官方 v4 安全边界</h2>
+<ul>
+<li>MinerU API 请求使用 Bearer Token、JSON 和 <code>redirect: error</code>。</li>
+<li>预签名 PUT 使用独立请求构造器，headers 严格为空：无 Authorization、Content-Type 或默认头。</li>
+<li>CDN ZIP 下载不携带 API Token，并禁止重定向。</li>
+<li>inspect/collect/CDN GET 与重新打开新流的裸 PUT 可重试；<code>/file-urls/batch</code> POST 不自动重试。</li>
+<li>HTTP 200 但 <code>code != 0</code> 仍失败，保留脱敏 <code>providerCode</code> 和 <code>traceId</code>。</li>
+<li>状态和结果只按插件生成的 <code>data_id</code> 关联，不信任 <code>file_name</code>。</li>
+<li>重复 <code>full_zip_url</code> 只下载一次。</li>
+<li>ZIP 拒绝绝对路径、<code>..</code>、NUL、反斜杠/驱动器路径、符号链接、非普通条目和加密条目。</li>
+<li>ZIP 中央目录先扫描限制，随后逐 entry 流式进入 staging；不会把整个归档解压到内存。</li>
+</ul>
+<h2>开发与验证</h2>
+<pre><code>pnpm install
+pnpm run typecheck
+pnpm test
+pnpm run build
+git diff --check
+
+# 在已运行的 DSH Web shell 中隔离加载当前 client bundle
+pnpm run verify:gui
+
+# 构建后显式启用真实官方 v4 全链路 smoke
+MINERU_API_KEY=&lt;token&gt; pnpm run smoke:official-v4 -- /absolute/path/sample.pdf
+</code></pre>
+<p>GUI verifier 只修改其隔离 Playwright 页面中的 boot graph，并 mock 该页面的插件 RPC；它不会安装插件、修改 profile 或重启 <code>127.0.0.1:3080</code>。校验覆盖 Provider 切换、retry 保存、全部存储运维命令、删除确认、console error、桌面/移动几何和截图。</p>
+<p>测试默认使用 mock HTTP 和本地 ZIP fixture，不需要真实 Token。<code>smoke:official-v4</code> 调用构建后的 <code>mineru_parse_document</code> 完整插件链路，必须显式提供真实 Token 和 PDF，不进入默认测试。</p>
+<h2>许可证</h2>
+<p>本项目使用 <a href="https://github.com/Yurzi/dsh-pdf-mineru/blob/HEAD/LICENSE">MIT License</a> 开源。</p>
+<h2>致谢</h2>
+<p>感谢 <a href="https://github.com/HuanLinOTO/dsh-plugin-mineru">Huanlin/dsh-plugin-mineru</a> 提供灵感。</p>

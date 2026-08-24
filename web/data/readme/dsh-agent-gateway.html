@@ -1,0 +1,116 @@
+<h1>dsh-agent-gateway</h1>
+<p>An MCP stdio gateway that exposes local AI CLI agents to DeepSeek Harness (DSH) as MCP tools.</p>
+<p>The gateway discovers configured agent profiles, invokes the matching CLI driver, applies the profile policy to the extent supported by that driver, and returns normalized results. DSH remains the orchestrator: it chooses agents, routes work, and verifies results. The gateway does not plan, route, merge, or accept work on DSH's behalf.</p>
+<p><code>subagent_codex</code> is intentionally outside this gateway because it retains DSH's background-job lifecycle. The gateway provides single-shot MCP calls.</p>
+<h2>Quick start</h2>
+<p>DSH is currently a developer preview. Install the bundle into the intended DSH profile:</p>
+<pre><code>dsh plugin add @longnb47/dsh-agent-gateway@next
+</code></pre>
+<p>Use <code>--profile &lt;profile&gt;</code> when targeting a specific profile:</p>
+<pre><code>dsh plugin --profile &lt;profile&gt; add @longnb47/dsh-agent-gateway@next
+</code></pre>
+<p>For an RC distributed as a local package tarball, pass the tarball path instead of the package name:</p>
+<pre><code>dsh plugin --profile &lt;profile&gt; add &lt;path-to-package.tgz&gt;
+</code></pre>
+<p>The package declares a DSH bundle patch. Installation adds the package to the profile's bundles and inserts one <code>@deepseek-ai/dsh-mcp-client</code> row named <code>dsh-agent-gateway</code>. That row starts the installed gateway with Node; it does not refer to a developer checkout.</p>
+<p>Before starting DSH, create the gateway config at:</p>
+<pre><code>~/.dsh/agent-gateway/agents.jsonc
+</code></pre>
+<p>For a zero-cost smoke test, copy <a href="https://github.com/longnb47/dsh-agent-gateway/blob/HEAD/examples/agents.example.jsonc">examples/agents.example.jsonc</a> to that location. It uses the shipped fake CLI, requires no real AI CLI, makes no network call, and uses no paid service. The fake script path resolves relative to the installed package root.</p>
+<p>If you use a custom <code>DSH_HOME</code>, the gateway does not derive its default from it. Set <code>DSH_AGENT_GATEWAY_CONFIG</code> in the MCP row's <code>env</code> configuration; setting it only in your shell does not work because the DSH MCP client scrubs ambient <code>DSH_*</code> variables. See <a href="https://github.com/longnb47/dsh-agent-gateway/blob/HEAD/docs/dsh-integration.md#custom-config-location-and-dsh_home">DSH integration</a>.</p>
+<p>Restart or start the selected DSH profile after creating the config.</p>
+<h2>Fake smoke test</h2>
+<p>From DSH, call these tools in order:</p>
+<ol>
+<li><code>mcp__agent-gateway__list_agents</code> with no input. Confirm that <code>fake-agent</code> is listed.</li>
+<li><code>mcp__agent-gateway__get_agent_status</code> with <code>{ "agent": "fake-agent" }</code>. Confirm that the fake executable/version/auth readiness result is returned without reading credentials.</li>
+<li><code>mcp__agent-gateway__call_agent</code> with a real absolute workspace directory:</li>
+</ol>
+<pre><code>{
+  "agent": "fake-agent",
+  "task": "Return a smoke-test response.",
+  "cwd": "&lt;absolute path to a workspace&gt;",
+  "timeoutSeconds": 60
+}
+</code></pre>
+<p>The fake call returns the same normalized <code>AgentResult</code> shape as a real driver, without contacting an AI service.</p>
+<h2>Tool surface</h2>
+<p>DSH exposes MCP tools as <code>mcp__&lt;serverName&gt;__&lt;rawName&gt;</code>. The public bundle uses <code>serverName: agent-gateway</code>, so the tools are:</p>
+<ul>
+<li><code>mcp__agent-gateway__list_agents</code> returns enabled profiles, including <code>name</code>, <code>label</code>, <code>description</code>, <code>purposes</code>, <code>policy</code>, <code>driver</code>, <code>kind</code>, <code>costTier</code>, <code>constraints</code>, and <code>enforcementSummary</code>.</li>
+<li><code>mcp__agent-gateway__call_agent</code> accepts <code>{ agent, task, cwd, model?, effort?, timeoutSeconds? }</code>. It returns a normalized <code>AgentResult</code> with <code>status</code> (<code>success</code>, <code>error</code>, <code>timeout</code>, or <code>cancelled</code>), a <code>response</code> or structured <code>error { phase, code, message }</code>, and metadata.</li>
+<li><code>mcp__agent-gateway__get_agent_status</code> accepts <code>{ agent }</code> and reports executable, version, and auth readiness without reading or returning credentials.</li>
+</ul>
+<h2>Drivers and enforcement</h2>
+<table>
+<thead>
+<tr>
+<th>Kind</th>
+<th>Purpose</th>
+<th>Read-only enforcement</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>fake</code></td>
+<td>Offline smoke tests and fixtures</td>
+<td>No real AI CLI; no network or paid service</td>
+</tr>
+<tr>
+<td><code>agy</code></td>
+<td>AGY headless specialist calls</td>
+<td>Best-effort, permission-based; not an OS sandbox</td>
+</tr>
+<tr>
+<td><code>codex</code></td>
+<td>Codex one-shot specialist calls</td>
+<td>Hard read-only sandbox for read-only profiles</td>
+</tr>
+<tr>
+<td><code>opencode</code></td>
+<td>OpenCode specialist calls</td>
+<td>Best-effort</td>
+</tr>
+</tbody></table>
+<p>Policy intent and actual enforcement are different. The gateway reports the requested policy and driver enforcement honestly; DSH must still treat agent output as untrusted evidence and verify it.</p>
+<h2>Missing or invalid config</h2>
+<p>The public bundle deliberately uses <code>failOnStartupError: false</code>. If the config file is missing or invalid, the gateway writes an actionable error to its stderr, which the DSH MCP client forwards to DSH output/logs. DSH continues booting, but the gateway tools are not registered.</p>
+<p>The bundle also sets <code>reconnect.maxAttempts: 3</code>, bounding the failure noise to about four total spawn attempts (roughly 3.5 seconds) instead of the MCP client's default ten retries. Check the config path proactively rather than relying only on child stderr. After setup, you may change the profile row to <code>failOnStartupError: true</code> for fail-fast startup or raise <code>reconnect.maxAttempts</code> if longer recovery is appropriate. See <a href="https://github.com/longnb47/dsh-agent-gateway/blob/HEAD/docs/troubleshooting.md">Troubleshooting</a>.</p>
+<h2>Compatibility</h2>
+<table>
+<thead>
+<tr>
+<th>Component</th>
+<th>Status</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>DSH <code>0.1.1-rc.2</code>, Node 24 shipped with DSH, Windows</td>
+<td>Verified together</td>
+</tr>
+<tr>
+<td>Node <code>&gt;=22.3.0</code></td>
+<td>Required by the bundle's <code>process.getBuiltinModule</code> expression; compatibility floor is unverified</td>
+</tr>
+<tr>
+<td>Linux and macOS</td>
+<td>Unverified; no tests yet</td>
+</tr>
+</tbody></table>
+<p>A new DSH minor or RC may change the bundle loader or MCP client because DSH is a developer preview.</p>
+<h2>Security</h2>
+<ul>
+<li>A bundle patch can contain <code>!!js</code>, which executes during config loading. The package and its patch are trusted code; inspect packages before installation.</li>
+<li>The gateway launches local CLIs with the current user's privileges. Config cannot supply arbitrary shell arguments: drivers own argv construction and processes use <code>shell: false</code>.</li>
+<li>Secrets are passed only through driver-specific environment allowlists. They are never logged, included in result metadata, or packed in the package tarball. Do not store API keys or tokens in <code>agents.jsonc</code>.</li>
+<li>Read-only enforcement varies by driver as shown above. DSH must verify all agent output.</li>
+</ul>
+<p>See <a href="https://github.com/longnb47/dsh-agent-gateway/blob/HEAD/SECURITY.md">SECURITY.md</a> for the threat boundaries and reporting process.</p>
+<h2>Documentation</h2>
+<ul>
+<li><a href="https://github.com/longnb47/dsh-agent-gateway/blob/HEAD/docs/config.md">Configuration reference</a></li>
+<li><a href="https://github.com/longnb47/dsh-agent-gateway/blob/HEAD/docs/dsh-integration.md">DSH bundle integration</a></li>
+<li><a href="https://github.com/longnb47/dsh-agent-gateway/blob/HEAD/docs/troubleshooting.md">Troubleshooting</a></li>
+<li><a href="https://github.com/longnb47/dsh-agent-gateway/blob/HEAD/SECURITY.md">Security policy</a></li>
+<li><a href="https://github.com/longnb47/dsh-agent-gateway/blob/HEAD/CHANGELOG.md">Changelog</a></li>
+</ul>
+<p>Repository: <a href="https://github.com/longnb47/dsh-agent-gateway">https://github.com/longnb47/dsh-agent-gateway</a></p>

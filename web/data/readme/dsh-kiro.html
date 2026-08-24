@@ -1,0 +1,194 @@
+<h1>dsh-kiro</h1>
+<p align="center">
+  <img src="https://raw.githubusercontent.com/dat-lequoc/dsh-kiro/HEAD/assets/kiro-icon.svg" alt="Kiro">
+</p>
+
+<p>English | <a href="https://github.com/dat-lequoc/dsh-kiro/blob/HEAD/README.zh.md">中文</a></p>
+<p>Kiro provider for <a href="https://github.com/deepseek-ai/deepseek-harness">DeepSeek Harness</a>, with multi-method Kiro login, automatic token/profile refresh, live account model discovery, Claude/open-weight streaming, tool calls, and reasoning effort controls.</p>
+<p>The bundle registers the <code>kiro</code> provider route and mounts itself when installed. No API key or manual <code>cordis.yml</code> entry is required.</p>
+<p>This is an independent integration and is not affiliated with or endorsed by AWS or Kiro. Kiro and its logo are Amazon trademarks; see <a href="https://github.com/dat-lequoc/dsh-kiro/blob/HEAD/NOTICE.md">NOTICE.md</a>.</p>
+<h2>Features</h2>
+<ul>
+<li>Sign in from <strong>Settings → Kiro</strong> with AWS Builder ID, IAM Identity Center, Google, or GitHub.</li>
+<li>Import a Kiro refresh token, API key, or CLIProxyAPI-compatible Microsoft external-IdP credential.</li>
+<li>Sign in with the same methods from a terminal using the included <code>kiro-login</code> command.</li>
+<li>Discover and persist the account's CodeWhisperer profile ARN so refreshed tokens keep the correct profile.</li>
+<li>Fall back to Kiro IDE/CLI's existing <code>~/.aws/sso/cache</code> sign-in when no plugin-managed login exists.</li>
+<li>Query Kiro's <code>ListAvailableModels</code> endpoint so the model picker reflects the signed-in account (Opus, Sonnet, Haiku, and available open-weight routes).</li>
+<li>Expose <code>off</code>, <code>low</code>, <code>medium</code>, and <code>high</code> reasoning efforts on thinking-capable models.</li>
+<li>Stream text, reasoning, and tool calls from Kiro's Amazon EventStream protocol.</li>
+<li>Support direct egress or an authenticated HTTP/HTTPS <code>CONNECT</code> proxy.</li>
+<li>Hot-reload <code>llm-kiro</code> settings without restarting DSH.</li>
+</ul>
+<h2>Install</h2>
+<pre><code>dsh plugin --profile web add github:dat-lequoc/dsh-kiro
+dsh --profile web
+</code></pre>
+<p>From a DeepSeek Harness source checkout, use its launcher:</p>
+<pre><code>cd ~/deepseek-harness
+pnpm dsh plugin --profile web add github:dat-lequoc/dsh-kiro
+pnpm dsh --profile web
+</code></pre>
+<p>Built <code>lib/</code> artifacts are committed, so a GitHub install does not need to execute a dependency build script.</p>
+<h2>Sign in</h2>
+<h3>Web</h3>
+<p>Open <strong>Settings → Kiro</strong> and select a method:</p>
+<ul>
+<li><strong>AWS Builder ID</strong> uses the standard device-code flow.</li>
+<li><strong>IAM Identity Center</strong> uses a device flow with your <code>https://&lt;company&gt;.awsapps.com/start</code> URL and region.</li>
+<li><strong>Google / GitHub</strong> uses Kiro's social device flow. The page shows a one-time <code>XXXX-XXXX</code> code and an <code>app.kiro.dev/account/device</code> authorization URL while the plugin waits for completion.</li>
+<li><strong>Refresh token</strong>, <strong>Kiro API key</strong>, and <strong>Microsoft external IdP JSON</strong> validate/import an existing credential without exposing it back to the browser status API.</li>
+</ul>
+<p>After an OAuth login, the plugin queries <code>ListAvailableProfiles</code>, saves the selected profile ARN with its managed credential, and uses the ARN's region for inference.</p>
+<h3>Terminal</h3>
+<p>Run the installed binary through the profile:</p>
+<pre><code>dsh plugin --profile web exec kiro-login
+</code></pre>
+<p>Useful options:</p>
+<pre><code>kiro-login --region eu-central-1
+kiro-login --method idc --start-url https://company.awsapps.com/start --region eu-central-1
+kiro-login --method github
+KIRO_REFRESH_TOKEN='…' kiro-login --method refresh-token
+KIRO_API_KEY='…' kiro-login --method api-key
+kiro-login --method external-idp --credentials-file ./kiro-auth.json
+kiro-login --proxy http://user:pass@proxy.example:8080
+kiro-login --no-open
+kiro-login --logout
+</code></pre>
+<p>Run <code>kiro-login --help</code> for all options. <code>KIRO_REGION</code>, <code>KIRO_PROXY_URL</code>, <code>KIRO_START_URL</code>, <code>KIRO_REFRESH_TOKEN</code>, and <code>KIRO_API_KEY</code> are supported environment variables. Environment variables or a protected credential file are preferable to secret command-line arguments.</p>
+<h2>Credentials</h2>
+<p>The bundled login writes only to <code>$DSH_HOME/storages/kiro-auth</code> (normally <code>~/.dsh/storages/kiro-auth</code>). Token and device-registration files are mode <code>0600</code>. <strong>Sign out</strong> deletes only these plugin-owned files.</p>
+<p>Managed device-flow credentials (Builder ID, Google, GitHub, and IDC) refresh through regional AWS OIDC; standalone imported refresh tokens use Kiro's desktop auth service; Microsoft external-IdP credentials refresh only against approved Microsoft login hosts. Rotated managed refresh tokens and discovered profile ARNs are written atomically. API keys are treated as long-lived and carry Kiro's required <code>TokenType: API_KEY</code> header.</p>
+<p>When managed credentials are absent, the adapter reads Kiro IDE/CLI's <code>~/.aws/sso/cache/kiro-auth-token.json</code> and its referenced client-registration file. It never deletes or overwrites Kiro-owned credentials; refreshed Kiro-owned tokens remain in memory only.</p>
+<p>Credential priority is:</p>
+<ol>
+<li>dsh-kiro managed credential</li>
+<li>Kiro IDE/CLI SSO cache</li>
+</ol>
+<h2>Model discovery and reasoning</h2>
+<p>The adapter asks the auth-appropriate Amazon Q/CodeWhisperer surface for the signed-in account and caches the result for five minutes. <strong>Settings → Kiro → Discover models</strong> forces a refresh. Model names, descriptions, input limits, and output limits are projected into the DSH catalog. If discovery is temporarily unavailable, the configured fallback catalog remains usable; unlisted model IDs are still passed through to Kiro.</p>
+<p>Thinking-capable routes advertise four effort IDs:</p>
+<table>
+<thead>
+<tr>
+<th>Effort</th>
+<th>Behavior</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>off</code></td>
+<td>No thinking marker is added.</td>
+</tr>
+<tr>
+<td><code>low</code></td>
+<td>Requests a short reasoning budget.</td>
+</tr>
+<tr>
+<td><code>medium</code></td>
+<td>Requests a balanced reasoning budget.</td>
+</tr>
+<tr>
+<td><code>high</code></td>
+<td>Requests the largest supported reasoning budget.</td>
+</tr>
+</tbody></table>
+<p>Kiro carries these controls through prompt markers rather than a native request field. Set the default from the DSH Models page or in <code>settings.yaml</code>:</p>
+<pre><code>llm-kiro:
+  reasoningEffort: medium
+</code></pre>
+<h2>Configuration</h2>
+<p>Put machine-level configuration in <code>$DSH_HOME/settings.yaml</code> (normally <code>~/.dsh/settings.yaml</code>):</p>
+<pre><code>llm-kiro:
+  proxyUrl: http://proxy.example:1082
+  reasoningEffort: medium
+</code></pre>
+<p>Every field is optional:</p>
+<table>
+<thead>
+<tr>
+<th>Field</th>
+<th>Default</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>proxyUrl</code></td>
+<td>direct</td>
+<td>HTTP/HTTPS proxy for Kiro and OIDC requests; credentials in the URL are supported.</td>
+</tr>
+<tr>
+<td><code>region</code></td>
+<td>signed-in token region</td>
+<td>Selects the <code>q.&lt;region&gt;.amazonaws.com</code> endpoint.</td>
+</tr>
+<tr>
+<td><code>profileArn</code></td>
+<td>account default</td>
+<td>CodeWhisperer profile used for requests and model discovery.</td>
+</tr>
+<tr>
+<td><code>thinking</code></td>
+<td><code>enabled</code></td>
+<td><code>disabled</code> restricts all models to effort <code>off</code>.</td>
+</tr>
+<tr>
+<td><code>reasoningEffort</code></td>
+<td><code>off</code></td>
+<td>Default: <code>off</code>, <code>low</code>, <code>medium</code>, or <code>high</code>.</td>
+</tr>
+<tr>
+<td><code>defaultContextWindow</code></td>
+<td><code>200000</code></td>
+<td>Fallback capacity when discovery reports no exact limit.</td>
+</tr>
+<tr>
+<td><code>models</code></td>
+<td>bundled fallback</td>
+<td>Advisory fallback catalog; live account discovery normally replaces it.</td>
+</tr>
+<tr>
+<td><code>streamIdleTimeoutMs</code></td>
+<td><code>300000</code></td>
+<td>Maximum idle time while a provider read is outstanding.</td>
+</tr>
+<tr>
+<td><code>tokenExpiryBufferMs</code></td>
+<td><code>300000</code></td>
+<td>Refresh an access token this long before expiration.</td>
+</tr>
+<tr>
+<td><code>retryPolicy</code></td>
+<td>bounded normal</td>
+<td>Provider retry policy executed by <code>dsh-llm-retry</code>.</td>
+</tr>
+</tbody></table>
+<p>To pin values to one profile instead, patch the bundle row by id in <code>$DSH_HOME/profiles/&lt;name&gt;/cordis.patch.yml</code>:</p>
+<pre><code>- id: llm-kiro
+  config:
+    proxyUrl: http://proxy.example:1082
+</code></pre>
+<p>Do not wrap this override in <code>insert:</code>; the bundle already inserts <code>llm-kiro</code>.</p>
+<h2>Request and response behavior</h2>
+<p>Kiro has no separate system slot, so the harness system prompt is placed on the earliest user turn. Conversation history is normalized to Kiro's strict user/assistant alternation, tool schemas are attached to the current turn, and orphaned tool results are carried as text so compaction cannot leave an invalid tool-call reference.</p>
+<p>Responses arrive as <code>vnd.amazon.eventstream</code> frames. The adapter validates frame boundaries and CRCs, routes <code>&lt;thinking&gt;</code> runs into DSH reasoning blocks, preserves text blocks, decodes tool calls, and suppresses known open-weight prompt-format artifacts.</p>
+<h2>Why some Claude routes need a proxy</h2>
+<p>Kiro can authorize model families by request egress as well as account entitlement. From an unauthorized egress a <code>claude-*</code> model may fail with <code>INVALID_MODEL</code> while open-weight routes work. <code>proxyUrl</code> provides the required egress when applicable. The adapter uses an HTTP <code>CONNECT</code> tunnel with TLS negotiated inside it, so the proxy sees the target hostname but not the bearer token or request body.</p>
+<h2>Errors</h2>
+<p>The adapter maps provider failures to stable DSH codes: <code>AUTH</code>, <code>FORBIDDEN</code>, <code>RATE_LIMIT</code>, <code>INVALID_MODEL</code>, <code>INVALID_REQUEST</code>, <code>SERVER</code>, <code>TRANSPORT</code>, <code>ABORTED</code>, <code>TIMEOUT</code>, <code>STREAM_CLOSED</code>, <code>MALFORMED_RESPONSE</code>, and <code>EMPTY_RESPONSE</code>.</p>
+<h2>Development</h2>
+<pre><code>npm install
+npm run check
+npm run pack:dist
+</code></pre>
+<p><code>npm run check</code> type-checks, runs the keyless Vitest suite, rebuilds committed artifacts, and syntax-checks the web client and login CLI.</p>
+<h2>Known limitations</h2>
+<ul>
+<li>Kiro reports consumed credits rather than exact token usage, so the adapter emits no <code>usage</code> chunk.</li>
+<li>Image content is currently rejected with <code>UNSUPPORTED_CONTENT</code>.</li>
+<li>Tool names must match <code>^[A-Za-z][A-Za-z0-9_]{0,63}$</code>.</li>
+<li>SOCKS proxies are not supported.</li>
+</ul>
+<h2>Acknowledgements</h2>
+<p>The Kiro transport foundation is derived under MIT from <a href="https://github.com/caopu16/dsh-llm-kiro">caopu16/dsh-llm-kiro</a>. Login, profile-ARN, API-key, and external-IdP behavior was cross-checked against <a href="https://github.com/decolua/9router">decolua/9router</a> and <a href="https://github.com/dat-lequoc/Kiro-Go">dat-lequoc/Kiro-Go</a>. The DSH Web integration follows the installable-bundle pattern demonstrated by <a href="https://github.com/LiZhenNet/dsh-antigravity">LiZhenNet/dsh-antigravity</a>. Original copyright notices are retained in <a href="https://github.com/dat-lequoc/dsh-kiro/blob/HEAD/LICENSE">LICENSE</a>.</p>
+<h2>License</h2>
+<p>MIT</p>

@@ -1,0 +1,419 @@
+<h1>wechat-clawbot</h1>
+<p>Connect a <a href="https://github.com/deepseek-ai/deepseek-harness">DeepSeek Harness</a> (DSH) profile to your WeChat through the official <strong>WeChat ClawBot</strong> bridge (Tencent iLink API). Once bound, you can message your DSH agent from WeChat while you are away from the computer — ask it to look at files, edit them, run commands — and it replies (including permission/approval questions) in the WeChat conversation.</p>
+<blockquote>
+<p><strong>Status: v0.9.0</strong> — text messages both ways; <strong>native vision</strong> (an inbound photo rides in the model's own message, and <code>look_at_image</code> hands a local one to it directly — no separate vision model, no second round trip); agent → WeChat file/image delivery; quoted (引用) message resolution; long-term memory; scheduled reminders; a <strong>settings card</strong> on 设置 → 插件 whose fields apply live; and a per-plugin model pin so the web UI's model picker no longer moves the bot. Group chats are not supported.</p>
+</blockquote>
+<h2>How it works</h2>
+<pre><code>Phone WeChat ──► Tencent iLink cloud ──► this plugin (long-poll monitor)
+        ◄────────────────────────────────  (text replies, approval questions)
+                          │
+                          ▼
+              one fixed DSH agent session ("wechat-main")
+              (persisted, auto-compacted like any DSH session)
+</code></pre>
+<ul>
+<li>The plugin reuses the protocol client from the official, MIT-licensed
+<a href="https://www.npmjs.com/package/@tencent-weixin/openclaw-weixin"><code>@tencent-weixin/openclaw-weixin</code></a>
+package (see <a href="https://github.com/Alphainfix/wechat-clawbot/blob/HEAD/NOTICE"><code>NOTICE</code></a>); only the OpenClaw integration layer was
+replaced with a DeepSeek Harness integration.</li>
+<li>The WeChat conversation maps to <strong>one fixed session id</strong> (default
+<code>wechat-main</code>), so context is shared, history survives restarts, and
+automatic context compaction keeps token usage low.</li>
+<li>The WeChat session's approval policy is forced to <code>ask</code>: permission
+requests (file access, command execution, sandbox escalation) are forwarded
+to WeChat and you answer with <code>同意</code> / <code>拒绝</code> (or <code>yes</code> / <code>no</code>).</li>
+<li><strong>File/image delivery</strong>: the WeChat agent has a <code>send_wechat_file</code> tool —
+just ask it (e.g. <em>"把 README.md 发给我"</em> or <em>"生成一张图表发给我"</em>). Files
+travel through Tencent's CDN with the official AES-128-ECB encrypted upload
+pipeline; images, PDFs, Office documents, archives etc. are supported.</li>
+<li>The plugin runs <strong>inside the profile process</strong>: as long as the profile is
+running, the bridge is up. Login is manual (scan a QR code), once per
+binding; the token is stored under <code>$DSH_HOME/clawbot</code> and reused on
+restart.</li>
+</ul>
+<h2>Requirements</h2>
+<ul>
+<li>Node.js &gt;= 22</li>
+<li>A DSH profile (e.g. the <code>web</code> profile) with a configured model provider</li>
+<li>The WeChat mobile app with the official <strong>微信ClawBot</strong> plugin available
+(设置 → 插件; WeChat may prompt you to update the app the first time you scan)</li>
+</ul>
+<h2>Install</h2>
+<pre><code># 1. Install the plugin into a profile (pnpm is required)
+dsh plugin --profile web add wechat-clawbot
+
+# 2. Restart the profile
+#    (stop `dsh web`, then start it again)
+dsh web
+</code></pre>
+<p>The plugin starts automatically at boot (<code>autoStart: true</code>). To change its
+configuration, add a <code>clawbot</code> row to the profile's <code>cordis.patch.yml</code>:</p>
+<pre><code>- id: clawbot
+  config:
+    allowFrom: []          # allowlist of WeChat user ids; [] = only the binder
+    sessionId: wechat-main # the fixed DSH session for all WeChat messages
+    forwardQuestions: false
+    approvalTimeoutMs: 0   # 0 = wait indefinitely for approval answers
+    logLevel: info
+</code></pre>
+<h2>Connect (one-time, manual)</h2>
+<pre><code># From the profile directory (or anywhere; the state dir is shared):
+clawbot login
+</code></pre>
+<p>A QR code is printed in the terminal. Scan it with <strong>WeChat → 扫一扫</strong> and
+confirm. Afterwards:</p>
+<ul>
+<li>WeChat shows a new contact <strong>「微信ClawBot」</strong> — open it and start chatting.</li>
+<li>The running profile picks up the credentials automatically within a second
+(it watches the state directory) — no restart needed.</li>
+</ul>
+<p>Other commands:</p>
+<pre><code>clawbot status   # show the bound account
+clawbot logout   # unbind and delete credentials
+</code></pre>
+<p>Environment:</p>
+<table>
+<thead>
+<tr>
+<th>Variable</th>
+<th>Default</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>CLAWBOT_STATE_DIR</code></td>
+<td><code>$DSH_HOME/clawbot</code></td>
+<td>credential/state directory</td>
+</tr>
+<tr>
+<td><code>CLAWBOT_LOG_LEVEL</code></td>
+<td><code>info</code></td>
+<td><code>debug</code> / <code>info</code> / <code>warn</code> / <code>error</code></td>
+</tr>
+</tbody></table>
+<h2>Security</h2>
+<ul>
+<li><strong>Allowlist</strong>: by default only the WeChat user who scanned the QR code may
+message the agent. Add more users via <code>allowFrom</code> (their WeChat user ids
+appear in the logs / <code>clawbot status</code>).</li>
+<li><strong>Approvals</strong>: the WeChat session runs with approval policy <code>ask</code>, so
+sensitive operations still require your explicit reply in WeChat. Other
+sessions (e.g. the local web GUI) keep their own policy.</li>
+<li>Unknown senders are ignored silently.</li>
+</ul>
+<h2>Configuration reference</h2>
+<table>
+<thead>
+<tr>
+<th>Key</th>
+<th>Type</th>
+<th>Default</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>autoStart</code></td>
+<td>boolean</td>
+<td><code>true</code></td>
+<td>start the monitor at boot when a bound account exists</td>
+</tr>
+<tr>
+<td><code>allowFrom</code></td>
+<td>string[]</td>
+<td><code>[]</code></td>
+<td>allowed sender ids; empty = binder only</td>
+</tr>
+<tr>
+<td><code>sessionId</code></td>
+<td>string</td>
+<td><code>wechat-main</code></td>
+<td>fixed DSH session for all WeChat traffic</td>
+</tr>
+<tr>
+<td><code>cwd</code></td>
+<td>string</td>
+<td><code>process.cwd()</code></td>
+<td>workspace for a freshly created session</td>
+</tr>
+<tr>
+<td><code>forwardQuestions</code></td>
+<td>boolean</td>
+<td><code>false</code></td>
+<td>forward <code>ask_user_question</code> / plan-review to WeChat (see note)</td>
+</tr>
+<tr>
+<td><code>approvalTimeoutMs</code></td>
+<td>number</td>
+<td><code>0</code></td>
+<td>approval answer timeout; <code>0</code> = wait forever</td>
+</tr>
+<tr>
+<td><code>botAgent</code></td>
+<td>string</td>
+<td><code>DSH-ClawBot/0.1.0 …</code></td>
+<td><code>bot_agent</code> reported to iLink</td>
+</tr>
+<tr>
+<td><code>maxImageEdge</code></td>
+<td>number</td>
+<td><code>2048</code></td>
+<td>long-edge pixel cap for compressed images</td>
+</tr>
+<tr>
+<td><code>imageQuality</code></td>
+<td>number</td>
+<td><code>80</code></td>
+<td>JPEG quality for compressed images</td>
+</tr>
+<tr>
+<td><code>compressThresholdBytes</code></td>
+<td>number</td>
+<td><code>1048576</code></td>
+<td>only compress images larger than this</td>
+</tr>
+<tr>
+<td><code>apiBaseUrl</code></td>
+<td>string</td>
+<td><code>https://ilinkai.weixin.qq.com</code></td>
+<td>iLink API base (override for testing)</td>
+</tr>
+<tr>
+<td><code>logLevel</code></td>
+<td><code>debug|info|warn|error</code></td>
+<td><code>info</code></td>
+<td>protocol log level</td>
+</tr>
+<tr>
+<td><code>stripEmoji</code></td>
+<td>boolean</td>
+<td><code>true</code></td>
+<td>strip Unicode emoji from outbound text</td>
+</tr>
+<tr>
+<td><code>noticeMinBytes</code></td>
+<td>number</td>
+<td><code>2097152</code></td>
+<td>announce a file before upload only above this size; <code>0</code> = always</td>
+</tr>
+<tr>
+<td><code>attachImages</code></td>
+<td>boolean</td>
+<td><code>true</code></td>
+<td>give images to the model directly when the route accepts them</td>
+</tr>
+<tr>
+<td><code>provider</code></td>
+<td>string</td>
+<td>—</td>
+<td>pin this session's provider; empty = follow the deployment default</td>
+</tr>
+<tr>
+<td><code>model</code></td>
+<td>string</td>
+<td>—</td>
+<td>pin the model; empty = follow the deployment default</td>
+</tr>
+<tr>
+<td><code>reasoningEffort</code></td>
+<td>string</td>
+<td>—</td>
+<td>pin the effort; empty = the model's own default</td>
+</tr>
+<tr>
+<td><code>mcpBridge</code></td>
+<td>boolean</td>
+<td><code>true</code></td>
+<td>answer the <code>/plugins/clawbot/mcp/*</code> routes (see <strong>The Claude bridge</strong>)</td>
+</tr>
+</tbody></table>
+<blockquote>
+<p><code>forwardQuestions</code>: only one <code>userQuestions</code> provider can exist per DSH
+context. The Web UI registers one while a browser is attached, so this
+option only takes effect in deployments without an active Web provider.
+Approval forwarding (<code>approval/request</code>) is independent and always on for
+the WeChat session.</p>
+</blockquote>
+<h2>Settings</h2>
+<p>Most of the table above is editable at <strong>设置 → 插件 → 微信 Bot</strong>, and a change
+lands on the next message with no restart and no dropped WeChat connection: the
+plugin diffs the committed settings and copies the <em>hot</em> fields into its live
+config, which every collaborator holds by reference and reads at the moment it
+is used.</p>
+<p>The card writes into the settings document's <code>clawbot</code> section, which is an
+<strong>override layer over the plugin's cordis row</strong> — <code>cordis.patch.yml</code> stays the
+default, and the file only ever stores fields you actually changed. Each row
+shows a 已覆盖 badge with a 重置 that drops back to the composed value.</p>
+<p>Cold fields (<code>sessionId</code>, <code>autoStart</code>, <code>forwardQuestions</code>, <code>botAgent</code>,
+<code>apiBaseUrl</code>, <code>cwd</code>) are deliberately <strong>absent from the card</strong>. They are stored
+but not applied in place — <code>apiBaseUrl</code> would redirect a connected client
+mid-flight and <code>sessionId</code> would point the bridge at a session it is not bound
+to — so they live in <code>cordis.patch.yml</code>, where changing them already means a
+reload.</p>
+<h3>Pinning the model</h3>
+<p>Leaving <code>provider</code>/<code>model</code> empty means the session follows the deployment
+default, which is also why picking a model in the web UI used to move the bot:
+that picker writes through to the global <code>agent-default-model</code>. Setting them
+here breaks the coupling. A model id that will not resolve is refused rather
+than applied, so a typo cannot brick the next message.</p>
+<h2>The Claude bridge</h2>
+<p>Two directions, and they are separate mechanisms with separate failure modes.</p>
+<h3>Outward: <code>/plugins/clawbot/mcp/*</code> — Claude Code drives DSH</h3>
+<p>Four routes, consumed by <a href="https://github.com/Alphainfix/wechat-clawbot/blob/HEAD/dsh-mcp-bridge">dsh-mcp-bridge</a> (an MCP server, not
+a DSH plugin), which is what gives a Claude Code session tools to list/read/drive
+DSH sessions and to reach the owner on WeChat.</p>
+<table>
+<thead>
+<tr>
+<th>Route</th>
+<th>Method</th>
+<th>Does</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>mcp/sessions</code></td>
+<td>GET</td>
+<td>list sessions: id, title, cwd, live, running</td>
+</tr>
+<tr>
+<td><code>mcp/read</code></td>
+<td>POST</td>
+<td>tail one session's user/assistant turns</td>
+</tr>
+<tr>
+<td><code>mcp/send</code></td>
+<td>POST</td>
+<td>steer or follow up a <strong>live</strong> agent</td>
+</tr>
+<tr>
+<td><code>mcp/notify</code></td>
+<td>POST</td>
+<td>one WeChat message to the owner</td>
+</tr>
+<tr>
+<td><code>mcp/status</code></td>
+<td>GET</td>
+<td>is the bridge on, has anything called it</td>
+</tr>
+</tbody></table>
+<p>The privileged half lives here rather than in the MCP server for a concrete
+reason: <code>ctx.agents</code> holds the live agent objects, and <code>steer()</code>/<code>followup()</code> are
+in-memory methods an out-of-process caller cannot reach. The WeChat send needs
+the account token plus per-peer context tokens, so duplicating it outside would
+mean a second copy of the credential handling.</p>
+<p>Three properties are load-bearing and covered by tests:</p>
+<ul>
+<li><strong><code>notify</code> takes no recipient.</strong> It sends to <code>account.userId</code> — the id linked by
+QR login — so messaging anyone but the owner is <em>unrepresentable</em>, not merely
+discouraged.</li>
+<li><strong><code>send</code> does not reach WeChat.</strong> Injected messages carry source plugin
+<code>clawbot-mcp</code>, and the bridge's session listener treats any non-<code>schedule</code>
+plugin turn as GUI-only (leaves <code>currentSender</code> unset). So a message pushed
+into <code>wechat-main</code> is answered in the web UI only. <code>notify</code> is the sole route
+to the phone. <strong>Changing that source string breaks the isolation.</strong></li>
+<li><strong>Auth.</strong> Every route needs <code>Authorization: Bearer &lt;token&gt;</code> from
+<code>&lt;state&gt;/mcp-token</code> (0600, minted on first boot). <code>mcp/status</code> is deliberately
+unauthenticated — a browser page cannot hold a secret — so it reports the
+token's <em>path</em>, never its value.</li>
+</ul>
+<p><code>mcpBridge: false</code> makes all four return 403 while leaving them registered: the
+flag is read per request, so it is a live kill switch in both directions.</p>
+<h3>Inward: three tools — DSH sees and steers Claude Code</h3>
+<p>Registered on the WeChat agent (<code>restrictTools</code> is a <strong>deny</strong> list, so they need
+no allowlisting): <code>list_claude_sessions</code>, <code>read_claude_session</code>,
+<code>send_to_claude_session</code>.</p>
+<p>Listing and reading go straight to files, which is the stable half:
+<code>~/.claude/sessions/&lt;pid&gt;.json</code> is world-readable, and
+<code>~/.claude/projects/&lt;slug&gt;/&lt;sessionId&gt;.jsonl</code> is the transcript (found by
+globbing for the id — deriving the directory name flattens both separators <em>and</em>
+dots, which is easy to get subtly wrong).</p>
+<p>Sending is the interesting half. There is <strong>no documented CLI</strong> for reaching a
+live session: <code>claude</code> has no send/message subcommand, and <code>--resume -p</code> starts a
+new run from history instead of the session the user is watching. The real
+mechanism is <code>peerProtocol 1</code> over <code>/tmp/cc-socks/&lt;pid&gt;.sock</code> with a 0600 key,
+and <code>claude.exe</code> is a native binary. So rather than reverse-engineer it, this
+shells out to a short-lived</p>
+<pre><code>claude -p "&lt;deliver X to session Y&gt;" --allowed-tools ListAgents,SendMessage --model haiku
+</code></pre>
+<p>and lets Claude Code do the socket work with its own implementation — protocol
+changes stay Anthropic's to keep working. Verified end to end.</p>
+<p>Four things learned the hard way, all of them now pinned by tests:</p>
+<ul>
+<li><strong>Session names drift.</strong> One session was observed renaming itself
+<code>harvard-96</code> → <code>harvard-35</code> → <code>harvard-ef</code> inside a day. So the name is
+resolved fresh on every send, never cached, and an ambiguous handle is an
+error rather than a guess.</li>
+<li><strong>Success needs an anchored match.</strong> A bare <code>/sent/i</code> scores Claude Code's own
+"Session X is not reachable" and the plausible "was not sent" as a delivery.</li>
+<li><strong>State the run state and the queue explicitly, including when zero.</strong> The
+first version omitted both, and the bot answered 「都没有正在运行的任务」about a
+session that was mid-tool-call. An absent field does not read as <em>unknown</em> to a
+model — it reads as <em>nothing</em>, and the gap gets filled by invention.</li>
+<li><strong>Queue accounting has three operations, not two.</strong> <code>enqueue</code> adds, <code>dequeue</code>
+delivers the head, and <code>remove</code> withdraws a specific item <strong>by content</strong>. A
+real session measured 15/9/6 — counting only enqueue/dequeue calls that 6
+pending when it is 0.</li>
+</ul>
+<p>Run state is an <em>inference</em>: a turn is in flight when the newest main-thread
+entry is an assistant message holding a <code>tool_use</code>, or a user entry that is
+nothing but <code>tool_result</code>. Gated on a 180s freshness window, because a session
+killed mid-tool-call keeps an unfinished last entry forever.</p>
+<p>Known limit: a message <strong>currently waiting</strong> in the queue does not appear in the
+transcript. Verified, not assumed — a session had one queued while
+enqueue/dequeue/remove balanced to zero, with the file 7s fresh and writes shown
+to be prompt. A live answer would need the peer socket.</p>
+<blockquote>
+<p>Timestamps in the transcript are <strong>UTC</strong>. Render them through
+<code>toLocaleTimeString</code>, never by slicing the ISO string — <code>"…T20:33:05Z" .slice(11,16)</code> reported a 16:33 message as 20:33.</p>
+</blockquote>
+<h2>Limitations</h2>
+<ul>
+<li>Group chats are not supported (official channel behaviour).</li>
+<li>Voice messages require a silk transcoder and are not supported.</li>
+<li>One bound WeChat account per state directory. Multiple accounts are tracked
+in the store but only the first is monitored.</li>
+<li>Scheduled reminders are session-local: one that comes due while the profile
+is not running is delivered, late, at the next start.</li>
+<li>The bridge runs only while the DSH profile process is running. For 24/7
+operation keep <code>dsh web</code> up (a login item or launchd unit).</li>
+<li>WeChat's own bracket emoji codes (<code>[捂脸]</code>) are stripped unconditionally from
+outbound text: they are WeChat-internal notation and arrive through this
+bridge as literal brackets.</li>
+</ul>
+<h2>Development</h2>
+<pre><code>npm install
+npm run typecheck   # tsc --noEmit
+npm run build       # tsc → lib/, then copies src/client.js → lib/client.js
+
+node test/regression.mjs     # 55 offline checks, no model calls, no WeChat
+node test/claude-peer.mjs    # 29 checks against the real ~/.claude
+node scripts/bot-sim.mjs     # reply-style harness against the real prompt
+</code></pre>
+<p>Both suites are offline and cost nothing: no model calls, no network, no WeChat.
+They exit non-zero, so either can gate a build.</p>
+<p><code>test/regression.mjs</code> covers the things that used to fail silently: a strip rule
+that ate a markdown link, a settings field declared "hot" but only read at boot,
+an output schema that rejects a field the attachment store just started
+returning, and the bridge invariants above (that <code>notify</code> reads no recipient,
+that injected messages keep the <code>clawbot-mcp</code> source tag, that <code>mcp/status</code>
+never echoes the token).</p>
+<p><strong>A hot field must appear as <code>config.X</code> in one of the source files that suite
+greps</strong> — a field only read inside <code>apply()</code> is not hot, whatever <code>HOT_FIELDS</code>
+claims, and the check enforces that. When adding a source file that reads
+settings, add it to that list too.</p>
+<p><code>test/claude-peer.mjs</code> runs the peer tools against the real <code>~/.claude</code>, because
+the failure mode there is not "it crashed" but "it silently returned nothing" —
+a renamed registry key, a changed transcript shape, a stale pid counted as live.
+Queue accounting, the idle path and the clock are asserted against a <em>synthetic</em>
+transcript with known answers, so they do not depend on what the machine happens
+to be doing. <code>send_to_claude_session</code> is registered but never invoked by the
+suite: it spawns a process and delivers into a real live session.</p>
+<p><code>scripts/bot-sim.mjs</code> drives the <strong>real</strong> system prompt and tool list against
+scripted turns and prints what WeChat would have received — so a prompt change
+can be judged without messaging yourself and without a session reset. It flags
+empty-response endings, stacked vision calls, and bracket emoji codes. Add
+<code>--allow-emoji</code> to exercise the <code>stripEmoji: false</code> branch.</p>
+<p>The vendored iLink protocol layer lives in <code>src/ilink/</code> (MIT, Tencent); the
+DSH integration is <code>src/bridge.ts</code>, <code>src/inbound.ts</code>, <code>src/approvals.ts</code>,
+<code>src/monitor.ts</code>, <code>src/questions.ts</code>, <code>src/index.ts</code>.</p>
+<h2>License</h2>
+<p>MIT. The vendored iLink client is MIT © Tencent — see <a href="https://github.com/Alphainfix/wechat-clawbot/blob/HEAD/NOTICE"><code>NOTICE</code></a>.</p>

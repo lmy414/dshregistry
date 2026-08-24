@@ -1,0 +1,201 @@
+<h1>dsh-github-token-injector</h1>
+<p>DeepSeek Harness (DSH) Web 客户端插件：自动给所有发往 <code>api.github.com</code> 的浏览器请求
+注入 <code>Authorization: Bearer &lt;token&gt;</code> 头，解决共享代理 IP 触发的 GitHub API 限流问题
+（匿名访问每小时仅 60 次，配 PAT 后提升至 5000 次/小时）。</p>
+<p>免去手动给浏览器扩展或代理工具配置 header。Token 仅保存在浏览器 <code>localStorage</code>，
+不上传任何服务端。</p>
+<p><img src="https://raw.githubusercontent.com/pan17/dsh-github-token-injector/HEAD/assets/screenshot.png" alt="dsh-github-token-injector Settings card"></p>
+<h2>为什么需要</h2>
+<ul>
+<li>DSH Web 内的皮肤管理器、插件市场等模块会从 <code>api.github.com</code> 拉元数据判断更新</li>
+<li>共享出口 IP 的代理环境容易被 GitHub 限流（HTTP 403），UI 一直显示「无法判断更新」</li>
+<li>配一个 GitHub PAT（Personal Access Token）可立刻绕过这个限制</li>
+</ul>
+<h2>安装</h2>
+<h3>推荐：从 npm 安装</h3>
+<pre><code>npx @deepseek-ai/dsh plugin --profile web add dsh-github-token-injector
+</code></pre>
+<p><code>web</code> 换成你的 profile 名。装完 <strong>重启 DSH</strong>。</p>
+<blockquote>
+<p>⚠️ <strong>别用</strong> <code>npx dsh plugin</code>——npm 上有个同名的冒名包 <code>dsh@1.0.1</code> 没暴露 bin，会报 <code>could not determine executable to run</code>。始终用完整包名 <code>@deepseek-ai/dsh</code>。</p>
+</blockquote>
+<h3>备选：从 GitHub 装</h3>
+<pre><code># 锁定版本
+npx @deepseek-ai/dsh plugin --profile web add github:pan17/dsh-github-token-injector#v0.1.0
+# 或默认分支最新
+npx @deepseek-ai/dsh plugin --profile web add github:pan17/dsh-github-token-injector
+</code></pre>
+<h3>本地 link 安装（开发场景）</h3>
+<p>把插件目录用 <code>link:</code> 装到 web profile：</p>
+<pre><code># 1. 确认插件目录在
+#    &lt;your-repo-dir&gt;/dsh-github-token-injector
+
+# 2. 编辑 web profile 的 package.json：
+#    a) dependencies 加：
+#       "dsh-github-token-injector": "link:&lt;your-repo-dir&gt;/dsh-github-token-injector"
+#    b) dsh.profile.bundles 在皮肤管理器之前插入：
+#       "dsh-github-token-injector"
+# 关键：bundles 顺序决定 cordis loader 创建 entry 的先后，
+# 把 token injector 放在皮肤管理器之前能保证 window.fetch 在
+# skin-manager 的 githubJson() 调用前已经被 patch。
+
+# 3. 安装并重启
+cd $DSH_HOME/profiles/web
+pnpm install
+npx @deepseek-ai/dsh web --no-open
+</code></pre>
+<pre><code>
+### 构建脚本授权
+
+如果 pnpm 提示不允许跑构建脚本（`ERR_PNPM_GIT_DEP_PREPARE_NOT_ALLOWED`），在该 profile 的 `pnpm-workspace.yaml` 加上：
+
+```yaml
+allowBuilds:
+  dsh-github-token-injector: true
+</code></pre>
+<h2>配置 Token</h2>
+<h3>方式一：Settings UI（推荐）</h3>
+<ol>
+<li>打开 Web UI（默认 <code>http://127.0.0.1:3080</code>）</li>
+<li>进入 <strong>设置 → GitHub Token</strong> 卡片</li>
+<li>粘入 PAT，点击「保存」</li>
+<li>点「立即测试」主动验证（状态点变绿 = 有效）</li>
+</ol>
+<h3>方式二：浏览器 Console</h3>
+<pre><code>// 设置
+localStorage.setItem('DSH_GITHUB_TOKEN', '&lt;your-pat&gt;')
+
+// 读当前 token
+window.__githubTokenInjector.getToken()
+
+// 看状态
+window.__githubTokenInjector.getStatus()
+// → { state: "ok" | "invalid" | "forbidden" | "rate-limited" | "no-token" | "unknown", ... }
+
+// 清空
+window.__githubTokenInjector.clearToken()
+
+// 主动触发鉴权探针
+window.__githubTokenInjector.forcePrecheck()
+</code></pre>
+<h3>方式三：环境变量注入（高级）</h3>
+<p>任何 DSH 客户端插件在启动时给 <code>window.__DSH_GITHUB_TOKEN__ = '&lt;your-pat&gt;'</code> 即可被读取
+（适用于多 profile 共用同一 token 的场景）。</p>
+<h2>拿一个 PAT</h2>
+<ol>
+<li>打开 <a href="https://github.com/settings/tokens">https://github.com/settings/tokens</a></li>
+<li><strong>Generate new token → Generate new token (classic)</strong></li>
+<li>选 expiration（90 天或不过期）</li>
+<li><strong>不需要勾选任何 scope</strong>——纯公共数据请求</li>
+<li>生成后复制 <code>ghp_</code> 开头的字符串</li>
+</ol>
+<h2>工作原理</h2>
+<ol>
+<li><strong>早期 patch</strong>：插件 factory 在 DSH 客户端模块表中第一个物化（依赖 bundles 顺序），立即用 <code>Symbol.for("dsh-github-token-injector.patched")</code> 标记位对 <code>window.fetch</code> 与 <code>XMLHttpRequest</code> 进行 monkey patch</li>
+<li><strong>目标过滤</strong>：通过 <code>URL</code> 解析只对 <code>api.github.com</code> 与 <code>raw.githubusercontent.com</code> 起作用，其他域名的 fetch 完全不改动</li>
+<li><strong>Header 注入</strong>：每次目标请求把 token 写进 <code>Authorization: Bearer xxx</code>，若调用方已自带 <code>Authorization</code> 头则尊重调用方</li>
+<li><strong>响应监控</strong>：在 <code>fetch().then()</code> 与 XHR <code>readystatechange=4</code> 里检查 status，401 → <code>invalid</code>，403 + <code>X-RateLimit-Remaining === 0</code> → <code>rate-limited</code></li>
+<li><strong>状态广播</strong>：通过 <code>dispatchEvent(new CustomEvent("dsh-github-token-injector:status", { detail }))</code> 让 UI 与其他插件订阅</li>
+<li><strong>HMR 安全</strong>：cordis <code>ctx.effect()</code> 注册副作用，dispose 时还原原始 <code>window.fetch</code> 引用，不污染全局</li>
+</ol>
+<h2>接口</h2>
+<h3><code>window.__githubTokenInjector</code></h3>
+<table>
+<thead>
+<tr>
+<th>方法</th>
+<th>用途</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>getToken()</code></td>
+<td>返回当前生效 token（trim 后）或 <code>null</code></td>
+</tr>
+<tr>
+<td><code>setToken(t)</code></td>
+<td>写入 <code>localStorage.DSH_GITHUB_TOKEN</code>，<code>null</code>/空串 = 清除</td>
+</tr>
+<tr>
+<td><code>getStatus()</code></td>
+<td>返回 <code>{ state, checkedAt, message }</code></td>
+</tr>
+<tr>
+<td><code>clearToken()</code></td>
+<td>清掉 token + 重置状态</td>
+</tr>
+<tr>
+<td><code>forcePrecheck()</code></td>
+<td>主动发起 <code>/octocat</code> 鉴权探针，返回 <code>Promise&lt;Response | null&gt;</code></td>
+</tr>
+</tbody></table>
+<h3>cordis service <code>dsh-github-token-injector</code></h3>
+<p>其他插件 <code>inject(['dsh-github-token-injector'])</code> 后可拿到：</p>
+<pre><code>interface TokenProvider {
+  getToken(): string | null
+  getStatus(): { state: TokenStatus; checkedAt: number; message?: string }
+  setToken(t: string | null): void
+}
+</code></pre>
+<h3>CustomEvent <code>dsh-github-token-injector:status</code></h3>
+<pre><code>window.addEventListener('dsh-github-token-injector:status', (ev) =&gt; {
+  console.log(ev.detail) // { state, checkedAt, message }
+})
+</code></pre>
+<h2>状态机</h2>
+<table>
+<thead>
+<tr>
+<th>状态</th>
+<th>触发条件</th>
+<th>UI 表现</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>ok</code></td>
+<td>任何 2xx/3xx 响应</td>
+<td>🟢 绿点 "有效"</td>
+</tr>
+<tr>
+<td><code>invalid</code></td>
+<td>401 响应</td>
+<td>🔴 红点 "已失效"</td>
+</tr>
+<tr>
+<td><code>forbidden</code></td>
+<td>403 响应（非限流）</td>
+<td>🟡 黄点 "无权限"</td>
+</tr>
+<tr>
+<td><code>rate-limited</code></td>
+<td>403 + <code>X-RateLimit-Remaining: 0</code></td>
+<td>🟡 黄点 "限流"</td>
+</tr>
+<tr>
+<td><code>no-token</code></td>
+<td>未配置 token</td>
+<td>⚪ 灰点 "未配置"</td>
+</tr>
+<tr>
+<td><code>unknown</code></td>
+<td>网络错误 / 启动后未发过请求</td>
+<td>⚪ 灰点 "未知"</td>
+</tr>
+</tbody></table>
+<h2>安全与隐私</h2>
+<ul>
+<li>Token <strong>仅</strong>存在浏览器 <code>localStorage</code>，不写入 DSH 服务端文件、不上传网络</li>
+<li>Patch 只对 <code>api.github.com</code> / <code>raw.githubusercontent.com</code> 域名生效，其他请求零改动</li>
+<li>卸载插件 / 清浏览器数据会一并删除 token</li>
+</ul>
+<h2>发布</h2>
+<p>参见 <a href="https://github.com/pan17/dsh-github-token-injector/blob/HEAD/PUBLISH.md">PUBLISH.md</a>：tag push 触发 GitHub Actions，自动 pack → GitHub Release → 等 CI green → publish 到 npm。</p>
+<h2>开发</h2>
+<pre><code>npm install
+npm run build       # tsc → dist/index.js + copy src/client.js → dist/client.js
+npm test            # vitest
+</code></pre>
+<p><strong>HMR 调试</strong>：在 web profile 跑 <code>pnpm run dev:web</code> 同时开新终端跑本插件的 <code>npm run dev</code>，
+修改 <code>src/client.js</code> 后浏览器自动 reload。</p>
+<p>本地未推送时也可以按路径装：</p>
+<pre><code>npx @deepseek-ai/dsh plugin --profile web add /path/to/dsh-github-token-injector
+</code></pre>

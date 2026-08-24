@@ -1,0 +1,107 @@
+<h1>dsh-opencode-session-id</h1>
+<blockquote>
+<p>dsh session IDs for opencode, zero config.</p>
+</blockquote>
+<p><strong>English</strong> | <a href="https://github.com/gausszhou/dsh-opencode-session-id/blob/HEAD/README.zh-CN.md">简体中文</a></p>
+<p>A <a href="https://github.com/deepseek-ai/dsh">DeepSeek Harness</a> (dsh) plugin: when you use an <strong>opencode model</strong> (providers such as <code>opencode</code> / <code>opencode-go</code> that point at the opencode.ai gateway), it makes the <strong>actual outgoing HTTP requests carry a session id</strong> — the same way the opencode client itself does.</p>
+<h2>Usage</h2>
+<p>Add the plugin to a dsh profile (install by package name once published to npm):</p>
+<pre><code>dsh plugin --profile web add "@gausszhou/dsh-opencode-session-id"
+</code></pre>
+<p>After installing, <strong>restart dsh web</strong> (<code>systemctl --user restart dsh-web</code>) so the bundle takes effect. The default configuration works out of the box: requests to <code>opencode.ai</code> automatically get <strong><code>x-opencode-session</code></strong> (the session header used by the opencode gateway) plus <code>x-session-affinity</code> / <code>x-client-request-id</code> / <code>x-session-id</code>. <strong>The header value defaults to a pure-alphanumeric nanoid(8) derived from the uuid portion of the session id</strong> (e.g. <code>0RpJJnxJ</code> — the <code>session-</code> prefix does not participate in the hash; the token is deterministically derived from the uuid via SHA-256). With <code>verbose: true</code>, the journal logs the mapping between the original id and the wire token:</p>
+<pre><code>journalctl --user -u dsh-web -f | grep opencode-session-id
+</code></pre>
+<h2>How it works</h2>
+<p>The opencode gateway branch uses <code>x-opencode-session</code> to carry the session id; this plugin listens on the <code>llm/stream</code> scope, wraps <code>fetch</code>, and adds that header at the wire layer. By default it hashes the uuid portion of <code>session-&lt;uuid&gt;</code> (the <code>session-</code> prefix is excluded) into an alphanumeric nanoid(8) before it goes on the wire. <strong>Only request headers are touched</strong> — the request body, URL, method, and everything else pass through unchanged. See <a href="https://github.com/gausszhou/dsh-opencode-session-id/blob/HEAD/docs/design.md">docs/design.md</a> for the full design rationale.</p>
+<h2>Configuration</h2>
+<p><strong>Zero configuration needed by default</strong> (the install command above is all you need). To enable injection logging through the patch layer:</p>
+<pre><code>- id: opencode-session-id
+  config:
+    verbose: true
+</code></pre>
+<p>All options (each optional, defaults shown):</p>
+<table>
+<thead>
+<tr>
+<th>Key</th>
+<th>Default</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>providers</code></td>
+<td><code>[opencode, opencode-go]</code></td>
+<td>llm-pi-ai route names whose sessionId should be tagged</td>
+</tr>
+<tr>
+<td><code>hosts</code></td>
+<td><code>[opencode.ai]</code></td>
+<td>URL host suffixes (including subdomains) that get session headers</td>
+</tr>
+<tr>
+<td><code>baseURLs</code></td>
+<td><code>[]</code></td>
+<td>Additional exact URL prefixes to match (custom gateways)</td>
+</tr>
+<tr>
+<td><code>headers</code></td>
+<td><code>[x-opencode-session, x-session-affinity, x-client-request-id, x-session-id]</code></td>
+<td>Request header names to inject</td>
+</tr>
+<tr>
+<td><code>extraHeaders</code></td>
+<td><code>{}</code></td>
+<td>Optional static extra headers (e.g. opencode fingerprint family <code>x-opencode-client: native</code> / <code>x-opencode-request: dsh</code>)</td>
+</tr>
+<tr>
+<td><code>userAgent</code></td>
+<td>empty</td>
+<td>Override <code>User-Agent</code> (opencode itself sends <code>opencode/&lt;version&gt;</code>; untouched by default)</td>
+</tr>
+<tr>
+<td><code>sessionIdEnv</code></td>
+<td>empty</td>
+<td>Environment variable name to fall back on for the session id</td>
+</tr>
+<tr>
+<td><code>verbose</code></td>
+<td><code>false</code></td>
+<td>Log every injection (including the original id → wire token mapping)</td>
+</tr>
+<tr>
+<td><code>seedSessionId</code></td>
+<td><code>false</code></td>
+<td>Seed <code>options.sessionId</code> for opencode routes</td>
+</tr>
+<tr>
+<td><code>nanoidSessionId</code></td>
+<td><code>true</code></td>
+<td>Hash <code>session-&lt;uuid&gt;</code> to a nanoid(8) before sending; <code>false</code> sends the raw id</td>
+</tr>
+<tr>
+<td><code>nanoidLength</code></td>
+<td><code>8</code></td>
+<td>Token length (4–32)</td>
+</tr>
+<tr>
+<td><code>nanoidAlphabet</code></td>
+<td><code>alphanumeric</code></td>
+<td><code>alphanumeric</code> (pure <code>A-Za-z0-9</code>, no <code>_</code>/<code>-</code>) or <code>urlsafe</code> (classic 64-character set)</td>
+</tr>
+<tr>
+<td><code>disableFetchInjection</code></td>
+<td><code>false</code></td>
+<td>When <code>true</code>, keep only the waterfall session scoping</td>
+</tr>
+</tbody></table>
+<h2>Verification</h2>
+<pre><code>node test/verify.mjs   # 10 checks: unit tests + real pi-ai wire request + concurrent isolation + headers-only guarantee
+node test/smoke-apply.mjs  # apply() wiring: listener registration, scoped fetch, mount/dispose lifecycle
+</code></pre>
+<p><code>verify.mjs</code> fires a real <code>opencode-go</code> request through the pi-ai bundled with the dsh CLI, asserting that the wire request headers really carry the session id; it also verifies concurrent-session isolation and that non-opencode endpoints are unaffected.</p>
+<h2>Notes &amp; limitations</h2>
+<ul>
+<li>The session id comes from <code>options.sessionId</code> (agent-loop fills it in per session); without a session context, the fallback chain is <code>sessionIdEnv</code> &gt; <code>DSH_SESSION_ID</code> (the process's startup session in web deployments) &gt; an in-process random id.</li>
+<li>Covers protocols that go through <code>fetch</code>, such as <code>openai-completions</code> / <code>openai-responses</code> / <code>anthropic-messages</code>; <code>transport: websocket</code> does not use fetch and is out of scope.</li>
+<li>The global fetch wrapper only appends request headers when an opencode endpoint is matched — nothing else is changed. The wire token is a one-way SHA-256 hash of the uuid portion of <code>session-&lt;uuid&gt;</code> (the <code>session-</code> prefix excluded, e.g. <code>0RpJJnxJ</code>), so the backend cannot reverse it to the original id; changing <code>nanoidAlphabet</code> / <code>nanoidLength</code> changes every token, breaking association with old records.</li>
+</ul>

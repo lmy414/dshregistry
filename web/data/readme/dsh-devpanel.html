@@ -1,0 +1,208 @@
+<h1>dsh-devpanel</h1>
+<blockquote>
+<p>A developer toolkit for the DeepSeek Harness (DSH) web console: a real multi-tab PTY terminal plus an AI-output file browser.</p>
+</blockquote>
+<p><code>dsh-devpanel</code> is a plugin for the DeepSeek Harness that brings two things into the browser console:</p>
+<ul>
+<li><strong>Terminal panel</strong> — a multi-tab, real PTY terminal docked under the composer. Start and stop processes, type commands by hand, and watch live output, just like a native terminal.</li>
+<li><strong>AI-output sidebar</strong> — a right-hand file viewer that lists every file the AI wrote or edited in the current session, with syntax highlighting, Markdown rendering, and image preview.</li>
+</ul>
+<p>Both surfaces are driven by a single host-side service, <code>TerminalPanelService</code>, which wraps the harness's <code>ctx.subprocess.spawnTerminal</code> PTY primitive and is exposed to the browser over the Typert Remote boundary — <strong>no harness changes required</strong>. The Gateway auto-discovers the service through its <code>typertRemote</code> binding.</p>
+<h2>Features</h2>
+<ul>
+<li><strong>Real PTY sessions</strong> — spawns the system login shell (<code>$SHELL</code>, falling back to <code>/bin/sh</code>) in the session's working directory, wrapped so it exports a real <code>TERM</code> (the harness forks PTYs with <code>TERM=dumb</code>, which breaks <code>clear</code> and prompt glyphs). Colored output from <code>git</code>, <code>ls</code>, and prompts renders like a native terminal.</li>
+<li><strong>Multi-tab terminal dialog</strong> — docked under the composer, with tab bar, shell badge, <code>+</code> new tab, per-tab close, and a close button that ends every session. Closing the last tab closes the panel; reopening spawns a fresh default tab.</li>
+<li><strong>Native terminal behavior</strong> — copy-on-select writes the selection to the clipboard, <code>Cmd/Ctrl+Shift+V</code> pastes, <code>clear</code> works, and multi-byte UTF-8 output survives arbitrary byte-chunk splits without <code>?</code> mojibake.</li>
+<li><strong>Process control</strong> — deliver <code>SIGINT</code> / <code>SIGTERM</code> / <code>SIGKILL</code> / <code>SIGTSTP</code> / <code>SIGHUP</code> to the verified foreground process group, or terminate the captured process tree with a 2-second grace period.</li>
+<li><strong>Live output deltas</strong> — the browser polls <code>read</code> for incremental output; the host keeps a per-session scrollback (1 MB tail) so long output stays browsable without unbounded memory.</li>
+<li><strong>AI-output file sidebar</strong> — collects the files the session's <code>write</code>/<code>edit</code> tool calls produced (from diff views and raw args, de-duplicated in first-seen order), reads them through the remote, and renders them as image, Markdown, highlighted code, or plain text, with a fullscreen mode.</li>
+<li><strong>Session-scoped cwd</strong> — the terminal and relative file reads resolve against the session's project directory (falling back to the user home / host cwd).</li>
+<li><strong>Bilingual UI</strong> — Simplified Chinese and English dictionaries, registered in the <code>toolkit</code> locale namespace.</li>
+<li><strong>Clean lifecycle</strong> — every live PTY is terminated when the plugin unloads; the client unregisters its slots, removes the injected stylesheet, and unmounts the Remote namespace.</li>
+</ul>
+<h2>Architecture</h2>
+<p>The plugin is a two-face bundle, mirroring the harness client preset:</p>
+<pre><code>┌─────────────────────────── browser (web platform) ───────────────────────────┐
+│  src/client/                                                                 │
+│    index.ts               plugin body: mounts the Remote, registers slots    │
+│    remote.ts              TYPERT_REMOTE contribution + ctx.remote typing     │
+│    ConsoleHeaderActions   two header icons (terminal + sidebar toggles)      │
+│    ConsoleSidebar         AI-output file viewer (right details column)       │
+│    TerminateDialog        multi-tab xterm dialog (composer dock)             │
+│    console-store.ts       shared sidebar/dialog open state                   │
+│    console.css.ts         injected &lt;style&gt; tag (no CSS pipeline)             │
+│    locales.ts             zh / en dictionaries (namespace 'toolkit')         │
+└───────────────▲──────────────────────────────────────────────────────────────┘
+                │  Typert Remote (JSON wire, zod-strict codecs)
+┌───────────────┴──────────────────────────── host (node) ────────────────────┐
+│  src/index.ts         TerminalPanelService (TypertRemoteService)             │
+│  src/typert.host.ts   TYPERT manifest for the typert-loader                  │
+│  src/types.ts         shared wire vocabulary (pure data, no runtime imports) │
+└──────────────────────────────────────────────────────────────────────────────┘
+</code></pre>
+<ul>
+<li><p><strong>Host half</strong> (<code>src/index.ts</code>) — <code>TerminalPanelService</code> extends <code>TypertRemoteService</code> and owns an owner-free session map. Each session wraps a <code>SubprocessTerminalHandle</code> from <code>ctx.subprocess.spawnTerminal</code> with a streaming <code>TextDecoder</code> (so a multi-byte char straddling two output chunks stays intact), a bounded scrollback buffer, and a read cursor for delta consumption. Session lifetimes follow the plugin: the constructor registers a fiber effect that terminates every live PTY on dispose.</p>
+</li>
+<li><p><strong>Client half</strong> (<code>src/client/</code>) — <code>apply</code> mounts the <code>TYPERT_REMOTE</code> contribution first (the dialog needs the namespace mounted before it injects it), then contributes <strong>three slots</strong> over one shared console store:</p>
+<ul>
+<li><code>conversation.session.header.utilities</code> (id <code>toolkit-actions</code>, order <code>10</code>) — the terminal-dialog and sidebar toggle icons;</li>
+<li><code>details</code> (priority <code>-10</code>) — the AI-output file viewer; a <strong>lower</strong> priority shadows the harness <code>DetailsPanel</code> (lowest renders, so <code>-10</code> wins) and drives the right column through <code>ctx.layout</code>;</li>
+<li><code>conversation.composer.dock</code> (id <code>toolkit-dialog</code>, order <code>10</code>) — the multi-tab terminal dialog.</li>
+</ul>
+<p>Because the plugin itself mounts <code>remote.terminalPanel</code>, it reads the live instance out of the service store (<code>ctx.get</code>) instead of declaring a static inject entry, avoiding a self-wait deadlock.</p>
+</li>
+<li><p><strong>Wire vocabulary</strong> (<code>src/types.ts</code>) — the JSON-safe shapes crossing the Remote boundary, shared by the host encode and the client descriptors. <code>src/typert.host.ts</code> ships a strict hand-written manifest so the endpoints are known to the gateway regardless of module identity (out-of-tree bundles would otherwise 404 on the runtime reflection fallback).</p>
+</li>
+</ul>
+<h2>Installation</h2>
+<p><code>dsh-devpanel</code> is developed as a workspace package next to the harness source. Requirements:</p>
+<ul>
+<li>Node <code>^22.19.0 || &gt;=24.0.0</code></li>
+<li>pnpm workspace including <code>../deepseek-harness</code> (see <code>pnpm-workspace.yaml</code>)</li>
+</ul>
+<pre><code># from the workspace root
+pnpm install
+pnpm --filter dsh-devpanel build
+</code></pre>
+<p>The plugin contributes a bundle row via <code>cordis.patch.yml</code> (<code>{ id: toolkit, name: dsh-devpanel }</code>); enable it in a harness profile that lists this bundle. The published package exposes four entry points:</p>
+<table>
+<thead>
+<tr>
+<th>Export</th>
+<th>Path</th>
+<th>Purpose</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>.</code></td>
+<td><code>lib/index.js</code></td>
+<td>host service entry (default export <code>TerminalPanelService</code>)</td>
+</tr>
+<tr>
+<td><code>./client</code></td>
+<td><code>lib/client.js</code></td>
+<td>browser CJS closure-factory bundle</td>
+</tr>
+<tr>
+<td><code>./types</code></td>
+<td><code>lib/types/types.js</code></td>
+<td>shared wire types</td>
+</tr>
+<tr>
+<td><code>./typert</code></td>
+<td><code>lib/typert.host.js</code></td>
+<td>host-face Typert manifest</td>
+</tr>
+</tbody></table>
+<h2>Usage</h2>
+<h3>Terminal panel</h3>
+<p>Click the terminal icon (<code>&gt;_</code>) in the session header to toggle the terminal dialog docked under the composer. The first open spawns a default tab in the session's working directory (the user home when the session has none). Use the tab bar to switch between sessions, <code>+</code> to open a new tab, and the <code>×</code> on each tab to close it — closing the last tab closes the whole panel, and reopening starts a fresh default tab.</p>
+<p>Input is delivered keystroke-by-keystroke into the PTY (Enter included, no newline conversion), so interactive programs (<code>vim</code>, <code>top</code>, REPLs) behave as expected. Select text to copy it; press <code>Cmd/Ctrl+Shift+V</code> to paste. The shell badge next to the tab bar shows the running shell program (e.g. <code>zsh</code>).</p>
+<h3>AI-output sidebar</h3>
+<p>Click the panel icon in the session header to toggle the file sidebar in the right details column. It lists every file the current session's <code>write</code> / <code>edit</code> tool calls produced (in first-seen order, de-duplicated). Click a file to read it through the host:</p>
+<ul>
+<li><code>.md</code> / <code>.mdx</code> renders as Markdown;</li>
+<li>common code extensions get syntax-highlighted blocks;</li>
+<li>images (<code>png</code>, <code>jpg</code>, <code>gif</code>, <code>webp</code>, <code>avif</code>, <code>svg</code>, …) render inline as data URLs;</li>
+<li>anything else renders as plain text.</li>
+</ul>
+<p>Use the <code>⛶</code> button to open the current file fullscreen; the <code>×</code> button closes the sidebar.</p>
+<h2>Remote API</h2>
+<p>The <code>terminalPanel</code> namespace is available on the client as <code>ctx.remote.terminalPanel.*</code>. All methods take an optional trailing <code>AbortSignal</code> and return a <code>RemoteResult&lt;T&gt;</code> (<code>{ ok: true, value }</code> or <code>{ ok: false, error }</code>).</p>
+<table>
+<thead>
+<tr>
+<th>Method</th>
+<th>Parameters</th>
+<th>Result</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>spawn</code></td>
+<td><code>{ argv, cwd, rows, cols, name? }</code></td>
+<td><code>{ id, pid, shell }</code></td>
+<td>Spawn one PTY session. Empty <code>argv</code> resolves the system login shell with a real <code>TERM</code>; empty or <code>~</code> cwd lands in the user home.</td>
+</tr>
+<tr>
+<td><code>write</code></td>
+<td><code>id, text, submit</code></td>
+<td><code>{ ok: true }</code></td>
+<td>Write text to the terminal; <code>submit</code> appends the Enter sequence (<code>\r</code>).</td>
+</tr>
+<tr>
+<td><code>read</code></td>
+<td><code>id</code></td>
+<td><code>{ delta, status }</code></td>
+<td>Consume the output produced since the previous read, plus the current session status.</td>
+</tr>
+<tr>
+<td><code>signal</code></td>
+<td><code>id, sig</code></td>
+<td><code>{ delivered: true, targetPgid }</code></td>
+<td>Deliver <code>SIGINT</code>/<code>SIGTERM</code>/<code>SIGKILL</code>/<code>SIGTSTP</code>/<code>SIGHUP</code> to the verified foreground process group.</td>
+</tr>
+<tr>
+<td><code>terminate</code></td>
+<td><code>id</code></td>
+<td><code>{ ok: true }</code></td>
+<td>Terminate the captured process tree (2 s grace) and await quiescence; the record stays listed as exited.</td>
+</tr>
+<tr>
+<td><code>list</code></td>
+<td>—</td>
+<td><code>{ sessions }</code></td>
+<td>List live sessions in creation order.</td>
+</tr>
+<tr>
+<td><code>dispose</code></td>
+<td><code>id</code></td>
+<td><code>{ ok: true }</code></td>
+<td>Remove the session record, terminating it first if still running; unknown ids are idempotently ok.</td>
+</tr>
+<tr>
+<td><code>readFile</code></td>
+<td><code>path, cwd?</code></td>
+<td><code>{ path, content, kind, dataUrl? }</code></td>
+<td>Read one file for the viewer. <code>~</code>-prefixed and relative paths resolve against <code>cwd</code> (default: host cwd); images return a base64 data URL.</td>
+</tr>
+</tbody></table>
+<p>Session status is <code>{ kind: 'running' }</code> or <code>{ kind: 'exited', exitCode, signal }</code>. The full TypeScript vocabulary lives in <code>src/types.ts</code> and is re-exported from the package's <code>./types</code> entry.</p>
+<h2>Project structure</h2>
+<pre><code>src/
+  index.ts               host: TerminalPanelService (TypertRemoteService)
+  typert.host.ts         host-face TYPERT manifest for the typert-loader
+  types.ts               shared JSON wire vocabulary (pure data)
+  client/
+    index.ts             client plugin body (apply/inject)
+    remote.ts            TYPERT_REMOTE contribution + ctx.remote typing
+    ConsoleHeaderActions.tsx   two session-header icon toggles
+    ConsoleSidebar.tsx        AI-output file viewer (details column)
+    TerminateDialog.tsx       multi-tab xterm dialog (composer dock)
+    console-store.ts          shared sidebar/dialog snapshot store
+    console.css.ts            injected stylesheet (style tag)
+    locales.ts                zh / en dictionaries (namespace 'toolkit')
+tests/
+  service.spec.ts        TerminalPanelService behavior over a stub subprocess
+  apply.client.spec.ts   client apply: slots, Remote mount, stylesheet
+  clear-repro.spec.ts    UTF-8 chunk-split + clear escape-sequence regressions
+  terminate-reopen.spec.ts  tab lifecycle: close-last-tab / reopen re-spawns
+cordis.patch.yml         bundle-row patch contributed to harness profiles
+tsdown.config.ts         two-face build (host ESM + client CJS closure bundle)
+vitest.config.ts         resolves @deepseek-ai/* to the harness source
+</code></pre>
+<h2>Development</h2>
+<pre><code>pnpm build          # tsc -p tsconfig.json &amp;&amp; tsdown (host + client bundles)
+pnpm typecheck      # tsc --noEmit
+pnpm test           # vitest run
+pnpm test:watch     # vitest (watch mode)
+</code></pre>
+<p>Notes for contributors:</p>
+<ul>
+<li><strong>Never bundle the runtime</strong> — the client bundle keeps <code>react</code>, <code>@deepseek-ai/*</code> (and friends) external via <code>CLIENT_EXTERNALS</code> in <code>tsdown.config.ts</code>; they resolve through the module loader's injected <code>require</code> at runtime.</li>
+<li><strong>The two Remote contributions must stay in sync</strong> — <code>src/client/remote.ts</code> (browser descriptors) and <code>src/typert.host.ts</code> (host manifest) both hand-write what the generator would emit; their zod schemas and wire names must match the <code>@Remote</code> methods in <code>src/index.ts</code>.</li>
+<li><strong>The client stylesheet is a string</strong> — there is no CSS pipeline in the client bundle, so styles ship as one injected <code>&lt;style&gt;</code> tag (see <code>console.css.ts</code>), colored via the <code>--dsw-*</code> token layer with neutral fallbacks.</li>
+<li><strong>Regression tests cover real byte streams</strong> — <code>clear-repro.spec.ts</code> splits real prompt/clear byte sequences at every possible position to guarantee no <code>U+FFFD</code> mojibake.</li>
+</ul>
+<h2>License</h2>
+<p>MIT — see <a href="https://github.com/lispking/dsh-devpanel/blob/HEAD/LICENSE">LICENSE</a>.</p>

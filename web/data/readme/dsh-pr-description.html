@@ -1,0 +1,160 @@
+<h1>dsh-pr-description</h1>
+<blockquote>
+<p>[!IMPORTANT]
+<strong>依赖前置：相邻 <code>dsh-src</code> 检出（<code>link:</code> 依赖）</strong>
+本项目在开发形态下使用 <code>link:</code> 依赖指向相邻的 DeepSeek Harness 源码检出（<code>dsh-src</code>），
+与当前仓库保持同一父目录布局（<code>&lt;parent&gt;/dsh-src</code>）。克隆本仓库后：</p>
+<ol>
+<li>先把官方 <code>deepseek-ai/deepseek-harness</code> 检出到与本仓库同级的 <code>dsh-src/</code> 目录，并执行其 <code>pnpm install &amp;&amp; pnpm run build</code>；</li>
+<li>再按下方「安装」一节执行本仓库的 <code>pnpm install --offline &amp;&amp; pnpm build</code> 与测试。
+发布到 npm 的版本会尽量把 <code>link:</code> 依赖替换为 registry 真实版本；无法替换的内部包保持 <code>link:</code>，见各包 README 说明。</li>
+</ol>
+</blockquote>
+<p>DSH 原生工具：分析当前分支 diff，自动生成符合 <strong>Conventional Commits</strong> 的 PR 标题、动机/方案/影响/测试/风险五段描述与<strong>自审清单</strong>，输出 Markdown 到工作区并在会话内渲染；可选 <code>confirm</code> 交互确认与 <code>openPr</code> 直接调用 gh CLI 提 PR。</p>
+<blockquote>
+<p>项目定位（2026-08 调研）：DSH 社区已有大量「代码评审」，但「PR 描述自动生成」无人做。本插件只借鉴上游 <code>anthropics/claude-plugins-official</code> 评审类插件的<strong>工作流顺序</strong>（范围 → diff → 聚焦），文案与实现全部自写，License 为 MIT。</p>
+</blockquote>
+<h2>功能</h2>
+<ul>
+<li><code>pr_describe</code> 工具，流程对齐评审工作流：<ol>
+<li><strong>确定范围</strong>：<code>git diff --name-status &lt;base&gt;...HEAD</code>；<code>base</code> 缺省自动探测（<code>origin/HEAD</code> → <code>origin/main</code> → <code>origin/master</code> → <code>main</code> → <code>master</code> → <code>develop</code> → <code>HEAD~1</code>），探测失败给出结构化错误提示显式指定；</li>
+<li><strong>统计与归类</strong>：新增/修改/删除文件数、<code>+/-</code> 行数；按 <code>docs / test / chore / feat / fix / refactor</code> 确定性归类（规则见下）；</li>
+<li><strong>符号提取</strong>：新增函数/类/导出（轻量正则，去重、上限 16）；</li>
+<li><strong>生成 PR 文本</strong>：<code>feat(scope): 动词短句</code> 标题 + 动机/方案（引用文件与符号）/影响范围/测试建议/风险与开放问题五段 + 自审清单（4 项）；</li>
+<li><strong>confirm / openPr</strong>：<code>confirm: true</code> 走 ask-user 交互确认，取消则不落盘；<code>openPr: true</code> 且 gh 可用时直接 <code>gh pr create --title --body-file</code>（不自动 push）。</li>
+</ol>
+</li>
+<li>结果写入 <code>PR_DESCRIPTION.md</code>（默认，可经 <code>output</code> / 配置 <code>outputFile</code> 修改）+ 会话内 Markdown 渲染。</li>
+<li>解析失败（非 git 仓库 / 无提交 / 无差异 / base 不存在）返回带稳定 <code>code</code> 的结构化错误。</li>
+<li>BREAKING CHANGE 标注<strong>当且仅当</strong>检测到破坏性信号：<code>BREAKING CHANGE:</code> 注解、<code>package.json</code> 主版本提升、删除公开导出且同文件无同名新增。</li>
+</ul>
+<blockquote>
+<p>说明：当前「动机/方案/影响/测试/风险」五段为<strong>确定性模板拼装</strong>（由 diff 统计、符号提取与破坏性信号直接填充文案），<strong>未调用 LLM</strong>；PROMPT §4.4 中「调用模型填充五段」尚未实现，如需语义润色请自行在生成后接入模型处理。</p>
+</blockquote>
+<h3>变更分类规则（确定性，可测试）</h3>
+<ol>
+<li>全部为文档文件（<code>.md</code> / <code>docs/</code> / <code>README*</code>）→ <code>docs</code></li>
+<li>全部为测试文件（<code>tests/</code> / <code>*.test.*</code> / <code>*.spec.*</code>）→ <code>test</code></li>
+<li>全部为配置/CI 文件（<code>.github/</code> / <code>*.yml</code> / <code>.eslint*</code> 等）→ <code>chore</code></li>
+<li>出现全新符号（function/class/export/type 且删除侧无同名声明）→ <code>feat</code></li>
+<li>新增行含修复类关键词（fix/bug/crash 等）→ <code>fix</code></li>
+<li>兜底 → <code>refactor</code></li>
+</ol>
+<h2>安装与加载</h2>
+<p>两种挂载方式。随包发布的 <code>cordis.yml</code>（package.json 的 <code>dsh.bundle.patch</code>）为<strong>生产模式</strong>行名，已按已安装包可解析的说明符（裸包名）书写：</p>
+<blockquote>
+<p><strong>行名解析</strong>：DSH loader 对 patch 内的行名按 profile 的 baseUrl 解析——相对路径锚定在
+<code>&lt;DSH_HOME&gt;/profiles/&lt;name&gt;/</code>（root config 所在目录），裸包名则从该目录的 node_modules 解析。
+因此相对源码路径 <code>./src/index.ts</code> 安装后会指向不存在的 <code>&lt;profile&gt;/src/index.ts</code>，必须用裸包名或绝对路径。</p>
+</blockquote>
+<h3>生产：安装为 bundle 后以裸包名挂载</h3>
+<pre><code>pnpm build                              # tsc → lib/（含 lib/types 声明归一化，见下）
+dsh plugin --profile demo add ./dsh-pr-description
+</code></pre>
+<p><code>dsh plugin add</code> 把本包安装进 profile 的 node_modules，并因 package.json 声明了 <code>dsh.bundle</code>
+将其 <code>cordis.yml</code> 作为 patch 层加入；行名 <code>dsh-pr-description</code> 为裸包名，loader 按 profile 的
+baseUrl 从已安装 node_modules 解析（<code>main</code> → <code>lib/index.js</code>）。</p>
+<h3>开发：热加载源码用绝对路径</h3>
+<p>不改随包发布的 <code>cordis.yml</code>，另写一个 overlay patch 并把行名指向源码绝对路径（同
+<code>dsh-src/scratch-plugin/cordis.yml</code> 的写法）：</p>
+<pre><code># cordis.dev.yml —— dev 热加载 overlay
+- insert:
+    - id: pr-describe
+      name: '/abs/path/to/dsh-pr-description/src/index.ts'   # 绝对路径，不能写 ./src/index.ts
+      config:
+        locale: 'zh'
+        defaultTitleStyle: 'conventional'
+        outputFile: 'PR_DESCRIPTION.md'
+</code></pre>
+<pre><code>dsh --patch ./cordis.dev.yml
+</code></pre>
+<p>loader 对 patch 内相对行名按 profile 的 baseUrl（而非 overlay 文件所在目录）解析，dev 模式必须写绝对路径。</p>
+<h2>用法（会话内示例）</h2>
+<pre><code>分析当前分支的改动，用 pr_describe 生成 PR 描述并确认后写入
+</code></pre>
+<p>工具参数：</p>
+<table>
+<thead>
+<tr>
+<th>参数</th>
+<th>类型</th>
+<th>默认</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>workdir</code></td>
+<td>string</td>
+<td>配置 <code>workdir</code> 或进程 cwd</td>
+<td>git 仓库目录</td>
+</tr>
+<tr>
+<td><code>base</code></td>
+<td>string</td>
+<td>自动探测</td>
+<td>对比基线</td>
+</tr>
+<tr>
+<td><code>titleStyle</code></td>
+<td>string</td>
+<td><code>conventional</code></td>
+<td><code>conventional</code> / <code>plain</code></td>
+</tr>
+<tr>
+<td><code>confirm</code></td>
+<td>boolean</td>
+<td><code>false</code></td>
+<td>生成前 ask-user 交互确认；取消不落盘</td>
+</tr>
+<tr>
+<td><code>openPr</code></td>
+<td>boolean</td>
+<td><code>false</code></td>
+<td>gh 可用时直接提 PR；不可用则跳过并说明</td>
+</tr>
+<tr>
+<td><code>output</code></td>
+<td>string</td>
+<td><code>PR_DESCRIPTION.md</code></td>
+<td>输出文件（相对 workdir）</td>
+</tr>
+<tr>
+<td><code>locale</code></td>
+<td>string</td>
+<td><code>zh</code></td>
+<td>模板语言 <code>zh</code> / <code>en</code></td>
+</tr>
+</tbody></table>
+<p>插件配置（<code>cordis.yml</code>）：</p>
+<pre><code>- insert:
+    - id: pr-describe
+      name: 'dsh-pr-description'
+      config:
+        locale: 'zh'
+        defaultTitleStyle: 'conventional'
+        outputFile: 'PR_DESCRIPTION.md'
+        defaultBase: ''        # 留空 = 自动探测
+        workdir: ''            # 留空 = 进程 cwd
+</code></pre>
+<h2>开发</h2>
+<pre><code>node tests/smoke.offline.mjs   # 零依赖离线冒烟（Node&gt;=22.18 原生 TS strip + 真实 git fixture）
+pnpm test:e2e                  # vitest fixture 仓库 e2e（需已安装 DSH 依赖）
+pnpm build                     # tsc → lib/ + lib/types 相对导入归一化为 .js
+</code></pre>
+<p>代码结构：</p>
+<pre><code>src/index.ts                # 装配 + Config + 工具注册（Cordis 插件行）
+src/tools/pr-describe.ts    # defineTool 定义（五阶段主流程）
+src/diff-analysis.ts        # git diff 解析（纯函数）+ GitRunner seam + 编排
+src/templates.ts            # 标题/五段/自审清单模板（zh/en，纯函数）
+src/gh.ts                   # gh CLI 探测与可选提 PR（runner seam）
+tests/smoke.offline.mjs     # 离线冒烟：真实 git fixture + 纯层断言
+tests/smoke.e2e.ts          # vitest e2e：假 ctx + 真实 git，覆盖 confirm/错误/gh
+</code></pre>
+<p>设计要点：</p>
+<ul>
+<li><strong>受控执行</strong>：所有 git/gh 调用以固定 argv 数组经 <code>ctx.subprocess</code>（<code>GITRunner</code> seam）执行，不拼接 shell 字符串，模型/用户输入永不进入命令行参数外的任何位置；</li>
+<li><strong>可测试性</strong>：解析/分类/模板/gh 均为零依赖纯函数，离线冒烟可直接驱动；<code>ctx.get('userQuestions')</code> 为可选依赖，缺失时给出 <code>ASK_USER_UNAVAILABLE</code> 结构化错误；</li>
+<li><strong>生命周期</strong>：<code>ctx.tools.register</code> 与所有 spawn 均随插件 Fiber 卸载自动清理（subprocess 服务持有进程树生命周期）。</li>
+</ul>
+<h2>License</h2>
+<p>MIT。上游 <code>pr-review-toolkit</code> / <code>commit-commands</code> 为 Proprietary，本插件仅借鉴工作流顺序与模板结构，未复制其文案。</p>

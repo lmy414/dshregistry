@@ -1,0 +1,301 @@
+<h1>dsh-mcp-tunnel</h1>
+<blockquote>
+<p>[!IMPORTANT]
+<strong>依赖前置：相邻 <code>dsh-src</code> 检出（<code>link:</code> 依赖）</strong>
+本项目在开发形态下使用 <code>link:</code> 依赖指向相邻的 DeepSeek Harness 源码检出（<code>dsh-src</code>），
+与当前仓库保持同一父目录布局（<code>&lt;parent&gt;/dsh-src</code>）。克隆本仓库后：</p>
+<ol>
+<li>先把官方 <code>deepseek-ai/deepseek-harness</code> 检出到与本仓库同级的 <code>dsh-src/</code> 目录，并执行其 <code>pnpm install &amp;&amp; pnpm run build</code>；</li>
+<li>再按下方「安装」一节执行本仓库的 <code>pnpm install --offline &amp;&amp; pnpm build</code> 与测试。
+发布到 npm 的版本会尽量把 <code>link:</code> 依赖替换为 registry 真实版本；无法替换的内部包保持 <code>link:</code>，见各包 README 说明。</li>
+</ol>
+</blockquote>
+<p>把本机 MCP Server 安全暴露给远程 Agent 的 DSH 隧道插件：一键为本机目录中的 MCP server
+拉起隧道栈（<strong>mcp-proxy + cloudflared</strong> 的 Docker Compose 栈），并把最终公开 URL 注册到
+<code>@deepseek-ai/dsh-mcp-client</code> 的 streamable-http 配置里（<strong>待确认片段</strong>，安全护栏 1）。</p>
+<blockquote>
+<p>设计取向（对齐上游 anthropics/claude-plugins-official#mcp-tunnels，仅参考行为、不抄源码）：
+隧道 = <strong>传输层</strong>；鉴权/授权应明确标注为「由暴露方自行加」。默认提供方
+cloudflare-quick（免账号、开箱即用），与上游 security model 的立场一致：
+<strong>免费快速隧道仅限测试，生产流量必须自行加鉴权层</strong>。</p>
+</blockquote>
+<hr>
+<h2>一、架构与安全模型</h2>
+<pre><code>远程 Agent (dsh-mcp-client, streamable-http)
+        │  HTTPS + Authorization: Bearer &lt;token&gt;
+        ▼
+https://&lt;random&gt;.trycloudflare.com        ← Cloudflare 边缘（TLS 由 Cloudflare 提供）
+        │  （cloudflared 与边缘之间的出站隧道连接）
+        ▼
+┌──────────── Docker Compose 网络（共享命名空间）────────────┐
+│  cloudflared ── network_mode: service:mcp-proxy ──► mcp-proxy │
+│         （出站-only，与代理共享网络命名空间，无任何入站端口）    │
+│  mcp-proxy（校验 Bearer 令牌 → 转发到上游）                        │
+│       │                                                        │
+│       ├─► hello-mcp（可选 FastMCP 示例：echo / uptime）          │
+│       └─► 你的 MCP server 的 HTTP(S) 端点（容器网络/宿主机回环）   │
+└──────────────────────────────────────────────────────────────┘
+  （宿主机仅绑定 127.0.0.1:&lt;回环调试端口&gt; —— 公网无任何监听端口）
+</code></pre>
+<p>关键属性：</p>
+<ul>
+<li><strong>出站-only</strong>：cloudflared 只主动连到 Cloudflare 边缘；公网无入站端口，
+宿主机唯一端口绑定是 <code>127.0.0.1:43180</code> 的回环调试端口（验收标准 1）。</li>
+<li><strong>本地 TLS 终结（命名隧道模式）</strong>：<code>certs/</code> 下的自签 CA + 服务端证书由隧道属主掌控，
+与上游「证书用户掌控」做法一致；Quick Tunnel 模式公网侧 TLS 由 Cloudflare 提供，
+证书仍生成并挂载供复用/自检。</li>
+<li><strong>鉴权边界（重要）</strong>：mcp-proxy 校验 <code>Authorization: Bearer &lt;token&gt;</code>（令牌在部署目录
+<code>.env</code> 中，0600）。Quick Tunnel 的随机域名不是安全边界 —— <strong>生产流量必须由暴露方
+自行加鉴权层/网关</strong>，本插件只保证「隧道=传输层」。</li>
+</ul>
+<h2>二、交付物</h2>
+<pre><code>dsh-mcp-tunnel/
+├── cordis.yml              # Cordis 装配（一行插件 + config 默认值；兼作 dsh.bundle.patch）
+├── package.json            # dsh-mcp-tunnel，声明 dsh.bundle（MIT）
+├── src/index.ts            # 装配 + 3 工具（create/status/stop）+ ctx.jobs 后台流程
+├── src/tunnel-stack.ts     # compose 栈生成（迷你 .hbs 渲染器）+ 落盘
+├── src/certs.ts            # 自签 CA/证书生成与目录管理（本地 openssl exec）
+├── src/mcp-client-config.ts# dsh-mcp-client 追加片段：生成/校验/待确认管理
+├── templates/
+│   ├── docker-compose.yml.hbs   # 栈布局（mcp-proxy / cloudflared / 可选 hello-mcp）
+│   └── proxy-config.env.hbs     # 代理非敏感环境配置（秘密一律走 .env）
+├── README.md               # 本文档（安全模型 + 限制）
+├── LICENSE                 # MIT
+├── tsconfig.json           # tsc --noEmit 类型检查用
+└── tests/
+    ├── tunnel.smoke.ts     # 离线冒烟（node:test，无需 docker）
+    └── tunnel.e2e.ts       # 真栈 e2e（需 docker + 公网，显式 DSH_MCP_TUNNEL_E2E=1 启用）
+</code></pre>
+<h2>三、安装</h2>
+<p>本地开发（scratch-plugin 风格，直接加载 TS 源码）：</p>
+<pre><code># 你的 profile 的 cordis.patch.yml 追加：
+- insert:
+    - id: dsh-mcp-tunnel
+      name: '/绝对路径/dsh-mcp-tunnel/src/index.ts'
+      config: {}
+</code></pre>
+<p>作为 profile bundle 安装（<code>dsh.bundle.patch: ./cordis.yml</code> 已声明）：</p>
+<pre><code>cd &lt;你的 DSH profile&gt;
+pnpm add ./dsh-mcp-tunnel
+# 行内引用建议改为包路径形式（随 exports 解析）：
+#   name: 'dsh-mcp-tunnel/src/index.ts'
+</code></pre>
+<blockquote>
+<p>依赖对齐（npm 上已发布的真实版本）：peerDependencies 声明 <code>@deepseek-ai/cordis ^4.0.1</code>、
+<code>@deepseek-ai/dsh-tools ^0.1.1-rc.2</code>、<code>@deepseek-ai/dsh-jobs ^0.1.0-rc.8</code>；dependencies 为
+<code>@deepseek-ai/schemastery ^3.18.1</code>（运行时仅真正 import schemastery；其余为类型级/服务级
+依赖）。peer 关系保留：目标运行时是 DSH 宿主，由宿主提供 cordis / dsh-tools / dsh-jobs 服务。</p>
+</blockquote>
+<h2>四、工具用法</h2>
+<h3><code>mcp_tunnel_create</code></h3>
+<table>
+<thead>
+<tr>
+<th>参数</th>
+<th>类型</th>
+<th>必填</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>name</code></td>
+<td>string</td>
+<td>✓</td>
+<td>隧道名 = compose 项目名 = mcp-client <code>serverName</code>（<code>^[A-Za-z0-9_-]{1,32}$</code>）</td>
+</tr>
+<tr>
+<td><code>serverDir</code></td>
+<td>string</td>
+<td></td>
+<td>MCP server 目录：优先读 <code>.mcp.json</code>（首个含 <code>url</code> 的条目作上游；<code>command</code> 型 stdio server 需先转成 HTTP 端点，见「限制」）</td>
+</tr>
+<tr>
+<td><code>upstreamUrl</code></td>
+<td>string</td>
+<td></td>
+<td>直接指定上游 MCP 端点（http/https），优先级高于 <code>.mcp.json</code></td>
+</tr>
+<tr>
+<td><code>provider</code></td>
+<td>string</td>
+<td></td>
+<td><code>cloudflare-quick</code>（默认，免账号）/ <code>anthropic</code>（命名隧道，需自备 Cloudflare 账号与 DNS）</td>
+</tr>
+<tr>
+<td><code>deployDir</code></td>
+<td>string</td>
+<td></td>
+<td>覆盖部署目录（默认 <code>&lt;deployRoot&gt;/&lt;name&gt;</code>，<code>deployRoot</code> 默认 <code>~/.dsh/mcp-tunnels</code>）</td>
+</tr>
+<tr>
+<td><code>useHelloMcp</code></td>
+<td>boolean</td>
+<td></td>
+<td>无上游可用时内置 hello-mcp 示例 server（<code>echo</code>/<code>uptime</code>）；默认自动</td>
+</tr>
+<tr>
+<td><code>token</code></td>
+<td>string</td>
+<td></td>
+<td>自定义访问令牌；缺省自动生成 32 字节随机令牌写入 <code>.env</code>(0600)</td>
+</tr>
+<tr>
+<td><code>hostProxyPort</code></td>
+<td>integer</td>
+<td></td>
+<td>宿主回环调试端口（默认 43180）</td>
+</tr>
+</tbody></table>
+<p>行为：生成栈文件 + 证书（CA 存在即<strong>复用</strong>，验收标准 3）→ 写 <code>.env</code>(0600，秘密不进 compose)
+→ 前置检查 docker（缺失给清晰提示，验收标准 5）→ 后台起容器（<code>ctx.jobs</code>，缺 jobs 时前台）
+→ 轮询 cloudflared 日志出 <strong>Quick Tunnel URL</strong> → 写 <code>state.json</code> → 生成 <strong>待确认片段</strong>
+<code>&lt;deployDir&gt;/mcp-client.pending.yml</code>。有 jobs 时返回 <code>{kind:'background', jobId}</code>，用
+<code>job_output</code> 收尾；无 jobs 时前台返回完整结果。</p>
+<h3><code>mcp_tunnel_status</code></h3>
+<table>
+<thead>
+<tr>
+<th>参数</th>
+<th>类型</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>name</code></td>
+<td>string</td>
+<td>隧道名；缺省列出全部隧道</td>
+</tr>
+</tbody></table>
+<p>输出：每隧道的部署目录、<code>state.json</code>、栈文件存在性、<code>docker compose ps</code> 结果、
+cloudflared 最近日志尾部（<strong>≤50 行</strong>）、待确认片段（serverName/url）。</p>
+<h3><code>mcp_tunnel_stop</code></h3>
+<table>
+<thead>
+<tr>
+<th>参数</th>
+<th>类型</th>
+<th>默认</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>name</code></td>
+<td>string（必填）</td>
+<td></td>
+<td>隧道名</td>
+</tr>
+<tr>
+<td><code>keepCerts</code></td>
+<td>boolean</td>
+<td>true</td>
+<td><code>false</code> 时删除 <code>certs/</code></td>
+</tr>
+</tbody></table>
+<p>行为：<code>docker compose down</code> 停栈并下线 URL（验收标准 4）→ 移除待确认片段 →
+写入 <code>state.json</code> 失效标注（<code>url</code> 下线 + <code>lastError</code>，status 可见）→ <strong>保留证书目录</strong>
+供下次 create 复用（验收标准 3/4）。</p>
+<h2>五、mcp-client 配置片段（安全护栏 1）</h2>
+<p><code>create</code> <strong>绝不自动改写任何 profile 配置</strong>，只在部署目录写出待确认片段
+（<code>mcp-client.pending.yml</code>），由你在显式确认后手动粘贴：</p>
+<pre><code>- insert:
+    - id: mcp-&lt;serverName&gt;
+      name: '@deepseek-ai/dsh-mcp-client'
+      config:
+        serverName: &lt;name&gt;
+        transport: streamable-http
+        url: &lt;https://xxx.trycloudflare.com&gt;
+        headers:
+          Authorization: 'Bearer &lt;token&gt;'
+        toolCallTimeoutMs: 60000
+        failOnStartupError: false
+</code></pre>
+<ul>
+<li>字段名与 <code>@deepseek-ai/dsh-mcp-client</code> 的 <code>StreamableHttpConfig</code> 完全一致；</li>
+<li>远程工具名 = <code>mcp__&lt;serverName&gt;__&lt;rawName&gt;</code>；</li>
+<li><code>mcp_tunnel_stop</code> 会删除该片段文件（验收标准 4）。若你已粘贴进 profile，
+记得同步删除那一行，否则请把 URL 标注为失效；</li>
+<li>「由 apply 注入」路径（显式确认后自动写 profile 的 cordis.patch.yml）留作后续版本。</li>
+</ul>
+<h2>六、安全护栏清单</h2>
+<ol>
+<li><strong>仅显式确认后写 mcp-client 配置</strong>：插件只产出待确认片段文件，绝不自动改写 profile；</li>
+<li><strong>秘密不进 compose</strong>：访问令牌只写入部署目录 <code>.env</code>（0600，docker compose 原生读取），
+<code>docker-compose.yml</code> / <code>proxy-config.env</code> 只含 <code>${API_KEY:?…}</code> 引用与占位；
+无用户 API key 时生成随机令牌并同步提供 <code>.env.example</code>；</li>
+<li><strong>公网无监听端口</strong>：唯一宿主端口绑定是 <code>127.0.0.1</code> 回环；</li>
+<li><strong>README 明示</strong>：免费快速隧道仅限测试，生产流量需要鉴权层（对齐上游 security model）。</li>
+</ol>
+<h2>七、栈契约（本插件声明的 compose 规范）</h2>
+<table>
+<thead>
+<tr>
+<th>服务</th>
+<th>镜像</th>
+<th>角色</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>mcp-proxy</code></td>
+<td><code>ghcr.io/anthropics/mcp-proxy:latest</code></td>
+<td>校验 <code>Authorization: Bearer</code>，转发到 <code>proxy-config.env</code> 的 <code>UPSTREAM_MCP_URL</code></td>
+</tr>
+<tr>
+<td><code>cloudflared</code></td>
+<td><code>cloudflare/cloudflared:latest</code></td>
+<td>出站-only 隧道；<code>network_mode: service:mcp-proxy</code></td>
+</tr>
+<tr>
+<td><code>hello-mcp</code>（可选）</td>
+<td>内嵌 Dockerfile 构建</td>
+<td>FastMCP 示例，SSE 端点 <code>/sse</code></td>
+</tr>
+</tbody></table>
+<ul>
+<li>环境变量契约以 <code>proxy-config.env</code> / <code>docker-compose.yml</code> 为准（<code>UPSTREAM_MCP_URL</code>、
+<code>MCP_PROXY_EXTERNAL_HOSTNAME</code>、<code>API_KEY</code> 引用等）；若你的 mcp-proxy 镜像版本使用
+不同 env 名，请以镜像文档微调 compose —— 本插件把 compose 文件视为最终契约并已在
+README 中显式声明。</li>
+<li>容器内依赖使用 <code>service_started</code>（cloudflared 对 mcp-proxy），不依赖镜像自带健康探针。</li>
+</ul>
+<h2>八、验收标准对照</h2>
+<ol>
+<li>✅ 无外部账号（cloudflare-quick）拿到可达 HTTPS URL，且本机无公网监听端口
+（回环-only 绑定 + 出站-only cloudflared；e2e 可实测）。</li>
+<li>✅/⚠ 远程侧配到 dsh-mcp-client 后调用 echo —— 片段结构对齐 mcp-client 配置；
+e2e 覆盖<strong>隧道栈可用性与可达性</strong>（公开 URL 可达 + SSE 接入面 + Authorization 被接受）；
+MCP 协议握手（initialize → tools/call → echo 返回值断言）<strong>未自动化</strong>（见「限制」#3）。</li>
+<li>✅ 证书目录复用：<code>certs.ts</code> 对既有 CA 只复用、不重新生成（冒烟测试断言）；私钥 0600。</li>
+<li>✅ 停栈后 URL 下线、待确认片段移除；stop 保留 <code>state.json</code> 并写入失效标注
+（<code>url</code> 下线 + <code>lastError</code>，status 可见）。</li>
+<li>✅ docker 缺失给清晰前置提示而非崩溃（<code>checkRuntimeAvailable</code>）。</li>
+</ol>
+<h2>九、限制与后续工作</h2>
+<ol>
+<li><strong>stdio → HTTP 桥接未内置</strong>：<code>.mcp.json</code> 的 <code>command</code> 型 server 需先用任意
+stdio→HTTP 网关转成 streamable-http/SSE 端点再交给 <code>upstreamUrl</code>。后续版本可内置
+host-side 桥接进程（spawn + job 生命周期管理）。</li>
+<li><strong><code>anthropic</code>（命名隧道）模式需要自备 Cloudflare 账号</strong>：compose 模板已预留
+<code>--config</code>/凭据挂载注释位，但 URL 由你的 DNS 决定、不在日志轮询范围内。上游本
+身是 research preview，本项目默认用免账号 Quick Tunnel 保证开箱即用。</li>
+<li><strong>完整 MCP 握手</strong>（initialize → tools/call → echo 返回值断言）需要
+<code>@modelcontextprotocol/sdk</code> 客户端；当前 e2e 验证到「公开 URL 可达 + SSE 接入面 +
+Authorization 被接受」，把 sdk 放进 devDependencies 后即可补全验收标准 2 的端到端断言。</li>
+<li><strong>镜像 env 契约未在离线环境验证</strong>：<code>ghcr.io/anthropics/mcp-proxy</code> 的具体 env/flag
+以 README「栈契约」为准，遇到镜像版本差异时按镜像文档微调 compose。</li>
+<li><strong>token 轮换</strong>：<code>create</code> 支持显式传 <code>token</code>，但轮换/吊销流程建议交给部署方自行管理
+（改 <code>.env</code> 后重启容器）。</li>
+<li><strong>回环端口冲突</strong>：<code>hostProxyPort</code> 被占用时 <code>compose up</code> 会报错，暂无自动避让；
+可显式传 <code>hostProxyPort</code> 换端口。</li>
+</ol>
+<h2>十、开发与测试</h2>
+<pre><code># 离线冒烟（无需 docker/网络；Node ≥ 23.6 原生跑 TS，22.x 需 --experimental-strip-types）
+npm test                # = node --test tests/
+npm run test:smoke      # 仅离线冒烟
+
+# 真栈 e2e（需要 docker daemon + 公网，会访问 Cloudflare 边缘）
+DSH_MCP_TUNNEL_E2E=1 npm run test:e2e
+
+npm run typecheck       # tsc --noEmit（需先 pnpm install）
+</code></pre>
+<h2>License</h2>
+<p>MIT（参考上游行为、未复制其 Proprietary 源码正文）。</p>

@@ -1,0 +1,109 @@
+<h1>dsh-usage-guard</h1>
+<p>A one-purpose patch for <a href="https://github.com/deepseek-ai/deepseek-harness">DeepSeek Harness</a> (dsh):
+<strong>one malformed token-usage sample should not take a whole session history down with it.</strong></p>
+<h2>The failure</h2>
+<p>Open a session and get this instead of your conversation:</p>
+<pre><code>history unavailable for session "session-…":
+  { "expected": "number", "code": "invalid_type", "received": "NaN",
+    "path": [ "uncachedInputTokens" ],
+    "message": "Invalid input: expected number, received NaN" }
+</code></pre>
+<p>Not a wrong number in a counter — no history at all. And it stays that way,
+because the session summary is recomputed by replaying the log every time.</p>
+<h2>The cause</h2>
+<p>The harness folds provider-reported usage into four buckets, and guards two of
+the four:</p>
+<pre><code>const bucketsFrom = (usage) =&gt; ({
+  uncachedInputTokens: usage.inputTokens,          // unguarded
+  outputTokens:        usage.outputTokens,         // unguarded
+  cacheReadTokens:     usage.cacheReadTokens ?? 0, // guarded
+  cacheWriteTokens:    usage.cacheWriteTokens ?? 0,// guarded
+})
+</code></pre>
+<p>Cache fields are optional because plenty of providers never send them. The two
+that are not guarded are just as optional in practice: providers disagree about
+the shape of a usage report, and some send only part of it. One sample without
+<code>inputTokens</code> turns the running total into <code>NaN</code>, the schema refuses it, and the
+whole history goes with it.</p>
+<h2>What this plugin does</h2>
+<p>It steps in front of the fold. A counter that is missing, <code>null</code>, <code>NaN</code> or not a
+number at all is repaired before the harness adds it up.</p>
+<p>Zero is the last resort, not the first move. Providers disagree about what to
+call the same number — <code>inputTokens</code>, <code>input_tokens</code>, <code>input</code>, <code>promptTokens</code> —
+and the harness knows one spelling, so the rest read as absent even though the
+figure is sitting right there. The plugin looks under the usual other names
+first and only falls back to zero when there is genuinely nothing to take.</p>
+<p>Because the fold is also where replay goes, <strong>sessions that are already broken
+open again by themselves</strong> — no session file is rewritten, nothing on disk is
+touched, and removing the plugin puts everything back exactly as it was.</p>
+<p>Zero in place of a missing counter is a known lie. But the choice is not between
+an exact total and an approximate one — it is between an approximate total and a
+conversation you cannot read.</p>
+<p>It also names the culprit. Each damaged sample is reported once, with the turn,
+the step and the raw object as it arrived:</p>
+<pre><code>[dsh-usage-guard] usage sample out of shape — turn 1, step 1;
+    arrived as: {"outputTokens":14,"cacheReadTokens":1024}; inputTokens zeroed
+[dsh-usage-guard] usage sample out of shape — turn 3, step 1;
+    arrived as: {"input":22533,"output":20}; inputTokens taken from an alias; outputTokens taken from an alias
+</code></pre>
+<p>That line is the point of the reporting half: providers that send incomplete
+usage are worth knowing about, and a bare <code>NaN</code> never told you which one it was.</p>
+<h2>Install</h2>
+<pre><code>dsh plugin --profile web add @goodandready/dsh-usage-guard
+</code></pre>
+<p>Restart the harness afterwards. There is no UI and nothing to configure to get
+the fix — it works from the moment it loads.</p>
+<h2>Settings</h2>
+<p>In <code>$DSH_HOME/settings.yaml</code> under <code>dsh-usage-guard:</code>, or in the profile:</p>
+<table>
+<thead>
+<tr>
+<th>Field</th>
+<th>Default</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>repair</code></td>
+<td><code>true</code></td>
+<td>Replace a missing or non-numeric counter with zero before the fold. Off means reporting only — the fold sees the sample as it came, and a broken one keeps the history unreadable.</td>
+</tr>
+<tr>
+<td><code>report</code></td>
+<td><code>true</code></td>
+<td>Log the turn, the step and the raw sample when a damaged one arrives. Reported once per turn, step and field set, not once per replay.</td>
+</tr>
+</tbody></table>
+<p>Turning <code>repair</code> off is for one situation: you want to see the failure happen
+rather than have it papered over.</p>
+<h2>How it attaches</h2>
+<p>Session projections live in an ordinary registry service, keyed by name, and
+each entry holds the <code>apply</code> the harness actually calls. The plugin wraps those.</p>
+<p>It wraps <strong>all</strong> of them, not one. Usage is read in three separate places —
+<code>tokenUsage</code> folds the four buckets, <code>contextPressure</code> computes its own sum for
+the prompt size, <code>contextBreakdown</code> its own for occupancy — and every one of
+them trips over the same missing counter. Keeping a list of keys in step with
+someone else's code is a standing debt; the guard is an identity for an event
+that carries no damaged usage, so a projection that never looks at usage pays
+one comparison and gets the very same event object it would have got anyway.</p>
+<p>Load order does not matter: whatever is already registered is wrapped
+immediately, and whatever registers later is caught as it lands in the registry.</p>
+<p>Nothing is patched by editing files, so a harness upgrade replaces the code this
+plugin wraps rather than fighting with it. If a later version guards those two
+fields itself, this plugin becomes a no-op that only reports — and can be
+removed.</p>
+<h2>Structure</h2>
+<pre><code>dsh-usage-guard/
+├── package.json         # dsh bundle metadata + peerDependencies
+├── cordis.patch.yml     # bundle layer: inserts the plugin row
+├── lib/index.js         # the plugin: settings, reporting, attachment
+├── lib/usage.js         # what counts as damaged and what it becomes — pure
+├── lib/patch.js         # how the guard gets in front of the fold — pure
+├── test/                # unit tests, no harness required
+├── README.md
+└── LICENSE              # MIT
+</code></pre>
+<p>Host half only — no browser code. No npm runtime dependencies, no build step,
+plain ESM.</p>
+<h2>License</h2>
+<p>MIT</p>

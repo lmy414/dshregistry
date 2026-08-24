@@ -1,0 +1,178 @@
+<h1>scopus-scholar — 学术文献检索与分析 Agent Preset</h1>
+<blockquote>
+<p>An agent preset for the <a href="https://github.com/deepseek-ai/deepseek-harness">DeepSeek Harness (dsh)</a> that turns the model into a scientific literature research analyst: <strong>Scopus-powered discovery + OpenAlex-powered metadata/citation completion + a built-in claim → verify → next-steps reasoning loop</strong>.</p>
+<p>一个面向 DeepSeek Harness 的 Agent 预设：模型不再是"搜索框"，而是能检索、提炼科学论断、从理论与进一步检索两个方向查证论断、并规划下一步调研的学术研究助手。</p>
+</blockquote>
+<hr>
+<h2>它是什么</h2>
+<p><code>scopus-scholar</code> 是一个<strong>开箱即用、自包含</strong>的 agent preset：</p>
+<ul>
+<li><strong>零外置依赖</strong>：检索脚本（<code>scopus.py</code>）与使用手册（<code>SKILL.md</code>）全部打包在 preset 自身的 <code>skills/</code> 目录里，随 preset 分发，用户不需要另外下载或指定路径；</li>
+<li><strong>完整工具集</strong>：基于 <code>standard</code> 预设，保留 bash、文件、网页检索、Skills、计划模式、目标、子代理、工作流等全部编码工具，学术调研与报告撰写一条龙；</li>
+<li><strong>内置研究闭环</strong>：persona 里写死了「检索 → 综合 → 论断 → 双向查证 → 下一步」的科研方法论，agent 的每一次检索都被迫走完整个推理链，而不是搜完即答。</li>
+</ul>
+<hr>
+<h2>技术路线</h2>
+<h3>1. 组合架构：一个 preset，一份组合，一个技能包</h3>
+<pre><code>dsh-scopus-searcher/             # npm 包（声明 dsh.bundle，可 dsh plugin add 一键安装）
+├── package.json                 # dsh.bundle.patch 声明 + 包元信息
+├── cordis.patch.yml             # bundle patch：把 agent-presets/ 注册进预设选单
+├── agent-presets/
+│   └── scopus-scholar/          # 预设本体（此目录即安装单元）
+│       ├── agent.cordis.yml     # Cordis 组合：persona + 工具行 + 技能挂载
+│       ├── preset.yml           # 显示名与描述（GUI 选单可见）
+│       └── skills/scopus-search/# 自包含技能包
+│           ├── SKILL.md         # 使用手册：检索策略、字段补全与故障排查
+│           ├── scopus.py        # Scopus API 封装（CLI + 可导入函数）
+│           ├── run_scopus.sh    # 认证/网络预处理包装器
+│           ├── scopus_search.py # raw query 短语精确检索
+│           └── openalex_tool.py # 元数据补全 + 引文追踪 + 摘要重建
+├── .gitignore
+├── LICENSE                      # MIT
+└── README.md
+</code></pre>
+<ul>
+<li><code>agent.cordis.yml</code> 通过 <code>skill-filesystem</code> 的 <code>customSkillDirs</code>（<code>baseUrl</code> 表达式）把技能目录挂到 preset 自身，<strong>preset 走到哪，技能跟到哪</strong>；</li>
+<li>persona 负责"怎么思考"（研究闭环），SKILL.md 负责"怎么用工具"（使用手册），职责分离、互相引用。</li>
+</ul>
+<h3>2. 检索工具链：四条流水线，各司其职</h3>
+<table>
+<thead>
+<tr>
+<th>组件</th>
+<th>职责</th>
+<th>解决的实战问题</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>scopus.py</code></td>
+<td>Scopus Search / Abstract / REF API 封装，CLI 与可导入函数双接口</td>
+<td>基础检索、摘要抓取</td>
+</tr>
+<tr>
+<td><code>run_scopus.sh</code></td>
+<td>在同一条 bash 命令内从 shell profile 加载 <code>SCOPUS_API_KEY</code>（不回显、不落盘），并设置 <code>NO_PROXY</code> 规避代理 TLS 劫持</td>
+<td>Harness <strong>凭据清洗</strong>：名字含 <code>KEY/PASSWORD/SECRET/TOKEN</code> 的环境变量会被剥离，<code>.bashrc</code> 里的 key 默认到不了 agent 的 shell</td>
+</tr>
+<tr>
+<td><code>scopus_search.py</code></td>
+<td><strong>raw query 直传</strong>：引号短语、<code>TITLE("...")</code> 精确标题、OR 组、<code>PUBYEAR</code> 年份界全部保留语义；<code>--out</code> 落盘防长输出截断</td>
+<td>Scopus <code>TITLE-ABS-KEY</code> 对短语<strong>松散匹配</strong>，CLI <code>-k</code> 拼接会丢掉引号，检索结果被严重污染</td>
+</tr>
+<tr>
+<td><code>openalex_tool.py</code></td>
+<td><code>work</code> / <code>enrich</code> / <code>trace</code> 三个子命令：批量补作者+引用数+出版年、从 <code>abstract_inverted_index</code> <strong>重建完整摘要</strong>、<code>cited_by</code>/<code>references</code> 双向分页引文追踪</td>
+<td>Scopus 检索结果<strong>缺作者字段、无引用数、摘要截断</strong>、REF 引用列表 <strong>40 条硬上限</strong></td>
+</tr>
+</tbody></table>
+<h3>3. 双源分工：Scopus 发现，OpenAlex 补全</h3>
+<pre><code>flowchart LR
+    subgraph Scopus
+        direction TB
+        S1["发现论文&lt;br/&gt;raw query 短语精确检索"]
+        S2["摘要 / EID / DOI"]
+    end
+    subgraph OpenAlex
+        direction TB
+        O1["作者 / 引用数 / 出版年补全"]
+        O2["完整摘要重建"]
+        O3["引文网络双向追踪&lt;br/&gt;不受 40 条上限"]
+    end
+    Scopus --&gt; OpenAlex
+</code></pre>
+<p>单库都有字段缺口，双库互补才是完整画像：Scopus 负责高信噪比发现，OpenAlex（免费、无 key）负责元数据与引用网络。</p>
+<h3>4. 研究闭环：检索只是第一步，论断必须查证</h3>
+<pre><code>flowchart LR
+    A[研究问题] --&gt; B[PLAN&lt;br/&gt;概念/同义词/作者/年份]
+    B --&gt; C[SEARCH&lt;br/&gt;短语精确 + 多角度并行]
+    C --&gt; D[SYNTHESIZE&lt;br/&gt;区分'证明'与'声称']
+    D --&gt; E[CLAIM&lt;br/&gt;论断 + 证据链 + 置信度]
+    E --&gt; F1[VERIFY·理论分析&lt;br/&gt;第一性原理/假设/可观测推论]
+    E --&gt; F2[VERIFY·进一步检索&lt;br/&gt;对立假设/新引文/综述/相邻领域]
+    F1 --&gt; G[CONCLUDE&lt;br/&gt;更新置信度]
+    F2 --&gt; G
+    G --&gt; H[下一步搜索与分析计划]
+    H -. 迭代 .-&gt; B
+</code></pre>
+<p>persona 强制每个论断走<strong>双向查证</strong>：既用自身领域知识做理论检验，又设计针对性检索去证实或证伪；每条论断都要求挂证据链（论文/DOI/数据点）和置信度。</p>
+<hr>
+<h2>调研效果：技术路线为实际调研带来什么</h2>
+<p>本 preset 的技术路线，直接转化为实际调研在三个维度上的增益：</p>
+<h3>科学性 — 证据基础可信，论断经得起检验</h3>
+<ul>
+<li><strong>检索结果真实相关</strong>：引号短语 + <code>TITLE(...)</code> 精确标题 + OR 组，把检索从"关键词命中"提升为"语义命中"，文献集不再被松散匹配的噪声污染，后续所有分析都建立在正确的证据集上；</li>
+<li><strong>论断必须查证</strong>：研究闭环强制每条科学论断同时接受理论分析与针对性检索的双向检验——既用领域知识检查其合理性、假设与可观测推论，又用独立证据（复现、对立假设、新引文、综述）证实或证伪，避免"搜到什么就信什么"；</li>
+<li><strong>证据与推理分离</strong>：每条论断都要求挂证据链（论文/DOI/数据点）和置信度，读者能清楚区分哪些是文献证据、哪些是模型推理。</li>
+</ul>
+<h3>丰富性 — 覆盖面广，脉络完整</h3>
+<ul>
+<li><strong>多角度并行检索</strong>：同义词 OR 组与机制词 × 上下文词的多路并行，覆盖同一问题的不同表述与不同子领域，单一路径的漏检由交叉搜索兜底；</li>
+<li><strong>引文网络双向延伸</strong>：向后追溯参考文献、向前追踪最新施引文献，把点状发现扩展成领域脉络——里程碑文献、后续进展、相邻领域一览无余；</li>
+<li><strong>双库叠加元数据维度</strong>：Scopus 负责发现、OpenAlex 补全作者/引用数/出版年/完整摘要，文献画像从"标题 + 摘要"扩展为可比较、可统计的完整记录，直接支撑综述与计量分析。</li>
+</ul>
+<h3>严谨性 — 细节可靠，过程可复现</h3>
+<ul>
+<li><strong>元数据补全与交叉校验</strong>：用 OpenAlex 补齐 Scopus 缺失的作者/引用数字段，并以 authorships 逐篇核验作者身份，杜绝同名误归属与字段缺失造成的误判；</li>
+<li><strong>完整摘要重建</strong>：从 <code>abstract_inverted_index</code> 重建被截断的摘要，避免"关键结论句被截掉"式的断章取义；</li>
+<li><strong>失败有明确诊断路径</strong>：凭据清洗、代理劫持、空结果、字段缺口各有对策，检索不再反复无效重试；长任务通过落盘与后台并行工程化，证据全程可追溯、可复现。</li>
+</ul>
+<p><strong>一句话总结</strong>：技术路线把学术调研从"搜索-摘抄"升级为"发现-查证-规划"的科研闭环——用短语精确检索保证科学性，用多角度检索与引文网络保证丰富性，用元数据校验与可复现流程保证严谨性。</p>
+<hr>
+<h2>安装</h2>
+<h3>方式一：一键安装（推荐，<code>dsh plugin add</code>）</h3>
+<p>本仓库是一个声明了 <code>dsh.bundle</code> 的插件包：<code>dsh plugin add</code> 会把它装进 profile 的依赖并<strong>自动挂载</strong>。挂载后，bundle patch 插入的一行宿主插件在 dsh 启动时把预设复制到预设根目录，预设随即出现在选单里（roster 每次读取都会重新扫描，<strong>无需重启即可看到</strong>；未重启的旧进程在下次启动后生效）。卸载用同一条命令。</p>
+<pre><code># 前置：dsh 的 plugin 子命令需要 pnpm（corepack enable 或 npm i -g pnpm）
+npm install -g pnpm
+
+# A. 直接从 GitHub 安装（仓库公开即可，无需发布 npm）
+dsh plugin --profile web add git+https://github.com/Gaochenyuen/dsh-scopus-searcher.git
+
+# B. 发布 npm 后，用短名字安装
+dsh plugin --profile web add dsh-scopus-searcher
+
+# 重启 dsh（新版本生效 + 插件行执行安装），然后新建会话选择「学术文献研究员」
+</code></pre>
+<ul>
+<li><code>--profile web</code> 对应你运行的 profile（<code>dsh web</code>）；其它部署按实际 profile 名调整；</li>
+<li>更新：<code>dsh plugin --profile web add dsh-scopus-searcher@latest</code>；卸载：<code>dsh plugin --profile web remove dsh-scopus-searcher</code>，并删除 <code>"${DSH_HOME:-$HOME/.dsh}/.agent-presets/scopus-scholar"</code>；</li>
+<li>安装机制双保险：bundle patch 插入的宿主插件行（当前 dsh 版本实际生效的路径）把预设复制进预设根目录；patch 里的只读预设根注册是为未来会应用 patch override 的 dsh 版本预留的增强。</li>
+</ul>
+<h3>方式二：手动放入预设根目录（不依赖 pnpm）</h3>
+<pre><code>mkdir -p "${DSH_HOME:-$HOME/.dsh}/.agent-presets"
+git clone https://github.com/Gaochenyuen/dsh-scopus-searcher.git
+cp -r dsh-scopus-searcher/agent-presets/scopus-scholar \
+  "${DSH_HOME:-$HOME/.dsh}/.agent-presets/"
+</code></pre>
+<h3>公共前置</h3>
+<pre><code>pip install requests                      # Python 3 环境
+# Scopus API key 写进 shell profile（agent shell 有凭据清洗，由 run_scopus.sh 按需加载，永不回显/落盘）
+echo 'export SCOPUS_API_KEY=&lt;your-key&gt;' &gt;&gt; ~/.bashrc
+</code></pre>
+<h2>快速上手</h2>
+<pre><code># 短语精确检索（检索质量分水岭）
+bash &lt;skill-dir&gt;/run_scopus.sh --raw \
+  --query 'TITLE-ABS-KEY("intermolecular coulombic decay" OR "interatomic coulombic decay") AND PUBYEAR &gt; 2019' \
+  --count 20 --out results.json
+
+# 批量补全作者/引用数/完整摘要
+python3 &lt;skill-dir&gt;/openalex_tool.py enrich --file dois.txt --abstract --out enriched.json
+
+# 双向引文追踪（不受 Scopus 40 条上限）
+python3 &lt;skill-dir&gt;/openalex_tool.py trace --doi 10.1103/PhysRevLett.79.4778 \
+  --direction cited_by --from-year 2019 --max 200 --out citing.json
+</code></pre>
+<p><code>&lt;skill-dir&gt;</code> 即 preset 内 <code>skills/scopus-search/</code> 目录；agent 加载 <code>scopus-search</code> 技能时会自动获得该路径，无需手动指定。</p>
+<h2>FAQ</h2>
+<p><strong>Q：agent 的 shell 里为什么看不到 <code>SCOPUS_API_KEY</code>？</strong>
+A：Harness 会做<strong>凭据清洗</strong>——名字匹配 <code>KEY/PASSWORD/SECRET/TOKEN</code> 的环境变量不会传给子进程，<code>.bashrc</code> 里的导出默认到不了 agent。<code>run_scopus.sh</code> 在同一条 bash 命令内从 shell profile 加载（不回显、不落盘），是刻意的显式转发路径。</p>
+<p><strong>Q：为什么 <code>-k</code> 搜出来全是无关文献？</strong>
+A：Scopus <code>TITLE-ABS-KEY</code> 把词当独立词松散匹配。短语请走 <code>--raw</code> 加引号，保留短语语义。</p>
+<p><strong>Q：为什么检索结果没有作者/引用数？摘要还被截断？</strong>
+A：Scopus Search API 不返回这些字段、摘要有限长。用 <code>openalex_tool.py enrich --abstract</code> 补齐。</p>
+<p><strong>Q：遇到 <code>SSLError: UNEXPECTED_EOF_WHILE_READING</code>？</strong>
+A：HTTP 代理劫持 TLS 握手。工具已内置 <code>NO_PROXY</code> 与 <code>trust_env=False</code> 对策，勿重复重试。</p>
+<h2>致谢与许可</h2>
+<ul>
+<li>基于 <code>scopus.py</code> 与 <code>SKILL.md</code>（原 scopus-search 工具目录）构建。</li>
+<li>本项目采用 <a href="https://github.com/Gaochenyuen/dsh-scopus-searcher/blob/HEAD/LICENSE">MIT License</a>。</li>
+</ul>

@@ -1,0 +1,104 @@
+<h1>dsh-undo</h1>
+<p>Undo button and side ruler for <a href="https://www.dshdesktop.com/">DSH</a> conversations: rewind to any earlier prompt and re-edit it via a fork.</p>
+<p>Built on the <a href="https://github.com/cordiverse/paper/blob/main/paper.pdf">Cordis</a> reversibility paradigm — the session log is the context, and undoing a prompt recovers the context to an earlier prefix (a <em>withdrawal</em>) without ever mutating the original log.</p>
+<h2>Features</h2>
+<ul>
+<li><strong>↶ Undo button</strong> in the session header. Hovering opens a dropdown with the trajectory of your previous prompts (one entry per user turn, most recent first). Picking one <strong>forks the session at the turn boundary right before that prompt</strong>, opens the fork, and prefills the composer with the prompt text so you can edit it and resend.</li>
+<li><strong>Side ruler</strong> under the Chat tab (replaces the shipped QueryRail while this plugin is active):<ul>
+<li>one tick per user/steering message, always visible (the shipped rail needs at least two prompts);</li>
+<li><strong>left-click</strong> jumps the conversation to that prompt;</li>
+<li><strong>right-click</strong> shows a confirmation and then performs the same undo directly from the ruler.</li>
+</ul>
+</li>
+<li>The active tick follows your scroll position.</li>
+</ul>
+<h2>Install</h2>
+<p>From the plugin market entry, or directly:</p>
+<pre><code>dsh plugin --profile web add github:tofe98/dsh-undo
+</code></pre>
+<p>No host half, no build step, no RPC: everything is computed from the live conversation snapshot.</p>
+<h2>Usage</h2>
+<ol>
+<li>Send a couple of prompts in a session.</li>
+<li><strong>Hover ↶</strong> in the session header → pick an earlier prompt → a forked child session opens, rewound to just before that prompt, composer prefilled with the prompt text.</li>
+<li>Edit and resend, or <strong>right-click a ruler tick</strong> → <strong>Undo</strong> (after confirmation) for the same flow from the side ruler.</li>
+</ol>
+<p>Notes:</p>
+<ul>
+<li>The original session is left untouched — undo is a fork (the paper's withdrawal semantics: recovery without destroying the log).</li>
+<li>The child conversation is rebuilt through DSH's projection machinery (the harness's cached-context path).</li>
+<li>Undoing restores the conversation state, but <strong>external side effects of the undone turns (file edits, web calls) are not reverted</strong> — they are emissions outside the system boundary (§6.1 of the paper).</li>
+</ul>
+<h2>How it works</h2>
+<ul>
+<li>The browser half reads the live conversation snapshot: user/steering nodes for the trajectory and the turn-end map (<code>chat.turnEnds</code>) to compute each prompt's fork boundary (the <code>turn/end</code> seq of the previous turn).</li>
+<li>Undo calls <code>sessions.fork({ sessionId, atSeq: boundary })</code>, opens the child, and prefills via <code>inputActions.setDraft(text)</code>.</li>
+<li>UI lives in <code>conversation.session.header.actions</code> (button) and <code>shell.overlay</code> (dropdown panel + side ruler).</li>
+</ul>
+<h2>Cache hit: the undo + resend test</h2>
+<p>Undoing and resending the same prompt preserves the whole request prefix, so provider-side
+prefix caching should reuse it. We measured it end to end (DeepSeek automatic prefix caching,
+<code>deepseek-v4-flash</code>, reasoning effort High):</p>
+<table>
+<thead>
+<tr>
+<th>run</th>
+<th>raw usage (<code>assistant/chunk</code>)</th>
+<th>per-request hit</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>msg 1 "ciao, mi piace deepseek"</td>
+<td><code>input=8107, cacheRead=1792</code></td>
+<td>~22% (shared system-prompt prefix only)</td>
+</tr>
+<tr>
+<td>msg 2 "molto interessante, vorrei parlare con te"</td>
+<td><code>input=134, cacheRead=9856</code></td>
+<td>98.7%</td>
+</tr>
+<tr>
+<td><strong>undo msg 2 → resend identical</strong></td>
+<td><code>input=6, cacheRead=9984</code></td>
+<td><strong>99.94%</strong></td>
+</tr>
+</tbody></table>
+<p>The resend read 9 984 of 9 990 billed input tokens from cache — the undo+resend flow is
+effectively a full cache hit. The ~6 residual tokens are the reserialized tail of the new
+user message (it gets a fresh id in the fork).</p>
+<p>Why the conversation's "Cache hit: 59%" line still showed ~59% in both runs:</p>
+<ul>
+<li>That readout is <strong>cumulative over the session</strong>, not per request: it sums every usage chunk
+in the log, including the first request's large cold miss (the runtime-context snapshot,
+the skill-catalog system reminder, and the prompt itself are new). Both sessions end at
+<code>(1792+9856)/(8107+134+1792+9856) ≈ 59%</code> because the fork inherits the parent's msg-1
+usage chunk and shares the same total.</li>
+<li>The per-request number lives in the session log: <code>assistant/chunk</code> events with
+<code>{"type":"usage","usage":{...}}</code>, where
+<code>hit = cacheReadTokens / (cacheReadTokens + inputTokens)</code>. The Trajectory view also shows
+per-cell <code>cacheRead</code>.</li>
+<li>Note the adapter's <code>inputTokens</code> field is not uniform (msg 1 reports the total, later
+chunks the new-only tokens), so the UI percentage can understate the real hit — the raw
+chunks are the ground truth.</li>
+</ul>
+<p>Takeaways for cache-hit optimization:</p>
+<ul>
+<li>Undo (fork at the previous turn boundary) preserves the entire message prefix — the ideal
+flow for prefix caching.</li>
+<li>Keep the model fixed and the system prompt deterministic (no timestamps in this
+deployment), and re-run within the provider's cache validity window; after long idle the
+first re-run misses and the second hits.</li>
+<li>The ~18–22% floor on the first request comes from the shared system-prompt prefix cached
+across sessions; a session whose first request is already warm shows ~100% from the start.</li>
+</ul>
+<h2>Structure</h2>
+<pre><code>lib/
+  index.js    # node half — empty apply so the Loader has a host-side row
+  client.js   # browser half — the whole feature (module-loader format)
+cordis.patch.yml
+package.json  # dsh.bundle + dsh.client declarations
+</code></pre>
+<h2>Development</h2>
+<p>The plugin is plain JavaScript — no build step. To try it during development, either load <code>lib/client.js</code> through the harness's dynamic plugin system or install the package from a local path.</p>
+<h2>License</h2>
+<p>MIT</p>

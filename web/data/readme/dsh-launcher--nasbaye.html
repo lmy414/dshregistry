@@ -1,0 +1,109 @@
+<h1>dsh-launcher</h1>
+<p>DeepSeek Harness web profile 插件:一键重启服务 + 前端状态徽标 + 重启续聊 + 截断自动继续。</p>
+<ul>
+<li><code>GET  /api/launcher/status</code> — 服务状态(JSON)</li>
+<li><code>POST /api/launcher/restart</code> — 重启服务(返回 202,实际由后台 worker 完成:
+预检依赖 → 杀掉端口上的旧监听进程 → 等端口释放 → 重新拉起
+<code>node &lt;dsh&gt;/lib/bin.js web</code> → 健康确认)</li>
+<li>UI:会话头部(或新建会话模式选择器)旁的状态点,点击可确认重启;重启完成后页面自动刷新</li>
+<li>重启前自动检测"正在进行"的会话,重启后向它们发送
+<code>因 DeepSeek Harness 重启导致对话中断,请继续</code>,让 agent 接着干活</li>
+<li>模型输出撞到 token 上限被截断时(前端显示"已达到输出 token 上限")自动补发
+<code>继续</code>,让模型接续输出(带防循环保护)</li>
+</ul>
+<h2>目录结构</h2>
+<pre><code>dsh-launcher/
+├── lib/
+│   ├── index.js            # 插件主体:状态/重启 API、状态点、续聊、截断自动继续
+│   └── restart-worker.js   # 重启 worker:依赖预检、杀进程、拉起、健康确认
+├── cordis.patch.yml        # 组合补丁(向 web profile 插入一行)
+└── package.json
+</code></pre>
+<h2>安装</h2>
+<pre><code># 在 profile 里安装本插件(路径按实际位置调整)
+pnpm --dir %USERPROFILE%\.dsh\profiles\web add file:D:/path/to/dsh-launcher
+</code></pre>
+<p>然后把 <code>@dsh-external/dsh-launcher</code> 加入
+<code>%USERPROFILE%\.dsh\profiles\web\package.json</code> 的 <code>dsh.profile.bundles</code>:</p>
+<pre><code>"dsh": {
+  "profile": {
+    "bundles": [ "...", "@dsh-external/dsh-launcher" ]
+  }
+}
+</code></pre>
+<p>完整重启 DeepSeek Harness 即生效(GUI 状态点 + API 立即可用)。</p>
+<h2>功能</h2>
+<h3>1. 状态点与一键重启</h3>
+<ul>
+<li>状态点显示在会话头部的 Agent 预设标签("标准模式"等)右侧;新开会话页则显示在
+模式选择器旁。绿=在线,黄=重启中,红=离线。每 5 秒轮询。</li>
+<li>点击状态点 → 确认 → <code>POST /api/launcher/restart</code>,worker 在后台完成重启。</li>
+<li>重启完成后页面自动刷新一次(检测到后端离线并恢复后),确保拿到最新前端。</li>
+</ul>
+<h3>2. 重启 worker 的可靠性</h3>
+<p><code>restart-worker.js</code> 自带三道保险:</p>
+<table>
+<thead>
+<tr>
+<th>保护</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>依赖预检</td>
+<td>重启前检查 <code>profiles/web/package.json</code> 的 bundles 是否都已安装(profile</td>
+</tr>
+<tr>
+<td>node_modules + 引擎嵌套 node_modules 两处);缺包先自动 <code>pnpm install</code>,装不上则</td>
+<td></td>
+</tr>
+<tr>
+<td><strong>中止重启、旧服务继续跑</strong></td>
+<td></td>
+</tr>
+<tr>
+<td>健康确认</td>
+<td>拉起后轮询端口最多 90 秒,成功/失败写入 <code>dsh-web.log</code></td>
+</tr>
+<tr>
+<td>无控制台弹窗</td>
+<td>worker 与子进程均使用 <code>windowsHide</code>,Windows 下不弹黑色窗口</td>
+</tr>
+</tbody></table>
+<p>日志以 <code>[launcher-worker ...]</code> 前缀写到 <code>dsh-web.log</code>。</p>
+<h3>3. 重启续聊(resume-after-restart)</h3>
+<p>重启前(调用 <code>restart()</code> 时)枚举所有 agent,按<strong>未完成工作信号</strong>筛选会话:</p>
+<ul>
+<li><code>status === 'running'</code>(执行中,含等待子代理返回);</li>
+<li><code>inbox.hasPending</code>(队列里还有待处理消息);</li>
+<li><code>phase.kind === 'maintenance'</code>(正在压缩等维护操作)。</li>
+</ul>
+<p>命中的会话 id 写入 <code>.dsh-launcher-resume.json</code>(一次性,消费即删);新进程启动后
+通过引擎的 <code>sessions.prompt</code> 通道向每个会话发送一条用户消息
+<code>因 DeepSeek Harness 重启导致对话中断,请继续</code> —— 与浏览器发消息完全同路径,
+agent 会自动恢复并继续执行。失败自动重试(每会话最多 5 次,间隔 3 秒)。</p>
+<h3>4. 截断自动继续(auto-continue)</h3>
+<p>监听 <code>session/event</code>,命中 <code>turn/end</code> 且 <code>reason.kind === 'max-tokens'</code>(即前端
+"已达到输出 token 上限,回答被截断"提示)时,自动向该会话发送用户消息 <code>继续</code>,
+模型接着输出。防循环保护:</p>
+<ul>
+<li>每会话连续自动"继续"最多 <strong>3 次</strong>;</li>
+<li>同会话 5 秒冷却;</li>
+<li>任何非 max-tokens 的轮次结束会重置计数;</li>
+<li>只处理顶层会话(子代理暂不自动继续)。</li>
+</ul>
+<p>日志:<code>[launcher] auto-continue #N sent to &lt;sessionId&gt;</code>。</p>
+<h2>日志</h2>
+<p>所有插件行为写入服务日志(默认 <code>D:\deepseekharness\dsh-web.log</code>):</p>
+<ul>
+<li><code>[launcher-worker ...]</code> — 重启流程(预检/杀进程/拉起/健康确认)</li>
+<li><code>[launcher ...]</code> — 续聊、自动继续、状态点相关</li>
+</ul>
+<h2>可选:Windows 无弹窗补丁(引擎侧)</h2>
+<p>本插件自身的子进程都带 <code>windowsHide</code>,但 DeepSeek Harness 引擎的
+<code>dsh-subprocess-local</code> 默认未设置该项:当 web 服务以无控制台方式启动时,每次工具
+调用(pwsh/bash 等)都会弹出可见控制台窗口。可在引擎文件中追加:</p>
+<p><code>dsh-subprocess-local/lib/index.js</code> 的 <code>spawn()</code> 选项里加 <code>windowsHide: true</code>
+(两个 execFileSync 辅助调用同样加)。这是引擎侧补丁,随引擎更新可能丢失。</p>
+<h2>License</h2>
+<p>MIT。</p>

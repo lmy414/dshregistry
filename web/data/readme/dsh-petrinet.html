@@ -1,0 +1,256 @@
+<h1>dsh-petrinet</h1>
+<p>A <strong>workflow-net runtime</strong> for the <a href="https://github.com/deepseek-ai/deepseek-harness">DeepSeek Harness</a>. It models a long-horizon plan as <em>state</em> — tokens sitting in places, transitions consuming and producing them — which gives it three properties:</p>
+<ol>
+<li><strong>Resource-aware concurrency.</strong> A semaphore, a mutex, an API quota, a "only one agent may touch the repo at a time" rule — all one declaration, enforced by the same firing rule that drives everything else.</li>
+<li><strong>Native loops and runtime fan-out.</strong> Retry-until-good, poll-until-ready, and "run once per item you discover" are ordinary structure.</li>
+<li><strong>Static soundness checking before a plan becomes durable.</strong> A plan that can deadlock is <em>refused at commit time</em>, with a concrete counterexample — before any work begins.</li>
+</ol>
+<p>On top of that it mines its own execution log to propose evidence-backed improvements to the plan.</p>
+<pre><code>dsh plugin add @yxie2/petrinet
+</code></pre>
+<p>New here? <strong><a href="https://github.com/yxie2/dsh-petrinet/blob/HEAD/docs/introduction.md">Read the introduction</a></strong> — the case for the design, from the shape of the problem to what the runtime does about it. This README is the reference. 中文读者请看**<a href="https://github.com/yxie2/dsh-petrinet/blob/HEAD/docs/introduction.zh-CN.md">中文简介</a>**。</p>
+<hr>
+<h2>What a workflow net models</h2>
+<p>Places hold tokens. Transitions consume tokens from their input places and produce them into their output places. A transition may fire only when every input place holds enough. That single rule carries a lot:</p>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>how it is expressed</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong>Concurrency limits</strong></td>
+<td>a place holding <em>k</em> tokens <strong>is</strong> a <em>k</em>-way semaphore</td>
+</tr>
+<tr>
+<td><strong>Loops</strong></td>
+<td>a cycle in the structure</td>
+</tr>
+<tr>
+<td><strong>Runtime fan-out width</strong></td>
+<td><em>n</em> tokens in a place = <em>n</em> parallel work items</td>
+</tr>
+<tr>
+<td><strong>AND-join vs XOR-join</strong></td>
+<td>structurally distinct</td>
+</tr>
+</tbody></table>
+<p>And because it is a Petri net, sixty years of analysis comes with it: reachability, boundedness, conservation laws, and a decidable notion of <strong>soundness</strong>.</p>
+<hr>
+<h2>The soundness gate</h2>
+<p>This is the feature worth the whole design.</p>
+<p>Every plan is statically analysed before it enters the durable log. Within an exploration budget the verdict is a <strong>proof</strong>, not a heuristic — van der Aalst's three conditions checked over the concretely enumerated reachability graph:</p>
+<ol>
+<li><strong>Option to complete</strong> — every reachable state can still reach the end.</li>
+<li><strong>Proper completion</strong> — reaching the end means nothing is left behind.</li>
+<li><strong>No dead transitions</strong> — every step is reachable somewhere.</li>
+</ol>
+<p>Here is a plan that looks entirely reasonable. Two branches, each needing two locks:</p>
+<pre><code>{
+  "resources": [{ "id": "A", "capacity": 1 }, { "id": "B", "capacity": 1 }],
+  "flow": { "parallel": [
+    { "guard": { "resource": "A", "body": { "guard": { "resource": "B", "body": { "task": { "id": "w1" } } } } } },
+    { "guard": { "resource": "B", "body": { "guard": { "resource": "A", "body": { "task": { "id": "w2" } } } } } }
+  ] }
+}
+</code></pre>
+<p><code>petri_plan</code> refuses it:</p>
+<pre><code>PETRI_UNSOUND_PLAN: net is unsound: 2 deadlock marking(s) reachable;
+1 reachable marking(s) can no longer reach the final marking
+</code></pre>
+<p>and <code>petri_analyze</code> hands back the state it would have died in:</p>
+<pre><code>{ "deadlockExample": { "p.guard.g1.body": 1, "p.guard.g3.body": 1 } }
+</code></pre>
+<p>Both branches holding one lock, each waiting for the other. Classic lock inversion, caught before a single token was spent. Widen either resource, or acquire in a consistent order, and the same plan verifies <code>SOUND</code>.</p>
+<p><strong>When the answer isn't known, it says so.</strong> Past the exploration cap the verdict is <code>UNKNOWN</code>, never an optimistic <code>SOUND</code>. Violations found by concrete counterexample stay definite even under a cap, because a deadlock marking has no enabled transitions regardless of what went unexplored.</p>
+<hr>
+<h2>The model writes structure, not arcs</h2>
+<p>Models are good at nested task structure and bad at emitting places, transitions and arc weights. So the Petri net is the <strong>intermediate representation</strong>, never the surface syntax. The model writes a small pattern DSL:</p>
+<pre><code>{
+  "resources": [{ "id": "repo_lock", "capacity": 1 }, { "id": "ci_slots", "capacity": 3 }],
+  "flow": { "seq": [
+    { "task": { "id": "survey", "name": "Survey the codebase" } },
+    { "foreach": { "id": "each_pkg", "over": "packages needing migration",
+                   "body": { "guard": { "resource": "ci_slots",
+                             "body": { "task": { "id": "migrate" } } } } } },
+    { "guard": { "resource": "repo_lock",
+                 "body": { "loop": { "id": "green", "maxIterations": 5,
+                           "body": { "task": { "id": "fix_tests" } } } } } }
+  ] }
+}
+</code></pre>
+<table>
+<thead>
+<tr>
+<th>node</th>
+<th>meaning</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>task</code></td>
+<td>one unit of real work, dispatched to a subagent</td>
+</tr>
+<tr>
+<td><code>seq</code></td>
+<td>run in order</td>
+</tr>
+<tr>
+<td><code>parallel</code></td>
+<td>AND-split, run concurrently, join when all finish</td>
+</tr>
+<tr>
+<td><code>choice</code></td>
+<td>XOR-split, take exactly one branch</td>
+</tr>
+<tr>
+<td><code>loop</code></td>
+<td>repeat until the exit branch is taken (<code>maxIterations</code> bounds it)</td>
+</tr>
+<tr>
+<td><code>foreach</code></td>
+<td>discover <em>n</em> items at runtime, run the body once per item, gather</td>
+</tr>
+<tr>
+<td><code>guard</code></td>
+<td>hold a semaphore for the duration of the body</td>
+</tr>
+</tbody></table>
+<p>Every pattern lowers to a fragment with exactly one entry and one exit place, and composition of such fragments is closed under the workflow-net shape. <strong>The control-flow patterns are therefore sound by construction.</strong> The analyser exists to catch what composition cannot guarantee: resource-induced deadlock — which is where real long-running plans actually fail.</p>
+<hr>
+<h2>Tokens move only on verification</h2>
+<p>Every firing is two-phase, and the phases are separated by adjudication:</p>
+<pre><code>claim    consume the input tokens under a lease   (reserved, not destroyed)
+   |
+execute  dispatch a subagent
+   |
+report   the worker's DECLARATION about the environment   &lt;- moves nothing
+   |
+verify   independent adjudication                          &lt;- the only thing that moves tokens
+   |
+   +-- passed  -&gt; produce the output tokens
+   +-- failed  -&gt; return the consumed tokens, burn one attempt
+</code></pre>
+<p>A confident-but-wrong subagent cannot advance the net. Nothing self-certifies.</p>
+<p>The marking is <strong>derived, never stored</strong> — re-folding the session log reconstructs the exact runtime state, so crash recovery, replay, and time-travel debugging come free. A worker that dies silently has its lease expire, its tokens returned, and its transition re-enabled.</p>
+<hr>
+<h2>Concurrency comes from the net</h2>
+<p>The driver does not schedule. It fires whatever the net enables, and the net's resource places decide how much of that can happen at once:</p>
+<pre><code>resources: [{ id: 'slots', capacity: 2 }]
+</code></pre>
+<p>is the entire implementation of a two-way concurrency cap. From the test suite:</p>
+<pre><code>capacity 1 -&gt; peak concurrency 1
+capacity 2 -&gt; peak concurrency 2
+capacity 3 -&gt; peak concurrency 3
+</code></pre>
+<p><code>maxConcurrency</code> on the driver is a second, coarser ceiling on top of that — a safety limit, not the mechanism.</p>
+<hr>
+<h2>Learning from the log</h2>
+<p>The event stream is, with no extra instrumentation, a <strong>process-mining event log</strong>: case id (the net revision), activity (the transition), order, outcome. That is the canonical input to a field whose canonical <em>output</em> is a Petri net. The loop closes on itself.</p>
+<p><code>petri_insights</code> reports two things:</p>
+<p><strong>Conformance.</strong> Token-replay fitness of a candidate plan against what actually happened. This is how a proposed repair is judged against history instead of against the model's own optimism — <em>a repair that scores worse than the plan it replaces is not a repair</em>.</p>
+<p><strong>Adaptations.</strong> Concrete numbers, each backed by a counted observation:</p>
+<pre><code>[
+  { "kind": "maxAttempts", "target": "t.flaky", "current": 3, "suggested": 4,
+    "rationale": "hit its budget of 3 yet committed elsewhere in history (worst streak 3); the failures are transient" },
+  { "kind": "resourceCapacity", "target": "ci_slots", "current": 3, "suggested": 4,
+    "rationale": "drained to zero while 18 further acquisition(s) were otherwise ready; widening it raises real concurrency" }
+]
+</code></pre>
+<p><code>alphaMine</code> additionally rediscovers a net from observed behaviour, so you can diff <em>what you planned</em> against <em>what actually happens</em>.</p>
+<h3>Self-repair, cheapest first</h3>
+<p>When a net dies, the driver repairs it in layers:</p>
+<ol>
+<li><strong><code>adaptive</code></strong> — free. Derives parameter changes from the session's own history. No model call, every change backed by an observation.</li>
+<li><strong><code>llm</code></strong> — the model authors a replacement <strong>workflow spec</strong>, which goes through the same compiler as the human path and inherits the same sound-by-construction patterns. It is handed the analysis report verbatim, including the concrete deadlock marking, because <em>"here is the exact state you got stuck in"</em> is far more actionable than <em>"your plan failed"</em>.</li>
+</ol>
+<p><strong>Both proposals pass the soundness gate before committing.</strong> A model that proposes a deadlock gets a rejection, not a stuck net. That gate is what separates this from unbounded self-modification.</p>
+<p>Structural change is never applied automatically from mining — a dead-transition observation is <em>reported</em>, never acted on. Widening a budget is reversible arithmetic; rewriting the plan is a decision.</p>
+<p>Honest limits, stated up front:</p>
+<ul>
+<li>The retry probe is capped (<code>RETRY_PROBE_CEILING</code>). A step that has never succeeded gets exactly one more attempt, once — past that, more patience is not the answer, and the code says so in the rationale it emits.</li>
+<li>The alpha algorithm cannot see loops of length one or two, duplicate activities, or invisible routing steps. Treat a low fitness score as a question, not a verdict.</li>
+</ul>
+<hr>
+<h2>Tools</h2>
+<table>
+<thead>
+<tr>
+<th>tool</th>
+<th>purpose</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>petri_create</code></td>
+<td>open a net for a long-horizon objective</td>
+</tr>
+<tr>
+<td><code>petri_analyze</code></td>
+<td><strong>compile and check a candidate plan without committing it</strong></td>
+</tr>
+<tr>
+<td><code>petri_plan</code></td>
+<td>commit a plan as the next revision (CAS; refused if unsound)</td>
+</tr>
+<tr>
+<td><code>petri_status</code></td>
+<td>marking, enabled transitions, choice points, every firing</td>
+</tr>
+<tr>
+<td><code>petri_insights</code></td>
+<td>conformance against history + evidence-backed adaptations</td>
+</tr>
+<tr>
+<td><code>petri_cancel</code></td>
+<td>abort the current net</td>
+</tr>
+</tbody></table>
+<p>Plus a <code>/petri</code> slash command (<code>status</code> / <code>analyze</code> / <code>cancel</code> / <code>&lt;objective&gt;</code>).</p>
+<p><code>petri_analyze</code> is the one worth encouraging: it turns a deadlock from a forty-hour loss into a free planning-time correction.</p>
+<hr>
+<h2>Configuration</h2>
+<p>Defaults cost nothing — deterministic choice, no repair:</p>
+<pre><code>- id: petri-driver
+  name: '@yxie2/petrinet/driver-host'
+  config:
+    decider: llm          # deterministic (default) | llm — only consulted at real choice points
+    repair: both          # off (default) | adaptive | llm | both
+    maxConcurrency: 4
+    approveRepairs: false
+</code></pre>
+<p><code>repair: adaptive</code> is <strong>also free</strong> — it reads history, not a model — so it is the first thing worth turning on.</p>
+<p>The <code>llm</code> decider is only consulted where transitions genuinely compete for the same tokens. Uncontested progress and control transitions cost no model calls at all.</p>
+<hr>
+<h2>Architecture</h2>
+<pre><code>compile.ts     workflow DSL  -&gt;  workflow net        (sound by construction)
+soundness.ts   structural | invariants | reachability (the gate)
+net.ts         the firing rule: enabling, conflict, marking algebra
+fold.ts        events -&gt; state (the marking is derived, never stored)
+validate.ts    admissibility, incl. the soundness gate on every revision
+mining.ts      traces, alpha algorithm, conformance, adaptations
+  |
+  +-- zero runtime dependencies; runs under `node --experimental-strip-types`
+  |
+driver.ts      the concurrent firing loop
+service.ts     ctx.petri  — event-sourced, CAS revisions
+tools.ts / trigger.ts / driver-host.ts / invariant.ts / projection.ts
+</code></pre>
+<p>The whole engine — semantics, lowering, analysis, fold, mining — is deliberately free of harness dependencies. Its test suites need no install and no build:</p>
+<pre><code>node --experimental-strip-types tests/net.test.mjs
+</code></pre>
+<p>A regression there is a regression in the mathematics, not in the integration.</p>
+<pre><code>npm test         # all suites
+npm run build    # typecheck + emit lib/
+</code></pre>
+<hr>
+<h2>Prior art</h2>
+<p>This is applied work, not invented theory. It leans on:</p>
+<ul>
+<li><strong>W.M.P. van der Aalst</strong>, <em>The Application of Petri Nets to Workflow Management</em> (1998) — workflow nets and soundness.</li>
+<li><strong>van der Aalst, ter Hofstede et al.</strong>, <em>Workflow Patterns</em> (2003) and <strong>YAWL</strong> — the pattern set the DSL implements.</li>
+<li><strong>van der Aalst</strong>, <em>Process Mining</em> — the alpha algorithm and token-replay conformance.</li>
+<li><strong>Rozinat &amp; van der Aalst</strong>, <em>Conformance Checking of Processes Based on Monitoring Real Behavior</em> (2008) — the fitness metric.</li>
+<li><strong><a href="https://github.com/qiaoy01/dsh-mission">dsh-mission</a></strong> — the principle this package adopts wholesale (<em>agents propose, the environment adjudicates, the runtime commits</em>), together with its event-sourced, compare-and-set approach to durable planning state. The two install side by side.</li>
+</ul>
+<h2>Licence</h2>
+<p>MIT</p>

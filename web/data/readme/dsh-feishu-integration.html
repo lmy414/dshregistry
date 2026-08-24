@@ -1,0 +1,159 @@
+<h1>dsh-feishu-integration</h1>
+<blockquote>
+<p><strong>中文优先 / Chinese first</strong></p>
+</blockquote>
+<p>将飞书与 <a href="https://github.com/deepseek-ai/deepseek-harness">DeepSeek Harness</a> 双向连接：</p>
+<ul>
+<li>DSH 会话完成后，把总结发送到飞书；</li>
+<li>在飞书中回复某条总结，自动路由回产生该总结的 DSH 会话；</li>
+<li>支持 p2p 和群聊的固定会话延续；</li>
+<li>在 DSH 设置页查看绑定状态、扫码绑定、重连、断开和解绑；</li>
+<li>提供二维码 provisioning 和 <code>fsum-admin</code> CLI 管理入口；</li>
+<li>支持飞书 Feishu 域和国际版 Lark 域。</li>
+</ul>
+<h2>安全默认值</h2>
+<p>公开安装包默认使用 <code>takeoverInbound: false</code>。这样安装时不会自动和已有的飞书长连接插件竞争事件流。</p>
+<p>只有在同一个 DSH profile 中禁用其他飞书长连接插件后，才应启用入站接管：</p>
+<pre><code>- id: xmanrui-dsh-feishu
+  disabled: true
+
+- id: dsh-feishu-integration
+  config:
+    takeoverInbound: true
+</code></pre>
+<p>飞书长连接使用集群式事件分发；同一个应用同时运行多个长连接客户端可能导致事件随机分流。</p>
+<h2>安装</h2>
+<p>在目标 DSH profile 中安装 GitHub 仓库：</p>
+<pre><code>dsh plugin --profile web add github:yangwuan55/dsh-feishu-integration
+</code></pre>
+<p>其他 profile 例如：</p>
+<pre><code>dsh plugin --profile headless add github:yangwuan55/dsh-feishu-integration
+</code></pre>
+<p>安装完成后重启对应的 DSH profile。插件自带 <code>dsh.bundle.patch</code>，会自动进入 profile；默认不会开启入站长连接。</p>
+<p>安装后可在：</p>
+<pre><code>设置 → 插件 → 飞书
+</code></pre>
+<p>查看当前绑定状态并扫码绑定。绑定状态和二维码由 DSH 设置页提供，不要求先使用 CLI。</p>
+<h2>启用入站回复路由</h2>
+<p>如果需要“回复飞书总结 → 路由回对应 DSH 会话”，先确认旧飞书长连接插件已禁用，再在 profile patch 中覆盖配置：</p>
+<pre><code>- id: xmanrui-dsh-feishu
+  disabled: true
+
+- id: dsh-feishu-integration
+  config:
+    takeoverInbound: true
+    replyTimeoutMs: 600000
+</code></pre>
+<p>配置文件通常是：</p>
+<pre><code>$DSH_HOME/profiles/web/cordis.patch.yml
+</code></pre>
+<p>也可以使用全局 patch：</p>
+<pre><code>$DSH_HOME/cordis.patch.yml
+</code></pre>
+<p>修改 patch 后可热重载配置；插件代码或依赖变化需要重启 DSH Web。</p>
+<h2>CLI 管理</h2>
+<p>设置页是推荐入口。CLI 仍然保留，方便自动化和无 UI 环境：</p>
+<pre><code>fsum-admin list
+fsum-admin bind
+fsum-admin bind --app-id cli_xxx --app-secret xxx --owner ou_xxx
+fsum-admin verify --app-id cli_xxx
+fsum-admin set-owner --app-id cli_xxx --open-id ou_xxx
+fsum-admin unbind --app-id cli_xxx
+</code></pre>
+<p>二维码绑定使用飞书 SDK 的设备授权流程。凭据优先通过 DSH loopback credentials RPC 写入；在 DSH Web 未运行时才回退到本地 credential 文件。</p>
+<h2>数据与兼容性</h2>
+<p>插件保留旧 <code>@xmanrui/dsh-feishu</code> 的本地数据布局，以便迁移时延续已有绑定和固定会话：</p>
+<pre><code>$DSH_HOME/integrations/dsh-feishu/config.json
+$DSH_HOME/integrations/dsh-feishu/reply-map.json
+$DSH_HOME/integrations/dsh-feishu/bots/&lt;bot-id&gt;/state.json
+</code></pre>
+<p>敏感的 <code>app_secret</code> 使用 DSH credential store，不写入公开配置文件。</p>
+<h2>路由行为</h2>
+<ol>
+<li>DSH 完成一次会话回合；</li>
+<li>插件向飞书发送文本总结；</li>
+<li>插件记录 <code>message_id → sessionId</code> 映射；</li>
+<li>用户在飞书中回复该总结；</li>
+<li>插件根据 <code>parent_id/root_id</code> 查找映射；</li>
+<li>命中后先立即在原飞书线程回复“已转发到哪个空间、哪个 DSH 会话”，其中包含 workspace 路径、会话标题和 session ID；</li>
+<li>再以 queue 模式把文本注入对应 DSH session；</li>
+<li>最终回答回帖到原飞书线程。</li>
+</ol>
+<p>即时回执的 <code>message_id</code> 也会写入同一个 <code>sessionId</code> 映射，因此用户继续回复这条确认消息时，仍会回到同一个 DSH 会话。</p>
+<p>由飞书回复触发的 DSH 回合带有 <code>fsum-</code> RPC 标记，不会再次生成总结，从而避免回环。</p>
+<h2>验证</h2>
+<pre><code>dsh web --dump-config
+node --check lib/index.js
+node --check lib/client.js
+</code></pre>
+<p>检查启动后的 Web 页面 <code>window.__DSH_BOOT__.entries</code> 是否包含 <code>dsh-feishu-integration</code>。如果设置页没有「飞书」，优先检查：</p>
+<ol>
+<li>package.json 是否保留 <code>exports["./package.json"]</code>；</li>
+<li>旧飞书插件是否被禁用；</li>
+<li>DSH profile 是否已经重启；</li>
+<li><code>dsh web --dump-config</code> 是否包含新插件 entry。</li>
+</ol>
+<h2>目录结构</h2>
+<pre><code>lib/index.js        组装根：config 解析 + 模块装配（无业务细节）
+lib/host/           host 侧领域模块：bot 存储 / reply-map / 飞书 API /
+                    总结推送 / session 网关 / 单 bot 入站运行时 / 设置页 RPC
+lib/shared/         纯函数与常量（findReplyMapping 等测试缝）
+client-src/         浏览器设置页源码（api / styles / index）
+lib/client.js       由 client-src 构建生成的浏览器 bundle（勿手改）
+scripts/            build-client.mjs：esbuild 打包出 ModuleLoader 包装产物
+test/               node:test 回归（路由映射 / 回执文案 / 入站顺序）
+</code></pre>
+<p>约束：一个 bot 只允许一个飞书长连接（集群模式多 client 会随机分流事件）；
+<code>parent_id/root_id → reply-map → DSH session</code> 的路由语义与 <code>fsum-</code> 防回环前缀不可变。</p>
+<h2>开发</h2>
+<pre><code>git clone https://github.com/yangwuan55/dsh-feishu-integration.git
+cd dsh-feishu-integration
+pnpm install
+pnpm build          # client-src/ → lib/client.js（改前端源码后必须重建）
+pnpm test           # node:test 全量回归
+node --check lib/index.js
+</code></pre>
+<p>改 host 侧逻辑直接编辑 <code>lib/host/*.js</code>，无需构建；改设置页 UI 编辑 <code>client-src/</code>，
+然后 <code>pnpm build</code> 重新生成 <code>lib/client.js</code>。发布包只含 <code>lib/</code>、<code>bin/</code> 与文档。</p>
+<h2>English</h2>
+<p><code>dsh-feishu-integration</code> connects Feishu/Lark and DeepSeek Harness in both directions:</p>
+<ul>
+<li>Send completed DSH turn summaries to Feishu;</li>
+<li>Route a reply to a summary back to the DSH session that produced it;</li>
+<li>Preserve fixed p2p/group sessions for unmatched messages;</li>
+<li>Provide a DSH settings tab with binding status, QR binding, reconnect, disconnect, and delete actions;</li>
+<li>Support QR provisioning and the <code>fsum-admin</code> CLI;</li>
+<li>Support both Feishu and Lark domains.</li>
+</ul>
+<p>When an inbound message is routed to a mapped DSH session, the plugin immediately replies in the same Feishu thread with the workspace path, session title, and session ID. That acknowledgement message is mapped to the same session, so follow-up replies continue in the same conversation.</p>
+<h3>Development</h3>
+<p>Host-side modules live in <code>lib/host/</code> and <code>lib/shared/</code> (plain ESM, no build step). The settings UI source lives in <code>client-src/</code> and is bundled into <code>lib/client.js</code> with esbuild — run <code>pnpm build</code> after editing it. <code>pnpm test</code> runs the regression suite (route mapping, acknowledgement copy, inbound ordering with a fake Lark SDK).</p>
+<h3>Safe default</h3>
+<p>The package defaults to <code>takeoverInbound: false</code>. Enable inbound takeover only after disabling every other Feishu long-connection plugin in the same profile:</p>
+<pre><code>- id: xmanrui-dsh-feishu
+  disabled: true
+
+- id: dsh-feishu-integration
+  config:
+    takeoverInbound: true
+</code></pre>
+<p>Feishu long connections use clustered event delivery. Running multiple clients for the same app can split events unpredictably.</p>
+<h3>Install</h3>
+<pre><code>dsh plugin --profile web add github:yangwuan55/dsh-feishu-integration
+</code></pre>
+<p>The package ships a <code>dsh.bundle.patch</code>, so it is automatically mounted into the profile. Restart DSH after installation, then open:</p>
+<pre><code>Settings → Plugins → Feishu
+</code></pre>
+<p>The settings UI is the preferred way to inspect binding status and scan a QR code.</p>
+<h3>CLI</h3>
+<pre><code>fsum-admin list
+fsum-admin bind
+fsum-admin verify --app-id cli_xxx
+fsum-admin unbind --app-id cli_xxx
+</code></pre>
+<h3>Compatibility</h3>
+<p>The plugin intentionally keeps the legacy local data paths under <code>$DSH_HOME/integrations/dsh-feishu/</code>, so existing bindings, reply maps, and fixed-session state can be reused during migration.</p>
+<h3>Official discovery</h3>
+<p>DeepSeek Harness currently recommends publishing a public GitHub repository and adding the <a href="https://github.com/topics/dsh-plugin"><code>dsh-plugin</code></a> topic for discovery. This repository follows that convention.</p>
+<h2>License</h2>
+<p>MIT. See <a href="https://github.com/yangwuan55/dsh-feishu-integration/blob/HEAD/LICENSE"><code>LICENSE</code></a>.</p>

@@ -1,0 +1,446 @@
+<h1>dsh-mem0-plugins</h1>
+<p><a href="https://github.com/runfali/dsh-mem0-plugins/blob/HEAD/LICENSE"><img src="https://img.shields.io/badge/License-MIT-blue.svg" alt="License: MIT"></a>
+<a href="https://github.com/runfali/dsh-mem0-plugins/blob/HEAD/package.json"><img src="https://img.shields.io/badge/node-%E2%89%A522-green.svg" alt="Node"></a>
+<a href="https://deepseek.com"><img src="https://img.shields.io/b/platform/DeepSeek%20Harness-orange" alt="Platform"></a></p>
+<p>English | <a href="https://github.com/runfali/dsh-mem0-plugins/blob/HEAD/README.zh-CN.md">简体中文</a></p>
+<p>Persistent memory for the <strong>DeepSeek Harness (dsh)</strong> web profile, backed by a
+self-hosted <a href="https://github.com/mem0ai/mem0">Mem0</a> server. The plugin gives your
+agent long-term memory with zero manual effort: relevant memories are recalled
+before answering, and every finished conversation turn is distilled into facts
+and written back automatically.</p>
+<blockquote>
+<p>[!IMPORTANT]
+<strong>Compatibility — read this first.</strong> This plugin speaks the custom HTTP API of
+<a href="https://github.com/runfali/mem0-graph"><code>runfali/mem0-graph</code></a>
+(<code>X-API-Key</code> auth, <code>POST /search</code>, <code>POST/PUT/DELETE /memories</code>,
+<code>POST /evolve/feedback</code>) and works <strong>only</strong> against a server deployed from that
+project. It does <strong>not</strong> support Mem0 Cloud or the official mem0 OSS REST/SDK
+API, and it is not a drop-in for other Mem0 deployments.</p>
+</blockquote>
+<p>It ships as a standard dsh bundle plugin: <code>dsh plugin add</code> to install,
+<code>dsh plugin remove</code> to uninstall. It changes no dsh source code.</p>
+<hr>
+<h2>Table of Contents</h2>
+<ul>
+<li><a href="#what-it-does-automatically">What it does automatically</a></li>
+<li><a href="#model-tools">Model tools</a></li>
+<li><a href="#requirements">Requirements</a></li>
+<li><a href="#installation">Installation</a></li>
+<li><a href="#configuration">Configuration</a><ul>
+<li><a href="#connection--identity">Connection &amp; identity</a></li>
+<li><a href="#automatic-recall--query-distillation">Automatic recall &amp; query distillation</a></li>
+<li><a href="#automatic-write-back-tidal-coalescing">Automatic write-back (tidal coalescing)</a></li>
+<li><a href="#reliability--timeouts">Reliability &amp; timeouts</a></li>
+</ul>
+</li>
+<li><a href="#recall-design">Recall design</a></li>
+<li><a href="#reliability-design">Reliability design</a></li>
+<li><a href="#observability">Observability</a></li>
+<li><a href="#development--testing">Development &amp; testing</a></li>
+<li><a href="#troubleshooting">Troubleshooting</a></li>
+<li><a href="#documentation">Documentation</a></li>
+<li><a href="#license">License</a></li>
+</ul>
+<h2>What it does automatically</h2>
+<table>
+<thead>
+<tr>
+<th>Capability</th>
+<th>When</th>
+<th>How</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong>Tool-driven recall</strong></td>
+<td>Before each answer</td>
+<td>A persistent usage section steers the model to call <code>mem0_search</code> first; the UI tool card makes the recall visible. Long queries are distilled before searching.</td>
+</tr>
+<tr>
+<td><strong>Forced recall step</strong></td>
+<td>First step of every turn</td>
+<td>Injects a plugin-source reminder ("search memory before answering") via <code>agent/pre-step</code>. Trivial turns are skipped; disable with <code>forceRecallStep</code>.</td>
+</tr>
+<tr>
+<td><strong>Automatic write-back</strong></td>
+<td>After every completed turn</td>
+<td>Sends "user message + assistant reply" to the server-side LLM extraction (<code>infer: true</code>). Pure-JSON tool output is replaced with placeholders so key names never leak in as "facts".</td>
+</tr>
+<tr>
+<td><strong>Tidal coalescing</strong></td>
+<td>At write time</td>
+<td>Short turns of the same session are bucketed per user and flushed as one batched write (idle 5 s / window 15 s / 5 turns / 4 000 chars — whichever hits first), amortizing server LLM extraction calls. Oversized messages (&gt; 2 000 chars) bypass the bucket and write directly.</td>
+</tr>
+<tr>
+<td><strong>Evolve feedback loop</strong></td>
+<td>After update/delete</td>
+<td>Best-effort <code>POST /evolve/feedback</code> (<code>correction</code> / <code>useless</code>) feeds the server-side salience evolution.</td>
+</tr>
+</tbody></table>
+<p>Interrupted turns are never written: a half-streamed reply is not a durable
+conversation truth.</p>
+<h2>Model tools</h2>
+<p>Four tools are registered under the dsh agent:</p>
+<table>
+<thead>
+<tr>
+<th>Tool</th>
+<th>Purpose</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>mem0_search</code></td>
+<td>Semantic search over the user's memories (per-call <code>top_k</code> / <code>rerank</code> overrides).</td>
+</tr>
+<tr>
+<td><code>mem0_add</code></td>
+<td>Store a durable fact verbatim — no server-side LLM extraction.</td>
+</tr>
+<tr>
+<td><code>mem0_update</code></td>
+<td>Fix an existing memory by ID (reports <code>correction</code> feedback).</td>
+</tr>
+<tr>
+<td><code>mem0_delete</code></td>
+<td>Forget a memory by ID (reports <code>useless</code> feedback).</td>
+</tr>
+</tbody></table>
+<h2>Requirements</h2>
+<ul>
+<li>Node.js ≥ 22 and a working <a href="https://deepseek.com">DeepSeek Harness</a> install
+(web profile).</li>
+<li>A running <a href="https://github.com/runfali/mem0-graph">runfali/mem0-graph</a>
+server reachable over HTTP (e.g. <code>http://127.0.0.1:8888</code>).</li>
+<li>If the server runs with auth enabled, an API key created from its dashboard.
+With <code>AUTH_DISABLED=true</code>, leave the key empty.</li>
+</ul>
+<h2>Installation</h2>
+<pre><code># Install into the web profile (restart dsh afterwards)
+dsh plugin --profile web add /path/to/dsh-mem0-plugins
+
+# Uninstall
+dsh plugin --profile web remove dsh-mem0-plugins
+</code></pre>
+<p>The plugin is <strong>enabled by default</strong> and needs zero configuration when pointed
+at a local <code>AUTH_DISABLED</code> server. Changes made in the settings page take effect
+immediately — no restart needed. To turn memory off entirely, flip <strong>Enable
+plugin</strong> off in the settings card; the card header always shows the current
+enabled state and host at a glance.</p>
+<h2>Configuration</h2>
+<p>All settings live in the dsh settings page under the <code>mem0</code> namespace. Values
+saved there override profile-layer defaults.</p>
+<h3>Connection &amp; identity</h3>
+<table>
+<thead>
+<tr>
+<th>Key</th>
+<th>Default</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>enabled</code></td>
+<td><code>true</code></td>
+<td>Master switch. When off: no recall, no writes, tools report "plugin disabled".</td>
+</tr>
+<tr>
+<td><code>host</code></td>
+<td><code>http://127.0.0.1:8888</code></td>
+<td>Base URL of the self-hosted mem0-graph server.</td>
+</tr>
+<tr>
+<td><code>apiKey</code></td>
+<td><em>(empty)</em></td>
+<td>Sent as the <code>X-API-Key</code> header. Leave empty for <code>AUTH_DISABLED</code> deployments.</td>
+</tr>
+<tr>
+<td><code>userId</code></td>
+<td><code>dsh-user</code></td>
+<td>Owner of the memories; shared across sessions.</td>
+</tr>
+<tr>
+<td><code>agentId</code></td>
+<td><code>dsh</code></td>
+<td>Attached as <code>agent_id</code> on writes.</td>
+</tr>
+</tbody></table>
+<p><img src="https://raw.githubusercontent.com/runfali/dsh-mem0-plugins/HEAD/docs/screenshot/settings-connection.png" alt="Connection and identity settings"></p>
+<h3>Automatic recall &amp; query distillation</h3>
+<table>
+<thead>
+<tr>
+<th>Key</th>
+<th>Default</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>forceRecallStep</code></td>
+<td><code>true</code></td>
+<td>Force-recall step (Plan B): inject a "must call <code>mem0_search</code> first" notice every turn (trivial turns skipped). Off = rely on usage guidance only.</td>
+</tr>
+<tr>
+<td><code>topK</code></td>
+<td><code>10</code></td>
+<td>Max results per search (1–50).</td>
+</tr>
+<tr>
+<td><code>rerank</code></td>
+<td><code>false</code></td>
+<td>Request full-depth reranking (server needs a reranker configured).</td>
+</tr>
+<tr>
+<td><code>distillEnabled</code></td>
+<td><code>true</code></td>
+<td>Master switch for query distillation (see below).</td>
+</tr>
+<tr>
+<td><code>distillMinChars</code></td>
+<td><code>500</code></td>
+<td>Queries up to this length go straight to <code>/search</code> unchanged — zero loss, zero extra calls.</td>
+</tr>
+<tr>
+<td><code>distillInputMaxChars</code></td>
+<td><code>8000</code></td>
+<td>Truncation cap for text sent to the distillation model.</td>
+</tr>
+<tr>
+<td><code>distillBaseUrl</code></td>
+<td>author's private endpoint</td>
+<td>OpenAI-compatible endpoint used to distill long queries. Empty = skip distillation. <strong>The shipped default points at the author's internal deployment — override it with your own endpoint.</strong></td>
+</tr>
+<tr>
+<td><code>distillApiKey</code></td>
+<td>author's private key</td>
+<td>Bearer token for the distillation endpoint.</td>
+</tr>
+<tr>
+<td><code>distillModel</code></td>
+<td><code>Qwen3.5-9B</code></td>
+<td>Distillation model id (a small local model is plenty).</td>
+</tr>
+<tr>
+<td><code>distillTimeoutMs</code></td>
+<td><code>90000</code></td>
+<td>Per-request distillation timeout.</td>
+</tr>
+<tr>
+<td><code>distillRetryAfterMs</code></td>
+<td><code>20000</code></td>
+<td>Hedged-request threshold: if the first request is still silent after this delay, fire a second concurrent one; first response wins.</td>
+</tr>
+</tbody></table>
+<p><img src="https://raw.githubusercontent.com/runfali/dsh-mem0-plugins/HEAD/docs/screenshot/settings-recall-search.png" alt="Recall settings: top-k, rerank, distillation"></p>
+<p><img src="https://raw.githubusercontent.com/runfali/dsh-mem0-plugins/HEAD/docs/screenshot/settings-recall-distill.png" alt="Distillation model, timeout and hedging"></p>
+<h3>Automatic write-back (tidal coalescing)</h3>
+<table>
+<thead>
+<tr>
+<th>Key</th>
+<th>Default</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>syncEnabled</code></td>
+<td><code>true</code></td>
+<td>End-of-turn write-back master switch.</td>
+</tr>
+<tr>
+<td><code>coalesceEnabled</code></td>
+<td><code>true</code></td>
+<td>Bucket short turns and flush merged writes; off = one request per turn.</td>
+</tr>
+<tr>
+<td><code>coalesceIdleMs</code></td>
+<td><code>5000</code></td>
+<td>Flush a bucket after this much inactivity.</td>
+</tr>
+<tr>
+<td><code>coalesceWindowMs</code></td>
+<td><code>15000</code></td>
+<td>Flush a bucket after this much wall time.</td>
+</tr>
+<tr>
+<td><code>coalesceMaxTurns</code></td>
+<td><code>5</code></td>
+<td>Max turns per bucket.</td>
+</tr>
+<tr>
+<td><code>coalesceMaxChars</code></td>
+<td><code>4000</code></td>
+<td>Max characters per bucket.</td>
+</tr>
+<tr>
+<td><code>fastpathChars</code></td>
+<td><code>2000</code></td>
+<td>Turns longer than this skip the bucket and write immediately.</td>
+</tr>
+<tr>
+<td><code>feedbackEnabled</code></td>
+<td><code>true</code></td>
+<td>Report evolve feedback after successful update/delete.</td>
+</tr>
+</tbody></table>
+<p><img src="https://raw.githubusercontent.com/runfali/dsh-mem0-plugins/HEAD/docs/screenshot/settings-write-back.png" alt="Write-back settings: coalescing thresholds, fast path, evolve feedback"></p>
+<h3>Reliability &amp; timeouts</h3>
+<table>
+<thead>
+<tr>
+<th>Key</th>
+<th>Default</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>queueMaxLen</code></td>
+<td><code>50</code></td>
+<td>Pending-write queue cap; oldest entry dropped when full.</td>
+</tr>
+<tr>
+<td><code>breakerThreshold</code></td>
+<td><code>5</code></td>
+<td>Consecutive failures that open the circuit breaker.</td>
+</tr>
+<tr>
+<td><code>breakerCooldownMs</code></td>
+<td><code>120000</code></td>
+<td>Breaker cooldown before half-open retry.</td>
+</tr>
+<tr>
+<td><code>requestTimeoutMs</code></td>
+<td><code>300000</code></td>
+<td>Hard per-request cap shared by search/add (mirrors hermes <code>httpx timeout=300.0</code>; worst-case server-side LLM fallback is ~180 s). There is deliberately no second tool-level timeout.</td>
+</tr>
+</tbody></table>
+<p><img src="https://raw.githubusercontent.com/runfali/dsh-mem0-plugins/HEAD/docs/screenshot/settings-reliability.png" alt="Reliability settings: queue, breaker, request timeout"></p>
+<p>To change profile-layer defaults (applies to all users of the machine), append
+to <code>~/.dsh/profiles/web/cordis.patch.yml</code>:</p>
+<pre><code>- id: mem0
+  config:
+    enabled: true
+    host: http://mem0.internal:8888
+    apiKey: your-admin-api-key
+</code></pre>
+<h2>Recall design</h2>
+<p><img src="https://raw.githubusercontent.com/runfali/dsh-mem0-plugins/HEAD/docs/screenshot/recall-demo.png" alt="Forced recall-step notice plus multi-angle Chinese-keyword mem0_search"></p>
+<ul>
+<li><strong>Explicit tool pipeline.</strong> No silent background prefetch — the dsh platform
+has no content-injection hook after message echo (see
+<a href="https://github.com/runfali/dsh-mem0-plugins/blob/HEAD/docs/COMPARISON.md">docs/COMPARISON.md</a> for the platform timing analysis).
+The model calls <code>mem0_search</code> following usage guidance; the tool card shows
+the recall happening, and distillation / hedging / the breaker all run inside
+the tool.</li>
+<li><strong>Forced recall step (default on).</strong> Every turn's first step gets a
+plugin-source notice ("answer only after calling <code>mem0_search</code>") rendered as a
+collapsed context-injection line in the UI. It never writes memory, skips
+trivial turns, and can be turned off with <code>forceRecallStep</code>.</li>
+<li><strong>Trivial-input guard</strong> (<a href="https://github.com/runfali/dsh-mem0-plugins/blob/HEAD/src/guards.js">src/guards.js</a>). Pure greetings,
+confirmations, and slash commands are classified by exact whole-string match
+against word lists — a real sentence is never misclassified. The same word
+list backs an explicit exemption written into both the usage section and the
+<code>mem0_search</code> description: when the ENTIRE message is a bare
+acknowledgement/continuation (好的、嗯、收到、继续、ok…), the search is
+skipped; any actual content restores the mandatory search.</li>
+<li><strong>Query distillation.</strong> Ported from hermes
+<code>agent/memory_manager.py::_distill_query</code>, applied to the <em>recall query only</em>
+(never the write path):<ol>
+<li>Query ≤ <code>distillMinChars</code>: search as-is;</li>
+<li>Long queries (pasted logs/code): truncate to <code>distillInputMaxChars</code>, ask a
+small model for a 2–4 keyword retrieval intent, then search with that;</li>
+<li>Language-drift guard: distilled output of Chinese input containing
+Vietnamese diacritics or other non-Latin/non-CJK characters (an observed
+small-model routing failure) is treated as pollution and rejected;</li>
+<li>Hedged requests: a silent first request triggers one concurrent retry;</li>
+<li>Total failure: fall back to the raw query — retrieval never silently dies.</li>
+</ol>
+</li>
+</ul>
+<h2>Reliability design</h2>
+<ul>
+<li><strong>Circuit breaker</strong>: <code>breakerThreshold</code> consecutive failures pause all mem0
+traffic; auto half-open after <code>breakerCooldownMs</code>. HTTP 404 / not-found style
+client errors don't count toward the breaker.</li>
+<li><strong>Connection-level retry</strong>: connection-refused/DNS failures retry once — the
+request most likely never reached the server, so no duplicate writes.</li>
+<li><strong>Bounded queue</strong>: pending writes capped at <code>queueMaxLen</code> (oldest dropped) so
+a long server outage can't grow memory unbounded.</li>
+<li><strong>Flush-on-dispose</strong>: all open coalescing buckets are flushed when the plugin
+stops — queued memories are never lost.</li>
+</ul>
+<h2>Observability</h2>
+<p>Coalescing and write-path hygiene counters go to the <strong>dsh host process logs</strong>
+(not the browser): the plugin logs through both <code>ctx.logger</code> (internal) and
+<code>console.log/warn</code> (host stdout). With systemd: <code>journalctl -u dsh.service -f</code>;
+otherwise watch the dsh process stdout.</p>
+<p>Every merged flush logs one info line with cumulative totals:</p>
+<pre><code>[dsh-mem0] mem0 coalesced 3 turn(s) into 1 write (session=&lt;id&gt;, saved 2 call(s), chars=512, trigger=idle; totals: batches=12 savedCalls=34 dropped=0 jsonSanitized=3)
+</code></pre>
+<table>
+<thead>
+<tr>
+<th>Counter</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>savedCalls</code></td>
+<td>Server LLM extraction calls saved by coalescing (merging N turns saves N−1).</td>
+</tr>
+<tr>
+<td><code>dropped</code></td>
+<td>Oldest-entry drops due to a full queue (each also logs a warn).</td>
+</tr>
+<tr>
+<td><code>jsonSanitized</code></td>
+<td>Pure-JSON messages stripped before write-back.</td>
+</tr>
+<tr>
+<td><code>batches</code> / <code>direct</code></td>
+<td>Merged batch writes / fast-path direct writes.</td>
+</tr>
+</tbody></table>
+<p>Queue drops log a warn; JSON stripping and fast-path writes are debug-level;
+breaker transitions and failed direct writes always warn.</p>
+<h2>Development &amp; testing</h2>
+<pre><code>git clone &lt;this-repo&gt; &amp;&amp; cd dsh-mem0-plugins
+npm install                # or symlink your dsh node_modules for offline dev
+node test/smoke.mjs        # host half: apply pipeline + tools + write path + guards
+node test/client-smoke.mjs # client half: bundle load + locale/slots + settings form save
+</code></pre>
+<h2>Troubleshooting</h2>
+<table>
+<thead>
+<tr>
+<th>Symptom</th>
+<th>Fix</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>Tools report "plugin disabled"</td>
+<td>Turn <code>enabled</code> on in the settings page and check <code>host</code>.</td>
+</tr>
+<tr>
+<td>"circuit breaker open"</td>
+<td>The server failed repeatedly. Restore the server and wait out the cooldown, or lower <code>breakerThreshold</code>.</td>
+</tr>
+<tr>
+<td>HTTP 401</td>
+<td><code>apiKey</code> missing/wrong — required unless the server runs <code>AUTH_DISABLED=true</code>.</td>
+</tr>
+<tr>
+<td>"server unreachable"</td>
+<td>Confirm reachability: <code>curl http://&lt;host&gt;/openapi.json</code>.</td>
+</tr>
+<tr>
+<td>Memories never recalled</td>
+<td>Nothing relevant under that <code>userId</code> (check <code>GET /memories</code>), or the model skipped <code>mem0_search</code> — verify the forced-recall notice isn't being skipped along with its tool card.</td>
+</tr>
+</tbody></table>
+<h2>Documentation</h2>
+<ul>
+<li><a href="https://github.com/runfali/dsh-mem0-plugins/blob/HEAD/docs/COMPARISON.md">docs/COMPARISON.md</a> — design notes vs. the hermes
+original, including the platform timing constraints that shaped the
+tool-driven recall (Chinese).</li>
+</ul>
+<h2>License</h2>
+<p><a href="https://github.com/runfali/dsh-mem0-plugins/blob/HEAD/LICENSE">MIT</a> © 2026 dsh-mem0 contributors</p>

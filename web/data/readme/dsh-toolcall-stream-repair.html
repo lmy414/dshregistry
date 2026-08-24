@@ -1,0 +1,265 @@
+<h1>dsh-toolcall-stream-repair</h1>
+<p>A <a href="https://github.com/deepseek-ai/deepseek-harness">DeepSeek Harness</a> plugin that repairs malformed
+<strong>streaming tool-call deltas</strong> from OpenAI-compatible gateways — before they assemble into a call the
+harness cannot dispatch.</p>
+<p>If you have seen <code>unknown tool ""</code>, a session that refuses to resume after a tool call, or two tool calls
+whose arguments got concatenated into one unparseable blob, this plugin targets that failure at its
+source.</p>
+<hr>
+<h2>What actually goes wrong</h2>
+<p>Two shipped adapters reach the same broken end state by <strong>different routes</strong>. Both are covered by fixtures.</p>
+<h3><code>llm-pi-ai</code></h3>
+<p>The harness assembles a streamed assistant message with <code>BlockAssembler</code>
+(<code>packages/llm/llm/src/assembler.ts</code>). Two lines make a malformed gateway response permanently corrupting:</p>
+<pre><code>// assembler.ts:71 — unconditional: a later empty id overwrites a good one
+partial.toolCallId = chunk.id
+
+// assembler.ts:112-117 — the intended fallback cannot fire for the EMPTY STRING
+case 'tool-call': return {
+  type: 'tool-call',
+  id: partial.toolCallId ?? CallId(`call-${index}`),
+  name: partial.toolCallName ?? '',
+  arguments: partial.toolCallArguments,
+}
+</code></pre>
+<h3><code>llm-deepseek</code> — the adapter behind every user report linked below</h3>
+<p>It reaches the same end state <strong>without touching those lines at all.</strong> <code>translate.ts:99-105</code> closes every
+open block on <code>[DONE]</code>, and <code>assembler.ts:107-108</code> returns a pre-closed block verbatim — so
+<code>assembler.ts:71</code>, <code>:72</code> and the <code>:114</code> fallback <strong>never run</strong>. The empty identity is introduced upstream,
+at <code>translate.ts:159-160</code>:</p>
+<pre><code>if (call.id !== undefined) block.callId = call.id
+if (call.function?.name !== undefined) block.name = call.function.name
+</code></pre>
+<p><code>undefined</code> is guarded; <code>''</code> is not. And because it re-assigns on <em>every</em> frame, a later <code>""</code> erases an id
+that already arrived. The corruption therefore reaches you inside an <strong>authoritative, already-closed</strong>
+block. This plugin handles that because it treats an incoming <code>block-end</code> as evidence and emits a freshly
+constructed one, never forwarding the adapter's object.</p>
+<p><strong>Adapters verified.</strong> <code>llm-deepseek</code> and <code>llm-pi-ai</code>, both at deepseek-harness <code>b150a551b</code>, each with its
+own fixture family and negative controls. The <code>llm-deepseek</code> fixtures are driven through a byte-identical
+copy of the shipped <code>translate.ts</code>, so they reproduce the real adapter rather than a model of it. On
+<code>llm-deepseek</code> <strong>six of the eleven repair codes are reachable</strong> — the other five describe stream-grammar
+faults <code>translate.ts</code> cannot produce. Any other OpenAI-compatible adapter is expected to work but is
+<strong>not</strong> covered by a fixture.</p>
+<p><code>??</code> catches <code>null</code> and <code>undefined</code>, not <code>''</code>. And the shipped pi-ai adapter produces exactly <code>''</code> when a
+gateway omits an id or a name (<code>packages/llm/llm-pi-ai/src/stream.ts:160-161</code>,
+<code>partial?.type === 'toolCall' ? partial.id : ''</code>). So an absent identity becomes an empty identity,
+survives every guard, and reaches the session log as a tool call with <code>name: ""</code>.</p>
+<p>This plugin sits on the <code>llm/stream</code> waterfall, which runs <strong>between the adapter and the assembler</strong>
+(<code>packages/core/agent-loop/src/agent.ts:346-352</code>). That position matters: the agent loop appends each
+post-waterfall chunk to the session log as <code>assistant/chunk</code> <em>before</em> assembly, so repairing here fixes
+the durable replay record too — not just the in-memory message.</p>
+<pre><code>adapter → [ llm/stream: this plugin ] → agent loop → assistant/chunk log → BlockAssembler → assistant/message
+</code></pre>
+<hr>
+<h2>Install</h2>
+<pre><code>dsh plugin --profile &lt;name&gt; add dsh-toolcall-stream-repair
+</code></pre>
+<p>Then restart the profile — bundle membership is fixed at profile start
+(<code>apps/cli/reference/README.md:55</code>).</p>
+<blockquote>
+<p><strong>Pin your harness packages.</strong> The <code>latest</code> dist-tag on several <code>@deepseek-ai/dsh-*</code> packages points at
+a stale <code>0.0.1-rc.1</code> placeholder while the real release sits on <code>next</code> (verified 2026-08-23:
+<code>@deepseek-ai/dsh-llm</code> <code>latest → 0.0.1-rc.1</code>, <code>next → 0.1.1-rc.2</code>). This package therefore declares
+harness packages as <strong>peer</strong> dependencies with explicit <code>||</code> ranges and never as <code>dependencies</code> — a
+duplicate Cordis would give the plugin a different, empty service registry.</p>
+</blockquote>
+<h2>Configure</h2>
+<p>Defaults are in <code>cordis.patch.yml</code>; override them in your profile's <code>cordis.patch.yml</code>.</p>
+<table>
+<thead>
+<tr>
+<th>Key</th>
+<th>Default</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>onUnrecoverableToolCall</code></td>
+<td><code>fail-request</code></td>
+<td>A tool call that never received a name cannot be dispatched. <code>fail-request</code> replaces the response with a terminal <code>error</code> finish, which the loop reports through <code>agent/request-error</code> — so <code>dsh-llm-retry</code> can retry it — instead of logging an undispatchable call. <code>passthrough</code> restores stock behaviour.</td>
+</tr>
+<tr>
+<td><code>splitOnIdCollision</code></td>
+<td><code>true</code></td>
+<td>Give a second call announced at an already-occupied block index its own block, instead of letting its arguments bleed into the first.</td>
+</tr>
+<tr>
+<td><code>closeTruncatedStream</code></td>
+<td><code>true</code></td>
+<td>Emit a terminal <code>error</code> finish when the upstream stream ends with no terminal chunk at all.</td>
+</tr>
+<tr>
+<td><code>logRepairs</code></td>
+<td><code>true</code></td>
+<td>Log each applied repair at debug level with its stable code.</td>
+</tr>
+</tbody></table>
+<hr>
+<h2>What it handles</h2>
+<p>Every row has a fixture in <code>tests/fixtures/</code> and a <strong>negative control</strong> — a test that asserts the
+corruption is present without the fix. Remove a repair and its paired assertion flips.</p>
+<table>
+<thead>
+<tr>
+<th>Code</th>
+<th>Malformed shape</th>
+<th>Without this plugin</th>
+<th>With it</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>unrecoverable-name</code></td>
+<td>Gateway sends no <code>function.name</code> on any frame</td>
+<td>Assembles <code>name: ""</code> → <code>unknown tool ""</code>, logged and unresumable</td>
+<td>Terminal <code>error</code> finish; nothing corrupt is logged; retryable</td>
+</tr>
+<tr>
+<td><code>synthesized-id</code></td>
+<td>Gateway sends no <code>id</code> on any frame</td>
+<td>Assembles <code>id: ""</code>; result cannot be paired with its call</td>
+<td>Mints <code>call-&lt;index&gt;</code>, the value <code>assembler.ts:114</code> already intended</td>
+</tr>
+<tr>
+<td><code>empty-id-clobber</code></td>
+<td>A continuation delta carries <code>id: ""</code> after a good one</td>
+<td><code>assembler.ts:71</code> overwrites the good id with <code>""</code></td>
+<td>Keeps the established id</td>
+</tr>
+<tr>
+<td><code>id-collision-split</code></td>
+<td>Two distinct calls share one <code>tool_calls[].index</code></td>
+<td>One block; arguments concatenated into invalid JSON; one call lost</td>
+<td>Two blocks, correct ids/names, each <code>arguments</code> separately parseable</td>
+</tr>
+<tr>
+<td><code>corrected-block-end</code></td>
+<td>Terminal frame carries a weaker id/name than the deltas did</td>
+<td>The authoritative <code>block-end</code> overwrites good identity with <code>""</code></td>
+<td>Restores identity from the deltas</td>
+</tr>
+<tr>
+<td><code>synthesized-block-start</code></td>
+<td>Deltas arrive with no opening block</td>
+<td>Fails the harness's own stream grammar</td>
+<td>Synthesizes the opening block</td>
+</tr>
+<tr>
+<td><code>duplicate-block-start</code></td>
+<td>An index is opened twice</td>
+<td>Fails the harness's own stream grammar</td>
+<td>Duplicate suppressed</td>
+</tr>
+<tr>
+<td><code>straggler-dropped</code></td>
+<td>A delta arrives after its block closed</td>
+<td>Fails the harness's own stream grammar</td>
+<td>Dropped, matching what the assembler already does</td>
+</tr>
+<tr>
+<td><code>synthesized-block-end</code></td>
+<td>Terminal finish arrives with a tool-call block still open</td>
+<td>Fails the harness's own stream grammar</td>
+<td>Corrected <code>block-end</code> synthesized first</td>
+</tr>
+<tr>
+<td><code>truncated-stream</code></td>
+<td>Upstream iterator ends with no terminal chunk</td>
+<td><code>LlmRuntime.adapterStream</code> returns without one (<code>index.ts:958-961</code>); the assembler reports a clean <code>stop</code> for a half-written call</td>
+<td>Terminal <code>error</code> finish</td>
+</tr>
+<tr>
+<td><code>recovered-name</code></td>
+<td>A continuation delta omits <code>name</code></td>
+<td>(Harmless — the assembler already guards this at <code>:72</code>)</td>
+<td>Reuses the established name</td>
+</tr>
+</tbody></table>
+<p>"Fails the harness's own stream grammar" means <code>validateStream</code>
+(<code>packages/llm/llm/src/invariant.ts:36-84</code>) reports a violation. That validator is installed on
+<code>llm/stream</code> with <code>{ global: true, prepend: true }</code>, i.e. as the <strong>outermost</strong> waterfall listener — so it
+validates what this plugin emits. The test suite asserts every repaired fixture produces <strong>zero</strong>
+violations against a transcription of that exact grammar.</p>
+<p>Two control fixtures assert that a <strong>well-formed</strong> stream passes through byte-identically with zero
+repairs reported.</p>
+<hr>
+<h2>What it does <strong>not</strong> handle</h2>
+<p>Stated plainly, because a repair tool that overstates its reach is worse than none.</p>
+<ul>
+<li><strong>It cannot invent a tool name.</strong> If no frame in the whole response names the tool, the call is
+unrecoverable. The plugin converts silent corruption into a loud, retryable error — it does not
+reconstruct the call. Nothing can.</li>
+<li><strong>Two nameless, id-less calls at one index are indistinguishable.</strong> The split relies on a <em>non-empty</em>
+id changing. With no ids at all, there is no signal that a second call started, and the arguments still
+concatenate.</li>
+<li><strong><code>max-tokens</code> truncation is deliberately left alone.</strong> <code>BlockAssembler</code> already drops tool calls under
+<code>max-tokens</code> (<code>assembler.ts:136-138</code>); this plugin only closes the block so the stream stays
+well-formed.</li>
+<li><strong>Mid-stream adapter <em>failures</em> were already handled.</strong> <code>LlmRuntime.adapterStream</code> converts an adapter
+throw into a terminal error finish (<code>packages/llm/llm/src/index.ts:940, 955</code>). The
+<code>truncated-stream</code> repair covers the narrower case of an iterator that ends <strong>silently</strong>, which that
+code path returns from without synthesizing a finish. <strong>Neither shipped first-party adapter reaches it:</strong>
+<code>llm-pi-ai</code> and <code>llm-deepseek</code> (<code>llm-deepseek/src/sse.ts:35-38</code>) both throw <code>STREAM_CLOSED</code> on a
+truncated body rather than returning silently, and that throw propagates through this plugin. This
+repair is insurance for third-party adapters, not something either shipped adapter needs.</li>
+<li><strong>A consumer that ignores an <code>error</code> finish still sees the partial.</strong> On <code>fail-request</code>, deltas already
+forwarded remain in the stream. The agent loop never reads <code>blocks()</code> after an error finish
+(<code>agent.ts:372-390</code>) and the supported partial read, <code>interruptedBlocks()</code>, omits tool calls by
+contract (<code>assembler.ts:161-178</code>). A custom consumer that calls <code>blocks()</code> on an errored stream anyway
+will still see the malformed block.</li>
+<li><strong>It does not repair sessions that are already broken.</strong> This is prevention only. For repair of
+existing logs, see the projects below.</li>
+<li><strong>It does not touch text or reasoning content</strong>, tool <em>results</em>, or the <code>session/*</code> event vocabulary.</li>
+<li><strong>No Web UI.</strong> Host-side only; no <code>dsh.client</code> half.</li>
+<li><strong>It cannot help a gateway that is malformed at the HTTP level</strong> — this plugin sees the adapter's chunk
+stream, not raw SSE bytes.</li>
+</ul>
+<hr>
+<h2>Prior art — this is not the only tool in this space</h2>
+<p>Three existing projects address a weaker version of this problem. Check whether one of them fits you
+better:</p>
+<ul>
+<li><strong><a href="https://github.com/Yukari316/dsh-toolcall-compat">Yukari316/dsh-toolcall-compat</a></strong> — the closest
+overlap: fixes tool-call JSON-schema misparsing for custom providers. In-band like this one, with one
+test file.</li>
+<li><strong><a href="https://github.com/Whning0513/deepseek-protocol-doctor">Whning0513/deepseek-protocol-doctor</a></strong> — a
+protocol <em>checker</em> with a test suite and CI, primarily a Python CLI. It diagnoses; it does not repair
+in band.</li>
+<li><strong><a href="https://github.com/jhuanxx44/dsh-sseye">jhuanxx44/dsh-sseye</a></strong> — an SSE debug console for inspecting
+what a gateway actually sent. Complementary: use it to capture the shape, this to fix it.</li>
+</ul>
+<p>Related, adjacent: <strong><a href="https://github.com/lokic7123-star/dsh-route-resilience">lokic7123-star/dsh-route-resilience</a></strong>.</p>
+<p>For sessions that are <strong>already</strong> corrupt, the repair niche is well served — see
+<a href="https://github.com/xiaoshenming/dsh-session-surgeon"><code>xiaoshenming/dsh-session-surgeon</code></a> (a spec-driven
+repairer with 14 diagnostic codes) and
+<a href="https://github.com/mayf3/dsh-session-doctor"><code>mayf3/dsh-session-doctor</code></a>, among others. This plugin is
+upstream of all of them: it tries to stop the log from breaking in the first place.</p>
+<p>What this plugin offers that the above do not, as far as we could verify: a fixture corpus of malformed
+gateway streams with a negative control per repair, and assertions against the harness's real
+<code>BlockAssembler</code> and its real stream grammar rather than against a mock.</p>
+<hr>
+<h2>Development</h2>
+<pre><code>npm ci
+npm run typecheck
+npm run build
+npm test          # 37 tests, fixture-driven, with negative controls
+npm run test:built # loads lib/ under plain node and drives the real waterfall
+</code></pre>
+<p>Fixtures live in two families:</p>
+<ul>
+<li><code>tests/fixtures/sse/*.sse</code> — OpenAI <code>chat.completion.chunk</code> frames, the format you capture from a
+gateway proxy. <code>tests/support/sse.ts</code> translates them the way an OpenAI-compatible adapter does. These
+are <strong>authored to reproduce the shapes described in the linked reports</strong>, not captured from a live
+gateway; the translator is a faithful model of the shipped adapter's observable behaviour
+(empty-string identity, 1:1 index mapping), not a copy of its internals.</li>
+<li><code>tests/fixtures/chunks/*.json</code> — harness <code>StreamChunk</code> sequences, for malformations that arise at the
+adapter protocol level rather than on the wire. Each file documents the shape it covers and what
+produces it.</li>
+</ul>
+<p>A test asserts the fixture list on disk matches the list the suite exercises, so a fixture cannot be
+added and silently left untested.</p>
+<h2>Compatibility</h2>
+<p>Developer preview: the harness states <strong>"THERE WILL BE COMPATIBILITY-BREAKING CHANGES"</strong> (<code>README.md:11</code>)
+and there is no semver or deprecation policy at <code>0.1.1-rc.2</code>. Peer ranges use <code>||</code> unions across <code>-rc</code>
+versions accordingly. Verified against deepseek-harness <code>b150a551b</code> (<code>release(dsh): 0.1.1-rc.2</code>).</p>
+<h2>Licence</h2>
+<p>MIT.</p>

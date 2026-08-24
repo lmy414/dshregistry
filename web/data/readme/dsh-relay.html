@@ -1,0 +1,347 @@
+<h1>dsh-relay</h1>
+<p><a href="https://github.com/SunNull/dsh-relay/blob/HEAD/README.en.md">English</a> | 中文</p>
+<p><strong>把家里运行的 <a href="https://github.com/deepseek-ai/deepseek-harness">DeepSeek Harness</a>（dsh）完整映射到公网</strong> —— 在任何设备、任何地点，通过一个网址获得与你家中电脑完全一致的 dsh 体验：会话实时同步、流式输出、工具卡片、审批弹窗、工作区浏览，一个不少。</p>
+<pre><code>手机 / 外网电脑 ──HTTPS──→ 云端中继（dsh-relay-cloud，一台 VPS）
+                              │  出站长连接干线（家端主动拨出）
+                              ▼
+                        家中 dsh（保持 127.0.0.1 回环绑定，零端口暴露）
+                        └─ dsh-relay-host 插件：进程内"隐形浏览器"，
+                           以回环身份复放全部请求
+</code></pre>
+<h2>它是如何工作的（Wire-Trunk 架构）</h2>
+<ul>
+<li><strong>家端是一个树外插件</strong>（~200 行，零构建）：它作为"dsh 进程里的隐形浏览器"，对本机 <code>127.0.0.1:3080</code> 发起与真实浏览器完全相同的协议连接（POST <code>/api/*</code> + 两条下行 WebSocket），并把它们原封不动复用到云端。</li>
+<li><strong>云端是纯转发面</strong>：对远端浏览器呈现与 dsh 原版逐字节一致的 wire；静态资源由家端实时上报、云端缓存——前端与宿主永远同版本，不存在协议漂移。</li>
+<li><strong>不修改 dsh 仓库任何一行代码</strong>：插件挂在 <code>~/.dsh/profiles/web/</code> 用户补丁层，<code>git pull</code>、自动更新、随时卸载互不干扰。</li>
+<li><strong>安全性</strong>：dsh 本身无认证层且特权方法钉死回环——本方案恰好让请求以回环身份进入，同时把认证（配对码 → 长期 Cookie）补在云端入口；家端零入站端口，天然穿 NAT。</li>
+</ul>
+<hr>
+<h2>完整部署教程</h2>
+<p>三个角色：<strong>云端</strong>（一台公网服务器）、<strong>家端</strong>（运行 dsh 的电脑）、<strong>远端</strong>（手机/任何浏览器）。按顺序做完约 15 分钟。</p>
+<h3>前置条件</h3>
+<table>
+<thead>
+<tr>
+<th>角色</th>
+<th>要求</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>云端</td>
+<td>公网 IP 的 Linux 服务器（1 核 1G 起步即可），能 SSH 登录，开放一个 TCP 端口（下文用 8443）</td>
+</tr>
+<tr>
+<td>家端</td>
+<td>已能运行 <code>dsh web</code>（默认 127.0.0.1:3080），Node ≥ 22</td>
+</tr>
+<tr>
+<td>远端</td>
+<td>任何现代浏览器</td>
+</tr>
+</tbody></table>
+<h3>第 1 步：准备凭据（家端电脑上执行）</h3>
+<p>生成两个强随机值，后面所有步骤都用它们：</p>
+<pre><code># 干线令牌（家端 ↔ 云端的身份凭证，32 位）
+node -e "console.log(require('crypto').randomBytes(24).toString('hex'))"
+# 记作 &lt;TOKEN&gt;，例如 9f86d081884c7d65...
+
+# 配对码（远端浏览器首次访问输入，8 位）
+node -e "console.log(require('crypto').randomBytes(4).toString('hex'))"
+# 记作 &lt;CODE&gt;，例如 a1b2c3d4
+</code></pre>
+<blockquote>
+<p>⚠️ 这两个值就是整套系统的钥匙，生成后妥善保存，不要提交进任何仓库。</p>
+</blockquote>
+<h3>第 2 步：部署云端</h3>
+<p>SSH 登录你的服务器：</p>
+<pre><code>ssh root@&lt;你的服务器IP&gt;
+</code></pre>
+<p><strong>2.1 安装 Node 22</strong>（已装可跳过；<code>node -v</code> 检查）：</p>
+<pre><code>ARCH=$(uname -m); case "$ARCH" in x86_64) NARCH=x64;; aarch64) NARCH=arm64;; esac
+curl -fsSL https://cdn.npmmirror.com/binaries/node/v22.14.0/node-v22.14.0-linux-$NARCH.tar.xz -o /tmp/node.tar.xz
+tar -xJf /tmp/node.tar.xz -C /opt
+ln -sfn /opt/node-v22.14.0-linux-$NARCH /opt/node
+ln -sf /opt/node/bin/node /usr/local/bin/node
+ln -sf /opt/node/bin/npm /usr/local/bin/npm
+node -v   # 应显示 v22.14.0
+</code></pre>
+<p><strong>2.2 获取代码并安装依赖</strong>：</p>
+<pre><code>git clone https://github.com/SunNull/dsh-relay.git /opt/dsh-relay
+cd /opt/dsh-relay/cloud
+npm install --registry=https://registry.npmmirror.com
+</code></pre>
+<p><strong>2.3 创建 systemd 常驻服务</strong>（把 <code>&lt;TOKEN&gt;</code>/<code>&lt;CODE&gt;</code> 换成第 1 步生成的值）：</p>
+<pre><code>cat &gt; /etc/systemd/system/dsh-relay.service &lt;&lt;EOF
+[Unit]
+Description=dsh-relay cloud
+After=network-online.target
+
+[Service]
+Environment=DSH_RELAY_BIND=0.0.0.0
+Environment=DSH_RELAY_PORT=8443
+Environment=DSH_RELAY_TOKEN=&lt;TOKEN&gt;
+Environment=DSH_RELAY_PAIRING_CODE=&lt;CODE&gt;
+WorkingDirectory=/opt/dsh-relay/cloud
+ExecStart=/usr/local/bin/node server.mjs
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload
+systemctl enable --now dsh-relay
+systemctl status dsh-relay        # 应为 active (running)
+curl -s http://127.0.0.1:8443/healthz   # 应返回 {"ok":true,...,"trunkReady":false}
+</code></pre>
+<blockquote>
+<p><code>trunkReady:false</code> 是正常的——家端还没连。</p>
+</blockquote>
+<p><strong>2.4 云防火墙/安全组放行 8443</strong>（TCP 入方向，源 0.0.0.0/0）：</p>
+<ul>
+<li><strong>阿里云/腾讯云</strong>：控制台 → 实例 → 安全组/防火墙 → 添加规则 TCP 8443</li>
+<li>服务器自身若开了 ufw：<code>ufw allow 8443/tcp</code></li>
+</ul>
+<p>在<strong>家端电脑</strong>浏览器打开 <code>http://&lt;服务器IP&gt;:8443/healthz</code> 验证，应返回 JSON——通了。</p>
+<h3>第 3 步：安装家端插件</h3>
+<p>在家端电脑（dsh 所在机器），两种安装方式。<strong>要管理面板 UI 请用方式 A</strong>；方式 B 功能等效但侧栏不出现面板入口（见其说明）。</p>
+<p><strong>方式 A：标准 bundle 安装</strong>（仓库声明 <code>dsh.bundle</code>，一条命令挂载；管理面板 UI 依赖此方式的 <code>dsh.client</code> 发现机制）：</p>
+<pre><code>dsh plugin --profile web add "github:SunNull/dsh-relay"
+</code></pre>
+<p>然后在 <code>~/.dsh/profiles/web/cordis.patch.yml</code> 追加干线配置（bundle 层不携带凭据，用户层覆盖）：</p>
+<pre><code>- id: dsh-relay-host
+  config:
+    relayUrl: ws://&lt;你的服务器IP&gt;:8443/trunk
+    token: &lt;TOKEN&gt;
+</code></pre>
+<p><strong>方式 B：安装器一条龙</strong>（克隆仓库并自动写好配置）：</p>
+<pre><code>git clone https://github.com/SunNull/dsh-relay.git
+cd dsh-relay
+node install.mjs --relay-url ws://&lt;你的服务器IP&gt;:8443/trunk --token &lt;TOKEN&gt;
+</code></pre>
+<p>安装器会：</p>
+<ol>
+<li>把插件的三个文件（<code>index</code>/<code>admin</code>/<code>client</code>）平铺复制到 <code>~/.dsh/profiles/web/plugins/</code>（<code>index.mjs</code> 以相对路径导入 <code>./admin.mjs</code>，三者必须同目录）</li>
+<li>在 <code>~/.dsh/profiles/web/cordis.patch.yml</code> 追加托管配置块（dsh 的补丁层<strong>热生效</strong>）</li>
+</ol>
+<blockquote>
+<p>方式 B 说明：中继与管理路由完整可用，但 dsh web <strong>侧栏不会出现「中继管理」入口</strong>——client 面板要走 bundle 的 <code>dsh.client</code> 发现机制（方式 A）。需要面板 UI 请改装方式 A。</p>
+</blockquote>
+<p>两种方式都需要<strong>重启一次 dsh web</strong>（模块代码需要进程加载；之后仅改配置不再需要重启）。卸载：方式 A 用 <code>dsh plugin --profile web remove dsh-relay-host</code>，方式 B 用 <code>node install.mjs --uninstall</code>。</p>
+<pre><code># 停掉现有 dsh web，重新启动，例如：
+pnpm dsh web
+</code></pre>
+<p><strong>验证干线已连</strong>——在服务器上执行：</p>
+<pre><code>curl -s http://127.0.0.1:8443/healthz
+# "trunkReady":true 即成功；false 则检查插件配置与令牌是否一致
+</code></pre>
+<h3>第 4 步：远端访问</h3>
+<p>手机（或任何设备）浏览器打开：</p>
+<pre><code>http://&lt;你的服务器IP&gt;:8443
+</code></pre>
+<ol>
+<li>首次出现配对页 → 输入 <code>&lt;CODE&gt;</code> → 点"配对"</li>
+<li>自动进入完整 dsh 界面（与家中电脑一模一样：会话、模型、工作区全同步）</li>
+<li>建议"添加到主屏幕"，即得类原生 App 体验</li>
+</ol>
+<p>多台设备重复第 4 步即可（默认上限 10 台，见环境变量）。</p>
+<h3>第 5 步（强烈推荐）：远程可选工作区</h3>
+<p>dsh 默认在宿主桌面弹<strong>原生目录选择框</strong>，远程设备看不到。追加此补丁让所有人走<strong>网页内目录浏览</strong>：</p>
+<p>编辑 <code>~/.dsh/profiles/web/cordis.patch.yml</code>，在末尾追加：</p>
+<pre><code>- id: directory-picker
+  disabled: true
+- insert:
+    - id: directory-picker-browse-host
+      name: '@deepseek-ai/dsh-host-directory-picker-browse'
+    - id: directory-picker-browse-ui
+      name: '@deepseek-ai/dsh-client-ui-directory-picker-browse'
+</code></pre>
+<p>保存即热生效（这是 dsh 官方为远程部署场景设计的标准换法）。之后"添加工作区"会打开网页目录浏览器，手机上可任意选择家中路径。</p>
+<h3>第 6 步（可选但强烈建议）：HTTPS</h3>
+<p>明文 HTTP 有被运营商劫持/窃听风险。有一个域名即可上自动 HTTPS：</p>
+<pre><code># 服务器上安装 Caddy（以官方 apt 源为例）
+apt install -y debian-keyring debian-archive-keyring apt-transport-https curl
+curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' | gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
+curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' | tee /etc/apt/sources.list.d/caddy-stable.list
+apt update &amp;&amp; apt install caddy
+</code></pre>
+<p>把 DNS A 记录指向服务器 IP，然后：</p>
+<pre><code>cp /opt/dsh-relay/cloud/Caddyfile.template /etc/caddy/Caddyfile
+# 编辑文件，把 dsh.example.com 换成你的域名
+nano /etc/caddy/Caddyfile
+systemctl reload caddy
+</code></pre>
+<p>之后用 <code>https://&lt;你的域名&gt;</code> 访问；家端重新指向（热生效，无需重启 dsh）：</p>
+<pre><code>cd dsh-relay
+node install.mjs --relay-url wss://&lt;你的域名&gt;/trunk --token &lt;TOKEN&gt;
+</code></pre>
+<hr>
+<h2>管理面板</h2>
+<p>dsh web 侧栏的 <strong>⚙ 中继管理</strong> 入口打开内置管理面板——本机直连和经中继配对的远程浏览器都能用，也就是说<strong>躺在沙发上用手机就能管</strong>。</p>
+<p>四个区域：</p>
+<ol>
+<li><strong>状态卡</strong>：干线在线状态、桥接下行数、缓存条数、云端运行时长</li>
+<li><strong>设备表</strong>：每台已配对设备的备注/配对时间/最后活跃，逐台剔除（立即吊销其 Cookie 并断开活动连接），或一键"全部剔除"</li>
+<li><strong>配对码表</strong>：多枚带备注的配对码——新增、点击显示码值、启用/停用、换值、删除</li>
+<li><strong>审计</strong>：云端操作尾部记录（配对成败、剔除、码管理等）</li>
+</ol>
+<p>安全模型一句话：<strong>管理权跟随 dsh web 的可达性</strong>——谁能打开你的 dsh web，谁就能管理中继；手机丢了，从家里电脑或任何其他已配对设备上把它剔除即可。</p>
+<blockquote>
+<p>升级要求：面板功能需要<strong>云端与家端插件同时更新</strong>到 0.2.0+（家端重跑 <code>dsh plugin --profile web add "github:SunNull/dsh-relay"</code> 或 <code>node install.mjs</code>，随后重启 dsh web）。</p>
+</blockquote>
+<hr>
+<h2>日常运维</h2>
+<table>
+<thead>
+<tr>
+<th>操作</th>
+<th>命令/位置</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>查看云端状态与审计</td>
+<td>配对后访问 <code>http://&lt;服务器&gt;:8443/__relay</code>（JSON）</td>
+</tr>
+<tr>
+<td>健康检查</td>
+<td><code>curl http://&lt;服务器&gt;:8443/healthz</code>（无需认证）</td>
+</tr>
+<tr>
+<td>云端日志</td>
+<td><code>journalctl -u dsh-relay -f</code></td>
+</tr>
+<tr>
+<td>踢掉某台/所有已配对设备</td>
+<td>dsh web 侧栏「中继管理」面板直接剔除（无需 SSH；见上文<a href="#%E7%AE%A1%E7%90%86%E9%9D%A2%E6%9D%BF">管理面板</a>）</td>
+</tr>
+<tr>
+<td>更新云端代码</td>
+<td><code>cd /opt/dsh-relay &amp;&amp; git pull &amp;&amp; systemctl restart dsh-relay</code>（各版本变化见 <a href="https://github.com/SunNull/dsh-relay/blob/HEAD/CHANGELOG.md">CHANGELOG</a>）</td>
+</tr>
+<tr>
+<td>卸载家端插件</td>
+<td>家端：<code>node install.mjs --uninstall</code>（再删掉仓库目录即完全清除）</td>
+</tr>
+<tr>
+<td>家端 dsh 重启后</td>
+<td>无需任何操作——插件自动重连云端（断线指数退避重试）</td>
+</tr>
+</tbody></table>
+<h2>云端环境变量</h2>
+<table>
+<thead>
+<tr>
+<th>变量</th>
+<th>默认</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>DSH_RELAY_PORT</code></td>
+<td>3081</td>
+<td>监听端口</td>
+</tr>
+<tr>
+<td><code>DSH_RELAY_BIND</code></td>
+<td>127.0.0.1</td>
+<td>绑定地址；公网部署设 0.0.0.0</td>
+</tr>
+<tr>
+<td><code>DSH_RELAY_TOKEN</code></td>
+<td>dev-token</td>
+<td>家端干线令牌（与插件 config.token 一致）</td>
+</tr>
+<tr>
+<td><code>DSH_RELAY_PAIRING_CODE</code></td>
+<td>随机生成并打印</td>
+<td>浏览器配对码；建议显式设置</td>
+</tr>
+<tr>
+<td><code>DSH_RELAY_STATE</code></td>
+<td>./relay-state.json</td>
+<td>设备令牌 + 审计日志持久化文件</td>
+</tr>
+<tr>
+<td><code>DSH_RELAY_MAX_TOKENS</code></td>
+<td>10</td>
+<td>最多配对设备数</td>
+</tr>
+<tr>
+<td><code>DSH_RELAY_MAX_WS</code></td>
+<td>16</td>
+<td>并发浏览器 WebSocket 上限</td>
+</tr>
+<tr>
+<td><code>DSH_RELAY_BLOCK_PRIVILEGED</code></td>
+<td>0</td>
+<td><code>1</code> = 云端拦截设置/凭据等特权方法（更保守）</td>
+</tr>
+<tr>
+<td><code>DSH_RELAY_HEARTBEAT_MS</code></td>
+<td>20000</td>
+<td>干线与浏览器下行连接的心跳周期（毫秒）。浏览器错过一个整周期的 pong 即判定为死连接断开（前端会自动重连并重放基线），心跳流量同时防止 NAT 空闲超时</td>
+</tr>
+</tbody></table>
+<h2>验收测试（probe/）</h2>
+<p>部署完成后跑一遍，确保全链路健康：</p>
+<pre><code># 1) 干线三要素（静态/RPC/WS 桥），在任意机器：
+node probe/e2e-probe.mjs   # 先编辑脚本顶部 BASE 为你的服务器地址
+
+# 2) 浏览器全流程（配对→UI→WS），需 pip install playwright &amp;&amp; playwright install chromium：
+DSH_RELAY_BASE=http://&lt;服务器&gt;:8443 DSH_RELAY_PAIRING_CODE=&lt;CODE&gt; python probe/browser-acceptance-m1.py
+</code></pre>
+<h2>安全须知（务必阅读）</h2>
+<ul>
+<li><strong>配对码即钥匙</strong>：通过配对的设备 ≈ 坐在你家电脑前使用 dsh（能聊天、跑命令、看文件）。公网部署必须用强配对码 + HTTPS。</li>
+<li><strong>特权面提醒</strong>：远程默认可访问 dsh 的设置/凭据面。保守起见可设 <code>DSH_RELAY_BLOCK_PRIVILEGED=1</code>（远端将无法改设置/看凭据，聊天与文件功能不受影响）。</li>
+<li>云端零业务落盘：<code>relay-state.json</code> 只存设备令牌与审计计数，<strong>不含任何会话内容</strong>。</li>
+<li>令牌轮换：换 <code>&lt;TOKEN&gt;</code> 需同步改云端 systemd 环境 + 家端重跑 <code>install.mjs --token</code>。</li>
+</ul>
+<h2>故障排查</h2>
+<table>
+<thead>
+<tr>
+<th>症状</th>
+<th>原因与解法</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>手机打开显示"家端不在线"</td>
+<td>家端 dsh 没跑 / 插件没连上。服务器 <code>curl localhost:8443/healthz</code> 看 <code>trunkReady</code>；false 则查家端配置与网络</td>
+</tr>
+<tr>
+<td>配对提示"设备数已达上限"</td>
+<td>之前测试占满 10 坑。在「中继管理」面板"全部剔除"后重新配对</td>
+</tr>
+<tr>
+<td><strong>忘记配对码</strong></td>
+<td>在 dsh web「中继管理」面板中点击码值即显示；0.2.0 之前部署的实例可读云端 <code>relay-state.json</code>（或 systemd 单元/启动日志中的旧值）</td>
+</tr>
+<tr>
+<td><strong>更换配对码</strong></td>
+<td>在面板中对目标码<strong>换值</strong>（或删除后新建）。注意：改 systemd 里的 <code>DSH_RELAY_PAIRING_CODE</code> 再重启<strong>不会</strong>轮换已有配对码——状态文件存在时环境变量只在首次播种配对码表，旧码继续有效；要作废某码请用面板的换值/停用/删除</td>
+</tr>
+<tr>
+<td>首次打开很慢（10-20 秒）</td>
+<td>正常：云端冷缓存逐个拉取静态资源，第二遍起快</td>
+</tr>
+<tr>
+<td>远程"添加工作区"无反应</td>
+<td>没做第 5 步补丁（原生弹窗弹在了家里屏幕上）</td>
+</tr>
+<tr>
+<td>界面空白/一直转圈</td>
+<td>先强刷新/清缓存；再跑 probe 脚本定位是静态、RPC 还是 WS 环节</td>
+</tr>
+</tbody></table>
+<h2>已知限制</h2>
+<ul>
+<li>HTTP 响应整包缓冲（SSE 下载流除外），超大导出需等待完整传输</li>
+<li>dsh web 协议无版本协商（client/host 同船发布）——前端由家端上报天然同版本；dsh 大版本升级后建议全链路回归跑一遍 probe</li>
+<li>家端插件模块更新需重启 dsh web（补丁配置热生效，模块代码不热替换）</li>
+</ul>
+<h2>适用版本</h2>
+<p>基于 DeepSeek Harness <code>0.1.0-rc.5</code>（2026-08）验证。dsh 处于 developer preview，wire 变化时以 probe 验收为准。</p>
+<h2>License</h2>
+<p><a href="https://github.com/SunNull/dsh-relay/blob/HEAD/LICENSE">MIT</a></p>

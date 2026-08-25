@@ -1,0 +1,151 @@
+<h1>dsh-cron-scheduler</h1>
+<p><strong>系统级 cron 定时任务插件 for DeepSeek Harness</strong>：规则存为 <strong>Cron 表达式</strong>，由用户机器的 <strong>crontab 在进程外执行 headless 任务</strong>，Web 端负责规则管理、部署与结果归类。</p>
+<ul>
+<li>定时执行不依赖 DSH Web 进程存活（机器开机 + cron 即可跑）</li>
+<li>支持完整 5 字段 Cron 表达式 + <code>@reboot/@daily/@hourly/@weekly/@monthly</code></li>
+<li>每次运行都是全新 root Agent + Session，结果自动挂到规则所属工作区，聊天里点开即见</li>
+<li>Web 设置页 + Agent 工具双入口管理</li>
+</ul>
+<blockquote>
+<p>社区插件，非 DeepSeek 官方产品。</p>
+</blockquote>
+<h2>架构</h2>
+<pre><code>系统 crontab（唯一调度器，支持任意 Cron 表达式）
+   └─ wrapper 脚本（每规则一个，~/.dsh/cron-scheduler/wrappers/&lt;id&gt;.sh）
+        ├─ 设置 DSH_PERMISSION_MODE（read-only / workspace-write 沙箱）
+        ├─ 写运行 manifest（queued→running→succeeded/failed/skipped）
+        ├─ cd 到规则工作区
+        └─ dsh --profile headless "[dsh-cron:task=&lt;id&gt;] &lt;名称&gt;\n\n&lt;prompt&gt;"
+              └─ 全新持久会话（cwd=工作区，首条消息带 task 标记）
+Web 端（dsh-cron-scheduler host 插件）
+   ├─ 规则 CRUD → 同步 crontab marked block + wrapper
+   ├─ 会话监听器：扫描新会话 → 匹配 task 标记 → attach 到工作区 + 回填 sessionId/摘要
+   └─ RPC + agent 工具（automation_*）
+</code></pre>
+<h3>数据位置</h3>
+<table>
+<thead>
+<tr>
+<th>内容</th>
+<th>路径</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>规则定义</td>
+<td><code>~/.dsh/cron-scheduler/definitions/&lt;id&gt;.json</code></td>
+</tr>
+<tr>
+<td>wrapper 脚本</td>
+<td><code>~/.dsh/cron-scheduler/wrappers/&lt;id&gt;.sh</code></td>
+</tr>
+<tr>
+<td>任务文本</td>
+<td><code>~/.dsh/cron-scheduler/tasks/&lt;id&gt;.txt</code></td>
+</tr>
+<tr>
+<td>运行记录</td>
+<td><code>~/.dsh/cron-scheduler/runs/&lt;runId&gt;.json</code></td>
+</tr>
+<tr>
+<td>运行日志</td>
+<td><code>~/.dsh/cron-scheduler/logs/&lt;id&gt;.log</code></td>
+</tr>
+<tr>
+<td>并发锁</td>
+<td><code>~/.dsh/cron-scheduler/locks/&lt;id&gt;.lock</code></td>
+</tr>
+</tbody></table>
+<p>crontab 中插件管理的条目位于明确的标记块内：</p>
+<pre><code># &gt;&gt;&gt; dsh-cron-scheduler managed block &gt;&gt;&gt;
+0 9 * * 1-5 /bin/bash /Users/you/.dsh/cron-scheduler/wrappers/task-abc123.sh &gt;&gt; /Users/you/.dsh/cron-scheduler/logs/task-abc123.log 2&gt;&amp;1
+# &lt;&lt;&lt; dsh-cron-scheduler managed block &lt;&lt;&lt;
+</code></pre>
+<h2>安装（一条命令，零配置）</h2>
+<p><strong>方式 A：npm 发布版</strong>（发布后）</p>
+<pre><code>dsh plugin --profile web add @mappedinfo/dsh-cron-scheduler
+</code></pre>
+<p><strong>方式 B：Git 仓库直装</strong>（无需发布）</p>
+<pre><code>dsh plugin --profile web add github:Mappedinfo/dsh-cron-scheduler
+</code></pre>
+<p><strong>方式 C：本地源码 + 一键脚本</strong></p>
+<pre><code>git clone https://github.com/Mappedinfo/dsh-cron-scheduler.git
+cd dsh-cron-scheduler &amp;&amp; ./scripts/install.sh        # 构建 + 安装 + 提示，默认 web profile
+</code></pre>
+<p>装完<strong>重启 DSH Web 并硬刷新浏览器</strong>即可，无需任何手工配置：设置 → 定时任务 出现管理页，侧边栏工作区树自动出现每次运行的会话。</p>
+<blockquote>
+<p><code>dsh plugin add</code> 会自动把插件的 bundle 层（cordis.patch.yml）和客户端模块（<code>dsh.client</code> → <code>lib/client.js</code>）注册进 profile，这是 DSH 的官方插件安装通道。</p>
+</blockquote>
+<h2>使用</h2>
+<ul>
+<li><strong>设置 → 定时任务</strong>：新建（名称 / Cron 表达式或预设 / 任务说明 / 工作区 / 权限）、编辑、暂停/恢复、立即运行、删除；下方为运行历史（排队中/运行中/成功/失败/跳过 + 结果会话）。</li>
+<li><strong>对话里</strong>：告诉 agent「每天 9 点运行 &lt;任务&gt;」，agent 会用 <code>automation_create</code> 创建（同样支持 <code>automation_list / automation_runs / automation_update / automation_run_now / automation_delete</code>）。</li>
+</ul>
+<h3>Cron 语法</h3>
+<p>5 字段：<code>分 时 日 月 周</code>。支持：</p>
+<ul>
+<li><code>*</code> 任意；<code>a-b</code> 范围；<code>*/n</code> 与 <code>a-b/n</code> 步长；<code>a,b,c</code> 列表</li>
+<li>月份/星期名称：<code>JAN-DEC</code>、<code>MON-SUN</code>（不区分大小写；星期 <code>0/7</code> = 周日）</li>
+<li>快捷：<code>@reboot</code>、<code>@daily</code>、<code>@hourly</code>、<code>@weekly</code>、<code>@monthly</code>、<code>@yearly</code></li>
+</ul>
+<p>示例：<code>0 9 * * 1-5</code>（工作日 9:00）、<code>*/15 * * * *</code>（每 15 分钟）、<code>0 9 1 * *</code>（每月 1 日 9:00）。</p>
+<p>时区以<strong>系统时区</strong>解释（cron 行为）；不支持秒级精度。</p>
+<h2>配置（一般不需要动）</h2>
+<table>
+<thead>
+<tr>
+<th>配置</th>
+<th>默认</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>profile</code></td>
+<td><code>headless</code></td>
+<td>wrapper 使用的 headless profile 名</td>
+</tr>
+<tr>
+<td><code>pollSeconds</code></td>
+<td><code>10</code></td>
+<td>会话监听器轮询间隔</td>
+</tr>
+<tr>
+<td><code>historyLimit</code></td>
+<td><code>100</code></td>
+<td>每规则保留的运行记录数</td>
+</tr>
+<tr>
+<td><code>dshCommand</code></td>
+<td>自动解析</td>
+<td>显式覆盖 wrapper 用的 dsh 命令（极少需要）</td>
+</tr>
+</tbody></table>
+<h3>dsh 命令自动解析（零配置）</h3>
+<p>wrapper 在 cron 环境下执行、PATH 极简，所以插件在生成 wrapper 时会在 <strong>dsh web 进程内</strong>按链自动解析 dsh：</p>
+<ol>
+<li><code>config.dshCommand</code>（显式覆盖）</li>
+<li><code>$DSH_BIN</code> 环境变量</li>
+<li><code>command -v dsh</code>（PATH 全局安装）</li>
+<li><strong>从当前进程推导 + 自动生成 shim</strong>：读取 <code>process.argv[1]</code>（<code>lib/bin.js</code> 或 dev 模式的 <code>src/bin.ts</code>），在 <code>~/.dsh/cron-scheduler/bin/dsh</code> 生成 <code>exec &lt;node&gt; &lt;cli入口&gt; "$@"</code> shim——覆盖 <code>pnpm dsh web</code>、源码 checkout、npm 全局安装等常见方式</li>
+<li>兜底 <code>dsh</code> + 设置页告警</li>
+</ol>
+<p>设置页顶部会显示解析到的命令与来源（config / DSH_BIN / PATH / 自动 shim / 兜底）。<code>@reboot</code> 任务在下次登录时执行。</p>
+<h2>权限与安全</h2>
+<ul>
+<li>每条规则可选 <code>read-only</code>（默认）或 <code>workspace-write</code> 沙箱，通过 wrapper 的 <code>DSH_PERMISSION_MODE</code> 生效；不提供 full-access。</li>
+<li>同一规则同时只允许一个运行：并发触发（cron 与手动叠加）自动记为 <code>skipped</code>。</li>
+<li>运行历史保留用于审计；删除规则不影响历史。</li>
+<li>会话标记（首条消息 <code>[dsh-cron:task=&lt;id&gt;]</code>）用于回挂，属"不可信内容"，不会注入指令。</li>
+</ul>
+<h2>已知限制</h2>
+<ul>
+<li>结果归属是<strong>最终一致</strong>的：Web 进程在运行期间轮询并 attach 会话；Web 未启动时运行照常完成，重启 Web 后会话会被补挂。</li>
+<li>会话标题目前是自动生成（含标记前缀）；自定义标题是后续增强。</li>
+<li>模型/预设为 headless 默认；按规则选择模型尚未实现。</li>
+</ul>
+<h2>开发</h2>
+<pre><code>pnpm install
+pnpm check      # typecheck + build
+node scripts/dev-test.mjs   # cron 校验 + wrapper 全链路自测（不碰真实 crontab）
+</code></pre>
+<h2>License</h2>
+<p>MIT</p>

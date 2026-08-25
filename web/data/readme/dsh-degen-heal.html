@@ -1,0 +1,887 @@
+<h1>@dsh-external/llm-degen-heal</h1>
+<blockquote>
+<p><strong>Detect and self-heal LLM output degeneration loops inside a DeepSeek Harness agent session.</strong>
+<strong>检测并自愈 DeepSeek Harness 代理会话中的 LLM 输出退化循环。</strong></p>
+</blockquote>
+<p>Plugin-only implementation: hooks documented harness extension points, never edits core routing / session / serialize logic. Pure fail-open design — it cannot deadlock itself.
+纯插件实现：挂接 Harness 文档化的扩展点，不修改任何核心 routing / session / serialize 逻辑。纯 fail-open 设计——自身不可能陷入死锁。</p>
+<hr>
+<h2>Table of Contents / 目录</h2>
+<ol>
+<li><a href="#application-scenario--%E5%BA%94%E7%94%A8%E5%9C%BA%E6%99%AF">Application Scenario / 应用场景</a></li>
+<li><a href="#architecture--extension-points--%E6%9E%B6%E6%9E%84%E4%B8%8E%E6%8E%A5%E7%BA%BF%E7%82%B9">Architecture &amp; Extension Points / 架构与接线点</a></li>
+<li><a href="#detection-signals--%E8%A7%A6%E5%8F%91%E8%A7%84%E5%88%99">Detection Signals / 触发规则</a></li>
+<li><a href="#self-healing-actions--%E8%87%AA%E6%84%88%E5%8A%A8%E4%BD%9C">Self-Healing Actions / 自愈动作</a></li>
+<li><a href="#state-machine--safety--%E7%8A%B6%E6%80%81%E6%9C%BA%E4%B8%8E%E5%AE%89%E5%85%A8">State Machine &amp; Safety / 状态机与安全</a></li>
+<li><a href="#configuration--%E9%85%8D%E7%BD%AE">Configuration / 配置</a></li>
+<li><a href="#diagnostics--%E8%AF%8A%E6%96%AD">Diagnostics / 诊断</a></li>
+<li><a href="#installation--%E5%AE%89%E8%A3%85">Installation / 安装</a></li>
+<li><a href="#testing--%E9%AA%8C%E6%94%B6%E8%87%AA%E6%B5%8B">Testing / 验收自测</a></li>
+<li><a href="#known-limitations--%E5%B7%B2%E7%9F%A5%E9%99%90%E5%88%B6">Known Limitations / 已知限制</a></li>
+<li><a href="#license--%E8%AE%B8%E5%8F%AF%E8%AF%81">License / 许可证</a></li>
+</ol>
+<hr>
+<h2>Application Scenario / 应用场景</h2>
+<p>Long agent sessions — filled with tool result logs, CMake/build output, large snapshots — push the model into a <strong>degeneration loop</strong> at the tail:</p>
+<p>长代理会话中，上下文被工具输出、CMake 日志、快照等内容塞满后，模型在收尾阶段容易陷入<strong>退化循环</strong>：</p>
+<ul>
+<li>consecutive turns emit meaningless short fragments (<code>Let me commit / Execute / Now / 跑</code>…) without ever issuing a tool call;
+连续多轮只输出无意义短碎词（"Let me commit / Execute / Now / 跑" 等），从不真正发出工具调用；</li>
+<li>"calls" often arrive with missing arguments (argument JSON truncated into fragments).
+偶有"调用"也常缺参数（JSON 被碎词截断）。</li>
+</ul>
+<p>This is the classic <em>degenerate repetition</em> failure mode. The plugin detects it in-stream, self-heals with corrective injection / bounded retry, and (if escalation keeps failing) fail-opens into a per-session lockout so it can never trap a session in a retry loop.</p>
+<p>这是典型的<strong>退化重复</strong>失效模式。本插件在流式输出中实时检测，通过修正注入 / 有界重试来自愈；若升级仍然失败，则对当前会话进入 fail-open lockout，确保不会把会话锁死在重试循环里。</p>
+<h3>When You Need This Plugin / 何时需要</h3>
+<table>
+<thead>
+<tr>
+<th>Situation / 场景</th>
+<th>Without plugin / 无插件</th>
+<th>With plugin / 有插件</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>Model emits 20× "Let me commit" then stops / 模型连发 20 次 "Let me commit" 后卡死</td>
+<td>User must manually intervene / 用户手动中断</td>
+<td>Auto-detected → corrective message + retry / 自动检测 → 修正注入 + 重试</td>
+</tr>
+<tr>
+<td>Alternating pair loop "OK. OK. OK. OK." / 交替对循环 "OK. OK. OK."</td>
+<td>Wastes tokens until context overflow / 耗尽 token 才停</td>
+<td>Interrupt on 2nd trigger, temperature adjusted / 第 2 次触发即中断并调整 temperature</td>
+</tr>
+<tr>
+<td>Model prints "我的思路是…" as visible output / 模型把"我的思路是…"当作可见输出</td>
+<td>Leaked reasoning pollutes response / 推理内容泄漏到回复</td>
+<td><code>leak-out</code> detected → injected steer message / 检测到泄漏 → 注入引导消息</td>
+</tr>
+<tr>
+<td>3+ idle turns with no tool calls / 3+ 个空转 turn 无工具调用</td>
+<td>Session stuck forever / 会话永久卡住</td>
+<td>Idle meter forces a tool-call steer / 空转仪表强制工具调用引导</td>
+</tr>
+</tbody></table>
+<hr>
+<h2>Architecture &amp; Extension Points / 架构与接线点</h2>
+<h3>Plugin Identity / 插件标识</h3>
+<pre><code>name:    '@dsh-external/llm-degen-heal'
+inject:  ['agents', 'sessions']
+</code></pre>
+<p>The plugin consumes two Cordis services:
+插件消费两个 Cordis 服务：</p>
+<ul>
+<li><code>agents</code> — to access the current <code>Agent</code>, its <code>Session</code>, and to call <code>agent.steer()</code> for idle-meter injection.
+访问当前 <code>Agent</code>、其 <code>Session</code>，并通过 <code>agent.steer()</code> 注入空转仪表引导。</li>
+<li><code>sessions</code> — to resolve live sessions by id for event logging (<code>session.append</code>).
+按 id 解析活跃会话，记录事件（<code>session.append</code>）。</li>
+</ul>
+<h3>Harness Extension Points Used / 使用的 Harness 扩展点</h3>
+<p>The plugin registers listeners on <strong>six</strong> documented harness waterfall / serial events:
+插件在 <strong>六个</strong> 文档化的 Harness waterfall / 串行事件上注册监听器：</p>
+<table>
+<thead>
+<tr>
+<th>Event / 事件</th>
+<th>Type / 类型</th>
+<th>Purpose / 用途</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>llm/stream</code></td>
+<td>waterfall</td>
+<td>Per-chunk tokenization, rolling window update, in-stream classification, escalate-interrupt</td>
+</tr>
+<tr>
+<td><code>agent/pre-step</code></td>
+<td>waterfall</td>
+<td>Idle-turn aggregation, corrective message injection (once per epoch)</td>
+</tr>
+<tr>
+<td><code>agent/request</code></td>
+<td>waterfall</td>
+<td>Temperature rewrite (once per epoch, optional)</td>
+</tr>
+<tr>
+<td><code>agent/request-error</code></td>
+<td>waterfall</td>
+<td>Bounded retry for <code>LLM_DEGENERATION</code> interrupt finish reason</td>
+</tr>
+<tr>
+<td><code>agent/turn-stopping</code></td>
+<td>serial</td>
+<td>Idle-turn meter: escalate when consecutive idle turns exceed threshold</td>
+</tr>
+<tr>
+<td><code>ctx.tools.register</code></td>
+<td>injection</td>
+<td>Register <code>dev_loop_status</code> diagnostic tool</td>
+</tr>
+</tbody></table>
+<p>Plus one lifecycle hook:
+外加一个生命周期钩子：</p>
+<table>
+<thead>
+<tr>
+<th>Hook / 钩子</th>
+<th>Purpose / 用途</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>ctx.effect(() =&gt; cleanup)</code></td>
+<td>Clear all process-local state on fiber dispose</td>
+</tr>
+</tbody></table>
+<h3>Internal Module Structure / 内部模块结构</h3>
+<pre><code>src/
+  index.ts      — Plugin entry: listeners + tool registration (497 lines)
+  detect.ts     — Pure detection primitives: tokenize, classifyWindow, assessTurn (297 lines)
+  state.ts      — Per-session state machine: epoch, cooldown, lockout, ring (153 lines)
+  validate.ts   — Fail-loud config validation (65 lines)
+lib/            — tsc build output (entry points mirror src/)
+</code></pre>
+<table>
+<thead>
+<tr>
+<th>Module / 模块</th>
+<th>Dependencies / 依赖</th>
+<th>Purity / 纯度</th>
+<th>Testability / 可测性</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>detect.ts</code></td>
+<td>None (pure functions) / 无（纯函数）</td>
+<td>100% pure / 纯函数</td>
+<td>Unit-testable standalone / 可独立单测</td>
+</tr>
+<tr>
+<td><code>state.ts</code></td>
+<td><code>detect.ts</code> types only / 仅类型</td>
+<td>Pure state transitions / 纯状态转换</td>
+<td>Unit-testable standalone / 可独立单测</td>
+</tr>
+<tr>
+<td><code>validate.ts</code></td>
+<td>None / 无</td>
+<td>Pure validation / 纯校验</td>
+<td>Unit-testable standalone / 可独立单测</td>
+</tr>
+<tr>
+<td><code>index.ts</code></td>
+<td>cordis Context + all above / cordis + 以上全部</td>
+<td>Event-driven / 事件驱动</td>
+<td>Self-test with fake adapter / 自测用 fake adapter</td>
+</tr>
+</tbody></table>
+<hr>
+<h2>Detection Signals / 触发规则</h2>
+<p>Four independent signals feed a per-session rolling token window (default 256 tokens). A signal fires only on a <strong>true run</strong> — global frequency and scattered bigrams in ordinary CJK prose are explicitly excluded.</p>
+<p>四个独立信号作用于每会话的滚动 token 窗口（默认 256 token）。信号仅在<strong>真正的连续重复</strong>时触发——全局频率和普通中文语篇中的离散共现被明确排除。</p>
+<h3>Signal 1: Token Loop (<code>tokenLoop</code>) / 碎词循环</h3>
+<p>A consecutive run of the same short token (≤ <code>shortTokenMaxLen</code> chars, default 32) ≥ <code>repeatThreshold</code> (default 8).</p>
+<p>同一短词（≤ <code>shortTokenMaxLen</code> 字符，默认 32）连续出现 ≥ <code>repeatThreshold</code> 次（默认 8）触发。</p>
+<p><strong>Examples that trigger / 触发示例：</strong></p>
+<ul>
+<li><code>跑跑跑跑跑跑跑跑</code> (8×)</li>
+<li><code>OK OK OK OK OK OK OK OK</code> (8×)</li>
+<li><code>Execute Execute Execute Execute Execute Execute Execute Execute</code> (8×)</li>
+</ul>
+<p><strong>Examples that do NOT trigger / 不触发示例：</strong></p>
+<ul>
+<li><code>的的的的的的的的</code> in normal Chinese prose — <code>的</code> is a function word appearing naturally; <strong>but</strong> <code>跑跑跑…</code> does trigger because it is a content word repeated unnaturally.
+正常中文中的 <code>的的的的的的的的</code>——<code>的</code> 是自然出现的高频虚词；但 <code>跑跑跑…</code> 作为实词 unnatural 重复会触发。</li>
+<li>scattered occurrences of <code>的</code> across a long window — not a consecutive run.
+长窗口中离散散布的 <code>的</code>——不是连续 run。</li>
+</ul>
+<h3>Signal 2: Alternating Pair Loop (<code>pairLoop</code>) / 交替对循环</h3>
+<p>Consecutive strict alternation <code>A B A B A B…</code> of two distinct short tokens, with run length ≥ <code>2 × repeatThreshold − 1</code> (default 15 tokens = 7½ pairs).</p>
+<p>两个不同短词的严格交替 <code>A B A B A B…</code>，run 长度 ≥ <code>2 × repeatThreshold − 1</code>（默认 15 token = 7.5 对）触发。</p>
+<p><strong>Examples that trigger / 触发示例：</strong></p>
+<ul>
+<li><code>高 的 高 的 高 的 高 的 高 的 高 的 高 的 高 的 高</code> (15 tokens, 7 pairs)</li>
+<li><code>OK . OK . OK . OK . OK . OK . OK . OK . OK . OK . OK . OK . OK . OK</code> (15 tokens)</li>
+</ul>
+<p><strong>Examples that do NOT trigger / 不触发示例：</strong></p>
+<ul>
+<li>Scattered bigrams in prose like "高的评价是高的标准" — not a strict alternating run.
+语篇中的离散共现如 "高的评价是高的标准"——不是严格交替 run。</li>
+</ul>
+<h3>Signal 3: Entropy Drop (<code>entropyDrop</code>) / 熵骤降</h3>
+<p><code>unique-tokens / total-tokens &lt; entropyRatio</code> (default 0.35) <strong>AND</strong> the window shows no structure (no code fences, no list bullets, no numbered lines, no newlines).</p>
+<p><code>unique-tokens / total-tokens &lt; entropyRatio</code>（默认 0.35）<strong>且</strong>窗口无结构（无代码围栏、无列表标记、无编号行、无换行）触发。</p>
+<p>This catches the case where the model has collapsed to emitting the same 1-2 tokens every call — unique ratio collapses but the window is too short to register as a token-loop.</p>
+<p>这捕获模型每次调用只输出相同 1-2 个 token 的情况——unique ratio 崩溃但窗口长度不足以注册为 token-loop。</p>
+<h3>Signal 4: Leak-Out (<code>leakOut</code>) / 思维泄漏</h3>
+<p>A configurable set of marker phrases (defaults include both English and Chinese planning language) hits ≥ <code>leakThreshold</code> (default 2) times in the window.</p>
+<p>可配置的标记短语集合（默认同时包含英文和中文规划语言）在窗口中命中 ≥ <code>leakThreshold</code> 次（默认 2）触发。</p>
+<p><strong>Default markers / 默认标记：</strong></p>
+<table>
+<thead>
+<tr>
+<th>English / 英文</th>
+<th>Chinese / 中文</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>let me think</code></td>
+<td><code>我思考一下</code></td>
+</tr>
+<tr>
+<td><code>let me start</code></td>
+<td><code>我的思路是</code></td>
+</tr>
+<tr>
+<td><code>let me first</code></td>
+<td><code>让我先</code></td>
+</tr>
+<tr>
+<td><code>let me check</code></td>
+<td><code>让我来</code></td>
+</tr>
+<tr>
+<td><code>let me try</code></td>
+<td></td>
+</tr>
+<tr>
+<td><code>let me work</code></td>
+<td></td>
+</tr>
+<tr>
+<td><code>my plan is</code></td>
+<td></td>
+</tr>
+<tr>
+<td><code>i will now</code></td>
+<td></td>
+</tr>
+<tr>
+<td><code>i'm going to</code></td>
+<td></td>
+</tr>
+</tbody></table>
+<p><strong>Customization example / 自定义示例：</strong></p>
+<pre><code>plugins:
+  '@dsh-external/llm-degen-heal':
+    leakMarkers:
+      - 'let me think'
+      - '我的思路是'
+      - '先让我看看'
+      - 'step by step'
+</code></pre>
+<h3>Signal 5: Idle-Turn Meter (<code>idle</code>) / 空转仪表</h3>
+<p>Aggregated at the <strong>turn</strong> granularity (not per-chunk). A turn is "idle" when:</p>
+<p>在 <strong>turn</strong> 粒度聚合（非逐 chunk）。一个 turn 为"空转"当：</p>
+<ul>
+<li>no tool call was issued in the entire turn / 整个 turn 没有发出任何工具调用</li>
+<li>total text &lt; <code>idleTurnWords</code> (default 60 words) / 总文本 &lt; <code>idleTurnWords</code>（默认 60 词）</li>
+<li>every model call in the turn had a degenerate window / turn 内每次模型调用的窗口均为退化</li>
+</ul>
+<p>Consecutive idle turns ≥ <code>idleTurns</code> (default 2) → meter fires and forces a tool-call steer.</p>
+<p>连续空转 turn ≥ <code>idleTurns</code>（默认 2）→ 仪表触发并强制工具调用引导。</p>
+<h3>Tokenization / 分词</h3>
+<p>CJK ideographs are split into single-character tokens; Latin text is whitespace-tokenized. This ensures <code>跑跑跑…</code> is caught as a run of individual characters, not fused into one unbreakable string.</p>
+<p>CJK 汉字按单字切分；拉丁文本按空白分词。这确保 <code>跑跑跑…</code> 被识别为单字 run，而非融合为不可拆分的字符串。</p>
+<hr>
+<h2>Self-Healing Actions / 自愈动作</h2>
+<p>When any detection signal fires, the plugin enters a <strong>healing epoch</strong> — a bounded, idempotent intervention round with cooldown.</p>
+<p>任一检测信号触发后，插件进入<strong>治愈 epoch</strong>——一个有界、幂等的干预轮次，带冷却。</p>
+<h3>Action Layers / 干预层级（按优先级）</h3>
+<pre><code>┌─────────────────────────────────────────────────────────────┐
+│  Layer 1: Corrective Message Injection (pre-step)            │
+│  第 1 层：修正消息注入（pre-step）                            │
+│                                                              │
+│  "Degeneration detected: stop writing fragments, stop        │
+│   leaking your thought process. Truncate and rephrase from   │
+│   your last meaningful step, then make exactly ONE tool      │
+│   call now to make concrete progress."                       │
+│                                                              │
+│  Injected once per epoch. Idempotent.                        │
+│  每个 epoch 注入一次。幂等。                                  │
+├─────────────────────────────────────────────────────────────┤
+│  Layer 2: Temperature Rewrite (agent/request)                │
+│  第 2 层：Temperature 重写（agent/request）                  │
+│                                                              │
+│  temperature ← clamp(base + temperatureDelta, [0, 2])        │
+│  Default delta = 0 (disabled). Set &gt; 0 to activate.         │
+│  默认 delta = 0（关闭）。设为 &gt; 0 启用。                      │
+│  Applied once per epoch. Idempotent.                         │
+│  每个 epoch 一次。幂等。                                      │
+├─────────────────────────────────────────────────────────────┤
+│  Layer 3: Stream Interrupt + Bounded Retry                   │
+│  第 3 层：流中断 + 有界重试                                  │
+│                                                              │
+│  On escalateAt (default 2) triggers in one epoch:           │
+│  同一 epoch 内达到 escalateAt（默认 2）次触发时：              │
+│    - Yield finish chunk with reason.code = LLM_DEGENERATION  │
+│    - agent/request-error grants 1 retry (maxRetriesPerEpoch) │
+│    - Stream window cleared for fresh slate                   │
+│                                                              │
+│  On lockoutAt (default 3) triggers with no recovery:         │
+│  达到 lockoutAt（默认 3）次且未恢复时：                        │
+│    - Set lockoutUntil = now + lockoutMs                      │
+│    - All detection silenced for this session                 │
+│    - No interrupt, no retry, no steer — FAIL OPEN            │
+├─────────────────────────────────────────────────────────────┤
+│  Layer 4: Lockout (deadlock escape hatch)                    │
+│  第 4 层：Lockout（死锁逃逸 hatch）                          │
+│                                                              │
+│  Independent of epoch cooldown. When escalation keeps        │
+│  failing, detection suspends entirely — the session cannot   │
+│  be trapped in a self-perpetuating interrupt/retry loop.     │
+│                                                              │
+│  Recovery: any healthy output, user message, or cooldown     │
+│  expiry calls recover() and clears lockout.                  │
+│  独立于 epoch 冷却。升级反复失败时完全暂停检测——会话不会陷入    │
+│  自我维持的中断/重试循环。恢复条件：健康输出、用户消息、冷却到期。│
+└─────────────────────────────────────────────────────────────┘
+</code></pre>
+<h3>Retry Semantics / 重试语义</h3>
+<p>When <code>agent/request-error</code> sees <code>failure.code === 'LLM_DEGENERATION'</code>:</p>
+<ul>
+<li>the degenerate stream's finish chunk carries <code>{ reason: { kind: 'error', failure: { code: 'LLM_DEGENERATION', message: '...' } } }</code></li>
+<li>the error handler grants <code>{ kind: 'retry' }</code> if <code>retryUsedInEpoch &lt; maxRetriesPerEpoch</code></li>
+<li>the retried request carries the <strong>same</strong> session/turn/step, so the agent replays from the same logical position</li>
+<li>the window is cleared (<code>st.window = []</code>) before the retry, giving the model a clean slate</li>
+</ul>
+<p><code>LLM_DEGENERATION</code> 是一个 harness-recognized finish reason, not a generic error — the agent framework knows this is a controlled interrupt, not a transport failure.</p>
+<p><code>LLM_DEGENERATION</code> 是 harness 识别的 finish reason，不是泛泛 error——代理框架知道这是受控中断，不是传输故障。</p>
+<h3>Idle-Turn Steer / 空转 Turn 引导</h3>
+<p>When the idle meter fires (<code>consecutiveIdle &gt;= idleTurns &amp;&amp; inEpoch &amp;&amp; !injectedThisEpoch</code>):</p>
+<ul>
+<li><code>agent.steer(healMessageUserMessage())</code> injects the corrective message as a high-priority system-style user message</li>
+<li><code>source: { kind: 'plugin', plugin: '@dsh-external/llm-degen-heal', form: 'notice', summary: 'degeneration self-heal' }</code></li>
+<li>The message content defaults to the built-in <code>DEFAULT_HEAL_MESSAGE</code>; override via <code>healMessage</code> config</li>
+</ul>
+<p>空转仪表触发时，通过 <code>agent.steer()</code> 注入高优先级系统级用户消息，强制模型在下一轮发出真实工具调用。</p>
+<hr>
+<h2>State Machine / 状态机</h2>
+<pre><code>                    ┌──────────────────────────────────┐
+                    │                                  │
+                    ▼                                  │
+             ┌──────────────┐                           │
+             │   IDLE       │◄── recover() ──┐           │
+             │   (正常)      │                 │           │
+             └──────┬───────┘                 │           │
+                    │ detect                 │           │
+                    ▼                         │           │
+             ┌──────────────┐                │           │
+             │  IN_EPOCH    │                │           │
+             │  (干预中)     │                │           │
+             │  cooldown    │                │           │
+             └──────┬───────┘                │           │
+                    │                        │           │
+          ┌─────────┼─────────┐              │           │
+          │         │         │              │           │
+          ▼         ▼         ▼              │           │
+    inject    config    retry              │           │
+    (1/epoch) (1/epoch) (maxRetries)        │           │
+          │         │         │              │           │
+          └─────────┼─────────┘              │           │
+                    │ triggers &gt;= lockoutAt  │           │
+                    ▼                        │           │
+             ┌──────────────┐                │           │
+             │  LOCKOUT     │                │           │
+             │  (fail-open) │                │           │
+             └──────────────┘                │           │
+                                               │           │
+          ┌────────────────────────────────────┘           │
+          │                                                 │
+          │  healthy output / user message / cooldown expiry │
+          │                                                 │
+          └─────────────────────────────────────────────────┘
+</code></pre>
+<h3>Per-Session State Fields / 每会话状态字段</h3>
+<pre><code>interface SessionDegenState {
+  window: string[]              // Rolling token buffer (max windowTokens)
+                                // 滚动 token 缓冲（最大 windowTokens）
+  turn: number                  // Current agent turn (from agent/pre-step)
+                                // 当前代理 turn
+  step: number                  // Current model call step (from agent/request)
+                                // 当前模型调用 step
+  steps: StepFacts[]            // Per-step facts for idle-turn assessment
+                                // 空转评估的每步事实
+  consecutiveIdle: number       // Consecutive idle turn count
+                                // 连续空转 turn 计数
+  epoch: number                 // Current healing epoch (increments per round)
+                                // 当前治愈 epoch（每轮递增）
+  epochAt: number               // Epoch start timestamp (ms)
+                                // Epoch 起始时间戳
+  cooldownUntil: number         // Epoch cooldown boundary (ms)
+                                // Epoch 冷却边界
+  triggersInEpoch: number       // Triggers counted in current epoch
+                                // 当前 epoch 内触发计数
+  injectedEpoch: number         // Last epoch that injected the corrective message
+                                // 上次注入修正消息的 epoch
+  configAppliedEpoch: number    // Last epoch that rewrote temperature
+                                // 上次重写 temperature 的 epoch
+  retryUsedInEpoch: number      // Retries granted in current epoch
+                                // 当前 epoch 已授权重试次数
+  lockoutUntil: number          // Lockout expiry (ms); 0 = not locked out
+                                // Lockout 到期时间；0 = 未 lockout
+  ring: DegenRecord[]           // Bounded observation ring (max 64 entries)
+                                // 有界观察环（最多 64 条）
+  lastVerdict?: WindowVerdict   // Most recent classification result
+                                // 最近一次分类结果
+}
+</code></pre>
+<h3>Idempotency Guarantees / 幂等保证</h3>
+<table>
+<thead>
+<tr>
+<th>Action / 动作</th>
+<th>Guard / 保护</th>
+<th>Scope / 范围</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>Corrective message injection</td>
+<td><code>injectedEpoch === epoch</code> check before inject</td>
+<td>Per epoch / 每 epoch</td>
+</tr>
+<tr>
+<td>Temperature rewrite</td>
+<td><code>configAppliedEpoch === epoch</code> check before rewrite</td>
+<td>Per epoch / 每 epoch</td>
+</tr>
+<tr>
+<td>Retry grant</td>
+<td><code>retryUsedInEpoch &lt; maxRetriesPerEpoch</code></td>
+<td>Per epoch / 每 epoch</td>
+</tr>
+<tr>
+<td>Epoch arm</td>
+<td><code>now &gt; cooldownUntil</code> resets all per-epoch counters</td>
+<td>Cool-down boundary / 冷却边界</td>
+</tr>
+<tr>
+<td>Lockout</td>
+<td><code>locked(st)</code> silences all detection + interrupt + steer</td>
+<td>Session-wide / 全会话</td>
+</tr>
+</tbody></table>
+<h3>Recovery Conditions / 恢复条件</h3>
+<p><code>recover()</code> is called when:
+以下情况调用 <code>recover()</code>：</p>
+<ul>
+<li>a streamed chunk finishes with <code>degenerate: false</code> AND the previous verdict was <code>degeneration: true</code> (the window has cleared)
+流式 chunk 以 <code>degenerate: false</code> 结束且上次 verdict 为 <code>degeneration: true</code>（窗口已清）</li>
+<li>a <code>user</code> message appears in <code>agent/pre-step</code> (user manually intervened)
+<code>agent/pre-step</code> 中出现 <code>user</code> 消息（用户手动干预）</li>
+</ul>
+<p>Recovery resets epoch, cooldown, trigger count, consecutive idle, and lockout — the session returns to full detection sensitivity immediately.</p>
+<p>恢复会重置 epoch、冷却、触发计数、连续空转和 lockout——会话立即恢复完整检测灵敏度。</p>
+<hr>
+<h2>Configuration / 配置</h2>
+<p>All tunables are validated at plugin load (fail-loud on bad values). Override in your profile's <code>cordis.patch.yml</code>, <code>cordis.yml</code>, or inject config.</p>
+<p>所有参数在插件加载时校验（非法值报错）。在你的 profile 的 <code>cordis.patch.yml</code>、<code>cordis.yml</code> 或 inject 配置中覆盖。</p>
+<h3>Full Schema / 完整配置</h3>
+<pre><code>plugins:
+  '@dsh-external/llm-degen-heal':
+    # ── Master switch ──
+    enabled: true                    # true = active; false = pure passthrough, no logging
+                                     # true = 生效；false = 纯透传，无日志
+
+    # ── Detection / 检测 ──
+    providers: []                    # Provider allowlist; empty = all providers
+                                     # Provider 白名单；空 = 全部
+    windowTokens: 256                # Rolling token window size
+                                     # 滚动 token 窗口大小
+    shortTokenMaxLen: 32             # Max token length for "short token" classification
+                                     # "短词"分类的最大 token 长度
+    repeatThreshold: 8               # Consecutive identical short tokens to trigger token-loop
+                                     # 触发碎词循环的连续相同短词数
+    entropyRatio: 0.35               # unique/total below this (unstructured) → entropy-drop
+                                     # unique/total 低于此值（无结构）→ 熵骤降
+    detectAlternating: true          # Detect A B A B… pair loops
+                                     # 检测 A B A B… 交替对循环
+    leakMarkers: [...]               # Custom thinking/planning leak phrases (defaults built-in)
+                                     # 自定义思维/规划泄漏短语（内建默认值）
+    leakThreshold: 2                 # Marker hits in window before leak-out fires
+                                     # 窗口内触发泄漏的标记命中次数
+    idleTurns: 2                     # Consecutive idle turns before meter fires
+                                     # 仪表触发前的连续空转 turn 数
+    idleTurnWords: 60                # Word cap for "idle" turn classification
+                                     # "空转" turn 分类的词数上限
+
+    # ── Self-healing / 自愈 ──
+    temperatureDelta: 0              # Temperature adjustment per epoch; 0 = disabled, range [-2, 2]
+                                     # 每 epoch 的 temperature 调整；0 = 关闭，范围 [-2, 2]
+    cooldownMs: 30000                # Healing epoch cooldown (ms); triggers within this window stay in one epoch
+                                     # 治愈 epoch 冷却（毫秒）；此窗口内的触发归入同一 epoch
+    escalateAt: 2                    # Trigger count in epoch that causes stream interrupt
+                                     # epoch 内达到此触发数时中断流
+    maxRetriesPerEpoch: 1            # Max retry grants per epoch (0 = detect-only, no retry)
+                                     # 每 epoch 最大重试授权数（0 = 仅检测，不重试）
+    lockoutAt: 3                     # Triggers in epoch before fail-open lockout
+                                     # epoch 内触发数超过此值进入 fail-open lockout
+    lockoutMs: 180000                # Lockout duration (ms); 180000 = 3 minutes
+                                     # Lockout 持续时间（毫秒）；180000 = 3 分钟
+
+    # ── Corrective message / 修正消息 ──
+    healMessage: |                  # Message injected when degeneration is detected
+      Degeneration detected: your previous output either repeated the same
+      short fragments without making progress, or leaked your thinking/planning
+      as visible prose instead of concise final answers. Stop writing fragments
+      and stop writing your thought process into the reply. Truncate and rephrase
+      from your last meaningful step, then make exactly ONE tool call now to make
+      concrete progress. If the task is genuinely complete, say so in one short
+      sentence and stop.
+</code></pre>
+<h3>Quick-Tune Presets / 快速调参</h3>
+<p><strong>Observe-only (no intervention / 仅观察，不干预):</strong></p>
+<pre><code>plugins:
+  '@dsh-external/llm-degen-heal':
+    enabled: true        # still logs; set false to silence entirely
+    maxRetriesPerEpoch: 0
+    temperatureDelta: 0
+</code></pre>
+<p><strong>Aggressive (interrupt early / 激进，尽早中断):</strong></p>
+<pre><code>plugins:
+  '@dsh-external/llm-degen-heal':
+    repeatThreshold: 5
+    escalateAt: 1
+    maxRetriesPerEpoch: 2
+    temperatureDelta: 0.3
+</code></pre>
+<p><strong>Lenient (high tolerance / 宽松，高容忍):</strong></p>
+<pre><code>plugins:
+  '@dsh-external/llm-degen-heal':
+    repeatThreshold: 12
+    entropyRatio: 0.25
+    idleTurns: 4
+    lockoutAt: 5
+</code></pre>
+<hr>
+<h2>Diagnostics / 诊断</h2>
+<h3><code>dev_loop_status</code> Tool / 诊断工具</h3>
+<p>Registered via <code>ctx.tools.register</code> — available as a callable tool in-session.</p>
+<p>通过 <code>ctx.tools.register</code> 注册——会话内可作为可调用工具使用。</p>
+<pre><code>{
+  "enabled": true,
+  "sessions": [
+    {
+      "sessionId": "abc-123",
+      "turn": 5,
+      "step": 3,
+      "windowTokens": 142,
+      "inEpoch": true,
+      "epoch": 2,
+      "triggersInEpoch": 1,
+      "consecutiveIdle": 1,
+      "locked": false,
+      "lastReasons": ["token-loop: run \"跑\" x 9"],
+      "recent": [
+        { "at": 1693001234567, "kind": "trigger", "reasons": ["token-loop: run \"跑\" x 9"], "action": "armed" },
+        { "at": 1693001234789, "kind": "heal", "action": "message", "step": { "turn": 5, "step": 2 } }
+      ]
+    }
+  ]
+}
+</code></pre>
+<table>
+<thead>
+<tr>
+<th>Field / 字段</th>
+<th>Meaning / 含义</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>enabled</code></td>
+<td>Plugin master switch / 插件总开关</td>
+</tr>
+<tr>
+<td><code>sessionId</code></td>
+<td>Session identifier / 会话 ID</td>
+</tr>
+<tr>
+<td><code>turn</code> / <code>step</code></td>
+<td>Current agent turn and model-call step / 当前代理 turn 和模型调用 step</td>
+</tr>
+<tr>
+<td><code>windowTokens</code></td>
+<td>Tokens currently in the rolling window / 滚动窗口中的 token 数</td>
+</tr>
+<tr>
+<td><code>inEpoch</code></td>
+<td>Whether the session is inside an active healing epoch / 是否在活跃治愈 epoch 中</td>
+</tr>
+<tr>
+<td><code>epoch</code></td>
+<td>Current epoch number / 当前 epoch 编号</td>
+</tr>
+<tr>
+<td><code>triggersInEpoch</code></td>
+<td>Triggers counted in this epoch / 本 epoch 内触发次数</td>
+</tr>
+<tr>
+<td><code>consecutiveIdle</code></td>
+<td>Consecutive idle turns / 连续空转 turn 数</td>
+</tr>
+<tr>
+<td><code>locked</code></td>
+<td>Whether the session is in lockout / 是否在 lockout 中</td>
+</tr>
+<tr>
+<td><code>lastReasons</code></td>
+<td>Human-readable trigger reasons / 人类可读的触发原因</td>
+</tr>
+<tr>
+<td><code>recent</code></td>
+<td>Last 10 ring records (trigger / heal / escalate / recover) / 最近 10 条环记录</td>
+</tr>
+</tbody></table>
+<h3>Session Log Events / 会话日志事件</h3>
+<p>Two custom event types are declared via cordis module augmentation and appended to the session's event log:</p>
+<p>两个自定义事件类型通过 cordis 模块扩充声明，追加到会话事件日志：</p>
+<table>
+<thead>
+<tr>
+<th>Event / 事件</th>
+<th>Data / 数据</th>
+<th>When / 时机</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>llm/degen-trigger</code></td>
+<td><code>turn</code>, <code>step</code>, <code>sessionId</code>, <code>reasons[]</code>, <code>action</code> (<code>armed</code>/<code>escalate</code>/<code>lockout</code>), <code>stats</code> (tokens, unique, uniqueRatio, topToken, topCount, structured, runMax, altMax)</td>
+<td>Detection fires / 检测触发</td>
+</tr>
+<tr>
+<td><code>llm/degen-heal</code></td>
+<td><code>turn</code>, <code>step</code>, <code>sessionId</code>, <code>kind</code> (<code>message</code>/<code>config</code>/<code>retry</code>/<code>meter</code>), <code>epoch</code></td>
+<td>Intervention taken / 执行干预</td>
+</tr>
+</tbody></table>
+<h3>Harness Logger / Harness 日志</h3>
+<p>All actions log via <code>ctx.logger.info()</code> with the <code>[llm-degen-heal]</code> prefix:</p>
+<p>所有动作通过 <code>ctx.logger.info()</code> 记录，前缀 <code>[llm-degen-heal]</code>：</p>
+<pre><code>[llm-degen-heal] trigger session=abc-123 action=armed reasons=token-loop: run "跑" x 9
+[llm-degen-heal] heal session=abc-123 kind=message epoch=2
+[llm-degen-heal] escalate interrupt session=abc-123 epoch=2 attempt=2
+[llm-degen-heal] grant degenerate retry session=abc-123 round=1
+[llm-degen-heal] idle meter session=abc-123 turn=5 consecutive=2 (123 words, no tool call, degenerate window)
+[llm-degen-heal] heal session=abc-123 kind=meter epoch=2
+</code></pre>
+<hr>
+<h2>Installation / 安装</h2>
+<h3>Prerequisites / 前置要求</h3>
+<ul>
+<li>A DeepSeek Harness checkout (<code>J:\deepseek-harness</code> monorepo) — for type-check deps and tsc.
+DeepSeek Harness  checkout——用于类型检查和编译。</li>
+<li>Node.js 20+ and pnpm (harness standard).
+Node.js 20+ 和 pnpm（harness 标准）。</li>
+<li>Bash (the build script is POSIX sh; use Git Bash on Windows).
+Bash（构建脚本为 POSIX sh；Windows 使用 Git Bash）。</li>
+<li><code>gh</code> CLI or git to fetch this repo.
+<code>gh</code> CLI 或 git 拉取本仓库。</li>
+</ul>
+<h3>1. Clone / 克隆</h3>
+<pre><code>git clone https://github.com/KakaruHayate/dsh-degen-heal.git
+cd dsh-degen-heal
+</code></pre>
+<h3>2. Build / 构建</h3>
+<pre><code># Linux / macOS
+DSH_CHECKOUT=/path/to/deepseek-harness bash scripts/build.sh
+
+# Windows (Git Bash)
+DSH_CHECKOUT=Z:/path/to/deepseek-harness bash scripts/build.sh
+</code></pre>
+<p><code>scripts/build.sh</code> probes <code>DSH_CHECKOUT</code>, junction-links the harness packages the plugin type-checks against, and compiles <code>src/ → lib/</code> with the checkout's tsc.</p>
+<p><code>scripts/build.sh</code> 探测 <code>DSH_CHECKOUT</code>，将插件类型检查所需的 harness 包做 junction 链接，然后用 checkout 的 tsc 编译 <code>src/ → lib/</code>。</p>
+<h3>3. Harness Profile Integration / 接入 Harness Profile</h3>
+<p>Add to your profile's <code>package.json</code> dependencies and bundles:</p>
+<pre><code>{
+  "dependencies": {
+    "@dsh-external/llm-degen-heal": "link:C:/path/to/dsh-degen-heal"
+  },
+  "dsh": {
+    "profile": {
+      "bundles": [
+        "@deepseek-ai/dsh-base",
+        "@deepseek-ai/dsh-web-app",
+        "@dsh-external/llm-degen-heal"
+      ]
+    }
+  }
+}
+</code></pre>
+<p>Or hot-inject without modifying profile files:</p>
+<pre><code>dev_inject_plugin --dir /abs/path/to/dsh-degen-heal
+</code></pre>
+<p>The plugin is <code>enabled: true</code> by default. Set <code>enabled: false</code> for observe-only (passthrough with logging).</p>
+<p>插件默认 <code>enabled: true</code>。设为 <code>false</code> 为仅观察模式（透传 + 日志）。</p>
+<h3>4. Verify / 验证</h3>
+<pre><code>pnpm test          # Run the self-test from the plugin root
+# or
+dsh web            # Start harness; check dev_loop_status tool
+</code></pre>
+<hr>
+<h2>Testing / 验收自测</h2>
+<h3><code>tests/self-test.mjs</code> — Synthetic Deterministic Self-Test</h3>
+<p>No real provider call needed. Uses an in-process <code>cordis.Context</code> + <code>ScriptedAdapter</code> (a programmable <code>LlmAdapter</code> whose <code>stream()</code> replays a pre-scripted chunk sequence).</p>
+<p>无需真实 provider 调用。使用进程内 <code>cordis.Context</code> + <code>ScriptedAdapter</code>（可编程的 <code>LlmAdapter</code>，其 <code>stream()</code> 回放预编写的 chunk 序列）。</p>
+<p><strong>Test scripts / 测试脚本：</strong></p>
+<table>
+<thead>
+<tr>
+<th>Script / 脚本</th>
+<th>Purpose / 用途</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>DEGEN_SCRIPT</code></td>
+<td>40 chunks of <code>Word0 Word1 Word2</code> cycling — classic token-loop degenerate output / 40 个 <code>Word0 Word1 Word2</code> 循环 chunk——经典碎词循环退化输出</td>
+</tr>
+<tr>
+<td><code>HEALTHY_SCRIPT</code></td>
+<td>Prose + code block + tool call — structured, productive output / 散文 + 代码块 + 工具调用——结构化、有产出</td>
+</tr>
+</tbody></table>
+<p><strong>Test cases / 测试用例：</strong></p>
+<table>
+<thead>
+<tr>
+<th>#</th>
+<th>Case / 场景</th>
+<th>Assertion / 断言</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>1</td>
+<td>Token-loop detection (DEGEN_SCRIPT)</td>
+<td><code>tokenLoop = true</code>, <code>degeneration = true</code></td>
+</tr>
+<tr>
+<td>2</td>
+<td>Entropy-drop + no structure</td>
+<td><code>entropyDrop = true</code> on unstructured low-diversity window</td>
+</tr>
+<tr>
+<td>3</td>
+<td>Leak-out detection</td>
+<td><code>leakOut = true</code> when marker phrases appear ≥ threshold</td>
+</tr>
+<tr>
+<td>4</td>
+<td>Healthy passthrough (HEALTHY_SCRIPT)</td>
+<td><code>degeneration = false</code>, no injection, no interrupt</td>
+</tr>
+<tr>
+<td>5</td>
+<td>Disabled passthrough</td>
+<td><code>enabled: false</code> → zero intervention, zero log</td>
+</tr>
+<tr>
+<td>6</td>
+<td>Arm → escalate → <code>LLM_DEGENERATION</code> → bounded retry</td>
+<td>Stream interrupted on trigger #2, retry granted, <code>retryUsedInEpoch</code> capped</td>
+</tr>
+<tr>
+<td>7</td>
+<td>Disposal cleanup</td>
+<td><code>ctx.effect</code> cleanup runs; <code>states</code> Map cleared</td>
+</tr>
+<tr>
+<td>8</td>
+<td>Lockout deadlock escape</td>
+<td>After <code>lockoutAt</code> triggers with no recovery → <code>locked = true</code>, all detection silenced</td>
+</tr>
+</tbody></table>
+<h3>Manual Verification / 手动验证</h3>
+<p>In a live harness session:</p>
+<pre><code># 1. Start harness
+dsh web
+
+# 2. Open dev tools or run the diagnostic tool
+dev_loop_status
+# → { enabled: true, sessions: [...] }
+
+# 3. (Optional) Force a degenerate scenario by appending a patch:
+#    - insert a loop of short repeated tokens in a test agent prompt
+#    - Observe the trigger → heal → recover cycle in dev_loop_status output
+</code></pre>
+<hr>
+<h2>Extension Points for Future Integration / 未来集成扩展点</h2>
+<h3><code>LlmRuntime</code> Waterfall (tool-cordis <code>api-catalog.ts</code>)</h3>
+<p>The harness ships a waterfall around every streaming model call at <code>packages/extensions/tool-cordis/src/api-catalog.ts</code> (<code>LlmRuntime</code>). The current plugin hooks <code>llm/stream</code> directly, which is the public-facing event alias for this waterfall. If the harness later exposes additional waterfall stages (e.g., pre-token hooks, post-stream analysis), the plugin can be extended to listen on those stages without changing its core detection logic.</p>
+<p>Harness 在 <code>packages/extensions/tool-cordis/src/api-catalog.ts</code> (<code>LlmRuntime</code>) 为每次流式模型调用提供了一个 waterfall。当前插件直接挂接 <code>llm/stream</code>，该事件是此 waterfall 的公开别名。如果 Harness 后续暴露更多 waterfall 阶段（如 pre-token hooks、post-stream analysis），插件可在不改变核心检测逻辑的前提下扩展监听。</p>
+<h3><code>repetition_penalty</code> / <code>presence_penalty</code> Wire Fields</h3>
+<p>As of the current harness version, <code>packages/llm/llm-deepseek/src/serialize.ts</code> only forwards <code>temperature</code>, <code>max_tokens</code>, <code>stop</code>, and reasoning fields. There is no <code>repetition_penalty</code>, <code>frequency_penalty</code>, or <code>presence_penalty</code> field in <code>GenerateOptions</code> or <code>LlmCallConfig</code>.</p>
+<p>在当前 Harness 版本中，<code>packages/llm/llm-deepseek/src/serialize.ts</code> 只透传 <code>temperature</code>、<code>max_tokens</code>、<code>stop</code> 和 reasoning 字段。<code>GenerateOptions</code> 和 <code>LlmCallConfig</code> 中没有 <code>repetition_penalty</code>、<code>frequency_penalty</code> 或 <code>presence_penalty</code> 字段。</p>
+<p><strong>Workaround / 变通方案：</strong> The plugin substitutes with (a) corrective message injection (Layer 1) and (b) temperature adjustment (Layer 2). Both are provider-agnostic and work with any LLM backend.</p>
+<p><strong>变通方案：</strong> 插件用 (a) 修正消息注入（第 1 层）和 (b) temperature 调整（第 2 层）替代。两者均与 provider 无关，适用于任何 LLM 后端。</p>
+<p><strong>Core change required for true penalty injection / 真正 penalty 注入所需的核心改动：</strong></p>
+<p>A one-line addition to <code>packages/llm/llm/src/types.ts</code> (<code>LlmCallConfig</code> interface) and a corresponding passthrough in <code>packages/llm/llm-deepseek/src/serialize.ts</code> would enable:</p>
+<pre><code>// packages/llm/llm/src/types.ts — add to LlmCallConfig:
+repetition_penalty?: number
+presence_penalty?: number
+</code></pre>
+<pre><code>// packages/llm/llm-deepseek/src/serialize.ts — add to serialize() output:
+...(call.repetition_penalty !== undefined ? { repetition_penalty: call.repetition_penalty } : {}),
+...(call.presence_penalty !== undefined ? { presence_penalty: call.presence_penalty } : {}),
+</code></pre>
+<p>This is intentionally <strong>not done in the plugin</strong> — per the constraint that the plugin must not modify core packages. If you want this, it is a one-line core change that any DSH maintainer can review and merge independently.</p>
+<p>此改动<strong>有意不在插件内完成</strong>——按插件不修改核心包的约束。如需此功能，是一行核心改动，任何 DSH maintainer 可独立审核合并。</p>
+<h3><code>dev_router_mode</code> Band Escalation</h3>
+<p>The plugin does <strong>not</strong> call <code>dev_router_mode</code> itself. Band escalation (e.g., <code>weak → strong</code>) is left to:</p>
+<ul>
+<li>the operator, who can call <code>dev_router_status</code> / <code>dev_router_mode</code> manually after seeing a lockout or repeated triggers in <code>dev_loop_status</code></li>
+<li>a future harness extension point that exposes a programmatic "escalate band" signal</li>
+</ul>
+<p>插件<strong>不</strong>主动调用 <code>dev_router_mode</code>。Band 升级（如 <code>weak → strong</code>）留给：</p>
+<ul>
+<li>操作员：在 <code>dev_loop_status</code> 中看到 lockout 或反复触发后手动调用 <code>dev_router_status</code> / <code>dev_router_mode</code></li>
+<li>未来 Harness 扩展点：暴露程序化的 "escalate band" 信号</li>
+</ul>
+<hr>
+<h2>Known Limitations / 已知限制</h2>
+<table>
+<thead>
+<tr>
+<th>#</th>
+<th>Limitation / 限制</th>
+<th>Severity / 严重程度</th>
+<th>Workaround / 变通</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>1</td>
+<td>No wire-level <code>repetition_penalty</code> / <code>presence_penalty</code> passthrough</td>
+<td>Medium / 中</td>
+<td>Temperature delta + corrective message injection (Layers 1 + 2)</td>
+</tr>
+<tr>
+<td>2</td>
+<td>No true history rollback ("revert to previous assistant message")</td>
+<td>Low / 低</td>
+<td>Interrupt + steer gives the model a fresh start contextually</td>
+</tr>
+<tr>
+<td>3</td>
+<td>Does not call <code>dev_router_mode</code> for band escalation</td>
+<td>Low / 低</td>
+<td>Operator-driven via <code>dev_loop_status</code> discovery</td>
+</tr>
+<tr>
+<td>4</td>
+<td>Detection window is per-stream, not cross-session</td>
+<td>Low / 低</td>
+<td>State is per-session (<code>SessionDegenState</code> keyed by sessionId); cross-session aggregation would be a future feature</td>
+</tr>
+<tr>
+<td>5</td>
+<td>CJK tokenization splits by character (not by word)</td>
+<td>Info / 提示</td>
+<td>Deliberate design choice: catches character-level loops (<code>跑跑跑…</code>) that whitespace tokenization would miss. For word-level CJK detection, a dictionary-based segmenter could be added.</td>
+</tr>
+<tr>
+<td>6</td>
+<td><code>lockoutMs</code> max 3 minutes prevents permanent silencing but may be too short for very long sessions</td>
+<td>Info / 提示</td>
+<td>Tune <code>lockoutMs</code> per deployment; set to 0 to disable lockout entirely (not recommended)</td>
+</tr>
+</tbody></table>
+<hr>
+<h2>License / 许可证</h2>
+<p>BSD-3-Clause. See <code>package.json</code>.</p>

@@ -1,0 +1,362 @@
+<h1>DSH DAG Workflow</h1>
+<p>DSH DAG Workflow 是一套基于 <a href="https://github.com/deepseek-ai/deepseek-harness">DeepSeek Harness</a> 插件体系的持久化 Workflow 能力：Skill 或 Agent 负责生成模板，DAG Engine 按模板执行，Canvas 直接编辑和观察同一份模板。</p>
+<p>它不是对 DSH 现有动态 JavaScript workflow 的替代。动态 workflow 适合 Agent 临时规划和扇出任务；本项目解决需要保存、复用、版本化、审计、暂停恢复和可视化编排的流程。</p>
+<h2>设计</h2>
+<pre><code>flowchart LR
+  A["Skill / Agent"] --&gt;|生成、校验、发布| T["WorkflowTemplate"]
+  C["Canvas Studio"] --&gt;|编辑同一份模板| T
+  T --&gt; E["DAG Engine"]
+  E --&gt; N["Node Registry"]
+  N --&gt; S["Pure Script Runtimes"]
+  E --&gt; R["Run Store"]
+  N --&gt; D["DSH tools / subagents / approval"]
+  R --&gt; C
+</code></pre>
+<p>核心设计约束：</p>
+<ul>
+<li><strong>一个真源</strong>：Agent、Engine 和 Canvas 都读写 <code>WorkflowTemplate</code>，不再维护第二套 Canvas DSL。</li>
+<li><strong>精确解析</strong>：节点使用 <code>type@version</code>，发布后的 Workflow 和子流程固定到不可变 revision。</li>
+<li><strong>能力不越权</strong>：<code>dsh.tool@1</code>、<code>dsh.agent@1</code>、<code>dsh.human-approval@1</code> 始终经过当前 DSH scope 的 tool、subagent、approval 和 owning Agent。</li>
+<li><strong>依赖先声明</strong>：动态节点的 capability、Tool、Agent provider、脚本 runtime、secret 和子流程必须出现在 <code>spec.requires</code>；模板声明只会收窄权限，不会授予新权限。</li>
+<li><strong>结果先契约化</strong>：节点可用 <code>expects.schema/maxBytes</code> 声明实例级结果契约，输出必须在写入 checkpoint 前通过确定性校验；需要业务语义复核时再显式连接 Agent 节点。</li>
+<li><strong>逻辑可扩展、边界不模糊</strong>：确定性 JSON 处理使用可插拔的 <code>core.script@1</code> runtime；网络、文件、密钥和外部副作用仍必须走 DSH Tool/Agent 节点。</li>
+<li><strong>外部扩展只有两级</strong>：普通外部能力注册为 DSH Tool，由通用 <code>dsh.tool@1</code> 执行；只有暂停恢复、长任务、事务补偿等特殊工作流语义才实现自定义 Node。</li>
+<li><strong>执行可恢复</strong>：每次状态推进同时追加有序事件并提交 checkpoint；未知副作用不会自动重试，而是进入 <code>needs_attention</code>。</li>
+<li><strong>布局不污染语义</strong>：节点位置和 viewport 位于 <code>layout</code>，移动节点只产生 layout diff，不改变 Workflow 的 semantic hash。</li>
+</ul>
+<p>一个模板包含输入/输出 Schema、节点、边、binding、执行策略和可选布局：</p>
+<pre><code>apiVersion: dsh.workflow/v1alpha1
+kind: WorkflowTemplate
+metadata:
+  id: echo-message
+  name: Echo message
+spec:
+  requires:
+    - { kind: capability, uses: dsh.tools.execute }
+    - { kind: tool, uses: echo }
+  inputSchema:
+    type: object
+    required: [message]
+    properties:
+      message: { type: string }
+  outputSchema:
+    type: object
+    required: [answer]
+    properties:
+      answer: { type: string }
+  nodes:
+    - id: start
+      uses: core.start@1
+      with: {}
+      inputs: {}
+    - id: echo
+      uses: dsh.tool@1
+      with: { name: echo }
+      expects:
+        schema:
+          type: object
+          required: [result]
+          properties:
+            result: { type: object }
+      inputs:
+        message: { input: message }
+    - id: end
+      uses: core.end@1
+      with: {}
+      inputs:
+        answer: { output: { node: echo, path: [result, echo] } }
+  edges:
+    - { id: start-echo, source: start, target: echo }
+    - { id: echo-end, source: echo, target: end }
+  outputs:
+    answer: { output: { node: end, path: [answer] } }
+</code></pre>
+<p>完整字段、校验规则和分支语义见 <a href="https://github.com/GM-HZ/dsh-dag-workflow/blob/HEAD/spec/workflow-template-v1.md">Workflow Template v1 规范</a>，多 Agent 示例见 <a href="https://github.com/GM-HZ/dsh-dag-workflow/blob/HEAD/examples/research-report.workflow.yaml">research-report.workflow.yaml</a>。真实外部数据的完整验收模板见 <a href="https://github.com/GM-HZ/dsh-dag-workflow/blob/HEAD/examples/weekly-ai-model-news.workflow.json">weekly-ai-model-news.workflow.json</a>：DSH Tool 获取一周内 100 条候选，Agent 只返回评分/摘要 overlay，受限脚本严格合并、稳定排序并输出 Top 10。</p>
+<h2>快速开始</h2>
+<p>要求 Node.js 22.19+。将 <code>dsh-dag-workflow</code> 主包安装到 DSH Web profile：</p>
+<pre><code>dsh plugin --profile web add @gm-hz/dsh-dag-workflow
+</code></pre>
+<p>该命令会装配 DAG runtime、Agent authoring tools、<code>workflow-builder</code> Skill、SQLite 持久化和 Canvas Studio；默认数据库位于 DSH home 下的 <code>dsh-dag-workflow/workflows.db</code>。从 <code>0.1.4</code> 及更早版本升级时，主包会在新路径不存在的前提下通过 SQLite backup API 迁移旧的 <code>dsh-workflow/workflows.db</code>，并保留旧文件作为备份。</p>
+<p>从源码开发和运行全部门禁需要 pnpm 11：</p>
+<pre><code>git clone https://github.com/GM-HZ/dsh-dag-workflow.git
+cd dsh-dag-workflow
+pnpm install
+pnpm check
+</code></pre>
+<p>发布前也可以直接把当前 workspace 链接到本机 DSH，不需要先上传 npm：</p>
+<pre><code>pnpm build
+dsh plugin --profile web add \
+  "$PWD/packages/core" \
+  "$PWD/packages/catalog" \
+  "$PWD/packages/dsh" \
+  "$PWD/packages/sqlite" \
+  "$PWD/packages/canvas" \
+  "$PWD"
+dsh web
+</code></pre>
+<p>打开任意顶层会话后，页面右下角会出现 <code>◇ FLOW</code>。本仓库提供了一个可直接执行的风险分流模板 <a href="https://github.com/GM-HZ/dsh-dag-workflow/blob/HEAD/examples/approval-gate.workflow.json">approval-gate.workflow.json</a>：<code>riskScore &gt; 70</code> 走 <code>true</code> 边，否则走 <code>false</code> 边，两路汇合并输出类型稳定的 <code>{ request, highRisk }</code>。</p>
+<p>先单独验证模板和 DAG Engine：</p>
+<pre><code>pnpm demo
+</code></pre>
+<p>也可以将同一组本地包链接到本机 <code>headless</code> profile，再让真实 DSH Agent 创建、校验、发布和运行该模板。Web 与 Headless profile 默认共用 <code>$DSH_HOME/dsh-dag-workflow/workflows.db</code>，因此 Agent 创建的模板会直接出现在 Canvas 的 OPEN 列表中。</p>
+<p>需要定制存储或 Canvas authority 时，也可以只安装子包并在 DSH Host 中手动装配。最小内存版只需要 <code>@gm-hz/dsh-dag-workflow-host</code>：</p>
+<pre><code>import * as DagWorkflow from '@gm-hz/dsh-dag-workflow-host'
+
+// Host 需要先提供 DSH 的 tools、subagents、approval 和 skills 服务。
+await ctx.plugin(DagWorkflow)
+</code></pre>
+<p>插件会发布六个 Cordis service：</p>
+<table>
+<thead>
+<tr>
+<th>Service</th>
+<th>用途</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>ctx.workflowCapabilities</code></td>
+<td>为自定义 Node 注册受声明约束的 Host 生命周期服务</td>
+</tr>
+<tr>
+<td><code>ctx.workflowScripts</code></td>
+<td>注册版本化、确定性的纯 JSON 脚本运行时</td>
+</tr>
+<tr>
+<td><code>ctx.workflowNodes</code></td>
+<td>注册并解析版本化节点</td>
+</tr>
+<tr>
+<td><code>ctx.workflowTemplates</code></td>
+<td>draft、CAS 更新、diff、校验和发布</td>
+</tr>
+<tr>
+<td><code>ctx.workflowRuns</code></td>
+<td>事件日志与 checkpoint</td>
+</tr>
+<tr>
+<td><code>ctx.dagWorkflowEngine</code></td>
+<td>启动、恢复和取消运行</td>
+</tr>
+</tbody></table>
+<p>内存 Provider 适合开发和测试。生产环境先挂载 SQLite Provider，再让主插件复用外部服务：</p>
+<pre><code>import {
+  WorkflowCapabilityRegistryService,
+  WorkflowNodeRegistryService,
+  WorkflowScriptRuntimeRegistryService,
+} from '@gm-hz/dsh-dag-workflow-host'
+import * as DagWorkflow from '@gm-hz/dsh-dag-workflow-host'
+import {
+  SqliteWorkflowRunsProvider,
+  SqliteWorkflowTemplatesProvider,
+} from '@gm-hz/dsh-dag-workflow-sqlite'
+
+const database = { path: './data/workflows.db' }
+
+await ctx.plugin(WorkflowCapabilityRegistryService)
+await ctx.plugin(WorkflowScriptRuntimeRegistryService)
+await ctx.plugin(WorkflowNodeRegistryService)
+await ctx.plugin(SqliteWorkflowTemplatesProvider, database)
+await ctx.plugin(SqliteWorkflowRunsProvider, database)
+await ctx.plugin(DagWorkflow, {
+  catalog: 'external',
+  runStore: 'external',
+})
+</code></pre>
+<h2>使用方式</h2>
+<h3>1. 让 Agent 生成 Workflow</h3>
+<p>主插件会向 DSH 注册 <code>workflow-builder</code> Skill，以及下面十个受 DSH 策略保护的工具：</p>
+<pre><code>workflow_nodes_list
+workflow_draft_create
+workflow_draft_import
+workflow_draft_read
+workflow_draft_update
+workflow_draft_validate
+workflow_validate
+workflow_diff
+workflow_publish
+workflow_run
+</code></pre>
+<p>可以直接对 Agent 表达目标，例如：</p>
+<blockquote>
+<p>创建一个“研究主题 → 两路独立调研 → 汇总报告 → 人工确认”的 workflow。先展示校验结果和 diff，得到我确认后再发布，并运行发布的精确 revision。</p>
+</blockquote>
+<p>Skill 引导 Agent 按 <code>查询节点/Agent provider → 生成拓扑 → 创建或导入 draft → 校验 → diff → 发布 → 运行</code> 的顺序工作。大型模板使用 <code>workflow_draft_import</code> 传递完整 JSON 字符串，避免模型把 object 参数错误序列化。Skill 不绕过工具直接修改 Catalog，因此原有的 scope、guard、approval 和 observer 策略仍然生效。</p>
+<h3>2. 从代码执行</h3>
+<pre><code>const published = ctx.workflowTemplates.getPublished('research-report', 1)
+const run = ctx.dagWorkflowEngine.start({
+  template: published.template,
+  inputs: { topic: 'DSH plugin architecture' },
+  parent: agent, // 发起运行并拥有权限的真实 DSH Agent
+})
+
+const result = await run.result
+await run.dispose()
+
+if (result.status === 'completed') {
+  console.log(result.outputs)
+}
+</code></pre>
+<p><code>result</code> 会以 <code>completed</code>、<code>failed</code>、<code>cancelled</code> 或 <code>paused</code> 收敛。调用方持有 run，并应在读取结果后 <code>dispose()</code>。</p>
+<h3>确定性脚本节点</h3>
+<p><code>core.script@1</code> 用于字段整理、模板拼接、数组筛选/投影和数值聚合。内置 <code>dsh.expr@1</code> 是有操作数上限的纯表达式语言，不使用 <code>eval</code>，表达式必须返回 JSON object：</p>
+<pre><code>{
+  "language": "dsh.expr@1",
+  "maxOperations": 10000,
+  "source": "{ customer: upper(trim(input.customer)), total: sum(mapGet(input.orders, \"amount\")) }"
+}
+</code></pre>
+<p>可运行示例见 <a href="https://github.com/GM-HZ/dsh-dag-workflow/blob/HEAD/examples/script-transform.workflow.json">script-transform.workflow.json</a>。<code>sortBy</code> 支持对象数组的稳定多键排序，<code>joinBy</code> 用唯一 key 严格合并等长 overlay，并拒绝未知、重复、缺失 key 或覆盖原字段。脚本没有 I/O、时间、随机数或凭据接口；这些能力应拆成 <code>dsh.tool@1</code> 或 <code>dsh.agent@1</code>，再把其结构化输出交给脚本节点。</p>
+<p>周报验收模板使用的 <a href="https://github.com/GM-HZ/dsh-dag-workflow/blob/HEAD/packages/ai-news-provider/README.md">AI news provider</a> 是源码内私有参考包：它证明普通外部 provider 只需注册一个 DSH Tool，不需要实现 Workflow Node。该模板还演示了更强的 Agent 边界：Agent 只能产出 <code>{id, ...新增字段}</code>，脚本用 <code>joinBy</code> 将其与 Tool 原始记录合并，因此标题、URL、发布时间和来源无法被 Agent 静默改写。</p>
+<p>动态依赖和结果契约属于模板语义并进入 semantic hash。执行时一个节点能看到的 gateway 或自定义 Host capability 会按其 NodeDefinition <code>capabilities</code> 裁剪；最终有效能力是“节点声明 ∩ Workflow requires ∩ owning Agent scope ∩ DSH policy”。</p>
+<p>恢复一个持久化运行：</p>
+<pre><code>const resumed = ctx.dagWorkflowEngine.resume({
+  runId,
+  parent: agent,
+  unknownNodeResolutions: {
+    charge: 'retry', // 也可以显式选择 'fail'
+  },
+})
+
+const result = await resumed.result
+await resumed.dispose()
+</code></pre>
+<h3>3. 启用 Canvas Studio</h3>
+<p>Canvas 是独立插件。所有 RPC 会先通过 Host 的实时 Agent registry 解析 <code>sessionId</code>，只接受仍附着在当前 Host 的顶层 Agent。多人或多租户部署应继续按用户、workspace、action/resource 增加授权策略：</p>
+<pre><code>import * as WorkflowCanvas from '@gm-hz/dsh-dag-workflow-canvas'
+
+await ctx.plugin(WorkflowCanvas, {
+  authorize: async ({ sessionId, agent, action, resourceId }) =&gt; {
+    return mayUseWorkflow(currentUserId(), agent, action, resourceId)
+      ? { subject: currentUserId(), agent }
+      : undefined
+  },
+})
+</code></pre>
+<p>省略 <code>authorize</code> 时使用面向本地单用户 profile 的默认边界：不存在、未附着或属于 subagent 的 session identity 会被拒绝，但 <code>sessionId</code> 本身不是多租户身份凭证。</p>
+<p>包内的 <code>dsh.client</code> manifest 会加载 XYFlow Studio。Studio 会把当前 Agent scope 可见的每个 DSH Tool 直接显示为一个 palette 项，拖入后保存的仍是 <code>dsh.tool@1 + with.name</code>。它同时支持自定义节点、边编辑、Schema/config 编辑、诊断、CAS 保存、语义/布局 diff、发布、draft 测试运行、持久 trace，以及未知副作用的 retry/fail 决策。</p>
+<p>其他 DSH Client 插件也可以打开同一个 overlay：</p>
+<pre><code>ctx.workflowCanvasUi.open({
+  templateId: 'research-report',
+  runId: 'dag-…',
+  nodeId: 'summarize',
+})
+</code></pre>
+<h2>两级扩展模型</h2>
+<h3>一级：DSH Tool</h3>
+<p>普通外部系统只注册 DSH Tool，不需要实现 Workflow 接口。Tool 的输入 Schema、scope、guard、credential、observer 和输出校验继续由 DSH 负责；<code>workflow_nodes_list</code> 和 Canvas 会读取当前 Agent scope 可见的 Tool catalog。Canvas 中的 Tool 条目不是第三种节点类型，保存时统一物化为：</p>
+<pre><code>- id: dms-query
+  uses: dsh.tool@1
+  with: { name: dms.query }
+  inputs:
+    sql: { input: sql }
+</code></pre>
+<p>编译器自动要求模板声明 <code>capability:dsh.tools.execute</code> 和 <code>tool:dms.query</code>。DMS 的目标库、SQL 风险、审批、脱敏等领域规则全部留在 DMS Tool 中。</p>
+<h3>二级：自定义 Node</h3>
+<p>只有 Tool 的单次 JSON 请求/响应无法表达的暂停恢复、进度 checkpoint、事务补偿或特殊控制流，才通过 <code>ctx.workflowNodes</code> 注册自定义 Node。自定义 Host 服务通过 <code>ctx.workflowCapabilities</code> 注册；节点只能从执行上下文解析自己预声明的 capability：</p>
+<pre><code>const reviews = ctx.acmeReviews
+ctx.effect(() =&gt; ctx.workflowCapabilities.register('acme.review.execute', reviews))
+
+ctx.effect(() =&gt; ctx.workflowNodes.register({
+  type: 'acme.review',
+  version: 1,
+  title: 'Review',
+  description: 'Run an internal review step.',
+  role: 'regular',
+  configSchema: {
+    type: 'object',
+    additionalProperties: false,
+    required: ['resource'],
+    properties: { resource: { type: 'string', minLength: 1 } },
+  },
+  inputSchema: { type: 'object' },
+  outputSchema: { type: 'object' },
+  outputPorts: ['success'],
+  capabilities: ['acme.review.execute'],
+  dependencyKinds: ['acme-resource'],
+  retry: 'safe',
+  dependencies(config) {
+    return [{ kind: 'acme-resource', uses: String(config.resource) }]
+  },
+  async execute(context) {
+    const service = context.capabilities.require&lt;typeof reviews&gt;('acme.review.execute')
+    return { outputs: await service.review(context.inputs, context.signal) }
+  },
+}))
+</code></pre>
+<p>模板中使用 <code>acme.review@1</code>，并在 <code>spec.requires</code> 精确声明 capability 与 resource。未安装 capability、Node 未声明它或模板没有 allowlist 时都会 fail closed。如需自定义 Canvas 外观，Client 插件可额外注册同一 <code>uses</code> 对应的 React renderer；未注册时仍可使用通用节点编辑器。</p>
+<p>纯脚本 runtime 是内置 <code>core.script@1</code> 的确定性实现细节，不构成第三种外部集成层。如果定制只是 JSON 数据逻辑，可以注册：</p>
+<pre><code>ctx.effect(() =&gt; ctx.workflowScripts.register({
+  language: 'acme.rules',
+  version: 1,
+  title: 'Acme Rules',
+  description: 'Deterministic business rules.',
+  deterministic: true,
+  validate(source) { return validateRules(source) },
+  async execute({ source, inputs, signal, maxOperations }) {
+    return runRules({ source, inputs, signal, maxOperations }) // 必须返回 JSON object
+  },
+}))
+</code></pre>
+<p>模板使用 <code>core.script@1</code>，并设置 <code>with.language: acme.rules@1</code>。Runtime 插件属于受信任的宿主代码；<code>deterministic: true</code> 是契约声明，不是对恶意插件的 sandbox。</p>
+<h2>可靠性与安全边界</h2>
+<ul>
+<li>draft 使用 revision CAS，published revision 不可变；运行发布版本时必须指定精确 revision。</li>
+<li><code>core.subworkflow@1</code> 和 <code>core.foreach@1</code> 只调用固定 published revision，并设置继承深度上限。</li>
+<li>secret binding 只保存引用；原值通过 Host 的 scoped resolver 进入瞬时节点输入，若流入节点输出则拒绝持久化。</li>
+<li>自动恢复只处理 <code>running + ownerRef + 可重新解析的 Agent</code>；paused 或无 authority 的 run 保持不动。</li>
+<li>Canvas 所有读写和运行 RPC 都先解析 Host 中的实时顶层 Agent；多人部署必须叠加用户/workspace/action/resource 授权策略。</li>
+<li>模板、输入、binding 和输出在执行/存储边界进行 lossless JSON materialize 与深冻结。</li>
+</ul>
+<p>生产部署前请阅读 <a href="https://github.com/GM-HZ/dsh-dag-workflow/blob/HEAD/docs/security.md">安全与恢复边界</a>。</p>
+<h2>包与文档</h2>
+<table>
+<thead>
+<tr>
+<th>包</th>
+<th>职责</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><a href="https://github.com/GM-HZ/dsh-dag-workflow/blob/HEAD/package.json"><code>@gm-hz/dsh-dag-workflow</code></a></td>
+<td>仓库根主包，可由 <code>dsh plugin add</code> 安装，默认启用 SQLite 和 Canvas</td>
+</tr>
+<tr>
+<td><a href="https://github.com/GM-HZ/dsh-dag-workflow/blob/HEAD/packages/core/README.md"><code>@gm-hz/dsh-dag-workflow-core</code></a></td>
+<td>协议、编译器、调度器、核心节点、Run Store contract</td>
+</tr>
+<tr>
+<td><a href="https://github.com/GM-HZ/dsh-dag-workflow/blob/HEAD/packages/catalog/README.md"><code>@gm-hz/dsh-dag-workflow-catalog</code></a></td>
+<td>draft CAS、diff、不可变发布版本</td>
+</tr>
+<tr>
+<td><a href="https://github.com/GM-HZ/dsh-dag-workflow/blob/HEAD/packages/dsh/README.md"><code>@gm-hz/dsh-dag-workflow-host</code></a></td>
+<td>Cordis services、DSH adapters、Agent tools、Skill</td>
+</tr>
+<tr>
+<td><a href="https://github.com/GM-HZ/dsh-dag-workflow/blob/HEAD/packages/sqlite/README.md"><code>@gm-hz/dsh-dag-workflow-sqlite</code></a></td>
+<td>SQLite Catalog、事件和 checkpoint Provider</td>
+</tr>
+<tr>
+<td><a href="https://github.com/GM-HZ/dsh-dag-workflow/blob/HEAD/packages/canvas/README.md"><code>@gm-hz/dsh-dag-workflow-canvas</code></a></td>
+<td>授权 RPC、DSH Client manifest、XYFlow Studio</td>
+</tr>
+<tr>
+<td><a href="https://github.com/GM-HZ/dsh-dag-workflow/blob/HEAD/packages/ai-news-provider/README.md"><code>@gm-hz/dsh-dag-workflow-ai-news-provider</code></a></td>
+<td>私有验收 provider；通过普通 DSH Tool 提供一周 AI 新闻候选</td>
+</tr>
+</tbody></table>
+<ul>
+<li><a href="https://github.com/GM-HZ/dsh-dag-workflow/blob/HEAD/docs/architecture.md">总体架构</a></li>
+<li><a href="https://github.com/GM-HZ/dsh-dag-workflow/blob/HEAD/docs/source-findings.md">源码对照与设计取舍</a></li>
+<li><a href="https://github.com/GM-HZ/dsh-dag-workflow/blob/HEAD/spec/workflow-template-v1.md">Workflow Template v1 规范</a></li>
+<li><a href="https://github.com/GM-HZ/dsh-dag-workflow/blob/HEAD/ref_project/README.md">参考项目版本</a></li>
+<li><a href="https://github.com/GM-HZ/dsh-dag-workflow/blob/HEAD/docs/implementation-status.md">实现与测试审计</a></li>
+</ul>
+<h2>开发</h2>
+<pre><code>pnpm build       # 构建所有包
+pnpm typecheck   # 类型检查
+pnpm test        # 运行测试
+pnpm check       # 完整校验
+</code></pre>
+<h2>License</h2>
+<p><a href="https://github.com/GM-HZ/dsh-dag-workflow/blob/HEAD/LICENSE">MIT</a></p>

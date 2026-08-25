@@ -1,0 +1,220 @@
+<h1>dsh-notify</h1>
+<p>一个 DeepSeek Harness（DSH）插件（bundle）：当会话<strong>完成任务</strong>或<strong>向用户提问（需要选择/回答）</strong>、且用户<strong>不在会话中</strong>时，发送桌面通知并播放系统默认提示音，让你把 DSH 挂到后台跑长任务时不错过关键节点。</p>
+<blockquote>
+<p>本插件是纯事件观察者：只监听会话事件流，不拦截、不修改任何会话行为；通知失败绝不会影响会话本身。</p>
+</blockquote>
+<h2>功能</h2>
+<h3>触发时机（均可单独开关）</h3>
+<table>
+<thead>
+<tr>
+<th>触发时机</th>
+<th>会话事件</th>
+<th>通知示例</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>一轮对话正常结束（agent 回答完毕、回到空闲）</td>
+<td><code>turn/end</code>，<code>reason.kind === 'completed'</code></td>
+<td><code>DSH · 回答完成</code> + 回答摘要</td>
+</tr>
+<tr>
+<td>持久化目标（goal）完成</td>
+<td><code>goal/change</code>，<code>operation === 'complete'</code></td>
+<td><code>DSH · 任务完成</code> + 目标内容</td>
+</tr>
+<tr>
+<td>agent 调用 <code>ask_user_question</code> 向你提问</td>
+<td><code>tool/call</code>，<code>name === 'ask_user_question'</code></td>
+<td><code>DSH · 需要你的回答</code> + 问题与选项</td>
+</tr>
+</tbody></table>
+<h3>在场检测（presence）——只在离开时打扰</h3>
+<p>浏览器端插件（<code>dsh.client</code> 客户端半部）把<strong>当前选中的会话 + 页面可见性</strong>实时上报给宿主：</p>
+<ul>
+<li>页面是当前标签页 <strong>且</strong> 窗口有焦点 → 视为"在会话中" → <strong>不弹</strong>通知</li>
+<li>切到别的标签页 / 别的应用 / 最小化 / 关闭页面 → 视为"离开" → 正常弹通知</li>
+<li>心跳 + 最后状态兜底：标签页崩溃或断连后宿主侧 45 秒（TTL）自动过期，不会永久静音</li>
+<li>无浏览器场景（headless / tui）没有上报 → 恒为"离开" → 全部通知</li>
+</ul>
+<h3>系统默认提示音</h3>
+<p>每次弹出桌面通知时，按顺序尝试 <code>canberra-gtk-play -i message</code>（系统声音主题的默认提示音）、<code>pw-play</code>/<code>paplay</code>（freedesktop <code>message.oga</code>），都不可用则只记录日志、保持静默。可通过 <code>playSound</code> 关闭。</p>
+<h3>通知后端</h3>
+<p>Linux 桌面 <code>notify-send</code>（自动检测，缺失时降级为控制台）、任意自定义命令（占位符 <code>{title}</code>/<code>{message}</code>）、纯控制台输出。</p>
+<h2>架构</h2>
+<pre><code>浏览器（客户端半部 lib/client.js）                     宿主（bundle 行）
+┌──────────────────────────────┐        ┌──────────────────────────────────┐
+│ dsh-notify/client            │  RPC   │ dsh-notify/rpc  →  ctx.presence   │
+│ visibilitychange / blur /    │ ─────► │ POST /dsh-notify/presence        │
+│ focus / pagehide / 心跳(15s) │        │        │                         │
+│ 当前会话 + 页面可见性         │        │        ▼                         │
+└──────────────────────────────┘        │ dsh-notify 主插件                │
+                                        │ session/event → 抑制检查 → 通知  │
+                                        └──────────────────────────────────┘
+</code></pre>
+<p>bundle 声明了两个宿主行：<code>notify</code>（<code>inject: ['sessions']</code>，提供 <code>presence</code> 服务，headless 可用）和 <code>notify-rpc</code>（<code>inject: ['connection', 'presence']</code>，仅在 Web 宿主注册 RPC 通道，headless 下自动挂起）。客户端半部通过 <code>dsh.client</code> 清单随 Web 装配加载，由构建脚本打包成 <code>window.__ModuleLoader__</code> 惰性工厂格式。</p>
+<h2>安装</h2>
+<p>本包是一个符合 DSH 规范的 <strong>bundle</strong>：<code>package.json</code> 中声明了 <code>dsh.bundle.patch</code>，指向随包发布的 <code>cordis.patch.yml</code> 配置层。</p>
+<h3>从本地目录安装（开发/自用）</h3>
+<pre><code># 1. 构建（lib/ 产物；link 方式安装不会自动跑 prepare）
+npm install
+npm run build
+
+# 2. 安装进某个 profile（首次使用该 profile 会自动初始化）
+dsh plugin --profile web add /path/to/DSH_remind
+</code></pre>
+<p><code>dsh plugin</code> 检测到包声明了 <code>dsh.bundle</code> 后，会自动把它追加进该 profile 的 <code>dsh.profile.bundles</code> 层列表。重启该 profile（如 <code>dsh web</code>）后生效。</p>
+<h3>从 GitHub 安装</h3>
+<p>发布到仓库后：</p>
+<pre><code>dsh plugin --profile web add github:you/dsh-notify#&lt;commit-sha&gt;
+</code></pre>
+<p>git 依赖安装时 pnpm 会执行 <code>prepare</code> 脚本（即 <code>npm run build</code>）自动构建 <code>lib/</code>；pnpm ≥ 10 需要你在 profile 目录的 <code>pnpm-workspace.yaml</code> 里允许执行构建脚本（首次 <code>add</code> 失败时 <code>dsh</code> 会打印确切的键）：</p>
+<pre><code>allowBuilds:
+  dsh-notify: true
+</code></pre>
+<h3>验证配置层（不启动）</h3>
+<pre><code>dsh --profile web --patch /path/to/DSH_remind/cordis.patch.yml --dump-config
+# 应能看到 "# == .../cordis.patch.yml" 下的 notify 行
+</code></pre>
+<h2>配置</h2>
+<p>默认零配置可用。在 profile 的 <code>cordis.patch.yml</code>（用户层）中按 id 覆盖该行：</p>
+<pre><code>- id: notify
+  name: dsh-notify
+  config:
+    backend: notify-send
+    urgency: normal
+    expireMs: 10000
+    onTurnComplete: true
+    onGoalComplete: true
+    onUserQuestion: true
+    onlyQuestionsWithChoices: false
+    onlyWhenAway: true
+    presenceTtlMs: 45000
+    playSound: true
+    titlePrefix: DSH
+    previewMaxChars: 120
+    debounceMs: 1000
+</code></pre>
+<table>
+<thead>
+<tr>
+<th>字段</th>
+<th>类型</th>
+<th>默认</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>backend</code></td>
+<td><code>auto | notify-send | console | command</code></td>
+<td><code>auto</code></td>
+<td><code>auto</code>：有 <code>notify-send</code> 用桌面通知，否则降级控制台</td>
+</tr>
+<tr>
+<td><code>command</code></td>
+<td>string</td>
+<td><code>''</code></td>
+<td><code>command</code> 后端的命令模板，经 <code>/bin/sh -c</code> 执行；<code>{title}</code>、<code>{message}</code> 被替换，引号转义由命令作者负责</td>
+</tr>
+<tr>
+<td><code>urgency</code></td>
+<td><code>low | normal | critical</code></td>
+<td><code>normal</code></td>
+<td><code>notify-send</code> 的紧急度</td>
+</tr>
+<tr>
+<td><code>expireMs</code></td>
+<td>number</td>
+<td><code>10000</code></td>
+<td><code>notify-send</code> 展示时长（毫秒，<code>0</code> = 常驻直到关闭）</td>
+</tr>
+<tr>
+<td><code>titlePrefix</code></td>
+<td>string</td>
+<td><code>DSH</code></td>
+<td>通知标题前缀</td>
+</tr>
+<tr>
+<td><code>onTurnComplete</code></td>
+<td>boolean</td>
+<td><code>true</code></td>
+<td>一轮回答完成时通知</td>
+</tr>
+<tr>
+<td><code>onGoalComplete</code></td>
+<td>boolean</td>
+<td><code>true</code></td>
+<td>goal（长期任务）完成时通知</td>
+</tr>
+<tr>
+<td><code>onUserQuestion</code></td>
+<td>boolean</td>
+<td><code>true</code></td>
+<td>agent 提问时通知</td>
+</tr>
+<tr>
+<td><code>onlyQuestionsWithChoices</code></td>
+<td>boolean</td>
+<td><code>false</code></td>
+<td>为 <code>true</code> 时只通知带选项（需选择）的问题</td>
+</tr>
+<tr>
+<td><code>onlyWhenAway</code></td>
+<td>boolean</td>
+<td><code>true</code></td>
+<td>为 <code>true</code> 时，正在浏览该会话（当前标签页且窗口有焦点）就不弹通知；离开才弹</td>
+</tr>
+<tr>
+<td><code>presenceTtlMs</code></td>
+<td>number</td>
+<td><code>45000</code></td>
+<td>浏览器上报的在场状态有效期（毫秒）；标签页停止上报（崩溃/断连）后超过该时长即视为离开</td>
+</tr>
+<tr>
+<td><code>playSound</code></td>
+<td>boolean</td>
+<td><code>true</code></td>
+<td>弹通知时播放系统默认提示音（<code>canberra-gtk-play -i message</code> → <code>pw-play</code>/<code>paplay</code> 兜底）</td>
+</tr>
+<tr>
+<td><code>previewMaxChars</code></td>
+<td>number</td>
+<td><code>120</code></td>
+<td>通知正文中回答摘要/目标内容的截断长度</td>
+</tr>
+<tr>
+<td><code>debounceMs</code></td>
+<td>number</td>
+<td><code>0</code> 及以上</td>
+<td>同类通知的最小间隔（毫秒），避免同一时刻连发多条</td>
+</tr>
+</tbody></table>
+<p>自定义命令示例（macOS）：</p>
+<pre><code>config:
+  backend: command
+  command: 'osascript -e "display notification \"{message}\" with title \"{title}\""'
+</code></pre>
+<h2>工作原理</h2>
+<pre><code>浏览器（页面）                           宿主（本 bundle）
+ 会话选中变化 ─┐
+ visibility/focus/blur ─┼─► RPC /dsh-notify/presence ─► ctx.presence（TTL 状态表）
+ 心跳 15s ─────┘                                        │
+                                                        ▼
+DSH 会话事件流 (session/event) ─────────────────► 离开检查（isAttended）─► 防抖 ─► 通知 + 提示音
+</code></pre>
+<ul>
+<li>主插件声明 <code>inject: ['sessions']</code>：等待 <code>dsh-session</code> 服务就绪后加载（每个 profile 的 <code>dsh-base</code> 都提供），并提供 <code>presence</code> 服务。</li>
+<li>通过 <code>ctx.on('session/event', …)</code> 订阅事件流；<code>session/disposed</code> 时清理会话状态。</li>
+<li>监听器整体 try/catch 包裹：<code>session/event</code> 处于会话热路径上，任何通知故障都会被吞掉并只写入日志，绝不冒泡。</li>
+<li>通知与提示音进程以 detached 方式派生并 <code>unref()</code>，不阻塞、不等待；退出码非零或 stderr 有输出会记录到 DSH 日志。</li>
+<li>所有注册（监听器、effect、RPC 通道）都由 Cordis 随插件卸载自动回收，支持 HMR。</li>
+<li>客户端半部保持零 import（构建期纯度门禁），由 <code>scripts/build-client.mjs</code> 打包成 Web 装配所需的惰性工厂格式。</li>
+</ul>
+<h2>开发</h2>
+<pre><code>npm install          # 依赖（沙箱环境可加 --cache ./.npm-cache）
+npm run build        # tsc → lib/（宿主）+ lib/client.js（客户端 bundle）
+npm test             # 构建 + 29 个测试（宿主事件/在场抑制/RPC/客户端 DOM 模拟，无需 LLM/网络）
+</code></pre>
+<p>测试直接加载构建产物：在裸 Cordis 根上下文上提供假 <code>sessions</code>/<code>connection</code> 服务，注入合成会话事件与在场上报并断言通知输出；客户端半部在 mock 的 DOM 与 ModuleLoader 上运行。</p>
+<h2>许可证</h2>
+<p>MIT</p>

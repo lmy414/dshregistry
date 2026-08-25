@@ -1,0 +1,250 @@
+<h1>gmail-dsh</h1>
+<p>A native <a href="https://github.com/deepseek-ai/deepseek-harness">DeepSeek Harness</a> plugin that gives the agent your Gmail: search and read the mailbox, send mail (thread-aware replies included), and manage labels — with a browser-based Google OAuth flow, per-account grants in the DSH credential store, and approval prompts on every mutating operation.</p>
+<p>MIT-licensed. Sister plugin: <a href="https://github.com/takasurazeem/websearch-dsh">websearch-dsh</a>.</p>
+<p>No MCP server, no third-party runtime dependencies: it registers directly on the harness tool runtime, credential store, command system, and system prompt.</p>
+<h2>What you get</h2>
+<table>
+<thead>
+<tr>
+<th>Surface</th>
+<th>What it does</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>gmail_search</code></td>
+<td>Gmail query search (<code>is:unread</code>, <code>from:x</code>, <code>newer_than:1w</code>, …), newest first, paged</td>
+</tr>
+<tr>
+<td><code>gmail_read</code></td>
+<td>Full message: plain text (HTML optional), headers, attachments, labels, thread</td>
+</tr>
+<tr>
+<td><code>gmail_send</code></td>
+<td>Send plain-text mail; <code>replyTo</code> threads the reply under an existing message — <strong>asks the user first</strong></td>
+</tr>
+<tr>
+<td><code>gmail_labels</code></td>
+<td>Add/remove labels on one message or a whole thread — <strong>asks the user first</strong></td>
+</tr>
+<tr>
+<td><code>gmail_status</code></td>
+<td>Authorization state: accounts, default account, scopes, OAuth-client status</td>
+</tr>
+<tr>
+<td><code>/gmail</code> command</td>
+<td><code>/gmail status</code>, <code>/gmail auth [email]</code>, <code>/gmail unauth [email]</code></td>
+</tr>
+<tr>
+<td>system-prompt section</td>
+<td>One paragraph telling the model Gmail is connected (zero tokens until an account is authorized)</td>
+</tr>
+</tbody></table>
+<p>Approval semantics: reads never prompt. <code>gmail_send</code> and <code>gmail_labels</code> return an <code>ask</code> decision from the tool pre-execute hook, which the harness approval service turns into a user prompt (recipient + subject / label change + target). If no approval service is mounted, <code>ask</code> degrades to deny, so the plugin is read-only in that deployment — it never sends without a user who can say yes.</p>
+<h2>How it works</h2>
+<pre><code>/gmail auth
+  └─ PKCE (S256) + state → browser → accounts.google.com
+       └─ callback to http://127.0.0.1:&lt;ephemeral port&gt;/gmail/callback
+            └─ code → https://oauth2.googleapis.com/token  (+client secret)
+                 └─ refresh_token ── stored ──▶ credential store
+                                          ~/.dsh/.credentials.yaml
+                                          records: gmail-dsh/&lt;slug of email&gt;
+            └─ access tokens: in-process cache only, refreshed on 401
+</code></pre>
+<ul>
+<li><strong>OAuth</strong> uses Google's Desktop (installed-app) client type, which accepts any <code>http://127.0.0.1:&lt;port&gt;</code> redirect — the plugin opens a loopback server on a random free port for the duration of one authorization. Only the short-lived authorization code crosses that server; it is closed immediately after. The <code>access_type=offline&amp;prompt=consent</code> parameters make Google return a refresh token.</li>
+<li><strong>Secrets</strong> live only in the DSH credential store: the OAuth <em>client</em> id/secret as references (<code>GMAIL_OAUTH_CLIENT_ID</code> / <code>GMAIL_OAUTH_CLIENT_SECRET</code>), and each account's <em>refresh token</em> as a grant record under the plugin's own scope (<code>gmail-dsh/&lt;slugified-email&gt;</code>; the canonical email is in the record payload). <code>modifyRecord</code> is the sole write path, which serializes refresh-token rotation across processes.</li>
+<li><strong>Multiple accounts</strong>: authorize as many as you like; tools take an optional <code>account</code> parameter, which defaults to the single account (or to <code>defaultAccount</code> when several).</li>
+</ul>
+<h2>Setup</h2>
+<h3>1. Google Cloud project</h3>
+<ol>
+<li>In <a href="https://console.cloud.google.com">Google Cloud Console</a>: create (or pick) a project.</li>
+<li><strong>APIs &amp; Services → Enable APIs and Services</strong> → enable the <strong>Gmail API</strong>.</li>
+<li><strong>OAuth consent screen</strong>: choose <strong>External</strong> (or Internal if you have Google Workspace), fill in the app name, and add your account to the test-users list while the screen is in <em>Testing</em> status.</li>
+<li><strong>Credentials → Create Credentials → OAuth client ID → Desktop application</strong>. Download the JSON; you need <code>client_id</code> and <code>client_secret</code>.</li>
+</ol>
+<h3>2. Store the client credentials</h3>
+<p>Either in the credential store (recommended — the web GUI's credentials screen writes these) or by hand in <code>~/.dsh/.credentials.yaml</code>:</p>
+<pre><code>version: 1
+refs:
+  GMAIL_OAUTH_CLIENT_ID: &lt;your-client-id&gt;
+  GMAIL_OAUTH_CLIENT_SECRET: &lt;your-client-secret&gt;
+</code></pre>
+<p>or as process environment variables of the same names. (Literal <code>clientId</code>/<code>clientSecret</code> config values also work but are discouraged; refs win when both are present.)</p>
+<h3>3. Install into a profile</h3>
+<p>From this directory (e.g. after <code>git clone https://github.com/takasurazeem/gmail-dsh</code>):</p>
+<pre><code>dsh plugin --profile web add file:$PWD
+</code></pre>
+<p>and add the bundle to the profile's <code>package.json</code> under <code>~/.dsh/profiles/web</code>:</p>
+<pre><code>"dsh": {
+  "profile": {
+    "bundles": [
+      "@deepseek-ai/dsh-base",
+      "@deepseek-ai/dsh-web-app",
+      "yolo-mode",
+      "gmail-dsh"
+    ]
+  }
+}
+</code></pre>
+<p>Restart <code>dsh web</code> (or let the profile HMR pick it up while the dev watcher runs). The plugin contributes its own <code>cordis.patch.yml</code> row, so nothing else in the profile needs editing.</p>
+<blockquote>
+<p><strong>Note for <code>file:</code> installs from a dev checkout:</strong> Node resolves a package's <code>import "@deepseek-ai/…"</code> specifiers from the package's <em>real</em> path, so the checkout needs a <code>node_modules</code> it can walk up to. This repo ships a <code>node_modules/@deepseek-ai</code> symlink into the dsh installation's own package set (it's git-ignored; recreate with <code>mkdir -p node_modules &amp;&amp; ln -s "$(npm root -g)/@deepseek-ai/dsh/node_modules/@deepseek-ai" node_modules/@deepseek-ai</code> if missing). Packages installed into a profile's own <code>node_modules</code> (the usual case) never need this.</p>
+<p><strong>Updating the plugin later:</strong> pnpm <em>copies</em> a <code>file:</code> package into the profile's <code>node_modules</code> at install time, so the installed copy is a <strong>frozen snapshot</strong> — later edits to the checkout won't reach a running app (and re-running the same <code>pnpm add</code> may not refresh it). To develop live, replace the copy with a symlink to the checkout and restart <code>dsh web</code>:</p>
+<pre><code>cd ~/.dsh/profiles/web
+rm -rf node_modules/gmail-dsh
+ln -s /path/to/this/checkout node_modules/gmail-dsh
+</code></pre>
+<p>Every subsequent restart then runs the checkout as it is on disk.</p>
+</blockquote>
+<h3>4. Authorize</h3>
+<p>In a session, run:</p>
+<pre><code>/gmail auth
+</code></pre>
+<p>Your browser opens Google's consent screen (or the command prints the URL). After you approve, the one-shot loopback server receives the code, exchanges it, verifies your email via the OIDC userinfo endpoint, and stores the refresh token. <code>/gmail status</code> confirms. To remove an account: <code>/gmail unauth [email]</code> (revoke on Google's side too at <a href="https://myaccount.google.com/permissions">https://myaccount.google.com/permissions</a> if you want to reclaim the grant).</p>
+<h2>Configuration</h2>
+<p>Row config for the <code>gmail</code> row (full row replacement semantics — patches restate every field):</p>
+<table>
+<thead>
+<tr>
+<th>Field</th>
+<th>Default</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>clientIdEnv</code></td>
+<td><code>GMAIL_OAUTH_CLIENT_ID</code></td>
+<td>Credential-store ref / env name for the client id</td>
+</tr>
+<tr>
+<td><code>clientSecretEnv</code></td>
+<td><code>GMAIL_OAUTH_CLIENT_SECRET</code></td>
+<td>Credential-store ref / env name for the client secret</td>
+</tr>
+<tr>
+<td><code>clientId</code></td>
+<td><code>''</code></td>
+<td>Literal fallback when no ref is set (discouraged)</td>
+</tr>
+<tr>
+<td><code>clientSecret</code></td>
+<td><code>''</code></td>
+<td>Literal fallback (discouraged)</td>
+</tr>
+<tr>
+<td><code>scopes</code></td>
+<td><code>[openid, email, gmail.modify]</code></td>
+<td>OAuth scopes; <code>https://www.googleapis.com/auth/gmail.modify</code> covers read + send + labels. The <code>openid</code>/<code>email</code> scopes are required — the token exchange works without them, but Google's userinfo endpoint (where the account email is read) rejects tokens lacking <code>openid</code> with 401 "Invalid Credentials". Narrower scopes (<code>gmail.readonly</code>) work for the read tools; sending requires the <code>modify</code> scope. <strong>Source of truth is <code>DEFAULT_SCOPES</code> in <code>src/config.js</code></strong> — the bundle's own patch layer deliberately omits this key (an explicit patch value overrides the defaults, and a stale restated list once silently defeated an openid fix on every restart); override it in your own profile patch layer if you need to</td>
+</tr>
+<tr>
+<td><code>callbackHost</code></td>
+<td><code>127.0.0.1</code></td>
+<td>Loopback callback host (Desktop clients accept any local port)</td>
+</tr>
+<tr>
+<td><code>callbackPath</code></td>
+<td><code>/gmail/callback</code></td>
+<td>Callback path</td>
+</tr>
+<tr>
+<td><code>defaultAccount</code></td>
+<td><code>''</code></td>
+<td>Account used when a tool omits <code>account</code> (auto-resolved when exactly one account is authorized)</td>
+</tr>
+<tr>
+<td><code>authTimeoutMs</code></td>
+<td><code>300000</code></td>
+<td>How long <code>/gmail auth</code> waits for the browser callback</td>
+</tr>
+<tr>
+<td><code>requireApproval.send</code></td>
+<td><code>true</code></td>
+<td>Ask the user before <code>gmail_send</code></td>
+</tr>
+<tr>
+<td><code>requireApproval.labels</code></td>
+<td><code>true</code></td>
+<td>Ask the user before <code>gmail_labels</code></td>
+</tr>
+<tr>
+<td><code>context.enabled</code></td>
+<td><code>true</code></td>
+<td>Emit the model-context section once authorized</td>
+</tr>
+<tr>
+<td><code>context.order</code></td>
+<td><code>117</code></td>
+<td>Section order in the system prompt (kept clear of stock bundles)</td>
+</tr>
+</tbody></table>
+<h2>Security notes</h2>
+<ul>
+<li>The callback server is <strong>loopback-only</strong> and lives for one authorization; tokens never appear in URLs, logs, or config.</li>
+<li>The durable secret is the refresh token, stored in your <code>~/.dsh/.credentials.yaml</code> under the <code>gmail-dsh/</code> record scope (the credential store file's usual protections apply).</li>
+<li>The OAuth scope is your boundary: <code>gmail.modify</code> lets the agent send as you and move messages between labels — it cannot export the mailbox in bulk any faster than the API's quotas allow, and every send still needs your explicit approval.</li>
+<li>If your deployment has no approval service, mutating tools fail closed (denied) rather than running silently.</li>
+</ul>
+<h2>Troubleshooting</h2>
+<table>
+<thead>
+<tr>
+<th>Symptom</th>
+<th>Fix</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>/gmail auth</code> says the client is not configured</td>
+<td>Set <code>GMAIL_OAUTH_CLIENT_ID</code> / <code>GMAIL_OAUTH_CLIENT_SECRET</code> (credential store or env) and check <code>/gmail status</code> again</td>
+</tr>
+<tr>
+<td>"no refresh token" after a successful consent</td>
+<td>Your browser already holds a non-interactive token for this app: revoke it at <a href="https://myaccount.google.com/permissions">https://myaccount.google.com/permissions</a> (or authorize in a private window) and retry</td>
+</tr>
+<tr>
+<td><code>invalid_grant</code> on a later refresh</td>
+<td>The refresh token was revoked or the consent changed: <code>/gmail unauth</code> and <code>/gmail auth</code> again</td>
+</tr>
+<tr>
+<td><code>403 … quota</code> from the Gmail API</td>
+<td>Project-level API quota; see <a href="https://developers.google.com/gmail/api/v1/reference/quota">Gmail API quotas</a></td>
+</tr>
+<tr>
+<td>"Multiple Gmail accounts are authorized" from a tool</td>
+<td>Pass <code>account</code> to the tool or set <code>defaultAccount</code></td>
+</tr>
+<tr>
+<td>Checkout edits don't take effect (e.g. an old error persists after a restart)</td>
+<td>The profile's <code>node_modules/gmail-dsh</code> is a snapshot copy from install time — replace it with a symlink to the checkout (Setup §3 note) and restart</td>
+</tr>
+<tr>
+<td><code>/gmail auth</code> consent passes but <code>userinfo request failed (401) "Invalid Credentials"</code></td>
+<td>The running code requests scopes without <code>openid</code>; the token Google issues can't call the userinfo endpoint. Make sure the checkout's <code>src/config.js</code> scopes (<code>openid</code>, <code>email</code>, <code>gmail.modify</code>) are what the app actually loaded — a stale snapshot copy will fail exactly like this</td>
+</tr>
+<tr>
+<td>A read tool fails with <code>credential key segment "" must match ...</code></td>
+<td>Plugin build predates <code>0.1.2</code>: the tools resolved the account but never forwarded it to the token fetch, so the credential key came out empty. Update the checkout and restart</td>
+</tr>
+</tbody></table>
+<h2>Tests</h2>
+<pre><code>node test.mjs
+</code></pre>
+<p>Plain Node, no framework, no network (the OAuth token endpoints are stubbed; the loopback callback tests use a real ephemeral port). The suite adapts to its environment: from a bare checkout it runs the pure-logic tests and skips the dsh-runtime-dependent ones; from a directory that can resolve the <code>@deepseek-ai/*</code> packages (a profile's <code>node_modules</code>, or the <code>node_modules</code> farm this repo symlinks in) it additionally validates all five tool definitions against the real <code>defineTool</code> and executes them against fakes.</p>
+<p>For a full composition check against a real profile layout:</p>
+<pre><code>DSH_HOME=$PWD/.dsh-home dsh --profile gmail-dev --dump-config   # composed tree
+DSH_HOME=$PWD/.dsh-home dsh --profile gmail-dev "…"             # headless boot (create a scratch profile under .dsh-home/)
+</code></pre>
+<h2>Development notes</h2>
+<ul>
+<li><strong>Zero runtime dependencies.</strong> Only <code>peerDependencies</code> on the harness packages (<code>@deepseek-ai/cordis</code>, <code>dsh-credentials</code>, <code>dsh-tools</code>), so <code>pnpm add</code> of this package never fetches anything; the import sites are lazy and degrade with actionable errors outside a dsh runtime.</li>
+<li><strong>Config contract.</strong> The cordis runtime calls <code>Config['~standard'].validate(raw)</code> <strong>synchronously</strong> (it rejects promises) and expects <code>{value}</code> or <code>{issues}</code>; the loader separately reads <code>Config.simplify</code> for HMR write-back. Both delegate to <code>normalizeConfig</code>.</li>
+<li><strong>Tool schema DSL.</strong> The value-schema DSL marks required fields per property (<code>required: true</code> on the property) — there is no root-level <code>required</code> array. The runtime validates every tool result against the compiled output schema and throws <code>ToolOutputError</code> on violation, so <code>required</code> marks must match what <code>execute</code> actually returns.</li>
+<li><strong>Credential key grammar.</strong> <code>credentialKey</code> segments match <code>^[a-z][a-z0-9-]*$</code>, so email addresses are slugified (<code>me@gmail.com</code> → <code>gmail-dsh/me-gmail-com</code>); the canonical email lives in the record payload, and <code>listAccounts</code> matches on it.</li>
+<li><strong>No custom session events</strong> (avoids the ignorable-trap), and the commands service is accessed opportunistically so a composition without it never leaves the plugin pending.</li>
+</ul>
+<h2>Uninstall</h2>
+<pre><code>dsh plugin --profile web remove gmail-dsh
+</code></pre>
+<p>remove <code>"gmail-dsh"</code> from the profile's <code>dsh.profile.bundles</code>, restart, and <code>/gmail unauth</code> each account (or delete the <code>gmail-dsh/…</code> records from <code>~/.dsh/.credentials.yaml</code>).</p>
+<h2>License</h2>
+<p>MIT — see <a href="https://github.com/takasurazeem/gmail-dsh/blob/HEAD/LICENSE">LICENSE</a>.</p>

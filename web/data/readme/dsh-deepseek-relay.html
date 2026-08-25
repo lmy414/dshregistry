@@ -1,0 +1,263 @@
+<h1>dsh-deepseek-relay — DeepSeek 中转站思考强度适配插件</h1>
+<p>让 deepseek-harness（<code>dsh</code>）里通过<strong>中转站</strong>（第三方 OpenAI 兼容网关，如
+OneAPI / new-api / one-hub 或各种"API 转发"服务）接入的 DeepSeek 模型，
+也能像官方 API 一样在 Web UI 里设置<strong>推理等级（思考强度）</strong>：Off / Low /
+High / Max 四档，并把思考参数按中转站认识的格式发出去。</p>
+<h2>问题</h2>
+<p>官方 API 走内置 <code>llm-deepseek</code> 适配器，<code>resolveModel</code> 会返回
+<code>reasoning.efforts = [Off, Low, High, Max]</code>，所以 UI 有推理等级选项。</p>
+<p>中转站通常走 <code>llm-pi-ai</code> 的"自定义提供方"（openai-completions）。但：</p>
+<ol>
+<li>Web UI 的表单没有 <code>reasoningEfforts</code> 字段，手写模型没有推理元数据，
+UI 里<strong>根本不出现推理等级选项</strong>；</li>
+<li>即使声明了，发往中转站的思考参数格式也不一定对——DeepSeek 官方格式
+（<code>thinking: {type: "enabled"}</code> + <code>reasoning_effort</code>）和 OpenAI 格式
+（只有 <code>reasoning_effort</code>）在中转站上不通用。</li>
+</ol>
+<h2>解决方式</h2>
+<p>本插件注册<strong>独立的 OpenAI 兼容适配器路由</strong>（每条中转站一条路由），并且：</p>
+<ul>
+<li><strong>始终向 UI 暴露 Off / Low / High / Max 四档推理等级</strong>（与官方 <code>llm-deepseek</code>
+完全一致，见 <code>src/adapter.ts</code> 的 <code>REASONING_EFFORTS</code>）；</li>
+<li>按 <code>thinkingFormat</code> 把思考参数写成中转站认识的方言（见 <code>src/serialize.ts</code>）：</li>
+</ul>
+<table>
+<thead>
+<tr>
+<th>档位</th>
+<th><code>openai</code>（默认）</th>
+<th><code>deepseek</code></th>
+</tr>
+</thead>
+<tbody><tr>
+<td>off</td>
+<td>不发送任何思考字段（网关默认）</td>
+<td><code>thinking: {type:"disabled"}</code></td>
+</tr>
+<tr>
+<td>low</td>
+<td><code>reasoning_effort: "low"</code></td>
+<td><code>thinking:{type:"enabled"}</code> + <code>reasoning_effort:"low"</code></td>
+</tr>
+<tr>
+<td>high</td>
+<td><code>reasoning_effort: "high"</code></td>
+<td><code>thinking:{type:"enabled"}</code> + <code>reasoning_effort:"high"</code></td>
+</tr>
+<tr>
+<td>max</td>
+<td><code>reasoning_effort: "max"</code></td>
+<td><code>thinking:{type:"enabled"}</code> + <code>reasoning_effort:"max"</code></td>
+</tr>
+</tbody></table>
+<ul>
+<li><code>thinkingFormat: auto</code> 时按 baseURL 域名猜：含 <code>deepseek.com/ai/cn</code> 用
+<code>deepseek</code>，其余默认 <code>openai</code>（多数中转站）。</li>
+<li>支持按模型覆盖 wire 值（<code>reasoningEfforts</code>），应对"网关要求 <code>ultra</code> 之类
+自定义取值"的场景。</li>
+</ul>
+<h2>使用</h2>
+<p>两种方式都符合官方插件规范（见下文「官方规范符合性」）：</p>
+<h3>方式 A：从源码运行，<code>--patch</code> 本地加载（开发/自用）</h3>
+<p>在 deepseek-harness 仓库根目录（已 <code>pnpm install</code> 过）：</p>
+<pre><code>pnpm dsh web --patch ./dsh-deepseek-relay/cordis.yml
+</code></pre>
+<p>启动前先编辑 <code>cordis.yml</code>，把 <code>providers.relay</code> 换成你的中转站信息：</p>
+<pre><code>- insert:
+    - id: dsh-deepseek-relay
+      name: '/绝对路径/deepseek-harness/dsh-deepseek-relay/src/index.ts'
+      config:
+        providers:
+          my-relay:
+            baseURL: https://your-relay.example.com/v1
+            apiKeyEnv: RELAY_API_KEY
+            thinkingFormat: auto
+            models:
+              - id: deepseek-v4-flash
+</code></pre>
+<ul>
+<li><strong>API key</strong>：设置环境变量 <code>RELAY_API_KEY</code>，或启动后在 Web UI
+<strong>设置 → 模型</strong> 里选中该提供方填入密钥（密钥存 <code>$DSH_HOME/.credentials.yaml</code>）。</li>
+<li><strong>模型</strong>：<code>models</code> 列表即模型选择器里出现的模型；<code>contextWindow</code> /
+<code>maxTokens</code> 会作为上下文/输出上限信息。</li>
+<li>保存后，在模型选择器选到该模型的会话里，输入框旁就会出现
+<strong>Off / Low / High / Max</strong> 推理等级下拉（和官方 API 一样）。</li>
+</ul>
+<h3>方式 B：作为组合包（bundle）安装（可分发）</h3>
+<pre><code># 本地目录 / git / tarball 均可；首次会初始化 profile
+dsh plugin --profile demo add ./dsh-deepseek-relay
+# 或 dsh plugin --profile demo add github:you/dsh-deepseek-relay
+</code></pre>
+<p>包内 <code>cordis.patch.yml</code> 声明了插件行（<code>name: dsh-deepseek-relay</code> 按包名解析，
+加载 <code>lib/index.js</code>），<code>prepare</code> 脚本（esbuild）会在安装时自动构建
+<code>lib/</code>。安装后插件处于 <strong>dormant（空配置可安全装载，不注册任何路由/目录，
+适配器与 configurable-provider 目录两侧都有空数组守卫，见 <code>src/index.ts</code> 的
+<code>ensureDirectory</code>/<code>ensureRegistrationFacts</code>）</strong>，在 profile 的
+<code>cordis.patch.yml</code> 或 <code>$DSH_HOME/cordis.patch.yml</code> 里覆盖同 id 行填入中转站
+配置（参考 <code>cordis.patch.yml</code> 顶部注释），或随后在 Web UI 设置中热更新生效。</p>
+<h2>配置项</h2>
+<table>
+<thead>
+<tr>
+<th>字段</th>
+<th>说明</th>
+<th>默认</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>baseURL</code></td>
+<td>中转站 OpenAI 兼容地址，<code>/chat/completions</code> 自动拼接</td>
+<td>必填</td>
+</tr>
+<tr>
+<td><code>apiKeyEnv</code></td>
+<td>API key 环境变量名</td>
+<td><code>RELAY_API_KEY</code></td>
+</tr>
+<tr>
+<td><code>displayName</code></td>
+<td>模型选择器显示名</td>
+<td>路由 key</td>
+</tr>
+<tr>
+<td><code>thinkingFormat</code></td>
+<td><code>auto</code> / <code>openai</code> / <code>deepseek</code></td>
+<td><code>auto</code></td>
+</tr>
+<tr>
+<td><code>reasoningEffort</code></td>
+<td>默认推理等级 <code>off</code>/<code>low</code>/<code>high</code>/<code>max</code></td>
+<td><code>high</code></td>
+</tr>
+<tr>
+<td><code>maxTokensField</code></td>
+<td>输出上限字段 <code>max_tokens</code>/<code>max_completion_tokens</code></td>
+<td><code>max_tokens</code></td>
+</tr>
+<tr>
+<td><code>maxTokens</code></td>
+<td>路由级默认输出上限</td>
+<td>256000</td>
+</tr>
+<tr>
+<td><code>models[].id</code></td>
+<td>发往网关的模型 id</td>
+<td>必填</td>
+</tr>
+<tr>
+<td><code>models[].name</code></td>
+<td>选择器显示名</td>
+<td>id</td>
+</tr>
+<tr>
+<td><code>models[].contextWindow</code></td>
+<td>上下文容量</td>
+<td>262144</td>
+</tr>
+<tr>
+<td><code>models[].maxTokens</code></td>
+<td>该模型输出上限</td>
+<td>路由级值</td>
+</tr>
+<tr>
+<td><code>models[].reasoningEfforts</code></td>
+<td>按档位覆盖 wire 值（<code>null</code>=支持但不发送）</td>
+<td>方言默认</td>
+</tr>
+</tbody></table>
+<h2>官方规范符合性</h2>
+<p>对照仓库 <code>docs/user/develop/basic/{index,config,publish}.zh.md</code> 与
+<code>docs/user/develop/practice/llm-adapter.zh.md</code>：</p>
+<table>
+<thead>
+<tr>
+<th>官方要求</th>
+<th>本插件</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>插件模块导出 <code>name</code> + <code>apply(ctx, config)</code></td>
+<td>✅ <code>src/index.ts</code></td>
+</tr>
+<tr>
+<td>声明 <code>inject</code>（本插件依赖 <code>llm</code> 服务）</td>
+<td>✅ <code>inject = ['llm']</code></td>
+</tr>
+<tr>
+<td>导出 <code>Config</code> 类型 + 同名 Schemastery schema，默认值写在 schema 中</td>
+<td>✅ <code>src/index.ts</code></td>
+</tr>
+<tr>
+<td><code>--patch</code> overlay 加载本地插件（源码路径 <code>.ts</code>）</td>
+<td>✅ <code>cordis.yml</code>（方式 A）</td>
+</tr>
+<tr>
+<td>组合包 <code>dsh.bundle</code> manifest + <code>cordis.patch.yml</code>（按包名引用）</td>
+<td>✅ <code>package.json</code> + <code>cordis.patch.yml</code>（方式 B）</td>
+</tr>
+<tr>
+<td>git 安装的 TS 包必须自带 <code>prepare</code> 构建（产出 <code>lib/</code>）</td>
+<td>✅ <code>scripts/build.mjs</code> + <code>tsconfig.build.json</code></td>
+</tr>
+<tr>
+<td><code>LlmAdapter</code> 契约：实现 <code>stream()</code>、<code>resolveModel</code> 返回 <code>reasoning</code> 元数据、<code>attributionHeaders()</code>、<code>LlmError</code> 稳定 code、透传 <code>options.signal</code></td>
+<td>✅ <code>src/adapter.ts</code></td>
+</tr>
+</tbody></table>
+<p>注：<code>--patch</code> 从源码路径加载 <code>.ts</code> 是官方教程支持的<strong>开发方式</strong>；正式分发
+（npm/git/tarball）走方式 B，<code>prepare</code> 构建出 <code>lib/index.js</code> 后与源码运行
+等价。两种方式共用同一份 <code>src/</code>。</p>
+<h2>备选：不装插件，直接用官方 llm-pi-ai 手工配置</h2>
+<p>官方 <code>llm-pi-ai</code> 本身支持同样的能力，只是要手写 <code>$DSH_HOME/settings.yaml</code>。
+如果不想装插件，可以这样写（等效于 <code>thinkingFormat: deepseek</code>）：</p>
+<pre><code>llm-pi-ai:
+  providers:
+    my-relay:
+      apiKeyEnv: RELAY_API_KEY
+      api: openai-completions
+      baseURL: https://your-relay.example.com/v1
+      compat:
+        thinkingFormat: deepseek
+      models:
+        - id: deepseek-v4-flash
+          reasoningEfforts:
+            off:
+            low: low
+            high: high
+            max: max
+</code></pre>
+<blockquote>
+<p>注意：<code>reasoningEfforts</code> 里 <code>off:</code> 冒号后留空表示"支持该档、不发送"；
+其余档必须给 wire 值，否则配置被拒。多数网关（OneAPI 等）应使用
+<code>thinkingFormat: openai</code> 而不是 <code>deepseek</code>，除非网关原样转发官方 API。</p>
+</blockquote>
+<h2>代码结构</h2>
+<pre><code>dsh-deepseek-relay/
+├── cordis.yml          # --patch 本地加载配置示例（方式 A）
+├── cordis.patch.yml    # 组合包配置层（方式 B，dsh.bundle.patch 指向它）
+├── package.json        # dsh.bundle manifest + scripts（prepare 构建）
+├── scripts/build.mjs   # esbuild 构建单文件 lib/index.js（external @deepseek-ai/*）
+├── tsconfig.json       # 类型检查（tsc --noEmit）
+└── src/
+    ├── index.ts      # 插件入口：Config schema、路由注册、settings 热更新
+    ├── adapter.ts    # RelayAdapter：四档推理等级 + fetch/SSE stream
+    ├── serialize.ts  # 消息 + 思考参数序列化（openai/deepseek 方言）
+    ├── translate.ts  # SSE chunk → harness StreamChunk
+    ├── sse.ts        # SSE 解析（eventsource-parser）
+    └── types.ts      # wire 类型
+</code></pre>
+<h2>验证</h2>
+<ul>
+<li><code>tsc --noEmit</code> 完整类型检查：0 错误（对 <code>@deepseek-ai/dsh-llm</code> 等 0.1.1-rc.2 官方 npm 包）。</li>
+<li>序列化逻辑测试（<code>resolveThinking</code> / <code>resolveThinkingFormat</code> / <code>serializeRequest</code>，openai/deepseek 方言 × off/low/high/max × 模型级覆盖 × session-title × maxTokensField）：全部通过。</li>
+<li>SSE 转换测试（<code>reasoning_content</code> 流、tool_calls 增量拼接、usage 去重、<code>[DONE]</code> 收尾、空响应）：全部通过。</li>
+<li>验证依赖通过 npm 平铺安装（<code>C:/Users/29261/Downloads/relay-verify</code>，测试脚本可复用）。</li>
+</ul>
+<h2>注意事项</h2>
+<ul>
+<li>中转站若在 <code>/chat/completions</code> 之外还有 <code>/v1</code> 后缀，<code>baseURL</code> 写完整路径，
+例如 <code>https://relay.example.com</code>（若网关恰好要求不带 <code>/v1</code>）。</li>
+<li>插件只支持文本输入（与官方 <code>llm-deepseek</code> 一致）；图片输入会以
+<code>UNSUPPORTED_CONTENT</code> 拒绝。</li>
+<li>一个插件实例可配多条中转站路由（<code>providers</code> dict 里加即可）。</li>
+</ul>

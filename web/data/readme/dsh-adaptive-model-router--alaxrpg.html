@@ -1,0 +1,225 @@
+<h1>DSH Adaptive Model Router</h1>
+<p><code>dsh-adaptive-model-router</code> 是 DeepSeek Harness 的 Cordis/Loader 插件。它发现多个 Provider 的模型，综合元数据、外部评价和可选的受限真实探测生成评分，把候选模型分入 <code>easy</code>、<code>normal</code>、<code>hard</code>，再由 <code>adaptive_subagent</code> 为每次子任务选择模型。</p>
+<p>这不是 Codex plugin。项目没有 <code>.codex-plugin/plugin.json</code>、Codex marketplace 条目、Codex skill 或 Codex hook，也不使用 <code>plugin-creator</code>。</p>
+<h2>设计边界</h2>
+<ul>
+<li>模型发现和模型评价相互独立；<code>/models</code> 只提供目录，不能证明能力。</li>
+<li>优先调用 Harness 的 <code>ctx.llm.discoverModels(...)</code>，无法使用时才走已配置 Provider 的 OpenAI-compatible <code>/models</code>。</li>
+<li>未知或不能可靠映射的模型保持 <code>unrated</code>，不会按模型名称猜测能力。</li>
+<li>人工配置始终优先于自动策略；刷新只写插件数据目录，不反写 <code>settings.yaml</code>。</li>
+<li>真实探测默认关闭，并受到模型数、请求数、Token、超时和月预算硬限制。</li>
+<li>刷新失败保留 last-known-good；新策略只影响之后启动的子代理。</li>
+<li>默认拒绝公网评价源或 Provider URL 跳转到 loopback、私网、链路本地和云元数据地址。需要本机 Provider 时必须显式允许。</li>
+</ul>
+<h2>运行要求</h2>
+<ul>
+<li>Node.js 20 或更高版本。</li>
+<li>已能启动的 DeepSeek Harness profile。</li>
+<li>Harness 组合中已有 <code>llm</code>、<code>tools</code>、<code>subagents</code> 以及对应的子代理 Provider。</li>
+<li>Provider 凭据继续由 DSH settings/credentials 服务管理；不要把 API Key 写进本插件配置。</li>
+</ul>
+<h2>安装与接入</h2>
+<p>开发目录中安装依赖、运行测试并生成 npm tarball：</p>
+<pre><code>npm install
+npm test
+npm pack
+</code></pre>
+<p>在 DSH profile 项目目录中安装刚生成的 tarball（路径按实际位置替换）：</p>
+<pre><code>cd "$DSH_PROFILE_DIR"
+npm install /absolute/path/to/dsh-adaptive-model-router-0.1.0.tgz
+node -e "import('dsh-adaptive-model-router').then(m =&gt; console.log(m.name, typeof m.apply))"
+</code></pre>
+<p>最后一条命令应输出 <code>adaptive-model-router function</code>，说明 Loader 所用的包名可被 Node 正常 import。</p>
+<p>把插件 patch 作为当前 profile 的最后一层 overlay 合并。参考 <a href="https://github.com/alaxrpg/dsh-adaptive-model-router/blob/HEAD/examples/cordis.patch.yml"><code>examples/cordis.patch.yml</code></a>：</p>
+<pre><code>- insert:
+    - id: adaptive-model-router
+      name: 'dsh-adaptive-model-router'
+      config:
+        dataDir: !!js dshHomePath('adaptive-model-router')
+</code></pre>
+<p>Cordis 通过命名导出的 <code>apply(ctx, config)</code> 加载插件。插件依赖相关 Harness 服务，并通过 <code>ctx.tools.register(...)</code> 注册 <code>adaptive_subagent</code>；卸载 Cordis fiber 时，工具注册、定时器和在途请求都会释放。</p>
+<p><code>config.dataDir</code> 表示插件的最终数据目录，不是共享根目录；因此上述 <code>dshHomePath('adaptive-model-router')</code> 实际写入 <code>$DSH_HOME/adaptive-model-router/</code>，不会再追加一层同名目录。未显式配置时，<code>DSH_DATA_DIR</code> 仍按 DSH 共享数据根目录处理。</p>
+<p>不要直接用示例覆盖 <code>$DSH_HOME/settings.yaml</code>。请只把 <a href="https://github.com/alaxrpg/dsh-adaptive-model-router/blob/HEAD/examples/settings.yaml"><code>examples/settings.yaml</code></a> 中的 <code>adaptive-model-router:</code> 节合并到已有设置；首次接入前先保留原文件副本。</p>
+<h2>配置</h2>
+<h3>可视化配置</h3>
+<p>在 DSH Web profile 中，插件在官方「设置 → 插件配置」页注册一张可折叠卡片——<strong>不再提供独立配置页</strong>，全部配置都在这张卡片内完成：</p>
+<ul>
+<li>常用区直接可见：启用状态、难度模式、默认档位、Provider 列表（启用开关、档位模式与模型、锁定、回退模型、别名、新增/删除）。</li>
+<li>刷新周期、路由回退、全局档位、分档阈值、评价权重等收在「高级设置」折叠区，默认隐藏，点击展开。</li>
+<li>卡片底部提供「手动刷新评分」按钮：立即执行一次完整的发现 → 评分 → 分档流程（等同一次刷新任务，不受 <code>refresh.enabled</code> 开关影响），完成后用最新评分与自动档位刷新显示。手动刷新与周期刷新共用 <code>refresh.timeoutSeconds</code> 超时，进行中的请求会去重复用，插件禁用或无已启用 Provider 时返回明确错误而不动缓存。</li>
+</ul>
+<p>卡片通过插件自己的同源 API 读写：<code>GET/PUT /api/adaptive-model-router/config</code> 与 <code>POST /api/adaptive-model-router/refresh</code>。保存时卡片回传读取到的 settings revision，Host 只对白名单路径调用 <code>SettingsProvider.mutate()</code>：Provider/别名删除可立即生效，浏览器未获取的 discovery、凭据、外部源、probe 和内部路径不会被重写；过期 revision 会被拒绝（409）。提交后通过 <code>SettingsScope.watch()</code> 热重载路由运行时。</p>
+<p>安全边界：</p>
+<ul>
+<li>卡片和 API 只由当前 DSH 同源提供；修改请求必须使用 loopback Host（<code>127.0.0.1</code>、<code>localhost</code> 或 <code>[::1]</code>）、匹配的 Origin 和 <code>application/json</code>，且请求体有大小上限。</li>
+<li><code>apiKey</code>、外部源 <code>headers</code>、<code>toolName</code>、<code>subagentProvider</code>、<code>dataDir</code> 和 discovery 连接参数不会发送到浏览器，API 也拒绝写入这些字段。</li>
+<li>Provider 删除按层区分：settings.yaml 用户层中的 Provider 会被真正删除（<code>unset</code>）；由 profile 组合基座（<code>cordis.patch.yml</code> 的插件 <code>config</code>）定义的 Provider 无法通过卡片删除——删除请求会改写为 <code>enabled: false</code> 的用户层覆盖，避免“删不掉又悄悄复活”的假象，真正移除需修改基座配置。</li>
+<li>悬挂或缓慢的请求体读取有超时上限；非预期错误只返回通用提示，不回显内部路径。</li>
+<li>付费 <code>evaluation.probes</code> 只读显示当前启用状态，不能通过卡片启用或修改预算；默认仍为关闭。</li>
+<li>CLI profile 没有 <code>webServer</code> 时只不注册 API，路由工具和 settings 热重载不受影响。</li>
+</ul>
+<p>DSH <code>0.1.0-rc.6</code> 的内置“插件配置”页面并不会根据任意第三方 Schemastery schema 自动生成表单，Host API proxy 也对可从 Web 访问的 settings namespace 使用显式白名单。因此本插件通过官方 <code>slots.inject('settings.plugin.item')</code> 扩展点把自带 React 卡片注入设置页，并用自身 <code>webServer</code> 路由提供同源 API，不修改 DSH core 或安装目录。参见 <a href="https://github.com/deepseek-ai/deepseek-harness/blob/master/docs/architecture.md">DeepSeek Harness Architecture</a> 和 <a href="https://github.com/deepseek-ai/deepseek-harness/blob/master/docs/cookbook/extension-cookbook.md">Extension Cookbook</a>。DSH 当前仍是 developer preview，升级后应重新验证此集成边界。</p>
+<h4>官方设置面板“插件配置”卡片</h4>
+<p>自 DSH <code>0.1.0-rc.7</code> 起，Host API 已全量暴露第三方 settings 命名空间，官方设置面板新增“插件配置”标签页，通过 <code>settings.plugin.item</code> 槽以命名空间为键配对浏览器卡片。本插件随包提供浏览器半身（<code>package.json</code> 的 <code>dsh.client</code> 声明 + <code>exports["./client"]</code>），因此在 DSH Web profile 的 <strong>设置 → 插件 → 插件配置</strong> 中会显示“自适应模型路由”卡片，可编辑：启用开关、难度模式、默认档位，以及每个 Provider 的启用与 easy/normal/hard 三档模型（下拉含已发现模型，未指定时标注当前自动档位模型）。保存走 revision-fenced 的嵌套路径 <code>mutate</code>，与独立页面同一套写语义。</p>
+<p>浏览器半身源码在 <code>src-client/</code>，构建产物为 <code>lib/client.js</code>（lazy-CJS factory 格式）。修改源码后需重新构建：</p>
+<pre><code>npm run build:client
+</code></pre>
+<p>构建依赖（esbuild）与宿主提供的 client 服务声明在 <code>package.json</code> 的 <code>dsh.client.inject</code>。插件集变更需重启 DSH 生效。</p>
+<p>最小配置：</p>
+<pre><code>adaptive-model-router:
+  enabled: true
+  providers: {}
+</code></pre>
+<p>完整默认值和单 Provider 人工三档配置见 <a href="https://github.com/alaxrpg/dsh-adaptive-model-router/blob/HEAD/examples/settings.yaml"><code>examples/settings.yaml</code></a>。关键配置如下：</p>
+<table>
+<thead>
+<tr>
+<th>配置</th>
+<th>默认值</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>difficulty.defaultTier</code></td>
+<td><code>normal</code></td>
+<td>自动难度无法可靠判断时使用</td>
+</tr>
+<tr>
+<td><code>refresh.runOnStart</code></td>
+<td><code>true</code></td>
+<td>启动后执行一次刷新</td>
+</tr>
+<tr>
+<td><code>refresh.intervalMinutes</code></td>
+<td><code>360</code></td>
+<td>周期刷新间隔</td>
+</tr>
+<tr>
+<td><code>refresh.jitterMinutes</code></td>
+<td><code>15</code></td>
+<td>最多附加的随机抖动</td>
+</tr>
+<tr>
+<td><code>refresh.staleAfterHours</code></td>
+<td><code>72</code></td>
+<td>自动策略过期界线</td>
+</tr>
+<tr>
+<td><code>routing.unavailableAction</code></td>
+<td><code>fallback</code></td>
+<td>显式 Provider/模型不可用时回退并记录原因，或用 <code>error</code> 直接报错</td>
+</tr>
+<tr>
+<td><code>evaluation.minimumConfidence</code></td>
+<td><code>0.60</code></td>
+<td>自动路由最低置信度</td>
+</tr>
+<tr>
+<td><code>evaluation.probes.enabled</code></td>
+<td><code>false</code></td>
+<td>是否允许真实调用探测</td>
+</tr>
+<tr>
+<td><code>evaluation.probes.estimatedCostUsd</code></td>
+<td>未设置</td>
+<td>模型价格未知时，每个 probe 请求预留的最坏费用；未设置则拒绝探测</td>
+</tr>
+<tr>
+<td><code>classification.strategy</code></td>
+<td><code>thresholds</code></td>
+<td><code>thresholds</code> 或 Provider 内 <code>percentile</code></td>
+</tr>
+<tr>
+<td><code>routing.staleAction</code></td>
+<td><code>last-known-good</code></td>
+<td>策略过期后的动作</td>
+</tr>
+</tbody></table>
+<p>每个 Provider 的 <code>tiers.easy/normal/hard</code> 支持：</p>
+<ul>
+<li><code>mode: auto</code>：选择最新、未过期、置信度合格的自动评价结果。</li>
+<li><code>mode: prefer</code>：优先指定 <code>model</code>，不可用时回到自动选择。</li>
+<li><code>mode: manual</code>：固定指定 <code>model</code>。</li>
+<li><code>locked: true</code>：周期刷新不能替换该档的人工结果。</li>
+</ul>
+<p>同一模型可人工配置到全部三个档位；只有一个可用模型时无需伪造三个不同候选。</p>
+<h2><code>adaptive_subagent</code> 工具</h2>
+<p>模型面对的调用参数：</p>
+<pre><code>{
+  "description": "分析认证模块",
+  "prompt": "检查调用链并提出修改方案",
+  "difficulty": "auto",
+  "provider": "auto"
+}
+</code></pre>
+<ul>
+<li><code>description</code> 和 <code>prompt</code> 必填。</li>
+<li><code>difficulty</code> 可为 <code>auto | easy | normal | hard</code>，默认 <code>auto</code>。</li>
+<li><code>provider</code> 默认为 <code>auto</code>，也可指定已启用 Provider。</li>
+<li><code>model</code> 可选；与 <code>provider</code> 一起作为本次调用的最高优先级覆盖。</li>
+</ul>
+<p>路由元数据至少包含：</p>
+<pre><code>{
+  "difficulty": "hard",
+  "provider": "opencode-go",
+  "model": "deepseek-v4-flash",
+  "routeSource": "provider-manual-locked",
+  "policyVersion": "2026-08-14T16:00:00+08:00",
+  "score": 84.5,
+  "confidence": 0.78,
+  "stale": false,
+  "fallbackReason": null
+}
+</code></pre>
+<p>Provider 和模型名称仅作为用户配置示例出现；源码默认值不会固定到该路由。</p>
+<h2>路由优先级</h2>
+<p>每次调用严格按以下顺序解析：</p>
+<ol>
+<li>调用显式指定的 <code>provider/model</code>。</li>
+<li>Provider 当前档位的 <code>manual + locked</code>。</li>
+<li>全局当前档位的人工锁定。</li>
+<li>Provider 当前档位的 <code>prefer</code>。</li>
+<li>Provider 最新有效自动结果。</li>
+<li>跨 Provider 全局自动结果。</li>
+<li>last-known-good。</li>
+<li>Provider fallback 或显式 fallback。</li>
+<li>返回清晰错误。</li>
+</ol>
+<p>指定模型不存在、被禁用或不支持目标子代理 Provider 时不会被静默改写；是否回退由 <code>routing.unavailableAction</code> 控制，并在结果的 <code>fallbackReason</code> 中说明。调用显式指定 Provider 时，所有候选、last-known-good 和 fallback 都必须属于该 Provider；只有 <code>provider: auto</code> 可以使用全局或跨 Provider fallback。</p>
+<p>当 policy 过期时，<code>routing.staleAction: last-known-good</code> 跳过过期自动结果并优先使用 last-known-good；<code>fallback</code> 同时跳过过期自动结果和 last-known-good，直接进入配置 fallback；<code>error</code> 则返回明确的 policy stale 错误。</p>
+<h2>数据文件与刷新</h2>
+<p>默认在 <code>$DSH_HOME/adaptive-model-router/</code> 保存：</p>
+<pre><code>catalog.json
+evaluations.json
+policy.json
+probe-budget.json
+</code></pre>
+<p>每个文件带 <code>schemaVersion</code> 与 <code>generatedAt</code>。保存过程先写同目录临时文件，校验后原子替换；文件损坏或 schema 不兼容时保留可读错误并尝试 last-known-good，不会清空人工设置。</p>
+<p>刷新任务启动时运行一次，之后默认每 6 小时运行，附加最多 15 分钟抖动（仅当 <code>refresh.enabled</code> 为 <code>true</code> 时调度；<code>runOnStart</code> 控制启动时是否立即执行一次）。同一插件实例只允许一个刷新运行；失败按有界退避重试，卸载时取消 timer 与 <code>AbortController</code>。此外，配置页的「手动刷新评分」随时可触发一次同步，用于 <code>refresh.enabled: false</code> 或调整权重/阈值后立即重算评分分配。</p>
+<h2>外部评价源和 SSRF 防护</h2>
+<p><code>evaluation.externalSources</code> 必须显式列出 URL。插件会限制协议、超时、响应体大小并校验 JSON schema；重定向后的每个地址仍需通过网络地址检查，且默认拒绝跨 origin 重定向。若显式允许跨 origin，插件会在下一跳剥离 <code>Authorization</code>、Cookie 和 API Key 类敏感头。默认拒绝：</p>
+<ul>
+<li><code>localhost</code>、loopback；</li>
+<li>RFC 1918 私网、链路本地；</li>
+<li>IPv6 loopback、ULA、链路本地和 IPv4-mapped 私网地址；</li>
+<li>常见云元数据终端地址。</li>
+</ul>
+<p>日志会脱敏 <code>Authorization</code>、API Key、token 和凭据查询参数。若 Provider 确实运行在 <code>127.0.0.1</code>，仅在该 Provider 配置上显式启用本地地址，不要对所有外部源解除限制。</p>
+<p>域名会在发起每一跳前解析并检查全部返回地址，但 Node 内置 <code>fetch</code> 不提供把已检查 IP 固定到连接的可移植接口，因此无法完全消除“检查后、连接前”的 DNS rebinding 时间窗。高风险部署应在出站代理/防火墙层再次禁止私网和元数据地址。</p>
+<p>真实 probe 的月预算写入 <code>probe-budget.json</code>，按 UTC 年月累计并跨刷新、进程重启保留；新月份自动从零开始。每个请求在发送前先持久化预留最坏费用。模型未同时声明输入/输出单价时，必须配置 <code>estimatedCostUsd</code>，否则该模型的 probe 会在联网前拒绝。</p>
+<h2>测试</h2>
+<p>测试使用 Node 内置 <code>node:test</code>，不会访问真实 Provider、不会读取真实凭据，也不会产生付费请求：</p>
+<pre><code>npm test
+</code></pre>
+<p>覆盖范围包括 Harness/OpenAI 两种 discovery、异常响应和超时、别名、评分与置信度、阈值/百分位分档、人工优先级、last-known-good、调度防重入与销毁、原子存储，以及 <code>adaptive_subagent</code> 的路由和资源释放。真实 Harness profile、网络 Provider、外部评价源和付费 probe 属于独立冒烟/集成验收边界。</p>
+<h2>本机冒烟验证</h2>
+<p>独立测试通过后，再合并 settings 与 patch 并启动当前 DSH web profile。建议验证：</p>
+<ol>
+<li>Loader 能加载插件且工具列表出现 <code>adaptive_subagent</code>。</li>
+<li>手动把一个现有模型配置到三个档位，三次显式难度调用均选择该模型。</li>
+<li>禁用或写错 <code>prefer</code> 模型时，结果带回退原因且命中有效自动/last-known-good。</li>
+<li>卸载插件后工具消失，数据文件保持有效，进程中没有遗留刷新定时器或子代理。</li>
+</ol>
+<p>不要为冒烟恢复已停用 Provider，不要修改现有 Provider 定义，也不要保留旧子代理线程。</p>
+<h2>License</h2>
+<p>MIT，见 <a href="https://github.com/alaxrpg/dsh-adaptive-model-router/blob/HEAD/LICENSE"><code>LICENSE</code></a>。</p>

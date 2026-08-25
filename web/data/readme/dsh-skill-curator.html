@@ -1,0 +1,134 @@
+<h1>dsh-skill-curator</h1>
+<p>Automatic skill curation for <a href="https://github.com/deepseek-ai/deepseek-harness">DeepSeek Harness</a> (DSH). After every N real conversation turns (default <strong>3</strong>), the plugin fires a background <strong>subagent</strong> that reads a digest of the session and <strong>creates or updates <code>SKILL.md</code> files</strong> under the user skills directory (<code>~/.dsh/skills/&lt;name&gt;/SKILL.md</code>) — the same self-improvement loop Nous Research's Hermes Agent runs, ported to DSH as a zero-intrusion bundle plugin.</p>
+<blockquote>
+<p>中文说明见 <a href="https://github.com/runfali/dsh-skill-curator/blob/HEAD/README.zh-CN.md">README.zh-CN.md</a>.</p>
+</blockquote>
+<h2>How it works</h2>
+<pre><code>turn ends ──▶ agent/turn-stopping (scoped listener, counted per agent)
+    │ 3 turns reached?  (skillNudgeInterval)
+    ▼
+async fire-and-forget (never blocks the turn close)
+    ▼
+session digest built ──▶ latest N messages verbatim + older turns compressed
+    ▼
+spawn subagent (provider: spawn) with digest + review instructions
+    │  toolFilter allow = skill-library-* only (whitelist, hermes-style)
+    ▼
+subagent reviews and writes ~/.dsh/skills/&lt;name&gt;/SKILL.md
+    │  frontmatter is stamped author: dsh-skill-curator (ownership marker)
+    ▼
+summary logged (host journal) + visible in the settings card status panel
+</code></pre>
+<p><img src="https://raw.githubusercontent.com/runfali/dsh-skill-curator/HEAD/docs/screenshot/0-1.png" alt="Backstage review subagent in the Tasks panel"></p>
+<p><em>The review subagent runs as a visible task in the Tasks panel — here you see queued/idle <code>skill review</code> entries; open the panel to watch a curation as it happens.</em></p>
+<p>Manual trigger: <code>/skill-refine [focus]</code> runs a review of the current session immediately.</p>
+<h2>Design decisions (vs Hermes)</h2>
+<table>
+<thead>
+<tr>
+<th>Hermes</th>
+<th>dsh-skill-curator</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>turn_finalizer nudge counters (10)</td>
+<td>scoped <code>agent/turn-stopping</code> counters (3, configurable)</td>
+</tr>
+<tr>
+<td>fork of AIAgent in a daemon thread</td>
+<td>platform subagent (<code>ctx.subagents.start</code>) — visible in the UI, fully isolated session</td>
+</tr>
+<tr>
+<td>replay full conversation (warm prefix cache)</td>
+<td>digest injection (tail-verbatim + head compression) — DSH has no cache advantage</td>
+</tr>
+<tr>
+<td>runtime tool whitelist (memory+skills)</td>
+<td><code>toolFilter.allow</code> whitelist + prompt constraint</td>
+</tr>
+<tr>
+<td>curator ownership markers</td>
+<td>frontmatter <code>author: dsh-skill-curator</code> + <code>skill-library-adopt</code></td>
+</tr>
+<tr>
+<td><code>/refine</code></td>
+<td><code>/skill-refine</code> command</td>
+</tr>
+</tbody></table>
+<p>Behavioral parity matrix: <a href="https://github.com/runfali/dsh-skill-curator/blob/HEAD/docs/COMPARISON.md">docs/COMPARISON.md</a>.</p>
+<h2>Install</h2>
+<pre><code>cd /path/to/dsh-skill-curator
+dsh plugin --profile web add ./
+# restart dsh, then open: Settings → Plugins tab → "Skill Curator" card
+</code></pre>
+<p>Skip the restart? The plugin only takes effect on next start (standard bundle plugin; no dsh source changes, ever).</p>
+<h2>Settings (Settings → Plugins tab → "Skill Curator" card)</h2>
+<table>
+<thead>
+<tr>
+<th align="center">Settings card (part 1)</th>
+<th align="center">Settings card (part 2)</th>
+</tr>
+</thead>
+<tbody><tr>
+<td align="center"><img src="https://raw.githubusercontent.com/runfali/dsh-skill-curator/HEAD/docs/screenshot/0-2.png" alt="Settings card 1/2"></td>
+<td align="center"><img src="https://raw.githubusercontent.com/runfali/dsh-skill-curator/HEAD/docs/screenshot/0-3.png" alt="Settings card 2/2"></td>
+</tr>
+</tbody></table>
+<ul>
+<li><strong>enabled</strong> — master switch (default on)</li>
+<li><strong>skillNudgeInterval</strong> — turns between reviews (default 3)</li>
+<li><strong>notifyMode</strong> — off / on / verbose (segmented buttons)</li>
+<li><strong>reviewProvider / reviewModel</strong> — optional review subagent model override (empty = follow the session's current model)</li>
+<li><strong>reviewBaseUrl / reviewApiKey</strong> — optional custom review endpoint (OpenAI-compatible <code>/chat/completions</code>). When <code>reviewBaseUrl</code> + <code>reviewModel</code> are set, the review subagent runs against that endpoint through a dedicated adapter route (provider name = <code>reviewProvider</code>, or <code>skill-curator-review</code> by default). Settings are read live on every request — no restart needed</li>
+<li><strong>Review history</strong> persists to <code>~/.dsh/skill-curator/reviews.json</code> (last 50 entries) — survives plugin removal/reinstall and restarts</li>
+<li><strong>Review resilience</strong> — two layers for endpoint/model failures (HTTP/network/auth/rate-limit/model missing/timeout): ① if the custom endpoint fails, the review retries <strong>once</strong> on the session's own model (marked <code>⚠️已回退主模型</code> in host log / review log / status panel); ② if the final attempt then dies on an endpoint-class error or a detail-less <code>killed</code>, it retries up to <code>reviewRetryCount</code> times with <code>reviewRetryDelayMs</code> backoff — a model connection blip no longer loses the review. Tool-layer errors are never retried</li>
+<li><strong>reviewTimeoutMs</strong> — review subagent budget (default 15 min)</li>
+<li><strong>reviewRetryCount</strong> — extra retries when the final review attempt dies on endpoint/model-layer failures (connection reset, HTTP errors, timeouts) or a detail-less <code>killed</code>; <code>0</code> disables retrying. Tool-layer errors are never retried. Default 1</li>
+<li><strong>reviewRetryDelayMs</strong> — backoff base for retries, n-th retry waits <code>base × n</code> ms (default 5000)</li>
+<li><strong>digestTail / digestMaxChars</strong> — digest shape</li>
+<li><strong>adoptSkills</strong> — comma-separated names of skills the curator may maintain although created elsewhere</li>
+</ul>
+<h2>Skill library tools (whitelist)</h2>
+<p>The review subagent can only call these six (they are also usable by any session):</p>
+<table>
+<thead>
+<tr>
+<th>Tool</th>
+<th>Purpose</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>skill-library-list</code></td>
+<td>list skills (name, description, owned?)</td>
+</tr>
+<tr>
+<td><code>skill-library-read</code></td>
+<td>read one SKILL.md</td>
+</tr>
+<tr>
+<td><code>skill-library-create</code></td>
+<td>create a class-level umbrella skill (Chinese body, bilingual description)</td>
+</tr>
+<tr>
+<td><code>skill-library-patch</code></td>
+<td>targeted <code>oldString→newString</code> or whole-body replacement (frontmatter preserved)</td>
+</tr>
+<tr>
+<td><code>skill-library-write-file</code></td>
+<td>support files under <code>references/</code> <code>templates/</code> <code>scripts/</code></td>
+</tr>
+<tr>
+<td><code>skill-library-adopt</code></td>
+<td>take ownership of an unowned skill (stamps the author marker)</td>
+</tr>
+</tbody></table>
+<p>Ownership guard: only skills stamped <code>author: dsh-skill-curator</code> or listed in <code>adoptSkills</code> can be patched; everything else is refused with an explicit "adopt first" message. Paths are boundary-checked; writes are atomic (tmp + rename).</p>
+<h2>Development</h2>
+<pre><code>pnpm install        # or symlink node_modules to your dsh install (see test notes)
+pnpm test           # node --test unit suites
+node test/smoke.mjs         # module/tool/whitelist smoke
+node test/client-smoke.mjs  # client bundle smoke (real component-tree execution)
+</code></pre>
+<h2>License</h2>
+<p>MIT</p>

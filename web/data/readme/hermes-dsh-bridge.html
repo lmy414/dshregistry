@@ -1,0 +1,437 @@
+<h1>hermes-dsh-bridge</h1>
+<blockquote>
+<p>专门桥接 <strong>Hermes ↔ DeepSeek Harness</strong> 的 MCP 插件：在 Harness 内部启动一个 MCP server，让外部 MCP 客户端（如 <a href="https://hermes-agent.nousresearch.com/">Hermes</a>）驱动 Harness 的 Agent 执行真实编码任务。</p>
+</blockquote>
+<p><strong>Hermes 是大脑，Harness 是双手。</strong></p>
+<p><a href="https://github.com/Emilia-awa/hermes-dsh-bridge/blob/HEAD/LICENSE"><img src="https://img.shields.io/badge/license-GPLv3-blue.svg" alt="license"></a>
+<a href="https://nodejs.org"><img src="https://img.shields.io/badge/node-%3E%3D22.18-orange" alt="node"></a>
+<a href="https://github.com/Emilia-awa/hermes-dsh-bridge/actions"><img src="https://github.com/Emilia-awa/hermes-dsh-bridge/workflows/CI/badge.svg" alt="CI"></a></p>
+<h2>为什么存在</h2>
+<p>Harness 自带强大的 Agent 运行时（工具、LLM、Agent、会话），但它是 <strong>Cordis 应用</strong>，别的 Agent 调不动它。这个插件把 Harness 翻了个面：在 Harness <strong>内部</strong>启动一个真正的 <strong>MCP server</strong>（StreamableHTTP），桥接 Harness 核心服务（<code>ctx.agents</code> / <code>ctx.agentPresets</code> / <code>ctx.tools</code>），让外部"大脑"把真正的活派给 Harness 的"双手"。</p>
+<pre><code>Hermes (MCP client, 大脑)
+   │  agent_run / task_inbox / fs_read / session_stats ... (HTTP)
+   ▼
+harness-mcp-server (MCP server, :8090)
+   │  ctx.agents.create → mount 'standard' preset
+   ▼
+Harness agent — 完整工具集: bash, fs, todo, web…
+</code></pre>
+<h2>工具（25 个）</h2>
+<h3>任务</h3>
+<table>
+<thead>
+<tr>
+<th>工具</th>
+<th>方向</th>
+<th>用途</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>agent_run</code></td>
+<td>→ Harness</td>
+<td>同步执行任务；返回结构化结果 + 本轮 <code>stats</code> 统计；可选 <code>preset</code> 单次覆盖预设、<code>sandbox</code> 单次覆盖权限三档；需要提档审批时会挂起等审（见"权限三档与审批桥"）</td>
+</tr>
+<tr>
+<td><code>task_inbox</code></td>
+<td>→ Harness</td>
+<td>推结构化任务（任务+记忆上下文+cwd+可选 <code>preset</code>/<code>sandbox</code>）进异步队列；<strong>审批转接的主路径</strong>：挂起等审期间轮询 <code>approval_list</code> → <code>approval_respond</code> 即续跑</td>
+</tr>
+<tr>
+<td><code>task_result</code></td>
+<td>← Harness</td>
+<td>取回队列任务的结构化结果</td>
+</tr>
+<tr>
+<td><code>task_list</code></td>
+<td>← Harness</td>
+<td>异步任务队列快照（id/status/createdAt/error）</td>
+</tr>
+<tr>
+<td><code>task_cancel</code></td>
+<td>→</td>
+<td>取消队列任务：queued 直接移除；running 尽力中止（agent.cancel，结果丢弃、会话保留可续接）</td>
+</tr>
+</tbody></table>
+<h3>会话</h3>
+<table>
+<thead>
+<tr>
+<th>工具</th>
+<th>方向</th>
+<th>用途</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>session_list</code></td>
+<td>←</td>
+<td>列会话（live+持久化合并），每行带 token/LLM 用时摘要</td>
+</tr>
+<tr>
+<td><code>session_log</code></td>
+<td>←</td>
+<td>读会话事件日志（已剥离 reasoning），tail N 条、按类型过滤</td>
+</tr>
+<tr>
+<td><code>session_stats</code></td>
+<td>←</td>
+<td>会话统计：rounds/steps/llmTime/toolTime/ttft/tokensPerSec/cacheHitRate/inputTokens/outputTokens</td>
+</tr>
+<tr>
+<td><code>session_search</code></td>
+<td>←</td>
+<td>跨会话搜索：标题匹配 + 内容搜索（持久化事件，单会话 2s 超时跳过），正则可选</td>
+</tr>
+<tr>
+<td><code>rename_session</code></td>
+<td>←</td>
+<td>会话改名（便于归档区分）</td>
+</tr>
+<tr>
+<td><code>attach_session</code></td>
+<td>←</td>
+<td>会话归组到工作区</td>
+</tr>
+</tbody></table>
+<h3>文件（受 path jail 约束）</h3>
+<table>
+<thead>
+<tr>
+<th>工具</th>
+<th>方向</th>
+<th>用途</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>fs_read</code></td>
+<td>←</td>
+<td>读文本文件（行号分页；路径 jail + 敏感名黑名单）</td>
+</tr>
+<tr>
+<td><code>fs_list</code></td>
+<td>←</td>
+<td>列目录（递归 depth 层，敏感项自动隐藏）</td>
+</tr>
+<tr>
+<td><code>fs_stat</code></td>
+<td>←</td>
+<td>文件/目录元数据</td>
+</tr>
+<tr>
+<td><code>fs_write</code></td>
+<td>→</td>
+<td>写文件（overwrite/append/create-new）——<strong>opt-in</strong>（<code>enableFsWrite: true</code> 才注册），仅限 workspaceRoots</td>
+</tr>
+</tbody></table>
+<h3>预设</h3>
+<table>
+<thead>
+<tr>
+<th>工具</th>
+<th>方向</th>
+<th>用途</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>preset_list</code></td>
+<td>←</td>
+<td>列出可用 agent preset + 默认</td>
+</tr>
+<tr>
+<td><code>preset_get</code></td>
+<td>←</td>
+<td>查询会话实际生效的 preset（或默认）</td>
+</tr>
+<tr>
+<td><code>preset_set</code></td>
+<td>→</td>
+<td>切换默认 preset（<code>scope=new-default</code>）或空白会话的 preset（<code>scope=session</code>）</td>
+</tr>
+</tbody></table>
+<h3>元</h3>
+<table>
+<thead>
+<tr>
+<th>工具</th>
+<th>方向</th>
+<th>用途</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>echo</code></td>
+<td>—</td>
+<td>验证 MCP 连通</td>
+</tr>
+<tr>
+<td><code>harness_list_tools</code></td>
+<td>—</td>
+<td>列出 Harness 内部注册的工具名</td>
+</tr>
+</tbody></table>
+<h3>权限与审批</h3>
+<table>
+<thead>
+<tr>
+<th>工具</th>
+<th>方向</th>
+<th>用途</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>policy_get</code></td>
+<td>←</td>
+<td>查询会话生效策略：<code>{sessionId, sandboxMode, source: override|default, workspaceRoot, approvalPolicy}</code>；无参返回部署默认</td>
+</tr>
+<tr>
+<td><code>set_policy</code></td>
+<td>→</td>
+<td>切换 <strong>live 会话</strong> 的文件权限档（追加 <code>sandbox/mode</code> 事件，下一次受限调用生效，重启靠 replay 保持）；冷会话需先 resume 再切</td>
+</tr>
+<tr>
+<td><code>approval_list</code></td>
+<td>←</td>
+<td>列出挂起审批（沙箱提档 escalation 等）：<code>[{approvalId, sessionId, toolName, callId?, reason?, requestedAt, waitedMs}]</code> + bridge 形态/超时配置</td>
+</tr>
+<tr>
+<td><code>approval_respond</code></td>
+<td>→</td>
+<td>回答挂起审批：<code>allowed-once</code>（仅本次放行）/<code>rejected</code>；与 Web UI 双通道<strong>先答者胜</strong>，败者回 <code>receipt=not-pending</code></td>
+</tr>
+</tbody></table>
+<h3>状态与配置</h3>
+<table>
+<thead>
+<tr>
+<th>工具</th>
+<th>方向</th>
+<th>用途</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>status_get</code></td>
+<td>←</td>
+<td>版本/uptime/provider/model/preset/live agents/队列深度 + <code>sandboxPolicy{defaultMode,bridge,pendingApprovals}</code></td>
+</tr>
+<tr>
+<td><code>config_get</code></td>
+<td>←</td>
+<td>运行时配置摘要（authToken 打码为 <code>***</code>）+ <code>defaultSandbox/approvalsBridge/approvalTimeoutMs</code></td>
+</tr>
+</tbody></table>
+<h3>结构化结果与统计</h3>
+<p>每次 <code>agent_run</code> 返回结构化结果，并附带本轮用量统计：</p>
+<pre><code>{
+  "sessionId": "...",
+  "assistantText": "最终回答",
+  "toolCalls": [{ "name": "bash", "args": "..." }],
+  "toolResults": ["命令输出"],
+  "changes": "改了什么",
+  "verification": "怎么验证的",
+  "leftovers": "遗留问题",
+  "stats": {
+    "rounds": 1, "steps": 3,
+    "llmTime": 13.9, "toolTime": 0.04,
+    "ttft": 3349, "tokensPerSec": 40.7,
+    "cacheHitRate": 1, "inputTokens": 8831, "outputTokens": 157
+  }
+}
+</code></pre>
+<p>闭环：客户端把记忆作为 <code>context</code> 喂进每次任务，结果（<code>changes</code>/<code>verification</code>/<code>leftovers</code>）再存回客户端记忆，供下一轮使用。</p>
+<h2>权限三档与审批桥（v0.5.0）</h2>
+<h3>三档语义</h3>
+<p>会话文件权限档与 Harness 原生 <code>SandboxMode</code> 一一对应，通过会话日志的 <code>sandbox/mode</code> 事件固化（重启靠 replay 保持）：</p>
+<table>
+<thead>
+<tr>
+<th>档位</th>
+<th>语义</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>read-only</code></td>
+<td>只读（仅 <code>/dev/null</code> 等必要 sink 可写）</td>
+</tr>
+<tr>
+<td><code>workspace-write</code></td>
+<td>工作区 + 后端临时区可写（<strong>默认</strong>，<code>defaultSandbox</code> 可改）</td>
+</tr>
+<tr>
+<td><code>danger-full-access</code></td>
+<td><strong>完全绕过文件围栏 + bash 解禁，全程无审批任意读写</strong> —— 仅限可信环境</td>
+</tr>
+</tbody></table>
+<ul>
+<li><code>agent_run</code> / <code>task_inbox</code> 的 <code>sandbox</code> 参数是<strong>请求级覆盖</strong>：仅影响新建/resume 的会话组合；已有会话保持原档位（显式切换用 <code>set_policy</code>）。请求档与会话固化档不一致时不会复用池会话、专用会话不入池——同 cwd 三档互不污染。</li>
+<li><code>session_list</code> 行在会话有 <code>sandbox/mode</code> 记录时带 <code>sandboxMode</code> 列。</li>
+</ul>
+<h3>审批转接（approvals 桥）</h3>
+<p>Agent 沙箱提档（escalation）等场景会向审批链提问。本插件把审批<strong>转接到 MCP 侧</strong>：</p>
+<pre><code>Harness agent 需要提权 → approval/request → [审批桥挂起]
+Hermes: approval_list() 轮询 → approval_respond(approvalId, sessionId, 'allowed-once'|'rejected')
+→ agent 继续（或收到拒绝）；Web UI 与 Hermes 双通道先答者胜
+</code></pre>
+<ul>
+<li><code>approvalsBridge: 'web'</code>（默认）：订阅 apiProxy 的 mux 流复用 Web 审批通道，回答经 <code>apiProxy.respond</code> 路由；apiProxy 缺失时自动降级 <code>'builtin'</code>（插件内建应答器）。设为 <code>'off'</code> 关闭桥（审批回到部署默认 fail-closed 行为）。</li>
+<li>审批未决期间 <code>agent_run</code> <strong>同步阻塞</strong>（长阻塞场景请用 <code>task_inbox</code> 异步路径）；<code>approvalTimeoutMs</code>（默认 120s）超时收尾为取消/拒绝——<strong>绝不超时放行</strong>。</li>
+<li>⚠️ <code>approval_respond</code> 等于远程提权按钮：MCP server 暴露非 loopback 时必须开 <code>authToken</code>（见 docs/SECURITY.md）。</li>
+</ul>
+<h2>安装</h2>
+<h3>方式 A — 从 npm 安装到 Harness profile</h3>
+<pre><code># 在 Harness profile 的 node_modules 下
+cd ~/.dsh/profiles/&lt;你的profile&gt;/node_modules
+npm install hermes-dsh-bridge
+</code></pre>
+<h3>方式 B — 源码构建</h3>
+<pre><code>git clone https://github.com/Emilia-awa/hermes-dsh-bridge.git
+cd hermes-dsh-bridge
+npm install &amp;&amp; npm run build   # 产出 lib/index.js
+# 把构建产物放进 Harness profile:
+#   ~/.dsh/profiles/&lt;你的profile&gt;/node_modules/hermes-dsh-bridge
+</code></pre>
+<blockquote>
+<p>⚠️ <strong>dual-package hazard（必读）</strong>：Harness 从<strong>全局树</strong>解析 <code>@deepseek-ai/*</code>，而插件自身 node_modules 可能带平行副本——两个模块实例 ⇒ <code>Symbol</code> 不匹配 ⇒ Agent 悄悄失去全部工具（表现为 <code>agent_run</code> 只输出 <code>&lt;tool_calls&gt;</code> 文本、<code>toolCalls</code> 恒为空数组）。修复：把插件的 <code>@deepseek-ai/*</code> 依赖 symlink 到 Harness 全局树：</p>
+<pre><code>PROFILE=~/.dsh/profiles/&lt;你的profile&gt;/node_modules
+GLOBAL=$(npm root -g)/@deepseek-ai/dsh/node_modules/@deepseek-ai
+for pkg in cordis cosmokit dsh-agent dsh-llm dsh-session dsh-tools dsh-scope \
+           dsh-agent-presets dsh-code-runtime dsh-system-prompt dsh-typert-protocol \
+           dsh-attachment dsh-brand dsh-invariants dsh-timeout dsh-settings \
+           dsh-home-paths dsh-atomic-write dsh-user-approval \
+           cordis-plugin-include cordis-plugin-loader; do
+  rm -rf "$PROFILE/@deepseek-ai/$pkg" &amp;&amp; ln -sfn "$GLOBAL/$pkg" "$PROFILE/@deepseek-ai/$pkg"
+done
+</code></pre>
+<p>（<code>cordis-plugin-include/loader</code> 未发布到 npm registry，只在 Harness 全局树里，必须 symlink。）</p>
+</blockquote>
+<h3>Patch 配置</h3>
+<p>在你的 Harness profile 的 <code>cordis.patch.yml</code>（或等价 patch 文件）末尾追加：</p>
+<pre><code>- insert:
+    - id: hermes-dsh-bridge
+      name: 'hermes-dsh-bridge'
+      config:
+        http: true
+        port: 8090
+        host: 127.0.0.1        # 默认仅本机; 暴露前必须加认证
+        # authToken: '你的随机长token'     # 可选: Bearer token 认证
+        # workspaceRoots: ['/workspace']  # 可选: cwd 白名单
+        # enableFsWrite: true             # 可选: 开启 fs_write(默认关)
+        # defaultSandbox: workspace-write # 可选: 新建会话默认权限档(read-only|workspace-write|danger-full-access)
+        # approvalsBridge: web            # 可选: 审批桥(web|builtin|off, 默认 web)
+        # approvalTimeoutMs: 120000       # 可选: 审批等待超时(超时收尾为取消/拒绝, 绝不超时放行)
+        # ⚠️ 必须显式声明 provider/model, 否则 agent 组装会因空 {{model}} 崩溃:
+        provider: opencode-go
+        model: deepseek-v4-flash
+</code></pre>
+<h3>重启并验证</h3>
+<pre><code>systemctl restart dsh.service        # 或你管理 Harness 的方式
+# 验证 25 个工具全在线:
+python3 examples/hermes_dsh_mcp.py list
+python3 examples/hermes_dsh_mcp.py call status_get '{}'
+</code></pre>
+<h2>🤖 AI 一键安装指南（给 AI Agent 看的安装说明）</h2>
+<blockquote>
+<p>下面的步骤是给 <strong>另一个 AI Agent</strong> 看的：如果你是一个 AI agent，要把这个插件装到你管理的 Harness 环境里，请严格按以下编号步骤执行，每步做完检查输出再继续。</p>
+</blockquote>
+<p><strong>前置检查（先做这 3 步）</strong></p>
+<ol>
+<li>确认 Node ≥ 22.18：<code>node --version</code>（低于 22.18 会报 zstd/<code>stripTypeScriptTypes</code> 缺失，先升级 Node）。</li>
+<li>确认目标 Harness profile 存在：<code>ls ~/.dsh/profiles/</code>（找到你要装的 profile 名，下文用 <code>&lt;PROFILE&gt;</code> 代替）。</li>
+<li>确认 Harness 全局树存在：<code>npm root -g</code>（下文用 <code>$GLOBAL_TREE</code> 代替 <code>npm root -g</code>）。</li>
+</ol>
+<p><strong>安装步骤（复制即可执行）</strong></p>
+<pre><code># ① 安装插件到 profile
+cd ~/.dsh/profiles/&lt;PROFILE&gt;/node_modules
+npm install hermes-dsh-bridge        # 未发布到 npm 前用方式 B（源码）
+
+# ② 修复 dual-package hazard: 把所有 @deepseek-ai/* 和 cordis-plugin-* symlink 到全局树
+GLOBAL_TREE=$(npm root -g)/@deepseek-ai/dsh/node_modules/@deepseek-ai
+for pkg in cordis cosmokit dsh-agent dsh-llm dsh-session dsh-tools dsh-scope \
+           dsh-agent-presets dsh-code-runtime dsh-system-prompt dsh-typert-protocol \
+           dsh-attachment dsh-brand dsh-invariants dsh-timeout dsh-settings \
+           dsh-home-paths dsh-atomic-write dsh-user-approval \
+           cordis-plugin-include cordis-plugin-loader; do
+  rm -rf "@deepseek-ai/$pkg" 2&gt;/dev/null
+  ln -sfn "$GLOBAL_TREE/$pkg" "@deepseek-ai/$pkg"
+done
+
+# ③ 在 profile 的 cordis patch 文件(cordis.patch.yml)末尾追加配置
+cat &gt;&gt; ~/.dsh/profiles/&lt;PROFILE&gt;/cordis.patch.yml &lt;&lt;'EOF'
+- insert:
+    - id: hermes-dsh-bridge
+      name: 'hermes-dsh-bridge'
+      config:
+        http: true
+        port: 8090
+        host: 127.0.0.1
+        provider: opencode-go      # ← 换成你自己的 provider id
+        model: deepseek-v4-flash   # ← 换成你自己的 model id
+EOF
+
+# ④ 重启 Harness(注意: 若你正跑在 Harness 里, 用 systemd-run 脱离进程树重启)
+systemctl restart dsh.service
+
+# ⑤ 验证: 等 8 秒后检查 MCP server 起来 + 工具列表
+sleep 8
+curl -s -X POST http://127.0.0.1:8090/mcp \
+  -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"ai-setup","version":"1.0"}}}' \
+  | tail -1 | head -c 300
+python3 examples/hermes_dsh_mcp.py list | grep -cE "agent_run|session_stats|preset_set"   # 期望 ≥ 3
+</code></pre>
+<p><strong>验收标准</strong></p>
+<ul>
+<li><code>dsh_mcp.py list</code> 输出 ≥ 25 个工具，其中必须包含 <code>agent_run</code>、<code>session_stats</code>、<code>preset_set</code>、<code>fs_read</code>。</li>
+<li><code>status_get</code> 返回的 <code>version</code> 为 <code>0.5.0</code>，<code>provider</code>/<code>model</code> 是你配置的值，<code>sandboxPolicy.bridge</code> 非空。</li>
+<li>跑一个冒烟任务 <code>python3 examples/hermes_dsh_mcp.py run '回复:安装成功'</code>，返回里含 <code>stats</code> 字段。</li>
+</ul>
+<p><strong>常见失败与对策（遇到再查）</strong></p>
+<table>
+<thead>
+<tr>
+<th>症状</th>
+<th>原因</th>
+<th>对策</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>agent_run</code> 返回文本但 toolCalls 恒空</td>
+<td>dual-package hazard，symlink 被 npm 重装还原</td>
+<td>重做第②步 symlink，重启</td>
+</tr>
+<tr>
+<td>启动报 <code>prompt variable "{{model}}" has no value</code></td>
+<td>patch 没写 provider/model</td>
+<td>补第③步的 provider/model</td>
+</tr>
+<tr>
+<td><code>MISSING_CREDENTIAL: &lt;provider&gt;</code></td>
+<td>API key 没注入 Harness 进程 env</td>
+<td>在 systemd unit 加 <code>Environment=KEY=...</code> 或 export</td>
+</tr>
+<tr>
+<td><code>Cannot find package '@deepseek-ai/cordis-plugin-include'</code></td>
+<td>第②步漏了 cordis-plugin-*</td>
+<td>补 symlink 这两个包</td>
+</tr>
+<tr>
+<td>版本号符合但行为像旧版</td>
+<td>系统里有双 npm 全局树，装错树</td>
+<td><code>which dsh</code> + <code>npm prefix -g</code> 核对，统一到实际启动的树</td>
+</tr>
+</tbody></table>
+<p>完整排障见 <a href="https://github.com/Emilia-awa/hermes-dsh-bridge/blob/HEAD/docs/TROUBLESHOOTING.md">docs/TROUBLESHOOTING.md</a>。</p>
+<h2>文档</h2>
+<ul>
+<li><a href="https://github.com/Emilia-awa/hermes-dsh-bridge/blob/HEAD/docs/TOOLS.md">docs/TOOLS.md</a> — 25 个工具的完整参考（入参/出参/限额/错误码）</li>
+<li><a href="https://github.com/Emilia-awa/hermes-dsh-bridge/blob/HEAD/docs/CONFIG.md">docs/CONFIG.md</a> — 配置字段、安全默认值</li>
+<li><a href="https://github.com/Emilia-awa/hermes-dsh-bridge/blob/HEAD/docs/TROUBLESHOOTING.md">docs/TROUBLESHOOTING.md</a> — 已知坑（SSE 解析、8KB 截断、dual-package hazard…）</li>
+<li><a href="https://github.com/Emilia-awa/hermes-dsh-bridge/blob/HEAD/docs/SECURITY.md">docs/SECURITY.md</a> — 威胁模型</li>
+<li><a href="https://github.com/Emilia-awa/hermes-dsh-bridge/blob/HEAD/examples/hermes_dsh_mcp.py">examples/hermes_dsh_mcp.py</a> — 零依赖 Python MCP 客户端（仅标准库）</li>
+</ul>
+<h2>定位</h2>
+<p>适合做<strong>备用工具</strong>而非日常主力：日常改代码请直接驱动你的主 Agent。需要<strong>上下文隔离</strong>（大重构会撑爆客户端上下文）或<strong>并行执行</strong>不相关任务时再找它。</p>
+<ul>
+<li>Agent 会话按 cwd <strong>复用</strong>（避免每次调用重新加载项目上下文）。</li>
+<li>Bash 沙箱化（<code>workspace-write</code>）：宿主机装 <code>bubblewrap</code>，否则写命令会被拒。</li>
+<li>reasoning/thinking 块在返回前<strong>剥离</strong>（插件侧 + 文本级兜底双层过滤）。</li>
+</ul>
+<h2>License</h2>
+<p><a href="https://github.com/Emilia-awa/hermes-dsh-bridge/blob/HEAD/LICENSE">GPL-3.0-only</a>，上游 MIT 部分保留——见 <a href="https://github.com/Emilia-awa/hermes-dsh-bridge/blob/HEAD/NOTICE.md">NOTICE.md</a>。</p>

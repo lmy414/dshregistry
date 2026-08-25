@@ -1,0 +1,121 @@
+<h1>Qwen3.8 Compaction Fix</h1>
+<p>Fix for a local <strong>qwen3.8-27b</strong> gateway that fails to compact. The model thinks at <code>xhigh</code>, spends the entire output token budget on reasoning before reaching a conclusion, and the compaction checkpoint comes back truncated. This <a href="https://github.com/deepseek-ai/deepseek-harness">DeepSeek Harness</a> (<code>dsh</code>) plugin disables thinking <strong>for compaction calls only</strong> and applies, to those calls, the sampling parameters the model recommends when thinking is off.</p>
+<h2>Install</h2>
+<pre><code>dsh plugin --profile web add zhubaohi/dsh-qwen38-compaction-fix
+</code></pre>
+<p>Then restart <code>dsh web</code> (or refresh the GUI page).</p>
+<h2>The symptom</h2>
+<p>When context pressure builds, dsh compacts the conversation into a checkpoint. With a local <strong>qwen3.8-27b</strong> running at its default reasoning level, compaction sometimes fails, and the session is left with exactly this line:</p>
+<blockquote>
+<p>summarization truncated at the token cap (incomplete checkpoint)</p>
+</blockquote>
+<p>That is dsh-compaction-basic's verdict that the summarizer hit its output token cap without finishing. The conversation is condensed only into the truncated text: everything the summary never reached is effectively lost from context.</p>
+<h2>Why it happens</h2>
+<p>Local <strong>qwen3.8-27b</strong> deployments think at their default effort: <code>xhigh</code> in a typical route config, on every call that does not explicitly set a reasoning effort. Compaction is one such call. The model is asked to write a long summary of the whole conversation. At <code>xhigh</code>, it spends the <strong>entire <code>max_tokens</code> output budget on reasoning tokens before ever writing a word of the summary</strong>. The response hits the cap with no conclusion, and you get the truncated checkpoint above.</p>
+<h2>The fix</h2>
+<ol>
+<li><strong>Disable thinking for compaction only.</strong> Stamps <code>reasoning_effort: "off"</code> onto the compaction call (waterfall layer, resolved through the model's <code>reasoningEfforts</code> declaration to the wire value <code>reasoning_effort: "none"</code>): zero reasoning tokens, and the whole output budget is available for the summary. Every other call, whether a normal turn, a subagent, or a request for any other model, keeps the route's <code>xhigh</code>. Thinking is never disabled globally.</li>
+<li><strong>Apply the sampling parameters recommended when thinking is off.</strong> <strong>qwen3.8-27b</strong> publishes different recommended sampling parameters for thinking mode and for the mode with thinking disabled. The plugin writes the second set (<code>temperature: 0.7, top_p: 0.8, top_k: 20, min_p: 0.0, presence_penalty: 1.5, repetition_penalty: 1.0</code>) into the compaction request body, so the request actually matches the mode it is in.</li>
+<li><strong>Restore the output budget.</strong> Raises the wire <code>max_tokens</code> of compaction bodies up to a configurable floor (default <code>16384</code>; the value is never lowered), undoing the context clamp in pi-ai that can collapse <code>max_tokens</code> on large conversations.</li>
+<li><strong>Fix session titles (secondary).</strong> Session title generation runs on the same route with a tiny output budget (<code>maxTokens: 64</code>), so <code>xhigh</code> thinking truncates titles too. The plugin writes the configured <code>reasoning_effort</code> wire value into title request bodies. The title provider locks its LLM options in place before the waterfall, so only the wire body is reachable.</li>
+</ol>
+<p>Everything else is untouched. Every gate checks the purpose and the model (waterfall), or the signature and the model (HTTP), so conversation turns, subagents, and any other model pass through unchanged, byte for byte, with the route defaults. Every guard fails open.</p>
+<h2>The model name must match: read this first</h2>
+<p>The plugin only acts when the <code>model</code> field of the outgoing request matches an id in the <code>models</code> allowlist: default exactly <code>qwen3.8-27b</code>, case sensitive. It is an <strong>exact id match, not a family or substring match</strong>, because the sampling parameters written into the body are specific to this model and would be wrong for any other model.</p>
+<p><strong>What id is being compared:</strong> the model <code>id</code> your route serves, the one declared under <code>llm-pi-ai.providers.&lt;provider&gt;.models[].id</code> in <code>$DSH_HOME/settings.yaml</code>. That is the value dsh puts in the <code>model</code> field of every outgoing request to your gateway. It is not whatever name your gateway internally calls the model.</p>
+<p><strong>Make it match: either of two places works:</strong></p>
+<ol>
+<li><p>The <code>qwen38-compaction-fix:</code> section of <code>$DSH_HOME/settings.yaml</code> (applies live, no restart):</p>
+<pre><code>qwen38-compaction-fix:
+  models: [your-model-id]
+</code></pre>
+</li>
+<li><p>The <code>config:</code> block of the plugin row in your profile's <code>cordis.patch.yml</code> (applies on the next GUI load):</p>
+<pre><code>- id: qwen38-compaction-fix
+  config:
+    models: [your-model-id]
+</code></pre>
+</li>
+</ol>
+<p>If your gateway serves the model under a different id (a custom model name, a suffixed variant, different casing), add <em>that</em> id to <code>models</code>. The sampling values stay the same; only the id has to match.</p>
+<p><strong>If nothing matches, the plugin silently does nothing:</strong> every request passes through unchanged, byte for byte, and there is no warning on a miss. If you installed this plugin and you still see the truncated checkpoint, check the model id first.</p>
+<h2>Configuration</h2>
+<p>All keys are optional; defaults are applied by the schema. Precedence (highest first):</p>
+<ol>
+<li><code>qwen38-compaction-fix:</code> section of <code>$DSH_HOME/settings.yaml</code> (applies live, no restart)</li>
+<li>the <code>config:</code> block of the plugin row in your profile's <code>cordis.patch.yml</code></li>
+<li>the defaults shipped with the plugin</li>
+</ol>
+<p>Example <code>settings.yaml</code>:</p>
+<pre><code>qwen38-compaction-fix:
+  effort: off            # "" disables the effort policy
+  models: [qwen3.8-27b]  # exact ids; [] disables the whole policy
+  sampling:              # wire field names, written verbatim into the body
+    temperature: 0.7
+    top_p: 0.8
+    top_k: 20
+    min_p: 0.0
+    presence_penalty: 1.5
+    repetition_penalty: 1.0
+  maxTokensFloor: 16384  # 0 disables the floor
+  titleReasoning: none   # "" disables the title gate
+</code></pre>
+<table>
+<thead>
+<tr>
+<th>Key</th>
+<th>Default</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>effort</code></td>
+<td><code>"off"</code></td>
+<td>Reasoning effort stamped onto matched calls. Preference order: configured, then <code>off</code>, then <code>low</code>; a model offering none of them keeps its own default (a single warning). <code>""</code> disables the effort policy.</td>
+</tr>
+<tr>
+<td><code>purposes</code></td>
+<td><code>["compaction"]</code></td>
+<td><code>purpose</code> tags of LLM calls the waterfall layer applies to.</td>
+</tr>
+<tr>
+<td><code>models</code></td>
+<td><code>["qwen3.8-27b"]</code></td>
+<td>Exact model ids (case sensitive) the policy applies to, checked at every layer. Empty list disables the whole policy. See the model name section above.</td>
+</tr>
+<tr>
+<td><code>sampling.*</code></td>
+<td><code>{}</code></td>
+<td>Sampling settings written verbatim into compaction request bodies. Absent keys stay absent.</td>
+</tr>
+<tr>
+<td><code>maxTokensFloor</code></td>
+<td><code>16384</code></td>
+<td>The wire <code>max_tokens</code>/<code>max_completion_tokens</code> of compaction bodies is raised to at least this value; never lowered. <code>0</code> disables.</td>
+</tr>
+<tr>
+<td><code>titleReasoning</code></td>
+<td><code>"none"</code></td>
+<td>Wire <code>reasoning_effort</code> value written into session title request bodies. <code>""</code> disables the gate.</td>
+</tr>
+</tbody></table>
+<p>An explicit <code>reasoningEffort</code> on the call itself always wins over the plugin default.</p>
+<h2>How it works</h2>
+<p>Four cooperating layers:</p>
+<ol>
+<li><strong><code>llm/stream</code> waterfall:</strong> for calls whose <code>purpose</code> is in <code>purposes</code> and whose <code>options.model</code> is in <code>models</code>, resolves the model's offered reasoning efforts and stamps the chosen effort in place before dispatch.</li>
+<li><strong>HTTP sampling:</strong> wraps the process <code>fetch</code>; when a chat completion body carries the compaction engine's final instruction (a stable signature) and its <code>model</code> field is allowed, applies the configured sampling entries.</li>
+<li><strong>HTTP max_tokens floor:</strong> same gate; raises the output cap to the floor; never lowers it.</li>
+<li><strong>HTTP session title reasoning:</strong> when a body carries the title provider's system prompt (stable signature) and its <code>model</code> is allowed, writes the configured <code>reasoning_effort</code> wire value.</li>
+</ol>
+<p>Identity at the HTTP layer relies on the instruction text shipped by dsh-compaction-basic and dsh-session-title-llm. If a future dsh release changes those instructions, the matching HTTP gate silently stops matching and the body keeps its wire defaults. The other gates are unaffected, and nothing ever breaks LLM traffic, because every guard fails open.</p>
+<h2>Limitations</h2>
+<ul>
+<li>Model matching is an <strong>exact id match</strong> against the id declared under <code>llm-pi-ai.providers.&lt;provider&gt;.models[].id</code> in <code>settings.yaml</code>. See the model name section above.</li>
+<li>The HTTP layer signatures track specific dsh releases; see "How it works" for what happens when a signature stops matching.</li>
+<li>This plugin shapes requests for the <em>local gateway</em> you run. It does not change the harness's own routing or the server's real capacity limits (the server still enforces them).</li>
+</ul>
+<h2>Testing</h2>
+<p>The gating logic is covered by a smoke test (see <a href="https://github.com/zhubaohi/dsh-qwen38-compaction-fix/blob/HEAD/CHANGELOG.md#verification">CHANGELOG.md</a>): allowed model bodies are rewritten with the expected sampling, floor, and reasoning values; disallowed model, missing model, and empty allowlist bodies pass through unchanged, byte for byte.</p>
+<h2>License</h2>
+<p>MIT. See <a href="https://github.com/zhubaohi/dsh-qwen38-compaction-fix/blob/HEAD/LICENSE">LICENSE</a>.</p>

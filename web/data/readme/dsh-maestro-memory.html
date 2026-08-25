@@ -1,0 +1,522 @@
+<h1>dsh-maestro-memory</h1>
+<h2>Purpose</h2>
+<p>Durable, user-governed memory and todos for DeepSeek Harness (DSH) that preserves your existing <code>~/.dsh/memories</code> files in place.</p>
+<blockquote>
+<p><strong>One sentence:</strong> Give the AI in DSH cross-session durable memory and todos — the more you use it, the more it understands you, and switching sessions never loses context.</p>
+</blockquote>
+<ul>
+<li><strong>Package:</strong> <code>@ddtcorex/dsh-maestro-memory</code> (<code>cordis.patch.yml</code> id <code>maestro-memory</code>)</li>
+<li><strong>Changelog:</strong> <code>CHANGELOG.md</code></li>
+<li><strong>Version:</strong> <code>1.0.1</code></li>
+</ul>
+<hr>
+<h2>Requirements</h2>
+<ul>
+<li>Node.js 22+, pnpm 11+</li>
+<li>DSH <code>deepseek-harness</code> master (for <code>cordis</code>, <code>dsh-client-*</code> peers)</li>
+<li>Existing <code>~/.dsh/memories</code> directory (created lazily if absent)</li>
+</ul>
+<hr>
+<h2>Install</h2>
+<p>From the checked-out repo:</p>
+<pre><code>pnpm install                    # install deps (frozen lockfile in CI)
+pnpm run build                  # tsc host + tsc client + build-client.mjs -&gt; lib/
+pnpm run verify                 # tsc --noEmit host + client (typecheck)
+pnpm test                       # full Vitest suite (13 files, 199 tests)
+</code></pre>
+<p>Manual verification of the client bundle:</p>
+<pre><code>test -f lib/client.js &amp;&amp; head -n 2 lib/client.js | grep -q "ModuleLoader" &amp;&amp; echo "bundle ok"
+ls -lh lib/client.js lib/index.js
+</code></pre>
+<h3>From a DSH profile (operator)</h3>
+<p>The package is consumed as a DSH plugin via <code>cordis.patch.yml</code>. Two install paths:</p>
+<p><strong>Local link (development / recommended for cutover rehearsal):</strong></p>
+<pre><code># inside the profile that will own the plugin:
+dsh plugin --profile web add link:/home/kai/Work/htdocs/maestro-harness/dsh-maestro-memory
+# or manually in ~/.dsh/profiles/web/package.json:
+# "@ddtcorex/dsh-maestro-memory": "link:/home/kai/Work/htdocs/maestro-harness/dsh-maestro-memory"
+</code></pre>
+<p><strong>Git / registry (production after release):</strong></p>
+<pre><code>dsh plugin --profile web add github:ddtcorex/dsh-maestro-memory#&lt;tag-or-sha&gt;
+# pin to an exact commit SHA; branch names reuse stale tarballs (pnpm cache pitfall)
+</code></pre>
+<p>After install, rebuild is not needed inside the profile — the host loads <code>lib/index.js</code> and the client loads <code>lib/client.js</code> via the <code>dsh.client</code> manifest. If you edited <code>src/client/</code>, rebuild at the checkout first (<code>pnpm run build</code>).</p>
+<hr>
+<h2>Profile Patch</h2>
+<p><code>cordis.patch.yml</code> is <strong>owned by the package</strong> and applied automatically by <code>dsh plugin add</code>. Do not duplicate it in the profile.</p>
+<pre><code># dsh-maestro-memory/cordis.patch.yml (shipped with the package)
+- insert:
+    - id: maestro-memory
+      name: '@ddtcorex/dsh-maestro-memory'
+      config:
+        memoryDir: null        # null -&gt; ~/.dsh/memories
+        snapshotOrder: 500     # systemPrompt.context order
+</code></pre>
+<p>Profile <code>~/.dsh/profiles/web/package.json</code> after a correct install:</p>
+<pre><code>{
+  "dsh": { "profile": { "bundles": ["@ddtcorex/dsh-maestro-memory"] } },
+  "dependencies": {
+    "@ddtcorex/dsh-maestro-memory": "link:/home/kai/Work/htdocs/maestro-harness/dsh-maestro-memory"
+  }
+}
+</code></pre>
+<p><strong>Rules:</strong></p>
+<ul>
+<li><code>dependencies</code> value <strong>must be <code>link:</code></strong>, not a semver. CI and <code>assertSingleOwner</code> reject non-link owners.</li>
+<li><code>bundles</code> must list exactly one owner for each compat tool (see below). Do not keep <code>dsh-memory-evolve</code> and <code>dsh-maestro-memory</code> in the same profile — they compete for <code>memory</code>/<code>dtodo</code> and for file ownership. The loader crashes on duplicate <code>id: maestro-memory</code> if you copy the patch row into the profile manually.</li>
+<li><code>memoryDir: null</code> resolves to <code>~/.dsh/memories</code> (<code>resolveMemoryRoot(null)</code>). Override only for tests / rehearsal (<code>--root /tmp/...</code>).</li>
+</ul>
+<p>Verify the profile in a rehearsal (see <code>src/host/migration/fixture.ts</code>):</p>
+<pre><code>import { createFixtureProfile, assertSingleOwner } from '@ddtcorex/dsh-maestro-memory/migration/fixture'
+await createFixtureProfile({ profileDir: '/tmp/profile', packageDir: '/path/to/dsh-maestro-memory' })
+const res = await assertSingleOwner('/tmp/profile')
+console.assert(res.ok &amp;&amp; res.owners['memory'] === '@ddtcorex/dsh-maestro-memory')
+</code></pre>
+<hr>
+<h2>Supported Tools</h2>
+<p>All tools are registered via <code>ctx.tools.register</code> inside <code>ctx.effect(..., 'label')</code> so they dispose cleanly on unload. No HTTP.</p>
+<table>
+<thead>
+<tr>
+<th>Tool</th>
+<th>Purpose</th>
+<th>When visible</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>memory</code></td>
+<td>CRUD + query for five tracks (<code>memory</code>/<code>user</code>/<code>project</code>/<code>key</code>/<code>daily</code>) + archive/expand. See <code>src/host/memory/store.ts</code>.</td>
+<td>Always</td>
+</tr>
+<tr>
+<td><code>dtodo</code></td>
+<td>Four-track todos (<code>life</code>/<code>work</code>/<code>project</code>/<code>daily</code>) with stable 8-hex ids, status/due/quadrant, smart view (max 8), historical daily lookup.</td>
+<td>Always</td>
+</tr>
+<tr>
+<td><code>memory_suggest</code></td>
+<td><strong>Gated</strong> — model proposes <code>memory</code>/<code>user</code>/<code>key</code>/<code>todo-*</code> into <code>SUGGESTIONS.jsonl</code>; never writes directly. Requires human approve/edit/reject via Review UI or <code>queue.decide</code> RPC.</td>
+<td>Always</td>
+</tr>
+<tr>
+<td><code>memory_review_status</code></td>
+<td>Read-only queue depth / write-block status (used by prompt hint / UI badge).</td>
+<td>Always</td>
+</tr>
+<tr>
+<td><code>skill_manage</code></td>
+<td>Browse / mutate <code>~/.agents/skills</code> (optional module). Disabled by default; enable only if the optional skills module is explicitly configured.</td>
+<td>Opt-in</td>
+</tr>
+</tbody></table>
+<h3><code>memory</code> — actions and targets</h3>
+<pre><code>memory({
+  action: 'add'|'list'|'replace'|'remove'|'archive'|'expand',
+  target: 'memory'|'user'|'project'|'key'|'daily',   // memory=global, key=per-cwd long-term
+  content?: string,    // add: entry body; replace: new body
+  match?: string,      // replace/remove/archive: unique substring of existing entry
+  filter?: string,     // list: content substring filter
+  since?: string, until?: string,  // list: YYYY-MM-DD
+  limit?: number, recent?: boolean, branch?: string, archived?: boolean,
+  branches?: string,   // add key: csv "main,dev" (empty=all), branch scope
+  summary?: string,    // add key: one-line summary for progressive disclosure
+  id?: string,         // expand: [mem-xxxx] id
+  cwd?: string,        // project/key track working directory (defaults to session cwd)
+  date?: string,       // daily track YYYY-MM-DD
+})
+</code></pre>
+<ul>
+<li><strong>Progressive disclosure:</strong> <code>key</code> entries are stored with an optional <code>[summary]</code> line; <code>list</code> without <code>expand</code> returns summaries; <code>expand</code> with <code>id</code> returns full text.</li>
+<li><strong>Branch scope:</strong> <code>key</code> entries may carry <code>[branch:main]</code> tags; <code>list</code> with <code>branch</code> filters to that branch + entries with no branch tag.</li>
+</ul>
+<h3><code>dtodo</code> — actions</h3>
+<pre><code>dtodo({
+  action: 'add'|'list'|'done'|'update'|'remove',
+  target?: 'life'|'work'|'project'|'daily',  // add/list filter; add defaults to cwd?project:work
+  content?: string,
+  id?: string,             // done/update/remove
+  due?: string,            // YYYY-MM-DD
+  quadrant?: 'q1'|'q2'|'q3'|'q4', // or important/urgent booleans -&gt; quadrant
+  cat?: string, status?: 'pending'|'doing'|'done'|'blocked'|'cancelled',
+  all?: boolean, past?: boolean, expired?: boolean,  // list: smart-view controls
+  cwd?: string, date?: string,
+})
+</code></pre>
+<ul>
+<li><strong>Smart view (default):</strong> when <code>all !== true</code> and no filter, <code>list</code> returns at most 8 items ordered <code>overdue -&gt; due today -&gt; current project -&gt; q1/q2 -&gt; rest</code>. Uses local date, not UTC.</li>
+<li><strong>History:</strong> <code>past=true</code> alone shows only completed history; <code>past=true AND expired=true</code> includes expired unfinished daily todos (daily todos expire same day).</li>
+</ul>
+<h3><code>memory_suggest</code> (gated)</h3>
+<pre><code>memory_suggest({ target: 'memory'|'user'|'key'|'todo-life'|'todo-work'|'todo-project'|'todo-daily', content: string, reason: string })
+</code></pre>
+<p>Dedupes by <code>(target, content)</code> within the queue (bumps <code>hits</code>), appends to <code>SUGGESTIONS.jsonl</code>. The model must never write <code>key</code>/<code>user</code> directly — queue + human click is the only activation path.</p>
+<hr>
+<h2>System Prompt Snapshot</h2>
+<p>Registered as <code>ctx.systemPrompt.context({ name: 'memory:snapshot', order: 500, text: (ctx) =&gt; renderSnapshot(cwd, branch) })</code>.</p>
+<p>Injected text is <strong>bounded</strong> and deterministic: <code>USER + global MEMORY + current-project KEY</code> (branch-filtered if <code>session.header.branch</code> is present), plus a header with <code>sessionId</code>/<code>sessionName</code> and an end-of-turn discipline note:</p>
+<blockquote>
+<p>End of every turn ... you must: 1. Write <code>daily+project</code> via <code>memory</code> entries (daily+project in one call) 2. Check <code>dtodo list</code> (bounded, max 8)</p>
+</blockquote>
+<p><code>daily</code> and <code>project log</code> (<code>projects/&lt;hash&gt;/MEMORY.md</code>) are queryable via <code>memory</code> but <strong>not injected</strong>, to keep prompt cost predictable. New <code>prompt/snapshot.ts</code> must reproduce this contract or agents silently stop writing logs.</p>
+<hr>
+<h2>UI &amp; RPC</h2>
+<ul>
+<li><strong>UI:</strong> exactly one <code>conversation.view</code> slot <code>{ name:'conversation.view', id:'maestro-memory', order:40, label:()=&gt;'Memory' }</code> with internal tabs <strong>Memory / Review queue / Todos</strong>. Uses package-private RPC, no HTTP, no DOM hacks. Client injects <code>['slots','locale','conversation','sessions','connection']</code>.</li>
+<li><strong>RPC channel:</strong> <code>/dsh-maestro-memory</code> (<code>ctx.connection.rpc.handle</code> host, <code>ctx.connection.rpc.call</code> client). Endpoints: <code>queue.list</code>, <code>queue.decide</code> (<code>approve</code>/<code>reject</code>/<code>archive</code> with optional <code>edits</code>/<code>targets</code> + <code>cwd</code>), <code>memory.list</code>, <code>todo.list</code>, <code>todo.mutate</code>, <code>migration.inspect</code>/<code>dryRun</code>/<code>run</code>/<code>verify</code>, <code>status</code> (<code>{ queue, blocked }</code>). <code>migration.run</code> via RPC requires <code>payload.apply === true</code>.</li>
+</ul>
+<hr>
+<h2>Cutover</h2>
+<p><strong>Principle:</strong> staged single-owner replacement — never run <code>dsh-memory-evolve</code> and <code>dsh-maestro-memory</code> in the same profile. The new internals, services, RPC methods, and slot ids use a Maestro namespace; compatibility is limited to agent-facing tool names and legacy file grammar.</p>
+<p><strong>Operator steps (production):</strong></p>
+<ol>
+<li><strong>Preflight</strong> on a copy, not live home (see Migration). Keep the live profile untouched until verification passes.</li>
+<li><strong>Backup</strong> the live <code>~/.dsh/memories</code> via <code>node scripts/migrate.mjs --root ~/.dsh/memories --apply</code> — this is the only write; it creates <code>manifest.json</code> + byte-identical <code>files/</code> under <code>.maestro-memory/backups/&lt;utc-run-id&gt;/</code> + <code>schema.json</code> + <code>journal</code>.</li>
+<li><strong>Verify</strong> (<code>--verify</code>) — must be <code>ok=true</code>, <code>mismatches=[]</code>. If not, writes are blocked (<code>write-block.json</code>) — resolve before continuing.</li>
+<li><strong>Profile swap:</strong> remove <code>dsh-memory-evolve</code> from <code>bundles</code>/<code>dependencies</code>, add <code>@ddtcorex/dsh-maestro-memory</code> as <code>link:</code> (or pinned git SHA). Ensure exactly one owner per compat tool (<code>memory</code>, <code>dtodo</code>).</li>
+<li><strong>Reload profile:</strong> restart <code>dsh web</code> at a user-approved window (ask first — do not kill the live <code>dsh web</code> process mid-session; it holds both :3000 and :3080). After restart, live-read every track (<code>memory</code> list for each target, <code>dtodo</code> list) before first mutation.</li>
+<li><strong>One write</strong> against live data, then <code>verify</code> again.</li>
+</ol>
+<p><strong>Before any writes, rollback is just a profile change</strong> (remove Maestro, restore old bundle). After writes, restore files from the manifest.</p>
+<p>For a disposable rehearsal, use <code>src/host/migration/fixture.ts</code> (<code>createFixtureProfile</code>, <code>createCopiedMemoryRoot</code>, <code>assertSingleOwner</code>) — see <code>tests/m4-rehearsal.spec.ts</code> and the <code>Migration rehearsal</code> CI job. Never touch <code>~/.dsh/memories</code> in tests.</p>
+<hr>
+<h2>Migration</h2>
+<p>CLI: <code>node scripts/migrate.mjs --root &lt;path&gt; [--inspect|--dry-run|--verify|--apply] [--run-id &lt;id&gt;]</code></p>
+<p>Default is <strong>read-only</strong>. The only write is <code>--apply</code>.</p>
+<table>
+<thead>
+<tr>
+<th>Command</th>
+<th>Effect</th>
+<th>Side effects</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>--inspect</code> (default)</td>
+<td>Inventory, parse, byte count, SHA-256, warnings for malformed JSONL / locks / non-canonical files</td>
+<td>None</td>
+</tr>
+<tr>
+<td><code>--dry-run</code></td>
+<td>Same as inspect, explicitly read-only</td>
+<td>None</td>
+</tr>
+<tr>
+<td><code>--apply</code></td>
+<td><strong>Backup + adopt:</strong> byte-preserving copy of every file (excluding <code>.maestro-memory</code>) into <code>backups/&lt;utc-run-id&gt;/files/</code> + <code>manifest.json</code> (<code>path, bytes, sha256, inventory</code>) + <code>schema.json</code> + <code>migration-journal.jsonl</code> entry. Only after all required data parses; source content is never reformatted.</td>
+<td>Writes <code>manifest</code>, <code>files/</code>, <code>schema.json</code>, <code>journal</code></td>
+</tr>
+<tr>
+<td><code>--verify</code></td>
+<td>Reopen with new stores, compare digest (<code>bytes</code>, <code>sha256</code>) + inventory (<code>memoryEntries</code>, <code>todoIds</code>, <code>queueValid</code>) against manifest. On mismatch, writes <code>.maestro-memory/write-block.json</code> and blocks mutations; on success clears the block.</td>
+<td>Writes <code>write-block.json</code> on failure; clears on success</td>
+</tr>
+</tbody></table>
+<p><strong>Disk layout:</strong></p>
+<pre><code>~/.dsh/memories/
+  MEMORY.md                 USER.md                 # may be absent until first global write
+  MEMORY-archive.md         USER-archive.md
+  SUGGESTIONS.jsonl
+  TODOS-life.md             TODOS-work.md
+  daily/YYYY-MM-DD.md       daily/YYYY-MM-DD.todo.md
+  projects/&lt;sha1(cwd)[:12]&gt;/
+    MEMORY.md               KEY.md
+    KEY-archive.md          TODOS.md
+  .maestro-memory/
+    schema.json
+    migration-journal.jsonl
+    write-block.json        # present only when verify failed
+    backups/&lt;utc-run-id&gt;/
+      manifest.json         # { files:[{path,relative,bytes,sha256,kind,...}], inventory, runId, at }
+      files/...             # byte-identical copies
+</code></pre>
+<p><strong>Warnings (non-fatal, reported in <code>inspect</code>/<code>dryRun</code>/<code>verify</code>):</strong></p>
+<ul>
+<li><code>non-canonical</code> — file does not round-trip through <code>§</code> parse/serialize (drift); mutation is refused until canonicalized.</li>
+<li><code>malformed todo</code> — entry missing timestamp/id in a todo file.</li>
+<li><code>malformed queue</code> — JSONL line in <code>SUGGESTIONS.jsonl</code> that does not parse as <code>{target, content}</code>.</li>
+</ul>
+<p><strong>Write-block:</strong> <code>migration/service.ts:isWriteBlocked(root)</code> checks <code>.maestro-memory/write-block.json</code>. When blocked, <code>memory</code>/<code>dtodo</code> mutations return an error until <code>verify</code> passes or <code>rollback</code> clears it.</p>
+<p><strong>Examples:</strong></p>
+<pre><code>node scripts/migrate.mjs --root ~/.dsh/memories            # inspect (read-only)
+node scripts/migrate.mjs --root /tmp/mem --dry-run         # dry-run
+node scripts/migrate.mjs --root /tmp/mem --apply           # backup + adopt
+node scripts/migrate.mjs --root /tmp/mem --verify          # verify (latest manifest)
+node scripts/migrate.mjs --root /tmp/mem --verify --run-id 20260824T151230.425Z
+</code></pre>
+<hr>
+<h2>Verification</h2>
+<ol>
+<li>After <code>inspect</code>/<code>dryRun</code>, confirm <code>ok=true</code>, expected <code>memoryEntries</code>/<code>todoIdsCount</code>/<code>queueValid</code>, and review <code>warnings</code>.</li>
+<li>After <code>--apply</code>, confirm <code>manifest.json</code> exists, each <code>files/&lt;relative&gt;</code> copy is byte-identical (<code>sha256</code> matches), and <code>~/.dsh/memories</code> files are unchanged (no reformatting).</li>
+<li>After <code>--verify</code>, confirm <code>ok=true</code>, <code>mismatches=[]</code>. If <code>ok=false</code>, check <code>mismatches</code> (<code>digest mismatch</code>, <code>byte count mismatch</code>, <code>todo ID set mismatch</code>, <code>inventory mismatch</code>) and <code>.maestro-memory/write-block.json</code>. No mutation should proceed while blocked.</li>
+<li>After profile reload, live-read via tools/RPC (<code>memory</code> list for <code>memory</code>/<code>user</code>/<code>key</code>/<code>daily</code>/<code>project</code>, <code>dtodo</code> list for <code>life</code>/<code>work</code>/<code>project</code>/<code>daily</code>) and compare to pre-cutover inventory.</li>
+</ol>
+<p>The rehearsal suite (<code>tests/m4-rehearsal.spec.ts</code>) exercises the full sequence against a copied schema: fixture profile (<code>link:</code>) → one-owner proof → dry-run (no <code>.maestro-memory</code>) → backup (byte-preserving) → verify → profile reload (<code>apply</code>/<code>ctx.effect</code>) → live reads → one write → second verify (fails) → rollback (byte-identical) → verify (passes) → live home untouched.</p>
+<hr>
+<h2>Rollback</h2>
+<p>Rollback restores files <strong>byte-identical</strong> from a backup manifest. It is exercised and tested in <code>tests/m4-rehearsal.spec.ts</code>.</p>
+<p><strong>When to rollback:</strong></p>
+<ul>
+<li>Before any writes: no rollback needed — just revert the profile change (remove Maestro bundle, restore old plugin).</li>
+<li>After a failed <code>verify</code> or a bad write: restore from the backup that <code>verify</code> reports.</li>
+</ul>
+<p><strong>How (CLI / service API):</strong></p>
+<pre><code>import { rollback } from './src/host/migration/service.ts'
+// restore latest (schema.json runId or newest backup)
+await rollback('/tmp/memories')
+// or specific run
+await rollback('/tmp/memories', '20260824T151230.425Z')
+</code></pre>
+<p>Or via the <code>migration</code> RPC (host) if exposed. The service:</p>
+<ul>
+<li>Copies each <code>manifest.files[].relative</code> from <code>backups/&lt;runId&gt;/files/</code> to its original <code>path</code>, verifying <code>sha256</code> after copy.</li>
+<li>If a file was absent at backup time (<code>exists:false</code> in manifest) but appeared later, it is removed.</li>
+<li>Clears <code>write-block.json</code> on completion and appends a <code>rollback</code> entry to <code>migration-journal.jsonl</code>.</li>
+<li>Returns <code>{ ok, runId, manifestPath, restored, errors }</code> (<code>restored</code> = count of files restored/removed).</li>
+</ul>
+<p><strong>After rollback:</strong></p>
+<ul>
+<li><code>verify</code> must pass (<code>ok=true</code>, no mismatches).</li>
+<li>A new write must succeed (the write-block is cleared).</li>
+</ul>
+<p><strong>Retention:</strong> keep <code>~/.dsh/memories/.maestro-memory/backups/</code> for at least 90 days after cutover (per plan). Do not delete the manifest for the adopted run.</p>
+<hr>
+<h2>Removed Features (intentionally not in v1)</h2>
+<p>Source-grounded inventory. Propose any as a separate plugin later.</p>
+<table>
+<thead>
+<tr>
+<th>Source subsystem</th>
+<th>Verdict</th>
+<th>Rationale</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong>Cross-device Git memory sync</strong> (<code>lib/sync/*</code>)</td>
+<td><strong>KEEP as optional module (M5)</strong></td>
+<td>Large conflict-resolution product; must not delay local-data reliability. Disabled = zero network/Git activity.</td>
+</tr>
+<tr>
+<td><strong>Skills management/browser</strong> (<code>lib/skills.js</code>, <code>lib/skills-manager.js</code>)</td>
+<td><strong>KEEP as optional module (M6)</strong></td>
+<td>Mutates <code>~/.agents/skills</code>; Maestro already owns skills in <code>maestro-skills</code>. Core stays read-only.</td>
+</tr>
+<tr>
+<td><strong>COI / external CLI dispatch, scheduler, broadcast, ws coordinator, stats, attachments, session orchestration</strong> (<code>lib/coi/*</code>, <code>lib/session-orch.js</code>)</td>
+<td><strong>DROP</strong></td>
+<td>Independent orchestration platform; profile already has DSH Codex/Claude subagent bundles.</td>
+</tr>
+<tr>
+<td><strong>Advisor</strong> (<code>lib/advisor/*</code>)</td>
+<td><strong>REDESIGN</strong> (separate opt-in plugin)</td>
+<td>Full reviewer runtime with model calls and panel — not memory.</td>
+</tr>
+<tr>
+<td><strong>Notify / channel send / session images</strong> (<code>lib/notify.js</code>)</td>
+<td><strong>DROP</strong></td>
+<td>IM/web delivery via global integration registry (<code>de_channel_send</code>, <code>de_notify</code>); unrelated to durable memory.</td>
+</tr>
+<tr>
+<td><strong>Local / docs / Codex search</strong> (<code>lib/search-docs.js</code>, <code>lib/search/*</code>)</td>
+<td><strong>DROP</strong></td>
+<td>Host file scans / shell-out expands authority without being needed for memory.</td>
+</tr>
+<tr>
+<td><strong>Prompt injection library</strong> (<code>lib/prompts.js</code>)</td>
+<td><strong>DROP</strong></td>
+<td>Reusable guidance belongs in <code>maestro-skills</code>.</td>
+</tr>
+<tr>
+<td><strong>Model registry / settings</strong> (<code>lib/models.js</code>)</td>
+<td><strong>DROP</strong></td>
+<td>Overlays DSH model config; <code>lib/index.js</code> already injects DSH settings/llm.</td>
+</tr>
+<tr>
+<td><strong>Bookmarks, Mermaid, canvas, UI settings, aliases, update checker, i18n</strong> (<code>lib/{bookmarks,mermaid,canvas,ui-settings,aliases,update,i18n}.js</code>)</td>
+<td><strong>REDESIGN</strong></td>
+<td>Independent features; propose individually if needed.</td>
+</tr>
+<tr>
+<td><strong>Client/WebUI broad tabs</strong> (<code>src/client/index.ts</code> family)</td>
+<td><strong>REDESIGN</strong></td>
+<td>Legacy mounts many tabs/actions + HTTP API; v1 has one slot + package-private RPC.</td>
+</tr>
+<tr>
+<td><strong>HTTP API</strong> (<code>lib/api.js</code> <code>/memory-evolve</code> prefix, <code>ctx.webServer</code>)</td>
+<td><strong>DROP</strong></td>
+<td>No <code>webServer</code> registration; only <code>ctx.connection.rpc.handle('/dsh-maestro-memory', …)</code>.</td>
+</tr>
+</tbody></table>
+<p><strong>Preserved in backup but not imported:</strong> <code>advisor/</code>, <code>pending-skills/</code>, <code>plugin-state.json</code>, <code>search-docs-index.json</code>, <code>coi/</code> (copied byte-identical into <code>files/</code> and listed in <code>manifest.json</code>, never parsed as memory state).</p>
+<hr>
+<h2>Workflow: Superpowers skills are mandatory</h2>
+<p>Every change to this repository MUST follow the Superpowers skill workflow, in order:</p>
+<ol>
+<li><strong>brainstorming</strong> — explore intent, requirements, and design before any code; record the outcome in <code>docs/superpowers/specs/</code> (<code>YYYY-MM-DD-&lt;topic&gt;-design.md</code>).</li>
+<li><strong>writing-plans</strong> — turn an approved spec into a task-by-task plan with exact test and implementation sketches in <code>docs/superpowers/plans/</code> (<code>YYYY-MM-DD-&lt;topic&gt;.md</code>).</li>
+<li><strong>executing-plans</strong> — implement task by task with strict TDD: write the failing test first, verify RED, implement, verify GREEN, then commit that task as its own commit before starting the next.</li>
+</ol>
+<p>Do not skip ahead to implementation, batch multiple tasks into one commit, or commit while a task's tests are red. Trivial mechanical fixes may go straight to a commit but still need tests when behavior changes.</p>
+<hr>
+<h2>Git Workflow</h2>
+<ul>
+<li>Never commit to <code>master</code> directly; batch related work on a feature branch (<code>feat/...</code>, <code>fix/...</code>). One TDD task = one commit while executing a plan.</li>
+<li>Conventional commit subjects, imperative mood.</li>
+<li>Push the branch and open an MR when the batch is green; rebase instead of merging master into the branch when the base moves.</li>
+<li><code>origin</code> is <code>git@github.com:ddtcorex/dsh-maestro-memory.git</code> (private, default branch <code>master</code>).</li>
+</ul>
+<hr>
+<h2>Layout</h2>
+<ul>
+<li><code>src/host/</code> — Cordis host plugin (<code>storage/legacy-format.ts</code>, <code>storage/layout.ts</code>, <code>storage/atomic-store.ts</code>, <code>memory/store.ts</code>, <code>todo/store.ts</code>, <code>review/queue.ts</code>, <code>migration/service.ts</code>, <code>prompt/snapshot.ts</code>, <code>index.ts</code>).</li>
+<li><code>src/client/</code> — DSH client bundle (<code>src/client/index.tsx</code> → <code>lib/client.js</code> via <code>scripts/build-client.mjs</code>, <code>conversation.view</code> id <code>maestro-memory</code> order 40, internal Memory/Review/Todos tabs, RPC <code>/dsh-maestro-memory</code>).</li>
+<li><code>tests/</code> — Vitest specs (<code>legacy-format.spec.ts</code>, <code>storage.spec.ts</code>, <code>atomic-store.spec.ts</code>, <code>memory-m2.spec.ts</code>, <code>todo-m3.spec.ts</code>, <code>migration.spec.ts</code>, <code>m4-rehearsal.spec.ts</code>, etc.).</li>
+<li><code>scripts/migrate.mjs</code> — migration CLI (<code>--root</code>, <code>--apply</code>/<code>--dry-run</code>/<code>--verify</code>).</li>
+</ul>
+<p>Build outputs in <code>lib/</code> (<code>lib/client.js</code> via <code>scripts/build-client.mjs</code>) are generated — never edit by hand.</p>
+<hr>
+<h2>Development</h2>
+<pre><code>pnpm install
+pnpm test                       # full suite (13 files, 199 tests)
+pnpm run verify                 # tsc --noEmit host + client (typecheck)
+pnpm run build                  # tsc host + tsc client + bundle client.js
+pnpm exec vitest run tests/legacy-format.spec.ts tests/storage.spec.ts tests/atomic-store.spec.ts  # unit
+pnpm exec vitest run tests/memory-m2.spec.ts tests/todo-m3.spec.ts tests/suggestion-queue.spec.ts tests/rpc-queue.spec.ts  # integration
+pnpm exec vitest run tests/migration.spec.ts                                                        # migration
+pnpm exec vitest run tests/m4-rehearsal.spec.ts                                                     # rehearsal (fixture profile + rollback)
+node scripts/migrate.mjs --root ~/.dsh/memories            # inspect (read-only)
+node scripts/migrate.mjs --root /tmp/mem --apply           # backup + adopt
+node scripts/migrate.mjs --root /tmp/mem --verify          # verify
+</code></pre>
+<p>Run <code>pnpm test</code> after host changes, <code>pnpm run verify</code> after TypeScript changes, <code>pnpm run build</code> after editing <code>src/client/</code>. Do not kill/restart the live <code>dsh web</code> process serving a session — ask for a convenient restart window.</p>
+<h3>CI</h3>
+<p><code>.github/workflows/ci.yml</code> runs on <code>push</code> to <code>master</code>/<code>main</code> and on every PR:</p>
+<table>
+<thead>
+<tr>
+<th>Job step</th>
+<th>Command</th>
+<th>What it proves</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>Install</td>
+<td><code>pnpm install --frozen-lockfile</code></td>
+<td>Reproducible deps</td>
+</tr>
+<tr>
+<td>Build</td>
+<td><code>pnpm run build</code></td>
+<td>Host + client compile</td>
+</tr>
+<tr>
+<td>Typecheck</td>
+<td><code>pnpm run verify</code></td>
+<td><code>tsc --noEmit</code> host + client</td>
+</tr>
+<tr>
+<td>Unit</td>
+<td><code>vitest run tests/legacy-format.spec.ts tests/storage.spec.ts tests/atomic-store.spec.ts</code></td>
+<td>Pure delimiter / path / atomic-store</td>
+</tr>
+<tr>
+<td>Integration</td>
+<td><code>vitest run tests/memory-m2.spec.ts tests/todo-m3.spec.ts tests/suggestion-queue.spec.ts tests/rpc-queue.spec.ts tests/smoke.spec.ts</code></td>
+<td>Stores + queue + RPC</td>
+</tr>
+<tr>
+<td>Migration</td>
+<td><code>vitest run tests/migration.spec.ts</code></td>
+<td>inspect/dryRun/run/verify, backup manifest, write-block</td>
+</tr>
+<tr>
+<td>Rehearsal</td>
+<td><code>vitest run tests/m4-rehearsal.spec.ts</code></td>
+<td>Fixture <code>link:</code> profile, one-owner proof, copied-schema cutover + rollback, live home untouched</td>
+</tr>
+<tr>
+<td>Client</td>
+<td><code>test -f lib/client.js &amp;&amp; grep ModuleLoader lib/client.js</code></td>
+<td>Bundle exists + header</td>
+</tr>
+<tr>
+<td>Full</td>
+<td><code>pnpm test</code></td>
+<td>Entire suite (13 files, 199 tests)</td>
+</tr>
+</tbody></table>
+<hr>
+<h2>Security</h2>
+<ul>
+<li>Never print, commit, or add fixture values for secrets. Use obviously synthetic values in tests and docs.</li>
+<li>No cloud service, database rewrite, telemetry, or sync in v1; M5 sync (Git-backed) is opt-in and disabled means zero network activity.</li>
+<li>Secrets must never be echoed to the client; new secret-bearing fields need masking + constant-time comparison.</li>
+<li>File permissions: memory files inherit host umask; <code>SUGGESTIONS.jsonl</code> is append-only; <code>write-block.json</code> is local-only.</li>
+</ul>
+<hr>
+<h2>Troubleshooting</h2>
+<table>
+<thead>
+<tr>
+<th>Symptom</th>
+<th>Cause</th>
+<th>Fix</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>tool "memory" has multiple owners</code> in <code>assertSingleOwner</code></td>
+<td>Both <code>dsh-memory-evolve</code> and <code>dsh-maestro-memory</code> in <code>bundles</code></td>
+<td>Remove the old plugin from the profile; keep exactly one owner per compat tool</td>
+</tr>
+<tr>
+<td><code>profile cordis.patch.yml must not duplicate id maestro-memory</code></td>
+<td>Profile patch duplicates the package's <code>cordis.patch.yml</code> row</td>
+<td>Delete the row from the profile patch; the package provides it</td>
+</tr>
+<tr>
+<td><code>verify failed: digest mismatch</code> / <code>write-block.json</code> exists</td>
+<td>File changed after backup (hand-edit, concurrent writer)</td>
+<td>Inspect <code>write-block.json</code> mismatches, then <code>rollback(root, runId)</code> or resolve drift and <code>verify</code> again</td>
+</tr>
+<tr>
+<td><code>non-canonical</code> warning</td>
+<td>File contains non-<code>§</code>-canonical content (hand-edit)</td>
+<td>Back up manually, then normalize via a single <code>replace</code> edit through the tool (creates canonical serialization)</td>
+</tr>
+<tr>
+<td><code>mismatched todo IDs</code> after verify</td>
+<td>Todo file edited outside the store</td>
+<td>Roll back or re-run <code>inspect</code> and compare inventories</td>
+</tr>
+<tr>
+<td>DSH Web UI shows no Memory tab</td>
+<td><code>lib/client.js</code> not built or bundle header missing</td>
+<td><code>pnpm run build</code> at the checkout, then restart <code>dsh web</code> (user-approved window) and hard-refresh the browser</td>
+</tr>
+</tbody></table>
+<hr>
+<h2>Ghi chú vận hành (Tiếng Việt — ngắn gọn)</h2>
+<blockquote>
+<p>English là ngôn ngữ chính của tài liệu và mã nguồn. Phần này chỉ tóm tắt thao tác cho người vận hành tiếng Việt.</p>
+</blockquote>
+<ul>
+<li><strong>Cài đặt:</strong> <code>pnpm install</code> → <code>pnpm run build</code> → <code>pnpm run verify</code> → <code>pnpm test</code>. Thêm plugin vào profile bằng <code>dsh plugin --profile web add link:/path/to/dsh-maestro-memory</code> (không copy <code>cordis.patch.yml</code> vào profile).</li>
+<li><strong>Công cụ hỗ trợ:</strong> <code>memory</code> (5 track), <code>dtodo</code> (4 track, smart view 8), <code>memory_suggest</code> (đề xuất phải được duyệt), <code>memory_review_status</code>. <code>skill_manage</code> chỉ khi bật module tùy chọn.</li>
+<li><strong>Cutover (chuyển đổi):</strong> chỉ chạy một plugin sở hữu <code>memory</code>/<code>dtodo</code>. Không chạy đồng thời <code>dsh-memory-evolve</code> và <code>dsh-maestro-memory</code>. Thực hiện trên bản copy trước, sau đó mới áp dụng lên <code>~/.dsh/memories</code>.</li>
+<li><strong>Migration:</strong> <code>node scripts/migrate.mjs --root &lt;path&gt;</code> (mặc định chỉ đọc). <code>--apply</code> mới ghi backup + <code>schema.json</code>. <code>--verify</code> kiểm tra <code>sha256</code> + tồn kho; nếu lệch sẽ ghi <code>write-block.json</code> và chặn ghi.</li>
+<li><strong>Rollback:</strong> <code>await rollback(root, runId)</code> khôi phục byte-identical từ <code>backups/&lt;runId&gt;/files/</code>; xóa <code>write-block.json</code> khi xong. Trước khi có ghi mới, rollback chỉ là đổi profile.</li>
+<li><strong>Tính năng đã loại bỏ:</strong> COI/broadcast, advisor, notify/<code>de_channel_send</code>, search, prompt library, model registry, bookmarks/mermaid/canvas. Chi tiết xem bảng "Removed Features".</li>
+<li><strong>CI:</strong> <code>build</code> + <code>typecheck</code> + <code>unit</code> + <code>integration</code> + <code>migration</code> + <code>rehearsal</code> + <code>client</code> + <code>full</code> — tất cả phải xanh trước khi merge.</li>
+</ul>
+<hr>
+<h2>Documentation</h2>
+<p>Keep current behavior in <code>README.md</code>. Do not add plans, transient investigation logs, or duplicate specifications under <code>docs/</code>; capture only durable operator and architecture knowledge. The one exception is Superpowers artifacts: specs under <code>docs/superpowers/specs/</code> and plans under <code>docs/superpowers/plans/</code> are kept as the design record for each change batch.</p>
+<hr>
+<h2>References</h2>
+<ul>
+<li><code>src/host/migration/service.ts</code> — inspect/dryRun/run/verify/rollback implementation</li>
+<li><code>src/host/migration/fixture.ts</code> — fixture profile + copied-schema helpers for rehearsal</li>
+<li><code>tests/m4-rehearsal.spec.ts</code> — end-to-end rehearsal (profile → backup → verify → reload → write → rollback)</li>
+<li><code>scripts/migrate.mjs</code> — operations CLI (read-only by default, <code>--apply</code> to write)</li>
+<li><code>.github/workflows/ci.yml</code> — build / typecheck / unit / integration / migration / client / full</li>
+</ul>

@@ -1,0 +1,185 @@
+<h1>dsh-compat-guard</h1>
+<p>兼容性治理插件包：<strong>升级前置闸门 + 存储格式指纹 + 自动备份 + 会话迁移 + profile 级锁文件 + 插件×DSH 兼容矩阵</strong>。一个 npm 包，六个能力，全部零运行时依赖（纯 Node ≥ 20）。</p>
+<pre><code>dsh-guard status            # 当前版本 / dist-tags / 存储指纹 / 锁文件状态
+dsh-guard preflight         # 升级前检查（闸门）：插件兼容 × 存储格式 × 自动备份
+dsh-guard upgrade           # 闸门 + 执行 dsh 升级 + 事后复检
+dsh-guard upgrade-plugins   # 闸门 + 更新 profile 插件 + 重写锁文件
+dsh-guard snapshot          # 备份 $DSH_HOME + 写入 dsh.guard.lock.json
+dsh-guard restore/rollback  # 一键回滚（先自动做安全快照）
+dsh-guard verify            # 与提交的锁文件比对（团队漂移检测）
+dsh-guard migrate           # 会话数据迁移（sqlite -&gt; zstd JSONL，先备份）
+dsh-guard dsh &lt;args...&gt;     # 透传模式：dsh plugin add/update 前自动过闸门
+</code></pre>
+<hr>
+<h2>四个缺口的对应设计</h2>
+<h3>缺口 1 — 升级前置检查（闸门）→ <code>preflight</code></h3>
+<p>一次 <code>dsh-guard preflight</code> 回答三个问题，任何一个是"破坏性"就 <strong>exit 1 拒绝升级</strong>（有警告则 exit 2）：</p>
+<ol>
+<li><strong>插件兼容</strong>：对目标 DSH 版本，逐个已装插件查<ul>
+<li>兼容矩阵注册表（机器跑出来的 <code>compat.json</code>，缺口 2 的输出）</li>
+<li>作者元数据（插件 package.json 里的 <code>dsh.compat.tested/requires</code>）</li>
+<li>都没有 → <code>untested</code> 警告，不硬拦</li>
+</ul>
+</li>
+<li><strong>存储格式破坏性变更</strong>：对 <code>$DSH_HOME</code> 做指纹（见下），与 <code>lib/formats.json</code> + 注册表里目标版本的事实比对。格式不同 → <strong>BLOCKED</strong>（这正是 rc.8 会话全丢事故的闸门）。</li>
+<li><strong>自动备份</strong>：闸门通过时先拍 <code>$DSH_HOME</code> 快照（tar + sha256 + manifest）。</li>
+</ol>
+<p><strong>为什么闸门只能靠 wrapper + 引导期探针，而不是插件树内钩子？</strong> 这是读源码后的事实约束：</p>
+<ul>
+<li><code>dsh plugin</code> 是 launcher 里的薄 pnpm 转发器（<code>bin.js</code> 的 switch 分支），<strong>没有前置钩子</strong>——没有任何插件能挂进 <code>pnpm update</code> 之前。</li>
+<li>树内插件解析命令行的路也被堵死：<code>dsh-web-app</code> 的 <code>web-startup</code> 行<strong>无条件调用 <code>parseCmdline</code></strong>，commander 拒绝未知命令，第二个解析行在同 profile 里必然炸掉整个启动树。</li>
+</ul>
+<p>所以设计是：</p>
+<ul>
+<li>真正的工作在 <strong>独立 bin <code>dsh-guard</code></strong>（不 boot 任何 profile，纯文件检查 + spawn）。</li>
+<li><code>cordis.patch.yml</code> 里只挂一个<strong>被动行</strong>（<code>guard-drift</code>）：每次 boot 记录 dsh 版本到 <code>$DSH_HOME/.guard-state.json</code>，发现版本变了就打印一行"你没过闸门就升级了"的告警。所有逻辑 try/catch，绝不 fail-loud。</li>
+<li>日常纪律用别名：<code>alias dsh='dsh-guard dsh'</code>（PowerShell 里包一层 function）。<code>dsh-guard dsh plugin add/update/install</code> 先过闸门再转发真实 <code>dsh</code>。</li>
+</ul>
+<h3>缺口 2 — 自动化兼容矩阵 → <code>compat/</code></h3>
+<p>把"作者有空才写文章"变成机器数据，三层：</p>
+<ol>
+<li><strong>元数据契约</strong>：插件在 package.json 声明 <code>dsh.compat</code>：<pre><code>"dsh": {
+  "bundle": { "patch": "./cordis.patch.yml" },
+  "compat": {
+    "requires": "&gt;=0.1.1-rc.1",
+    "tested": ["0.1.0-rc.7", "0.1.1-rc.1"],
+    "storageFormats": ["zstd-jsonl"],
+    "kind": "tooling"
+  }
+}
+</code></pre>
+</li>
+<li><strong>CI 矩阵</strong>：<code>compat/compat-matrix.yml</code>（可复制到任意插件仓库或中央调度仓库）+ <code>compat/report.mjs</code>。每个 job 在<strong>全新 profile</strong>（隔离 <code>DSH_HOME</code>）里 <code>npm i -g @deepseek-ai/dsh@&lt;ver&gt;</code> → <code>dsh plugin --profile ci add &lt;plugin&gt;</code> → <code>dsh --profile ci --dump-config</code>（boot 冒烟：树能组装出来就是过了）→ 输出一行 JSON。collector 合并成 <code>compat.json</code> 并提交。</li>
+<li><strong>注册表 + 徽章</strong>：<code>compat.json</code> 按 <code>compat/schema.json</code> 组织，托管在
+<a href="https://github.com/Shizuku-keop/Blue-Whale-Harness/tree/main/compat">Blue-Whale-Harness 的 compat/ 目录</a>
+（已推送，2026-08-25 首版含 8/8 实测数据），CDN 源
+<code>cdn.jsdelivr.net/gh/Shizuku-keop/Blue-Whale-Harness@main/compat/compat.json</code>
+（<code>lib/registry.js</code> 默认，含 raw + GitHub API base64 回退）。徽章用
+shields.io dynamic JSON 直接指 CDN 文件。<strong>preflight 消费同一份数据</strong>——
+货架上的"保质期标签"。</li>
+</ol>
+<p>首版实测数据（2026-08-25，<code>compat/local-matrix.ps1</code>，隔离 DSH_HOME + pnpm 11）：</p>
+<table>
+<thead>
+<tr>
+<th>插件 \ DSH</th>
+<th>0.1.0-rc.7</th>
+<th>0.1.0-rc.8</th>
+<th>0.1.1-rc.1</th>
+<th>0.1.1-rc.2</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>dsh-better-sidebar 0.15.2</td>
+<td>✅ pass</td>
+<td>✅ pass</td>
+<td>✅ pass</td>
+<td>✅ pass</td>
+</tr>
+<tr>
+<td>dsh-mnemon 0.2.16</td>
+<td>✅ pass</td>
+<td>✅ pass</td>
+<td>✅ pass</td>
+<td>✅ pass</td>
+</tr>
+</tbody></table>
+<blockquote>
+<p>注意：矩阵验证的是<strong>插件 API 兼容</strong>（安装 + mount）。rc.8 的存储格式变更
+（社区报告的数据丢失事故）在<strong>数据层</strong>——注册表 <code>storageFormats</code> 里
+rc.8 仍是 <code>unknown</code>，升级闸门靠存储指纹拦截，不依赖插件 pass。</p>
+</blockquote>
+<p>注册表条目示例：</p>
+<pre><code>{ "schema": 1, "updated": "2026-08-25T03:00:00Z",
+  "plugins": { "dsh-better-sidebar": { "0.1.1-rc.2":
+    { "status": "pass", "testedAt": "2026-08-25T03:00:00Z",
+      "by": "run 1234", "evidence": "dsh-install:0 plugin-install:0 boot:0" } } },
+  "storageFormats": { "0.1.1-rc.2": { "sessionFormat": "zstd-jsonl", "projcacheVersion": 3 } } }
+</code></pre>
+<h3>缺口 3 — 会话数据迁移 → <code>migrate</code></h3>
+<p>安全优先管线：<strong>detect → backup → transform → verify → checkpoint</strong>。</p>
+<ul>
+<li><code>detectLegacy</code> 扫描 <code>$DSH_HOME/sessions/**</code> 的文件头：zstd（<code>28 B5 2F FD</code>）/ sqlite（<code>SQLite format 3</code>）/ gzip / 未知。<strong>不知道的格式拒绝转换，只备份</strong>——绝不猜。</li>
+<li>sqlite → zstd JSONL：读用 Node ≥ 22.5 内置 <code>node:sqlite</code>（零原生依赖），写 zstd 帧用外部 <code>zstd</code> CLI 或可选 <code>fzstd</code>；两个都没有就拒绝（裸 <code>.jsonl</code> DSH 读不了）。</li>
+<li>原文件在<strong>验证通过后</strong>才改名 <code>.legacy.bak</code>，新文件先写 <code>.migrating</code> 再原子改名。</li>
+<li>诚实边界：每版 DSH 的 session JSONL 记录 schema 必须对照目标版本读文件确认——<code>lib/formats.json</code> 里逐版本登记，没登记就是 unknown（preflight 会因此警告，不会静默放行）。</li>
+</ul>
+<h3>缺口 4 — profile 级锁文件 → <code>snapshot</code> / <code>verify</code> / <code>rollback</code></h3>
+<p><code>profiles/&lt;name&gt;/dsh.guard.lock.json</code>（随团队仓库提交）：</p>
+<pre><code>{ "schema": 1, "profile": "web",
+  "dsh": { "version": "0.1.1-rc.2", "integrity": "sha256:…" },
+  "plugins": { "dsh-better-sidebar": { "version": "0.15.2", "integrity": "sha256:…", "bundle": true } },
+  "storage": { "sessionFormat": "zstd-jsonl", "sessionCount": 74, "projcacheVersion": 3 },
+  "configHash": { "cordis.patch.yml": "sha256:…", "pnpm-workspace.yaml": "sha256:…", "settings.yaml": "sha256:…" },
+  "backup": "backups/2026-08-25T03-00-00-000Z/snapshot.tar" }
+</code></pre>
+<ul>
+<li><code>dsh-guard snapshot</code>：拍快照 + 写锁文件（锁里记录备份路径）。</li>
+<li><code>dsh-guard verify</code>：把本机实况与锁文件比对——插件版本、内容完整性、配置 hash、存储格式逐项 diff，输出"你跑得了我跑不了"的具体差异。</li>
+<li><code>rollback</code> / <code>restore</code>：解 tar 回写，恢复 <code>pnpm-lock.yaml</code> 后自动 <code>pnpm install --frozen-lockfile</code>；恢复前<strong>先做安全快照</strong>（永远有回头路）。</li>
+<li>快照默认<strong>排除凭据文件</strong>（<code>.credentials.yaml</code>、<code>pet.json</code>、<code>.gh_*</code>、<code>.env</code>），<code>--include-secrets</code> 显式开启——备份是可交给同事的东西，不是泄露源。</li>
+</ul>
+<hr>
+<h2>关键技术事实（源码核实）</h2>
+<table>
+<thead>
+<tr>
+<th>事实</th>
+<th>影响</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>dsh plugin</code> = 薄 pnpm 转发器，launcher 无前置钩子</td>
+<td>闸门只能 wrapper/别名 + 引导期探针</td>
+</tr>
+<tr>
+<td><code>dsh-web-app</code> 无条件 <code>parseCmdline</code>，commander 拒绝未知命令</td>
+<td>同树内不能有第二个解析命令行的插件 → CLI 必须独立 bin</td>
+</tr>
+<tr>
+<td>sessions = <code>session-&lt;uuid&gt;/session.jsonl.zstd</code>（zstd 魔数 <code>28 B5 2F FD</code>，本机实测）</td>
+<td>格式指纹 = 魔数扫描，廉价可靠，不用解码</td>
+</tr>
+<tr>
+<td><code>storages/session_projcache.json</code> 带 <code>unit.version</code>（本机 = 3）</td>
+<td>缓存格式版本号可进指纹，版本变化 = 警告（会重建，非数据丢失）</td>
+</tr>
+<tr>
+<td>bundle 插件 = npm 包声明 <code>dsh.bundle.patch</code>，<code>main</code> 导出 <code>{name,inject,apply}</code>，loader 取 <code>exports.default</code></td>
+<td>插件包可同时是 CLI + 被动 cordis 行（default 导出插件，命名导出库 API）</td>
+</tr>
+<tr>
+<td><code>$DSH_HOME</code> = <code>$DSH_HOME</code> 环境变量 → <code>~/.dsh</code>（<code>dsh-home-paths</code> 源码）</td>
+<td>路径解析完全对齐官方</td>
+</tr>
+<tr>
+<td>版本号权威来源 = launcher <code>package.json</code>（<code>dsh --version</code>）；dist-tags 每周在变</td>
+<td>永远运行时解析 <code>next/latest</code>，绝不硬编码（本文档引用的 rc 号已经过时）</td>
+</tr>
+</tbody></table>
+<h2>安装与使用</h2>
+<pre><code># 作为 CLI（不装进 profile 也能用）
+npm i -g dsh-compat-guard        # 或 pnpm add -g
+
+# 装进 profile（可选：获得 boot 期漂移探针）
+dsh plugin --profile web add dsh-compat-guard
+
+# 日常纪律：把 dsh 包一层
+# bash:  alias dsh='dsh-guard dsh'
+# pwsh:  function dsh { dsh-guard dsh @args }
+</code></pre>
+<h2>已知边界（诚实声明）</h2>
+<ol>
+<li><strong>闸门不是强制性的</strong>——launcher 没有钩子，纪律靠别名/团队约定；探针只能事后告警。上游要根治需给 <code>dsh plugin</code> 加 pre-hook，本包是社区侧能做的全部。</li>
+<li><strong>注册表已托管</strong>：默认指向 Blue-Whale-Harness 的 compat/（jsDelivr CDN，多源回退），<code>lib/registry.js</code> 的 <code>DEFAULT_REGISTRY_URL</code> 可换；离线时用 <code>$DSH_HOME/.guard-cache/</code> 缓存并降级为"只警告"。</li>
+<li><strong><code>lib/formats.json</code> 是种子数据</strong>：本机只实测过 <code>0.1.1-rc.2</code>（zstd-jsonl / projcache v3）。rc.7/rc.1 的存储布局必须有人实测登记（或等注册表 <code>storageFormats</code> 补上）——未知 = 警告而非静默放行。</li>
+<li><strong>迁移的 JSONL schema</strong> 必须对照目标版本读文件确认；工具对未知格式只备份不转换。</li>
+<li><code>verify</code> 的 integrity 是 sha256(插件 package.json)——检测内容漂移够用，不是 npm integrity 的替代。</li>
+</ol>
+<h2>开发</h2>
+<pre><code>node --test test/        # 单元测试（node:test，零依赖）
+node lib/cli.js status   # 本机实况（只读）
+node lib/cli.js preflight --target next   # 对真实 $DSH_HOME 干跑（会备份！）
+</code></pre>
+<h2>License</h2>
+<p>MIT</p>

@@ -1,0 +1,367 @@
+<h1>websearch-dsh</h1>
+<p>A native <a href="https://github.com/deepseek-ai/deepseek-harness">DeepSeek Harness</a> (dsh) plugin that replaces the harness's built-in single-provider <code>web_search</code> backend with a <strong>resilient multi-provider fallback chain</strong> — so <code>web_search</code> works <strong>without a DEEPSEEK_API_KEY</strong>, survives per-provider rate limits / quota exhaustion / outages, and — when no key is configured at all — still answers via keyless DuckDuckGo.</p>
+<p>MIT-licensed. No MCP server, no sidecar process: it registers on the harness <code>web</code> seam, and the built-in <code>web_search</code> tool stays the single model-facing tool. Sister plugin: <a href="https://github.com/takasurazeem/gmail-dsh">gmail-dsh</a>.</p>
+<hr>
+<h2>Table of contents</h2>
+<ul>
+<li><a href="#what-you-get">What you get</a></li>
+<li><a href="#how-the-chain-works">How the chain works</a></li>
+<li><a href="#the-onoff-toggle">The on/off toggle</a></li>
+<li><a href="#setup">Setup</a></li>
+<li><a href="#provider-reference">Provider reference</a></li>
+<li><a href="#failure-classification">Failure classification</a></li>
+<li><a href="#the-duckduckgo-leg">The DuckDuckGo leg</a></li>
+<li><a href="#verification">Verification</a></li>
+<li><a href="#configuration-reference">Configuration reference</a></li>
+<li><a href="#developing-the-plugin">Developing the plugin</a></li>
+<li><a href="#faq">FAQ</a></li>
+<li><a href="#troubleshooting">Troubleshooting</a></li>
+<li><a href="#reverting--uninstalling">Reverting / uninstalling</a></li>
+<li><a href="#license">License</a></li>
+</ul>
+<hr>
+<h2>What you get</h2>
+<table>
+<thead>
+<tr>
+<th>Surface</th>
+<th>What it does</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>The <code>web_search</code> tool</td>
+<td>Unchanged from the harness's perspective — same tool, same model, now served by the chain.</td>
+</tr>
+<tr>
+<td><code>websearch_status</code> tool</td>
+<td>Read-only: which providers have keys, the live chain, last serving provider, recent per-provider failures, toggle state.</td>
+</tr>
+<tr>
+<td><code>/websearch status</code> command</td>
+<td>Same info, rendered for humans in chat.</td>
+</tr>
+<tr>
+<td>Model-context section</td>
+<td>One stable paragraph (zero tokens until it matters): what serves <code>web_search</code>, in what order, and whether the user has it enabled. Re-reads the live state on each render.</td>
+</tr>
+<tr>
+<td>GUI toggle card</td>
+<td><strong>Settings → Plugins → Configurable → Web Search</strong> in the dsh web client: one click, no restart.</td>
+</tr>
+<tr>
+<td>Bundle patch layer</td>
+<td>Points the harness <code>web</code> row's <code>searchProvider</code> at this plugin, so search works with no DeepSeek key at all.</td>
+</tr>
+</tbody></table>
+<h2>How the chain works</h2>
+<pre><code>web_search "…"
+   │
+   ├─ toggle off?  ──▶  decline immediately (no provider called, no credit spent)
+   │
+   ├─ resolve keys per call ──▶ credential store refs first, then process env
+   │
+   ├─ Tavily ──fail──▶ Exa ──fail──▶ Firecrawl ──fail──▶ Brave ──fail──▶ Serper
+   │        (only providers with a non-empty key are in the chain; priority order)
+   │
+   └─ DuckDuckGo (always last, no key required)
+         └─ 3 legs in order: d.js JSON → lite HTML → Instant API
+</code></pre>
+<p>Key properties:</p>
+<ul>
+<li><strong>Keys are resolved on every search</strong> — from the DSH credential store (the refs the web Credentials screen writes) first, then <code>process.env</code>. A key added to <code>~/.dsh/.env</code> or stored in the Credentials screen after startup is picked up on the next search, <strong>no restart</strong>. Keys are never stored by the plugin.</li>
+<li><strong>Any failure falls through.</strong> Auth, quota, rate limit, timeout, network, and parse failures each advance the chain to the next provider. Only a <em>caller abort</em> (the model/harness cancelling the search) stops the walk early.</li>
+<li><strong>One combined error</strong> is reported only when <em>every</em> leg fails, naming each provider and why: <code>All web search providers failed for "…": tavily: auth — …; serper: quota — …; duckduckgo: network — …</code>.</li>
+<li><strong>Provenance</strong> (default <code>on-fallback</code>): when the keyless DuckDuckGo leg is what served, the result carries a note the model can see — e.g. <code>Served by DuckDuckGo (keyless fallback) after tavily (rate), exa (auth) failed.</code> <code>always</code> annotates every provider; <code>off</code> stays silent.</li>
+<li><strong>Clamping</strong>: <code>maxResults</code> is clamped to 1–50 (default 10); empty queries are rejected before any network I/O.</li>
+</ul>
+<h2>The on/off toggle</h2>
+<p>The plugin registers a <code>websearch-dsh</code> namespace in the harness <strong>settings document</strong> (<code>~/.dsh/settings.yaml</code>) through the live-watched <code>settings</code> service:</p>
+<pre><code># created on first GUI click (or by hand):
+websearch-dsh:
+  enabled: false
+</code></pre>
+<ul>
+<li><strong>Default is on</strong> (the registered <code>base</code> layer is <code>{enabled: true}</code>; an absent section means enabled).</li>
+<li><strong>The search chain checks the flag on every call.</strong> Off → <code>web_search</code> declines with a model-friendly message ("disabled by the user … do not call web_search until it is re-enabled") before any provider is contacted — so <strong>zero API credit is spent while off</strong>. <code>websearch_status</code>, the <code>/websearch</code> command, and the model-context section all reflect the state.</li>
+<li><strong>The GUI card</strong> (a plain JS bundle shipped as <code>client.js</code> — no build step) renders on <strong>Settings → Plugins → Configurable</strong>. One click on the checkbox performs one revision-fenced write of <code>enabled</code>; the committed change is published by the settings service, the client mirror folds it in, and the server side sees it on the next call. <strong>No restart, ever.</strong></li>
+<li><strong>External edits work too</strong>: the settings file is watched, so editing <code>~/.dsh/settings.yaml</code> by hand applies live.</li>
+<li><strong>Loopback only</strong>: dsh's settings transport serves the local browser. A remote browser sees the card as read-only (the flag is still global on the machine).</li>
+<li><strong>Tolerant</strong>: a composition without the settings service simply has no toggle; search stays enabled. The plugin never hard-depends on it.</li>
+</ul>
+<h2>Setup</h2>
+<h3>1. API keys (any subset — all optional)</h3>
+<p>dsh loads two env layers at startup: the project <code>&lt;cwd&gt;/.env</code> and the user layer <strong><code>~/.dsh/.env</code></strong> (skipped when the project directory <em>is</em> your home directory). <code>.env</code> values only fill names <strong>not already exported in the launching shell</strong> — shell exports win. Quoted or unquoted values parse identically (Node's built-in env parser); <code>#</code> starts a comment.</p>
+<pre><code># ~/.dsh/.env   (chmod 600 recommended)
+TAVILY_API_KEY="tvly-…"      # best all-round; generous free tier
+EXA_API_KEY="…"              # neural/keyword search
+FIRECRAWL_API_KEY="fc-…"     # search + scrape
+BRAVE_API_KEY="BSA…"         # Brave Search API
+SERPER_API_KEY="…"           # Google SERP data
+</code></pre>
+<p>Or store them in the dsh web GUI's <strong>Credentials</strong> screen under the same names — credential refs are checked before the environment and are re-read on every search.</p>
+<p><strong>If no key is configured, everything works via DuckDuckGo</strong> (see <a href="#the-duckduckgo-leg">The DuckDuckGo leg</a>).</p>
+<h3>2. Wire it into your profile</h3>
+<p>In your profile's <code>package.json</code> (e.g. <code>~/.dsh/profiles/web/package.json</code>):</p>
+<pre><code>{
+  "dependencies": {
+    "websearch-dsh": "file:/path/to/websearch-dsh"
+  },
+  "dsh": {
+    "bundles": [
+      "@deepseek-ai/dsh-base",
+      "@deepseek-ai/dsh-web-app",
+      "websearch-dsh"
+    ]
+  }
+}
+</code></pre>
+<p>then <code>pnpm install</code> in the profile directory. For live development, symlink the checkout instead of copying:</p>
+<pre><code>ln -sfn /path/to/websearch-dsh node_modules/websearch-dsh
+</code></pre>
+<p>The plugin's bundle patch layer (<code>cordis.patch.yml</code>) does the rest:</p>
+<ul>
+<li>inserts a <code>search-multi</code> row carrying the deployment knobs (timeout, provenance, context), and</li>
+<li>re-points the <code>web</code> row: <code>searchProvider: websearch-dsh</code>.</li>
+</ul>
+<p>It deliberately carries <strong>only deployment knobs</strong> — never the key names or priority, which stay in code so they can't go stale.</p>
+<h3>3. Restart dsh</h3>
+<pre><code>dsh web
+</code></pre>
+<p>A restart is needed once for the composition. After that: keys, the toggle, and every other runtime change apply live.</p>
+<h2>Provider reference</h2>
+<table>
+<thead>
+<tr>
+<th>#</th>
+<th>Provider</th>
+<th>Endpoint</th>
+<th>Auth</th>
+<th>Free tier (at time of writing)</th>
+<th>Notes</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>1</td>
+<td><a href="https://tavily.com">Tavily</a></td>
+<td><code>POST api.tavily.com/search</code></td>
+<td><code>Authorization: Bearer</code> (legacy <code>api_key</code> also accepted)</td>
+<td>~1,000 credits/mo</td>
+<td>Strong for research queries; <code>search_depth: advanced</code> used; results include snippets + relevance score.</td>
+</tr>
+<tr>
+<td>2</td>
+<td><a href="https://exa.ai">Exa</a></td>
+<td><code>POST api.exa.ai/search</code></td>
+<td><code>x-api-key</code> header</td>
+<td>~1,000 credits/mo</td>
+<td>Neural/keyword/auto search; maps <code>text</code> → snippet, carries <code>publishedDate</code>.</td>
+</tr>
+<tr>
+<td>3</td>
+<td><a href="https://firecrawl.dev">Firecrawl</a></td>
+<td><code>POST api.firecrawl.dev/v1/search</code></td>
+<td><code>Authorization: Bearer</code></td>
+<td>~500 credits</td>
+<td>Also a scraping API; in-band <code>success:false</code> responses are classified (quota text → <code>quota</code>).</td>
+</tr>
+<tr>
+<td>4</td>
+<td><a href="https://brave.com/search/api/">Brave Search</a></td>
+<td><code>GET api.search.brave.com/res/v1/web/search</code></td>
+<td><code>X-Subscription-Token</code> header</td>
+<td>~2,000 queries/mo</td>
+<td>GET with query string; maps the <code>web.results</code> block.</td>
+</tr>
+<tr>
+<td>5</td>
+<td><a href="https://serper.dev">Serper</a></td>
+<td><code>POST google.serper.dev/search</code></td>
+<td><code>X-API-KEY</code> header</td>
+<td>~2,500 credits</td>
+<td>Google SERP data; maps <code>organic</code> (skips ads/answers).</td>
+</tr>
+<tr>
+<td>6</td>
+<td><a href="https://duckduckgo.com">DuckDuckGo</a></td>
+<td>3 legs, see below</td>
+<td><strong>none</strong></td>
+<td>unlimited (rate-limited)</td>
+<td>Keyless last resort; serialized across concurrent searches.</td>
+</tr>
+</tbody></table>
+<p>Each provider module (<code>src/providers/&lt;id&gt;.js</code>) is a pure function of <code>(query, {key, maxResults, timeoutMs, legTimeoutMs, signal, fetch}) → {sources, truncated}</code> — trivially swappable or extendable. To add a provider: implement it, add it to <code>src/providers/index.js</code>, extend <code>DEFAULT_PRIORITY</code>/<code>DEFAULT_ENV_KEYS</code> in <code>src/config.js</code>.</p>
+<h2>Failure classification</h2>
+<p><code>src/http.js</code> classifies every failure so the chain (and the status tool) can report <em>why</em>:</p>
+<table>
+<thead>
+<tr>
+<th>Code</th>
+<th>Triggered by</th>
+<th>Chain behavior</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>auth</code></td>
+<td>401 / 403 (no quota text)</td>
+<td>skip provider, try next</td>
+</tr>
+<tr>
+<td><code>quota</code></td>
+<td>402, or 403/429 with quota-ish text ("quota", "credits", "exhausted", …)</td>
+<td>skip provider, try next</td>
+</tr>
+<tr>
+<td><code>rate</code></td>
+<td>429 (bare)</td>
+<td>skip provider, try next</td>
+</tr>
+<tr>
+<td><code>timeout</code></td>
+<td>per-provider budget exceeded (default 10 s; DDG legs also cap at 8 s each)</td>
+<td>skip provider, try next</td>
+</tr>
+<tr>
+<td><code>network</code></td>
+<td>fetch rejects (DNS, connection reset, TLS)</td>
+<td>skip provider, try next</td>
+</tr>
+<tr>
+<td><code>parse</code></td>
+<td>2xx but the body isn't the expected shape</td>
+<td>skip provider, try next</td>
+</tr>
+<tr>
+<td><code>aborted</code></td>
+<td>the <em>caller's</em> signal aborted</td>
+<td><strong>stop the whole walk</strong> and rethrow</td>
+</tr>
+</tbody></table>
+<p>Failures are remembered per provider in <code>websearch_status</code> (most recent first) and named in the combined all-failed error.</p>
+<h2>The DuckDuckGo leg</h2>
+<p>Three attempts, in order, per search (a vendor's API has changed underfoot — the npm <code>duckduckgo-search</code> package is broken against current endpoints, so this plugin ships a fixed, dependency-free port):</p>
+<ol>
+<li><strong><code>d.js</code></strong> — harvest a <code>vqd</code> token from the HTML search page, then query <code>links.duckduckgo.com/d.js</code> for the JSON result set (deduped, tag/entity stripped).</li>
+<li><strong>Lite HTML</strong> — <code>lite.duckduckgo.com/lite</code> results page; result links are <code>uddg</code>-resolved and decoded.</li>
+<li><strong>Instant API</strong> — <code>api.duckduckgo.com/?q=…&amp;format=json</code> (title + first paragraph + related topics).</li>
+</ol>
+<p>Concurrency is <strong>serialized</strong> across searches (one in-flight leg at a time) as a politeness measure. Current status (2026-08): serving normally; from some networks/IPs DuckDuckGo intermittently returns an anti-bot <strong>202 challenge</strong> instead of results — the three legs usually get through, and when a challenge does bite you get the clear combined error naming it, not a hang.</p>
+<h2>Verification</h2>
+<table>
+<thead>
+<tr>
+<th>Check</th>
+<th>What to look for</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>web_search</code> in chat, no <code>DEEPSEEK_API_KEY</code> set</td>
+<td>Works: keyed providers first, DDG last.</td>
+</tr>
+<tr>
+<td><code>websearch_status</code> tool / <code>/websearch status</code></td>
+<td><code>Web search: enabled.</code> (or <code>DISABLED</code>), live chain, key presence per provider, last serving provider, recent failures.</td>
+</tr>
+<tr>
+<td>Settings → Plugins → Configurable in the web GUI</td>
+<td>The <strong>Web Search</strong> card with the on/off checkbox.</td>
+</tr>
+<tr>
+<td><code>~/.dsh/settings.yaml</code> after a click</td>
+<td>A <code>websearch-dsh: { enabled: … }</code> section appears.</td>
+</tr>
+<tr>
+<td><code>node test.mjs</code> in the plugin directory</td>
+<td>66/66 (one network test self-skips when offline).</td>
+</tr>
+</tbody></table>
+<h2>Configuration reference</h2>
+<p>All fields optional; defaults shown. (These are the fields of the <code>search-multi</code> row the bundle patch inserts; a full custom composition can also set them on any plugin row.)</p>
+<table>
+<thead>
+<tr>
+<th>Field</th>
+<th>Default</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>envKeys</code></td>
+<td><code>{ TAVILY_API_KEY, EXA_API_KEY, FIRECRAWL_API_KEY, BRAVE_API_KEY, SERPER_API_KEY }</code></td>
+<td>Env/credential names, per provider.</td>
+</tr>
+<tr>
+<td><code>priority</code></td>
+<td><code>[tavily, exa, firecrawl, brave, serper]</code></td>
+<td>Chain order; unknown ids dropped, order preserved.</td>
+</tr>
+<tr>
+<td><code>providerTimeoutMs</code></td>
+<td><code>10000</code></td>
+<td>Overall budget per provider call (each DDG leg also caps at 8 s).</td>
+</tr>
+<tr>
+<td><code>provenance</code></td>
+<td><code>on-fallback</code></td>
+<td><code>off</code> — never annotate · <code>on-fallback</code> — annotate when keyless DDG served · <code>always</code> — annotate every serving provider.</td>
+</tr>
+<tr>
+<td><code>context.enabled</code></td>
+<td><code>true</code></td>
+<td>Emit the model-context section at all.</td>
+</tr>
+<tr>
+<td><code>context.order</code></td>
+<td><code>118</code></td>
+<td>Ordering among model-context sections.</td>
+</tr>
+</tbody></table>
+<h2>Developing the plugin</h2>
+<pre><code>node test.mjs        # offline suite, plain Node, no framework
+</code></pre>
+<p>The suite covers: config normalization/<code>~standard</code> validation, the HTTP + classification layer, per-call key resolution, <strong>every provider's request shape and response mapping</strong> (faked fetch routes), the fallback chain (fall-throughs, provenance, clamping, abort semantics, DDG serialization, live key changes, the toggle), the status tool, and the settings/client contract (fake <code>settings</code> service + a fake <code>window.__ModuleLoader__</code> harness that runs the real <code>client.js</code>). Run it from a checkout with the dsh packages resolvable (e.g. your live-symlinked profile's <code>node_modules</code>) for the full variant against real <code>dsh-tools</code>/<code>dsh-credentials</code>/<code>dsh-settings</code>/<code>schemastery</code>; from a bare clone it degrades gracefully and still exercises everything that doesn't need them.</p>
+<p>Composition check with a scratch <code>DSH_HOME</code>:</p>
+<pre><code>dsh --profile &lt;name&gt; --dump-config   # expect the websearch-dsh rows, no errors
+</code></pre>
+<h2>FAQ</h2>
+<p><strong>Why one composite provider instead of five?</strong> The harness's <code>web</code> seam selects one <code>searchProvider</code> at construction time (<code>dsh-web</code> pins it — there is no runtime re-selection seam). A single composite provider is the only way to do failover <em>and</em> keep the built-in <code>web_search</code> tool as the single model-facing surface.</p>
+<p><strong>Why not an MCP server?</strong> A native plugin skips the sidecar process and its own lifecycle: it registers directly on the harness seams (tools, settings, credentials, system prompt), so the on/off toggle, approval semantics, and live config behave like first-party features.</p>
+<p><strong>Does it work outside the web GUI?</strong> Yes — the chain, tools, command, and context section are server-side and work in <code>dsh chat</code>/headless too. Only the toggle <em>card</em> is a web-client feature (the settings.yaml file works everywhere).</p>
+<p><strong>Will it spend my credits while I'm just chatting?</strong> Only when <code>web_search</code> is actually called and the toggle is on. The model-context section is one static paragraph.</p>
+<p><strong>Can I reorder providers?</strong> Yes — <code>priority</code> in the row config (e.g. put <code>serper</code> first). Unknown ids are dropped with a validation warning, never a crash.</p>
+<h2>Troubleshooting</h2>
+<table>
+<thead>
+<tr>
+<th>Symptom</th>
+<th>Fix</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>web_search</code> says "disabled by the user"</td>
+<td>The toggle is off — flip it in the GUI or set <code>websearch-dsh.enabled: true</code> in <code>~/.dsh/settings.yaml</code>.</td>
+</tr>
+<tr>
+<td>Status shows a provider without a key although you set the env</td>
+<td>Check you set it in a layer dsh reads (<code>~/.dsh/.env</code> or the launching shell) and restarted dsh once; or use the Credentials screen (live).</td>
+</tr>
+<tr>
+<td>Every search is served by DuckDuckGo with a provenance note</td>
+<td>The keyed providers are failing — read <code>websearch_status</code> → failures (auth = bad key, quota = free tier exhausted, rate = throttled).</td>
+</tr>
+<tr>
+<td>Combined "All web search providers failed" error</td>
+<td>Network-level: the machine can't reach any provider API (or DDG is challenging you). The error lists each provider's code — fix the one that matches your setup.</td>
+</tr>
+<tr>
+<td>The GUI card is missing</td>
+<td>You're on a pre-0.1.2 GUI build, or a remote browser (loopback-only feature) — or the plugin isn't in the profile's <code>dsh.bundles</code>.</td>
+</tr>
+<tr>
+<td><code>web_search</code> still says "no API key for DEEPSEEK_API_KEY" after install</td>
+<td>You haven't restarted <code>dsh web</code> since wiring the profile, or the bundle patch layer isn't applied (check <code>dsh --dump-config</code> for <code>searchProvider: websearch-dsh</code>).</td>
+</tr>
+</tbody></table>
+<h2>Reverting / uninstalling</h2>
+<p>Re-point the <code>web</code> row in a profile-level bundle patch (<code>searchProvider: deepseek-official</code>) or simply remove <code>websearch-dsh</code> from the profile's <code>dsh.bundles</code>, then restart. Nothing else the plugin does depends on it; the settings section (if any) is inert without the plugin.</p>
+<h2>License</h2>
+<p>MIT — see <a href="https://github.com/takasurazeem/websearch-dsh/blob/HEAD/LICENSE">LICENSE</a>.</p>

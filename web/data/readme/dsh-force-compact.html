@@ -1,0 +1,328 @@
+<h1>dsh-force-compact</h1>
+<p><strong>Aggressive, local-first context compaction for DeepSeek Harness agents.</strong></p>
+<p>A DSH <strong>Cordis function plugin</strong> that keeps the agent's working context lean by design: serve
+<code>Qwen3.8‑27B</code> on a self-hosted llama.cpp with a modest context, and the plugin shrinks the
+conversation itself — a large-window feel with no API cost and no data egress.</p>
+<p><a href="https://github.com/falling-ts/dsh-force-compact/blob/HEAD/README.cn.md">中文</a></p>
+<hr>
+<h2>Why</h2>
+<ul>
+<li><strong>Self-hosted inference</strong> — the agent talks to a local OpenAI-compatible llama.cpp server
+through the standard DeepSeek adapter; no separate adapter needed.</li>
+<li><strong>Low context, high signal</strong> — instead of fighting a small cap, the plugin shrinks the
+conversation, so the agent reasons over a tight prompt while keeping deep memory in the
+compressed head.</li>
+<li><strong>Think off for compactions, passthrough everywhere else</strong> — <code>disableThinking: true</code>
+(default) turns thinking off on <em>this plugin's own compaction summarization call only</em>;
+every other model request rides the machine's configuration unchanged.</li>
+<li><strong>Private &amp; free</strong> — no per-token billing, no egress.</li>
+</ul>
+<hr>
+<h2>What it does</h2>
+<p>Two compaction engines coexist behind one facade (<code>resolveCompaction</code>), transparent to callers:</p>
+<table>
+<thead>
+<tr>
+<th>Engine</th>
+<th>Used when</th>
+<th>Notes</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong>Official</strong></td>
+<td>the <code>compaction</code> service resolves in the agent realm</td>
+<td>Preferred; delegates to <code>compaction/basic</code>.</td>
+</tr>
+<tr>
+<td><strong>Builtin</strong></td>
+<td>automatic fallback (typical standard preset isolates the service)</td>
+<td>Self-contained persistent transaction on <code>ctx.sessions</code> / <code>ctx.llm.stream</code> / <code>ctx.tokenMeter</code>; reuses the official <code>compaction/*</code> event vocabulary, so it replays safely across builds.</td>
+</tr>
+</tbody></table>
+<p>No toggling — official wins when reachable, builtin takes over otherwise.</p>
+<h3>Trigger points</h3>
+<ul>
+<li><strong>Per-request guard (<code>agent/pre-step</code>)</strong> — reads the session's <em>projected</em> context tokens
+(the exact number the harness renders bottom-right). At <code>autoThresholdTokens</code> it rejects the
+outgoing request and compacts the head instead, retaining the latest <code>retainLatestTokens</code>
+verbatim. Below the threshold the request proceeds.</li>
+<li><strong>Turn end / idle (<code>agent/status</code> → <code>idle</code>)</strong> — when the agent quiesces, optionally
+compacts via <code>compactNow</code> (gate: <code>turnEndForceCompactionEnabled</code>).</li>
+<li><strong>Manual <code>/force-compact</code></strong> — immediate <code>compactNow</code> when idle; when busy it queues a
+process-local flag consumed at the next model step. <strong>Loaded lazily</strong> — see "Command
+availability" under Install.</li>
+<li><strong><code>session/flush</code></strong> — the awaited durability checkpoint.</li>
+</ul>
+<p>Every path funnels into the single <em>"compaction result landed in the session"</em> boundary — the
+same point where the LiveUI signal fires.</p>
+<p>Decision key is <code>projectedTokens</code> (provider-anchored, same figure as the UI corner), so the
+plugin never drifts from what you see; the threshold-aware shrink gate skips summarizer calls
+that provably cannot pull the session below the threshold (kills the low-threshold dead loop).</p>
+<p>The builtin transaction bills <code>shadowedTokenCount</code> from the <strong>same</strong> <code>tokenMeter.measure</code>
+per-node prices the official engine uses, so the meter's collapse protocol settles the drop
+correctly — the bottom-right counter goes <em>down</em> after compaction.</p>
+<h3>Thinking control: scoped to compactions</h3>
+<p>Since the 2026-08 semantics revision, <code>disableThinking</code> controls <strong>one thing</strong>: whether this
+plugin's own summarization call (<code>engine/builtin.js</code> → <code>engine/summarizer.js</code> →
+<code>ctx.llm.stream</code>) carries <code>reasoningEffort:'off'</code>. Everything else is untouched:</p>
+<table>
+<thead>
+<tr>
+<th>Call site</th>
+<th>With <code>disableThinking: true</code></th>
+</tr>
+</thead>
+<tbody><tr>
+<td>Builtin-engine summarization call</td>
+<td>Carries <code>reasoningEffort:'off'</code></td>
+</tr>
+<tr>
+<td>Every other model request (business, sub-agents, tools, other plugins)</td>
+<td>Machine's <code>LlmCallConfig</code> unchanged</td>
+</tr>
+<tr>
+<td>Official <code>compaction</code> service calls</td>
+<td>Not routed through any plugin seam — unaffected</td>
+</tr>
+</tbody></table>
+<p>When the target is a <strong>llama.cpp / OpenAI-compatible endpoint</strong>, the
+<code>thinking: { type: 'disabled' }</code> field the adapter emits is silently ignored there — so the
+summarizer ALSO stamps the llama.cpp-native top-level <code>reasoning_effort: "none"</code>, gated on
+the exact same condition. One options object carries BOTH fields:</p>
+<table>
+<thead>
+<tr>
+<th>Endpoint family</th>
+<th>Reads</th>
+<th>Result</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>Real DeepSeek API</td>
+<td><code>reasoningEffort:'off'</code> → <code>thinking:{type:'disabled'}</code></td>
+<td>Thinking off ✅</td>
+</tr>
+<tr>
+<td>llama.cpp / OAI-compatible</td>
+<td><code>reasoning_effort:"none"</code> (top-level)</td>
+<td><code>enable_thinking=false</code> ✅</td>
+</tr>
+</tbody></table>
+<p>Each family tolerates-and-ignores the foreign key, so emitting both is harmless. The field is
+stamped in <code>src/engine/summarizer.js</code> (immediately before <code>llm.stream(options)</code>), NOT in the
+<code>llm/stream</code> waterfall — a prior draft injected there but proved ineffective structurally
+(middle-layer returns are discarded; in-place seed mutation crashes the host); see the
+<code>src/hooks/wire-rewrite.js</code> module header for the write-up. That hook now serves only the
+LiveUI watermark role.</p>
+<p>Need thinking off on <strong>business calls</strong> too? Set your provider's <code>reasoningEffort</code> at the
+request-header level — the plugin deliberately stays out of that decision.</p>
+<h4>Observability: per-attempt audit lines</h4>
+<p>Every summarization attempt logs two lines (visible at the default <code>debug: true</code>) — the
+durable proof of the scoping decision and its wire fields, without capturing traffic:</p>
+<pre><code>[force-compact] &lt;sessionId&gt;: compaction thinking-policy — settings.disableThinking=true → extra.reasoningEffort='off' (this summarization call carries thinking-OFF)
+[force-compact] &lt;sessionId&gt;: summarization wire-fields → &lt;provider&gt;/&lt;model&gt;: reasoningEffort='off' + reasoning_effort="none" (llama.cpp-native wire field)
+</code></pre>
+<ul>
+<li><strong>Line 1</strong> (<code>engine/builtin.js</code>) records where <code>disableThinking</code> is read and routed into
+the call options; with the setting off it records <em>machine default</em>.</li>
+<li><strong>Line 2</strong> (<code>engine/summarizer.js</code>) records both wire fields exactly as they leave the
+options object, plus resolved provider/model; unstamped fields are labeled <code>(absent…)</code>.</li>
+</ul>
+<p>Empirically grounded: probed against a local llama.cpp endpoint, a baseline request returned
+populated <code>reasoning_content</code> (the model thinks by default), while the same request with
+top-level <code>reasoning_effort:"none"</code> returned none at all — the field genuinely disables
+thinking there, and business calls (which omit it) keep thinking.</p>
+<h3>LiveUI status</h3>
+<p>A tiny host→client messenger (the <code>liveUi</code> settings field mirrored live to the browser) pins a
+badge beside the turn:</p>
+<ul>
+<li><strong>Red "compressing"</strong> — just before a compaction commits (screen text is Chinese);</li>
+<li><strong>Green "done"</strong> — the instant a compaction lands; 3 s later a fresh random working line
+takes over;</li>
+<li><strong>Blue "working"</strong> — otherwise a rotating playful one-liner.</li>
+</ul>
+<p>Publishers are fail-safe: a messenger glitch can never disturb the actual compaction.</p>
+<hr>
+<h2>How it works</h2>
+<pre><code>agent/request(payload, next)              # every model request
+    return await next()                  # pure pass-through (thinking-off scopes
+                                          # ONLY to the plugin's own summarizer)
+
+agent/pre-step(payload, next)             # before each model step
+    projectedTokens &gt;= autoThresholdTokens?
+        no  -&gt; next()                     # let the request proceed
+        yes -&gt; compactRegion(head-before-retainLatestTokens, signal)
+               return { kind: "reject" }  # no model request this step
+
+agent/status({ agent, status })          # lifecycle transition
+    status === "idle" &amp;&amp; turnEndForceCompactionEnabled?
+        -&gt; compactNow(agent, freshSignal) # turn-end compaction
+
+session/flush(session)                   # durability checkpoint
+    select region -&gt; project messages -&gt; preview + shrink gate
+    -&gt; compaction.compactRegion(start, end, agent, signal)
+</code></pre>
+<p>Supporting modules:</p>
+<ul>
+<li><code>src/hooks/guard.js</code> — <code>agent/request</code> pure pass-through + <code>pre-step</code> threshold gate +
+process-local force flag (<code>thinkingDisabled</code> survives only as a legacy predicate).</li>
+<li><code>src/hooks/command.js</code> — the <code>/force-compact</code> command (lazily registered).</li>
+<li><code>src/hooks/idle.js</code> — turn-end forced compaction.</li>
+<li><code>src/hooks/wire-rewrite.js</code> — the <code>llm/stream</code> LiveUI watermark hook (no wire manipulation;
+historical note in the module header).</li>
+<li><code>src/engine/region.js</code> — head/tail-anchored region selection (with the official pairing ledger).</li>
+<li><code>src/engine/summarizer.js</code> — the one-shot LLM summarizer, fully aligned with official
+<code>compaction-basic</code> (target resolution, prefix-cache alignment, <code>purpose:'compaction'</code> tag,
+fail-closed finish classification, usage capture).</li>
+<li><code>src/engine/builtin.js</code> — the builtin persistent transaction (official <code>compaction/*</code> vocab).</li>
+<li><code>src/engine/checkpoint.js</code> — preview + shrink gate + delegation to the compaction service.</li>
+<li><code>src/core/projected.js</code> — provider-anchored <code>projectedTokens</code>.</li>
+<li><code>src/core/ui-signal.js</code> — the LiveUI messenger.</li>
+</ul>
+<hr>
+<h2>Install</h2>
+<p>As an installable package (recommended):</p>
+<pre><code># from npm (published):
+npm install @falling-ts/dsh-force-compact
+# from git:
+dsh plugin --profile web add github:falling-ts/dsh-force-compact
+# from a local checkout:
+dsh plugin --profile web add ./dsh-force-compact
+</code></pre>
+<p>Or, from a local checkout, as a <code>--patch</code> overlay without installing:</p>
+<pre><code>dsh web --patch dsh-force-compact/cordis.patch.yml
+</code></pre>
+<p>The plugin is loaded iff <code>~/.dsh/logs/dsh-force-compact.log</code> gains:</p>
+<pre><code>[force-compact] debug logging enabled — writing [force-compact] lines to &lt;absolute path&gt;
+</code></pre>
+<h3>Command availability — <code>/force-compact</code> loads lazily</h3>
+<p>The <code>commands</code> service arrives with the agent-presets plane, <strong>after</strong> the plugin's boot-time
+<code>apply</code>, so registration happens at the first guarded-listener activation
+(<code>agent/request</code> / <code>agent/pre-step</code> / <code>agent/status</code> / <code>session/flush</code>), settling
+permanently on the first success. Practical effect: <strong>after (re)starting the instance, a
+fresh session's <code>/</code> picker does NOT show <code>/force-compact</code> until that session makes its first
+model request</strong> — send any one message, then the command is registered process-wide.</p>
+<ul>
+<li>Success: <code>[force-compact] /force-compact command registered (deferred)</code></li>
+<li><code>commands</code> permanently absent: one <code>… still UNREGISTERED 10 min …</code> warn explains the
+empty picker. Until registered, the rest of the plugin works — degradation, not an
+install failure.</li>
+</ul>
+<p>Verify a compaction happened:</p>
+<pre><code>idle compaction (builtin) shadowed N nodes (~M tokens)
+builtin compaction OK — replaced span seq[A..B] (N nodes, ~K tokens) with a P-char checkpoint
+compaction thinking-policy — settings.disableThinking=true → extra.reasoningEffort='off' (…)
+summarization wire-fields → &lt;provider&gt;/&lt;model&gt;: reasoningEffort='off' + reasoning_effort="none" (…)
+</code></pre>
+<p>(The last two lines are the per-attempt audit pair described under "Observability".)</p>
+<hr>
+<h2>Settings</h2>
+<p><code>$DSH_HOME/settings.yaml</code>, namespace <code>falling-ts-force-compact</code>:</p>
+<table>
+<thead>
+<tr>
+<th>key</th>
+<th>type</th>
+<th>default</th>
+<th>meaning</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>disableThinking</code></td>
+<td>boolean</td>
+<td><code>true</code></td>
+<td>Only the plugin's own summarization call carries <code>reasoningEffort:'off'</code>; everything else unchanged.</td>
+</tr>
+<tr>
+<td><code>autoThresholdTokens</code></td>
+<td>number ≥ 32000</td>
+<td><code>32000</code></td>
+<td>Projected-token trigger for the gate. <strong>Floor 32000</strong> (clamps back up at read time).</td>
+</tr>
+<tr>
+<td><code>retainLatestTokens</code></td>
+<td>positive int ≥ 8000</td>
+<td><code>8000</code></td>
+<td>Retain the latest N tokens verbatim; older history is summarized in one batch. <strong>Floor 8000.</strong> Drives both the auto gate and <code>/force-compact</code>.</td>
+</tr>
+<tr>
+<td><code>turnEndForceCompactionEnabled</code></td>
+<td>boolean</td>
+<td><code>true</code></td>
+<td>Compact on the agent's <code>idle</code> transition.</td>
+</tr>
+<tr>
+<td><code>debug</code></td>
+<td>boolean</td>
+<td><code>true</code></td>
+<td>Emit <code>[force-compact]</code> diagnostics to the plugin log.</td>
+</tr>
+<tr>
+<td><code>logFile</code></td>
+<td>string</td>
+<td><code>~/.dsh/logs/dsh-force-compact.log</code></td>
+<td>Diagnostics destination (<code>~</code> expands to home dir).</td>
+</tr>
+<tr>
+<td><code>compactionMode</code></td>
+<td><code>'realm' | 'global'</code></td>
+<td><code>'realm'</code></td>
+<td>Official-service resolution strategy (priority-1 path).</td>
+</tr>
+<tr>
+<td><code>builtinEnabled</code></td>
+<td>boolean</td>
+<td><code>true</code></td>
+<td>Gate for the builtin engine fallback.</td>
+</tr>
+<tr>
+<td><code>maxSummaryTokens</code></td>
+<td>integer (1024–200000)</td>
+<td><code>1024</code></td>
+<td>Cap on the summarizer LLM <code>maxTokens</code>.</td>
+</tr>
+</tbody></table>
+<p>Example — an aggressive <strong>local</strong> profile:</p>
+<pre><code>falling-ts-force-compact:
+  disableThinking: true
+  autoThresholdTokens: 40000   # compact sooner ⇒ keep the live prompt small
+  retainLatestTokens: 8000
+  turnEndForceCompactionEnabled: true
+</code></pre>
+<p>Without the <code>settings</code> service the plugin falls back to the same defaults and still compacts —
+the namespace is optional, never a hard dependency.</p>
+<h3>Tuning for low-context llama.cpp</h3>
+<p>Keep <code>autoThresholdTokens</code> comfortably <strong>below</strong> the served context: the live prompt stays
+small and latency flat, while the agent keeps deep memory through the compressed head.
+Pressure is measured in <em>projected</em> tokens (provider-anchored), so the threshold maps
+predictably onto the UI figure.</p>
+<hr>
+<h2>Behavior notes</h2>
+<ul>
+<li><strong>Runtime dependency:</strong> the <code>compaction</code> service (preset plane
+<code>agent-presets:compaction-basic</code>), read live via <code>ctx.get('compaction')</code>; unreachable →
+the builtin engine takes over (or the request proceeds).</li>
+<li><strong>Optional dependencies:</strong> <code>settings</code> / <code>tokenMeter</code> / <code>commands</code> / <code>llm</code> / <code>agents</code> are
+read via <code>ctx.get(...)</code> with guards — a missing one degrades gracefully.</li>
+<li><strong>Per-request settings read:</strong> parameters are read every model request, so edits take
+effect on the next request without a restart.</li>
+<li><strong>Signals:</strong> <code>agent/*</code> Waterfalls forward the current turn's signal; the <code>session/flush</code>
+checkpoint and the <code>agent/status</code> idle listener each mint a fresh <code>AbortController</code>.</li>
+<li><strong>Persistence:</strong> durable output is the <code>compaction/*</code> bracket events + a
+<code>surfaceOp:replace</code> <code>user/message</code> checkpoint, replay-safe across builds.</li>
+<li><strong>Client half:</strong> <code>web/client.js</code> adds the settings section "Force Compact" (localized
+labels), live-editable without restart (uSES-safe mirror).</li>
+<li><strong>One intentional timer:</strong> the 3 s <code>publishDone</code> fallback (presentation-only, documented
+deviation). Otherwise the plugin is pure listeners + a process-local <code>Map</code> force flag.</li>
+</ul>
+<hr>
+<h2>Screenshots</h2>
+<p><img src="https://raw.githubusercontent.com/falling-ts/dsh-force-compact/HEAD/assets/settings-panel.png" alt="Settings panel — Force Compact section, all knobs live-editable"></p>
+<p><em>Settings page — the <strong>Force Compact</strong> section; all nine fields above are editable live
+without a restart.</em></p>
+<p><img src="https://raw.githubusercontent.com/falling-ts/dsh-force-compact/HEAD/assets/live-conversation.png" alt="Conversation page — red"></p>
+<p><em>Conversation page — the LiveUI signal paints three states (red: compressing / green: done /
+blue: working); the green banner fades after about 3 s back to a random working line.</em></p>
+<hr>
+<h2>License</h2>
+<p>MIT (see LICENSE).</p>

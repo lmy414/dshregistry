@@ -1,0 +1,93 @@
+<h1>dsh-plugin-archived-sessions</h1>
+<p>Browse and read archived <a href="https://github.com/deepseek-ai/deepseek-harness">DeepSeek Harness</a> sessions from a sidebar panel.</p>
+<p>Archiving a session in DSH hides it from every grouping surface — the workspace tree, the flat list, and search. The session log is kept, but the UI ships no way back: there is no unarchive action, no "show archived" toggle, and no way to reach an archived session once it disappears. This plugin gives those sessions a drawer, and a reader.</p>
+<blockquote>
+<p><strong>This is a viewer, not an unarchive button.</strong> Clicking a session opens a read-only transcript inside the panel — it does not restore the session to the sidebar, and it does not reopen it in the main chat view so you can keep talking to it. Both of those need harness changes a plugin cannot make; <a href="#what-it-deliberately-does-not-do">the reasons are exact and worth reading</a> if you were hoping otherwise.</p>
+</blockquote>
+<p><img src="https://raw.githubusercontent.com/GroupWork888/dsh-plugin-archived-sessions/HEAD/docs/panel.png" alt="The archived-sessions panel, listing archived sessions with a search box"></p>
+<h2>What it does</h2>
+<p>Adds an <strong>Archived</strong> entry beside Settings at the foot of the sidebar, with a live count of how many sessions are hidden there:</p>
+<p><img src="https://raw.githubusercontent.com/GroupWork888/dsh-plugin-archived-sessions/HEAD/docs/sidebar-entry.png" alt="The Archived entry at the sidebar foot, showing a count of 53"></p>
+<p>Opening it shows every archived session, newest activity first, with:</p>
+<ul>
+<li>title and workspace for each row, plus a search box to filter them</li>
+<li>click a row to read that session's transcript in a read-only reader</li>
+<li>backwards pagination through the whole log</li>
+<li>a live count on the trigger</li>
+<li>English and Chinese copy, following the app's active language</li>
+<li>theme-aware styling via the shell's own design tokens</li>
+</ul>
+<p>Clicking a row opens that session's transcript in a read-only reader:</p>
+<p><img src="https://raw.githubusercontent.com/GroupWork888/dsh-plugin-archived-sessions/HEAD/docs/reader.png" alt="The read-only transcript reader, showing a prompt and labelled injected context"></p>
+<p>The reader shows human prompts, assistant replies, reasoning, injected context (labelled and clamped), and the names of tools that were called. It is plain text: no markdown rendering and no tool cards, because those surfaces live in the shell's conversation packages and reproducing them here would mean vendoring code this plugin does not own.</p>
+<h2>What it deliberately does not do</h2>
+<h3>It does not open archived sessions in the main conversation view</h3>
+<p>This is the one design decision worth reading before forking, because the obvious implementation looks like it works and does not.</p>
+<p><code>sessions.open(id)</code> succeeds on an archived id — <code>manager.select()</code> validates only that the id is in the list, and archived sessions stay in the list. But the client runtime sweeps the selection away immediately afterwards, in <code>WorkspaceRuntime.project()</code>:</p>
+<pre><code>// packages/client/runtime/src/client/workspaces/service.ts
+if (sessions.current !== undefined
+    &amp;&amp; workspace.archivedSessionIds.includes(sessions.current)) {
+  this.sessions.clear()
+}
+</code></pre>
+<p><code>project()</code> runs on every sessions-store notification, and <code>select()</code> ends with <code>notifier.notifyNow()</code>. So the sequence is: click → select → notify → sweep → clear, all before React paints. <strong>The click looks completely dead.</strong></p>
+<p>That sweep is deliberate core behaviour — it is how the UI drops a session that another tab just archived, and how a reconnect discards a stale persisted selection. It is not a bug to route around from a plugin, and it fires on every projection rather than only on archive events, so no amount of plugin-side sequencing survives it.</p>
+<p>So this plugin does not make archived sessions current at all. It reads the log directly through the <code>session.history</code> RPC — whose contract states it "uses an attached Session or persistence inspection and never resumes or publishes an Agent" — and renders the transcript in its own overlay. <code>tests/smoke.mjs</code> asserts the plugin never touches the sessions service, so this cannot silently regress.</p>
+<p>Making archived sessions genuinely openable is a ~5-line upstream change: make the sweep transition-based (clear when the archive set <em>changes</em> to include the current session) instead of state-based. That preserves all three documented sweep cases while letting a deliberate open stick.</p>
+<h3>It does not restore sessions to the sidebar</h3>
+<p>Un-archiving needs a host-side write, and every route into that state is sealed to a plugin:</p>
+<ul>
+<li><code>WorkspaceRegistry.archiveSession()</code> only ever appends — there is no removal method</li>
+<li>its <code>setState</code> is private, and the state is written as a whole blob</li>
+<li><code>storageDomain.open('workspace')</code> throws <code>already-open</code>, so a plugin cannot open the domain the registry holds</li>
+<li>editing <code>workspace.json</code> directly is clobbered, because the registry caches state in memory and rewrites the entire blob on its next mutation</li>
+</ul>
+<p>Adding real unarchive means an <code>unarchiveSession</code> RPC upstream (registry method, API proxy handler, wire schemas, client manager) — a patch to the harness, not a plugin. Notably the rest of the plumbing already exists: the host frame producer watches <code>domain/changed</code> and emits <code>host/archived-sessions-changed</code>, and the client manager handles it, so a restored session would appear in the sidebar immediately, in its original position.</p>
+<p>Rows whose session has left the session list entirely are shown but disabled: their log may be gone from disk, and the list is the only evidence the client has either way.</p>
+<h2>Why it works without touching harness code</h2>
+<ul>
+<li><code>workspace.list</code> already ships <code>archivedSessionIds</code> to every client as ordinary data</li>
+<li>the session list is never filtered host-side — the store carries every row, and the sidebar's own derivation is what hides archived ones at render time</li>
+<li><code>sidebar.footer.action</code> is a <code>list</code> slot that supplies both <code>useSessions</code> and <code>useWorkspaces</code> as standard props</li>
+<li><code>session.history</code> reads a log from persistence without waking an agent</li>
+</ul>
+<p>So the rows are already sitting in your browser; this plugin draws them, and pages the log for the one you pick. It is strictly read-only: it never calls <code>archiveSession</code>, never changes the current session, and never writes host state. The node half is deliberately empty.</p>
+<h3>A note on page size</h3>
+<p><code>session.history</code> returns every raw event, and <code>assistant/chunk</code> dominates a real log by roughly 20:1 — one measured tool-heavy session returned 6,239 events for a 60-message page, 5,917 of them chunks that this viewer folds away. That is 1.7 MB transferred to render 109 lines. The page size is therefore 30 rather than the shell's 60 (0.84 MB for 50 lines). Loopback hides the difference; a Tailscale-reached web UI does not.</p>
+<h2>Install</h2>
+<p>With an installed <code>dsh</code> command:</p>
+<pre><code>dsh plugin --profile web add https://github.com/GroupWork888/dsh-plugin-archived-sessions
+</code></pre>
+<p>If you run DSH from a source checkout instead, invoke the same CLI through its package script:</p>
+<pre><code>cd /path/to/deepseek-harness
+pnpm dsh plugin --profile web add https://github.com/GroupWork888/dsh-plugin-archived-sessions
+</code></pre>
+<p>Then restart the Web profile (<code>dsh web</code>, or <code>pnpm dsh web</code> from a source checkout) and refresh the page. The built bundle is committed, so there is no plugin build step.</p>
+<p>From a local clone instead, if you want to read or change the source:</p>
+<pre><code>git clone https://github.com/GroupWork888/dsh-plugin-archived-sessions
+cd dsh-plugin-archived-sessions &amp;&amp; pnpm install
+dsh plugin --profile web add "$PWD"
+</code></pre>
+<p>Installing writes only to <code>$DSH_HOME/profiles/web</code> (its <code>package.json</code>, <code>node_modules</code>, and lockfile). Nothing in the harness checkout is modified.</p>
+<p>To remove it, run <code>dsh plugin --profile web remove dsh-plugin-archived-sessions</code> and restart. Source-checkout users run the equivalent <code>pnpm dsh plugin ...</code> command from the harness root.</p>
+<h2>Requirements</h2>
+<ul>
+<li>A DSH <code>web</code> profile. The panel is browser-only.</li>
+<li>Built against the <code>0.1.1-rc.2</code> client packages. The slot contract it uses (<code>sidebar.footer.action</code>) is a declared extension seam, but DSH is pre-1.0 and seams may move between releases.</li>
+</ul>
+<h2>Develop</h2>
+<pre><code>pnpm install      # no harness checkout required
+pnpm build        # emits lib/index.js (node half) and lib/client.js (browser half)
+pnpm test         # load the BUILT bundle in jsdom and drive the panel
+pnpm verify       # build + test — works anywhere
+</code></pre>
+<p><strong>You do not need a <code>deepseek-harness</code> checkout to hack on this.</strong> The <code>link:</code> dev dependencies point at one, but they are type-only: <code>pnpm install</code>, <code>pnpm build</code>, and <code>pnpm test</code> all succeed with those links dangling, and the resulting <code>lib/client.js</code> is byte-identical to one built with the checkout present (verified). The checkout is only ever read, never written.</p>
+<p>The one thing that needs it is type resolution:</p>
+<pre><code>pnpm typecheck     # requires ../deepseek-harness (else ~5 cannot-find-module errors)
+pnpm verify:types  # build + typecheck + test
+</code></pre>
+<p>If you want it, clone the harness as a sibling directory (<code>../deepseek-harness</code>) or repoint the <code>link:</code> paths in <code>package.json</code>. Worth doing before sending a PR — it typechecks against the real DSH contracts and catches wrong prop names and missing locale declarations that a build will happily emit.</p>
+<p><code>tests/smoke.mjs</code> executes <code>lib/client.js</code> through a fake <code>__ModuleLoader__</code> whose <code>require</code> answers exactly the shared module table the web shell provides, then renders the registered component and drives a full read. That catches what a typecheck cannot: registering under the wrong id, requesting a module the loader cannot answer, filling the wrong slot, mis-sorting rows, duplicating replies from stream chunks, mislabelling injected context as a human prompt, paging from the wrong cursor — and, above all, reaching for the sessions service, which is the exact bug that made an earlier version's rows unclickable.</p>
+<p>Note that <code>@deepseek-ai/dsh-client-connection</code> is <strong>not</strong> in the shell's shared module table (<code>PLATFORM_MODULES</code>), so the wire types are declared structurally in <code>src/client/history.ts</code> and the service is resolved at runtime with <code>ctx.get('connection')</code>. A value import of that package would not resolve in the browser.</p>
+<h2>License</h2>
+<p>MIT</p>

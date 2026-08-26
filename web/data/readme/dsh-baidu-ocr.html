@@ -1,0 +1,285 @@
+<h1>dsh-baidu-ocr</h1>
+<p>百度云 OCR 的 DeepSeek Harness Web 插件（bundle）。把图片 / PDF / 办公文档拖进页面，用百度云 OCR 识别为 Markdown，并把结果写成<strong>本地文件</strong>。</p>
+<ul>
+<li><strong>PaddleOCR-VL</strong>（同步）：千帆平台 <code>qianfan.baidubce.com</code> 的通用文字识别，返回 <code>markdown.text</code>，支持版面分析、图表识别、方向/畸变矫正。</li>
+<li><strong>Unlimited-OCR</strong>（异步）：<code>aip.baidubce.com</code> 的文档解析，公式 LaTeX、表格 HTML、多栏版面智能合并。</li>
+</ul>
+<blockquote>
+<p>一句话：一个 key、两个引擎、拖入即识别、结果落盘、既能 GUI 也能当模型工具用。</p>
+</blockquote>
+<hr>
+<h2>目录</h2>
+<ul>
+<li><a href="#%E5%AE%83%E6%98%AF%E4%BB%80%E4%B9%88">它是什么</a></li>
+<li><a href="#%E4%B8%BA%E4%BB%80%E4%B9%88%E8%BF%99%E6%A0%B7%E8%AE%BE%E8%AE%A1">为什么这样设计</a></li>
+<li><a href="#%E6%9E%B6%E6%9E%84">架构</a></li>
+<li><a href="#%E8%83%BD%E5%8A%9B%E4%B8%80%E8%A7%88">能力一览</a></li>
+<li><a href="#%E5%AE%89%E8%A3%85">安装</a></li>
+<li><a href="#%E9%85%8D%E7%BD%AE-api-key">配置 API Key</a></li>
+<li><a href="#%E4%BD%BF%E7%94%A8">使用</a></li>
+<li><a href="#%E8%BE%93%E5%87%BA">输出</a></li>
+<li><a href="#%E7%9B%AE%E5%BD%95%E7%BB%93%E6%9E%84">目录结构</a></li>
+<li><a href="#%E5%AE%89%E5%85%A8">安全</a></li>
+<li><a href="#%E5%BC%80%E5%8F%91%E4%B8%8E%E8%B0%83%E8%AF%95">开发与调试</a></li>
+<li><a href="#faq">FAQ</a></li>
+<li><a href="#%E8%B7%AF%E7%BA%BF%E5%9B%BE">路线图</a></li>
+</ul>
+<hr>
+<h2>它是什么</h2>
+<p>这是一个符合 DeepSeek Harness <strong>bundle 规范</strong>的插件包，安装后同时提供：</p>
+<table>
+<thead>
+<tr>
+<th>界面</th>
+<th>形态</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong>拖入面板</strong></td>
+<td>浏览器右下角浮窗</td>
+<td>拖入文件 → 自动解析真实本地路径 → 选引擎 → 识别 → 结果卡片预览</td>
+</tr>
+<tr>
+<td><strong>模型工具</strong></td>
+<td><code>baidu_ocr</code> 工具</td>
+<td>对话里直接 <code>用 baidu_ocr 识别 /path/to/img.png</code>，Agent 可自动调用</td>
+</tr>
+<tr>
+<td><strong>设置卡片</strong></td>
+<td>设置 → 插件 → 百度 OCR</td>
+<td>在 GUI 里填写 API key（不回显、不落日志）</td>
+</tr>
+</tbody></table>
+<p>它解决的核心痛点：<strong>浏览器无法把「拖进来的文件」直接交给本地 OCR 引擎</strong>——浏览器只给你 <code>File</code> 对象（没有真实路径），而 DSH 的工具需要真实路径来读文件。本插件在 Host 端读真实路径、调 API、写结果文件，在 Client 端把拖入的文件解析回真实路径。</p>
+<hr>
+<h2>为什么这样设计</h2>
+<p>这是经过验证后收敛出来的架构，几个关键取舍：</p>
+<ol>
+<li><p><strong>零 <code>@deepseek-ai</code> 依赖</strong>：社区 bundle 会被 <code>dsh plugin add</code> 装进 profile 的 <code>node_modules</code>，那里<strong>没有</strong> DSH 内部包。因此 host 只用 Node 内置（<code>node:fs</code>/<code>node:path</code> + 原生 <code>fetch</code>），client 端拖入面板用<strong>纯 DOM</strong>（不 import React），只有设置卡片用 platform seed 里的 <code>react</code>。</p>
+</li>
+<li><p><strong>原生 <code>fetch</code> 而非 Python</strong>：bundle 的 host 运行在真实 Node 进程里（不同于动态插件的受限沙箱），可以直接 <code>fetch</code> 调百度 API。相比早期的 Python 脚本方案，零外部依赖、更可分发。</p>
+</li>
+<li><p><strong>Client ↔ Host 走 HTTP 路由</strong>（而非动态插件的 <code>host.call</code>）：bundle 没有动态插件那种「Package 私有 RPC」，标准做法是 host 注册 <code>webServer</code> 路由、client <code>fetch</code> 调用。这是 dsh-drag-and-drop / modlens 等社区 bundle 的同一模式。</p>
+</li>
+<li><p><strong>key 永不回传浏览器</strong>：设置页只读到 <code>hasKey</code> 布尔值，真值只存在于 <code>${DSH_HOME:-~/.dsh}/baidu-ocr.json</code>（<code>0600</code> 权限），提交时留空 = 保留原值。参照 modlens 的安全模型。</p>
+</li>
+</ol>
+<hr>
+<h2>架构</h2>
+<pre><code>┌─────────────────────────────────────────────────────────────────┐
+│  Host (lib/index.js, Node 进程, inject: [tools, webServer])      │
+│                                                                 │
+│  baidu_ocr 工具 ──┐                                             │
+│                   ├─ resolveKey(ctx)  ── 设置文件 &gt; credentials &gt; env
+│                   │                                             │
+│  /baidu-ocr/run ──┼─ runOcr(path, engine, key)                  │
+│  (client 面板用)  │    ├─ paddleocr()   → qianfan 同步 POST       │
+│                   │    └─ unlimited()   → aip 提交→轮询→下载      │
+│                   │    └─ writeResults() → ocr_output/*.md/.json  │
+│                   │                                             │
+│  /baidu-ocr/config ─ writeSettingsFile() → ${DSH_HOME:-~/.dsh}/baidu-ocr.json │
+│  (设置页用)         readSettingsFile() → { hasKey } (不回显 key)   │
+└─────────────────────────────────────────────────────────────────┘
+                              │ HTTP (同源 fetch)
+┌─────────────────────────────────────────────────────────────────┐
+│  Client (lib/client.js, window.__ModuleLoader__)                 │
+│                                                                 │
+│  拖入面板（纯 DOM）:                                              │
+│    drag/drop → 解析 file:// URI → 真实路径 chip → 选引擎          │
+│    → POST /baidu-ocr/run → 结果卡片 (markdown 预览 + 文件路径)     │
+│    · 可拖动 / 可收起 / FAB 跟随 composer 上方（不挡发送按钮）        │
+│                                                                 │
+│  设置卡片（React, settings.plugin.item）:                         │
+│    GET /baidu-ocr/config → hasKey 状态                           │
+│    POST → 写 key（留空 = 保留）                                   │
+└─────────────────────────────────────────────────────────────────┘
+</code></pre>
+<hr>
+<h2>能力一览</h2>
+<h3>双引擎</h3>
+<table>
+<thead>
+<tr>
+<th>引擎</th>
+<th>接口</th>
+<th>模式</th>
+<th>适用</th>
+<th>输出</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>paddleocr</code></td>
+<td><code>qianfan.baidubce.com/v2/ocr/paddleocr</code></td>
+<td>同步</td>
+<td>图片、PDF 通用识别</td>
+<td><code>markdown.text</code></td>
+</tr>
+<tr>
+<td><code>unlimited</code></td>
+<td><code>aip.baidubce.com/.../unlimited-ocr-parser</code></td>
+<td>异步（提交→轮询→下载）</td>
+<td>文档解析、公式、表格、多栏</td>
+<td><code>markdown_url</code> 内容</td>
+</tr>
+</tbody></table>
+<p>引擎选择：</p>
+<ul>
+<li><code>auto</code>（默认）：按扩展名自动选 —— 图片（jpg/png/bmp/tif…）→ <code>paddleocr</code>；办公文档/PDF（pdf/ofd/doc/docx/ppt/pptx…）→ <code>unlimited</code>；</li>
+<li>也可在面板下拉框或工具参数里显式指定。</li>
+</ul>
+<h3>支持格式</h3>
+<table>
+<thead>
+<tr>
+<th>类型</th>
+<th>扩展名</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>图片</td>
+<td><code>.jpg .jpeg .png .bmp .tif .tiff</code></td>
+</tr>
+<tr>
+<td>版式文档</td>
+<td><code>.pdf .ofd</code></td>
+</tr>
+<tr>
+<td>流式文档</td>
+<td><code>.doc .docx .txt .wps .ppt .pptx</code></td>
+</tr>
+</tbody></table>
+<hr>
+<h2>安装</h2>
+<pre><code>dsh plugin --profile web add &lt;本仓库路径或 git url&gt;
+</code></pre>
+<blockquote>
+<p><code>dsh plugin</code> 是 pnpm 转发器：它把包加进 profile 的依赖，然后扫描声明了 <code>dsh.bundle.patch</code> 的包，自动 reconcile 进 <code>dsh.profile.bundles</code> 层栈。无需手改 config。</p>
+</blockquote>
+<p>然后<strong>重启 Web UI 并刷新浏览器</strong>：</p>
+<pre><code>dsh web --host 127.0.0.1 --port 3080 --no-open
+</code></pre>
+<blockquote>
+<p>注意：请用与当前运行实例<strong>同一个</strong> <code>dsh</code> 二进制重启（如果你机器上有多个 dsh 版本，旧版可能不认 <code>--no-open</code>）。</p>
+</blockquote>
+<p>安装后：</p>
+<ul>
+<li>Host 注册 <code>baidu_ocr</code> 工具 + <code>/baidu-ocr/run</code> + <code>/baidu-ocr/config</code> 路由；</li>
+<li>Client 注册右下角拖入面板 + 设置页「百度 OCR」卡片；</li>
+<li>3080 直连与 5173 皮肤壳（iframe 代理 <code>/plugins</code>）都会自动加载，无需手动配置。</li>
+</ul>
+<hr>
+<h2>配置 API Key</h2>
+<p>三种来源，优先级从高到低：</p>
+<ol>
+<li><strong>设置页</strong>（推荐）：设置 → 插件 → 百度 OCR，填 key 保存 → 写入 <code>${DSH_HOME:-~/.dsh}/baidu-ocr.json</code>；</li>
+<li><strong>credentials 服务</strong>：<code>ctx.get('credentials').resolve('BAIDU_OCR_KEY')</code>；</li>
+<li><strong>环境变量</strong>：<code>export BAIDU_OCR_KEY="bce-v3/ALTAK-.../..."</code>。</li>
+</ol>
+<p>key 格式为百度 <strong>BCE IAM API Key</strong>（<code>bce-v3/ALTAK-.../...</code>），对两个引擎的 Bearer 鉴权都有效。</p>
+<p>获取：<a href="https://console.bce.baidu.com/iam/#/iam/accesslist">https://console.bce.baidu.com/iam/#/iam/accesslist</a></p>
+<hr>
+<h2>使用</h2>
+<h3>方式一：拖入</h3>
+<ol>
+<li>从 Finder（或文件管理器）拖文件到页面任意位置，全屏出现「松开以添加文件到 OCR」提示；</li>
+<li>右下角「百度 OCR」面板弹出，文件变成可删除的 chip（hover 显示完整路径）；</li>
+<li>选引擎（自动 / PaddleOCR-VL / Unlimited-OCR），点「识别 N 个文件」；</li>
+<li>结果卡片显示 markdown 预览 + 结果文件路径，<code>.md</code>/<code>.json</code> 落到源文件旁。</li>
+</ol>
+<p>面板可<strong>拖动标题栏</strong>移动、<strong>收起</strong>成 <code>OCR</code> 圆钮（悬浮在输入框上方，不挡发送按钮）、支持粘贴绝对路径手动添加。</p>
+<h3>方式二：模型工具</h3>
+<p>在对话里直接说：</p>
+<pre><code>用 baidu_ocr 识别 /absolute/path/to/image.png
+</code></pre>
+<p>工具返回预览 + 文件路径；要拿完整文本，再让 Agent 用 <code>read</code> 读 <code>markdownFile</code>。</p>
+<hr>
+<h2>输出</h2>
+<p>每个文件在 <code>&lt;源目录&gt;/ocr_output/</code> 下产出两个文件：</p>
+<ul>
+<li><code>&lt;文件名&gt;.md</code> — Markdown 识别结果（含公式 LaTeX、表格 HTML）；</li>
+<li><code>&lt;文件名&gt;.json</code> — 元数据：</li>
+</ul>
+<pre><code>{
+  "engine": "paddleocr",
+  "source": "/abs/path/to/image.png",
+  "markdownFile": "/abs/path/to/ocr_output/image.md",
+  "charCount": 1234,
+  "requestId": "as-xxx",
+  "generatedAt": "2026-08-24T08:00:00.000Z"
+}
+</code></pre>
+<hr>
+<h2>目录结构</h2>
+<pre><code>dsh-baidu-ocr/
+├── package.json          # dsh.bundle.patch + dsh.client 声明、exports、files
+├── cordis.patch.yml      # insert 插件行的 bundle patch
+├── lib/
+│   ├── index.js          # host：baidu_ocr 工具 + /run + /config + 双引擎（原生 fetch，零依赖）
+│   └── client.js         # client：拖入面板（纯 DOM）+ 设置卡片（React）
+├── test/
+│   └── index.test.js     # fence / 路径校验等纯逻辑的单元测试（node --test）
+├── .github/workflows/ci.yml  # CI：语法检查 + 单元测试
+└── README.md
+</code></pre>
+<hr>
+<h2>安全</h2>
+<ul>
+<li><strong>key 不回显、不落日志</strong>：设置页只拿到 <code>hasKey</code> 布尔值；真值存 <code>${DSH_HOME:-~/.dsh}/baidu-ocr.json</code>（<code>0600</code> 权限），会话日志里不出现。</li>
+<li><strong>跨站写防护（CSRF fence）</strong>：<code>/baidu-ocr/config</code> 与 <code>/baidu-ocr/run</code> 复刻 DSH 自身 <code>/api</code> 的信任模型——副作用请求只接受 <code>application/json</code> 的 POST，并校验 <code>Origin</code> 与请求 Host 同源；恶意网页的跨站请求会被强制进入本服务永不应答的 CORS preflight。只读的 GET 也做 Origin 校验。</li>
+<li><strong>OCR 目标路径校验</strong>：<code>/run</code> 只接受<strong>绝对路径</strong>、扩展名在白名单（图片 / PDF / 办公文档）、且确认为普通文件的目标，防止任意本地文件被上传到百度云（路径遍历 / 数据外带加固）。<code>unlimited</code> 引擎的结果下载只允许 <code>https://</code> 的 markdown_url。</li>
+<li><strong>结果文件写源目录</strong>：<code>.md</code>/<code>.json</code> 写到源文件旁的 <code>ocr_output/</code>，可预期、可追溯。</li>
+<li><strong>零依赖</strong>：host 只用 Node 内置，client 拖入面板纯 DOM，攻击面最小。</li>
+</ul>
+<blockquote>
+<p>安全模型参照：DSH 的 <code>/api</code> 代理在 <code>dsh-host-apiproxy</code> 中以「仅接受 <code>application/json</code>」实现跨站写 fence；bundle 路由注册在 <code>webServer</code>（loopback），浏览器与 host 同源。</p>
+</blockquote>
+<hr>
+<h2>开发与调试</h2>
+<h3>验证 host 逻辑</h3>
+<pre><code># 起临时实例（独立端口，不打扰正式 3080）
+node /path/to/dsh/lib/bin.js web --host 127.0.0.1 --port 3090 --no-open
+
+# 探测 config 路由（GET 不回显 key，POST 写 key）
+curl http://127.0.0.1:3090/baidu-ocr/config
+curl -X POST http://127.0.0.1:3090/baidu-ocr/config \
+  -H "content-type: application/json" -d '{"apiKey":"bce-v3/..."}'
+
+# 跑一次 OCR
+curl -X POST http://127.0.0.1:3090/baidu-ocr/run \
+  -H "content-type: application/json" -d '{"path":"/tmp/test.png","engine":"auto"}'
+</code></pre>
+<h3>改 client 后生效</h3>
+<ul>
+<li>有 <code>pnpm run dev:web</code>（HMR watcher）：client 改动热更新；</li>
+<li>无 watcher：改 <code>lib/client.js</code> 后，<code>serveBundle</code> 实时读磁盘，<strong>浏览器硬刷新（Cmd+Shift+R）即可</strong>；若要 rev 缓存键也更新，重启 <code>dsh web</code>。</li>
+</ul>
+<h3>语法校验</h3>
+<pre><code>node --check lib/index.js
+node --check lib/client.js
+</code></pre>
+<h3>单元测试</h3>
+<pre><code>npm test
+</code></pre>
+<p>覆盖 host 侧的 CSRF fence 与目标路径校验等纯逻辑（<code>test/index.test.js</code>）。CI（<code>.github/workflows/ci.yml</code>）在每次 push 自动运行语法检查与测试。</p>
+<hr>
+<h2>FAQ</h2>
+<p><strong>Q：为什么拖入能拿到真实路径？</strong>
+A：浏览器对拖入文件只暴露 <code>File</code> 对象，但文件管理器会带 <code>text/uri-list</code>（<code>file://</code> URI）。client 端解析这些 URI 还原成本地绝对路径（POSIX / Windows 盘符 / UNC），再交给 host 读文件。这复用了 dsh-drag-and-drop 的定位思路。</p>
+<p><strong>Q：两个引擎的 key 一样吗？</strong>
+A：是。同一个 BCE IAM API Key（<code>bce-v3/ALTAK-...</code>）对 PaddleOCR-VL（千帆 Bearer）和 Unlimited-OCR（aip Bearer）都有效，一个 key 通吃。</p>
+<p><strong>Q：结果能直接「拖出」到任意文件夹吗？</strong>
+A：浏览器标准不支持「拖出写文件」，但 DSH 是本地 Web UI，host 直接写本地文件更可靠——结果落在源文件旁 <code>ocr_output/</code>，会话里展示预览 + 路径。</p>
+<p><strong>Q：为什么 5173 皮肤壳也能看到？</strong>
+A：皮肤壳是 <code>&lt;iframe&gt;</code> 代理 <code>/plugins</code>、<code>/api</code> 到 3080，bundle 的 client 走静态路由 <code>/plugins/dsh-baidu-ocr/client.js</code>，两个视图都代理到了，无需重复配置。</p>
+<hr>
+<h2>路线图</h2>
+<ul>
+<li> 批量目录识别 + 并发限流（QPS 控制）</li>
+<li> 结果文件路径做成可再拖入的 chip</li>
+<li> 更多引擎（PP-OCRv6 通用文字识别）</li>
+<li> 打包成 npm 包发布（当前为本地 <code>link:</code> 安装）</li>
+</ul>
+<hr>
+<h2>License</h2>
+<p>MIT</p>

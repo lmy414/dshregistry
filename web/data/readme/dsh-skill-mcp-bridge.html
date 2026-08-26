@@ -1,0 +1,169 @@
+<h1>dsh-skill-mcp-bridge</h1>
+<p>dsh（DeepSeek Harness）项目桥接插件：<strong>自动导入 <code>.claude/.agents/.trae</code> 下的 skills</strong>，并<strong>桥接工作区 MCP 服务器</strong>（HTTP/SSE 与 stdio 双传输），全部功能由 GUI 开关控制、状态持久化。</p>
+<ul>
+<li>技能导入：<code>.claude/skills</code>、<code>.agents/skills</code>、<code>.trae/skills</code>，以及 <code>.claude/agents</code>、<code>.claude/commands</code></li>
+<li>MCP 桥接：读取 <code>.mcp.json</code> / <code>.trae/mcp.json</code> / <code>.claude/settings.json</code> 中的 <code>mcpServers</code>，注册为 dsh 工具（<code>mcp__&lt;server&gt;__&lt;name&gt;</code>）</li>
+<li>控制面板：设置页 + 工具视图双面板（开关、扫描、重连、状态）</li>
+<li>自动监听：4 秒轮询文件指纹，skills/MCP 配置变更自动重载</li>
+</ul>
+<h2>安装</h2>
+<h3>方式一：<code>dsh plugin add</code>（推荐）</h3>
+<p>dsh CLI 内置插件安装命令（转发 pnpm），git 仓库与 npm 包均可：</p>
+<pre><code># git 仓库源
+dsh plugin --profile web add github:cstarc/dsh-skill-mcp-bridge
+
+# 等价形式（与 dsh-at-file 的 git+https 依赖同机制）
+dsh plugin --profile web add git+https://github.com/cstarc/dsh-skill-mcp-bridge.git
+</code></pre>
+<ul>
+<li>自动写入 profile <code>package.json</code> 依赖与 <code>pnpm-lock.yaml</code></li>
+<li><strong>包内 <code>cordis.patch.yml</code> 会被 loader 自动应用，装完即激活</strong>，无需手动配置</li>
+<li>若已发布到 npm registry，裸包名同样可用：<code>dsh plugin --profile web add dsh-skill-mcp-bridge</code></li>
+</ul>
+<h3>方式二：手动放置（备选）</h3>
+<p>将本仓库复制到 dsh web profile 的 node_modules：</p>
+<pre><code>cp -r dsh-skill-mcp-bridge /data/.dsh/profiles/web/node_modules/
+</code></pre>
+<p>（profile 使用 pnpm <code>nodeLinker: hoisted</code>，直接放目录即可被解析。）</p>
+<p>然后手动在 <code>/data/.dsh/profiles/web/cordis.patch.yml</code>（用户补丁层，升级不覆盖）追加：</p>
+<pre><code>- insert:
+    - id: dsh-skill-mcp-bridge
+      name: dsh-skill-mcp-bridge
+</code></pre>
+<blockquote>
+<p>注意：手动放置的包不会被自动激活，必须补 insert 行；<code>dsh plugin add</code> 方式无需此步。</p>
+</blockquote>
+<h3>3. 重启与验证</h3>
+<p>重启 dsh 后插件自动加载（无需审批）。可在<strong>不重启</strong>的情况下先验证组合：</p>
+<pre><code>dsh --profile web --dump-config   # 应看到 dsh-skill-mcp-bridge 行
+</code></pre>
+<h2>使用</h2>
+<h3>技能开关</h3>
+<p>面板位于 <strong>设置页 →「项目桥接（Skills + MCP）」</strong> 与 <strong>工具视图</strong>：</p>
+<table>
+<thead>
+<tr>
+<th>开关</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>.claude/skills</code></td>
+<td>导入 <code>.claude/skills/*/SKILL.md</code>（rank 250）</td>
+</tr>
+<tr>
+<td><code>.agents/skills</code></td>
+<td>导入 <code>.agents/skills</code>（rank 260）</td>
+</tr>
+<tr>
+<td><code>.trae/skills</code></td>
+<td>导入 <code>.trae/skills</code>（rank 270）</td>
+</tr>
+<tr>
+<td><code>.claude/agents</code></td>
+<td>导入 <code>.claude/agents/*.md</code>（rank 251，随 claude 开关）</td>
+</tr>
+<tr>
+<td><code>.claude/commands</code></td>
+<td>导入 <code>.claude/commands/**/*.md</code>（rank 252，随 claude 开关）</td>
+</tr>
+</tbody></table>
+<h3>frontmatter 语义</h3>
+<table>
+<thead>
+<tr>
+<th>字段</th>
+<th>行为</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>name</code></td>
+<td>技能名（必须 kebab-case）</td>
+</tr>
+<tr>
+<td><code>description</code></td>
+<td>技能描述；缺省取正文首段（≤1536 字符）</td>
+</tr>
+<tr>
+<td><code>when_to_use</code> / <code>when-to-use</code> / <code>whenToUse</code></td>
+<td>触发时机</td>
+</tr>
+<tr>
+<td><code>disable-model-invocation: true</code></td>
+<td>模型不会自动触发该技能，在输入框发送 <code>/技能名</code> 手动调用</td>
+</tr>
+<tr>
+<td><code>user-invocable: false</code></td>
+<td>禁止用户手动调用</td>
+</tr>
+<tr>
+<td><code>metadata</code></td>
+<td>透传元数据</td>
+</tr>
+</tbody></table>
+<h3>MCP 服务器</h3>
+<p>支持两种配置形态（按 <code>.trae/mcp.json</code> → <code>.mcp.json</code> → <code>.claude/settings.json</code> 顺序合并覆盖）：</p>
+<pre><code>// .mcp.json — HTTP/SSE 传输
+{
+  "mcpServers": {
+    "my-http-server": {
+      "url": "https://example.com/mcp",
+      "headers": { "Authorization": "Bearer xxx" }
+    }
+  }
+}
+</code></pre>
+<pre><code>// .mcp.json — stdio 传输（换行 JSON-RPC）
+{
+  "mcpServers": {
+    "my-stdio-server": {
+      "command": "node",
+      "args": ["mcp-stdio-bridge.js"],
+      "env": { "MCP_SERVER_URL": "http://10.0.0.1:9090/mcp" }
+    }
+  }
+}
+</code></pre>
+<p>注册的工具名为 <code>mcp__&lt;server&gt;__&lt;原始名&gt;</code>。每个 server 可用独立开关；<code>disabled: true</code> 的 server 默认关闭。</p>
+<h2>状态持久化</h2>
+<p>开关状态保存于 <code>&lt;工作区&gt;/.claude/skills-state.json</code>：</p>
+<pre><code>{
+  "claude": true,
+  "agents": true,
+  "trae": true,
+  "mcp": { "dbquery-mcp": true, "hundsun": true }
+}
+</code></pre>
+<p>诊断日志：<code>&lt;工作区&gt;/.claude/bridge-diag.log</code>（截断 8000 字符）。</p>
+<h2>架构</h2>
+<pre><code>Host（Node.js）                         Client（浏览器）
+┌─────────────────────────────┐       ┌──────────────────────────┐
+│ skills.registerProvider     │       │ settings.section 面板     │
+│   · .claude/.agents/.trae   │       │ tool.view.cordis 面板     │
+│   · frontmatter 解析        │       │                          │
+│ tools.register (defineTool) │◄─────►│ ctx.remote.$mount        │
+│   · MCP HTTP/SSE (fetch)    │ typert │  ctx.reflect.get(         │
+│   · MCP stdio (子进程)      │ RPC    │    "remote.skillMcpBridge")│
+│ timer 指纹轮询             │       │                          │
+└─────────────────────────────┘       └──────────────────────────┘
+</code></pre>
+<ul>
+<li>面板 RPC 走 Typert Remote（<code>src-json</code> 宽松 codec），host 端 <code>@Remote</code> 装饰器方法 + <code>ctx.typert.register(MANIFEST)</code>。</li>
+<li>工具注册使用 <code>@deepseek-ai/dsh-tools</code> 的 <code>defineTool</code>（参数 DSL 不支持属性级 <code>enum/const/oneOf</code>，桥接时已做 schema 白名单净化）。</li>
+<li>网络访问受限环境通过子进程 <code>node -e</code> 执行 fetch（沙箱无 fetch）。</li>
+</ul>
+<h2>构建</h2>
+<pre><code>esbuild src/index.js  --bundle --format=esm --platform=node   --outfile=lib/index.js  --external:node:* --target=es2020
+esbuild src/client.js --bundle --format=esm --platform=browser --outfile=lib/client.js --log-level=warning
+</code></pre>
+<blockquote>
+<p><code>--target=es2020</code> 必要：让 esbuild 转译 TC39 装饰器（Node 原生不支持装饰器语法）。</p>
+</blockquote>
+<h2>兼容性</h2>
+<ul>
+<li>dsh web profile（<code>nodeLinker: hoisted</code> 布局）</li>
+<li>Client 平台包注入：<code>@deepseek-ai/dsh-client-runtime</code>、<code>@deepseek-ai/dsh-client-ui-tool</code>、<code>@deepseek-ai/dsh-client-ui-settings</code></li>
+<li>Node.js ≥ 18（MCP HTTP 子进程使用全局 <code>fetch</code>）</li>
+</ul>
+<h2>License</h2>
+<p>MIT</p>

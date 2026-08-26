@@ -1,0 +1,139 @@
+<h1>@achasoft/dsh-usage-info</h1>
+<p>Context usage and account balance for the <a href="https://github.com/deepseek-ai/deepseek-harness">DeepSeek Harness</a> Web Client. A readout in the session header shows how full the model's context window is and what the account paying for it currently holds; clicking it opens a panel with the breakdown behind both numbers.</p>
+<p>Balance is a swappable capability. A DeepSeek provider ships with this package; any other billing backend can implement the same seam.</p>
+<h2>Requirements</h2>
+<ul>
+<li>A dsh installation with the Web Client (<code>@deepseek-ai/dsh-web-app</code>).</li>
+<li>For context occupancy: nothing. It rides the token meter the harness already runs.</li>
+<li>For the balance: one provider, configured below. Without one, the readout still shows context occupancy and the settings card explains what is missing — an unconfigured install loses no working half.</li>
+</ul>
+<h2>Install</h2>
+<p><code>dsh plugin</code> forwards to pnpm, so any pnpm source works:</p>
+<pre><code>dsh plugin --profile default add @achasoft/dsh-usage-info
+</code></pre>
+<details>
+<summary>Other install sources</summary>
+
+<pre><code>dsh plugin --profile default add ./achasoft-dsh-usage-info-0.1.0.tgz   # from `pnpm pack`
+dsh plugin --profile default add ./dsh-usage-info                       # a local checkout
+dsh plugin --profile default add github:achasoft/dsh-usage-info#&lt;sha&gt;   # from git
+</code></pre>
+<p>A git install fetches sources, not build output. This package ships a <code>prepare</code> script that builds them, but pnpm will not run it until you allow it — add the key pnpm names to your profile's <code>pnpm-workspace.yaml</code>:</p>
+<pre><code>allowBuilds:
+  '@achasoft/dsh-usage-info': true
+</code></pre>
+<p>That is permission to execute this package's code at install time. Prefer the npm or tarball forms, which need no such allowance.</p>
+</details>
+
+<p>The bundle appends itself to your profile automatically. Verify with <code>dsh --profile default --dump-config</code>, which should show a <code># == @achasoft/dsh-usage-info</code> layer.</p>
+<h2>Turn the balance on</h2>
+<p>The provider ships disabled, because no default can guess which endpoint to ask or which environment variable holds its key. Enable it from your profile's own <code>cordis.patch.yml</code> (<code>$DSH_HOME/profiles/&lt;name&gt;/cordis.patch.yml</code>). A patch replaces a row's entire <code>config</code>, so restate every key.</p>
+<pre><code>- id: usage-info-deepseek
+  disabled: false
+  config:
+    baseURL: https://api.deepseek.com
+    apiKeyEnv: DEEPSEEK_API_KEY
+    timeoutMs: 15000
+</code></pre>
+<table>
+<thead>
+<tr>
+<th>Field</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>baseURL</code></td>
+<td>API prefix without the <code>/user/balance</code> suffix.</td>
+</tr>
+<tr>
+<td><code>apiKeyEnv</code></td>
+<td><strong>Name of an environment variable</strong>, never the key. Defaults to the same reference the harness's own DeepSeek adapter uses, so an installation that can already call the model can already read its balance.</td>
+</tr>
+<tr>
+<td><code>timeoutMs</code></td>
+<td>Deadline for one reading.</td>
+</tr>
+</tbody></table>
+<p><strong>The key never reaches the browser.</strong> That is the whole reason this plugin has a host half: the balance endpoint needs a bearer token, and a token shipped to a browser is a leaked token. The browser asks the host, the host asks the provider.</p>
+<p><strong>The key is addressed, never stored.</strong> <code>apiKeyEnv</code> is a credential <em>reference</em>: the value is resolved from the harness credential seam at the start of every reading and never cached, so rotating it reaches the next reading with no restart — and rotating it also drops the cached balance, because a new key can mean a different account.</p>
+<p>Only one provider may be mounted. A composition that mounts two fails loudly at load rather than silently preferring one.</p>
+<h2>Settings</h2>
+<p>The <strong>Usage information</strong> card on the plugin settings tab edits these live; the values below are the composition defaults.</p>
+<table>
+<thead>
+<tr>
+<th>Field</th>
+<th>Default</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>showContext</code></td>
+<td><code>true</code></td>
+<td>Show context occupancy for the current session.</td>
+</tr>
+<tr>
+<td><code>showBalance</code></td>
+<td><code>true</code></td>
+<td>Show the account balance.</td>
+</tr>
+<tr>
+<td><code>refreshIntervalMs</code></td>
+<td><code>300000</code></td>
+<td>How often each browser re-asks for a balance.</td>
+</tr>
+<tr>
+<td><code>cacheTtlMs</code></td>
+<td><code>240000</code></td>
+<td>How long one reading stays servable from the host's shared cache.</td>
+</tr>
+<tr>
+<td><code>lowBalanceThreshold</code></td>
+<td><em>(unset)</em></td>
+<td>Exact decimal string at or below which the readout warns. Blank disables the warning.</td>
+</tr>
+</tbody></table>
+<p><code>refreshIntervalMs</code> is the poll cadence and <code>cacheTtlMs</code> is the request rate. Every open tab polls on its own timer, but a poll landing inside the cache window is answered from the host's stored reading, so the provider is asked at most once per <code>cacheTtlMs</code> no matter how many windows are open. Setting <code>cacheTtlMs</code> above <code>refreshIntervalMs</code> is refused at load: every poll would be served a reading already older than the cadence it was scheduled at.</p>
+<h2>How it works</h2>
+<pre><code>                      ┌─ contextPressure  ─┐
+session projections ──┤                    ├──→ ring + breakdown bar     (no request at all)
+                      └─ contextBreakdown ─┘
+                                                                          session header readout
+browser poll ── one unary RPC ──→ UsageInfoService.balance()               ↑
+                                        │                                  │
+                                   shared TTL cache ──→ ctx.accountBalance ─┴─ deepseek
+</code></pre>
+<p>Four decisions worth knowing:</p>
+<ul>
+<li><strong>The two halves arrive by different routes, on purpose.</strong> Context occupancy is already a durable session projection the harness's token meter publishes, and every session-scoped seat receives it through the standard kit. Routing it through this plugin's endpoint would add a round trip, a second copy of the same numbers, and a way for the two copies to disagree. The balance cannot work that way, because it needs a credential.</li>
+<li><strong>Nothing here is model-facing.</strong> No prompt, no tool, no session event. A balance reading is operator information that never enters a request, and the context figures are read from the log rather than written to it.</li>
+<li><strong>Money is never a number.</strong> Every figure stays the exact decimal string the provider sent, from the JSON parse through the wire to the display, and the low-balance comparison is digit-wise. <code>0.1 + 0.2</code> is why: a rounding artifact in a figure a person reads as their money is a defect no display formatting can undo.</li>
+<li><strong>Failures cross the wire as values, not exceptions.</strong> The RPC gateway erases a thrown error's classification, and the readout's next move depends on which class it was — "configure a key" is not "try again", and "this endpoint publishes no balance" means stop asking entirely, which is why a 404 halts the poll instead of retrying forever.</li>
+</ul>
+<h3>What the numbers mean</h3>
+<p>Occupancy is anchored to the provider: it is the last reported prompt size plus a heuristic repricing of whatever the conversation gained or lost since that sample. That is what makes it answer for the <em>next</em> request and react the moment a compaction shortens the surface — a compaction reports no usage of its own, so the raw provider sample alone would keep showing a full context after one.</p>
+<p>The three parts in the panel — system prompt, tool definitions, conversation — are a <em>composition</em>, not a total. They use the meter's fixed density estimate, which underprices CJK text and JSON schemas, so they will not sum to the anchored occupancy figure. Read them as proportions.</p>
+<h2>Extending it</h2>
+<p><code>ctx.accountBalance</code> is a capability, not a DeepSeek client. To bill against something else, implement the Service Definition this package exports and mount your plugin instead of <code>usage-info-deepseek</code>:</p>
+<pre><code>import { AccountBalanceProvider, BalanceError } from '@achasoft/dsh-usage-info'
+import type { AccountBalance, BalanceProviderInfo } from '@achasoft/dsh-usage-info'
+
+export class MyBalance extends AccountBalanceProvider {
+  async read(signal: AbortSignal): Promise&lt;AccountBalance&gt; { /* … */ }
+  async describe(): Promise&lt;BalanceProviderInfo&gt; { /* … */ }
+}
+</code></pre>
+<p>Throw <code>BalanceError</code> with one of the capability's classified codes; every other rejection is a defect. Do not cache — the consumer owns that, because only it knows how many surfaces share one reading.</p>
+<h2>Development</h2>
+<pre><code>pnpm install        # builds both halves through `prepare`
+pnpm run typecheck  # src, generated, and tests
+pnpm test           # artifact check, then vitest
+pnpm run build      # tsc emit → tsdown bundle
+</code></pre>
+<p><code>generated/</code> holds the Typert RPC contract, which only the deepseek-harness generator can produce, so it ships as committed source rather than as build output. <code>pnpm test</code> refuses to pass when it drifts from <code>src/host/</code>: it compares the declared <code>@Remote</code> endpoints against the artifact's and checks a fingerprint of the Host surface. A stale artifact is not a build error but a silent wire mismatch — the browser would validate against schemas that no longer describe what the host sends.</p>
+<p>Regenerate it against a clean harness checkout:</p>
+<pre><code>node scripts/regen-typert.mjs ../deepseek-harness
+</code></pre>
+<p>The script stages this package's host sources inside that workspace, builds the harness's Host face, copies the artifacts back, and restores everything it touched. It refuses to run against a dirty tree, and it takes several minutes.</p>
+<p><strong>Run it alone.</strong> It is the only thing in this repository that writes to the harness checkout, and it assumes exclusive access: it edits <code>tsconfig.base.json</code>, <code>tsconfig.host.json</code>, and <code>pnpm-lock.yaml</code>, then restores all three with <code>git checkout</code> in a <code>finally</code>. Two plugins regenerating at once will therefore clobber each other's staging — the second restore reverts the first's edits mid-build. Check that no other <code>regen-typert.mjs</code> is running, and that the harness tree is yours, before starting.</p>

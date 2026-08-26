@@ -1,0 +1,244 @@
+<h1>dsh-github-router</h1>
+<p><strong>English</strong> | <a href="https://github.com/AngelosZou/dsh-github-router/blob/HEAD/README.zh.md">中文</a></p>
+<blockquote>
+<p>Read-only GitHub access for a DeepSeek Harness project — load PRs, issues, files, and API data through tools that route internally (API, gh CLI, git protocol, page HTML, mirrors), so an agent never burns turns fighting shell-side TLS or proxy failures.</p>
+</blockquote>
+<p><a href="https://github.com/AngelosZou/dsh-github-router/blob/HEAD/LICENSE"><img src="https://img.shields.io/badge/License-MIT-blue.svg" alt="License: MIT"></a>
+<a href="https://nodejs.org/"><img src="https://img.shields.io/badge/Node.js-%3E%3D20.18-brightgreen" alt="Node.js >= 20.18"></a>
+<a href="https://www.npmjs.com/package/dsh-github-router"><img src="https://img.shields.io/npm/v/dsh-github-router" alt="npm version"></a></p>
+<p>A <a href="https://github.com/deepseek-ai/deepseek-harness">DeepSeek Harness</a> plugin bundle that gives agents GitHub reads without shell retries:</p>
+<ul>
+<li><strong>Five read-only tools</strong> — <code>github_probe</code>, <code>github_pr</code>, <code>github_issue</code>, <code>github_file</code>, <code>github_api</code> — plus the <code>github-router</code> skill and a system-prompt guidance section. No write, push, comment, or mutation capability exists anywhere in the package.</li>
+<li><strong>In-tool routing</strong> — every request runs host-side (outside the sandbox's TLS/proxy restrictions) and falls through a route ladder: <code>api.github.com</code> (direct → proxy) → <code>gh</code> CLI (read-only subcommands) → git protocol (plugin fetch cache, or a local clone read with log/diff/show only) → PR/issue page HTML (strict JSON island extraction) → user-configured raw mirrors.</li>
+<li><strong>One call, structured outcome</strong> — PRs come back with metadata, discussion, reviews, commits, changed files, and the diff, each part annotated with the route that served it; failures return a route matrix instead of a dozen retried shell commands.</li>
+<li><strong>Connectivity probe</strong> — <code>github_probe</code> reports which routes are live from the host in one call, with timings and a recommended route chain.</li>
+<li><strong>Zero runtime dependencies</strong> — peers resolve from the DSH profile; proxied requests travel through the plugin's own CONNECT tunnel (no third-party HTTP stack), so the package installs fully offline.</li>
+<li><strong>Settings page</strong> — an independent Settings entry ("GitHub Router", like the 通知 section): the <code>dsh-github-router</code> settings namespace (secret token, proxy, route switches, cache TTLs, byte caps) with staged edits, save/discard, and override badges.</li>
+<li><strong>Context efficiency</strong> — response caching with per-kind TTLs, byte caps everywhere, list caps with truncation notes, and rate-limit surfacing.</li>
+</ul>
+<h2>Requirements</h2>
+<ul>
+<li>Node.js &gt;= 20.18</li>
+<li>A DSH profile composed from <code>@deepseek-ai/dsh-base</code> (it provides the <code>tools</code>, <code>subprocess</code>, <code>skills</code>, <code>settings</code>, and <code>credentials</code> services the plugin uses)</li>
+<li>Optional: the <code>gh</code> CLI (authenticated) for the gh route; <code>git</code> for the git route</li>
+</ul>
+<h2>Install</h2>
+<p>From npm:</p>
+<pre><code>dsh plugin --profile web add dsh-github-router
+</code></pre>
+<p>From a local checkout (development):</p>
+<pre><code>dsh plugin --profile web add link:&lt;absolute-path-to-this-repo&gt;
+</code></pre>
+<p>From a git host:</p>
+<pre><code>dsh plugin --profile web add github:&lt;owner&gt;/dsh-github-router
+</code></pre>
+<p>Then <strong>restart the DSH backend</strong> — the host composition loads at process start. The tools appear in new sessions: <code>github_probe</code>, <code>github_pr</code>, <code>github_issue</code>, <code>github_file</code>, <code>github_api</code>, plus the <code>github-router</code> skill.</p>
+<h2>Usage</h2>
+<p>Agent side:</p>
+<table>
+<thead>
+<tr>
+<th>Tool</th>
+<th>What it does</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>github_probe</code></td>
+<td>One-shot connectivity matrix (api direct/proxy, gh installed/authed, git ls-remote, page direct/proxy, mirrors, token presence) with timings and a recommended route chain. Call first when access fails or is slow.</td>
+</tr>
+<tr>
+<td><code>github_pr</code></td>
+<td>Full PR view: metadata, description, discussion (issue + inline review comments), reviews, commits, changed files, and the unified diff, each with route attribution. Parts toggle (<code>includeDiscussion</code>/<code>includeReviews</code>/<code>includeCommits</code>/<code>includeFiles</code>/<code>includeDiff</code>) and cap (<code>maxDiffBytes</code>/<code>maxItems</code>). <code>localRepo</code> (or session-cwd auto-detection) reads commits/diff from a local clone with zero network.</td>
+</tr>
+<tr>
+<td><code>github_issue</code></td>
+<td>Issue metadata, body, labels, and comments, with route attribution.</td>
+</tr>
+<tr>
+<td><code>github_file</code></td>
+<td>File content (or directory listing) at a branch/tag/sha via api contents → raw → mirrors → git; returns size, truncation state, and the serving route.</td>
+</tr>
+<tr>
+<td><code>github_api</code></td>
+<td>Validated <strong>GET-only</strong> escape hatch for any <code>api.github.com</code> endpoint; query values sanitized, responses cached, rate-limit headers surfaced, errors carry stable codes.</td>
+</tr>
+</tbody></table>
+<pre><code>github_probe                                                  # which routes are live right now
+github_pr { owner: "o", repo: "r", number: 12 }               # full PR view
+github_pr { owner: "o", repo: "r", number: 12, localRepo: "C:/src/r" }  # commits/diff from a local clone
+github_issue { owner: "o", repo: "r", number: 34 }
+github_file { owner: "o", repo: "r", path: "src/index.js", ref: "main" }
+github_api { path: "/repos/o/r/commits", query: { per_page: 5 } }
+</code></pre>
+<p>Behavior notes:</p>
+<ul>
+<li>Route order is fixed per part type: API first (direct then proxy), then gh, then page HTML (proxy-first — machines with reset direct TLS usually reach pages through the proxy), then git, then mirrors. Each part records the route that served it.</li>
+<li>Anonymous API use is rate-limited (60 requests/hour per IP); configure a token (Settings or <code>GITHUB_TOKEN</code>) for 5000/hour. Responses are cached to save quota; <code>forceRefresh</code> bypasses the cache.</li>
+<li>Mirrors are <strong>off by default</strong> — they are third parties that see requested paths; enable them in settings only if you accept that.</li>
+<li>The git route never writes to user repositories: local clones are read with <code>git log</code>/<code>diff</code>/<code>show</code> only, and fetches happen exclusively in the plugin-owned cache under <code>&lt;DSH_HOME&gt;/storages/dsh-github-router/</code>.</li>
+</ul>
+<h2>Configuration</h2>
+<p>Settings → <strong>Plugins</strong> shows the <strong>GitHub Router</strong> card on the configurable
+tab (the framework's <code>settings.plugin.item</code> card slot keyed by the settings
+namespace; requires DSH ≥ 0.1.0-rc.7): edits are staged locally and written
+only on save, fields overridden by the user are badged, and blank fields
+fall back to the defaults below. The token is a write-only field — a blank
+save clears a configured token. The same values can be set in the
+composition (profile <code>cordis.patch.yml</code>) as the plugin's base config; the
+Settings UI overrides per user.</p>
+<table>
+<thead>
+<tr>
+<th>Field</th>
+<th>Default</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>token</code></td>
+<td>—</td>
+<td>Literal GitHub token (secret; redacted on the wire, write-only input). Prefer <code>tokenEnv</code>.</td>
+</tr>
+<tr>
+<td><code>tokenEnv</code></td>
+<td><code>GITHUB_TOKEN</code></td>
+<td>Environment variable / credential ref naming the token.</td>
+</tr>
+<tr>
+<td><code>proxy</code></td>
+<td><code>''</code></td>
+<td>Proxy URL for proxy attempts. <code>''</code> inherits ambient <code>HTTP(S)_PROXY</code>; <code>direct</code> never proxies.</td>
+</tr>
+<tr>
+<td><code>directTimeoutMs</code> / <code>proxyTimeoutMs</code></td>
+<td>8000 / 15000</td>
+<td>Per-attempt timeouts.</td>
+</tr>
+<tr>
+<td><code>retries</code></td>
+<td>1</td>
+<td>Retries for idempotent GETs on 429/5xx (honors <code>Retry-After</code>).</td>
+</tr>
+<tr>
+<td><code>routesApi</code> / <code>routesGh</code> / <code>routesGit</code> / <code>routesHtml</code> / <code>routesMirror</code></td>
+<td>on / on / on / on / <strong>off</strong></td>
+<td>Route switches (the card shows them as checkboxes).</td>
+</tr>
+<tr>
+<td><code>mirrors</code></td>
+<td><code>[]</code></td>
+<td>Raw-content mirror bases, e.g. <code>["https://ghproxy.net"]</code>.</td>
+</tr>
+<tr>
+<td><code>cacheTtlMeta</code> / <code>cacheTtlContent</code></td>
+<td>300 / 86400</td>
+<td>Response cache TTLs (PR/issue metadata vs immutable-ish content), in seconds.</td>
+</tr>
+<tr>
+<td><code>maxBytes</code></td>
+<td>1048576</td>
+<td>Byte cap for every response body read by the plugin.</td>
+</tr>
+<tr>
+<td><code>repos</code></td>
+<td><code>[]</code></td>
+<td>Local repositories granted for read-only git-route reads.</td>
+</tr>
+<tr>
+<td><code>gitCacheDir</code></td>
+<td><code>''</code></td>
+<td>Plugin fetch-cache dir; <code>''</code> = <code>&lt;DSH_HOME&gt;/storages/dsh-github-router/git</code>.</td>
+</tr>
+</tbody></table>
+<h2>How it works</h2>
+<ul>
+<li><strong>Host-side execution</strong> — plugin code runs in the host process, so the sandbox's TLS credential resets and proxy misrouting never apply. The unrestricted token is compensated by the confinement model in <a href="https://github.com/AngelosZou/dsh-github-router/blob/HEAD/SECURITY.md">SECURITY.md</a> — not by weakening the sandbox.</li>
+<li><strong>Explicit proxy decisions</strong> — global <code>fetch</code> does not inherit ambient proxy env; each attempt gets an explicit direct/proxy choice, and proxied requests use a zero-dependency CONNECT tunnel (<code>node:http</code>/<code>node:tls</code>) with target-hostname TLS validation and <code>accept-encoding: identity</code>.</li>
+<li><strong>Strict parsing</strong> — the page-HTML route extracts only <code>react-app.embeddedData</code> JSON islands and runs <code>JSON.parse</code> (never evaluated); a bounded BFS copies a whitelist of fields, so CSRF tokens and the raw payload never reach the model.</li>
+<li><strong>Argv-only subprocesses</strong> — every <code>gh</code>/<code>git</code> invocation is an argv array with fixed flag lists; user input reaches argv only after regex validation, and nothing is shell-interpolated.</li>
+<li><strong>Tool contract</strong> — canonical values are lossless JSON (arrays carry no side properties), byte-capped, and rendered as compact text with route attribution.</li>
+<li><strong>Skill &amp; guidance</strong> — the <code>github-router</code> skill teaches tool-first usage and the "never escalate for GitHub reads" rule; one system-prompt section (<code>dsh-github-router:guidance</code>, order 118) reminds every session that the github_* tools are the sanctioned path.</li>
+</ul>
+<h2>Project layout</h2>
+<table>
+<thead>
+<tr>
+<th>Path</th>
+<th>Purpose</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>cordis.patch.yml</code></td>
+<td>Profile patch layer inserting the <code>dsh-github-router</code> row</td>
+</tr>
+<tr>
+<td><code>lib/index.js</code></td>
+<td>Host plugin: settings namespace, five tools, skill, guidance</td>
+</tr>
+<tr>
+<td><code>lib/client.js</code></td>
+<td>Browser half: the settings card (hand-written factory bundle, no build step)</td>
+</tr>
+<tr>
+<td><code>lib/config.js</code></td>
+<td>Settings schema, defaults, runtime option resolution</td>
+</tr>
+<tr>
+<td><code>lib/net.js</code>, <code>lib/tunnel.js</code></td>
+<td>Route-aware HTTP layer; zero-dependency CONNECT proxy tunnel</td>
+</tr>
+<tr>
+<td><code>lib/routes/</code></td>
+<td>One module per route: <code>api</code> (GET-only REST), <code>gh</code> (CLI), <code>git</code> (protocol), <code>html</code> (page parse), <code>mirror</code> (raw mirrors)</td>
+</tr>
+<tr>
+<td><code>lib/core/</code></td>
+<td>Per-call runtime assembly and the <code>pr</code>/<code>issue</code>/<code>file</code>/<code>probe</code> aggregators</td>
+</tr>
+<tr>
+<td><code>lib/tools/</code></td>
+<td>The five model tools</td>
+</tr>
+<tr>
+<td><code>lib/cache.js</code>, <code>lib/render.js</code>, <code>lib/util.js</code></td>
+<td>TTL cache, text renderers, guards and shaping</td>
+</tr>
+<tr>
+<td><code>lib/skill.js</code>, <code>lib/guidance.js</code></td>
+<td>Skill content and prompt-injection section</td>
+</tr>
+<tr>
+<td><code>test/</code></td>
+<td>Runtime-free behavior tests (see Development)</td>
+</tr>
+<tr>
+<td><code>docs/</code></td>
+<td>Design and analysis documents</td>
+</tr>
+</tbody></table>
+<h2>Development</h2>
+<p>No build step: the plugin is plain ESM and the tests run with Node directly
+(a mock ctx stands in for the DSH services; the real <code>defineTool</code> validates
+every schema):</p>
+<pre><code>npm test
+# or: node --test --test-isolation=none "test/*.test.js"
+</code></pre>
+<p>The tests are fully offline — they cover JSON-island extraction, input
+guards, URL builders, the TTL cache, commit-log parsing, the tunnel request
+head, and the apply() wiring. See <a href="https://github.com/AngelosZou/dsh-github-router/blob/HEAD/CONTRIBUTING.md">CONTRIBUTING.md</a> for the
+development loop, including offline peer resolution.</p>
+<h2>Security</h2>
+<p>Read-only by construction: no write verb exists, tokens attach only to
+<code>api.github.com</code> and are redacted on every boundary, page payloads are
+whitelist-extracted, and the only disk writes are the two plugin-owned
+caches under <code>&lt;DSH_HOME&gt;/storages/dsh-github-router/</code>. See
+<a href="https://github.com/AngelosZou/dsh-github-router/blob/HEAD/SECURITY.md">SECURITY.md</a> for the complete threat model and mitigation
+list.</p>
+<h2>Documentation</h2>
+<ul>
+<li><a href="https://github.com/AngelosZou/dsh-github-router/blob/HEAD/docs/design.md">docs/design.md</a> — architecture, route ladder, cache and confinement model, known limitations</li>
+<li><a href="https://github.com/AngelosZou/dsh-github-router/blob/HEAD/SECURITY.md">SECURITY.md</a> — threat model and compensating controls</li>
+<li><a href="https://github.com/AngelosZou/dsh-github-router/blob/HEAD/CHANGELOG.md">CHANGELOG.md</a> — release history</li>
+</ul>
+<h2>License</h2>
+<p>MIT</p>

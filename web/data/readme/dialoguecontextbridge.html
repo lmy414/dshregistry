@@ -1,0 +1,364 @@
+<h1>DialogueContextBridge · 对话上下文桥接</h1>
+<blockquote>
+<p><strong>为大语言模型（LLM）与 AI 智能体的对话会话做跨会话上下文桥接。</strong></p>
+<p>把一次对话里「已经了解的信息」打包成可移植的知识单元，一键引入新对话，让 AI 不必反复从头了解背景。</p>
+</blockquote>
+<p>
+  <img src="https://raw.githubusercontent.com/ShadowQuill/DialogueContextBridge/HEAD/website/assets/social-preview.svg" alt="DialogueContextBridge 对话上下文桥接">
+</p>
+
+<table>
+<thead>
+<tr>
+<th>资源</th>
+<th>链接</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>📖 文档站点</td>
+<td><a href="https://shadowquill.github.io/DialogueContextBridge/">shadowquill.github.io/DialogueContextBridge</a></td>
+</tr>
+<tr>
+<td>架构设计</td>
+<td><a href="https://github.com/ShadowQuill/DialogueContextBridge/blob/main/docs/architecture.md">docs/architecture.md</a></td>
+</tr>
+<tr>
+<td>快照格式</td>
+<td><a href="https://github.com/ShadowQuill/DialogueContextBridge/blob/main/docs/snapshot-schema.md">docs/snapshot-schema.md</a></td>
+</tr>
+<tr>
+<td>宿主联调</td>
+<td><a href="https://github.com/ShadowQuill/DialogueContextBridge/blob/main/docs/dsh-host-integration.md">docs/dsh-host-integration.md</a></td>
+</tr>
+</tbody></table>
+<p><a href="https://github.com/ShadowQuill/DialogueContextBridge/actions/workflows/ci.yml"><img src="https://github.com/ShadowQuill/DialogueContextBridge/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+<a href="https://github.com/ShadowQuill/DialogueContextBridge/actions/workflows/deploy-docs.yml"><img src="https://github.com/ShadowQuill/DialogueContextBridge/actions/workflows/deploy-docs.yml/badge.svg" alt="Deploy Docs"></a>
+<a href="https://github.com/ShadowQuill/DialogueContextBridge/blob/HEAD/LICENSE"><img src="https://img.shields.io/badge/License-MIT-blue.svg" alt="License: MIT"></a>
+<a href="https://shadowquill.github.io/DialogueContextBridge/"><img src="https://img.shields.io/badge/Website-shadowsquill.github.io-blue?logo=githubpages" alt="Docs Site"></a></p>
+<h2>这是什么</h2>
+<p>做长周期项目（软件开发、学术研究、产品设计）时，你和大语言模型（LLM）/ AI 智能体的工作往往跨越多个对话会话。每开一个新对话，模型都「失忆」，要重新解释一遍背景，于是出现三个老问题：</p>
+<ul>
+<li><strong>效率低</strong>：反复手动复制粘贴历史上下文；</li>
+<li><strong>信息丢</strong>：关键决策、代码、参数在摘要里被磨平；</li>
+<li><strong>体验断</strong>：长期项目的连续性被会话边界切断。</li>
+</ul>
+<p>DialogueContextBridge 是一个 <strong>DSH（DeepSeek Harness，一个面向大语言模型的智能体运行时）插件</strong>，用「对话上下文快照」解决这件事：在源对话里 <code>/compile</code> + <code>/save</code>，在新对话里一键引入，AI 立刻拿到你们此前达成的全部共识。</p>
+<p>所有数据只存在本机 <code>~/.dsh/</code>，不上传任何服务器；快照是纯文本 Markdown，任何能读文本的 Agent 都能接手。</p>
+<h2>核心设计：三层快照</h2>
+<p>快照不是对话日志的转储，而是一个结构化的三层复合体。</p>
+<table>
+<thead>
+<tr>
+<th>层</th>
+<th>内容</th>
+<th>处理策略</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong>① 关键消息原文</strong></td>
+<td>最终敲定的代码、决策结论、技术参数、硬性指令</td>
+<td><strong>逐字保留</strong>，禁止压缩与截断</td>
+</tr>
+<tr>
+<td><strong>② 结构化摘要</strong></td>
+<td>讨论背景、推导过程、中间试错、已排除方案</td>
+<td>由 <code>/compile</code> 压缩为分层要点</td>
+</tr>
+<tr>
+<td><strong>③ 用户偏好与设定</strong></td>
+<td>风格偏好、角色设定、项目硬性约束</td>
+<td>按稳定 <code>key</code> 归档，便于跨快照裁决</td>
+</tr>
+</tbody></table>
+<p>这个分层是为了解决「摘要损失」：把不可压缩的东西和可压缩的东西分开处理，而不是对整段对话做一次无差别摘要。</p>
+<pre><code>flowchart LR
+  A[对话消息] --&gt; B[分类器]
+  B --&gt; C[① 原文层]
+  B --&gt; D[② 摘要层]
+  B --&gt; E[③ 偏好层]
+  C &amp; D &amp; E --&gt; F[token 预算裁剪]
+  F --&gt; G[Markdown + Schema 头]
+  G --&gt; H[(SQLite + FTS5)]
+</code></pre>
+<p><img src="https://raw.githubusercontent.com/ShadowQuill/DialogueContextBridge/HEAD/website/assets/architecture.svg" alt="三层快照数据流"></p>
+<h2>快速开始</h2>
+<h3>环境要求</h3>
+<ul>
+<li>Node.js ≥ 18.17</li>
+<li>一个基于 Cordis 的 DSH 运行时</li>
+<li>SQLite ≥ 3.34（用于 FTS5 <code>trigram</code> 分词器，中文检索依赖它；低版本会自动回退到 <code>unicode61</code>）</li>
+</ul>
+<h3>安装</h3>
+<pre><code># 在 DSH 工作目录中安装
+npm install dsh-plugin-dialogue-context-bridge
+</code></pre>
+<h3>启用插件</h3>
+<p>在 DSH 配置中加载插件，或在设置面板中搜索「对话上下文桥接」启用：</p>
+<pre><code>import bridge from 'dsh-plugin-dialogue-context-bridge';
+
+ctx.plugin(bridge, {
+  maxTokens: 4096,
+  autoSave: false,
+});
+</code></pre>
+<h3>三条命令跑通闭环</h3>
+<pre><code># 1. 把当前对话编译为快照草稿（只在内存中，不写盘）
+/compile --title "上下文桥接架构评审" --tags 架构,phase1
+
+# 2. 确认无误后落库
+/save
+
+# 3. 在任何时候按关键词找回它
+/snapshot-search 上下文桥接
+
+# 4. 在新对话里一键引入——默认「仅新信息」模式（只读背景，不回写）
+/import snap_a1b2c3
+
+#    想让当前对话与历史快照融合？用 merge 模式（Phase 3 基线）
+/import snap_a1b2c3 --mode merge
+
+#    只看简报、不注入，先确认内容对不对
+/import snap_a1b2c3 --dry-run
+</code></pre>
+<h3>跨设备 / 跨账号迁移记忆（文件导入导出）</h3>
+<p>快照文档是纯文本 Markdown + 自描述 Schema 头，可脱离本插件独立存在。导出为文件后，
+拷贝到另一台机器或账号，再用 <code>/dcb-import</code> 接手——这就是 spec 要求的「可迁移性」超越
+聊天内复制粘贴的形态。</p>
+<pre><code># 导出单条快照为 .md 文件（默认落 &lt;数据目录&gt;/exports/）
+/dcb-export snap_a1b2c3
+
+# 导出全部快照
+/dcb-export --all
+
+# 指定导出目录
+/dcb-export --all -o ~/Desktop/my-snapshots
+
+# 先预览、不落库：解析并校验文件，确认内容对不对
+/dcb-import ~/Desktop/my-snapshots/snap_a1b2c3__xxx.md --dry-run
+
+# 导入到记忆库（自动分配新 id，绝不覆盖本地已有快照）
+/dcb-import ~/Desktop/my-snapshots/snap_a1b2c3__xxx.md
+</code></pre>
+<p>导入后会生成新 id（避免与本地或其他来源的相同 id 冲突覆盖），正文校验和重算后写回；
+目标库若开启加密，导入内容会按本地策略重新加密落盘。</p>
+<h3>打开 Web UI</h3>
+<pre><code>dsh --profile web          # 启动并自动打开默认浏览器到 Web UI
+# 后台运行且不自动开浏览器： dsh --profile web --no-open
+</code></pre>
+<p>插件加载后，在对话里输入 <code>/dcb</code> 会返回一张**「记忆库总览」卡片**（近期快照表 + 一键操作清单）；<code>/dcb &lt;id&gt;</code>、<code>/save</code>、<code>/dcb-save</code>、<code>/import</code> 的回执也统一为卡片样式（引用块标题带 + GFM 表格 + 状态徽标）。设置面板中可看到「对话上下文桥接」配置卡片，所有配置<strong>热改即时生效</strong>。</p>
+<h2>命令参考</h2>
+<table>
+<thead>
+<tr>
+<th>命令</th>
+<th>说明</th>
+<th>常用选项</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>/compile</code></td>
+<td>编译当前对话为三层快照草稿并预览</td>
+<td><code>--title</code> <code>--tags</code> <code>--max-tokens</code> <code>--full</code> <code>--discard</code></td>
+</tr>
+<tr>
+<td><code>/save</code></td>
+<td>把草稿写入本地记忆库；无草稿时即时编译并保存</td>
+<td><code>--title</code> <code>--tags</code> <code>--max-tokens</code></td>
+</tr>
+<tr>
+<td><code>/snapshot-search &lt;keywords&gt;</code></td>
+<td>FTS5 全文检索（多关键词为 AND 语义）</td>
+<td><code>-n, --limit</code></td>
+</tr>
+<tr>
+<td><code>/snapshot-list</code></td>
+<td>列出快照</td>
+<td><code>-n, --limit</code> <code>--here</code></td>
+</tr>
+<tr>
+<td><code>/snapshot-show &lt;id&gt;</code></td>
+<td>查看快照完整文档与完整性校验结果</td>
+<td><code>--meta</code></td>
+</tr>
+<tr>
+<td><code>/snapshot-remove &lt;id&gt;</code></td>
+<td>删除快照及其索引（不可撤销）</td>
+<td>—</td>
+</tr>
+<tr>
+<td><code>/snapshot-history &lt;id&gt;</code></td>
+<td>查看快照版本历史（Phase 4 版本控制）</td>
+<td>—</td>
+</tr>
+<tr>
+<td><code>/snapshot-rollback &lt;id&gt;</code></td>
+<td>回滚快照到历史版本并重新落库</td>
+<td><code>--to &lt;ref&gt;</code></td>
+</tr>
+<tr>
+<td><code>/import &lt;id&gt;</code></td>
+<td>把历史快照引入当前对话：默认「仅新信息」，亦可「合并」</td>
+<td><code>--mode inject|merge</code> <code>--policy snapshotWins|newWins|timestamp</code> <code>-d, --dry-run</code></td>
+</tr>
+<tr>
+<td><code>/dcb &lt;id&gt;</code></td>
+<td>一键台：带 <code>&lt;id&gt;</code> 等价 inject 一键引入；不带 <code>&lt;id&gt;</code> 显示近期快照与快捷操作</td>
+<td>—</td>
+</tr>
+<tr>
+<td><code>/dcb-save</code></td>
+<td>一键导出当前对话为快照：编译并落库，回显可复制的 Markdown 与 id（Phase 4 一键操作）</td>
+<td><code>--title</code> <code>--tags</code> <code>--max-tokens</code></td>
+</tr>
+<tr>
+<td><code>/dcb-export &lt;id&gt;</code></td>
+<td>把快照导出为独立 <code>.md</code> 文件（明文、自描述 Schema 头，可被任意 Agent 接手）</td>
+<td><code>--all</code> <code>-o, --out &lt;dir&gt;</code></td>
+</tr>
+<tr>
+<td><code>/dcb-import &lt;path&gt;</code></td>
+<td>从 <code>.md</code> 文件导入快照到记忆库（自动分配新 id 防覆盖）</td>
+<td><code>--dry-run</code></td>
+</tr>
+</tbody></table>
+<p><code>/compile</code> 与 <code>/save</code> 是有意分开的两步：快照一旦落库就可能被其他对话引入，必须由你确认内容后再持久化。若你更喜欢一步到位，把配置项 <code>autoSave</code> 打开即可。</p>
+<h2>配置项</h2>
+<p>在 DSH 设置面板中可热改，<strong>无需重启</strong>（配置经 <code>installSettingsSection</code> 接入，改动即通过 <code>setSource</code> 热更新到日志级别、token 预算、合并策略、加密口令与版本控制开关）。唯一例外：<code>dataDir</code> 在加载期已打开数据库，改后需重启 <code>dsh web</code> 方能切换数据目录。</p>
+<table>
+<thead>
+<tr>
+<th>配置项</th>
+<th>默认值</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>dataDir</code></td>
+<td><code>dialogue-context-bridge</code></td>
+<td>数据目录，相对路径挂在 <code>~/.dsh</code> 下</td>
+</tr>
+<tr>
+<td><code>maxTokens</code></td>
+<td><code>4096</code></td>
+<td>单个快照的 token 上限，可扩展至 8192</td>
+</tr>
+<tr>
+<td><code>maxBulletsPerSection</code></td>
+<td><code>6</code></td>
+<td>摘要每小节保留的最大要点数</td>
+</tr>
+<tr>
+<td><code>maxHistoryMessages</code></td>
+<td><code>400</code></td>
+<td><code>/compile</code> 单次读取的消息上限</td>
+</tr>
+<tr>
+<td><code>autoSave</code></td>
+<td><code>false</code></td>
+<td><code>/compile</code> 后是否自动落库</td>
+</tr>
+<tr>
+<td><code>searchLimit</code></td>
+<td><code>10</code></td>
+<td>检索默认返回条数</td>
+</tr>
+<tr>
+<td><code>encryption.enabled</code></td>
+<td><code>false</code></td>
+<td>启用 AES-256-GCM 静态加密</td>
+</tr>
+<tr>
+<td><code>encryption.passphrase</code></td>
+<td><code>''</code></td>
+<td>加密口令（≥ 8 位，不落盘）</td>
+</tr>
+<tr>
+<td><code>encryption.indexPlaintext</code></td>
+<td><code>false</code></td>
+<td>加密时是否仍建明文索引（<strong>默认关闭</strong>，开启会通过索引泄漏内容）</td>
+</tr>
+<tr>
+<td><code>logLevel</code></td>
+<td><code>info</code></td>
+<td>日志级别</td>
+</tr>
+<tr>
+<td><code>merge.policy</code></td>
+<td><code>newWins</code></td>
+<td>合并模式（<code>/import --mode merge</code>）的冲突裁决规则：<code>newWins</code> 当前对话覆盖历史快照、<code>snapshotWins</code> 历史快照优先、<code>timestamp</code> 按时间戳先后</td>
+</tr>
+<tr>
+<td><code>versioning.enabled</code></td>
+<td><code>false</code></td>
+<td>记忆库版本控制：每次保存/删除快照后自动 <code>git</code> 提交（数据目录下 <code>snapshots/</code> 子目录即仓库），并可用 <code>/snapshot-rollback</code> 回滚。<strong>注意</strong>：被版本化的是快照 Markdown 明文，git 历史不加密</td>
+</tr>
+</tbody></table>
+<h3>关于加密擦除</h3>
+<p>口令不落盘。丢弃口令即等价于销毁全部密文（cryptographic erasure）——这也意味着<strong>口令丢失后快照无法恢复</strong>，请自行妥善保管。</p>
+<h2>项目结构</h2>
+<pre><code>DialogueContextBridge/
+├── src/
+│   ├── index.ts              # Cordis 插件入口（apply / 服务注册 / 生命周期）
+│   ├── config.ts             # schemastery 配置 Schema
+│   ├── service.ts            # 编译→预览→落库→检索的编排层
+│   ├── types.ts              # 三层快照数据模型
+│   ├── commands/             # 命令层（/compile、/save、/snapshot-*）
+│   │   ├── compile.ts
+│   │   ├── save.ts
+│   │   ├── search.ts
+│   │   ├── manage.ts
+│   │   ├── format.ts         # 面向用户的输出渲染
+│   │   └── shared.ts         # 选项解析与错误包装
+│   ├── core/                 # 与宿主解耦的纯逻辑
+│   │   ├── lexicon.ts        # 语义识别词典（可扩展）
+│   │   ├── classifier.ts     # 消息 → 三层分类
+│   │   ├── summarize.ts      # 摘要器（内置抽取式，可注入 LLM 实现）
+│   │   ├── budget.ts         # token 预算裁剪
+│   │   ├── serializer.ts     # Markdown + Schema 头 序列化/解析
+│   │   └── compiler.ts       # /compile 的完整流水线
+│   ├── storage/              # SQLite + FTS5
+│   │   ├── database.ts
+│   │   ├── migrations.ts
+│   │   └── repository.ts
+│   ├── security/crypto.ts    # AES-256-GCM 封装
+│   ├── dsh/types.ts          # 宿主能力的类型接缝
+│   └── utils/                # id / token 估算 / 路径 / 日志
+├── tests/                    # vitest 单元测试
+└── docs/
+    ├── architecture.md       # 架构与设计决策
+    └── snapshot-schema.md    # 快照文档格式规范
+</code></pre>
+<h2>开发指南</h2>
+<pre><code>npm install          # 安装依赖
+npm run dev          # tsup 监听构建
+npm run typecheck    # 类型检查
+npm run lint         # ESLint（Airbnb TypeScript 风格）
+npm test             # vitest
+npm run test:coverage
+npm run build        # 产出 lib/（esm + cjs + d.ts）
+</code></pre>
+<h3>代码约定</h3>
+<ul>
+<li><strong>风格</strong>：Airbnb TypeScript 风格指南，由 ESLint + Prettier 强制；</li>
+<li><strong>注释</strong>：所有公开函数、接口必须有完整 JSDoc（含 <code>@param</code> / <code>@returns</code>）；</li>
+<li><strong>范式</strong>：优先函数式，用工厂函数替代 class（ESLint 规则会拦住 <code>class</code> 声明）；</li>
+<li><strong>提交</strong>：遵循 <a href="https://www.conventionalcommits.org/">Conventional Commits</a>，由 commitlint 校验。</li>
+</ul>
+<pre><code>feat(core): 支持按标签过滤快照检索
+fix(storage): 修正 trigram 短词回退时的空结果
+docs(readme): 补充加密擦除说明
+</code></pre>
+<p><code>type</code> 允许 <code>feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert</code>；<code>scope</code> 建议使用 <code>core|storage|security|commands|dsh|config|docs|deps|release</code>。</p>
+<h3>单元测试的边界</h3>
+<p><code>src/core</code>、<code>src/storage</code>、<code>src/security</code> 全部可在纯 Node 环境下测试，不需要启动 DSH。宿主相关的耦合被收敛在 <code>src/dsh/types.ts</code> 这一个文件里——若 DSH 的命令/对话 API 与此处声明不同，只需改这一处适配。</p>
+<h2>路线图</h2>
+<ul>
+<li> <strong>Phase 1</strong> 快照导出：三层编译、Markdown + Schema 落盘、FTS5 检索</li>
+<li> <strong>Phase 2</strong> 快照导入：「仅了解新引入信息」模式（快照作为只读背景情报注入，<code>/import</code> + <code>InjectionService</code> 宿主接缝）</li>
+<li> <strong>Phase 3</strong> 合并模式：当前上下文与引入快照智能融合，偏好层按可配置规则裁决（<code>newWins</code> / <code>snapshotWins</code> / <code>timestamp</code>），冲突清单写入「裁决报告」供复核（<code>/import --mode merge [--policy ...]</code>，<code>merge.policy</code> 配置项）</li>
+<li> <strong>Phase 4</strong> UI 优化 / 一键操作 / 设置面板集成：经 <code>ctx.settings</code>（<code>installSettingsSection</code>）把 <code>Config</code> Schema 接入 DSH 设置面板，自动渲染配置表单并<strong>热改无需重启</strong>（日志级别、token 预算、合并策略、加密口令、版本控制开关均 live 生效；<code>dataDir</code> 变更需重启）；新增 <code>/dcb</code> 一键台（不带 id 显示近期快照与快捷操作）与 <code>/dcb-save</code> 一步导出可复制快照；记忆库版本控制此前已完成（<code>/snapshot-history</code> + <code>/snapshot-rollback</code> 回滚）</li>
+<li> <strong>Phase 4.1</strong> 卡片 UI 统一：新增 <code>src/commands/card.ts</code> 渲染助手（引用块标题带 + GFM 表格 + 状态徽标 + 快捷操作清单），<code>/dcb</code>、<code>/import</code>、<code>/save</code>、<code>/dcb-save</code> 回执统一为清爽卡片；设置表单字段描述收紧。注：DSH 0.1.x 的设置面板卡片由 harness 预编译进 web 包，外部插件无法注入自定义卡片，故卡片统一落在对话内呈现</li>
+<li> <strong>Phase 4.2</strong> 快照文件导入 / 导出：新增 <code>/dcb-export &lt;id&gt;</code>（<code>--all</code> 全量、<code>-o &lt;dir&gt;</code> 指定目录）把快照写成独立明文 <code>.md</code> 文件，以及 <code>/dcb-import &lt;path&gt;</code>（<code>--dry-run</code> 预演）从文件导入记忆库；复用 <code>serializer.ts</code> 的 <code>serializeSnapshot</code> / <code>parseSnapshot</code> / <code>verifySnapshotDocument</code> 保证往返零损失，导入自动分配新 id 防覆盖、按本地加密策略重加密落盘。顺带修 <code>parseFlags</code> 把 <code>--dry-run</code> 转驼峰 <code>dryRun</code>（修复 <code>/import --dry-run</code> 此前静默失效）</li>
+</ul>
+<h2>License</h2>
+<p><a href="https://github.com/ShadowQuill/DialogueContextBridge/blob/HEAD/LICENSE">MIT</a></p>

@@ -1,0 +1,169 @@
+<h1>dsh-adaptive-effort</h1>
+
+  <img src="https://raw.githubusercontent.com/imkingjh999/dsh-adaptive-effort/HEAD/docs/screenshots/reply-label.png" alt="回复标签：模型 · 档位 · tokens 与用时统计">
+  <p><sub>每条回复末尾的徽标：<code>glm-5.3 · 低 · 344 tok</code>；右侧为宿主自带的用时统计。</sub></p>
+
+
+<p><strong><a href="https://github.com/deepseek-ai/deepseek-harness">DSH</a> 宿主插件：用 MiniMax 给每条用户消息打复杂度分，自动选择 <code>reasoning_effort</code>（low / high / max），带 effort-router 风格的 token 记账（分档统计、降档节省估算、误路由标记），并在每条 AI 回复末尾挂元数据标签（模型 · 思考档位 · 输出 tokens · 步数，点击回到该回复开头）。GLM-5.3 安全：绝不自动选 <code>off</code> / <code>medium</code>，强制思考模型上的手动 <code>off</code> 会被钳制为 <code>low</code>。</strong></p>
+<p><a href="https://github.com/imkingjh999/dsh-adaptive-effort/blob/HEAD/README_EN.md">English</a> · 中文</p>
+<h2>它解决什么问题</h2>
+<ul>
+<li>effort 是会话级设置，没有程序化的逐轮调整手段：默认高档在琐碎改动上浪费 token，默认低档在难题上思考不足（effort-router 的问题陈述，同样适用于 DSH）。</li>
+<li>GLM-5.3 强制思考（<code>thinking.type: disabled</code> 直接报错）且只认 <code>low</code> / <code>high</code> / <code>max</code> 三档（<code>medium</code> 报错）——自动切换器必须守住这条硬边界。</li>
+</ul>
+<h2>工作原理</h2>
+<pre><code>用户消息 ──► MiniMax 复杂度打分（thinking 关闭，max_tokens≤64，严格 JSON）
+                │  失败/超时/无 key ──► 启发式回退（长度+代码块+关键词）
+                ▼
+            tier ∈ {low, high, max}（按消息缓存：一条消息最多打一次分）
+                │  + 近期工具重负载只升不降（≥3200 字符参数 → max）
+                ▼
+       agent/request 瀑布注入 reasoningEffort（prepend，模型选择器手动档优先）
+                ▼
+       JSONL 账本（~/.dsh/adaptive-effort/ledger-&lt;会话&gt;.jsonl）
+                ▼
+       中文报表：分档 token 统计 / 降档节省估算 / 误路由标记
+</code></pre>
+<ul>
+<li><strong>打分后端</strong>：默认 <code>minimax</code>（LLM 判分，准）；可切 <code>heuristic</code>（零依赖纯规则）。MiniMax 调用带 <code>thinking: {type:"disabled"}</code>——打分要快要便宜。</li>
+<li><strong>手动优先</strong>：模型选择器里选了 <code>off/low/high/max</code> 就不干预；插件往选择器里注入 <code>Auto</code> 档，选 <code>Auto</code> 才启用自动调度。</li>
+<li><strong>GLM-5.3 钳制</strong>：强制思考模型（glm-5.3+ / glm-4.7）上的手动 <code>off</code> 会被替换成 <code>low</code> 并记日志，避免 API 报错。</li>
+<li><strong>记账</strong>：每次请求记录（tier、effort、原因、打分来源），每步的 <code>assistant/message</code> usage（input/output tokens）延迟入库；报表给出「疑似低估」（low 档输出爆炸）与「疑似高估」（high/max 档输出极小）标记。</li>
+</ul>
+<h2>回复标签（v0.3）</h2>
+<p>每条已定稿的 AI 回复的 IconActions 行里渲染一枚徽标：</p>
+<pre><code>[ glm-5.3 · 低 · 1.5k tok ]
+</code></pre>
+<ul>
+<li><strong>模型 · 思考档位 · 输出 tokens</strong>；点击平滑滚到该回复；</li>
+<li>挂官方 <code>conversation.chat.assistant-actions</code> list 插槽（additive，与 feedback 等共存；不走 turnTail 链——那是 first-match-wins 互斥链，会被 better-sidebar/deliverables 挡掉）；</li>
+<li>数据 = 会话快照 legacy nodes（usage）join trajectory 视图（requestConfig：model/reasoningEffort，按 turn+step 对齐）——零 RPC；</li>
+<li>标签上的「思考」就是实际注入档位——配合自动调度，一眼核验每条回复真的跑在哪档。</li>
+</ul>
+<h2>档位入口：模型选择弹窗（v0.2.1 起）</h2>
+<p><strong>像选 DeepSeek 推理等级一样</strong>：点开模型选择弹窗 → 模型下方「推理等级」列表 → 多出一项 <strong>「自动」</strong>（副标题：自适应档位，MiniMax 打分消息复杂度，在 low/high/max 间自动调度）。</p>
+<table>
+<thead>
+<tr>
+<th>模型弹窗「推理等级」</th>
+<th>行为</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong>自动</strong></td>
+<td><strong>MiniMax 打分 + 调度</strong>（low/high/max，重负载工具只升不降）</td>
+</tr>
+<tr>
+<td>Off / Low / High / Max</td>
+<td>原生手动档，插件不介入、不打分</td>
+</tr>
+<tr>
+<td>未选</td>
+<td>不介入（走适配器默认）</td>
+</tr>
+</tbody></table>
+<p>GLM-5.3 等强制思考模型上，任何来源的 <code>off</code> 都会被钳制为 <code>low</code> 并记日志。</p>
+<p>设置 → 插件卡片只放<strong>后端配置</strong>（打分后端 MiniMax/启发式、API Key、打分模型、启用开关、重负载升级开关）；高级用户可用 cordis.yml 的 <code>level</code> 强制全局档位。</p>
+
+  <img src="https://raw.githubusercontent.com/imkingjh999/dsh-adaptive-effort/HEAD/docs/screenshots/settings-card.png" alt="设置 → 插件 → 自适应思考档位 配置卡片">
+  <p><sub>设置 → 插件 →「自适应思考档位」：打分后端 / API Key / 打分模型 / 总开关 / 重负载升档。</sub></p>
+
+
+<h2>安装（本地开发）</h2>
+<pre><code>cd dsh-adaptive-effort
+pnpm install &amp;&amp; pnpm build
+dsh plugin add ./dsh-adaptive-effort   # 或按你的 profile 方式挂载
+</code></pre>
+<p>刷新 DSH 页面后生效。</p>
+<h2>配置（cordis.yml 或设置命名空间 <code>adaptive-effort</code>）</h2>
+<table>
+<thead>
+<tr>
+<th>键</th>
+<th>默认</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>enabled</code></td>
+<td><code>true</code></td>
+<td>总开关</td>
+</tr>
+<tr>
+<td><code>level</code></td>
+<td><code>auto</code></td>
+<td>插件级档位：<code>auto</code>（跟随模型选择器，双 Auto 才打分）或强制档 <code>off/low/high/max</code></td>
+</tr>
+<tr>
+<td><code>mode</code></td>
+<td><code>minimax</code></td>
+<td><code>minimax</code> / <code>heuristic</code></td>
+</tr>
+<tr>
+<td><code>minimaxApiKey</code></td>
+<td><code>''</code></td>
+<td>为空时读环境变量 <code>MINIMAX_API_KEY</code>，再为空回退启发式</td>
+</tr>
+<tr>
+<td><code>minimaxBaseUrl</code></td>
+<td><code>https://api.minimaxi.com/v1</code></td>
+<td>国际站；国内换成 <code>https://api.minimax.chat/v1</code></td>
+</tr>
+<tr>
+<td><code>minimaxModel</code></td>
+<td><code>MiniMax-M3</code></td>
+<td>打分模型</td>
+</tr>
+<tr>
+<td><code>scoreTimeoutMs</code></td>
+<td><code>4000</code></td>
+<td>打分超时，超时回退启发式</td>
+</tr>
+<tr>
+<td><code>allowToolUpgrade</code></td>
+<td><code>true</code></td>
+<td>允许重负载工具参数把档位升到 max</td>
+</tr>
+<tr>
+<td><code>clampForcedThinkingOff</code></td>
+<td><code>true</code></td>
+<td>GLM-5.3 等强制思考模型上把手动 off 钳制为 low</td>
+</tr>
+<tr>
+<td><code>ledgerDir</code></td>
+<td><code>''</code></td>
+<td>账本目录；空 = <code>~/.dsh/adaptive-effort</code></td>
+</tr>
+</tbody></table>
+<h2>报表</h2>
+<pre><code>node lib/report.js            # 会话索引
+node lib/report.js --last     # 最近会话报表
+node lib/report.js --session &lt;id&gt;
+node lib/report.js --all      # 全部合并
+</code></pre>
+<p>输出示例：</p>
+<pre><code>== 自适应思考档位报表 ==
+会话步骤数：42，总输出 tokens：318442
+
+档位      步数    输出 tokens    均值/步
+low       6       5222           870
+high      21      330440         15735
+max       15      276780         18452
+
+降档节省估算（相对全程 max 的粗略反事实）：约 36503 tokens
+</code></pre>
+<h2>设计来源与致谢</h2>
+<ul>
+<li>分类器形态参考 <a href="https://github.com/viz-A-viz/hermes-plugin-adaptive-effort">hermes-plugin-adaptive-effort</a>（每轮打分→三档），打分后端换成 MiniMax LLM。</li>
+<li>记账参考 <a href="https://github.com/cfitzgerald-pd/effort-router">effort-router</a>（分档 token 账本、节省估算、误路由标记）。</li>
+<li>宿主接入点与 <code>auto</code> 掩码模式参考 <a href="https://github.com/drscrewdriver/dsh-thinking-levels">dsh-thinking-levels</a>（<code>agent/request</code> prepend 瀑布、模型目录注入）。</li>
+<li>GLM-5.3 档位约束来自<a href="https://docs.bigmodel.cn/cn/guide/models/text/glm-5.3">智谱官方文档</a>。</li>
+</ul>
+<h2>已知限制</h2>
+<ul>
+<li>账本采集发生在下一次 <code>agent/request</code>：一轮的最后一个 assistant 步骤要等下一轮请求才入库（中断的轮次可能缺usage记录）。</li>
+<li>启发式回退是保守的长度+关键词规则，中文为主；MiniMax 后端可用时不参与定档。</li>
+<li>报表 CLI 只读本地 JSONL，不消耗 API。</li>
+</ul>
+<h2>License</h2>
+<p>MIT</p>

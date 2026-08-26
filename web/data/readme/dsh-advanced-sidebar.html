@@ -1,0 +1,155 @@
+<h1>@achasoft/dsh-advanced-sidebar</h1>
+<p>Advanced sidebar operations for the DeepSeek Harness Web Client: <strong>Changes</strong>, <strong>Terminal</strong>, <strong>Files</strong>, <strong>Background tasks</strong>, <strong>Open in</strong>, <strong>Archive</strong>, and <strong>Delete</strong>, reachable from one menu at the sidebar foot and from the same menu in the open session's header.</p>
+<p>Everything the browser can already do goes through the Web Client's own capabilities. Everything it structurally cannot — running <code>git</code>, allocating a pseudo-terminal, launching an editor, stopping a background task, removing a session log — goes through this plugin's own Typert Remote namespace, <code>ctx.remote.advancedSidebar</code>.</p>
+<p>Nothing here is model-facing: no tool, no prompt section, no session event.</p>
+<h2>Install</h2>
+<pre><code>dsh plugin --profile web add /abs/path/to/dsh-advanced-sidebar
+dsh web
+</code></pre>
+<p>From a harness source checkout instead:</p>
+<pre><code>pnpm dsh plugin --profile web add ../dsh-plugins/dsh-advanced-sidebar
+pnpm dsh web
+</code></pre>
+<p>Build the plugin first (<code>pnpm install &amp;&amp; pnpm run build</code>); the Web Client refuses to start when a composed plugin has no built <code>lib/client.js</code>.</p>
+<h2>The menu</h2>
+<table>
+<thead>
+<tr>
+<th>Entry</th>
+<th>What it opens</th>
+<th>What it needs on the Host</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>Changes</td>
+<td>Uncommitted changes in the session's working directory, each file's patch, and staging + commit</td>
+<td><code>git</code> on PATH, <code>ctx.subprocess</code>, <code>ctx.fs</code></td>
+</tr>
+<tr>
+<td>Terminal</td>
+<td>An interactive shell of your own, in that directory</td>
+<td><code>ctx.subprocess</code>, <code>ctx.fs</code></td>
+</tr>
+<tr>
+<td>Files</td>
+<td>That directory, one level at a time, with a text preview</td>
+<td><code>ctx.fs</code></td>
+</tr>
+<tr>
+<td>Preview</td>
+<td>The workspace's dev server, started and shown in a frame, with its logs</td>
+<td><code>ctx.subprocess</code>, <code>ctx.fs</code></td>
+</tr>
+<tr>
+<td>Background tasks</td>
+<td>This session's <code>ctx.jobs</code> records, with Stop and the output of a settled one</td>
+<td><code>ctx.jobs</code></td>
+</tr>
+<tr>
+<td>Open in ▸</td>
+<td>A second browser window, a configured editor, or the operating system's file manager</td>
+<td><code>ctx.subprocess</code> for the editors</td>
+</tr>
+<tr>
+<td>Archive</td>
+<td>Hides the session; its log and its accounting slot remain</td>
+<td><code>ctx.workspaceRegistry</code></td>
+</tr>
+<tr>
+<td>Delete</td>
+<td>Archives, and — in <code>purge</code> mode — removes the durable session log</td>
+<td><code>ctx.workspaceRegistry</code>, <code>ctx.sessionPersistence</code></td>
+</tr>
+</tbody></table>
+<p>An entry whose capability is missing is <strong>disabled with the reason beside it</strong> rather than hidden, so a mistyped <code>command</code> or an uninstalled <code>git</code> is visible instead of silent. An entry switched off in settings is absent entirely.</p>
+<p>The target of every entry is the session's own <code>cwd</code>, falling back to its Workspace path. A session started in a subdirectory therefore works there, rather than at a repository root the model is not using.</p>
+<h2>What each panel does, and what it deliberately does not</h2>
+<p><strong>Changes</strong> reads the repository and writes to its index. The reading is <code>git status --porcelain=v2 --branch -z --untracked-files=all</code>, parsed in <a href="https://github.com/navid-kianfar/dsh-advanced-sidebar/blob/HEAD/src/host/porcelain.ts"><code>src/host/porcelain.ts</code></a>; <code>-z</code> is what keeps a path containing a space, a quote, or a newline identical between the status reading and the diff request that follows it.</p>
+<p>Stage and unstage act on one file or a whole group, and <strong>Commit</strong> records what is staged, with an optional amend. Each write returns the reading that follows it, so the lists never lag a round trip behind the index they describe, and open patches are dropped with the index they described.</p>
+<p><strong>Discarding is deliberately absent.</strong> Stage, unstage, and commit are all recoverable — the working tree is untouched by the first two, and a commit stays in the reflog — while <code>git restore</code> destroys uncommitted work with nothing left to recover it from. A sidebar is the wrong place for the one irreversible verb in the set, and it is a keystroke away in the Terminal panel beside it.</p>
+<p>Four things the panel does rather than leaving to git's own error text:</p>
+<ul>
+<li>Every path is proved to sit inside the repository before git sees it, and passed after <code>--</code> as a literal path — <code>git add</code> takes <em>pathspecs</em>, so an unchecked <code>:(exclude)</code> would stage something nobody picked.</li>
+<li>The message crosses as one argument to <code>-m</code>, so no shell sees it and nothing in it can become an option. A message of <code>--amend --author=someone</code> commits that text.</li>
+<li>The author is read with <code>git var GIT_AUTHOR_IDENT</code> — git's own answer to "who would this commit be by" — and shown under the box, so a missing <code>user.email</code> is visible <em>before</em> the button is pressed.</li>
+<li>Committing has its own timeout (<code>gitCommitTimeoutMs</code>, default 2 minutes) because it runs the repository's <code>pre-commit</code> hook, which can far outlast any reading; killing one mid-run leaves a stale <code>index.lock</code>. Hooks run, and a hook's stderr comes back verbatim rather than summarized.</li>
+</ul>
+<p>Both writes are gated by settings (<code>allowGitStaging</code>, <code>allowGitCommit</code>) that the <strong>Host</strong> enforces, not just the menu: switching them off takes the verb away rather than hiding it.</p>
+<p><strong>Terminal</strong> allocates its own shell through <code>ctx.subprocess.spawnTerminal</code> — deliberately <strong>not</strong> <code>ctx.terminals</code>. That registry's sessions are owner-fenced to an <code>Agent</code> and are the model's working terminals; joining them would let a human's keystrokes land in a session the model believes it controls.</p>
+<p>The screen is a real terminal emulator (<code>@xterm/xterm</code>), and that is why the browser bundle is large. It is not a preference: an interactive shell redraws its prompt with cursor addressing on every keystroke, and a hand-rolled screen model renders a login shell's prompt as overwritten fragments — verified, then replaced. Colour, line editing, history recall, and full-screen programs come with the emulator. Ctrl+C is intercepted and delivered as a <strong>signal to the foreground process group</strong> rather than as a byte, which is the difference between interrupting a running command and doing nothing.</p>
+<p>Output is polled, not pushed: an out-of-tree plugin has no host-to-client push channel, so the panel holds the whole-stream offset it has already written into the emulator and asks for whatever came after it. That offset is also what makes a reopened panel replay the retained scrollback.</p>
+<p>There is no resize: the subprocess seam exposes none. The emulator follows the drawer so rendered rows stay readable, but the <em>shell</em> keeps the size it was allocated at; <strong>Restart</strong> allocates one at the new size.</p>
+<p><a href="https://github.com/navid-kianfar/dsh-advanced-sidebar/blob/HEAD/src/client/terminal-screen.ts"><code>src/client/terminal-screen.ts</code></a> survives as the log renderer for the Preview and Background tasks panels, which show plain output rather than an interactive screen.</p>
+<p><strong>Files</strong> lists through this plugin's own endpoint rather than the Web Client's <code>listDirectory</code>, because the Host's browse capability returns directories only — its one shipped caller is a workspace picker. Every path is resolved through <code>ctx.fs</code> and proved to sit inside the workspace before anything reads it.</p>
+<p><strong>Preview</strong> runs what you are building and shows it beside the conversation.</p>
+<p>Launch configurations are read from the workspace's own <strong><code>.claude/launch.json</code></strong> — Claude Code's file, unchanged — and from the <code>previews</code> settings rows, in that order; a name declared in both is taken from the repository's file, because a repository is the authority on how to run itself. A row with a <code>runtimeExecutable</code> starts a process; a row with only a <code>url</code> is attach-only and simply points the frame at something already running.</p>
+<pre><code>{
+  "version": "0.0.1",
+  "configurations": [
+    { "name": "web", "runtimeExecutable": "npm", "runtimeArgs": ["run", "dev"], "port": 3000 },
+    { "name": "docs", "runtimeExecutable": "pnpm", "runtimeArgs": ["docs:dev"], "port": 5173, "cwd": "website" }
+  ]
+}
+</code></pre>
+<p>Readiness is a <strong>TCP connect to the configured port</strong>, retried until it accepts or <code>previewReadyTimeoutMs</code> passes. An HTTP probe would need a path, a method, and an opinion about which status codes count; a listening socket is the one fact every dev server agrees on. <code>PORT</code> is exported to the child, and <code>NO_COLOR</code>/<code>FORCE_COLOR</code> are set so the log view shows text rather than escape sequences.</p>
+<p>The frame is a plain <code>&lt;iframe&gt;</code> with viewport presets (desktop, tablet, mobile) scaled to the drawer, and an editable address bar so you can navigate into a route rather than only the root. Two controls are permanent rather than error states:</p>
+<ul>
+<li><strong>Logs</strong> — stdout and stderr interleaved in arrival order, read by the same caller-owned offset the Terminal panel uses. A server that failed to start has nothing to put in the frame and its stderr is the only place the reason exists, so a failed start opens the log view itself.</li>
+<li><strong>Open in a new window</strong> — a page can refuse to be framed (<code>X-Frame-Options</code>, <code>frame-ancestors</code>), and cross-origin framing gives the panel no way to detect that: the load event fires either way. The escape hatch is therefore always present instead of appearing after a failure nothing can observe.</li>
+</ul>
+<p>Stopping is <code>SIGTERM</code> then <code>SIGKILL</code> on the whole process tree after <code>previewGraceMs</code>, so a dev server's own child processes go with it. Starting a configuration that is already running replaces it rather than racing it for the port, and every server is stopped when the plugin unloads.</p>
+<p><strong>Background tasks</strong> does not fetch its list. The Host already pushes <code>session/jobs</code> frames that the Web Client folds into <code>jobsBySession</code>, so the panel reads the same live data the session header's job chip reads. Only Stop and output cross this plugin's endpoint:</p>
+<ul>
+<li><strong>Stop</strong> marks the registry record <em>reported</em>, which suppresses the completion notice its producer would otherwise deliver to the model. That is the correct trade for a person pressing Stop — the work is cancelled on their authority — and it is why the verb is a setting (<code>allowTaskKill</code>) rather than always on.</li>
+<li><strong>Output</strong> is served only once a task has settled <strong>and</strong> its completion has been reported. <code>ctx.jobs.read()</code> consumes the same cursor the model reads from, so draining a live task's stream would silently delete output the model was about to receive. Text already drained is retained Host-side, so reopening the panel shows it again instead of an empty second read.</li>
+</ul>
+<p><strong>Open in</strong> distinguishes a directory from a file: a directory is opened, a file is <em>selected</em> in its folder (<code>open -R</code>, <code>explorer /select,</code>). The harness's own <code>host.openPath</code> hands a path to its default application, which is the right verb for the first and the wrong one for the second.</p>
+<p><strong>Delete</strong> is assembled, because no harness capability deletes a session — persistence is append-only and exposes no delete verb, and the workspace registry can only archive. So Delete is honest about which half it managed:</p>
+<ul>
+<li><code>archive</code> hides the session and keeps its log.</li>
+<li><code>purge</code> also removes the persistence backend's per-session artifact. Nothing undoes that, it requires <code>confirmDelete</code>, and it <strong>never touches a live session</strong> — a running turn would keep appending to a file that no longer exists, so the archive commits and the reason comes back with it. A backend that keeps no per-session artifact (SQLite) reports <code>archive</code> from <code>describe()</code>, so the confirmation never promises a removal that will not happen.</li>
+</ul>
+<p>A live session is detected through the <strong>agent registry</strong>, not the session store: an agent is what runs a turn, and a cold session the store merely retains is not being written to.</p>
+<h2>Settings</h2>
+<p>The <code>advanced-sidebar</code> section is registered by the Host half and rendered as a card on the settings <strong>Plugins</strong> tab. Every control writes straight through the bound settings scope, which owns revision fencing; there is no save or discard.</p>
+<p><code>describe()</code> also carries the <strong>resolved section</strong>, and every surface reads <code>bound scope value ?? describe().settings</code>. That is not redundancy: <code>ctx.settingsScope</code> resolves to a real document only on a loopback connection and answers <code>unavailable</code> with no value on every remote Web Client. Without the Host's copy the whole surface would read "no settings" as "switched off" and disappear for remote access; with it, a remote client sees the deployment's real configuration, read-only.</p>
+<p>Every deployment-varying choice is a <code>config</code> field on the <code>advanced-sidebar</code> row in <a href="https://github.com/navid-kianfar/dsh-advanced-sidebar/blob/HEAD/cordis.patch.yml"><code>cordis.patch.yml</code></a> — placement, which entries exist, drawer width, delete mode, task permissions, git bounds, the shell, the terminal count, the file-preview bounds, and the Open in targets. The card edits all of them except the target list, which stays in <code>cordis.yml</code> where a command and its arguments can be written properly; the card shows each target's <strong>availability on this Host</strong>, which the file cannot state.</p>
+<h2>Composition</h2>
+<p>Two rows, both always composed:</p>
+<pre><code>- insert:
+    - id: advanced-sidebar
+      name: '@achasoft/dsh-advanced-sidebar/host'
+      config: { ... }
+    - id: advanced-sidebar-ui
+      name: '@achasoft/dsh-advanced-sidebar'
+</code></pre>
+<p>The second row is the <strong>bare package name</strong> deliberately: the Web Client discovers a browser half by resolving <code>&lt;row name&gt;/package.json</code>, so a subpath row would leave every seat silently unserved.</p>
+<p>Four slot registrations: <code>sidebar.footer.action</code>, <code>conversation.session.header.utilities</code>, <code>shell.overlay</code> (the drawer and the Delete confirmation), and <code>settings.plugin.item</code>. They have no common React ancestor, so what a person opened lives in a controller this package owns and hands to each registration through its inject face.</p>
+<h2>The generated Typert artifact</h2>
+<p><code>generated/</code> carries the RPC contract the browser half mounts. The harness's Typert generator reads a TypeScript program seeded from the harness's own <code>tsconfig.host.json</code>, so it cannot run against a package outside that checkout; the artifact is therefore <strong>authored to that generator's format</strong> by <a href="https://github.com/navid-kianfar/dsh-advanced-sidebar/blob/HEAD/scripts/emit-typert.mjs"><code>scripts/emit-typert.mjs</code></a>, which holds the endpoint list and every wire schema.</p>
+<p>Editing <code>src/host/types.ts</code> or the <code>@Remote</code> surface means editing that spec too:</p>
+<pre><code>pnpm run regen:typert   # re-emits generated/ and records its fingerprint
+</code></pre>
+<p><code>pnpm test</code> refuses a mismatch: <code>scripts/check-typert.mjs</code> compares declared and generated endpoints as sets and re-hashes the inputs, and <code>tests/typert-contract.spec.ts</code> parses a representative value through every descriptor's schemas.</p>
+<h2>Development</h2>
+<pre><code>pnpm install
+pnpm run build       # tsc emit -&gt; tsdown two-half bundle
+pnpm run typecheck
+pnpm test            # typert drift check + vitest
+</code></pre>
+<p>For a live loop, run <code>npx tsdown --watch</code> in this package: the harness's HMR half stat-polls the served bundle, so any writer of <code>lib/client.js</code> triggers a reload.</p>
+<h2>Known limitations</h2>
+<ul>
+<li><strong>The preview frame cannot report its own console or network.</strong> Those need same-origin access to the framed page, which a dev server on another port does not give. The server's own logs are what the panel shows; the browser's devtools are one "Open in a new window" away.</li>
+<li><strong>No push channel.</strong> An out-of-tree plugin cannot add a wire frame, so terminal output, preview logs, and the git reading are polled. Background tasks are the exception — they ride the Host's existing <code>session/jobs</code> push.</li>
+<li><strong>No terminal resize.</strong> The subprocess seam has no resize verb. Long lines wrap rather than scroll, and <strong>Restart</strong> re-measures the box.</li>
+<li><strong>Stopping a task suppresses its model notice.</strong> See Background tasks above; <code>allowTaskKill: false</code> removes the verb.</li>
+<li><strong>Purge removes one artifact.</strong> Exactly the path the persistence backend reported for that session — a sidecar the backend owns is the backend's to remove, and a recursive delete here could take a directory.</li>
+<li><strong>The browser bundle is ~1 MB (205 KB gzipped).</strong> The emulator is most of it. The client module loader serves one file per plugin with no code splitting, so it cannot be deferred until the Terminal panel opens.</li>
+<li><strong><code>--dsw-alias-label-error</code> is not used here.</strong> ui-theme declares no such token, though three harness stylesheets reference it; this package uses <code>--dsw-alias-state-error-primary</code>, and <code>tests/styles.spec.ts</code> fails on any token ui-theme does not declare.</li>
+</ul>
+<h2>Verification</h2>
+<p>Every panel was exercised against a running <code>dsh web</code> before release: the git reading, a per-file patch, staging one file, unstaging it, and a real commit against a real repository — verified with <code>git log</code>, then undone, a <code>/bin/zsh</code> shell running a command and rendering its output, the file listing and a text preview, a <code>.claude/launch.json</code> dev server started and shown in the frame plus a deliberately failing one whose stderr opened the log view, the empty task list, and the Delete confirmation. <code>tests/</code> covers the porcelain parser against real <code>git status -z</code> output, the launch-file parser and merge, the screen model's control vocabulary, the path-containment guard, the generated wire contract end to end, and every design token the stylesheets name.</p>
+<p>An adversarial audit of the finished package found 35 candidate defects; the confirmed ones are fixed here, including a path-traversal hole in the untracked-diff path (<code>git diff --no-index</code> applies no repository containment of its own), a duplicated task-output buffer, a preview poll loop that never stopped on a failed server, and the settings fallback described above.</p>
+<h2>License</h2>
+<p>MIT</p>

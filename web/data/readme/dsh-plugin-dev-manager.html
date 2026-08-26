@@ -1,0 +1,385 @@
+<h1>dsh-plugin-dev-manager</h1>
+<p>在一个稳定的 DeepSeek Harness 中管理隔离的 Plugin 开发实例。</p>
+<p>它解决这样的开发风险：目标 Plugin 的 Host 代码、配置或依赖发生错误时，开发 DSH 可以重启或启动失败，负责写代码的稳定 DSH 仍然保持运行。</p>
+<pre><code>稳定 DSH
+  └─ dsh-plugin-dev-manager
+       ├─ Settings / Plugin Dev
+       └─ 本地 supervisor
+            ├─ Workspace A → Plugin A + Common + Auth → 127.0.0.1 / LAN:3081
+            └─ Workspace B → Plugin B + Storage → 127.0.0.1 / LAN:3082
+</code></pre>
+<p>supervisor 作为独立 Node.js 进程运行。稳定 DSH 重启或重新加载 Manager Plugin 后，会通过带随机令牌的 localhost RPC 重新连接到原 supervisor。</p>
+<p>从旧版本升级时，Manager 会把旧 supervisor 返回的单 Plugin 数据自动补成单成员 Workspace，因此原有项目可以继续展示和使用。多 Plugin API 需要 supervisor protocol v2，实例删除 API、可恢复删除记录和注销后保留的数据所有权需要 protocol/registry v3。若当前 supervisor 版本过旧，先保存开发实例中的工作并执行 <code>dsh_dev_shutdown({ confirm: true })</code>；下一次 Manager 调用会启动新版 supervisor 并迁移 registry。该操作会停止旧 supervisor 管理的开发实例。registry v3 是前向升级，旧版 supervisor 不再读取它。</p>
+<h2>当前能力</h2>
+<ul>
+<li>为每个开发 Workspace 创建独立 <code>DSH_HOME</code>、Web profile 和端口。</li>
+<li>一个 Workspace 可以组合多个本地 Plugin、固定版本依赖和团队 Preset。</li>
+<li>为开发实例设置独立 <code>DSH_AGENTS_HOME</code> 和 bundled-skill 目录，避免扫描稳定实例的 Skills。</li>
+<li>执行依赖安装与初始构建。</li>
+<li>通过 <code>link:&lt;absolute-plugin-path&gt;</code> 安装所有本地成员，并为每个成员独立运行 build/watch。</li>
+<li>支持仓库内的 <code>.dsh-dev.yml</code>、<code>.dsh-dev.yaml</code> 或 <code>.dsh-dev.json</code> 声明。</li>
+<li>在启动前运行 <code>dsh --profile web --dump-config</code>。</li>
+<li>启动、停止、重启、检查一个开发 DSH。</li>
+<li>安全注销单个实例，并可选择清理受管开发数据，同时保留已晋级 Release 和 Plugin 源码。</li>
+<li>自动启动每个本地成员的 <code>dev:client</code> watcher（存在该 script 时）。</li>
+<li>localhost supervisor RPC 使用原生 HTTP，绕过 Devbox 的环境代理。</li>
+<li>supervisor 启动失败或竞争失败时主动回收刚创建的进程。</li>
+<li>在 DSH 设置页提供 Plugin Dev 管理面板。</li>
+<li>读取 Host、watcher、check、clean validation 和 supervisor 日志。</li>
+<li>执行目标包的 <code>check</code>、<code>test</code> 或指定 package script。</li>
+<li>将 pnpm tarball 安装到全新的验证环境，完成 config composition 和 Web 健康检查。</li>
+<li>通过干净环境门禁后，复制原始 tarball、计算 SHA-256 并写入晋级元数据。</li>
+<li>拒绝停止 supervisor 没有持有进程句柄的端口占用者。</li>
+</ul>
+<h2>安装</h2>
+<p>直接使用 GitHub package spec 安装固定版本：</p>
+<pre><code>dsh plugin --profile web add \
+  "github:QuanQQQ/dsh-plugin-dev-manager#v0.4.1"
+</code></pre>
+<p>仓库提交包含构建后的 <code>lib/</code>，因此目标机器无需安装源码构建依赖。私有仓库需要提前配置 GitHub SSH 访问；也可以使用完整地址：</p>
+<pre><code>dsh plugin --profile web add \
+  "git+ssh://git@github.com/QuanQQQ/dsh-plugin-dev-manager.git#v0.4.1"
+</code></pre>
+<p>需要 tarball 时，可以从 GitHub Release 下载已验证的安装包：</p>
+<pre><code>gh release download v0.4.1 \
+  --repo QuanQQQ/dsh-plugin-dev-manager \
+  --pattern 'dsh-plugin-dev-manager-*.tgz'
+
+dsh plugin --profile web add ./dsh-plugin-dev-manager-0.4.1.tgz
+</code></pre>
+<p>私有仓库需要先执行 <code>gh auth login</code>。也可以在 GitHub Release 页面下载 tarball，再复制到目标机器。</p>
+<p>首次部署 PDM 时，推荐把发布 tarball 安装到稳定 DSH，让控制面与正在编辑的源码完全分离：</p>
+<pre><code>pnpm install
+pnpm run check
+pnpm pack --pack-destination ..
+
+dsh plugin --profile web add /absolute/path/to/dsh-plugin-dev-manager-0.4.1.tgz
+</code></pre>
+<p>首次安装尚无 PDM 队列可用，应先确认稳定 Host 没有活动会话或后台任务，再由操作者按宿主环境的正常方式重启以加载 bundle。PDM v0.4.0 及后续版本之间的更新不得重复这条直装/直启流程，必须使用 <code>dsh_dev_queue_update(confirm=true)</code>。从不具备更新队列的 v0.3.x 或更早版本升级到 v0.4.0 时，需先保存所有工作、确认稳定 Host 已空闲并停止旧开发 supervisor，再将这次升级作为显式的一次性 fallback；目标 Plugin 不要安装到稳定 profile。</p>
+<p>只在调试 Manager 本身的早期阶段使用 link 安装：</p>
+<pre><code>dsh plugin --profile web add "link:/absolute/path/to/dsh-plugin-dev-manager"
+</code></pre>
+<p>开发 Manager 本身时，可在控制面安装上一版稳定 tarball，再把当前源码仓库作为目标 Plugin 注册到 Manager。</p>
+<p>启动稳定 DSH 后，打开 <code>Settings → Plugin Dev</code>。输入目标 Plugin 的绝对路径即可创建隔离环境。Agent 工具与 Web 面板操作同一个 supervisor 和项目注册表。</p>
+<h2>推荐开发 SOP</h2>
+<ol>
+<li>准备一个稳定 DSH，只安装 Manager 和日常开发所需的稳定插件。</li>
+<li>在 Plugin Dev 面板或通过 <code>dsh_dev_workspace_create</code> 注册 Workspace。Manager 会读取开发清单、安装依赖、初始构建、分配独立端口，并把所有成员组合到独立 <code>DSH_HOME</code>。</li>
+<li>调用启动。Client 代码由目标包的 <code>dev:client</code> watcher 持续构建，DSH Client HMR 会加载新的 <code>client.js</code>。</li>
+<li>修改 Host 代码后，先保存工作，再执行受控重启。Web 面板会弹出确认，Agent 工具要求 <code>confirm=true</code>。</li>
+<li>调用检查。准备交付时执行“验证并晋级”或 <code>dsh_dev_promote</code>。</li>
+<li>使用 <code>releases/latest.json</code> 指向的原始 tarball 进行安装或发布，保留其中的 SHA-256 供核对。</li>
+</ol>
+<p>这套流程把开发实例的故障域限制在单个 Workspace。目标 Host 启动失败或自行退出时，稳定 DSH、Agent 对话和其他开发实例仍可继续工作。</p>
+<h2>多 Plugin Workspace</h2>
+<p>在 Workspace 根目录添加 <code>.dsh-dev.yml</code>：</p>
+<pre><code>version: 1
+name: campaign-dev
+preset: team-web
+
+plugins:
+  - path: .
+    role: primary
+    watch: dev:client
+
+  - path: ../dsh-plugin-common
+    role: member
+
+  - source: github:example/dsh-plugin-storage#v1.3.0
+    role: dependency
+</code></pre>
+<p>然后在面板输入 Workspace 路径，或调用：</p>
+<pre><code>dsh_dev_workspace_create({ workspacePath: "/work/campaign-plugin" })
+</code></pre>
+<p><code>primary</code> 是执行 check、pack、promote 的主 Plugin；<code>member</code> 是一起构建和调试的本地 Plugin；<code>dependency</code> 是安装到同一 profile 的运行依赖。省略 <code>role</code> 时，第一个本地 Plugin 会成为 primary，其他本地 Plugin 使用 member，远程 source 使用 dependency。</p>
+<p>安装顺序固定为 Preset、非 primary 成员、primary。这样 primary 的配置补丁最后参与组合。每个本地成员拥有独立 watcher PID 和日志。任意 Host 代码变化都需要重启整个 Workspace，Workspace 内的运行中任务会随之中断。</p>
+<p>单 Plugin 场景可以继续使用 <code>dsh_dev_create</code>；它会创建只有一个 primary 成员的 Workspace。</p>
+<p>Manager 以解析后的真实 <code>workspacePath</code> 作为共享实例边界：不同会话即使传入不同 <code>id</code>，只要 Workspace 与 Plugin 组成一致，就直接返回已有实例，不会重复安装、分配端口或启动 Host。若同一 Workspace 请求了不同组成，调用会提示刷新已有共享实例，而不是并行创建另一份。</p>
+<h2>配置</h2>
+<p>默认只允许管理稳定 DSH 启动目录下的 Plugin。需要管理其他目录时，在稳定 profile 的 <code>cordis.patch.yml</code> 覆盖配置：</p>
+<pre><code>- id: dsh-plugin-dev-manager
+  config:
+    allowedRoots:
+      - /absolute/path/to/plugin-workspaces
+    portStart: 3081
+    portEnd: 3180
+    startupTimeoutMs: 30000
+    shutdownTimeoutMs: 7000
+    usePollingWatch: false
+    allowRemoteWebApi: false
+    discoverLanUrls: true
+    defaultPreset: team-web
+    presets:
+      team-web:
+        - github:example/dsh-plugin-auth#v2.1.0
+        - github:example/dsh-plugin-observability#v1.4.2
+</code></pre>
+<p>可用字段：</p>
+<table>
+<thead>
+<tr>
+<th>字段</th>
+<th align="right">默认值</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>stateDir</code></td>
+<td align="right"><code>$DSH_HOME/dev-manager</code></td>
+<td>supervisor、项目注册表、实例 home、日志和产物目录</td>
+</tr>
+<tr>
+<td><code>allowedRoots</code></td>
+<td align="right">稳定 DSH 的启动目录</td>
+<td>可管理 Plugin 的路径白名单</td>
+</tr>
+<tr>
+<td><code>dshCommand</code></td>
+<td align="right"><code>dsh</code></td>
+<td>开发实例使用的 DSH 可执行文件</td>
+</tr>
+<tr>
+<td><code>packageManager</code></td>
+<td align="right"><code>pnpm</code></td>
+<td>安装、构建、检查和打包命令</td>
+</tr>
+<tr>
+<td><code>portStart</code> / <code>portEnd</code></td>
+<td align="right"><code>3081</code> / <code>3180</code></td>
+<td>自动分配端口范围</td>
+</tr>
+<tr>
+<td><code>startupTimeoutMs</code></td>
+<td align="right"><code>30000</code></td>
+<td>等待开发 DSH 监听端口的时间</td>
+</tr>
+<tr>
+<td><code>shutdownTimeoutMs</code></td>
+<td align="right"><code>7000</code></td>
+<td>SIGTERM 后等待时间，超时升级到 SIGKILL</td>
+</tr>
+<tr>
+<td><code>operationTimeoutMs</code></td>
+<td align="right"><code>600000</code></td>
+<td>install、build、check、pack 的最长时间</td>
+</tr>
+<tr>
+<td><code>maxOutputBytes</code></td>
+<td align="right"><code>131072</code></td>
+<td>单次命令和日志返回上限</td>
+</tr>
+<tr>
+<td><code>usePollingWatch</code></td>
+<td align="right"><code>false</code></td>
+<td>设置 <code>CHOKIDAR_USEPOLLING=1</code>；遇到 <code>EMFILE</code> 时启用</td>
+</tr>
+<tr>
+<td><code>allowRemoteWebApi</code></td>
+<td align="right"><code>false</code></td>
+<td>允许来自非回环对端的可信 authority 访问 Web 管理 API；显式启用后会传递给受管开发 DSH，确保其中的 PDM 也能从同一受信 LAN 使用</td>
+</tr>
+<tr>
+<td><code>discoverLanUrls</code></td>
+<td align="right"><code>true</code></td>
+<td>探测并展示实际可达的本机私网 IPv4 URL；不会修改开发 DSH 的监听配置</td>
+</tr>
+<tr>
+<td><code>stableDshHome</code></td>
+<td align="right">当前 <code>$DSH_HOME</code></td>
+<td>排队更新最终写入的稳定 DSH home</td>
+</tr>
+<tr>
+<td><code>stableUpdateIdleMs</code></td>
+<td align="right"><code>5000</code></td>
+<td>所有对话和后台任务停止后，安装与重启前各自需要保持的静默时间</td>
+</tr>
+<tr>
+<td><code>stableUpdatePollMs</code></td>
+<td align="right"><code>2500</code></td>
+<td>待更新队列与稳定版空闲状态的检查间隔</td>
+</tr>
+<tr>
+<td><code>stableUpdateRetryMs</code></td>
+<td align="right"><code>30000</code></td>
+<td>可重试安装/重启错误的退避时间</td>
+</tr>
+<tr>
+<td><code>stableUpdateMaxAttempts</code></td>
+<td align="right"><code>3</code></td>
+<td>自动重试上限；达到后必须显式重试</td>
+</tr>
+<tr>
+<td><code>autoRestartStable</code></td>
+<td align="right"><code>true</code></td>
+<td>安装后自动重启稳定版 systemd user service</td>
+</tr>
+<tr>
+<td><code>stableSystemdUnit</code></td>
+<td align="right">空</td>
+<td>可选的明确稳定版 <code>.service</code> 单元；为空时只接受以 <code>dsh</code> 开头的 cgroup 叶子 service，不匹配祖先单元</td>
+</tr>
+<tr>
+<td><code>presets</code></td>
+<td align="right"><code>{}</code></td>
+<td>团队公共 Plugin 集合；值会按顺序传给 <code>dsh plugin add</code></td>
+</tr>
+<tr>
+<td><code>defaultPreset</code></td>
+<td align="right">空</td>
+<td>Workspace 未声明 preset 时使用的默认名称</td>
+</tr>
+</tbody></table>
+<h2>Agent 工具</h2>
+<table>
+<thead>
+<tr>
+<th>工具</th>
+<th>作用</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>dsh_dev_create</code></td>
+<td>安装依赖、构建、创建隔离 profile、link Plugin、dump-config</td>
+</tr>
+<tr>
+<td><code>dsh_dev_workspace_create</code></td>
+<td>从开发清单或显式成员列表创建多 Plugin Workspace</td>
+</tr>
+<tr>
+<td><code>dsh_dev_start</code></td>
+<td>启动 Client watcher 和开发 DSH，等待健康</td>
+</tr>
+<tr>
+<td><code>dsh_dev_stop</code></td>
+<td>受控停止开发 DSH 和 watcher</td>
+</tr>
+<tr>
+<td><code>dsh_dev_remove</code></td>
+<td>经确认后停止并注销单个实例；可选清理开发数据</td>
+</tr>
+<tr>
+<td><code>dsh_dev_restart</code></td>
+<td>只重启开发实例</td>
+</tr>
+<tr>
+<td><code>dsh_dev_status</code></td>
+<td>查看单个项目的状态、URL、PID 和错误</td>
+</tr>
+<tr>
+<td><code>dsh_dev_list</code></td>
+<td>查看全部项目</td>
+</tr>
+<tr>
+<td><code>dsh_dev_logs</code></td>
+<td>读取 Host、watch、check、validation 或 supervisor 日志</td>
+</tr>
+<tr>
+<td><code>dsh_dev_check</code></td>
+<td>执行 package.json 中的验证 script</td>
+</tr>
+<tr>
+<td><code>dsh_dev_pack</code></td>
+<td>执行检查并输出 tarball</td>
+</tr>
+<tr>
+<td><code>dsh_dev_validate</code></td>
+<td>在全新 DSH_HOME 中安装 tarball、dump-config、启动并检查健康</td>
+</tr>
+<tr>
+<td><code>dsh_dev_promote</code></td>
+<td>通过 clean validation 后保存带 SHA-256 的发布候选</td>
+</tr>
+<tr>
+<td><code>dsh_dev_queue_update</code></td>
+<td>经确认后验证、晋级并记录稳定版待更新版本，等待稳定版空闲后安装并重启</td>
+</tr>
+<tr>
+<td><code>dsh_dev_retry_update</code></td>
+<td>经确认后清除失败退避，重试持久化的安装或重启</td>
+</tr>
+<tr>
+<td><code>dsh_dev_shutdown</code></td>
+<td>经确认后停止 supervisor 及其管理的全部开发实例</td>
+</tr>
+</tbody></table>
+<p>示例对话：</p>
+<pre><code>为 /work/dsh-foo 创建开发 Workspace。
+启动 dsh-foo Workspace。
+查看其中 dsh-plugin-common 的 Watcher 日志。
+运行检查，成功后验证并晋级。
+</code></pre>
+<p><code>dsh_dev_create</code> 的关键参数：</p>
+<ul>
+<li><code>pluginPath</code>：目标 Plugin 路径，必填。</li>
+<li><code>id</code>：稳定项目 ID；省略时从 package name 推导。</li>
+<li><code>install</code>：默认 <code>true</code>。存在 <code>pnpm-lock.yaml</code> 时使用 <code>--frozen-lockfile</code>。</li>
+<li><code>build</code>：默认 <code>true</code>。存在 <code>build</code> script 时自动执行。</li>
+<li><code>watchScript</code>：默认探测 <code>dev:client</code>。</li>
+<li><code>checkScript</code>：默认依次探测 <code>check</code>、<code>test</code>。</li>
+</ul>
+<p><code>dsh_dev_workspace_create</code> 的关键参数：</p>
+<ul>
+<li><code>workspacePath</code>：Workspace 根目录，必填。</li>
+<li><code>id</code>：稳定 Workspace ID；省略时依次使用清单 name 和 primary package name。</li>
+<li><code>preset</code>：稳定控制面配置中的公共 Plugin 集合。</li>
+<li><code>plugins</code>：显式成员列表；提供后会覆盖仓库开发清单。</li>
+<li><code>install</code> / <code>build</code>：所有本地成员的默认行为；成员级配置可以覆盖。</li>
+</ul>
+<p><code>dsh_dev_remove</code> 必须传入 <code>confirm: true</code>。默认只停止并从活动列表注销实例，registry 会保留 ID、原 Workspace 与受管数据的所有权记录，原有 <code>DSH_HOME</code>、日志和产物仍留在磁盘；之后只有同一 Workspace 能用该 ID 重新接管，不同 Workspace 会被拒绝，避免继承旧 profile。对已注销 ID 再传 <code>purge: true</code> 也可清理保留数据。purge 会删除 Manager 管理的实例 home、当前 Workspace 的已知日志、顶层 tarball、依赖包和 validation 目录；<code>artifacts/&lt;id&gt;/releases/</code> 中的晋级 tarball、历史元数据及 <code>latest.json</code> 始终保留。该操作不会删除 Workspace 或 Plugin 源码。</p>
+<p>Web 面板分别提供“注销”和“清理数据”：前者保留全部磁盘数据，后者使用 <code>purge: true</code>；两者使用不同确认文案，成功后会关闭该项目已打开的日志面板。</p>
+<p>执行 purge 时，Manager 会先把注销和 cleanup tombstone 原子写入 registry，再清理磁盘，最后移除 tombstone。清理中断或部分失败时，<code>dsh_dev_list</code> 会以 <code>removing</code> 状态显示该 ID；只有再次传入 <code>purge: true</code> 才会继续幂等清理，默认的 <code>purge: false</code> 不会越过原始保留契约。cleanup 未完成前不能用同一 ID 重新创建。<code>remove</code> 遇到 RPC 传输错误不会自动重放，而会提示先调用 <code>dsh_dev_list</code> 判断注销是否已经提交。</p>
+<h2>状态与故障处理</h2>
+<p>Workspace 状态包含：</p>
+<pre><code>stopped → initializing → starting → ready
+                         ↘ failed
+                         ↘ orphaned
+removing → retry cleanup → removed
+</code></pre>
+<p><code>orphaned</code> 表示端口有进程，但当前 supervisor 没有对应的子进程句柄。Manager 会拒绝停止或删除该实例，避免 PID 或端口复用时误杀其他程序，或在未知进程仍使用实例数据时清理磁盘。先核对端口和日志，再手动处理该进程。</p>
+<p>开发 DSH 中的运行中任务在 Host 重启时仍会中断。Manager 保护的是稳定控制面和其他开发实例；调用 <code>dsh_dev_restart</code> 前仍应确认目标开发实例没有需要保留的任务。</p>
+<p><code>validate</code> 与 <code>promote</code> 每次都使用新的验证目录。primary 和本地 member 会分别打包为 <code>.tgz</code>，Preset 与固定 source 随后一起安装；验证过程不会复用 link 开发环境。晋级目录包含 primary 的不可变 tarball、时间戳元数据和 <code>latest.json</code>。单独调用 <code>promote</code> 不会修改稳定 DSH。</p>
+<p><code>dsh_dev_queue_update(confirm=true)</code> 会把晋级产物写入 <code>stateDir/stable-updates.json</code>。同一 npm package 只保留最新候选，不同 package 可合并；稳定 Host 同时检查所有 live agent 的 <code>idle/running</code>、agent maintenance 和 owner/unowned background jobs。第一次完整静默窗口后，supervisor 校验 tarball 的 releases 路径、SHA-256 和内部 <code>package.json</code> 名称，再逐个安装到稳定 Web profile；每次执行命令前先写 applying journal，每个 package 成功后立即 checkpoint，因此批次中途失败不会丢失已安装/未安装边界。profile 安装只修改磁盘，不改变当前进程；若最后一次空闲检查后有新工作开始，它仍继续使用当前已加载版本。随后重新等待一个完整静默窗口。重启交接前，Coordinator 使用 agent maintenance 栅栏锁住现有 Agent，并同步接管新创建的 Agent；此后到 Host teardown 之间的新消息只会排队，不会先开始再被重启打断。新 Host PID 启动后，Coordinator 优先要求它报告与安装后相同的 Web profile generation。若 generation 仅因其他合法 profile 更新而变化，则必须同时确认当前磁盘仍与 Host 启动快照一致、且本批次每个 bundle 的 manifest dependency 与 lockfile resolution 都仍精确引用原不可变 tarball，才把批次标记为已应用；目标 bundle 被移除、替换或在 Host 启动后再次漂移时仍会 fail-closed 并要求显式处理。</p>
+<p>队列、applying journal 和“已安装、待重启”状态都通过临时文件 fsync、rename、目录 fsync 后再切换内存状态。安装/重启失败按配置有限退避，达到上限后使用 <code>dsh_dev_retry_update(confirm=true)</code> 显式恢复；supervisor 恢复时若发现结果未知的 applying journal，或旧版待重启记录缺少 install-time profile generation，则禁止自动处理，必须显式确认。更新类非幂等 RPC 在响应丢失时不会盲目重发。自动重启只接受显式 <code>stableSystemdUnit</code> 或 <code>/proc/self/cgroup</code> 的唯一叶子 <code>.service</code>，拒绝 scope 中的祖先 service。systemctl 使用阻塞式 restart：明确失败时释放栅栏并记录错误，成功路径由 Host teardown 和新 PID 确认。protocol v5 以前的 supervisor 不支持此能力时，先保存开发实例中的工作并执行 <code>dsh_dev_shutdown(confirm=true)</code>，让下一次调用启动新版 supervisor。稳定更新 Web API 只接受回环对端。</p>
+<p>安装 PDM 后，它会自动向 DSH 的全局 system prompt 注册稳定更新弱护栏，不需要再安装独立 prompt Plugin。规则按行为而不是按某条宿主命令描述：稳定 profile 的修改、包替换以及 Host、supervisor、service、container、process 或 machine 的中断都必须走 PDM 队列和 idle gate；队列不可用时 Agent 必须停止并请求明确的 fallback 选择，不能自行换用 shell、文件系统、包管理器或平台 API 绕过。该机制会影响后续 prompt 组装，包括已有会话的后续 turn，但它是模型约束，不是 OS 权限隔离，不能替代强制执行。</p>
+<h2>安全边界</h2>
+<ul>
+<li>所有子进程通过参数数组启动，<code>shell</code> 固定为 <code>false</code>。</li>
+<li><code>allowedRoots</code> 在真实路径解析后检查，可拦截越界路径和符号链接逃逸。</li>
+<li>supervisor 只监听 <code>127.0.0.1</code>，RPC 使用 256-bit 随机 bearer token。</li>
+<li>控制面 RPC 通过 Node 原生 loopback HTTP 发出，不读取代理分发器。</li>
+<li>supervisor 元数据与配置以 <code>0600</code> 权限写入。</li>
+<li>Web 管理 API 默认同时要求 loopback 对端与可信 authority。只有显式启用 <code>allowRemoteWebApi</code> 后，非回环对端才可通过 <code>webRuntime.trustedHosts</code> authority、Fetch Metadata 与 Origin 篱笆访问；Origin 必须同时匹配当前 transport scheme 与 authority，远端伪造 <code>Host: 127.0.0.1</code> 不会被当成本地请求。写操作还要求同源 Client 使用的自定义请求头。</li>
+<li><code>allowRemoteWebApi</code> 是可信网络 opt-in，不是用户认证；启用后，同一受信网络中的原生 HTTP 客户端仍可能伪造浏览器头并执行管理操作。必须配合防火墙、VPN 或其他网络访问控制，不能把端口直接暴露到不可信网络。该显式 opt-in 会通过受管环境变量传给开发 DSH，但默认 <code>false</code> 不会被自动放宽。</li>
+<li><code>discoverLanUrls</code> 只展示经 TCP 探测实际可达的私网 URL，不绕过 DSH 对 <code>--host 0.0.0.0</code> 的安全限制。LAN 监听必须由开发 profile 显式启用（例如放入受信的 LAN-access Preset），并配合防火墙或 VPN；这不是用户认证。</li>
+<li>package script 名称经过白名单校验。</li>
+<li>日志和命令输出有大小限制。</li>
+<li>所有本地 Plugin 都必须声明 <code>dsh.bundle</code>。</li>
+<li>端口冲突时启动失败，不会接管未知进程。</li>
+<li>停止后会确认受管 Host/watcher 进程句柄对应的 PID 已退出且端口关闭；任一受管进程仍存活时拒绝注销或清理。目标脚本自行 daemonize 的后代进程不在句柄保证范围内，因此只管理受信任的 package scripts。子进程退出回调会立即清除受管句柄，降低 PID 复用导致的误信号风险。</li>
+<li>删除要求传入与列表完全一致的规范化实例 ID；加载 registry 时也会重新验证项目和成员 ID。清理路径只由 <code>stateDir</code> 和这些 ID 推导，每次删除都校验受管根目录和 containment，不信任 registry 中的 <code>dshHome</code>，也不会跟随实例或 artifact 根目录的符号链接；日志按已知精确文件名清理，避免相似 ID 互相误删。</li>
+<li><code>purge</code> 保留整个 <code>artifacts/&lt;id&gt;/releases/</code>，不会把晋级产物与临时验证数据一起删除。</li>
+</ul>
+<p>安装依赖和执行 package script 会运行目标仓库中的代码。只管理受信任的 Plugin 仓库，并把 <code>allowedRoots</code> 缩小到实际开发目录。</p>
+<h2>开发与验证</h2>
+<pre><code>pnpm install
+pnpm run typecheck
+pnpm test
+pnpm run build
+pnpm run test:e2e
+pnpm pack --dry-run
+</code></pre>
+<p><code>test:e2e</code> 会创建临时 Plugin 和临时 <code>DSH_HOME</code>，使用真实 <code>dsh</code> CLI 完成 link、dump-config、Web 启动、HTTP 健康检查、Manager 重连、受控停止、clean validation、晋级和实例清理，并在 purge 后重新校验晋级 tarball 的 SHA-256、历史元数据和 <code>latest.json</code>。单元测试还覆盖多 Plugin 组合、Preset、YAML 清单、多个 watcher、并发删除、cleanup 恢复、进程存活校验、路径防护和代理绕行。</p>
+<p>环境覆盖：</p>
+<pre><code>DSH_COMMAND=/path/to/dsh \
+DSH_DEV_MANAGER_E2E_PORT=43881 \
+CHOKIDAR_USEPOLLING=1 \
+pnpm run test:e2e
+</code></pre>
+<h2>已知边界</h2>
+<ul>
+<li>当前管理 Web profile。</li>
+<li>Client HMR 依赖各本地成员持续重写 Client bundle；默认探测 <code>dev:client</code> script。</li>
+<li>Host 代码变化需要调用 <code>dsh_dev_restart</code>。</li>
+<li>supervisor 进程自身异常退出时，已启动的开发 DSH 可能成为 <code>orphaned</code>；安全策略会保留它并拒绝自动终止。</li>
+<li>稳定 DSH 自身退出仍会中断它正在执行的任务；独立 supervisor 与开发实例会继续运行，稳定 DSH 恢复后可重新连接。</li>
+</ul>

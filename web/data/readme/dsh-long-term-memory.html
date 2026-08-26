@@ -1,0 +1,312 @@
+<h1>dsh-long-term-memory — 长期记忆</h1>
+<p>一个 DeepSeek Harness（<code>dsh</code>）<strong>静态 Host 插件</strong>，为会话提供<strong>分层的、确定性的长期记忆</strong>：
+跨会话持久化「用户画像 / 事实 / 偏好 / 决策 / 约束」，用**确定性关键词（BM25）**召回，并在每轮请求前自动注入记忆。
+<strong>零外部依赖</strong>：不需要向量库、不需要额外的模型调用、不需要自建 SQLite 或外部服务器。</p>
+<p>它只<strong>组合 DSH 已有接缝</strong>，不改任何 core 包。</p>
+<h2>它能做什么</h2>
+<table>
+<thead>
+<tr>
+<th>能力</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong>三库分层</strong></td>
+<td><code>user</code>（用户画像）/ <code>global</code>（跨项目事实）/ <code>workspace</code>（项目专属），各占一个 JSONL 文件。</td>
+</tr>
+<tr>
+<td><strong>记忆沉淀</strong></td>
+<td>模型用 <code>memory_write</code> 把值得长期保存的事实写入存储。</td>
+</tr>
+<tr>
+<td><strong>确定性召回</strong></td>
+<td><code>memory_recall</code> 用 CJK 感知的 BM25 检索（中/日/韩按汉字 bigram 匹配，英文按单词），结果可解释、可重放。</td>
+</tr>
+<tr>
+<td><strong>每轮自动注入</strong></td>
+<td>每次组装 request 前，通过 <code>systemPrompt.context()</code> 注入记忆摘要（同步渲染，不破坏 prefix cache）。</td>
+</tr>
+<tr>
+<td><strong>注入三档</strong></td>
+<td><code>recent</code>（默认，每库最近几条）/ <code>full</code>（全部，受字符预算，快照式注入）/ <code>off</code>。</td>
+</tr>
+<tr>
+<td><strong>威胁扫描</strong></td>
+<td>写入内容与注入快照都做轻量威胁模式检测：命中则写入拒绝、注入替换为 <code>[BLOCKED: …]</code> 占位符。</td>
+</tr>
+<tr>
+<td><strong>写入审批门</strong></td>
+<td>可选：<code>memory_write</code> / <code>memory_forget</code> 先走 <code>tools/pre-execute</code> 的 <code>ask</code> 决策，由 DSH 审批接缝裁决。</td>
+</tr>
+<tr>
+<td><strong>写入护栏</strong></td>
+<td>跨进程文件锁 + 原子写；外部漂移检测（备份并拒绝，不静默丢数据）；文件不可读拒绝覆写；每库字符预算，超限要求先删后加。</td>
+</tr>
+<tr>
+<td><strong>低开销召回</strong></td>
+<td><code>memory_recall</code> 的命中计数（touch）为<strong>纯内存操作</strong>，不重写文件——召回 O(1)，实测 ~0.3ms。</td>
+</tr>
+</tbody></table>
+<h2>模型工具</h2>
+<table>
+<thead>
+<tr>
+<th>工具</th>
+<th>用途</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>memory_write(content, scope?, tags?)</code></td>
+<td>写入一条记忆，返回 <code>id</code> / <code>scope</code>。<code>scope: user/global/workspace</code>（默认 workspace，无 cwd 时 global）。超限时报 usage + 当前条目。</td>
+</tr>
+<tr>
+<td><code>memory_recall(query, scope?, limit?)</code></td>
+<td>BM25 检索，返回带分数、id、scope 的命中。<code>scope: user/global/workspace/all</code>（默认 <code>all</code>，user 优先）。</td>
+</tr>
+<tr>
+<td><code>memory_list(scope?, limit?)</code></td>
+<td>按更新时间列出近期记忆（无评分）。</td>
+</tr>
+<tr>
+<td><code>memory_forget(id, scope?)</code></td>
+<td>按 id 删除记忆（不指定 scope 时按 user→global→workspace 顺序查）。</td>
+</tr>
+<tr>
+<td><code>memory_export(scope?, format?)</code></td>
+<td>导出为可移植 bundle（JSON v1 可往返导入，或人类可读 Markdown）；只带 content/scope/tags。</td>
+</tr>
+<tr>
+<td><code>memory_import(bundle, scope?)</code></td>
+<td>从 v1 JSON bundle 恢复记录；可按 content 去重跳过；可强制归入指定 scope。</td>
+</tr>
+<tr>
+<td><code>memory_batch(scope, operations)</code></td>
+<td>单 scope 原子批量：add/replace/remove 一次落盘；预算按最终态检查（可先删后加）；重复/缺失/多匹配计数返回。</td>
+</tr>
+</tbody></table>
+<h2>存储</h2>
+<p>纯 JSONL，人类可读、可手改（读路径容忍坏行；<strong>写路径检测到坏行会备份并拒绝</strong>，防止静默丢弃手改内容）：</p>
+<ul>
+<li><strong><code>user</code> 作用域</strong>（用户画像：姓名/角色/偏好/风格）：<code>$DSH_HOME/dsh-memory/user.jsonl</code></li>
+<li><strong><code>global</code> 作用域</strong>（跨项目事实）：<code>$DSH_HOME/dsh-memory/global.jsonl</code></li>
+<li><strong><code>workspace</code> 作用域</strong>（跟项目走）：<code>&lt;workspaceRoot&gt;/.dsh/memory.jsonl</code>，可随项目一起提交</li>
+</ul>
+<p>写入采用「写临时文件 + rename」的原子方式，并持有 <code>&lt;file&gt;.lock</code> 跨进程锁（死锁/崩溃留锁会被自动打破）；崩溃不会留下半个记录。每个 backing file 只在首次访问时读入内存，之后复用。</p>
+<h2>安装</h2>
+<pre><code>cd dsh-long-term-memory
+dsh plugin --profile web add .
+# 或从插件目录用 file: 形式
+dsh plugin --profile web add "file:$(pwd)"
+</code></pre>
+<p>然后<strong>重启 <code>dsh web</code></strong>。bundle patch 会插入一个 <code>id: long-term-memory</code> 的行调用该包。</p>
+<blockquote>
+<p>⚠️ 注意：<code>dsh plugin add</code> 曾在你的 profile 里破坏过 <code>link:</code> 相对路径（导致 <code>dsh-artifacts-panel</code> 被移出 bundles）。本插件已用<strong>绝对路径</strong> <code>link:/Users/...</code> 固化；请勿再对新插件依赖相对路径。</p>
+</blockquote>
+<h2>使用</h2>
+<p>重启后，让模型记忆/取回即可，例如：</p>
+<blockquote>
+<p>“记住我喜欢喝美式咖啡，记到用户画像里。”
+（模型会调 <code>memory_write</code>，<code>scope: user</code>）</p>
+<p>“这个项目之前决定过关于依赖管理的约束吗？”
+（模型会调 <code>memory_recall("依赖 约束", scope: "workspace")</code>）</p>
+</blockquote>
+<p>模型默认会看到<strong>每轮注入的记忆摘要</strong>（user 优先），因此不一定要先召回；相关任务开始时建议显式 <code>memory_recall</code> 以便拿到带分数的相关命中和 <code>id</code>。</p>
+<h2>斜杠命令（用户面，不经模型）</h2>
+<p>重启后可直接在输入框使用 <code>/memory</code>：</p>
+<table>
+<thead>
+<tr>
+<th>命令</th>
+<th>作用</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>/memory list [user|global|workspace|all]</code></td>
+<td>列出近期记忆（默认 all，user 优先）</td>
+</tr>
+<tr>
+<td><code>/memory search &lt;query&gt;</code></td>
+<td>BM25 检索全部作用域</td>
+</tr>
+<tr>
+<td><code>/memory get &lt;id&gt;</code></td>
+<td>查看单条记忆</td>
+</tr>
+<tr>
+<td><code>/memory forget &lt;id&gt;</code></td>
+<td>删除单条记忆</td>
+</tr>
+<tr>
+<td><code>/memory export [json|markdown]</code></td>
+<td>导出可移植 bundle</td>
+</tr>
+</tbody></table>
+<p>适合不想经过模型直接管理记忆的场景（如清理过期条目、导出备份）。</p>
+<h2>配置</h2>
+<p>在 profile 的 <code>cordis.patch.yml</code> 覆盖（<code>dsh.profile.bundles</code> 装载后应用）：</p>
+<pre><code>- id: long-term-memory
+  config:
+    # 写入前是否需人工审批（默认 false）
+    requireApprovalForWrite: false
+    # 注入策略：recent（默认）/ full / off（兼容旧布尔 true/false）
+    injectContext: recent
+    # 写入内容是否做威胁扫描（默认 true）
+    scanThreatsOnWrite: true
+    # 自动总结：每轮对话结束后用 LLM 蒸馏值得长期记住的事实（默认 false，每次是辅助模型调用）
+    autoSummarize: false
+    # 两次自动总结间的最小间隔（ms，默认 30000，防抖）
+    summarizeIntervalMs: 30000
+    # 至少产生多少条新用户消息才触发总结（默认 1）
+    summarizeMinMessages: 1
+    # 超限时用 LLM 精炼压缩（默认 false = 纯规则压缩：淘汰最冷 + 合并子串重复）
+    compressWithLLM: false
+    # 用户画像文件（默认 $DSH_HOME/dsh-memory/user.jsonl）
+    userFile: null
+    # 全局记忆文件（默认 $DSH_HOME/dsh-memory/global.jsonl）
+    globalFile: null
+    # 工作区记忆文件，绝对或相对 workspace 根（默认 .dsh/memory.jsonl）
+    workspaceFile: null
+    # session 无 cwd 时的 workspace 根回退（默认 process.cwd()）
+    workspaceRoot: null
+    # 注入摘要的字符上限（默认 2400；full 模式也受它约束）
+    maxInjectedChars: 2400
+    # 工具 limit 的上限（默认 25）
+    maxResults: 25
+    # 每库字符预算；超限时先自动压缩（规则或 LLM），仍超才拒绝（默认 20000）
+    charLimit: 20000
+</code></pre>
+<h2>自动总结与自动压缩</h2>
+<p>除了模型主动写入，插件提供两级自动化（默认关闭，需在配置或 <code>settings.yaml</code> 开启）：</p>
+<ul>
+<li><strong>自动总结</strong>（<code>autoSummarize: true</code>）：每轮对话结束（<code>agent/status → idle</code>）时，在空闲期用 LLM 蒸馏本轮新增的对话，提取值得长期记住的事实写入记忆（威胁内容跳过、去重、超限自动压缩）。<code>settings.yaml</code> 可热重载开关：<pre><code>long-term-memory:
+  autoSummarize: true
+  compressWithLLM: true
+</code></pre>
+</li>
+<li><strong>自动压缩</strong>：<code>memory_write</code> 超限时先尝试压缩腾空间再拒绝：<ul>
+<li><code>compressWithLLM: false</code>（默认）：纯规则——按 <code>hits</code> 从低到高淘汰最冷条目 + 合并子串重复内容，零成本确定性；</li>
+<li><code>compressWithLLM: true</code>：先用 LLM 精炼整个 store（合并重叠、去陈旧），失败回退规则压缩。</li>
+<li>压缩只有真正腾出空间才落盘——无法压缩时报错且不误删旧条目。</li>
+</ul>
+</li>
+</ul>
+<h2>Web 图形界面</h2>
+<p>插件带一个浏览器客户端（<code>dsh.client</code> bundle），提供两个界面：</p>
+<p><strong>记忆管理面板</strong>（右侧详情栏，<code>details</code> 插槽）：列表（按作用域过滤）、BM25 搜索、<strong>新增 / 编辑 / 删除记忆</strong>、导出 JSON、粘贴导入——全部调用宿主 API，不经模型。</p>
+<p><strong>设置卡片</strong>（<code>Settings → Plugins → long-term-memory</code>，<code>settings.plugin.item</code> 插槽）：基础开关——自动总结、LLM 压缩、上下文注入模式、写入审批、字符预算，保存即写入 <code>settings.yaml</code> 的 <code>long-term-memory:</code> 节（热重载）。</p>
+<blockquote>
+<p>其他插件复用同一模式即可获得图形设置入口：注册 settings namespace（宿主侧）+ 挂 <code>settings.plugin.item</code> 卡片（客户端侧，<code>key</code> 填 namespace）。</p>
+</blockquote>
+<h2>宿主 API</h2>
+<p>web profile 下注册以下路由（JSON，界面与命令共用）：</p>
+<table>
+<thead>
+<tr>
+<th>路由</th>
+<th>方法</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>/api/memory/list?scope=</code></td>
+<td>GET</td>
+<td>列出各作用域记忆</td>
+</tr>
+<tr>
+<td><code>/api/memory/search?q=&amp;scope=</code></td>
+<td>GET</td>
+<td>BM25 检索</td>
+</tr>
+<tr>
+<td><code>/api/memory/get?id=</code></td>
+<td>GET</td>
+<td>单条记忆</td>
+</tr>
+<tr>
+<td><code>/api/memory/put</code></td>
+<td>POST</td>
+<td>新增/编辑（<code>{id?, scope, content, tags}</code>）</td>
+</tr>
+<tr>
+<td><code>/api/memory/delete?id=</code></td>
+<td>GET</td>
+<td>删除单条</td>
+</tr>
+<tr>
+<td><code>/api/memory/import</code></td>
+<td>POST</td>
+<td>导入 v1 JSON bundle</td>
+</tr>
+<tr>
+<td><code>/api/memory/settings</code></td>
+<td>GET/POST</td>
+<td>读写开关（POST 更新 <code>settings.yaml</code>）</td>
+</tr>
+</tbody></table>
+<h2>测试</h2>
+<pre><code>node test/unit.test.mjs
+</code></pre>
+<p>纯 store 后端（tokenizer / BM25 / JSONL 往返 / 漂移与预算护栏）+ 威胁扫描在临时目录上验证，不依赖 DSH 运行时。</p>
+<h2>文件</h2>
+<ul>
+<li><code>lib/store.js</code> — 纯后端：CJK tokenizer、BM25、JSONL 原子持久化、跨进程锁、漂移/不可读防护、字符预算。</li>
+<li><code>lib/threats.js</code> — 轻量威胁模式扫描（写入拒绝 + 注入占位符）。</li>
+<li><code>lib/automation.js</code> — 自动总结/压缩的纯逻辑：回合文本提取、LLM JSON 解析、规则压缩器。</li>
+<li><code>lib/llm.js</code> — 一发一收的辅助 LLM 调用封装（继承 agent 的 provider/model）。</li>
+<li><code>lib/index.js</code> — 插件主体：注册工具、三档动态上下文注入、自动总结钩子、压缩接入、设置 namespace、宿主 API。</li>
+<li><code>lib/client.js</code> — 浏览器 bundle：记忆管理面板（details 栏）+ 设置卡片（settings.plugin.item）。</li>
+<li><code>cordis.patch.yml</code> — bundle patch（插入一行 <code>long-term-memory</code>）。</li>
+<li><code>package.json</code> — bundle manifest（<code>dsh.bundle.patch</code> + <code>dsh.client</code>）。</li>
+<li><code>lib/types/</code> — <code>index.d.ts</code>（插件）+ <code>store.d.ts</code>（store 模块）类型声明。</li>
+<li><code>test/unit.test.mjs</code> — 单元测试。</li>
+</ul>
+<h2>设计取舍</h2>
+<ul>
+<li><strong>确定性优先</strong>：不用 embedding、不额外调模型，召回完全本地、结果可解释，契合 DSH 的简约哲学。</li>
+<li><strong>三库分层</strong>：<code>user</code> 画像 &gt; <code>global</code> 跨项目 &gt; <code>workspace</code> 项目内，注入与 <code>all</code> 检索都按此优先级。</li>
+<li><strong>注入保持同步</strong>：DSH 的 prompt 组装器同步调用 <code>text</code> 函数，异步会返回 Promise 导致崩溃——注入渲染全部走同步路径（首个 assembly 前异步预热 store）。</li>
+<li><strong>写入门可关闭</strong>：默认 <code>requireApprovalForWrite: false</code>，开箱即用；需要审计/人工确认时开启。</li>
+<li><strong>威胁扫描保守</strong>：模式刻意收窄（指令覆盖/系统提示泄露/角色劫持/标记注入），避免把正常笔记误伤；注入快照用占位符而非删条，原文保留供用户处理。</li>
+<li><strong>无 Web 面板</strong>：v1 只做模型工具 + 注入；浏览用 <code>memory_list</code>，不引入客户端 bundle。</li>
+</ul>
+<h2>实测基准（本机 macOS / Node 22，真实 defineTool + 真实 store）</h2>
+<table>
+<thead>
+<tr>
+<th>操作</th>
+<th>延迟</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>每轮注入渲染（sync，内存读）</td>
+<td>~15 µs</td>
+<td>每请求一次，可忽略</td>
+</tr>
+<tr>
+<td><code>memory_write</code>（锁 + 原子写 + 威胁扫描）</td>
+<td>~2 ms</td>
+<td>低频</td>
+</tr>
+<tr>
+<td><code>memory_recall</code>（BM25 + 内存 touch）</td>
+<td>~0.3 ms</td>
+<td>修复前 ~11 ms（touch 曾全文件重写）</td>
+</tr>
+<tr>
+<td>威胁扫描（11 模式）</td>
+<td>~0.7 µs</td>
+<td>可忽略</td>
+</tr>
+</tbody></table>
+<h2>Roadmap</h2>
+<ul>
+<li> 基础记忆：三作用域 + BM25 召回 + JSONL 存储</li>
+<li> 导出/导入、批量操作、/memory 命令</li>
+<li> 威胁扫描、写入护栏、自动总结、LLM 压缩</li>
+<li> Web 管理界面（记忆面板 + 设置卡片）</li>
+<li> 多标签右侧栏容器（details-tabs：记忆/产物/终端/文件浏览）</li>
+<li> 记忆导出到云盘/剪贴板格式选择</li>
+<li> 标签过滤注入（recent 模式按 tag 过滤）</li>
+</ul>

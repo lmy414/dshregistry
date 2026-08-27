@@ -1,0 +1,68 @@
+<h1>dsh-plugin-om</h1>
+<p><a href="https://www.npmjs.com/package/dsh-plugin-om"><img src="https://img.shields.io/npm/v/dsh-plugin-om.svg" alt="npm version"></a></p>
+<p>在 DSH 里应用 <a href="https://mastra.ai/research/observational-memory">Observational Memory</a> 风格的上下文管理策略</p>
+<h2>安装与启用</h2>
+<h3>说明</h3>
+<ul>
+<li><code>$DSH_HOME</code> 缺省为 <code>~/.dsh</code></li>
+<li><em>profile</em>描述了dsh进程的启动模式，官方的启动命令就是名为<code>web</code>的profile</li>
+</ul>
+<h3>生产使用</h3>
+<p>安装插件</p>
+<pre><code>dsh plugin --profile &lt;profile&gt; add dsh-plugin-om
+</code></pre>
+<blockquote>
+<p>对于 pnpm11+ 添加脚本失败的说明：
+插件的依赖 <code>@huggingface/transformers</code> 自带原生构建脚本，pnpm 11 默认禁止依赖构建脚本，并会抛出异常。
+把 <code>$DSH_HOME/profiles/&lt;profile&gt;/pnpm-workspace.yaml</code> 的 <code>allowBuilds</code> 改为 <code>true</code> 即可
+或者使用<code>dsh plugin --profile &lt;profile&gt; add dsh-plugin-om --allow-build=onnxruntime-node --allow-build=protobufjs --allow-build=sharp</code></p>
+</blockquote>
+<p>安装完成后，需要重启dsh</p>
+<p>可以通过<code>dsh --profile &lt;profile&gt; --dump-config</code>审查配置是否正确</p>
+<p>如果需要覆盖默认配置，打开 <code>$DSH_HOME/profiles/&lt;profile&gt;/cordis.patch.yml</code> 删除里面的空数组，加入</p>
+<pre><code>- id: dsh-plugin-om
+  config:
+    thresholdRatio: 0.2
+    # 其他配置参考下文
+</code></pre>
+<p>不需要重启 可以热更新</p>
+<h3>开发插件</h3>
+<p>运行<code>pnpm dev</code>，等待<code>dist/index.mjs</code>构筑完毕（本地嵌入模型可在运行时自动下载到跨版本共享目录；如需提前预下载用<code>pnpm run download:model</code>，已存在则跳过）</p>
+<p>在 <code>cordis.patch.yml</code> 里加入</p>
+<pre><code>- insert:
+    - id: dsh-plugin-om-dev
+      name: file:///&lt;repo&gt;/dist/index.mjs
+</code></pre>
+<p>可以热重载</p>
+<h3>关于<code>compaction-basic</code></h3>
+<p>dsh的"预设"分为两层，<code>dsh web</code>等同于<code>dsh --profile web</code>，调用的是"名为web的profile"，进程上的预设</p>
+<p>而<code>web-profile</code>里定义了多个"预设agent"<code>preset-agent</code> 这里主要说的是<code>preset-agent</code>的问题</p>
+<p><code>preset-agent</code>配置里自带一个<code>compaction-basic</code>，会在到达阈值后做简单的摘要，与此插件冲突。</p>
+<p>由于配置注入的顺序是层级低的覆盖层级高的，所以<code>cordis.patch.yml</code>对<code>compaction-basic</code>的禁用不会生效。</p>
+<p>此外，这个插件位于<code>preset-agent</code>的定义而非额外的安装，也无法通过<code>dsh plugin</code>卸载。</p>
+<p>解决方案：</p>
+<ul>
+<li>直接改<code>preset-agent</code>的定义(不推荐)</li>
+<li>定义不含<code>compaction-basic</code>的<code>preset-agent</code></li>
+<li><code>compaction-basic</code>压缩阈值是80%上下文窗口，而只需要确保OM的配置中，<code>thresholdRatio</code>+<code>historyMergeRatio</code>&lt;0.8，理论上没到强制摘要就会被OM压缩了(默认值满足这一条件)</li>
+</ul>
+<h2>工作原理</h2>
+<ol>
+<li>在未压缩的消息到达观察阈值后，进行摘要</li>
+<li>将新生成摘要追加到已有摘要后（每条压缩日志是独立的消息/块，旧块原地保留）</li>
+<li>如果摘要总长到达反思阈值，对其本身进行摘要（把全部  块拼接合并为一条）</li>
+<li>提供recall/recall-semantic两个tool进行检索</li>
+</ol>
+<p>观察与反思共用同一套系统提示词（buildHistoryPrompt）：输入与输出都是合法的  块（模型消息 + index 的表达形式），先定义块、要求压缩、再给出数据源（下方  消息记录）。</p>
+<h3>压缩日志块结构</h3>
+<ul>
+<li>观察压缩只精确替换被压缩的新消息区间：旧  块保留为独立消息，新观察日志作为新块追加在其后（多块并存按序排列），历史不会随压缩次数膨胀；反思合并时才把多个块合并为一条更紧凑的摘要</li>
+<li>压缩边界：消息列表中最后一个合法的  块（source 为插件，plugin 为插件标识 <code>dsh-plugin-om</code>；兼容旧日志的宿主 checkpoint 标记 <code>compact</code>）之后的消息视为未压缩；其前（含自身）视为已压缩，不重复压缩、不计入观察阈值</li>
+<li>观察输入经 <code>@xmldom/xmldom</code> 构建为合法  块（用户消息文本/assistant 文本/reasoning 特殊字符自动转义，图片/文件以注释补充；assistant 文本与 toolcall&amp;result 原样；系统消息——user_message 中 source.kind 非 user 的部分，如宿主注入的上下文——渲染为  空块，内容不进入压缩输入）</li>
+<li>输出经 <code>@xmldom/xmldom</code> 解析校验：结构合法（标签匹配/闭合/单块）、不含 、index/start/end 连续（与预期覆盖区间一致），失败按 <code>compressRetryCount</code> 重试</li>
+<li>块开标签带 <code>tip</code> 属性（对 AI 的提醒："当前块是历史消息的压缩产物，不要复述"）；块顶为构成逻辑注释（完整消息定义串 + 条目标签语义），消息正文不再附加前缀句</li>
+</ul>
+<h3>压缩卡片（消息列表中的「已压缩」展示）</h3>
+<p>插件自产的替换消息使用插件自身标记（source.plugin = <code>dsh-plugin-om</code>）；宿主 conversation UI 只识别内置的 <code>compact</code> 检查点，因此插件额外注册一个浏览器客户端 bundle（<code>src/client/</code>，经 <code>dsh.client</code> 声明、exports["./client"] → <code>dist/client.js</code>，由 dsh 客户端模块系统按 <code>/plugins/dsh-plugin-om/client.js</code> 加载），自行认领压缩生命周期事件与替换检查点，在消息列表渲染折叠式「已压缩」卡片：</p>
+<ul>
+<li>卡片默认折叠，采用与宿主「上下文注入」卡片同款样式：同一 DisclosureRow 外壳组件 + IconBrowseOutline16 图标，行内统计与展开体样式按宿主 ContextInjectionRow 的规则注入（插件 bundle 无法引用宿主编译期哈希的 CSS Module 类名，按宿主 client bundle 的同一机制注入 </li></ul>

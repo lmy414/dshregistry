@@ -1,0 +1,178 @@
+<h1>dsh-bluebubbles</h1>
+<p>Bridges a local <a href="https://bluebubbles.app">BlueBubbles</a> server (the macOS iMessage bridge) into DeepSeek Harness.</p>
+<p>Design principle (Unix philosophy): <strong>the host plugin keeps only passive capabilities</strong> (webhook receive + binding resolution + message injection) and <strong>two high-frequency model tools</strong> (send text / send attachment); everything else converges into the <code>bb-channel</code> CLI — agents call it via bash, humans and automation scripts use it directly.</p>
+<h2>Components</h2>
+<table>
+<thead>
+<tr>
+<th>Component</th>
+<th>Location</th>
+<th>Role</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>bluebubbles-bridge</code></td>
+<td><code>src/index.ts</code></td>
+<td>webhook route + message injection + 2 send tools + the <code>bluebubbles</code> service</td>
+</tr>
+<tr>
+<td><code>dsh-heartbeat</code></td>
+<td><code>src/heartbeat.ts</code></td>
+<td>generic periodic wake-up (reads <code>heartbeat-targets.json</code>)</td>
+</tr>
+<tr>
+<td><code>dsh-cron</code></td>
+<td><code>src/cron.ts</code></td>
+<td>cron-time tasks (reads <code>cron-jobs.json</code>)</td>
+</tr>
+<tr>
+<td><code>bb-channel</code></td>
+<td><code>bin/bb-channel.mjs</code></td>
+<td>CLI: chats/messages/send/bind/contacts/webhook/configure…</td>
+</tr>
+</tbody></table>
+<h2>Model tools (deliberately only two)</h2>
+<table>
+<thead>
+<tr>
+<th>Tool</th>
+<th>Role</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>bluebubbles_send_text</code></td>
+<td>send a text message</td>
+</tr>
+<tr>
+<td><code>bluebubbles_send_attachment</code></td>
+<td>send an attachment (image/file)</td>
+</tr>
+</tbody></table>
+<p>Everything else goes through the CLI (agents call it via bash — equivalent capability):</p>
+<pre><code>~/.local/bin/bb-channel chats [--limit N] [--all]      # list chats (placeholder/pairing-code noise hidden by default)
+~/.local/bin/bb-channel messages &lt;chatGuid&gt; [--limit N] # read history (with sender display names)
+~/.local/bin/bb-channel send &lt;chatGuid&gt; &lt;text...&gt;       # send text
+~/.local/bin/bb-channel send-attachment &lt;chatGuid&gt; &lt;file&gt;
+~/.local/bin/bb-channel attachment &lt;guid&gt; [--dir D]     # download an attachment
+~/.local/bin/bb-channel bind &lt;chatGuid&gt; (--workspace PATH | --session ID)
+~/.local/bin/bb-channel unbind &lt;chatGuid&gt;
+~/.local/bin/bb-channel bindings                        # show the binding table
+~/.local/bin/bb-channel contacts / set-contact &lt;address&gt; &lt;name&gt;
+~/.local/bin/bb-channel webhook [--url URL]             # check/self-register the webhook
+~/.local/bin/bb-channel ping / configure                # connectivity / write ~/.dsh/.env
+</code></pre>
+<ul>
+<li>Output is always pretty JSON (jq-friendly); errors go to stderr with exit 1.</li>
+<li>Credential chain matches the plugin: <code>process.env</code> → <code>~/.dsh/.env</code> → <code>~/.zshenv</code>; nothing to fill in by hand.</li>
+<li>The CLI edits <code>~/.dsh/bluebubbles-bindings.json</code> / <code>bluebubbles-contacts.json</code> directly; the plugin hot re-reads both files before every inbound message — <strong>edits take effect immediately, no reload</strong>.</li>
+</ul>
+<h2>Push path (webhook)</h2>
+<pre><code>BlueBubbles server (new message)
+   │  POST {type:"new-message", data:{...}}
+   ▼
+DSH webServer route  /bluebubbles/webhook  (loopback only)
+   │  hot re-read bindings/contacts → look up chatGuid → workspacePath/sessionId
+   ▼
+workspace.sessionIds[0] → agents.get(sessionId).send(userMessage, 'next-step', true)
+   ▼
+The workspace's model wakes up and sees a message annotated
+"📱 iMessage · &lt;chat name&gt; · 来自 &lt;name&gt; (&lt;number&gt;)"
+</code></pre>
+<p><strong>Anti-loop (two layers, v22+)</strong>:</p>
+<ol>
+<li><code>pendingSent</code> queue: the plugin records <code>(chatGuid, normalized text)</code> before every send; webhook echoes with <code>isFromMe=true</code> matching an entry are dropped (60s TTL, unicode NFC-normalized comparison);</li>
+<li><code>seenGuids</code>: after a successful send the real guid returned by the API joins a dedup set (BlueBubbles occasionally pushes the same event twice — second-layer backstop).</li>
+</ol>
+<p>A blanket <code>isFromMe</code> drop is not an option: phones on the same Apple ID also produce <code>isFromMe=true</code> in a <strong>self-chat DM</strong>, and dropping all of them would kill real user messages.</p>
+<p><strong>Sender display name</strong>: <code>payload.handle.displayName</code> → <code>~/.dsh/bluebubbles-contacts.json</code> (address→name, maintained via <code>bb-channel set-contact</code>) → bare number.</p>
+<h2>Relay auto-delivery (same mode for inbound and cron)</h2>
+<p>With <code>relay: true</code> on a binding, the bridge registers a reply trigger for the woken session (persisted to <code>bluebubbles-relay-state.json</code>, 10min TTL, cleared on <code>turn/end</code>; an exact <code>NO_REPLY</code> reply suppresses delivery). During that turn, every assistant message containing text parts is sent back to the chat immediately — thinking and tool results are never delivered.</p>
+<p>When <code>dsh-cron</code> fires a job whose target session has a <code>relay: true</code> binding, it arms the same mechanism through the <code>bluebubbles</code> service's <code>armRelay</code>. <strong>Cron task prompts must not tell the model to call send tools itself</strong> — that would double-send.</p>
+<h2>Configuration</h2>
+<h3>Credentials</h3>
+<table>
+<thead>
+<tr>
+<th>Method</th>
+<th>Takes effect</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>bb-channel configure --password &lt;pw&gt;</code> (writes <code>~/.dsh/.env</code>)</td>
+<td>after DSH restart or bridge reload</td>
+</tr>
+<tr>
+<td>env var <code>BLUEBUBBLES_PASSWORD</code> (optionally <code>BLUEBUBBLES_BASE_URL</code>)</td>
+<td>after DSH restart</td>
+</tr>
+</tbody></table>
+<p><strong>Never put <code>DSH_</code>-prefixed variables in <code>.env</code></strong> — the DSH bootstrap refuses to start. That is why heartbeat/cron config keys are <code>HEARTBEAT_INTERVAL</code> / <code>HEARTBEAT_TARGETS</code> / <code>CRON_JOBS</code>.</p>
+<h3>State files (<code>$DSH_HOME</code>, default <code>~/.dsh</code>)</h3>
+<table>
+<thead>
+<tr>
+<th>Path</th>
+<th>Content</th>
+<th>Writer</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>bluebubbles-bindings.json</code></td>
+<td><code>{ "chat:&lt;guid&gt;": { workspacePath | sessionId } }</code></td>
+<td><code>bb-channel bind/unbind</code></td>
+</tr>
+<tr>
+<td><code>bluebubbles-contacts.json</code></td>
+<td><code>{ "address": "display name" }</code></td>
+<td><code>bb-channel set-contact</code></td>
+</tr>
+<tr>
+<td><code>bluebubbles-media/</code></td>
+<td>inbound attachments (<code>&lt;guid&gt;-&lt;filename&gt;</code>)</td>
+<td>bridge auto-download</td>
+</tr>
+<tr>
+<td><code>heartbeat-targets.json</code></td>
+<td>heartbeat targets</td>
+<td>hand-edited</td>
+</tr>
+<tr>
+<td><code>cron-jobs.json</code></td>
+<td>cron jobs</td>
+<td>hand-edited</td>
+</tr>
+</tbody></table>
+<p><strong>Session resolution chain</strong>: <code>sessionId</code> direct → otherwise <code>workspacePath</code> → that workspace's <code>sessionIds[0]</code> (most recent session) → verify a live agent. With no live agent the message is dropped and logged (no fallback, no queue).</p>
+<h2>Updating the code</h2>
+<ol>
+<li>Edit <code>src/*.ts</code> → <code>npm run typecheck</code> → <code>git commit</code></li>
+<li>In <code>~/.dsh/profiles/web/cordis.patch.yml</code>, bump the corresponding row's <code>?v=N</code> by 1 and save</li>
+<li>In-process HMR does not reliably hot-replace the bridge module (stale fiber routes survive), so <strong>restarting DSH is the reliable load path</strong>; verify the version marker with <code>curl -X POST -d '{}' http://127.0.0.1:3080/bluebubbles/webhook</code> (<code>ok-vN</code>).</li>
+</ol>
+<h3>Diagnostics</h3>
+<p>With <code>BLUEBUBBLES_DEBUG=1</code> (env or <code>.env</code>), inbound events and drop reasons go to <code>~/.dsh/bluebubbles-debug.log</code> (serialized appends, no lost lines).</p>
+<h2>Security</h2>
+<ul>
+<li>The webhook route only accepts loopback sources; BlueBubbles webhooks have no signing mechanism.</li>
+<li>Injected content is plain text messages and triggers no tools; outbound sends always happen through explicit model tool calls.</li>
+<li>Neither the repository nor the patch file contains credentials.</li>
+</ul>
+<h2>Installation</h2>
+<p>As a profile bundle (consumers):</p>
+<pre><code>dsh plugin --profile web add github:vINyLogY/dsh-bluebubbles
+</code></pre>
+<p><code>dsh plugin add</code> forwards to pnpm and, because this package declares
+<code>dsh.bundle.patch</code>, automatically joins the profile's bundle stack — the
+shipped <code>cordis.patch.yml</code> inserts rows for all three plugins
+(<code>bluebubbles-bridge</code>, <code>dsh-heartbeat</code>, <code>dsh-cron</code>, resolved through the
+package exports map). A DSH restart loads them. The <code>bb-channel</code> CLI lands on
+the profile's <code>node_modules/.bin</code> via the package <code>bin</code> entry.</p>
+<p>For local development, insert absolute-path rows with a <code>?v=N</code> cache-buster
+into the profile's own <code>cordis.patch.yml</code> instead (see below).</p>
+<h2>Tech stack</h2>
+<ul>
+<li><strong>TypeScript</strong> (erasable syntax only), types from <code>@deepseek-ai/dsh-*</code> devDeps (0.1.0-rc.7 / cordis 4.0.1).</li>
+<li><strong>Zero build</strong>: Node ≥ 23.6 native type stripping; composition rows point straight at <code>src/index.ts</code>.</li>
+<li>The CLI is plain Node ESM (<code>bin/bb-channel.mjs</code>), zero dependencies, global <code>fetch</code>/<code>FormData</code> — deliberately <code>.mjs</code> so it runs on any modern Node and stays ESM wherever it is symlinked.</li>
+<li>Bootstrap: <code>npm install --cache ./.npm-cache &amp;&amp; npm run typecheck</code>.</li>
+</ul>

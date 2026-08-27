@@ -1,0 +1,105 @@
+<h1>dsh-yzj — 云之家 × DeepSeek Harness 插件</h1>
+<p>将云之家（Yunzhijia）的全部 CLI 能力搬进 DeepSeek Harness：<code>yzj-cli</code> 桥接、六域模型面工具（含写入确认流）、以及一套为云之家设计的浏览器 UI（工具结果富卡片 + 云之家工作台面板）。</p>
+<p>独立仓库的 bundle 包，通过 <code>dsh plugin --profile &lt;name&gt; add &lt;package&gt;</code> 安装，不修改 harness 本体。</p>
+<h2>包结构</h2>
+<table>
+<thead>
+<tr>
+<th>包</th>
+<th>角色</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><a href="https://github.com/GuoxinShan/dsh-yzj/blob/HEAD/packages/bridge/README.md"><code>packages/bridge</code></a></td>
+<td><code>@dsh-yzj/bridge</code> → <code>ctx.yzjBridge</code></td>
+<td>有界子进程通道：argv 数组直启 <code>yzj-cli</code>，无 shell 插值；复用机器上 <code>yzj-cli auth login</code> 的登录态与 keychain 凭据，harness 全程不接触 appSecret/accessToken</td>
+</tr>
+<tr>
+<td><a href="https://github.com/GuoxinShan/dsh-yzj/blob/HEAD/packages/tool-yzj/README.md"><code>packages/tool-yzj</code></a></td>
+<td><code>@dsh-yzj/tool-yzj</code>（注册到 <code>ctx.tools</code>）</td>
+<td>45 个模型面工具：doc（16）/ sheet（10）/ calendar（7）/ contact（3）/ im（3）/ file（2）/ <strong>todo（4）</strong>；每个工具输出有界 digest，并把裁剪后的结构化载荷经 <code>output.presentationMeta</code> 投影给 UI；todo 核心同时以 <code>ctx.yzjTodo</code> 服务暴露给浏览器面</td>
+</tr>
+<tr>
+<td><a href="https://github.com/GuoxinShan/dsh-yzj/blob/HEAD/packages/ui-yzj/README.md"><code>packages/ui-yzj</code></a></td>
+<td><code>@dsh-yzj/ui-yzj</code>（<code>dsh.client</code> 双面包）</td>
+<td>node half：<code>/yzj</code> Connection RPC 通道（49 端点，含面板直写 im-send/file-upload/file-data 与 robot-share-write）；browser half：<code>tool.call.toolview</code> keyed 富卡片 + 悬浮球入口 + 工作台 overlay 面板（四 tab + 真 IM composer）+ <strong>设置 → 云之家</strong>（机器人通道与记忆库管理，非页签）</td>
+</tr>
+<tr>
+<td><a href="https://github.com/GuoxinShan/dsh-yzj/blob/HEAD/packages/robot-yzj/README.md"><code>packages/robot-yzj</code></a></td>
+<td><code>@dsh-yzj/robot-yzj</code> → <code>ctx.yzjRobot</code></td>
+<td>机器人双向通道（R2.x host 面，设计见 <a href="https://github.com/GuoxinShan/dsh-yzj/blob/HEAD/docs/spec/robot-channel-plan.md">docs/spec/robot-channel-plan.md</a>）：实测协议 WS 入站（心跳/退避重连/msgId 去重）+ sendMsgUrl 出站（引用卡/分片/限流）；每 (机器人,用户) DM 一条持久 DSH session，ack-then-push 回推；bang 命令族 <code>!help/!status/!routines/!memory/!mute/!unmute/!restart/!configure</code> + <code>!fork &lt;群名|群ID&gt; &lt;指令&gt;</code>（跨群上下文交接）+ <code>!feedback</code>；群聊锚定 + 事件驱动推送 + 记忆注入 + intro 轮；allowFrom 默认仅 CLI 登录用户；<strong>DSH→机器人双向控制</strong>：<code>robot_status</code>（通道/cwd/会话表面）/<code>robot_notify</code>/<code>robot_continue</code>/<code>robot_fork</code>/<code>robot_share_write</code>、<code>robot_share_list</code>（群共享工作区；per-thread 私有 cwd + 群共享区三层模型）；<strong>chatnode 桥</strong>（<code>bridgeToken</code>/<code>bridgeTarget</code>/<code>guiUrl</code>）：ops 调度器经 <code>POST /yzj/chatnode</code> 复用本通道投递 digest，不持机器人凭据（见 <a href="https://github.com/GuoxinShan/dsh-yzj/blob/HEAD/docs/spec/routines-delivery.md">routines-delivery.md</a> §3.1）</td>
+</tr>
+<tr>
+<td><a href="https://github.com/GuoxinShan/dsh-yzj/blob/HEAD/packages/memory-yzj/README.md"><code>packages/memory-yzj</code></a></td>
+<td><code>@dsh-yzj/memory-yzj</code> → <code>ctx.yzjMemory</code></td>
+<td>记忆库组件（设计见 <a href="https://github.com/GuoxinShan/dsh-yzj/blob/HEAD/docs/spec/memory-vault-design.md">docs/spec/memory-vault-design.md</a>）：明文 Markdown vault（sections/entities/observations + log/index，默认 <code>$DSH_HOME/yzj-memory</code>，按 <code>user</code>/<code>group:&lt;id&gt;</code> scope 分仓）；5 个 <code>memory_*</code> 工具（observe/read/search/dream_load/dream_apply）；<code>systemPrompt.context</code> 有界注入（每 scope <code>inject_char_cap</code>，默认 6000）；<strong>dream 固化默认关闭</strong>——<code>dream.json</code> 运行时开关（面板可翻）+ 每日 <code>dailyAt</code> 进程内定时 + 「立即固化」，模型链＝dream 配置 &gt; 插件默认 &gt; harness 默认，rev 乐观锁保护人工编辑；<code>group:&lt;id&gt;</code> scope 留缝群组记忆</td>
+</tr>
+<tr>
+<td><a href="https://github.com/GuoxinShan/dsh-yzj/blob/HEAD/packages/model-yzj/README.md"><code>packages/model-yzj</code></a></td>
+<td><code>@dsh-yzj/model-yzj</code> → <code>ctx.yzjModels</code></td>
+<td>插件级默认模型（<code>~/.dsh/yzj-model.json</code>，明文热生效）：robot 模型解析链尾部（会话覆盖 &gt; 机器人配置 &gt; 通道默认 &gt; <strong>插件默认</strong> &gt; harness 默认）与 dream 执行器共用；<code>catalog()</code> 提供活跃路由的 provider/model 目录（面板选择器数据源）</td>
+</tr>
+<tr>
+<td><strong>根 = <code>@dsh-yzj/bundle</code></strong>（monobundle）</td>
+<td>可安装的 profile patch 层（<code>cordis.patch.yml</code> 在根，行名 <code>@dsh-yzj/bundle/&lt;row&gt;</code>）</td>
+<td>tsdown 聚合六包 host half 进 <code>lib/*.mjs</code>（互依内嵌、<code>@deepseek-ai/*</code> 外部化）+ <code>scripts/copy-client.mjs</code> 搬运 ui-yzj closure bundle 为 <code>lib/client.js</code>；<code>dsh.bundle</code> + <code>dsh.client</code> 声明；发布 = 构建 + tag（见 <a href="https://github.com/GuoxinShan/dsh-yzj/blob/HEAD/docs/release.md">docs/release.md</a>）</td>
+</tr>
+</tbody></table>
+<h2>安装</h2>
+<pre><code># 本机开发（harness checkout 下）：
+pnpm dsh plugin --profile web add -w link:&lt;本仓库路径&gt;
+
+# 对外安装（GitHub，monobundle 后一行可装）：
+dsh plugin --profile web add github:GuoxinShan/dsh-yzj#v0.1.0
+</code></pre>
+<p>安装后重启 GUI（源码启动时重启 <code>node --import tsx/esm apps/cli/src/bin.ts web</code>），右下角出现「云之家」悬浮球（hover 展开快捷坞）。</p>
+<blockquote>
+<p>本地开发用 <code>link:</code> 依赖指向 harness checkout；对外安装走 monobundle + git tag
+（根包依赖已全部指向 registry 的 <code>@deepseek-ai</code> rc.6 系列，见 docs/release.md）。</p>
+</blockquote>
+<h2>功能面</h2>
+<ul>
+<li><strong>doc</strong>：知识库列表/详情/新建、文档树浏览、文档详情、最近文档、创建/重命名/移动/删除、导入（md inline / 文件 reference）、下载链接、块级 list/insert/update/delete</li>
+<li><strong>sheet</strong>：多维表格创建、schema 读取、数据表 get/create/rename/delete、记录 list（筛选/搜索/分页）/create/update/delete</li>
+<li><strong>calendar</strong>：日程 list/get/create/update/delete（软取消或硬删）、参会人、空闲会议室</li>
+<li><strong>contact</strong>：whoami、通讯录搜索、用户详情</li>
+<li><strong>im</strong>：发消息（text/file/richText、@、回复、多图）、聊天记录、最近会话</li>
+<li><strong>file</strong>：上传（≤30MB、最多 5 并发）、下载（自动重命名 / 覆盖）</li>
+<li><strong>todo</strong>：语义化待办工具族（demo 阶段以多维表格「待办任务库」承载，首用自动开通）——<code>yzj_todo_list/create/update/complete</code>；稳定 ID 幂等、host 强制状态机、追加式推进日志；<strong>核心理念 tag 自由聚合</strong>（tag 可以是项目/群组/主题）；<strong>团队协作</strong>：面板任务库切换器一键切换个人/团队库或按需在企业知识库开通（权限标注），agent 写入跟随当前激活库，浏览器持久化选择；后端迁移架构见 <code>docs/migration/todo-backend-migration.md</code></li>
+<li><strong>memory</strong>：明文 Markdown 记忆库（<code>@dsh-yzj/memory-yzj</code>，设计见 <code>docs/spec/memory-vault-design.md</code>）——<code>memory_observe/read/search/dream_load/dream_apply</code> 五工具 + <code>systemPrompt.context</code> 有界注入；管理面在 <strong>设置 → 云之家 · 记忆库</strong>（sections/entities 展开、观察草稿区、注入统计、dream 固化日志、直写「记一条」、<strong>dream 开关/每日时间/模型选择/立即固化、插件默认模型设置</strong>）；dream 固化<strong>默认关闭</strong>（<code>dream.json</code> 运行时开关），开启后每日定时或手动触发，模型链＝dream 配置 &gt; 插件默认（<code>@dsh-yzj/model-yzj</code>，robot 通道同用）&gt; harness 默认；rev 乐观锁保护人工编辑；<code>group:&lt;id&gt;</code> scope 留缝群组记忆；dsh-routines routine 为备选路径（模板 <code>docs/spec/memory-dream-routine.yaml</code>）</li>
+<li><strong>定时任务（无人值守）</strong>：外部引擎 <strong>dsh-routines</strong>（专用 <code>ops</code> daemon profile，官方推荐形态）+ 自研 <code>ctx.chatnode</code> 投递——digest 经 <strong>chatnode 桥</strong>（<code>POST /yzj/chatnode</code>，loopback + Bearer 口令）由 web profile 的机器人通道推送进群，ops 侧不持任何机器人凭据（架构/决策/生产布局见 <code>docs/spec/routines-delivery.md</code>）；routine 为 YAML（<code>~/.dsh/routines/*.yaml</code>），到点起 headless 子进程独立会话，审计完整（<code>runs/&lt;runId&gt;.json</code> + digest）；生产部署：<code>start-prod.cmd</code> 统一入口 + 登录自启 ops daemon（幂等防双跑）</li>
+</ul>
+<h3>确认流（确认卡）</h3>
+<p>全部 25 个写工具按风险分级在 <code>tools/pre-execute</code> 返回 <code>ask</code>（标准确认 / 强确认），由 host 侧 <code>write-gate</code> 应答 <code>approval/request</code> waterfall 后，在浏览器渲染<strong>按 domain 分发的确认卡</strong>：参数全文（消息目标/文档落位/记录内容/日程时间/待办字段等，不折叠截断；目标以解析后的名称展示，ID 不再裸露）、风险徽标（删除类强确认红色卡片）、四动词（确认 / 取消 / 查看上下文 / 编辑）。<code>查看上下文</code> 打开面板并锚定对应 tab/消息（卡片↔面板双向跳转）；终态由官方工具事件承载（回放安全）。覆盖：<code>doc</code>（含 workspace/rename/move/import/block）、<code>sheet</code>（含 table/record）、<code>calendar</code>、<code>im message send</code>、<code>file upload/download</code>、<code>todo</code> 全部写操作。</p>
+<p><strong>写路径两分原则（待正式拍板成文）</strong>：确认卡门控的是 <strong>agent 发起的写</strong>；用户在面板的直接操作（IM composer 发消息，以及规划中的待办勾选/新建）即用户本人意志，不经确认卡，走 <code>/yzj</code> 直写端点（<code>im-send</code>/<code>file-upload</code>）。</p>
+<h2>与 yzj-cli skill 的关系</h2>
+<p>bundle 交付<strong>改造版 skill</strong>（<code>packages/bundle/skills/yzj-cli/SKILL.md</code>），安装到 <code>~/.agents/skills/yzj-cli/</code>（覆盖官方原版前请先备份；本机已备份为 <code>SKILL.md.orig</code>，<code>references/</code> 保留官方细节）：</p>
+<ul>
+<li><strong>红线</strong>：写操作必须走 <code>yzj_*</code> 工具（确认卡门控）；<strong>禁止 bash 直调 <code>yzj-cli</code> 执行写命令</strong>——官方原版 skill 会引导模型绕过确认卡直发消息（已真实复现并封堵，见 gap 文档验证证据）；</li>
+<li>仅当工具不可用（未登录、CLI 缺失、权限错误）时，bash 兜底只允许只读命令；</li>
+<li>保留官方红线：禁止编造 ID、写前先查、删除类复述目标。</li>
+</ul>
+<h3>UI 设计</h3>
+<ul>
+<li><strong>工具结果富卡片</strong>：<code>tool.call.toolview</code> keyed 注册全部 45 个工具名。pending 态从参数渲染标题；settled 态优先渲染结构化 <code>meta</code>（文档详情/列表、数据表 schema、记录表、日程时间线、消息气泡、联系人卡片、待办列表/动作摘要），无结构时回退到 digest 文本。失败态显示错误摘要。</li>
+<li><strong>云之家工作台</strong>：悬浮球唯一入口（hover 快捷坞、持久化显隐、真实未读角标轮询），四个 tab——知识库（双栏：左侧知识库/文档树<strong>含文件夹下钻（面包屑导航）</strong>，右侧文档内容预览）、日程（<strong>打开即落在今天</strong>、今天快捷跳转、日视图 + 详情）、会话（完整 IM：正序气泡、媒体/文件预览、表情渲染、回复、日期分割线、锚点定位、全部已读、真 composer 直发）、<strong>待办</strong>（逾期/今天/进行中/待办/已完成分桶 + #tag 聚合过滤 + 快捷新建（识别 <code>#标签</code> 与日期片段）+ 勾选完成/重开 + 整行拖入对话；未开通时一键开通）。未读数来自 CLI <code>unreadCount</code> + 本地已读持久化（刷新不回退 99+）；未读增长触发浏览器系统通知；<strong>Esc 逐层收起</strong>（表情面板→回复条→面板本体）。全条目可拖拽进 composer（全屏 drop overlay）成 chip + 上下文回源。</li>
+</ul>
+<h2>开发</h2>
+<pre><code>pnpm install          # link 依赖指向 ../deepseek-harness（相对路径，可移植）
+pnpm -r --sort build  # 全仓构建（tsc + tsdown）
+pnpm test             # vitest：bridge 单测 + 工具真实 CLI 冒烟 + 浏览器组件测试
+pnpm --filter @dsh-yzj/ui-yzj bundle   # 仅重建客户端 bundle（改 UI 后）
+</code></pre>
+<p>改了客户端 UI 后需重建 bundle 并重启 GUI（web profile 的 <code>hmr</code> 在 web-app 层被禁用）。浏览器验收脚本见 <code>.acceptance/</code>（<code>verify-real-data.mjs</code> 需已登录的 yzj-cli，<code>verify-windows.mjs</code> 验证无 CLI 降级）。</p>
+<h2>已知限制</h2>
+<ul>
+<li><strong>依赖解析</strong>：各包以 <code>link:</code> 相对路径依赖 harness checkout（<code>../../../deepseek-harness/...</code>）；发布前需替换为已发布的版本范围并验证 <code>dsh plugin add</code> 从 registry 安装。</li>
+<li><strong>确认卡状态不落会话日志</strong>：harness 对外部插件的自定义 session 事件类型无注册面，确认卡 pending/approved 瞬态由 host 内存表承载（SPA 刷新存活；host 重启降级为普通工具卡），终态由官方工具事件回放。</li>
+<li><strong>面板「我的」tab 已移除</strong>（原设计四 tab）：身份经 <code>yzj_whoami</code>、找人经 @ 候选；第四 tab 现为<strong>待办</strong>（是否另恢复通讯录浏览待拍板）。</li>
+<li><strong>拖入即处理快捷动作已移除</strong>：现为全屏 drop overlay 直接成 chip（v1.6 硬性要求 4 曾实现后删除，终局与否待拍板）。</li>
+<li><strong>无群搜索/消息搜索</strong>：沿用 CLI 能力面（最近会话翻页定位）。</li>
+<li><strong><code>file download</code> 只回传摘要</strong>：CLI 的 <code>downloaded N bytes to &lt;path&gt;</code> 文本输出不携带结构化路径，卡片回退文本模式。</li>
+<li><strong>待办为 demo 阶段</strong>：数据存于多维表格「待办任务库」（个人知识库，首用自动开通）；负责人/标签因 CLI 字段写入限制降级为文本形态；原生后端迁移方案见 <code>docs/migration/todo-backend-migration.md</code>。</li>
+<li><strong>无独立文件夹概念</strong>：归类用父文档挂载，与云之家产品语义一致。</li>
+</ul>

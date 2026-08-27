@@ -1,0 +1,219 @@
+<h1>dsh-cloudflare-access</h1>
+<p>Cloudflare Access JWT verification and remote privileged authorization for <a href="https://github.com/deepseek-ai/deepseek-harness">DeepSeek Harness</a>.</p>
+<p>This is a dual-face <strong>Profile Bundle + Web Client</strong> plugin. It does <strong>not</strong> replace Cloudflare Access. Identity stays in Access. The plugin re-validates <code>Cf-Access-Jwt-Assertion</code> at the DSH Origin and maps a successful result onto DSH remote authorization so Settings, Credentials, Agent Preset management, and model discovery can work from <code>https://dsh.example.com</code>.</p>
+<p>It does not ship a login page, password store, MFA, session table, or Cloudflare API client.</p>
+<p>Live-tested against DeepSeek Harness <strong><code>0.1.1-rc.2</code></strong>. Do not assume newer DSH releases work until the <a href="#compatibility-matrix">compatibility matrix</a> is updated.</p>
+<h2>Security model</h2>
+<p>Remote privileged requests must pass <strong>both</strong>:</p>
+<ol>
+<li>DSH Host / Origin / <code>sec-fetch-site</code> checks (<code>--trusted-host</code> remains mandatory).</li>
+<li>A valid Cloudflare Access JWT (signature, <code>iss</code>, <code>aud</code>, expiry).</li>
+</ol>
+<p>A valid JWT never authorizes an arbitrary Host or Origin.</p>
+<p>Loopback (<code>localhost</code> / <code>127.0.0.1</code> / <code>::1</code>) does not require a JWT, so <code>SSH Tunnel → localhost → DSH</code> keeps working.</p>
+<p>Remote privileged APIs always require a JWT in v0.1. There is no switch to disable that.</p>
+<p>Recommended deployment:</p>
+<pre><code>Internet
+   ↓
+Cloudflare Access
+   ↓
+Cloudflare Proxy
+   ↓
+Origin Network Controls
+   ↓
+Reverse Proxy
+   ↓
+DeepSeek Harness
+   ↓
+dsh-cloudflare-access
+</code></pre>
+<p>Origin should only accept Cloudflare (or equivalent) ingress. Installing this plugin is not a reason to put DSH on the public internet.</p>
+<h2>Install</h2>
+<p>Requires a DeepSeek Harness <strong>Web</strong> profile.</p>
+<pre><code>dsh plugin --profile web add dsh-cloudflare-access
+</code></pre>
+<p>The package is on <a href="https://www.npmjs.com/package/dsh-cloudflare-access">npm</a>. To install an unreleased Git commit instead:</p>
+<pre><code>dsh plugin --profile web add github:Luawig/dsh-cloudflare-access
+</code></pre>
+<p>The Git tree ships prebuilt <code>lib/index.js</code> and <code>lib/client.js</code>, so a Git install does not need to run this package's <code>prepare</code> script.</p>
+<p>Restart DSH. The package declares <code>dsh.bundle</code> and <code>dsh.client</code>, so the Web profile bundle stack and browser module graph pick it up. You do not edit <code>$DSH_HOME/profiles/web/cordis.patch.yml</code> by hand, and you do not patch DSH itself.</p>
+<h3>Activate / verify</h3>
+<pre><code>dsh --profile web --dump-config
+</code></pre>
+<p>Confirm a bundle layer named <code>dsh-cloudflare-access</code> and a plugin row <code>id: cloudflare-access</code>. After restart, open the remote Web UI through Cloudflare Access and load Settings.</p>
+<h3>Disable / uninstall</h3>
+<pre><code>dsh plugin --profile web remove dsh-cloudflare-access
+</code></pre>
+<p>After unload, DSH restores the official remote privileged loopback pin. Restart if the running process still has the old fiber.</p>
+<h2>Cloudflare Access configuration</h2>
+<ol>
+<li>Put the DSH Web origin behind a Cloudflare Access application.</li>
+<li>Copy the application <strong>Audience</strong> (<code>aud</code>) and your team domain, for example <code>https://example.cloudflareaccess.com</code>.</li>
+<li>Cloudflare injects <code>Cf-Access-Jwt-Assertion</code> on authenticated requests. The plugin verifies that header only. It does not trust the <code>CF_Authorization</code> cookie.</li>
+</ol>
+<p>Issuer and JWKS URL are derived:</p>
+<pre><code>issuer  = teamDomain
+JWKS    = &lt;teamDomain&gt;/cdn-cgi/access/certs
+</code></pre>
+<p>You do not configure <code>issuer</code> or <code>jwksUrl</code> separately. Multiple audiences are supported.</p>
+<h2>DSH configuration</h2>
+<p>Pin team domain and audiences with environment variables in production. Env locks the trust root so a remote Settings session cannot retarget another Cloudflare team.</p>
+<pre><code>dsh --profile web --trusted-host dsh.example.com
+</code></pre>
+<table>
+<thead>
+<tr>
+<th>Variable</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>DSH_CF_ACCESS_TEAM_DOMAIN</code></td>
+<td>Team domain / issuer</td>
+</tr>
+<tr>
+<td><code>DSH_CF_ACCESS_AUDIENCES</code></td>
+<td>Comma-separated audiences</td>
+</tr>
+<tr>
+<td><code>DSH_CF_ACCESS_ORDINARY_MODE</code></td>
+<td><code>off</code> | <code>optional</code> | <code>required</code></td>
+</tr>
+</tbody></table>
+<p>If a variable exists, even as an empty string, that field is locked. Environment variables override Cordis / bundle config.</p>
+<p>Cordis overlay (only used when the matching env var is unset):</p>
+<pre><code>cloudflare:
+  teamDomain: https://example.cloudflareaccess.com
+  audiences:
+    - xxxxxxxxxxxxxxxxx
+auth:
+  ordinary: off
+</code></pre>
+<p>Missing <code>teamDomain</code> or <code>audiences</code>: the plugin still starts, loopback is unchanged, remote privileged APIs are denied.</p>
+<h2>systemd example</h2>
+<pre><code>[Service]
+Environment=DSH_CF_ACCESS_TEAM_DOMAIN=https://example.cloudflareaccess.com
+Environment=DSH_CF_ACCESS_AUDIENCES=xxxxxxxxxxxxxxxxxxxxxxxxx
+Environment=DSH_CF_ACCESS_ORDINARY_MODE=off
+ExecStart=/usr/bin/dsh --profile web --trusted-host dsh.example.com
+</code></pre>
+<h2>nginx / Cloudflare deployment</h2>
+<pre><code>Browser
+   ↓
+Cloudflare Access + Proxy (TLS, JWT injection)
+   ↓
+Origin allowlist (Cloudflare IP ranges or authenticated origin pulls)
+   ↓
+nginx (TLS offload optional; proxy_pass to DSH)
+   ↓
+DSH 127.0.0.1:3080 or LAN bind with --trusted-host
+</code></pre>
+<p>nginx should forward <code>Host</code>, <code>Origin</code>, and <code>Cf-Access-Jwt-Assertion</code>. Do not strip the assertion header. Do not require the plugin to manage nginx.</p>
+<h2>Ordinary API modes</h2>
+<p><code>auth.ordinary</code> applies only to <strong>remote non-privileged</strong> APIs (including <code>/api/events.mux</code> and <code>/api/events.host</code>). Loopback ignores it. Host/Origin always runs first.</p>
+<table>
+<thead>
+<tr>
+<th>Mode</th>
+<th>No JWT</th>
+<th>Valid JWT</th>
+<th>Invalid JWT</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>off</code> (default)</td>
+<td>DSH original policy</td>
+<td>ignored</td>
+<td>ignored</td>
+</tr>
+<tr>
+<td><code>optional</code></td>
+<td>DSH original policy</td>
+<td>allow</td>
+<td>deny</td>
+</tr>
+<tr>
+<td><code>required</code></td>
+<td>deny</td>
+<td>allow</td>
+<td>deny</td>
+</tr>
+</tbody></table>
+<p>Privileged remote APIs always require a valid JWT, regardless of this setting.</p>
+<h2>Troubleshooting</h2>
+<table>
+<thead>
+<tr>
+<th>Symptom</th>
+<th>Check</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>Remote Settings still unavailable</td>
+<td>Confirm Access is in front of the site; hard-refresh the browser so <code>__DSH_BOOT__</code> picks up <code>immediately: true</code>; confirm the assertion header reaches Origin.</td>
+</tr>
+<tr>
+<td>Settings UI never calls <code>settings.describe</code></td>
+<td>The client module must load before <code>ui-settings</code>. This package sets <code>dsh.client.immediately: true</code> and injects <code>@deepseek-ai/dsh-client-connection</code>. Reinstall the plugin if an older tarball omitted that.</td>
+</tr>
+<tr>
+<td>401 on <code>settings.*</code></td>
+<td>Header missing. Inspect nginx/<code>cf-access</code> forwarding, not cookies.</td>
+</tr>
+<tr>
+<td>403 on <code>settings.*</code></td>
+<td>Invalid <code>iss</code>/<code>aud</code>/signature/expiry, unconfigured plugin, or Host/Origin mismatch.</td>
+</tr>
+<tr>
+<td>Loopback Settings broken</td>
+<td>Unload the plugin; loopback must not require JWT. File a bug if it does.</td>
+</tr>
+<tr>
+<td>JWKS / key rotation failures</td>
+<td>Confirm <code>https://&lt;team&gt;/cdn-cgi/access/certs</code> is reachable from Origin. No config change should be required after Cloudflare rotates keys.</td>
+</tr>
+<tr>
+<td>Logs</td>
+<td>Reasons are categories only (<code>expired</code>, <code>invalid_signature</code>, <code>issuer_mismatch</code>, <code>audience_mismatch</code>, <code>missing_token</code>, <code>jwks_unavailable</code>, <code>unconfigured</code>). Tokens are never logged.</td>
+</tr>
+</tbody></table>
+<h2>Compatibility Matrix</h2>
+<table>
+<thead>
+<tr>
+<th>Plugin</th>
+<th>DSH</th>
+<th>Status</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>0.1.x</td>
+<td>0.1.1-rc.2</td>
+<td>Live-tested (Web profile, remote Settings / Credentials)</td>
+</tr>
+<tr>
+<td>0.1.x</td>
+<td>0.1.0-rc.5</td>
+<td>Source research for hooks; not the live install target</td>
+</tr>
+</tbody></table>
+<p>Do not assume newer DSH releases work until this matrix is updated.</p>
+<h2>Security Considerations</h2>
+<ul>
+<li>Additional layer, not a replacement. See <a href="https://github.com/Luawig/dsh-cloudflare-access/blob/HEAD/SECURITY.md">SECURITY.md</a>.</li>
+<li>Fail closed: JWKS outages deny remote privileged traffic.</li>
+<li>v0.1 does not authorize <code>host.pickDirectory</code> or <code>host.openPath</code>. The client capability wrap may still show some native-host UI; those RPCs remain rejected.</li>
+<li>Unloading the plugin must restore DSH's official remote privileged pin.</li>
+</ul>
+<h2>Develop</h2>
+<pre><code>pnpm install
+pnpm test
+pnpm typecheck
+pnpm pack:check
+</code></pre>
+<p>After source changes, run <code>pnpm build</code> so committed <code>lib/</code> matches <code>src/</code>. Local development install:</p>
+<pre><code>dsh plugin --profile web add ./
+</code></pre>
+<p>Plugin packaging follows <a href="https://dsh.pub/develop-plugin.md">dsh.pub/develop-plugin.md</a>. This repository is not claiming a dsh.pub listing or a security audit. Maintainers can later add the GitHub topic <code>dsh-plugin</code> and submit the public commit to the community catalog.</p>
+<h2>License</h2>
+<p>MIT</p>

@@ -1,0 +1,95 @@
+<h1>dsh-usage-board</h1>
+<p>DSH（DeepSeek Harness / Cordis）的用量·成本·诊断面板插件：实时采集 token/耗时/错误指标，冷启动回溯全部历史会话，按 Sub-agent DAG 聚合，需要时按指针回查原文。</p>
+<ul>
+<li><strong>架构</strong>：CQRS——DSH 会话文件是只读的 Write Model，本插件维护的 SQLite 是可重建的 Read Model。</li>
+<li><strong>双层读模型</strong>：暖层 SQLite 物化汇总 + 热层进程内不可变快照，UI 一次 fetch 拿到渲染就绪的全帧。</li>
+<li><strong>零依赖</strong>：零运行时依赖、零 Worker、零本地编译；仅用 Node ≥ 22.5 内置 <code>node:sqlite</code>。</li>
+</ul>
+<h2>快速上手</h2>
+<pre><code>npm install      # 只装 devDependencies（typescript 与 @types/node）
+npm test         # node --test，全量测试（无网络、无外部进程）
+npm run typecheck
+</code></pre>
+<p>作为库嵌入（结构化 HostContext，无需真实 Cordis 运行时）：</p>
+<pre><code>import { createEngine } from './src/index.ts'
+
+const engine = createEngine(ctx, { dbPath, sessionsRoot })
+await engine.ready                       // 冷启动回溯完成（已就绪则秒开跳过）
+const rollup = engine.query.getRollupBySession(rootSessionId)
+const heat  = engine.query.getHeatmapData(12)
+const fails = engine.query.getTimelineAnomalies(100)
+const text  = engine.query.loadTurnDetails({ sessionFilePath, turnIndex })
+await engine.dispose()                   // 逆序清理，幂等
+</code></pre>
+<h2>双层读模型与快照端点</h2>
+<p>第二阶段在查询之上加预处理层：</p>
+<ul>
+<li><strong>暖层</strong>：SQLite 物化汇总表 <code>daily_rollups</code> / <code>session_rollups</code>，按脏分区从 turns 整段重算；金额永不落库，由价目表现算。</li>
+<li><strong>热层</strong>：进程内不可变快照主帧（零 Worker），一次 <code>get()</code> 拿到渲染就绪的全部汇总——KPI 总账、84 天热力图、24 小时峰谷剖面、byModel、最近会话、异常计数、计价信息（含 <code>nextSwitchEpochMs</code> 与反事实省额）、余额块。</li>
+<li><strong>revision 条件请求</strong>：写入事务原子递增 <code>data_revision</code>；UI 携带旧 revision 轮询，无新数据时端点应答 body 级 <code>unchanged</code>，不触发重渲染。</li>
+</ul>
+<p>注入 <code>ctx.webServer</code> 时自动注册端点（回环 same-origin 限定；未注入时引擎作为库完整可用）：</p>
+<table>
+<thead>
+<tr>
+<th>端点</th>
+<th>语义</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>GET /api/usage-dashboard/snapshot?rev=N</code></td>
+<td>rev 命中 → <code>{unchanged:true, revision}</code>；否则全量主帧（含 <code>snapshotVersion</code>）</td>
+</tr>
+<tr>
+<td><code>GET /api/usage-dashboard/snapshot?refresh=1</code></td>
+<td>余额透传：旁路 TTL 强制出网一次，必答全量新余额块</td>
+</tr>
+<tr>
+<td><code>GET /api/usage-dashboard/turns?limit=N&amp;format=csv</code></td>
+<td>最近 turn 详情帧（垃圾值/&lt;1 回默认 500、&gt;500 钳到 500）；行含 <code>toolMs</code>（按 step 聚合工具时长，无调用为 null）与 <code>delegationDepth</code>（子代理深度）；<code>format=csv</code> 出 CSV（列序 = JSON 字段序）</td>
+</tr>
+<tr>
+<td><code>GET /api/usage-dashboard/turns?session_id=&amp;root_session_id=</code></td>
+<td>按会话过滤（可选，可同给 = 交集）：<code>session_id</code> 精确匹配该会话、<code>root_session_id</code> 匹配整棵会话树；垃圾值视同缺省 → 全库最近 N 条</td>
+</tr>
+</tbody></table>
+<h2>UI 层</h2>
+<p>浏览器半（<code>src/client/</code> → <code>lib/client.js</code>）经宿主 slot 系统挂载，只消费上表端点，不碰文件系统与 SQLite：</p>
+<ul>
+<li><strong>挂载点</strong>（宿主 slot 注入，共三个）：<ul>
+<li><code>conversation.view</code> —— 会话页 "Usage" Tab（该会话树根聚合：KPI、五桶构成、模型占比、step 耗时瀑布）；</li>
+<li><code>sidebar.footer.action</code> —— 侧栏底栏图标按钮，开合大盘；</li>
+<li><code>shell.overlay</code> —— 全屏大盘（余额卡 + 可烧天数、异常与反事实、84 天热力图、byModel、24 小时剖面、最近会话、详情表 + Export CSV）。</li>
+</ul>
+</li>
+<li><strong>数据层</strong>（<code>src/client/store/</code>，纯函数、node --test 直测）：<strong>手动刷新、无自动轮询</strong>——快照 <code>?rev=</code> 条件请求（<code>unchanged</code> 应答不重渲染），<code>?refresh=1</code> 强制余额出网；turns 懒加载（<code>?limit=&amp;session_id=&amp;root_session_id=</code>，CSV 同端点）；投影形选择器把真实帧投影成组件消费形状。</li>
+<li><strong>开发工作流</strong>：<pre><code>npm run build                                   # tsdown 双产物：lib/index.js（node 半）+ lib/client.js（浏览器半）
+npm run dev                                     # tsdown --watch（配合宿主 client-hmr 热替换）
+dsh plugin --profile web add "$(pwd)"           # 安装到 web profile（pnpm link + bundle 清单登记）
+dsh --profile web --port 3099                   # 起宿主；UI 打开 http://127.0.0.1:3099
+</code></pre>
+开发态改 <code>src/client/**</code> → watch 重编 <code>lib/client.js</code> → 宿主 stat-poll 触发 <code>clientModules.rebuilt</code> → SSE 推浏览器热替换；生产态 <code>dsh web</code> 按 rev（bundle sha256 前 12 位）服务 <code>/plugins/&lt;id&gt;/client.js?rev=</code>，内容变更即换址免缓存。</li>
+</ul>
+<h2>余额查询配置</h2>
+<p>大盘的余额卡读取 DeepSeek 官方 <code>GET /user/balance</code>，key 复用宿主凭证：在「设置 → 模型」里配置 <code>DEEPSEEK_API_KEY</code>，或写入 <code>~/.dsh/.credentials.yaml</code>（文件权限须 0600，顶层 <code>DEEPSEEK_API_KEY: &lt;key&gt;</code>）。未配置时余额块显示占位态，其余功能不受影响（引擎中唯一出网组件就是余额服务，其余一切纯本地）。</p>
+<h2>数据位置</h2>
+<table>
+<thead>
+<tr>
+<th>内容</th>
+<th>路径</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>投影库（Read Model）</td>
+<td><code>~/.dsh/data/usage.sqlite</code>（0600，WAL）</td>
+</tr>
+<tr>
+<td>真相源（Write Model，只读）</td>
+<td><code>~/.dsh/sessions/&lt;projectKey&gt;/&lt;sessionId&gt;/session.jsonl.zstd</code></td>
+</tr>
+</tbody></table>
+<h2>删库重建</h2>
+<p>投影库可随时删除（先停用插件，再 <code>rm ~/.dsh/data/usage.sqlite*</code>）。下次启动 backfill 会重扫全部历史会话重建投影；正在进行的活会话由事件总线继续增量补齐。Write Model 永远不要删。</p>
+<h2>License</h2>
+<p><a href="https://github.com/zhm20001/dsh-usage-board/blob/HEAD/LICENSE">MIT</a></p>

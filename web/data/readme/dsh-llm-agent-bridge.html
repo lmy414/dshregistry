@@ -1,0 +1,220 @@
+<h1><code>dsh-llm-agent-bridge</code></h1>
+<p>Brings vendor agent SDKs into <a href="https://github.com/deepseek-ai/deepseek-harness">DeepSeek Harness</a>
+as selectable LLM providers. Today that is <strong>Claude</strong>, served through Anthropic's
+official <a href="https://code.claude.com/docs/en/agent-sdk">Claude Agent SDK</a>.</p>
+<p>Pick it from the model dropdown in <strong>any</strong> DSH mode — Standard, PTC, Creator,
+Minimal, or your own preset. DSH keeps its prompt, its tools, its approvals and
+its conversation history; Claude does the thinking.</p>
+<h2>How it works</h2>
+<p>DSH's LLM service routes a call to whichever adapter owns <code>options.provider</code>.
+This plugin registers one adapter under the provider id <code>claude</code>, and
+that adapter:</p>
+<ol>
+<li>Creates (or resumes) a Claude Agent SDK session keyed to the DSH session.</li>
+<li>Passes <strong>DSH's</strong> assembled system prompt through as the SDK's <code>systemPrompt</code>,
+with <code>settingSources: []</code> so no <code>~/.claude</code> settings, <code>CLAUDE.md</code>, skills, or
+hooks load on top of it.</li>
+<li>Hands DSH's tools to Claude as an in-process MCP server (<code>mcp__dsh__*</code>) and
+passes <code>tools: []</code> so Claude Code's own built-ins are removed from context —
+<code>allowedTools</code> alone only pre-approves, it does not scope, and the built-ins
+would win. <code>toolAliases</code> redirects built-in names at the DSH tool of the same
+name, since DSH's prompt refers to its tools bare ("use the read tool").</li>
+<li><strong>Hands tool calls back to DSH to execute.</strong> The MCP handler does no work: it
+parks, announces the call, and the adapter emits it as a DSH <code>tool-call</code>
+chunk with a <code>tool-calls</code> finish. DSH's own agent loop then runs the tool
+under its sandbox and approval policy, records <code>tool/call</code> and <code>tool/result</code>
+in its trajectory, opens the next step, and calls back with the result —
+which resumes the same Claude query rather than starting a new one.
+The bridged tools <em>are</em> listed in <code>allowedTools</code>, which pre-approves them at
+the SDK layer on purpose: they run through DSH's tool runtime, which resolves
+"ask" decisions through its own approval seam against the session's sandbox
+policy. Gating at the SDK layer as well would prompt on every call regardless
+of that policy — workspace-write included — which is not how DSH treats its
+own agent's calls.</li>
+<li>Projects Claude's reasoning and text into DSH's native stream chunk
+vocabulary, so the conversation renders like any other model's, and reports
+the turn's token usage and the model's context window so DSH's own counters —
+input, output, cache-hit rate, tokens/sec, context pressure — work for Claude
+rows exactly as they do for its own. Usage arrives once per turn, on its last
+step, since one Claude query spans every step of that turn. The plugin
+contributes no client bundle and no renderer of its own: tool work is DSH's
+to display, from its own trajectory.</li>
+</ol>
+<p>Claude still decides what to call and when; DSH executes. One DSH step per model
+call, exactly as with DSH's own models — which is what puts Claude's tool calls
+in the trajectory and keeps the conversation history shared between providers.</p>
+<h2>Install</h2>
+<pre><code>npx @deepseek-ai/dsh plugin --profile web add github:daveycodez/dsh-llm-agent-bridge#main
+npx @deepseek-ai/dsh web
+</code></pre>
+<p>Authenticate Claude Code normally first (<code>claude</code>, then sign in). This plugin
+never sees your credentials — see below.</p>
+<h2>Plan usage in the composer</h2>
+<p>A usage ring sits in the composer's tool row while a Claude row is selected,
+reporting the subscription limit that matters for the current model and opening
+a panel of every reported window:</p>
+<pre><code>Plan usage limits · Max
+  5-hour limit          Resets in 1 hr 8 min    10%
+  Weekly · all models   Resets in 19 hr 18 min  81%
+  Weekly · Fable        Resets in 19 hr 18 min  100%
+</code></pre>
+<p>The numbers come from the Agent SDK's own usage reporting — the same source as
+Claude Code's <code>/usage</code> — served to the browser over this plugin's <code>/agent-bridge</code>
+channel. No credential is read and no other plugin is required.</p>
+<p>Reading them costs a Claude Code control session, so the answer is cached on the
+host and again in the browser, with no idle polling: the ring revalidates when
+you interact with it or while a turn runs, never on a timer. The underlying SDK
+method is explicitly experimental, so a failure to read leaves the ring hidden
+rather than failing anything.</p>
+<h2>Thinking</h2>
+<p>Turns request <code>thinking: { type: "adaptive", display: "summarized" }</code>. Without
+that <code>display</code>, the models stream thinking blocks whose text is empty — a
+signature and a token count, nothing to render — which is why reasoning appeared
+to be missing for every model except Haiku. With it:</p>
+<table>
+<thead>
+<tr>
+<th>model</th>
+<th>reasoning text without it</th>
+<th>with it</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>Opus 5</td>
+<td>0 chars</td>
+<td>140</td>
+</tr>
+<tr>
+<td>Sonnet 5</td>
+<td>0 chars</td>
+<td>1,178</td>
+</tr>
+<tr>
+<td>Haiku 4.5</td>
+<td>~340</td>
+<td>680</td>
+</tr>
+</tbody></table>
+<p>It composes with the effort selector rather than replacing it: effort still
+decides how much thinking happens — Sonnet at <code>low</code> does none at all, at <code>high</code>
+it thinks and the summary comes through — while <code>display</code> decides whether you
+can read it. Adaptive thinking is genuinely variable, so a given turn may think
+little or not at all; <code>reasoningTokens</code> in the usage counter tells you which.</p>
+<p>Set <code>thinkingSummaries: false</code> on the plugin row to leave the SDK's own default
+alone.</p>
+<h2>Switching models mid-session</h2>
+<p>The Claude session only knows the turns it answered. When it is created, or when
+another model answered turns while it was deselected, the adapter prepends those
+turns as a <code>&lt;dsh-context&gt;</code> block so switching providers mid-session does
+not silently drop context.</p>
+<p>Tool calls and their results live in DSH's own message history, so a later
+DeepSeek turn sees the actual work rather than a prose summary.</p>
+<p>One known limit: <strong>DSH-side rewrites are not replayed.</strong> If DSH compacts or edits
+earlier turns after Claude has seen them, the Claude session keeps the original.</p>
+<h2>DSH's session telemetry</h2>
+<p><code>@deepseek-ai/dsh-base</code> mounts an OTLP exporter aimed at
+<code>harness-telemetry.deepseeksvc.com</code>. It is off by default, but when it is on,
+DSH's own note on the row says uploads carry session-log records "with no
+session-telemetry/record redaction rule, so exports are the raw captured copy" —
+and with this plugin installed, that copy contains Claude's output.</p>
+<p><strong>The plugin turns a live exporter off at load — before any Claude turn is
+possible</strong> — and says so in the log:
+it drains the pipeline through the backend's own <code>shutdown()</code>, then unmounts the
+row so capture stops as well. Reading the mounted backend is exact — it sees the
+exporter whatever switched it on, which a scan of environment and config layers
+cannot promise.</p>
+<p>Afterwards it re-reads the host rather than trusting its own teardown, and if an
+exporter survived, the turn fails instead. <code>disable</code> degrades to <code>refuse</code> rather
+than reporting a success it cannot verify. The test suite mounts the real
+<code>dsh-session-telemetry-otel</code> backend in <code>FULL</code> against a loopback collector and
+asserts both that the row is gone from the host and that nothing reached the
+collector.</p>
+<p>What this does not cover: an exporter some other plugin adds. It runs before the
+adapter is registered, so nothing Claude produced can have been captured or
+queued beforehand — but it reaches the row DSH ships, not an arbitrary one.
+Setting <code>DSH_TELEMETRY_DISABLED=1</code> in the launching shell prevents the exporter
+from ever being constructed, which is strictly better if you control the
+environment.</p>
+<p>Configure the behaviour on the plugin row if the default does not suit:</p>
+<pre><code>- id: agent-bridge-llm
+  name: 'dsh-llm-agent-bridge'
+  config:
+    telemetry: disable   # default; `refuse` fails the turn instead, `ignore` skips the guard
+</code></pre>
+<p><code>refuse</code> is the choice for anyone who would rather the plugin never touch host
+configuration: turns fail with an inline error naming what to switch off.</p>
+<h2>Tracing a stalled turn</h2>
+<p>The handoff spans two <code>stream()</code> calls with a live Claude query parked between
+them, so a stall has no stack to show. Set <code>DSH_AGENT_BRIDGE_DEBUG=1</code> to record
+each decision to <code>$DSH_HOME/plugin-data/agent-bridge-debug.log</code> (or give it a
+path of your own):</p>
+<pre><code>DSH_AGENT_BRIDGE_DEBUG=1 dsh web
+</code></pre>
+<p>Each line names the parked call ids and the tool-result ids that came back, so a
+mismatch is visible directly. A resumed turn that stays silent fails after five
+minutes rather than hanging; <code>DSH_AGENT_BRIDGE_RESUME_TIMEOUT_MS</code> overrides that.</p>
+<h2>Anthropic terms compliance</h2>
+<p>This plugin uses your Claude subscription the way Anthropic's
+<a href="https://code.claude.com/docs/en/legal-and-compliance">legal and compliance page</a>
+requires: it never collects, stores, or intermediates your credentials.</p>
+<ul>
+<li>The <strong>only</strong> route to Anthropic is <code>await import("@anthropic-ai/claude-agent-sdk")</code>
+— the official SDK, which runs the published Claude Code binary. That binary
+performs its own authentication and token refresh, exactly as when you run
+<code>claude</code> yourself.</li>
+<li>No source file reads <code>~/.claude/.credentials.json</code>, the macOS Keychain,
+<code>CLAUDE_CODE_OAUTH_TOKEN</code>, or any API-key environment variable.</li>
+<li>No source file constructs an <code>Authorization</code> header or calls
+<code>api.anthropic.com</code> directly.</li>
+<li>The CLI fallback spawns <code>claude</code> with this process's environment and nothing
+else: there is no per-turn env override, so no caller can inject
+<code>ANTHROPIC_BASE_URL</code> or an API key into the binary that holds your login.</li>
+</ul>
+<p>Verify it yourself:</p>
+<pre><code>grep -rnE "credentials\.json|find-generic-password|CLAUDE_CODE_OAUTH_TOKEN|ANTHROPIC_API_KEY|Authorization|api\.anthropic\.com" *.js *.mjs internal src
+</code></pre>
+<h3>What this does not claim</h3>
+<p>Running this locally, on your own subscription, signed in through Anthropic's own
+flow, matches the carve-out on that page for "an end user signing in to the
+unmodified Claude Code binary with their own Claude subscription". Publishing a
+plugin whose function is to route Agent SDK traffic through subscription OAuth
+is addressed by a different sentence in the same section — developers "should use
+API key authentication through Claude Console". Both are true at once, and the
+second is advisory rather than prohibitive. Only Anthropic can rule on it; this
+README describes what the code does, not what they permit.</p>
+<p>An API key resolves the question outright: export <code>ANTHROPIC_API_KEY</code> in the
+shell that launches DSH and the binary uses it, with no change to this plugin.</p>
+<p>Two things that remain your responsibility:</p>
+<ul>
+<li><p><strong>Keep DSH bound to localhost.</strong> A DSH instance other people can reach means
+your subscription is serving their requests, which the terms prohibit. DSH
+refuses <code>--host 0.0.0.0</code> outright ("it would expose remote code execution to
+the network"), but that guard matches the literal string only — a LAN address
+or <code>::</code> still binds, and a tunnel pointed at the web port bypasses it
+entirely. Don't tunnel DSH.</p>
+</li>
+<li><p><strong>Use an API key for unattended workloads.</strong> Subscription limits assume
+"ordinary, individual usage"; batch or scheduled runs belong on a key.</p>
+</li>
+<li><p><strong>Telemetry is turned off for you.</strong> See below — you do not have to configure
+anything, though <code>DSH_TELEMETRY_DISABLED=1</code> in the launching shell is still
+the version with no gap at all. <code>@deepseek-ai/dsh-base</code> mounts an OTLP exporter
+pointed at <code>harness-telemetry.deepseeksvc.com</code>. It defaults to <code>DISABLED</code> and
+stays off unless you set <code>DSH_TELEMETRY_MODE</code>, but DSH's own note says
+uploading mirrors session-log records "with no session-telemetry/record
+redaction rule, so exports are the raw captured copy." With this plugin
+installed, that raw copy contains Claude's outputs — and Anthropic's Consumer
+Terms prohibit using the Services to develop or train competing models. Don't
+set <code>DSH_TELEMETRY_MODE</code>; to opt out irrevocably, set <code>DSH_TELEMETRY_DISABLED</code>
+to any non-empty value, which patches the row off entirely.</p>
+<p>Check your own posture:</p>
+<pre><code>env | grep DSH_TELEMETRY; grep -i telemetry "${DSH_HOME:-$HOME/.dsh}/settings.yaml"
+</code></pre>
+</li>
+</ul>
+<h2>Credits</h2>
+<p>Forked from <a href="https://github.com/yangbobo2021/relay-dsh-plugin-claude"><code>relay-dsh-plugin-claude</code></a>
+by yangbobo2021 (MIT), which integrates Claude Code as its own DSH <em>mode</em>. This
+fork takes the opposite trade: Claude as a <em>provider</em> usable from every mode,
+with DSH owning the prompt and tools.</p>
+<p>MIT.</p>

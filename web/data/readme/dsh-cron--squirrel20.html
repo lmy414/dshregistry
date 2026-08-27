@@ -1,0 +1,136 @@
+<h1>dsh-cron</h1>
+<p>English | <a href="https://github.com/squirrel20/dsh-cron/blob/HEAD/README.zh-CN.md">简体中文</a></p>
+<p>Unattended scheduled-jobs plugin for DeepSeek Harness (dsh): run <strong>agent tasks</strong> (spawn a one-shot agent to execute a prompt through the full dsh toolchain) or <strong>command tasks</strong> (run a script directly) on a cron expression, a fixed interval, or a one-time instant. Complementary to <code>@deepseek-ai/dsh-schedule</code> — that one is persistent in-session reminders, this one is a host-side job scheduler: jobs belong to no interactive session and fire automatically while the process is up.</p>
+<p><img src="https://raw.githubusercontent.com/squirrel20/dsh-cron/HEAD/assets/demo-run-session.png" alt="Sidebar job list with expanded run history; clicking an agent run opens the full session replay"></p>
+<h2>UI</h2>
+<ul>
+<li><strong>Sidebar section</strong>: status dot (last result) + next-trigger time, live elapsed timer while running; rows expand into run history, and clicking an agent run jumps straight to that run's full session.</li>
+<li><strong>Create / edit modal</strong>: trigger presets (hourly / daily / weekdays / weekly, with cron expression / interval / one-shot tucked into a custom tier), task kind, mode / permission / model knobs (blank = inherit defaults), working directory, timeout, and overlap / misfire policies — all on one screen; the time zone is taken silently from the browser (edits keep the job's own).</li>
+</ul>
+<table>
+<thead>
+<tr>
+<th>Create a job</th>
+<th>Row actions</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><img src="https://raw.githubusercontent.com/squirrel20/dsh-cron/HEAD/assets/demo-new-job.png" alt="Create-job modal"></td>
+<td><img src="https://raw.githubusercontent.com/squirrel20/dsh-cron/HEAD/assets/demo-row-menu.png" alt="Run now / pause / edit / delete"></td>
+</tr>
+</tbody></table>
+<h2>Features</h2>
+<ul>
+<li><strong>Three trigger kinds</strong>: <code>cron</code> (5-field expression + explicit IANA <code>timeZone</code>; the process time zone is never consulted), <code>everySeconds</code> (anchor-aligned interval, 60s minimum), <code>at</code> (one-time RFC 3339 instant; a Z or numeric offset is required).</li>
+<li><strong>Two task kinds</strong>: <code>agent</code> (create a one-shot agent via <code>ctx.agents.create</code>, submit the prompt, wait for quiescence, take the last assistant message as the summary, dispose to finish — i.e. the dsh-headless one-shot recipe); <code>command</code> (spawn a child process, record exit code and output tail).</li>
+<li><strong>Persistent state</strong>: job dispatch state and run history live in the storage domain layer (<code>ctx.storage.domain</code>, domain name <code>cron</code>), never in session event logs.</li>
+<li><strong>Reliability semantics</strong>: at-most-once per occurrence (<code>lastFiredMs</code> is persisted before execution); missed occurrences are never replayed one by one (the misfire policy runs at most once, against the latest due occurrence); runs interrupted by a crash are repaired to <code>aborted</code> on the next startup.</li>
+<li><strong>Policies</strong>: <code>overlap: skip | queue | replace</code> (when the previous run is still going: skip / queue the latest one occurrence / kill and restart); <code>misfire: skip | runOnce</code> (occurrences missed while the process was down: ignore / catch up once).</li>
+<li><strong>Delivery</strong>: optional delivery command; the run record is fed as JSON on stdin (fires only on failure by default).</li>
+<li><strong>Clock discipline</strong> (inherited from dsh-schedule): long waits are chunked and the wall clock is re-read on every wake-up — a backwards clock jump never fires early, a forwards jump is handled as overdue.</li>
+</ul>
+<h2>Installation</h2>
+<h3>From the Plugin Market</h3>
+<p>With <a href="https://github.com/dsh-market/dsh-market">dsh-market</a> installed, open <strong>Settings → Plugin Market</strong>, search <strong>dsh-cron</strong>, and install with one click — the market adds both the dependency and the profile bundle entry for you, and most installs go live after a page refresh.</p>
+<p>Or install the release tarball from the command line (this only runs the package install — add <code>"dsh-cron"</code> to <code>dsh.profile.bundles</code> yourself, as shown below):</p>
+<pre><code>dsh plugin --profile web add https://github.com/squirrel20/dsh-cron/releases/latest/download/dsh-cron.tgz
+</code></pre>
+<blockquote>
+<p>The npm package named <code>dsh-cron</code> is an unrelated project — install from the market or the release tarball, not from the npm registry.</p>
+</blockquote>
+<h3>From source</h3>
+<p>In your profile's <code>package.json</code>:</p>
+<pre><code>{
+  "dependencies": { "dsh-cron": "link:/path/to/dsh-cron" },   // or a git checkout / release tarball
+  "dsh": { "profile": { "bundles": [ /* …existing bundles… */, "dsh-cron" ] } }
+}
+</code></pre>
+<h3>Config-declared jobs (optional)</h3>
+<p>Declare always-on jobs by overriding the config in the profile's <code>cordis.patch.yml</code> — or skip this entirely and create jobs from the UI or a session (see <a href="#usage">Usage</a>):</p>
+<pre><code>- id: dsh-cron
+  config:
+    maxConcurrentRuns: 1
+    historyLimit: 50
+    jobs:
+      - name: daily-log-review
+        schedule: { cron: "0 7 * * *", timeZone: "Asia/Shanghai" }
+        task:
+          kind: agent
+          prompt: Read yesterday's logs under logs/, summarize anomalies and suggest remediations.
+          cwd: /path/to/project
+          timeoutSeconds: 1800
+        policy: { overlap: skip, misfire: skip }
+        delivery:
+          argv: ["/usr/local/bin/notify", "--stdin"]
+          onlyOnFailure: true
+      - name: heartbeat
+        schedule: { everySeconds: 3600 }
+        task: { kind: command, argv: ["./scripts/heartbeat.sh"], cwd: /path/to/project }
+    sessionGc:            # optional; defaults: enabled: true, graceMinutes: 30, root: ~/.dsh/sessions
+      enabled: true
+      graceMinutes: 30
+</code></pre>
+<p>Job misconfiguration (duplicate names, invalid expressions, missing time zone, …) fails loud at mount time — it is never swallowed silently.</p>
+<h2>Usage</h2>
+<h3>Adding a job by hand</h3>
+<p>Click <strong><code>+</code></strong> in the sidebar's <strong>Cron Jobs</strong> section header. The New job dialog configures everything on one screen:</p>
+<ul>
+<li><strong>Name</strong> — lowercase, digits and <code>-</code>.</li>
+<li><strong>Trigger</strong> — <code>cron</code> (5-field expression + IANA time zone), <code>interval</code>, or <code>one-shot</code>.</li>
+<li><strong>Task</strong> — <code>agent</code> (a prompt executed unattended through the full dsh toolchain) or <code>command</code> (an argv to spawn).</li>
+<li><strong>Preset / Access / Model</strong> — leave blank to inherit the host defaults.</li>
+<li><strong>Working directory</strong> — type a path or browse via the folder icon.</li>
+<li><strong>Timeout, On overlap, On misfire</strong> — see <a href="#features">Features</a> for the policy semantics.</li>
+</ul>
+<p><strong>Create &amp; enable</strong> persists the job (a "manual" chip marks it apart from config-declared jobs). Afterwards, each row's <code>⋯</code> menu offers <strong>Run now / Pause schedule / Edit job / Delete job</strong>; clicking a row expands its run history, and clicking an agent run opens that run's full session replay.</p>
+<h3>Adding a job from a session</h3>
+<p>Just ask the agent in any session:</p>
+<blockquote>
+<p>Every Monday at 07:00 review our outdated dependencies and save an upgrade checklist to reports/deps-audit.md.</p>
+</blockquote>
+<p>The bundled <strong>cron-create</strong> skill (auto-registered when the host has a skill registry) walks the model through collect → confirm → create → verify, calling the <code>cron_create</code> tool under the hood; <code>cron_delete</code> removes a manual job the same way. Jobs created from a session are ordinary manual jobs — the exact same overlay the web dialog writes — so they show up in the sidebar immediately and can be edited there later. The read/steer tools (<code>cron_list</code>, <code>cron_runs</code>, <code>cron_run_now</code>, <code>cron_enable</code>, <code>cron_disable</code>) work on config-declared jobs too.</p>
+<h2>Run records</h2>
+<p>The <code>runs</code> table keeps the most recent <code>historyLimit</code> entries keyed by <code>&lt;job&gt;#&lt;seq&gt;</code>:</p>
+<pre><code>{
+  "job": "daily-log-review", "seq": 42,
+  "target": "2026-08-26T23:00:00.000Z",       // the occurrence this run is for
+  "startedAt": "…", "finishedAt": "…",
+  "status": "ok",                              // ok|failed|timeout|skipped-overlap|replaced|aborted
+  "summary": "…",                              // agent's last reply / command output tail (truncated)
+  "sessionId": "cron-daily-log-review-…"       // agent task's session, inspectable under ~/.dsh/sessions
+}
+</code></pre>
+<h2>Boundaries and known limitations</h2>
+<ul>
+<li>Agent runs carry a fixed <code>[CRON RUN]</code> framing that states the run is unattended and questions are forbidden. It is injected as a scoped system-prompt section, so the user message holds only the job's prompt; hosts without the system-prompt service fall back to prepending it to the message.</li>
+<li>Config jobs come from plugin config (declarative); the conversational tools (<code>cron_list</code> / <code>cron_runs</code> / <code>cron_run_now</code> / <code>cron_enable</code> / <code>cron_disable</code>) observe and steer them but never create or delete them. Runtime "manual" jobs are the exception: <code>cron_create</code> / <code>cron_delete</code> manage those from a session, guided by the bundled <code>cron-create</code> skill (registered into the host's skill registry when one exists), through the same <code>manual</code>-table overlay as the web dialog.</li>
+<li><code>queue</code> depth is 1: only the single latest squeezed-out occurrence is kept.</li>
+</ul>
+<h2>Web overlay</h2>
+<p>When the profile includes <code>@deepseek-ai/dsh-web-app</code>, the plugin also ships a
+sidebar overlay: a clock badge at the sidebar foot opens a panel listing
+every job (kind, schedule, next occurrence, latest outcome); a job row
+drills into its recent run history, and failed runs expand their summary
+tail, session id, and exit code. Rows carry hover actions — run an idle job
+now (the <code>cron_run_now</code> semantics), or stop the run in flight (the record
+settles as <code>killed</code>; later occurrences are untouched). The panel's <code>+</code>
+opens a create form (name; trigger presets — hourly/daily/weekdays/weekly,
+compiled to plain cron shapes and mapped back onto the presets on edit, with
+cron expression/interval/one-shot in a custom tier and the time zone taken
+silently from the browser; agent/command task; working directory with a
+browse dialog over the host's directory capability; timeout; overlap/misfire
+policy); created jobs persist in the
+storage domain's <code>manual</code> table, re-normalize on every boot, and show a
+"manual" chip beside config-declared jobs — a config job with the same name
+wins and evicts the manual copy. A manual job's drill-in view carries a
+two-click delete (trash, then confirm) that drops the job and its whole run
+ledger; config jobs and jobs with a run in flight are refused.</p>
+<p>The browser half is <code>lib/client.js</code> (declared via <code>exports["./client"]</code> +
+the <code>dsh.client</code> package field). The host half (<code>lib/web.js</code>) serves
+<code>GET /dsh-cron/api/state</code> plus four writes — <code>POST …/run-now</code>, <code>…/stop</code>,
+<code>…/jobs</code>, <code>…/delete</code> — which demand <code>application/json</code> bodies so cross-site simple
+requests die before dispatch; routes register on <code>ctx.webServer</code> only while
+a webserver is present, so headless profiles mount unchanged.</p>
+<h2>Tests</h2>
+<pre><code>npm test   # unit tests for the scheduling math (cron parsing, time zones, anchor alignment, misfire collapsing)
+</code></pre>

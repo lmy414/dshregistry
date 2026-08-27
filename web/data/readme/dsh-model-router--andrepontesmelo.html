@@ -1,0 +1,231 @@
+<h1>dsh-model-router</h1>
+<p>DSH plugin: declare <strong>virtual model ids</strong> in config, each bound to a routing
+<strong>algorithm</strong> (<code>priority</code>, <code>round-robin</code>; pluggable) over a list of real
+provider/model candidates. Using the virtual id anywhere — agent options,
+model picker — transparently dispatches to a real provider chosen by the
+algorithm, with failover.</p>
+<h2>Config</h2>
+<pre><code>{
+  "routes": [
+    {
+      "id": "virtual-a",                    // unique route id
+      "provider": "routed",                // optional: virtual provider id to register under
+                                            // (defaults to the route id). Routes sharing a
+                                            // provider form ONE picker group
+      "model": "routed-chat",               // optional: advertised virtual model id
+                                            // (defaults to the route id -&gt; "virtual-a")
+      "algorithm": "priority",              // "priority" | "round-robin"
+      "candidates": [
+        { "provider": "deepseek-official", "model": "deepseek-v4-flash" },
+        { "provider": "pi-ai", "model": "..." }
+      ]
+    }
+  ]
+}
+</code></pre>
+<p><code>routes</code> defaults to <code>[]</code>. The schema is <code>schemastery</code> (the DSH fork of zod):
+callable, so the same <code>Config</code> feeds <code>installSettingsSection</code> (settings
+provider) and the cordis loader (<code>~standard.validate</code>). <code>model</code> is optional
+and backward compatible: routes without it parse identically and advertise
+<code>&lt;route-id&gt;/&lt;route-id&gt;</code> (e.g. route <code>pool</code> advertises <code>pool/pool</code>) in the
+model picker; with it, the route advertises exactly one model under
+<code>&lt;route-id&gt;/&lt;model&gt;</code>. <code>provider</code> is likewise optional: routes sharing one
+<code>provider</code> id register as a single virtual provider whose picker group
+advertises one model per route (e.g. <code>routed/routed</code> + <code>routed/strong</code>),
+and the request's model id selects the route. Advertised model ids must be
+unique within a provider group.</p>
+<h2>The RoutingAlgorithm extension point</h2>
+<p>An algorithm is a <strong>factory</strong>:</p>
+<pre><code>factory(ctx, routes) =&gt; {
+  select(route, callCtx)    // -&gt; candidate | undefined
+  onFailure(route, candidate, callCtx)
+  onDispatch?(route, candidate, callCtx) // first dispatch of a request
+  onSuccess?(route, candidate, callCtx)   // optional; shim calls it on success
+}
+</code></pre>
+<ul>
+<li><code>select</code> returns one candidate from <code>route.candidates</code> to dispatch now
+(<code>undefined</code> = exhausted, failover stops, error surfaces). It must be PURE:
+the shim probes it for boolean checks (<code>peek()</code>), so no state may advance.</li>
+<li><code>onFailure</code> records a failed candidate so the next <code>select</code> skips it.</li>
+<li><code>onDispatch</code> (optional) is called by the shim in <code>prepareCall</code> the moment a
+candidate is picked for a request's FIRST dispatch — BEFORE the stream
+starts. Allocation-style algorithms spend their slot here.</li>
+<li><code>onSuccess</code> (optional) is called by the shim when a dispatch finishes
+successfully; kept for custom algorithms (round-robin rotates in
+<code>onDispatch</code> instead).</li>
+<li><code>callCtx</code> carries per-request state (<code>{ failed }</code>, a set keyed by
+<code>provider\0model</code>; round-robin adds a <code>dispatched</code> marker); algorithms may
+extend it. On terminal success the shim swaps in fresh call records
+(replace-on-success) instead of mutating live ones — a running failover
+chain keeps its private snapshot even if a sibling request succeeds
+concurrently.</li>
+</ul>
+<p>The registry maps name → factory (<code>lib/routing.js</code>): <code>register(name, factory)</code>,
+<code>resolve(name)</code>, <code>has(name)</code>, <code>names()</code>. Both built-ins are implemented:
+<code>'priority'</code> (ordered failover — first candidate whose provider has a live
+registered adapter and has not failed this request) and <code>'round-robin'</code>
+(rotating cursor over live candidates; each REQUEST consumes its slot at
+DISPATCH time — <code>onDispatch</code>, before the stream starts — so two prompts sent
+back-to-back land on different candidates even while the first is still
+answering; retries within one request never consume an extra slot). A future
+algorithm registers into the same registry — no restructuring of the shim or
+plugin entry.</p>
+<h2>Writing your own algorithm</h2>
+<p>Two steps, plus one seam note.</p>
+<ol>
+<li><p><strong>Write a factory</strong> (one module). <code>examples/least-dispatched.js</code> is a
+complete, working example — a fair-share spreader that hands each first
+dispatch to the usable candidate dispatched least often — and
+<code>test/examples.test.js</code> proves it composes through the real shim +
+failover path, wired exactly the way <code>apply()</code> wires built-ins. Skeleton:</p>
+<pre><code>export function myFactory(ctx, routes) {            // ctx: plugin Cordis context
+  const crossRequestState = new Map();              // OUTLIVES one request: put it HERE
+  return {
+    select(route, callCtx) {
+      // PURE scan of route.candidates: skip dead providers, entries in
+      // callCtx.failed, cooled candidates; return ONE candidate object
+      // (or undefined to exhaust failover and surface the error).
+      // Must NOT advance anything - the shim re-runs it as a probe.
+    },
+    onFailure(route, candidate, callCtx) {
+      callCtx.failed.add(`${candidate.provider}\u0000${candidate.model}`);
+    },
+    onDispatch?(route, candidate, callCtx) {
+      // Slot for this request is consumed NOW (first dispatch, before
+      // the stream starts). Allocation lives here, never in onSuccess.
+    },
+    onSuccess?(route, candidate, callCtx) {
+      // Dispatch finished successfully - outcome bookkeeping only
+      // (e.g. reset backoff). Fires after the stream ends.
+    }
+  };
+}
+</code></pre>
+</li>
+<li><p><strong>Register it against the existing registry</strong> (<code>lib/routing.js</code>) before
+the plugin resolves its routes; names are unique and duplicates throw:</p>
+<pre><code>import { defaultRegistry } from "dsh-model-router/routing";
+defaultRegistry.register("my-algo", myFactory);
+</code></pre>
+</li>
+</ol>
+<p>Seam note: the plugin resolves every configured <code>route.algorithm</code> from this
+same <code>defaultRegistry</code> (<code>lib/index.js</code>) — registry in, instance attached to
+the route, <code>RouterShim</code> over the virtual provider. One caveat today: the
+Config schema still ENUMERATES shipped names
+(<code>z.union(["priority", "round-robin"])</code>, <code>lib/index.js</code>), so routing config
+itself cannot reference a third-party name until that union widens. The
+registry/shim/failover machinery accepts any registered algorithm right now
+— <code>test/examples.test.js</code> drives the example through <code>RouterShim</code> exactly
+as config-driven requests flow.</p>
+<h3>Factory contract — the fine print</h3>
+<ul>
+<li><strong><code>select</code> must be pure.</strong> After each failure the shim calls <code>onFailure</code>
+and then RE-RUNS <code>select</code> just as a boolean probe ("anyone left?" —
+<code>lib/shim.js requestFailed</code>). A <code>select</code> that mutates state answers the
+probe differently than the real pick and corrupts the chain: same
+arguments in, same answer out, however many times it runs.</li>
+<li><strong>Failure keying</strong> is the string <code>${provider}\0${model}</code> inside the
+shim-owned <code>callCtx.failed</code> Set. Filter with the same key shape;
+<code>examples/least-dispatched.js</code> shows the convention.</li>
+<li><strong>Allocation timing.</strong> Anything meaning "this candidate was taken for
+this request" belongs in <code>onDispatch</code>: it fires inside <code>prepareCall</code>
+BEFORE the stream starts, so a second request issued while the first is
+still answering sees the slot gone. <code>onSuccess</code> fires only when a
+dispatch SUCCEEDS — too late for allocation; right for outcomes.</li>
+<li><strong><code>callCtx</code> extension etiquette.</strong> Per-request extras go under your own
+key (round-robin uses <code>callCtx.dispatched</code>; prefer
+<code>callCtx.yourAlgo = {...}</code>): never reassign or delete the shim-owned
+<code>{ failed, current }</code> fields. On terminal success the shim swaps in
+FRESH records that carry ONLY <code>{ failed, current }</code> (replace-on-success,
+<code>lib/shim.js</code>) — custom keys intentionally die with their record, so
+anything that must survive past one request lives on the factory closure,
+not on <code>callCtx</code>.</li>
+</ul>
+<h2>Seam mechanics (proven by the test suite)</h2>
+<ul>
+<li>A shim <code>LlmAdapter</code> (<code>lib/shim.js</code>) registers under each virtual route id
+and delegates <code>prepareCall</code>/<code>stream</code> to the real adapter via <strong>direct
+registry lookup</strong> (<code>ctx.llm.registration(realProvider).adapter...</code>), never
+re-entering the <code>llm/stream</code> waterfall (one fire per request).</li>
+<li>The prepared <code>config</code> stays <strong>virtual</strong> (<code>callConfigEquals</code> gate); only the
+stream-forwarding closure rewrites provider/model.</li>
+<li>The shim declares its own <code>providerRetryPolicy</code> (never-matching) so
+dsh-llm-retry does not consume retryable codes before this plugin's
+<code>agent/request-error</code> failover listener, which marks the failed candidate
+and returns <code>{ kind: "retry" }</code> while candidates remain. Exhaustion → no
+retry → the error surfaces.</li>
+</ul>
+<h2>Global backoff for failing candidates</h2>
+<ul>
+<li>A real <code>provider + model</code> that fails dispatch is <strong>suppressed from selection</strong>
+for a cooldown starting at <strong>30s</strong>, doubling per successive failure, capped
+at <strong>8 hours</strong>.</li>
+<li>The cooldown key is the concrete <strong>provider + model</strong> (same <code>\0</code>-joined key
+as the routing algorithms), and it is <strong>global across all routes</strong> of one
+plugin instance: a candidate failing in route A is suppressed in route B too.</li>
+<li>A <strong>successful dispatch of that same provider+model fully resets</strong> the
+cooldown (the escalation restarts at 30s). A success on any <em>other</em>
+candidate does not re-enable a cooled one.</li>
+<li>The backoff is <strong>hardcoded</strong> (<code>lib/backoff.js</code>), no config surface.</li>
+<li>When every candidate is cooled (or otherwise unusable), <code>select</code> returns
+<code>undefined</code>, the shim throws <strong><code>NO_CANDIDATE</code></strong> and the failover listener
+stops retrying — same exhaustion behavior as today.</li>
+</ul>
+<h3>Sleep windows in provenance</h3>
+<p>The backoff ladder is made visible on both failure surfaces the shim owns, so
+the durable <code>llm/attempt</code> events (rendered by the web provenance view) carry
+the cost of each failure:</p>
+<ul>
+<li>A failed attempt's error message gains a suffix with the window that failure
+earns, human-readable via <code>formatWindow</code>: e.g. <code>alpha down (sleep 30s)</code>,
+escalating to <code>(sleep 1m0s)</code>, <code>(sleep 2m0s)</code>, ... capped at <code>(sleep 8h0m)</code>.</li>
+<li>Full exhaustion names the sleepers with their <strong>remaining</strong> time (a live
+number, unlike the historical earned window):
+<code>... has no live candidates — sleeping: a/m 29.9s, b/n 1m0s</code>.</li>
+<li>Aborted streams are never annotated; with no store (<code>noopBackoff</code>) every
+suffix is omitted and messages stay byte-identical to the unannotated era.</li>
+</ul>
+<h2>Test</h2>
+<pre><code>npm test          # node --test
+</code></pre>
+<p>No network, no API keys: an in-memory Cordis <code>Context</code> + real <code>LlmRuntime</code> +
+mock adapters prove config parsing, per-route shim registration, registry
+resolution, delegation, priority failover/exhaustion/reset, and cycle
+rejection.</p>
+<h2>Smoke</h2>
+<pre><code>npm run smoke                              # LOCAL: in-memory drills, no network/keys
+npm run smoke -- deployed &lt;profile&gt;        # DEPLOYED: named dsh profile
+npm run smoke -- deployed &lt;profile&gt; --patch ./overlay.yml   # overlay layers
+npm run smoke -- deployed &lt;profile&gt; --dump-only             # composition report, no dispatch
+</code></pre>
+<p>LOCAL re-runs the drill minimum through the real plugin code (shim,
+algorithms, backoff store): priority exhaustion surfaces an error; escalating
+sleep windows annotate failures (<code>30s -&gt; 1m0s -&gt; 2m0s</code>); cooldown resets on
+own success; round-robin alternates dispatches; <code>NO_CANDIDATE</code> stops retry
+cleanly. Same zero-network guarantee as <code>npm test</code>.</p>
+<p>DEPLOYED parses the profile's composed configuration
+(<code>dsh --profile &lt;name&gt; --dump-config</code>) for the plugin's routes and where
+<code>agent-default-model</code> points, then answers ONE task through the live profile
+so the routes actually dispatch. Needs network plus whatever credentials the
+profile's providers require. Knobs: <code>DSH_HOME</code>, <code>DSH_BIN</code>,
+<code>SMOKE_TIMEOUT_S</code>, <code>SMOKE_VERBOSE=1</code>.</p>
+<p>This command is the pre-install/deploy ritual: run LOCAL everywhere before
+installing; run DEPLOYED against a configured profile before relying on its
+routes.</p>
+<h2>Known limitations</h2>
+<ul>
+<li><strong>Round-robin changes the real model across requests</strong>: resume/retry can
+land on a different real model than produced earlier history (breaks the
+KV-cache prefix). Accepted for v1 — the adapter seam carries no
+conversation identifier, so sticky-per-conversation is impossible
+plugin-only. Round-robin spreads load across independent traffic and does
+not protect provider prompt caches; <strong>cache-sensitive routes should choose
+<code>priority</code></strong>. True stickiness returns as a fresh effort after portfolio
+publication, when DSH can pass a session id through the seam.</li>
+<li><strong>Delegation cycles are rejected at config time</strong> (<code>apply()</code> throws on any
+route graph whose candidates delegate back into a virtual provider,
+directly or transitively) — otherwise such a config would recurse in the
+shim until <code>RangeError</code>.</li>
+</ul>

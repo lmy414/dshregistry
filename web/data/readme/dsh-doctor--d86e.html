@@ -1,0 +1,470 @@
+<h1>dsh-doctor</h1>
+<p><a href="https://github.com/d86e/dsh-doctor/actions/workflows/ci.yml"><img src="https://github.com/d86e/dsh-doctor/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+<a href="https://github.com/d86e/dsh-doctor/blob/HEAD/LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License: MIT"></a>
+<a href="https://nodejs.org"><img src="https://img.shields.io/badge/node-%3E%3D18-339933" alt="Node"></a>
+<a href="https://github.com/deepseek-ai/deepseek-harness"><img src="https://img.shields.io/badge/dsh-%3E%3D0.1.0--rc.6-0066ff" alt="DSH"></a></p>
+<blockquote>
+<p>Self-healing watchdog for the DeepSeek Harness <strong>web</strong> profile. Recovers from plugin-induced boot failures within a <strong>60-second</strong> downtime budget. Runs an unbounded <code>dsh doctor</code> CLI for already-broken installs. Captures every <strong>tool error</strong> through the official <code>tools/*</code> event hooks. <strong>Watches every live session</strong> and nudges stuck turns back to life.</p>
+</blockquote>
+<p><code>dsh-doctor</code> runs as an <strong>independent Node process</strong> (LaunchAgent on macOS, systemd user unit on Linux, Task Scheduler on Windows) so it survives even when <code>dsh web</code> cannot spawn a child. It is <strong>fully independent of <code>dsh-daemon</code></strong>: it does not call it, does not require it, and does not conflict with it. If both are installed, you get layered protection.</p>
+<hr>
+<h2>Table of contents</h2>
+<ul>
+<li><a href="#what-it-does">What it does</a></li>
+<li><a href="#when-to-use-it">When to use it</a></li>
+<li><a href="#install">Install</a></li>
+<li><a href="#usage">Usage</a></li>
+<li><a href="#architecture">Architecture</a></li>
+<li><a href="#configuration">Configuration</a></li>
+<li><a href="#tools">Tools</a></li>
+<li><a href="#tool-error-handling">Tool error handling</a></li>
+<li><a href="#session-watching">Session watching</a></li>
+<li><a href="#safety-guarantees">Safety guarantees</a></li>
+<li><a href="#troubleshooting">Troubleshooting</a></li>
+<li><a href="#roadmap">Roadmap</a></li>
+<li><a href="#development">Development</a></li>
+<li><a href="#contributing">Contributing</a></li>
+<li><a href="#security">Security</a></li>
+<li><a href="#license">License</a></li>
+</ul>
+<hr>
+<h2>What it does</h2>
+<p>Four jobs, in one plugin:</p>
+<table>
+<thead>
+<tr>
+<th>Job</th>
+<th>Where it runs</th>
+<th>Time budget</th>
+<th>Trigger</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong>1. Web boot recovery</strong></td>
+<td>Standalone Node process (LaunchAgent / systemd / Task Scheduler)</td>
+<td><strong>60 seconds</strong> per incident</td>
+<td><code>dsh web</code> health probe fails N times in a row</td>
+</tr>
+<tr>
+<td><strong>2. CLI doctor</strong></td>
+<td><code>dsh doctor</code> in your shell, drives the same <code>apply(ctx, config)</code> code path</td>
+<td><strong>No budget</strong> — keeps trying until solved</td>
+<td>You start it</td>
+</tr>
+<tr>
+<td><strong>3. Tool error capture</strong></td>
+<td>In-process, attached to the <code>tools/*</code> cordis event waterfalls</td>
+<td>Passive — never blocks the host</td>
+<td>Any tool call fails in any session</td>
+</tr>
+<tr>
+<td><strong>4. Live session watch</strong></td>
+<td>In-process, attached to <code>session/event</code></td>
+<td>Tick every 30 s, no events lost</td>
+<td>A turn is <code>running</code> with no new event for <code>watchIdleThresholdMs</code> (default 10 min)</td>
+</tr>
+</tbody></table>
+<h3>1. Web boot recovery (60 s budget)</h3>
+<p>Every 30 s the watchdog probes <code>http://127.0.0.1:$DSH_WEB_PORT/health</code>. After 3 consecutive failures it enters the <strong>triage</strong> state machine, with a hard 60-second ceiling on total downtime per incident.</p>
+<p><strong>Simple path</strong> (~10 s) — the most common case, a single broken plugin:</p>
+<ol>
+<li>Read the last 200 lines of the dsh web log.</li>
+<li>Run <strong>triage</strong> against a regex pattern table (EADDRINUSE, duplicate loader entry, schema parse error, module-not-found, plugin load error, …).</li>
+<li>If the failing bundle is identified, <strong>disable that single row</strong> in <code>~/.dsh/profiles/web/cordis.patch.yml</code> (write the change to a sibling <code>cordis.patch.yml.dr-disabled-&lt;bundle&gt;</code> file — your original is never edited).</li>
+<li>Restart dsh web. The boot succeeds because the offending bundle is gone.</li>
+</ol>
+<p><strong>Complex path</strong> (≤60 s) — multiple bundles, the simple path didn't work, or the failure is unknown:</p>
+<ol>
+<li>Drop a <strong>safe-mode patch</strong> into the profile that overrides every bundle with a no-op config (<code>safeMode: true</code>), except an explicit allow-list (<code>safeModeBundles</code>, default <code>["dsh-core"]</code>).</li>
+<li>Restart dsh web. The profile boots in safe mode — all your dsh_doctor_* tools are still available, every other plugin is silenced.</li>
+<li>Write a <code>restart-lock</code> marker so a <code>dsh doctor</code> invocation running in parallel can skip the 60 s budget and work unbounded until safe mode is gone.</li>
+</ol>
+<p><strong>Invariants</strong> enforced on every recovery:</p>
+<ul>
+<li>The watchdog only kills the PID it reads from <code>~/.dsh/profiles/web/.dsh-web.pid</code>. It never invokes <code>pkill</code>, <code>killall</code>, or any pattern-killer.</li>
+<li>A sibling file pattern means your real <code>cordis.patch.yml</code> is never silently mutated. Inspect / revert at any time.</li>
+<li>If 60 s elapses without a healthy probe, the watchdog backs off and retries on the next probe tick instead of thrashing.</li>
+</ul>
+<h3>2. CLI doctor (no time budget)</h3>
+<pre><code>$ dsh doctor
+</code></pre>
+<p>Same triage + recovery engine, but:</p>
+<ul>
+<li>Started in the foreground, not as a service.</li>
+<li>The 60-second budget is <strong>disabled</strong>. It keeps iterating (fix → restart → probe → fix → …) until the profile boots cleanly.</li>
+<li>More aggressive fallbacks are allowed because a human is watching: when simple + safe-mode both fail, it will eventually offer to disable <strong>every</strong> non-allow-listed bundle and boot with only the allow-list.</li>
+<li>A "what did you change?" summary is printed at the end so the human can revert anything they don't want.</li>
+</ul>
+<h3>3. Tool error capture</h3>
+<p>Every tool call in dsh passes through a <code>tools/*</code> cordis event waterfall. <code>dsh-doctor</code> subscribes to <code>tools/execute</code> and <code>tools/post-execute</code> and runs every failed result through a <strong>classifier</strong> (default: <code>transient</code> / <code>agent</code> / <code>business</code>) and a <strong>policy</strong> (default: record + log, optionally defer). The doctor never mutates the waterfall itself — it observes.</p>
+<p>The 9th model-facing tool, <code>dsh_doctor_drain_deferred(sessionId)</code>, lets the agent pull queued errors at a quiet moment in the current turn and decide what to do.</p>
+<h3>4. Live session watch</h3>
+<p>Every session in the dsh process emits a <code>session/event</code> (<code>turn/start</code>, <code>turn/end</code>, <code>tool/call</code>, <code>tool/result</code>, <code>user/message</code>, <code>assistant/message</code>, …). <code>dsh-doctor</code> keeps a per-session state machine:</p>
+<pre><code>                    ┌──────────────┐
+                    │  event fires │ ◀── every session event
+                    └──────┬───────┘
+                           │
+                    ┌──────▼───────┐
+                    │  reset idle  │
+                    │   counter    │
+                    └──────┬───────┘
+                           │
+              (every watchTickIntervalMs)
+                           │
+                    ┌──────▼───────────────────┐
+                    │ is turn running?         │
+                    │ is no-event-time &gt; N?    │
+                    │ cooldown elapsed?        │
+                    │ nudgesSent &lt; cap?        │
+                    │ user is not currently    │
+                    │ driving the session?     │
+                    └──────┬───────────────────┘
+                       yes  │
+                    ┌──────▼────────────────────┐
+                    │ agent.followup("继续")    │
+                    │ count +1                  │
+                    └───────────────────────────┘
+</code></pre>
+<p>The doctor <strong>does not write code, does not run commands, does not touch the model</strong>. It sends a <code>继续</code> user message through the same <code>agent.followup</code> primitive the dsh community's <code>dsh-auto-continue</code> uses. If the agent is in a true infinite loop, <code>dsh_doctor_watch_cancel</code> is also exposed for explicit user intervention.</p>
+<p>Manual control tools are also exposed: <code>dsh_doctor_watch_list</code> shows every tracked session, <code>dsh_doctor_watch_nudge</code> lets you inject a custom message, <code>dsh_doctor_watch_cancel</code> aborts the current turn with <code>kind: 'user'</code> so it is not confused with a system stop.</p>
+<hr>
+<h2>When to use it</h2>
+<p>You want <code>dsh-doctor</code> if you:</p>
+<ul>
+<li>Have ever had a bad plugin update take down your <code>dsh web</code> for hours because you had to SSH in, read logs, edit JSON, and restart by hand.</li>
+<li>Run multiple plugins and want a layer between "broken plugin" and "completely dead profile."</li>
+<li>Run long, unattended agent tasks that occasionally get stuck waiting on a flaky network call or an interrupted LLM stream.</li>
+<li>Already use <code>dsh-auto-continue</code> and want a more thorough, self-contained solution (dsh-doctor subsumes its core logic — keep using both if you depend on its UI; or uninstall it once you upgrade to dsh-doctor ≥ 0.2.0).</li>
+<li>Want <strong>layered protection</strong> alongside <code>dsh-daemon</code> (they don't conflict; dsh-doctor also covers the "dsh web came up at all" case).</li>
+</ul>
+<p>You do <strong>not</strong> want dsh-doctor if:</p>
+<ul>
+<li>You are on a single-plugin setup and prefer to fix breakage by hand.</li>
+<li>You want an "AI automatically debugs my DSH install" agent — that's a different product. dsh-doctor is a watchdog, not an AI.</li>
+</ul>
+<hr>
+<h2>Install</h2>
+<h3>Option A — from git (recommended)</h3>
+<pre><code># Install into the web profile (the only profile dsh-doctor supports today)
+dsh plugin --profile web add https://github.com/d86e/dsh-doctor.git
+dsh plugin --profile web reload
+</code></pre>
+<p>You can pin a version with a git ref:</p>
+<pre><code># Pin a specific tag
+dsh plugin --profile web add https://github.com/d86e/dsh-doctor.git#v0.2.0
+
+# Or a branch
+dsh plugin --profile web add https://github.com/d86e/dsh-doctor.git#main
+</code></pre>
+<p>The doctor is published as a git repository rather than an npm package because
+DSH plugins are loaded as <code>cordis.patch.yml</code> composition rows by the host
+process — they never need to be <code>require()</code>'d from a node_modules tree.
+Git install keeps the version control simple: a <code>git pull &amp;&amp; dsh plugin reload</code>
+is the entire upgrade story.</p>
+<p>This mounts the 12 <code>dsh_doctor_*</code> tools. To also enable the standalone watchdog (recommended):</p>
+<pre><code># Tell the dsh agent to use dsh_doctor_install
+&gt; dsh_doctor_install
+</code></pre>
+<p>The <code>install</code> tool:</p>
+<ol>
+<li>Writes <code>~/.dsh/doctor/watchdog.js</code> (standalone dep-free Node).</li>
+<li>Writes the platform service spec (LaunchAgent / systemd / Task Scheduler).</li>
+<li>Starts the service.</li>
+<li>The service starts probing <code>127.0.0.1:3080/health</code> immediately.</li>
+</ol>
+<h3>Option B — npm package</h3>
+<p>If you prefer npm, the same source is also published as <code>@d86e/dsh-doctor</code>:</p>
+<pre><code>dsh plugin --profile web add @d86e/dsh-doctor
+</code></pre>
+<p><code>dsh plugin add</code> accepts a git URL, a <code>&lt;owner&gt;/&lt;repo&gt;</code> shorthand, or an npm
+package name — they all end up in the same place.</p>
+<h3>Option C — dynamic (sandboxed one-off)</h3>
+<p>Useful for a single session, no install. Ask any agent:</p>
+<pre><code>&gt; Use the dsh doctor from https://raw.githubusercontent.com/d86e/dsh-doctor/v0.2.0/lib/index.js
+</code></pre>
+<p>Then call <code>dsh_doctor_install</code> when you are ready to make it permanent.</p>
+<hr>
+<h2>Usage</h2>
+<p>After install, you can ask the agent:</p>
+<pre><code>&gt; dsh_doctor_status
+&gt; dsh_doctor_diagnose
+&gt; dsh_doctor_watch_list
+&gt; dsh_doctor_safe_mode_enter
+&gt; dsh_doctor_drain_deferred
+</code></pre>
+<p>From a shell:</p>
+<pre><code>dsh doctor                  # unbounded CLI doctor (foreground)
+dsh doctor --dry-run        # triage only, no writes
+</code></pre>
+<p>To uninstall:</p>
+<pre><code>&gt; dsh_doctor_uninstall
+</code></pre>
+<hr>
+<h2>Architecture</h2>
+<p>See <a href="https://github.com/d86e/dsh-doctor/blob/HEAD/docs/ARCHITECTURE.md"><code>docs/ARCHITECTURE.md</code></a> for the full state machine, file layout, and inter-process protocol.</p>
+<pre><code>┌──────────────────────────────────────────────────────────────┐
+│  dsh web process (cordis composition rows)                  │
+│                                                              │
+│   ┌────────────────────┐  ┌────────────────────┐            │
+│   │ tools/ event hooks │  │ session/event hooks│            │
+│   └────────┬───────────┘  └─────────┬──────────┘            │
+│            │                       │                         │
+│            ▼                       ▼                         │
+│   ┌──────────────────────────────────────────────┐          │
+│   │  dsh-doctor (apply)                          │          │
+│   │   ├ tool error capture (waterfall listener)  │          │
+│   │   ├ session watch (timer + ctx.agents)       │          │
+│   │   └ 12 dsh_doctor_* tools                    │          │
+│   └──────────────────────────────────────────────┘          │
+└──────────────────────────┬───────────────────────────────────┘
+                           │ (file-system state)
+                           ▼
+  ┌──────────────────────────────────────────────────┐
+  │  $DSH_HOME/doctor/                               │
+  │   ├ watchdog.js      standalone dep-free script  │
+  │   ├ watchdog.pid     current watchdog pid       │
+  │   ├ installed-marker  plugin-version stamp      │
+  │   ├ stopped-marker   pause flag                 │
+  │   ├ safe-mode.patch  auto-generated disable     │
+  │   └ logs/                                        │
+  │     ├ watchdog.log   (5MB × 3 rotation)         │
+  │     ├ doctor.log     (5MB × 3 rotation)         │
+  │     └ tool-errors.log                          │
+  └──────────────────────────────────────────────────┘
+                           ▲
+                           │ (HTTP /health probe)
+                           │
+  ┌────────────────────────┴─────────────────────────┐
+  │  watchdog.js (LaunchAgent / systemd / Task Sched) │
+  │   - 30 s health probe                             │
+  │   - triage + simple/complex recovery              │
+  │   - no pkill, no killall, no remote fetch          │
+  └────────────────────────────────────────────────────┘
+</code></pre>
+<hr>
+<h2>Configuration</h2>
+<p>All knobs can be set either in <code>cordis.patch.yml</code> (under <code>config:</code>) or via <code>DSH_DOCTOR_*</code> environment variables.</p>
+<table>
+<thead>
+<tr>
+<th>Field</th>
+<th>Env var</th>
+<th>Default</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>healthIntervalMs</code></td>
+<td><code>DSH_DOCTOR_HEALTH_INTERVAL</code></td>
+<td><code>30000</code></td>
+<td>Health probe period</td>
+</tr>
+<tr>
+<td><code>healthFailuresToRecover</code></td>
+<td><code>DSH_DOCTOR_HEALTH_FAILURES</code></td>
+<td><code>3</code></td>
+<td>Failures before triage</td>
+</tr>
+<tr>
+<td><code>recoveryBudgetMs</code></td>
+<td><code>DSH_DOCTOR_BUDGET_MS</code></td>
+<td><code>60000</code></td>
+<td>Hard ceiling per incident (watchdog)</td>
+</tr>
+<tr>
+<td><code>logMaxBytes</code></td>
+<td>—</td>
+<td><code>5242880</code></td>
+<td>Per-log rotation size</td>
+</tr>
+<tr>
+<td><code>logBackups</code></td>
+<td>—</td>
+<td><code>3</code></td>
+<td>Rotated log files kept</td>
+</tr>
+<tr>
+<td><code>safeModeBundles</code></td>
+<td>—</td>
+<td><code>["dsh-core"]</code></td>
+<td>Bundles kept in safe mode</td>
+</tr>
+<tr>
+<td><code>toolErrorCapture</code></td>
+<td><code>DSH_DOCTOR_TOOL_ERROR_CAPTURE</code></td>
+<td><code>true</code></td>
+<td>Subscribe to <code>tools/*</code></td>
+</tr>
+<tr>
+<td><code>toolErrorMaxQueue</code></td>
+<td><code>DSH_DOCTOR_TOOL_ERROR_QUEUE</code></td>
+<td><code>500</code></td>
+<td>Per-session queue cap</td>
+</tr>
+<tr>
+<td><code>watchEnabled</code></td>
+<td><code>DSH_DOCTOR_WATCH_ENABLED</code></td>
+<td><code>true</code></td>
+<td>Master switch for session watch</td>
+</tr>
+<tr>
+<td><code>watchIdleThresholdMs</code></td>
+<td><code>DSH_DOCTOR_WATCH_IDLE_MS</code></td>
+<td><code>600000</code></td>
+<td>Idle timeout (10 min)</td>
+</tr>
+<tr>
+<td><code>watchNudgeCooldownMs</code></td>
+<td><code>DSH_DOCTOR_WATCH_COOLDOWN_MS</code></td>
+<td><code>300000</code></td>
+<td>Min interval between nudges</td>
+</tr>
+<tr>
+<td><code>watchMaxNudgesPerSession</code></td>
+<td><code>DSH_DOCTOR_WATCH_MAX_NUDGES</code></td>
+<td><code>3</code></td>
+<td>Cap before giving up</td>
+</tr>
+<tr>
+<td><code>watchContinueText</code></td>
+<td><code>DSH_DOCTOR_WATCH_TEXT</code></td>
+<td><code>"继续"</code></td>
+<td>Text to inject (supports <code>{elapsed}</code>, <code>{turn}</code>, <code>{sessionId}</code>)</td>
+</tr>
+<tr>
+<td><code>watchTickIntervalMs</code></td>
+<td><code>DSH_DOCTOR_WATCH_TICK_MS</code></td>
+<td><code>30000</code></td>
+<td>Idle-check period</td>
+</tr>
+</tbody></table>
+<h3>Tool error classifier — replace it</h3>
+<p>If the default classification (network/5xx/429 → <code>transient</code>, 401/403/quota/context-overflow → <code>agent</code>, else → <code>business</code>) is wrong for your stack, pass your own classifier / policy when you register the plugin from a wrapper bundle. Both functions receive the full <code>ToolErrorContext</code> and return synchronously.</p>
+<h3>Session watch text — localize it</h3>
+<p><code>watchContinueText</code> accepts the placeholders <code>{elapsed}</code> (seconds since last event), <code>{turn}</code> (current turn number), <code>{sessionId}</code>. So <code>"已经过去 {elapsed} 了，请继续第 {turn} 步"</code> works.</p>
+<hr>
+<h2>Tools</h2>
+<p>12 model-facing tools, all <code>dsh_doctor_*</code> prefixed.</p>
+<table>
+<thead>
+<tr>
+<th>Tool</th>
+<th>Purpose</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>dsh_doctor_install</code></td>
+<td>Generate the standalone watchdog and platform service</td>
+</tr>
+<tr>
+<td><code>dsh_doctor_uninstall</code></td>
+<td>Unregister, remove state files (logs optional)</td>
+</tr>
+<tr>
+<td><code>dsh_doctor_status</code></td>
+<td>Installed? running? uptime? last 5 recoveries? watch snapshot?</td>
+</tr>
+<tr>
+<td><code>dsh_doctor_pause</code></td>
+<td>Stop recovery, keep probing</td>
+</tr>
+<tr>
+<td><code>dsh_doctor_resume</code></td>
+<td>Re-enable recovery</td>
+</tr>
+<tr>
+<td><code>dsh_doctor_diagnose</code></td>
+<td>One-shot triage, no writes</td>
+</tr>
+<tr>
+<td><code>dsh_doctor_safe_mode_enter</code></td>
+<td>Manually drop a safe-mode patch</td>
+</tr>
+<tr>
+<td><code>dsh_doctor_safe_mode_exit</code></td>
+<td>Remove the safe-mode patch</td>
+</tr>
+<tr>
+<td><code>dsh_doctor_drain_deferred</code></td>
+<td>Pull queued agent-class tool errors for a session</td>
+</tr>
+<tr>
+<td><code>dsh_doctor_watch_list</code></td>
+<td>List every session the doctor is tracking</td>
+</tr>
+<tr>
+<td><code>dsh_doctor_watch_nudge</code></td>
+<td>Manually inject a "继续" message into a session</td>
+</tr>
+<tr>
+<td><code>dsh_doctor_watch_cancel</code></td>
+<td>Cancel the current turn of a session (kind=user)</td>
+</tr>
+</tbody></table>
+<hr>
+<h2>Tool error handling</h2>
+<p>By default the doctor <strong>observes</strong> tool errors; it never retries and never mutates the waterfall. To change that, the <code>installToolErrorCapture</code> API is exported for wrapper bundles:</p>
+<pre><code>import { installToolErrorCapture, defaultClassify, defaultPolicy } from '@d86e/dsh-doctor/tool-errors'
+
+installToolErrorCapture(ctx, config, log, {
+  // user classifier: nil-pointers count as agent-class
+  (ctx) =&gt; ctx.message.includes('panic') ? 'agent' : null,
+}, defaultPolicy)
+</code></pre>
+<p>See <a href="https://github.com/d86e/dsh-doctor/blob/HEAD/src/tool-errors.ts"><code>src/tool-errors.ts</code></a> for the full contract.</p>
+<hr>
+<h2>Session watching</h2>
+<p>The doctor keeps a per-session state machine in-process. It is read-only with respect to the model and the agent's tool calls — the <strong>only</strong> action it takes is <code>agent.followup({content: [{type: 'text', text: '继续'}], source: {kind: 'user'}})</code>.</p>
+<p>Three protections against over-firing:</p>
+<ol>
+<li><strong>Cooldown</strong> — two nudges to the same session must be at least <code>watchNudgeCooldownMs</code> apart.</li>
+<li><strong>Cap</strong> — a session that has been nudged <code>watchMaxNudgesPerSession</code> times in its lifetime is left alone until the next <code>turn/end:completed</code>.</li>
+<li><strong>User override</strong> — if a real <code>user/message</code> (<code>source.kind === 'user'</code>) arrived within 5 s of the candidate nudge time, the doctor steps back and assumes the human is driving.</li>
+</ol>
+<p>The watch is <strong>degrades silently</strong> if the dsh host does not expose <code>ctx.agents</code> (i.e. an older dsh). The 12 tools still work, the watchdog still works — only the in-process nudging is gone.</p>
+<hr>
+<h2>Safety guarantees</h2>
+<ul>
+<li><strong>No network calls</strong> by the watchdog (it probes <code>127.0.0.1</code> only).</li>
+<li><strong>No <code>pkill</code> / <code>killall</code></strong> anywhere. Only the recorded <code>~/.dsh/profiles/web/.dsh-web.pid</code> is signaled.</li>
+<li><strong>No silent mutation</strong> of your <code>cordis.patch.yml</code>. Disable / safe-mode actions write to sibling files (<code>cordis.patch.yml.dr-disabled-&lt;bundle&gt;</code>, <code>cordis.patch.yml.dr-safemode</code>).</li>
+<li><strong>The watchdog is dep-free</strong> (only <code>node:fs/path/os/http/child_process/crypto</code>). It runs even if dsh cannot start its own node_modules.</li>
+<li><strong>No telemetry</strong>, no analytics, no phone-home.</li>
+<li><strong><code>dsh_doctor_safe_mode_exit</code> is idempotent</strong> — running it twice is safe.</li>
+<li><strong>Nudges never modify model state</strong> — they only send a user message through the same primitive the dsh-auto-continue community plugin uses.</li>
+</ul>
+<hr>
+<h2>Troubleshooting</h2>
+<p>See <a href="https://github.com/d86e/dsh-doctor/blob/HEAD/docs/TROUBLESHOOTING.md"><code>docs/TROUBLESHOOTING.md</code></a>.</p>
+<hr>
+<h2>Roadmap</h2>
+<p>Done:</p>
+<ul>
+<li>✅ <strong>0.2.0</strong> — Live session watch with idle detection + nudge + cancel.</li>
+<li>✅ <strong>0.1.0</strong> — Web boot recovery, CLI doctor, tool error capture.</li>
+</ul>
+<p>Future:</p>
+<ul>
+<li>Optional browser notification bridge (for users running the dsh Web UI).</li>
+<li>Pluggable triage patterns (load your own regex table from a file).</li>
+<li><code>dsh_doctor_simulate</code> — run a fake failure end-to-end against a test profile to validate the watchdog.</li>
+</ul>
+<hr>
+<h2>Development</h2>
+<pre><code>git clone https://github.com/d86e/dsh-doctor
+cd dsh-doctor
+pnpm install
+pnpm test          # 83 unit tests
+pnpm run build     # tsc → lib/
+pnpm run typecheck
+</code></pre>
+<p><code>tests/dsh-smoke.sh</code> is a shell-only smoke that builds → packs → would <code>dsh plugin add</code>. It is skipped in CI because the CI host does not have <code>dsh</code> installed.</p>
+<hr>
+<h2>Contributing</h2>
+<p>See <a href="https://github.com/d86e/dsh-doctor/blob/HEAD/CONTRIBUTING.md"><code>CONTRIBUTING.md</code></a>.</p>
+<hr>
+<h2>Security</h2>
+<p>See <a href="https://github.com/d86e/dsh-doctor/blob/HEAD/SECURITY.md"><code>SECURITY.md</code></a>. Report vulnerabilities via the GitHub Security tab — do not file a public issue.</p>
+<hr>
+<h2>License</h2>
+<p><a href="https://github.com/d86e/dsh-doctor/blob/HEAD/LICENSE">MIT</a> — 2026 Tommy (d86e).</p>

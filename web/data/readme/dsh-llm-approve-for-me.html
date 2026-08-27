@@ -1,0 +1,81 @@
+<h1>dsh-llm-approve-for-me</h1>
+<p>一个 DeepSeek Harness（DSH）插件：当会话选择 <strong>AI Approval</strong> 权限预设时，每一笔有效的沙箱权限升级（Shell/PowerShell 命令、<code>write</code>/<code>edit</code> 文件写入等所有带 <code>sandbox_permissions</code> 的工具调用）都由插件内置的专用无工具审查角色判定（独立模型路由、无会话单次调用、快速裁决）。</p>
+<h2>设计边界</h2>
+<ul>
+<li><strong>专用审查角色</strong>：审查由插件内置的 <code>REVIEWER_ROLE</code>（固定 system persona、无工具、单请求快速裁决、严格 JSON 输出）执行，不借用环境里任何通用子代理角色模板。</li>
+<li><strong>不污染子代理列表</strong>：审查直接通过 DSH <code>llm</code> 服务执行无会话单次调用，不创建 Agent/Session，因此不会在子代理 catalog 中留下条目，也不会累积历史上下文。</li>
+<li>没有命令前缀、正则、白名单、黑名单、危险操作列表或其他规则判断。</li>
+<li>不会绕过 DSH 的沙箱：每次允许只返回原生的 <code>allowed-once</code> 一次性授权。</li>
+<li>审查 LLM 输出是唯一的自动决策来源：<code>allow</code> 允许一次、<code>deny</code> 拒绝、<code>ask</code> 交回原生人工审批。</li>
+<li>覆盖面：<code>bash</code>/<code>pwsh</code> 传完整命令文本；<code>write</code>/<code>edit</code> 传文件路径 + 变更摘要（old/new 或 content，截断至 2000 字符防大文件刷屏）；其他带升级参数的工具从参数里尽力提取可审查目标。无法提取审查目标的请求交回人工。</li>
+<li>每个会话顶部提供 <strong>AI Approval</strong> 面板：History 页按 session 隔离展示最近 100 条审批记录（请求目标、申请理由、目标权限、审查模型、AI 结论与最终结果）；Settings 页可视化调整审查模型配置。</li>
+<li>缺失审查模型路由、超时、取消、模型调用异常或 JSON 输出无效时，同样交回人工审批；不会默许放行，且记录具体失败原因。</li>
+</ul>
+<p>这不是安全产品，也不能替代人工授权、最小权限、备份或隔离。它的含义是把授权判断交给你在 DSH 中配置的 LLM，而不是交给本插件的命令规则。</p>
+<h2>安装</h2>
+<p>在 DSH profile 中安装 GitHub 包：</p>
+<pre><code>dsh plugin --profile web add github:alaxrpg/dsh-llm-approve-for-me
+</code></pre>
+<p>重启 DSH Web 后，包内的 <a href="https://github.com/alaxrpg/dsh-llm-approve-for-me/blob/HEAD/dsh/cordis.patch.yml"><code>dsh/cordis.patch.yml</code></a> 会添加该权限预设、挂载插件，并把 <strong>AI Approval</strong> 设为新会话的默认预设（你仍可在设置页显式覆盖为其他预设；已存在的会话保留各自当前的预设）。点击会话顶部的 <strong>AI Approval</strong> 可切换查看审批历史（History）与审查设置（Settings）；不要再手动重复插入同一个插件实例。</p>
+<h2>可视化设置（v0.4.0+）</h2>
+<p>会话顶部 <strong>AI Approval → Settings</strong> 提供表单，手动调整后 Save 即写入 <code>~/.dsh/llm-approve-for-me.settings.json</code>，下一次审查立即生效（无需重启）：</p>
+<table>
+<thead>
+<tr>
+<th>设置项</th>
+<th>默认</th>
+<th>范围</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>Reviewer provider</td>
+<td>空（继承主会话）</td>
+<td>任意 provider 名</td>
+<td>留空继承提出请求的会话</td>
+</tr>
+<tr>
+<td>Reviewer model</td>
+<td>空（继承主会话）</td>
+<td>任意 model 名</td>
+<td>推荐指向快速非推理模型，秒级出结论</td>
+</tr>
+<tr>
+<td>Timeout</td>
+<td>300 秒</td>
+<td>1–600 秒</td>
+<td>推理模型的思考时间计入超时</td>
+</tr>
+<tr>
+<td>Max tokens</td>
+<td>16384</td>
+<td>256–65536</td>
+<td>含推理过程；推理模型建议保持默认或更高</td>
+</tr>
+</tbody></table>
+<p>审查请求固定为无工具、无会话的最小上下文，只包含内置 persona 与本次 <code>REQUEST_JSON</code>；不会注入 AGENTS.md/CLAUDE.md。</p>
+<p>设置合并顺序：<code>~/.dsh/llm-approve-for-me.settings.json</code> &gt; profile <code>cordis.patch.yml</code> 的 <code>reviewer</code> 段 &gt; 上表默认值。</p>
+<p>也可以继续在 profile 的 <code>cordis.patch.yml</code> 中静态配置（会被设置文件覆盖）：</p>
+<pre><code>- insert:
+    - id: llm-approve-for-me
+      name: dsh-llm-approve-for-me
+      config:
+        reviewer:
+          provider: your-review-provider
+          model: your-review-model
+          timeoutMs: 300000
+          maxTokens: 16384
+</code></pre>
+<h2>审核协议</h2>
+<p>插件通过 DSH <code>llm</code> 服务向内置专用审查角色发起无工具、无会话的单次请求，并要求其严格按下面的 JSON 结构返回：</p>
+<pre><code>{"decision":"allow","rationale":"原因（可选）"}
+</code></pre>
+<p><code>decision</code> 只能是 <code>allow</code>、<code>deny</code> 或 <code>ask</code>。任何额外字段、未知值、Markdown code fence 或其他非严格 JSON 响应都会回落到原生人工审批。审核超时（默认 300 秒）、取消、模型调用异常或输出无效时，具体的失败原因会写入该条审批记录的 AI 说明，方便区分"审不了"和"没审完"。</p>
+<h2>本地验证与打包</h2>
+<pre><code>npm test
+npm run check
+npm pack
+</code></pre>
+<p>测试不读取真实凭据、不请求真实模型。真实 DSH profile 中的加载、权限下拉框和端到端审查调用需要作为独立集成验收执行。</p>
+<h2>License</h2>
+<p>MIT，见 <a href="https://github.com/alaxrpg/dsh-llm-approve-for-me/blob/HEAD/LICENSE">LICENSE</a>。</p>

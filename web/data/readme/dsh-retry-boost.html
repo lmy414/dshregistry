@@ -1,0 +1,163 @@
+<h1>dsh-retry-boost</h1>
+<p>遇到网关瞬时故障（429 限流/断流/超时）时自动退避重试、直到任务完成——一个 DSH
+插件，启动时把防断流 <code>retryPolicy</code> 热注入到所有 <code>llm-pi-ai</code> provider。
+再也不用手动发「继续」了。</p>
+<p><a href="https://github.com/hhb1028/dsh-retry-boost/blob/HEAD/README.en.md">English README</a></p>
+<hr>
+<h2>问题背景</h2>
+<p>网关返回 <strong><code>429 insufficient_quota</code></strong>（商汤 SenseNova 和很多 LLM 网关都这么措辞）时，
+DSH 的错误分类器会先命中 <code>isQuotaExceededError</code> 把它归为 <strong><code>QUOTA</code></strong> 码，
+而不是通用的 429 → <code>RATE_LIMIT</code>。</p>
+<p>DSH 内置重试（<code>dsh-llm-retry</code>）只重试 <code>retryableCodes</code> 列表里的错误码。而<strong>默认</strong>策略是：</p>
+<pre><code>retryableCodes: [EMPTY_RESPONSE, RATE_LIMIT, SERVER, TIMEOUT, TRANSPORT]   // ← 没有 QUOTA
+maxRetries: 5
+backoff: 500ms → 10s
+</code></pre>
+<p><code>QUOTA</code> 不在列表里 → 瞬时 <code>429 insufficient_quota</code> 直接 <strong>fail-fast</strong>：
+一次都不重试、turn 立刻死掉，手动「继续」也会再撞同一堵墙。上游同源问题：
+<a href="https://github.com/deepseek-ai/deepseek-harness/discussions/892">deepseek-ai/deepseek-harness discussion #892</a>
+（目前 0 回复，官方尚未修复）。</p>
+<h2>解决方案</h2>
+<p>插件启动时把一份加宽的 <code>retryPolicy</code> 写入 <code>llm-pi-ai</code> 设置命名空间，
+llm-pi-ai 的 settings <code>onChange</code> 会<strong>热生效，无需重启</strong>。注入的策略：</p>
+<pre><code>retryableCodes: [EMPTY_RESPONSE, RATE_LIMIT, QUOTA, SERVER, TIMEOUT, TRANSPORT, PI_AI_ERROR, UNKNOWN]
+maxRetries: 50
+backoff: 1s → 60s，抖动 0.2（指数退避）
+</code></pre>
+<p>效果：瞬时 429 / 断流 / 超时会被指数退避<strong>重试直到任务完成</strong>——就是把商汤生产
+环境里用的那个 settings.yaml 补丁产品化，让任何人都能一键装上。</p>
+<h2>为什么做成插件而不是只改 settings.yaml？</h2>
+<ul>
+<li><strong>一条命令安装</strong>——对<em>所有</em> provider 生效，不只是你手改的那一个。</li>
+<li><strong>跟着新 provider 走</strong>——以后新增 provider，下次启动自动套用。</li>
+<li><strong>可配置</strong>——<code>fill</code> / <code>boost</code> / <code>force</code> 三种策略，重试预算可调。</li>
+<li><strong>透明</strong>——注入的策略会出现在 <code>settings.yaml</code> 里，看得见、改得动；
+插件幂等，绝不和你手改的配置打架。</li>
+</ul>
+<h2>与 dsh-chat-continue 的区别</h2>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>dsh-retry-boost（本项目）</th>
+<th><a href="https://github.com/Chu-m/dsh-chat-continue">dsh-chat-continue</a></th>
+</tr>
+</thead>
+<tbody><tr>
+<td>定位</td>
+<td><strong>第一道防线</strong>——让 DSH 内置重试真正生效</td>
+<td><strong>第二道防线</strong>——内置重试耗尽后兜底重试</td>
+</tr>
+<tr>
+<td>机制</td>
+<td>给所有 <code>llm-pi-ai</code> provider 注入 <code>retryPolicy</code>（走官方重试链路）</td>
+<td>拦截 <code>agent/request-error</code> 自己重发失败的请求</td>
+</tr>
+<tr>
+<td>退避</td>
+<td>指数退避 1s → 60s + 抖动</td>
+<td>固定间隔</td>
+</tr>
+<tr>
+<td>手动确认</td>
+<td>——</td>
+<td>可选弹窗通知</td>
+</tr>
+<tr>
+<td>安装</td>
+<td><code>github:hhb1028/dsh-retry-boost#main</code></td>
+<td><code>@wuxjs/dsh-chat-continue</code></td>
+</tr>
+</tbody></table>
+<p>两者<strong>互补</strong>：单独用本项目即可；也可以叠上 chat-continue 作为最后的兜底网。</p>
+<h2>环境要求</h2>
+<ul>
+<li>DSH <code>&gt;= 0.1.1-rc.1</code>（支持 <code>dsh.bundle.patch</code> 宿主插件）</li>
+<li>Node.js <code>&gt;= 20</code></li>
+</ul>
+<h2>安装</h2>
+<pre><code>dsh plugin --profile &lt;你的profile名&gt; add "github:hhb1028/dsh-retry-boost#main"
+</code></pre>
+<p>发布到 npm 后（见 <a href="#roadmap">Roadmap</a>）：</p>
+<pre><code>dsh plugin --profile &lt;你的profile名&gt; add dsh-retry-boost
+</code></pre>
+<p>然后重启 DSH。日志里会出现类似：</p>
+<pre><code>dsh-retry-boost: injected retry policy for "sensenova" (mode=normal retries=50 backoff=1000ms-&gt;60000ms codes=8)
+</code></pre>
+<p>注入后的策略会出现在 profile 的 <code>settings.yaml</code> 中
+<code>llm-pi-ai.providers.*.retryPolicy</code> 下——可以随意手动修改。</p>
+<h2>配置项</h2>
+<p>在合并进 profile 的 <code>cordis.patch.yml</code> roster 行（或 DSH 的插件配置界面）里调整：</p>
+<table>
+<thead>
+<tr>
+<th>键</th>
+<th>默认值</th>
+<th>含义</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>strategy</code></td>
+<td><code>fill</code></td>
+<td><code>fill</code> = 只处理<strong>没有</strong>显式 <code>retryPolicy</code> 的 provider；<code>boost</code> = 对显式配置的也合并缺失错误码并抬高上限；<code>force</code> = 全部替换为插件策略</td>
+</tr>
+<tr>
+<td><code>mode</code></td>
+<td><code>normal</code></td>
+<td><code>normal</code> = 有界重试；<code>always</code> = 无限重试（⚠️ 慎用，永远重试下去）</td>
+</tr>
+<tr>
+<td><code>maxRetries</code></td>
+<td><code>50</code></td>
+<td><code>normal</code> 模式下的重试次数上限</td>
+</tr>
+<tr>
+<td><code>initialDelayMs</code></td>
+<td><code>1000</code></td>
+<td>首次退避延迟</td>
+</tr>
+<tr>
+<td><code>maxDelayMs</code></td>
+<td><code>60000</code></td>
+<td>退避上限</td>
+</tr>
+<tr>
+<td><code>jitterRatio</code></td>
+<td><code>0.2</code></td>
+<td>抖动比例（0–1）</td>
+</tr>
+<tr>
+<td><code>retryableCodes</code></td>
+<td>上面 8 个码</td>
+<td>需要重试的失败码</td>
+</tr>
+</tbody></table>
+<h2>卸载</h2>
+<pre><code>dsh plugin --profile &lt;你的profile名&gt; remove &lt;名字&gt;
+</code></pre>
+<p>卸载后注入到 <code>settings.yaml</code> 里的 <code>retryPolicy</code> 段<strong>不会自动删除</strong>——手动清掉
+（或卸载前先用 <code>force</code> 策略并恢复你自己的值），即可回到 DSH 默认行为。</p>
+<h2>工作原理</h2>
+<ol>
+<li>启动时读取 <code>llm-pi-ai</code> 设置命名空间。</li>
+<li>按 <code>strategy</code> 为每个 provider 规划目标 <code>retryPolicy</code>（<code>lib/policy.js</code> 纯函数，
+全量单元测试）。</li>
+<li>通过 DSH 的 settings provider 合并写入：经 llm-pi-ai 校验（与 <code>dsh-llm</code>
+的 <code>RetryPolicySchema</code> 完全一致）→ 持久化到 <code>settings.yaml</code> →
+<code>installSettingsSection</code> 的 <code>onChange</code> 热生效。</li>
+<li>写入幂等：已达标时再次运行产生空 patch，绝不反复改写。</li>
+</ol>
+<h2>开发</h2>
+<pre><code>npm test        # 单元 + 真实 schema 集成 + apply 流程测试（node --test）
+npm run check   # 语法检查
+</code></pre>
+<p>无构建步骤——纯 ESM。schema 集成测试会把生成的策略跑过框架<strong>真实</strong>的
+<code>RetryPolicySchema</code> / <code>resolveRetryPolicy</code>，保证注入的 patch 永远不会被设置校验拒绝。</p>
+<h2>Roadmap</h2>
+<ul>
+<li> 发布到 npm（<code>dsh-retry-boost</code>）</li>
+<li> llm-pi-ai 配置变化时自动重跑策略（目前是启动时）</li>
+<li> 可选的设置页面（Settings → Retry Boost）</li>
+</ul>
+<h2>许可证</h2>
+<p>MIT</p>

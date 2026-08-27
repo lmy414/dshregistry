@@ -1,0 +1,175 @@
+<h1>dsh-sidebar-onlyoffice</h1>
+<p><a href="https://github.com/chendefine/dsh-sidebar-onlyoffice/blob/HEAD/README.zh-CN.md">中文</a> · <a href="https://www.npmjs.com/package/dsh-sidebar-onlyoffice">npm</a> · <a href="https://github.com/chendefine/dsh-sidebar-onlyoffice">GitHub</a></p>
+<p>A <a href="https://github.com/deepseek-ai/deepseek-harness">DeepSeek Harness</a> (DSH) web plugin that opens and edits <code>.docx</code> / <code>.xlsx</code> / <code>.pptx</code> in the <a href="https://github.com/omdsh-dev/DSH-better-sidebar">dsh-better-sidebar</a> file sidebar through a self-hosted <a href="https://github.com/ONLYOFFICE/Docker-DocumentServer">ONLYOFFICE Document Server</a> — with JWT-signed configs, atomic save-back to disk, and <strong>live refresh when the AI edits an open file</strong>.</p>
+<p><img src="https://img.shields.io/npm/v/dsh-sidebar-onlyoffice" alt="npm"> <img src="https://img.shields.io/npm/l/dsh-sidebar-onlyoffice" alt="license"> <img src="https://img.shields.io/node/v/dsh-sidebar-onlyoffice" alt="node"> <img src="https://img.shields.io/github/actions/workflow/status/chendefine/dsh-sidebar-onlyoffice/ci.yml" alt="CI"> <img src="https://img.shields.io/github/stars/chendefine/dsh-sidebar-onlyoffice" alt="stars"></p>
+<h2>Features</h2>
+<ul>
+<li><strong>Real office editing</strong> — the full ONLYOFFICE editor (words / sheets / slides) embedded in the better-sidebar viewer, not a static preview. Saves write back to the file on disk.</li>
+<li><strong>Signed and fenced by default</strong> — editor configs are HS256-JWT-signed when a secret is configured; every file download is gated by a short-lived HMAC token; browser-facing routes sit behind the dsh web trust fence; files outside the session working directory are refused.</li>
+<li><strong>Live refresh on AI edits</strong> — when the agent modifies a file that is open in the editor, the viewer swaps to the new version within ~a second via <code>refreshFile</code>, with no page reload and no api.js reload. A dirty editor is never auto-refreshed (a banner offers a manual reload instead).</li>
+<li><strong>Atomic saves, self-save suppression</strong> — Document Server callbacks download the saved bytes and replace the file through temp-file + rename, serialized per document key; the plugin's own writes are absorbed by the watch hub so saving never echoes a refresh back.</li>
+<li><strong>In-network save fetch</strong> — optional <code>internalDocumentServerUrl</code> rewrites Document Server save URLs onto a docker-network base (container-to-container) instead of hairpinning through the public reverse proxy.</li>
+<li><strong>Coexists with the office preview plugin</strong> — viewer ids <code>onlyoffice:docx|xlsx|pptx</code> (priority 10) never clash with <code>@huanlin/dsh-plugin-better-sidebar-plugin-office</code>'s <code>docx/xlsx/pptx</code> (priority 0); either side can be disabled per-viewer in the side card settings.</li>
+</ul>
+<h2>How it works</h2>
+<table>
+<thead>
+<tr>
+<th>Half</th>
+<th>Location</th>
+<th>Responsibility</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>Host (server)</td>
+<td><code>src/</code></td>
+<td>Registers four routes on the dsh web webServer implementing the "document storage service" role from the official ONLYOFFICE integration docs.</td>
+</tr>
+<tr>
+<td>Browser (client)</td>
+<td><code>src/client/</code></td>
+<td>Registers the three better-sidebar file viewers; loads the Document Server api.js on demand, mounts <code>DocsAPI.DocEditor</code>, subscribes to the SSE watch stream.</td>
+</tr>
+</tbody></table>
+<pre><code>better-sidebar viewer (onlyoffice:docx|xlsx|pptx)
+   ├─ GET /sidebar/onlyoffice/config    (browser, trust-fenced)
+   │     → editor config + JWT + api.js URL + HMAC file token
+   ├─ GET /sidebar/onlyoffice/file      (Document Server; HMAC token = auth)
+   ├─ POST /sidebar/onlyoffice/callback (Document Server; status 2/6 → atomic save-back)
+   └─ GET /sidebar/onlyoffice/watch     (browser SSE; inotify-fed disk changes)
+         → change → re-fetch config → docEditor.refreshFile(config)  [no reload]
+</code></pre>
+<ul>
+<li><strong>Node half</strong> — the config route builds the editor config for an absolute path inside the session cwd (documentType mapping, content-addressed <code>key = sha256(host+path+size+mtime)</code>), signs the whole config as an HS256 JWT, and registers the key→file mapping. The file route serves the raw bytes to the Document Server. The callback route (JWT-verified) downloads saved bytes on status 2/6 and <strong>atomically replaces the file</strong>, forgets the key on status 4, and always acknowledges with <code>{"error":0}</code>. The watch route streams disk changes as SSE, fed by an inotify watch hub (<code>fs.watch</code> on the file <strong>and</strong> its directory, debounced, signature-filtered through the same content-addressed key).</li>
+<li><strong>Browser half</strong> — loads the Document Server api.js once per URL, mounts the editor, calls <code>destroyEditor()</code> on teardown; failures show an error panel plus a download fallback link (reusing better-sidebar's <code>/sidebar/file</code> route). While mounted it subscribes to the watch stream and reacts to outside (AI) edits by re-fetching the config and calling <code>docEditor.refreshFile(config)</code>.</li>
+</ul>
+<h3>Live refresh on AI edits</h3>
+<p>When an agent modifies a file that is open in the ONLYOFFICE editor, the viewer finds out within ~a second: inotify → SSE <code>change</code> event → config re-fetch (whose content-addressed key changed with the file) → <code>refreshFile</code>. The editor iframe itself is reused — no page reload, no api.js reload, and the DS opens the new version as a fresh session (old key closed with status 4). Guard rails:</p>
+<ul>
+<li>A <strong>dirty editor is never auto-refreshed</strong> — <code>refreshFile</code> unconditionally drops unsaved edits (no <code>isDocumentModified</code> guard on the integrator path, verified in the DS source). Instead a banner appears ("file changed on disk — reloading discards unsaved edits") with a manual <strong>Reload</strong> button; clicking it is the user's confirmation.</li>
+<li>The DS's own <code>onRequestRefreshFile</code> (fired on reconnect / same-key saves, only while NOT modified) rides the same refresh path.</li>
+<li>The plugin's own callback saves are suppressed server-side (<code>noteSelfSave</code> records the just-written signature), so a user save doesn't bounce a refresh back and reset the cursor.</li>
+<li>File deletion pushes a <code>removed</code> notice; re-creation pushes a <code>change</code>.</li>
+</ul>
+<h2>Requirements</h2>
+<ul>
+<li>A DSH <strong>web</strong> profile (<code>dsh web</code>), Node.js ≥ 20, with the <a href="https://github.com/omdsh-dev/DSH-better-sidebar">dsh-better-sidebar</a> plugin installed.</li>
+<li>A self-hosted ONLYOFFICE Document Server (verified against 9.4 community edition) that can reach the dsh web server over the network, and that the browser can reach directly.</li>
+<li>With JWT enabled (the DS default), the plugin's <code>jwtSecret</code> must equal the DS <code>JWT_SECRET</code>.</li>
+<li>The DS needs <code>ALLOW_PRIVATE_IP_ADDRESS=true</code> when <code>document.url</code> / <code>callbackUrl</code> are private addresses (the DS refuses them by default).</li>
+</ul>
+<h2>Installation</h2>
+<p>From the npm registry (prebuilt — no build permission needed):</p>
+<pre><code>dsh plugin --profile web add dsh-sidebar-onlyoffice
+</code></pre>
+<p>From a GitHub repository (source — pnpm runs the <code>prepare</code> build; allowlist the package in <code>profiles/web/pnpm-workspace.yaml</code> if pnpm blocks the build script):</p>
+<pre><code>dsh plugin --profile web add github:chendefine/dsh-sidebar-onlyoffice
+</code></pre>
+<p>Or through the DSH plugin marketplace (设置 → DSH插件市场) — the repo carries the <code>dsh-plugin</code> topic and is indexed automatically.</p>
+<p>After a bundle plugin is added to the profile layer stack, write your config into the profile's <code>cordis.patch.yml</code> layer (see below), <strong>restart <code>dsh web</code></strong>, and hard-refresh the browser (Ctrl+Shift+R). Uninstall with <code>dsh plugin --profile web remove dsh-sidebar-onlyoffice</code> and restart again.</p>
+<h2>Configuration</h2>
+<p>All keys are optional; the profile's <code>cordis.patch.yml</code> layer carries them:</p>
+<pre><code>- id: dsh-sidebar-onlyoffice
+  config:
+    jwtSecret: "&lt;the DS JWT_SECRET&gt;"          # empty = unsigned (only for JWT_ENABLED=false servers)
+    # documentServerUrl: http://192.168.1.10:3082  # browser-side api.js base; empty = derive from the page Origin
+    # internalDocumentServerUrl: http://onlyoffice-documentserver  # server-side fetch base for DS save URLs (see below)
+    # internalBaseUrl: http://172.31.255.4:3080    # how the DS reaches dsh web; empty = auto-detect
+    # documentServerPort: 3082
+    # defaultMode: edit                             # edit | view
+    # fileLimitMb: 100
+    # tokenTtlSec: 600
+</code></pre>
+<table>
+<thead>
+<tr>
+<th>Field</th>
+<th>Default</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>jwtSecret</code></td>
+<td><code>''</code></td>
+<td>Shared secret with the Document Server (its <code>JWT_SECRET</code>). Editor configs and callbacks are JWT-signed/verified when set; empty only fits a DS running <code>JWT_ENABLED=false</code>.</td>
+</tr>
+<tr>
+<td><code>documentServerUrl</code></td>
+<td><em>(derived)</em></td>
+<td>Browser-side DS base URL (e.g. <code>http://192.168.1.10:3082</code>). Empty = derive from each request's Origin host + <code>documentServerPort</code>.</td>
+</tr>
+<tr>
+<td><code>documentServerPort</code></td>
+<td><code>3082</code></td>
+<td>Port appended when deriving the DS URL from the page Origin.</td>
+</tr>
+<tr>
+<td><code>internalDocumentServerUrl</code></td>
+<td><code>''</code></td>
+<td>Base URL this server fetches DS-reported save URLs through (docker-network direct, e.g. <code>http://onlyoffice-documentserver</code>). Empty = fetch exactly as reported (through the public entry).</td>
+</tr>
+<tr>
+<td><code>internalBaseUrl</code></td>
+<td><code>''</code></td>
+<td>Base URL the DS uses to reach this dsh web server (document download + callbacks). Empty = auto-detect the first non-loopback IPv4 + the webserver port.</td>
+</tr>
+<tr>
+<td><code>defaultMode</code></td>
+<td><code>edit</code></td>
+<td>Default open mode; the viewer's gear setting overrides it per user.</td>
+</tr>
+<tr>
+<td><code>fileLimitMb</code></td>
+<td><code>100</code></td>
+<td>Max file size (MB) for serving and saving back.</td>
+</tr>
+<tr>
+<td><code>tokenTtlSec</code></td>
+<td><code>600</code></td>
+<td>Signed URL token lifetime in seconds.</td>
+</tr>
+</tbody></table>
+<p>Each viewer's gear settings add two shared toggles: <strong>open mode</strong> (edit/view) and <strong>document server URL</strong> (browser-side override; a value set on any card applies to all three viewers).</p>
+<h3>In-network save fetch (<code>internalDocumentServerUrl</code>)</h3>
+<p>The three directions are configured independently: browser → DS via <code>documentServerUrl</code>, DS → this server via <code>internalBaseUrl</code>, and this server → DS (downloading saved bytes) defaults to the URL the DS <strong>reports</strong> in its callback — behind a reverse proxy that points back through the public entry, so save traffic hairpins out (DNS + TLS + terminator + gateway). Setting <code>internalDocumentServerUrl</code> (e.g. <code>http://onlyoffice-documentserver</code>, the docker-network container name) rewrites the browser-side prefix (scheme/host/sub-path) of reported save URLs onto that base — path suffix and query stay intact — for a direct container-to-container fetch.</p>
+<p>Safety verified against Document Server 9.4: <code>/cache/files</code> auth is an nginx <code>secure_link</code> md5 over <code>expires + request-path + server secret</code>, where the request path is the one AFTER the proxy strips the sub-path prefix — host and stripped prefix are not signed material, so a rewritten URL still returns 200. A reported URL outside the browser base is fetched as-is with a warn log.</p>
+<h3>Deployment shape</h3>
+<p>The canonical deployment: the Document Server container and dsh web share a docker network (DS container name resolvable, e.g. <code>onlyoffice-documentserver</code>), DS published on host port 3082, JWT enabled with a fixed secret, and <code>ALLOW_PRIVATE_IP_ADDRESS=true</code> on the DS container.</p>
+<h2>Troubleshooting: editor reports errorCode:-4 "download failed"</h2>
+<p><code>-4</code> means the DS could not download <code>document.url</code>. Start from the target URL in the DS container log (<code>error downloadFile:url=...</code>):</p>
+<ul>
+<li>URL points at the DS itself → <code>internalBaseUrl</code> was misconfigured to the DS address. It must be the address <strong>the DS uses to call back into dsh web</strong> (use the container name when both share a docker network); editing the profile's <code>cordis.patch.yml</code> hot-applies via Cordis HMR, no restart needed.</li>
+<li>404 → wrong host in the URL; 403 → token expired/bad signature (reopen the file after a dsh web restart); connection refused/timeout → network unreachable (both containers must share a network; the DS needs <code>ALLOW_PRIVATE_IP_ADDRESS=true</code>).</li>
+<li>Quick check without a browser: fetch the config route with <code>Host: localhost</code> to get <code>document.url</code>, then <code>docker exec onlyoffice-documentserver curl -v &lt;that URL&gt;</code> — expect 200.</li>
+</ul>
+<h2>Known limits</h2>
+<ul>
+<li>Saves are whole-file overwrites: concurrent writes to the same file by the agent race (last writer wins). Live refresh narrows this window — a clean editor is pushed to the newest version within ~a second — but a dirty editor that saves after an AI edit still overwrites it; the stale banner is cleared on save (the overwrite resolved the divergence).</li>
+<li>Self-save suppression has a millisecond race: an external write landing between the plugin's save and its <code>noteSelfSave</code> stat can be wrongly absorbed (one missed refresh event; the next change recovers). Negligible in practice.</li>
+<li><code>onRequestRefreshFile</code> requires ONLYOFFICE Docs ≥ 8.3; <code>refreshFile</code> itself was verified against Document Server 9.4 community edition.</li>
+<li>The browser must reach the Document Server directly (mixed-content rule: an https GUI cannot load http api.js — put a proxy in front or point <code>documentServerUrl</code> at an https entry).</li>
+<li>A dsh web restart loses the in-memory key→file mapping; editors already open in the DS will see error 1 on their next save callback (the DS retries, then gives up) — reopening the file is the fix. The watch stream reconnects on its own (EventSource <code>retry: 3000</code>).</li>
+</ul>
+<h2>Security</h2>
+<p>The host half only ever serves and writes files <strong>inside a session working directory</strong>, browser-facing routes sit behind the dsh web trust fence, and every Document-Server download is gated by a short-lived HMAC token minted per config request. The Document Server itself is user-deployed and user-configured — deploy it on a trusted network. See <a href="https://github.com/chendefine/dsh-sidebar-onlyoffice/blob/HEAD/SECURITY.md">SECURITY.md</a> for the full stance and threat model.</p>
+<h2>Development</h2>
+<pre><code>pnpm install
+pnpm run typecheck   # type gate
+pnpm test            # vitest (69 cases: JWT/key/tokens, route fences and callback saves, in-network save-URL rewrite, viewer descriptors, inotify watch hub + SSE route)
+pnpm run build       # lib/index.js (node half) + lib/client.js (ModuleLoader-wrapped browser half)
+</code></pre>
+<p>Repository layout:</p>
+<pre><code>src/
+├── index.ts        # host entry: the four webServer routes
+├── config.ts       # schemastery schema, base-URL derivation/detection
+├── onlyoffice.ts   # editor config, JWT payload, file tokens, save-URL rewrite
+├── jwt.ts          # minimal HS256 sign/verify (no dependencies)
+├── registry.ts     # document key → file mapping, atomic save-back
+├── watch.ts        # inotify watch hub (debounce, signature filter, self-save absorption)
+├── trust-fence.ts  # browser-request trust check (host/origin)
+├── paths.ts        # absolute-path + containment helpers
+├── wire.ts         # JSON body/error helpers
+└── client/         # browser half: viewers, editor mount, i18n, settings
+</code></pre>
+<h2>License</h2>
+<p><a href="https://github.com/chendefine/dsh-sidebar-onlyoffice/blob/HEAD/LICENSE">MIT</a></p>

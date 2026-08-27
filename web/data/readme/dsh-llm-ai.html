@@ -1,0 +1,191 @@
+<h1>dsh-llm-ai</h1>
+<p>English | <a href="https://github.com/WooLeo1995/dsh-llm-ai/blob/HEAD/README.zh.md">中文</a></p>
+<p>A models.dev-cataloged multi-provider LLM adapter for the DeepSeek Harness: every provider and model fact comes from the community-maintained <a href="https://models.dev">models.dev</a> <code>api.json</code> registry, and the request runtime is a harness-owned <code>openai-completions</code> streaming implementation (direct fetch + SSE) with no pi-ai dependency. It replaces <code>dsh-llm-pi-ai</code> on the same <code>ctx.llm</code> seam.</p>
+<img alt="image" src="https://github.com/user-attachments/assets/28b5c095-4bb2-4f8a-8292-56e1de8a44d7">
+
+<ul>
+<li><strong>Protocol support</strong>: v1 serves <code>openai-completions</code> only (the overwhelming majority of OpenAI-compatible endpoints); <code>anthropic-messages</code> and other protocols are v2 work.</li>
+<li><strong>Verification status</strong>: 205+ unit tests at per-file 100% coverage; deployed as a complete replacement on DSH Desktop 2.0.3 (the dsh 0.1.1-rc.2 family) and in daily use.</li>
+<li><strong>Version baseline</strong>: developed against <code>@deepseek-ai/*@next</code> (the 0.1.1-rc.2 line); peers are compatible with the same generation.</li>
+</ul>
+<h2>Install (npm)</h2>
+<p>Published as the unscoped package <code>dsh-llm-ai</code> (the <code>@deepseek-ai/dsh-llm-ai</code> name is the harness monorepo's integrated twin). With the official CLI:</p>
+<pre><code>dsh plugin --profile &lt;name&gt; add dsh-llm-ai
+</code></pre>
+<p>One command installs and mounts: the CLI forwards to <code>pnpm add</code> in the profile directory, sees this package's <code>dsh.bundle.patch</code> declaration, appends it to the <code>dsh.profile.bundles</code> layer stack, and the profile boot merges the bundled patch — which disables the bundled <code>llm-pi-ai</code> mount and inserts <code>llm-ai</code> (the two adapters cannot coexist: the configurable-provider directory keys provider ids globally and both declaring the same catalog id fails <code>DUPLICATE_DIRECTORY</code> at load).</p>
+<p>Notes:</p>
+<ul>
+<li>Migrating from a manual mount: remove the old <code>llm-ai</code> insert and <code>llm-pi-ai</code> disable lines from the profile's own <code>cordis.patch.yml</code> to avoid a duplicate entry id.</li>
+<li>Bundled-UI builds (DSH Desktop / web-app releases predating the llm-ai migration) hardcode the <code>llm-pi-ai</code> namespace in their Models page — apply the single-string alias documented under Deployment, step 4, to the installed copy at <code>&lt;profile&gt;/node_modules/dsh-llm-ai/lib/index.js</code>.</li>
+<li>Provider profiles live in the <code>llm-ai:</code> settings section (see the configuration reference); credential references need no migration.</li>
+</ul>
+<h2>Features</h2>
+<ul>
+<li><strong>models.dev catalog</strong>: <code>api.json</code> is fetched once at plugin load and cached to disk under the DSH home (<code>storages/models-dev-cache.json</code>); offline boots serve the last good snapshot; a fetch failure is loud only when nothing is cached. <code>catalogUrl</code> / <code>catalogCachePath</code> override the endpoint and cache location.</li>
+<li><strong>openai-completions runtime</strong>: streaming SSE (eventsource-parser), text, tool calls with raw-string arguments, tiered reasoning, image input with oldest-first offload under <code>maxRequestImageBytes</code>, usage and cache-hit accounting, an idle watchdog (<code>streamIdleTimeoutMs</code>), and exactly one provider request per <code>stream()</code> call.</li>
+<li><strong>Stable error codes</strong>: <code>AUTH</code> / <code>QUOTA</code> / <code>RATE_LIMIT</code> / <code>CONTEXT_WINDOW_EXCEEDED</code> / <code>INVALID_REQUEST</code> / <code>SERVER</code> / <code>HTTP_&lt;n&gt;</code> / <code>TRANSPORT</code> / <code>TIMEOUT</code> / <code>ABORTED</code> / <code>STREAM_CLOSED</code> / <code>MALFORMED_RESPONSE</code> / <code>EMPTY_RESPONSE</code> (retryable classification).</li>
+<li><strong>Compat switches</strong>: <code>maxTokensField</code> / <code>supportsDeveloperRole</code> / <code>thinkingFormat</code> (<code>openai</code> | <code>deepseek</code> | <code>openrouter</code>), resolved per field <strong>model → route → protocol default</strong>; unknown and valueless keys are refused listing the offered set — nothing is silently dropped.</li>
+<li><strong>Reasoning declarations</strong>: <code>reasoningEfforts</code> maps each selectable level to its wire spelling; <code>off</code> is tri-state (absent = not offered; declared without a value = send the disabled spelling; declared with a value = send it); an undeclared level is refused before any network I/O. Without a declaration, a registry model's offered levels come from models.dev <code>reasoning_options</code> effort values (each level spelled as itself; <code>none</code> → valueless <code>off</code>); <code>toggle</code>, empty, absent, or non-canonical-only options keep the protocol default set (<code>off</code>/<code>low</code>/<code>medium</code>/<code>high</code>); a profile declaration still reshapes either.</li>
+<li><strong>Dynamic configuration</strong>: the <code>providers</code> dict merges with the user settings section per provider, effective on the next request without a restart; dormant mounting (zero routes with no providers); atomic re-registration when the route set changes.</li>
+<li><strong>Credentials</strong>: configuration stores <code>apiKeyEnv</code> references only; each request resolves them through the credentials seam, then the trusted environment; format checks (<code>INVALID_CREDENTIAL</code>) and empty references (<code>MISSING_CREDENTIAL</code>) name the route and every configuration entry point and never any part of the key.</li>
+<li><strong>Endpoint interrogation</strong>: <code>GET /models</code> discovery for hand-declared gateways (a 4 MiB received-bytes ceiling, a typed draft key winning over stored references, and the <code>DISCOVERY_*</code> error family).</li>
+<li><strong>Configurable-provider directory</strong>: declares all 203 models.dev providers to configuration surfaces (including families it cannot yet serve, with honest metadata).</li>
+</ul>
+<h2>Configuration reference</h2>
+<p>Cordis composition entry:</p>
+<pre><code>- id: llm-ai
+  name: '@deepseek-ai/dsh-llm-ai'
+  # Omitting config mounts dormant (zero routes); a settings section can
+  # activate routes at any time.
+  config:
+    catalogUrl: https://models.dev/api.json      # optional: self-hosted mirror
+    catalogCachePath: /path/to/cache.json        # optional: cache location
+    providers:
+      openai:                    # Catalog route: endpoint, protocol, and models
+        apiKeyEnv: OPENAI_API_KEY    # all inherited from models.dev.
+      zai-coding-cn:             # Hand-declared route: api + baseURL + a
+        apiKeyEnv: ZAI_CODING_CN_API_KEY   # non-empty models list are required.
+        api: openai-completions
+        baseURL: https://open.bigmodel.cn/api/coding/paas/v4
+        models:
+          - { id: glm-5.3, contextWindow: 1000000, maxTokens: 131072 }
+</code></pre>
+<p>Provider profile fields: <code>apiKeyEnv</code> (credential reference), <code>displayName</code>, <code>api</code> (<code>openai-completions</code> only in v1), <code>baseURL</code>, <code>models</code> (<strong>replaces</strong> the route's catalog; unset fields default from the registry entry of the same id), <code>modelOverrides</code> (reshapes individual models while the rest of the catalog keeps serving), <code>compat</code> (the three switches), <code>reasoning</code> (the deployment default level), <code>retryPolicy</code> (omission = normal mode with five retries), <code>headers</code>, <code>defaultContextWindow</code> / <code>defaultMaxTokens</code> / <code>defaultInput</code> (fallbacks for configured entries that state no capacity), <code>streamIdleTimeoutMs</code> (five-minute default), <code>maxRequestImageBytes</code> (20 MiB default).</p>
+<p>Catalog resolution notes: a models.dev model with no context window is refused rather than guessed; a <code>modelOverrides</code> key naming a model the catalog does not describe is refused; <code>timeoutMs</code> is gone (it named pi-ai runtime behavior) and configuring it fails with migration directions.</p>
+<h2>DSH Desktop deployment (the complete procedure)</h2>
+<p>The following is the verified deployment path (executed on DSH Desktop 2.0.3 / dsh 0.1.1-rc.2). The desktop loads plugins through the pnpm mini-workspace at <code>~/.dsh/profiles/desktop/</code> — <strong>the .app bundle itself is never modified</strong>.</p>
+<h3>1. Build a self-sufficient install directory</h3>
+<pre><code>mkdir -p ~/Downloads/project/github/dsh-llm-ai-app
+# Take the build outputs from the harness repo (tsc lib/types + bundled runtime)
+cp -R &lt;harness&gt;/packages/llm/llm-ai/lib ~/Downloads/project/github/dsh-llm-ai-app/
+</code></pre>
+<p>The install directory's <code>package.json</code> declares the plugin plus every peer as a <strong>real</strong> dependency from npm's <code>@next</code> dist-tag (self-sufficient, the vibe-island pattern):</p>
+<pre><code>{
+  "name": "@deepseek-ai/dsh-llm-ai",
+  "version": "0.1.1-rc.2",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": { "types": "./lib/types/index.d.ts", "default": "./lib/index.js" },
+    "./invariant": { "types": "./lib/types/invariant.d.ts", "default": "./lib/invariant.js" }
+  },
+  "dependencies": {
+    "@deepseek-ai/cordis": "next",
+    "@deepseek-ai/dsh-attachment": "next",
+    "@deepseek-ai/dsh-credentials": "next",
+    "@deepseek-ai/dsh-home-paths": "next",
+    "@deepseek-ai/dsh-launch-environment": "next",
+    "@deepseek-ai/dsh-llm": "next",
+    "@deepseek-ai/dsh-settings": "next",
+    "@deepseek-ai/dsh-timeout": "next",
+    "@deepseek-ai/schemastery": "next",
+    "eventsource-parser": "^3.1.1"
+  }
+}
+</code></pre>
+<pre><code>cd ~/Downloads/project/github/dsh-llm-ai-app &amp;&amp; pnpm install
+node --input-type=module -e "const m = await import('./lib/index.js'); console.log(typeof m.apply)"   # smoke test: function
+</code></pre>
+<h3>2. Wire it into the profile workspace</h3>
+<p>Add to the dependencies of <code>~/.dsh/profiles/desktop/package.json</code>:</p>
+<pre><code>"@deepseek-ai/dsh-llm-ai": "link:/Users/&lt;you&gt;/Downloads/project/github/dsh-llm-ai-app"
+</code></pre>
+<pre><code>cd ~/.dsh/profiles/desktop &amp;&amp; pnpm install
+</code></pre>
+<h3>3. Composition patch</h3>
+<p>Append to <code>~/.dsh/profiles/desktop/cordis.patch.yml</code> (keep any managed blocks already there, such as vibe-island):</p>
+<pre><code>- id: llm-pi-ai
+  disabled: true
+- insert:
+    - id: llm-ai
+      name: '@deepseek-ai/dsh-llm-ai'
+</code></pre>
+<h3>4. Namespace compatibility (for the desktop's bundled UI)</h3>
+<p><strong>The key pitfall</strong>: the Models page bundled with DSH Desktop (an upstream rc.2 build) hardcodes the <code>"llm-pi-ai"</code> namespace — the add-card's enable gate, protocol choices, form layout, and write target all recognize that name alone. Once llm-ai mounts, the page degrades to "other fields live in settings.yaml" hints.</p>
+<p>The fix is a <strong>single-string patch</strong> on the plugin copy so it registers under <code>llm-pi-ai</code> (the settings section, directory entries, and discovery registration all flow from this one constant):</p>
+<pre><code>// dsh-llm-ai-app/lib/index.js — the only occurrence in the file
+- const NS = settingsNamespace("llm-ai");
++ const NS = settingsNamespace("llm-pi-ai");
+</code></pre>
+<p>Diagnostic message prefixes (<code>llm-ai: provider "..."</code>) need no change. When an upstream desktop release natively knows <code>llm-ai</code>, restore this string and rename the settings section to return to the canonical namespace.</p>
+<h3>5. settings.yaml migration</h3>
+<p>In <code>~/.dsh/settings.yaml</code>, migrate the previous <code>llm-pi-ai:</code> section to the curated routes (<code>anthropic-messages</code> routes must be removed — validation resolves the whole section, so one unserviceable profile refuses all of it). See the configuration reference above for a six-route example. Credential references (<code>apiKeyEnv</code> → environment variables / <code>~/.dsh/.credentials.yaml</code>) need no migration at all.</p>
+<p><strong>Zero-downtime switch</strong>: until the app restarts, the still-running pi-ai plugin keeps reading the old section — migrate with both sections present, restart, and delete the inert old section afterwards.</p>
+<h3>6. Pre-seed the models.dev cache (optional, recommended)</h3>
+<pre><code>curl -s https://models.dev/api.json -o ~/.dsh/storages/models-dev-cache.json
+</code></pre>
+<p>This guarantees an offline-capable first boot; the plugin still tries a fresh fetch on every load and falls back to the cache on failure.</p>
+<h3>7. Restart and verify</h3>
+<p>Fully quit (⌘Q) and reopen DSH Desktop. Expected: the six routes are live, the model picker works, the Models page renders full editable cards (key / endpoint / protocol / model list), the add-provider card is usable, and the protocol dropdown offers <code>openai-completions</code> only.</p>
+<h2>Troubleshooting</h2>
+<table>
+<thead>
+<tr>
+<th>Symptom</th>
+<th>Cause and fix</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>The Models page shows "Other fields live in settings.yaml; edit that section directly"</td>
+<td>The bundled UI classifies <code>llm-ai</code> as an unknown layout — the step-4 namespace patch is not in effect; check that <code>settingsNamespace("llm-pi-ai")</code> occurs exactly once in the plugin copy</td>
+</tr>
+<tr>
+<td>Writing files under <code>/Applications</code> fails with <code>EPERM</code></td>
+<td>macOS App Management (TCC) protects app bundles from every headless process (including node children of your own terminal) — which is why this procedure never touches the .app</td>
+</tr>
+<tr>
+<td>The app fails to start after "disable the bundled UI entry + insert a replacement"</td>
+<td>The desktop's composition loader rejects that substitution (verified to break boot); never replace the web-app's built-in client entries through a profile patch</td>
+</tr>
+<tr>
+<td>A same-name link (shadowing a bundled package) does not take effect</td>
+<td>Resolution precedence is not guaranteed to prefer the profile; when you need determinism, use a unique package name with an explicit entry, or an absolute path (the vibe-island precedent)</td>
+</tr>
+<tr>
+<td>Every provider disappears at once</td>
+<td>The settings section carries one unserviceable route (for example <code>anthropic-messages</code>) and was refused as a whole; fix or remove the route named in the error</td>
+</tr>
+<tr>
+<td>First boot fails reporting a models.dev fetch failure</td>
+<td>Nothing cached and the network is unreachable; run the step-6 seed</td>
+</tr>
+</tbody></table>
+<p><strong>Full rollback</strong>: delete the three patch entries from <code>cordis.patch.yml</code> → copy <code>settings.yaml.bak-llm-ai-swap</code> back over <code>settings.yaml</code> → restart. The install directory and profile link can stay (unreferenced means inert).</p>
+<h2>Known limitations (v1)</h2>
+<ul>
+<li><code>openai-completions</code> only: the anthropic / google / bedrock / vertex / OAuth-only families stay visible in the directory but unserviceable, and naming them under <code>api</code> is refused; <code>anthropic-messages</code> is planned for v2.</li>
+<li>No replay envelope: cross-provider history converts provider-neutrally (no new session-log structure; logs recorded by pi-ai still load).</li>
+<li>The settings layer can add or override routes, never remove routes declared in the composition base (cordis.yml).</li>
+<li>One wire protocol per route: a mixed-protocol provider splits across two route keys.</li>
+<li><code>tool_choice</code> and stop sequences are unsupported (an MVP cut shared with both predecessors).</li>
+</ul>
+<h2>Development</h2>
+<pre><code>src/
+  index.ts       plugin apply: catalog load, dormant/atomic registration, the
+                 settings section, directory and discovery registration
+  adapter.ts     LlmAiAdapter: stream(), per-call snapshot freeze, timeout and
+                 abort handling, error classification
+  catalog.ts     profile → route/model resolution (models/modelOverrides/
+                 compat/reasoning)
+  config.ts      the schemastery Config schema and resolveProfiles
+  modelsdev.ts   the api.json loader (fetch/cache/offline snapshot, injectable
+                 fetchImpl)
+  serialize.ts   request serialization, reasoning dispatch, image serialization
+                 and offload
+  sse.ts         eventsource-parser framing, the [DONE] sentinel, comment
+                 watchdog pulses
+  translate.ts   wire events → StreamChunk translation (usage precedes finish)
+  discovery.ts   GET /models endpoint interrogation
+  provider.ts    the protocol table (openai-completions only) and withheld
+                 families
+  types.ts       the wire vocabulary
+</code></pre>
+<pre><code>pnpm install
+npx tsc --noEmit        # typecheck
+npx vitest run          # the whole suite (204+, no network)
+npx vitest run --coverage  # per-file 100% coverage gate
+pnpm run build          # tsdown: lib/ runtime bundle + declarations
+</code></pre>
+<p>The complete decision record lives in the deployment source repository under <code>.scratch/llm-ai/</code> (the spec plus twelve ticket resolutions); the harness monorepo's <code>packages/llm/llm-ai</code> is the integrated twin (with repo gates and doc regeneration). This directory is the origin for publication and standalone development.</p>
+<h2>License</h2>
+<p>MIT (following the upstream DeepSeek Harness).</p>

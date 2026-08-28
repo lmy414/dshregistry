@@ -1,0 +1,147 @@
+<h1>dsh-quant-factor-pipeline</h1>
+<blockquote>
+<p>Quant Factor Research Pipeline — a companion <strong>user-layer MCP server</strong> for <a href="https://github.com/deepseek-ai/deepseek-harness">DeepSeek Harness (dsh)</a>.</p>
+<p>把「探针驱动 → 面板 → IC/5 门 → 回测 → Regime」的量化研究流水线封装成模型可逐步调用的 MCP 工具。
+作者：<strong>helibeiqi</strong>（本仓库为本地源码，配套装于 dsh web profile）。</p>
+</blockquote>
+<hr>
+<h2>核心定位</h2>
+<p>把一套<strong>工程纪律严格</strong>的因子研究流程变成 dsh 里模型能直接编排的工具：</p>
+<pre><code>panel_probe  ──►  ic_gate  ──►  regime_check  ──►  factor_backtest
+   (拉面板)        (IC/5门)       (regime切换)        (多空近似回测)
+        │                                              │
+        └──────────── project_save / project_load ─────┘
+                  (持久化研究项目 manifest YAML)
+</code></pre>
+<p>设计原则（与本地量化工程纪律一致）：</p>
+<ul>
+<li><strong>探针驱动</strong>：任何数据源先 <code>panel_probe</code> 核验覆盖度与完整性，再下游使用。</li>
+<li><strong>防前视</strong>：前瞻收益用「调后收盘→收盘」，信号取 <code>T-1</code> 收盘，杜绝 look-ahead。</li>
+<li><strong>稳健统计</strong>：IC 显著性用 <strong>Newey-West</strong> t 统计，而非朴素 t。</li>
+<li><strong>单一真理源 / 可归因</strong>：每个工具输出机读、可溯源的结果，便于审计。</li>
+</ul>
+<hr>
+<h2>工具清单（模型命名空间 <code>mcp__quant_factor__*</code>）</h2>
+<table>
+<thead>
+<tr>
+<th>工具</th>
+<th>作用</th>
+<th>阶段</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>panel_probe</code></td>
+<td>拉取 A 股日频面板，汇报换手率覆盖率，产出完整性 <code>panel_hash</code>（F4）</td>
+<td>探针 / 面板</td>
+</tr>
+<tr>
+<td><code>ic_gate</code></td>
+<td>构建 CGO 处置效应因子，计算 RankIC vs 前瞻收益、Newey-West t 统计、R² 机械健康度（F5）</td>
+<td>IC / 5 门</td>
+</tr>
+<tr>
+<td><code>regime_check</code></td>
+<td>对信号/收益序列做粗粒度 regime 状态 + 相关性断裂 / 正交性检测（F5 / P1-F9）</td>
+<td>Regime</td>
+</tr>
+<tr>
+<td><code>factor_backtest</code></td>
+<td>纯 Node 多空十分位回测近似（RankIC / ICIR / Sharpe / 换手 / 净值曲线）（P1-F7）。<strong>注：P1 近似，非 engine_max</strong></td>
+<td>回测</td>
+</tr>
+<tr>
+<td><code>project_save</code></td>
+<td>将研究项目 manifest 写入 <code>quant-workspace/.quant-pipeline/projects/&lt;id&gt;.yaml</code>（F1）</td>
+<td>持久化</td>
+</tr>
+<tr>
+<td><code>project_load</code></td>
+<td>读回上述 manifest（F1）</td>
+<td>持久化</td>
+</tr>
+</tbody></table>
+<hr>
+<h2>协议与运行</h2>
+<ul>
+<li><strong>协议</strong>：NDJSON（JSON-RPC 2.0，每行一个 JSON 对象，以 <code>\n</code> 结束，容忍末尾 <code>\r</code>）。这与 dsh-mcp-client / MCP SDK 的帧格式一致。<strong>不要</strong>用 Content-Length 帧（会被误判，导致 server 挂不上）。</li>
+<li><strong>传输</strong>：stdio。</li>
+<li><strong>运行时</strong>：managed Node 22.22.2（绝对路径，无需构建）。</li>
+<li><strong>依赖</strong>：<strong>零依赖</strong>，仅用 Node 内置（<code>http/https</code>、<code>zlib</code>、<code>crypto</code>、<code>fs</code>、<code>path</code>）。</li>
+</ul>
+<hr>
+<h2>数据源（已验证端点）</h2>
+<p>仅使用从既有 quant MCP 继承的<strong>已验证</strong>端点：</p>
+<ul>
+<li><code>push2his.eastmoney.com/api/qt/stock/kline/get</code> —— kline + 换手率</li>
+<li><code>datacenter-web.eastmoney.com/api/data/v1/get</code> —— <code>RPT_LICO_FN_CPD</code> 财务数据</li>
+<li><code>qt.gtimg.cn</code> —— 腾讯快照</li>
+</ul>
+<h3>数据源禁区（DO NOT CALL — 反爬 / 失效 / 403 / 重定向）</h3>
+<ul>
+<li><code>emweb.securities</code>（旧东方财富 emweb 站点）—— 已下线</li>
+<li><code>f10.eastmoney.com/zycwzbAjax</code> —— 反爬 403</li>
+<li><code>web.ifzq.gtimg.cn</code>（部分历史端点）—— 已停服</li>
+</ul>
+<hr>
+<h2>安装到 dsh</h2>
+<ol>
+<li>在 dsh web profile 中作为 user-layer MCP server 挂接（见 <code>cordis.patch.yml</code>）。</li>
+<li>patch 层为<strong>纯覆盖式</strong>：<code>- insert:</code> 完整条目，必须带 <code>name: '@deepseek-ai/dsh-mcp-client'</code> 并将 server 配置包在 <code>config:</code> 下。</li>
+<li>所有本地路径（日志 / 项目持久化目录 / QMT 数据目录 / akshare 桥接）均可通过环境变量覆盖，默认按"脚本目录 / 用户主目录"解析，因此在<strong>任何机器上都是 drop-in</strong>（详见下方「环境变量」）。</li>
+</ol>
+<pre><code># 等价手动安装（绕过 pnpm forwarder 时）
+npm pack &amp;&amp; cd ~/.dsh/profiles/web &amp;&amp; npm install /path/to/dsh-quant-factor-pipeline-0.1.0.tgz --no-save --no-audit --no-fund
+# 重启 dsh web（端口 3080）生效
+</code></pre>
+<blockquote>
+<p>⚠️ 不要裸装 <code>@latest</code>，请以本仓库锁定版本为准。</p>
+</blockquote>
+<hr>
+<h2>环境变量</h2>
+<table>
+<thead>
+<tr>
+<th>变量</th>
+<th>作用</th>
+<th>默认值</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>QMT_DATADIR</code></td>
+<td>QMT 仿真终端 <code>datadir</code> 路径；设空则禁用 QMT 数据源层</td>
+<td>未设置 = 禁用</td>
+</tr>
+<tr>
+<td><code>AKSHARE_PYTHON</code></td>
+<td>运行 akshare 桥接脚本的 Python 解释器</td>
+<td><code>python3</code>（系统 PATH 查找）</td>
+</tr>
+<tr>
+<td><code>AKSHARE_HELPER</code></td>
+<td>akshare 桥接 <code>.py</code> 脚本路径</td>
+<td>同目录 <code>dsh_akshare_kline.py</code></td>
+</tr>
+<tr>
+<td><code>QUANT_MCP_LOG</code></td>
+<td>侧向日志文件路径（stdout 仅供 NDJSON），用于排障</td>
+<td>同目录 <code>dsh-mcp-quant-factor-server.log</code></td>
+</tr>
+<tr>
+<td><code>QUANT_PROJECTS_DIR</code></td>
+<td><code>project_save</code> / <code>project_load</code> 持久化 manifest 目录</td>
+<td>用户主目录下 <code>.quant-pipeline/projects</code></td>
+</tr>
+</tbody></table>
+<blockquote>
+<p>注：本仓库源码不依赖任何本地绝对路径；上述默认值在任意机器均可解析。</p>
+</blockquote>
+<hr>
+<h2>当前状态</h2>
+<ul>
+<li>✅ 加载健康；<code>panel_probe</code> 实测可拉取真实面板数据（2790+ 条）。</li>
+<li>🔧 待完善（P0）：① 本仓库首次发布；② 本 README；③ 单文件缺单元测试；④ 与 <code>dsh-quant-data-mcp</code> 的职责边界需进一步厘清（避免重复数据源）。</li>
+</ul>
+<hr>
+<h2>License</h2>
+<p>MIT — Copyright (c) 2026 helibeiqi</p>

@@ -1,0 +1,123 @@
+<h1>dsh-event-relay</h1>
+<p>A <a href="https://github.com/deepseek-ai/deepseek-harness">DeepSeek Harness</a> (DSH)
+plugin: install it into a profile alongside your own plugins.</p>
+<p><strong>Push from host to browser.</strong> The host can start a conversation; every other
+channel (fetch, RPC) requires the browser to ask first. If your plugin's UI
+should react the moment something happens host-side (a setting changed, a
+build finished, a notification arrived), this is that channel.</p>
+<p>One shared SSE route (<code>/relay/events</code>) holds every subscriber's response open
+and streams JSON messages <code>{"topic","payload"}</code> as things happen. One
+connection per browser tab, no matter how many plugins subscribe.</p>
+<h2>Architecture</h2>
+<pre><code>flowchart LR
+    subgraph HOST["🖥️ Host, dsh-event-relay (host half)"]
+        P["publish(topic, payload)"]
+        N["notifyClients&lt;br/&gt;filter per client"]
+        W[("/relay/events&lt;br/&gt;held-open responses")]
+    end
+    subgraph WIRE["⇄ SSE"]
+        direction LR
+        M["data: {topic, payload}&lt;br/&gt;...one message per event..."]
+    end
+    subgraph BROWSER["🌐 Browser tab, dsh-event-relay (client half)"]
+        C["eventRelay service&lt;br/&gt;subscribe(topic, listener)"]
+        S["notifyListeners&lt;br/&gt;fan-out per topic"]
+        L1["plugin A listener"]
+        L2["plugin B listener"]
+        L3["plugin C listener"]
+    end
+    P --&gt; N --&gt; W
+    W --&gt; M
+    M --&gt; C
+    C --&gt; S
+    S --&gt; L1
+    S --&gt; L2
+    S --&gt; L3
+</code></pre>
+<h2>Plugin value proposition</h2>
+<table>
+<thead>
+<tr>
+<th>alternative</th>
+<th>falls short</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>polling</td>
+<td>latency + waste (N fetches to learn "nothing changed")</td>
+</tr>
+<tr>
+<td>refetch on focus/navigation</td>
+<td>free and correct, but updates only when the user acts</td>
+</tr>
+<tr>
+<td>your own EventSource/WebSocket per plugin</td>
+<td>the browser caps ~6 connections/domain (HTTP/1.1); a few plugins permanently occupy them and <strong>every other request queues</strong>. This shared stream is one connection for the whole tab</td>
+</tr>
+<tr>
+<td>host RPC (<code>/api</code>)</td>
+<td>request→response: the frontend can ask, but the host cannot interrupt</td>
+</tr>
+</tbody></table>
+<p><strong>One direction, on purpose.</strong> Browser→host is transaction-shaped (command →
+reply): use plain HTTP (a route your host half registers) with status codes,
+validation, and error handling the stream doesn't have. Host→browser is
+notification-shaped: unpredictable moments, all tabs at once. Different jobs,
+different roads.</p>
+<h2>How to install</h2>
+<p>Requires a DeepSeek Harness checkout and a profile (here <code>web</code>):</p>
+<pre><code># from the harness checkout
+pnpm dsh plugin --profile web add /path/to/dsh-event-relay
+
+# verify the profile still composes
+pnpm dsh --profile web --dump-config
+</code></pre>
+<p>Then (re)start the harness; the host half loads at boot. Browser plugins
+consume the client service with <code>ctx.get('eventRelay')</code>, nothing to wire up
+beyond installing this package.</p>
+<h2>Producers (host plugins)</h2>
+<pre><code>const relay = ctx.get('eventRelay')            // optional, degrade if absent
+relay.publish('my-topic', payload)             // direct
+ctx.on('my/event', (data) =&gt; relay.publish('my/event', data))   // mirror a Cordis event (do this in your plugin)
+</code></pre>
+<h2>Consumers (browser bundles)</h2>
+<pre><code>const relay = ctx.get('eventRelay')            // provided by this package's client half
+const unsubscribe = relay.subscribe('kanban', (topic, payload) =&gt; { ... })
+// or raw: new EventSource('/relay/events?topics=kanban,notifications')
+</code></pre>
+<p><code>payload</code> in the callback is whatever the publisher passed. Apply it directly
+or ignore it and refetch your own truth, both are first-class styles.</p>
+<p>Topic filtering: a subscription matches its exact topic and any child topic
+(<code>'kanban'</code> matches <code>'kanban/change'</code>). The browser's connection URL carries
+the union of the tab's topics, so the server only sends what this tab listens
+for. When the last listener of the tab unsubscribes, the connection closes.</p>
+<p>On every (re)open of the stream, subscribers of the synthetic topic <code>__relay</code>
+receive <code>'__relay/open'</code>. Consumers that apply state from messages use it to
+resynchronize: anything missed while the stream was down is recovered by one
+refetch.</p>
+<h2>Design</h2>
+<p>Transport, not a bus: Cordis events remain the host-side event system; this
+only carries messages across the plane boundary.</p>
+<p>Payload is optional, not doorbell-only. Some plugins use the relay purely as a
+change signal, a topic-only message that tells them to refetch their own
+truth. Others consume the payload directly: the notifications demo pushes the
+notification itself, a kanban board pushes change messages. <code>publish(topic, payload)</code>: send whatever is useful. Doorbells are one usage style, not the
+contract.</p>
+<p>Liveness, not correctness: the relay may be absent, and a consumer should
+fall back to pull-on-focus (or pull on <code>__relay/open</code>) rather than depend on
+the stream for state.
+Route roots are composition-level contracts (<code>/api</code>, <code>/plugins</code>,
+<code>/workspace-history</code>, <code>/notifications</code>, <code>/granular-settings</code> are taken).</p>
+<h2>Debugging</h2>
+<p>The wire can be listened to from a terminal. Very useful to verify publishes
+end-to-end without a browser:</p>
+<pre><code>curl -N 'http://127.0.0.1:3080/relay/events'
+</code></pre>
+<p>Add <code>?topics=&lt;prefixes&gt;</code> to mirror a client's filter; <code>-N</code> makes curl stream
+instead of buffering.</p>
+<h2>Dependencies</h2>
+<p>None</p>
+<h2>Plugins dependent on this</h2>
+<ul>
+<li><a href="https://github.com/joao-paulo-santos/dsh-granular-settings">dsh-granular-settings</a> publishes doorbell-only change notifications for its scoped settings platform</li>
+</ul>

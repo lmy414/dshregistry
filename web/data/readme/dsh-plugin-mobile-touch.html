@@ -1,0 +1,78 @@
+<h1>📱 dsh-plugin-mobile-touch</h1>
+<p><a href="https://dsh.market/?q=AnonyJcy%2Fdsh-plugin-mobile-touch"><img src="https://raw.githubusercontent.com/2BingLing/dsh-market/master/assets/readme/badge-listed-zh.svg" alt="DSH Market 收录徽章"></a>
+<a href="https://www.npmjs.com/package/@anonyjcy/dsh-plugin-mobile-touch"><img src="https://img.shields.io/npm/v/@anonyjcy/dsh-plugin-mobile-touch.svg?color=blue" alt="npm version"></a>
+<a href="https://github.com/AnonyJcy/dsh-plugin-mobile-touch/releases"><img src="https://img.shields.io/github/v/release/AnonyJcy/dsh-plugin-mobile-touch?color=blue" alt="GitHub release"></a>
+<a href="https://github.com/AnonyJcy/dsh-plugin-mobile-touch/blob/HEAD/LICENSE"><img src="https://img.shields.io/badge/license-MIT-green.svg" alt="license"></a></p>
+<p><strong>简体中文</strong> | <a href="https://github.com/AnonyJcy/dsh-plugin-mobile-touch/blob/HEAD/README.en.md">English Version</a></p>
+<blockquote>
+<p><strong>DeepSeek Harness (DSH)</strong> 移动端与 iPad 触控交互深度优化插件。<br>针对 iPadOS / Safari WebKit 渲染引擎与触控手势管线深度定制，彻底解决手势拦截卡死、会话切换输入法弹起误触、全页弹性颠簸与侧边栏折叠抖动等全链路痛点。</p>
+</blockquote>
+<hr>
+<h2>🌟 核心问题深度剖析与解决方案（踩坑实录与内核原理解析）</h2>
+<p>在 iPad (Safari/WebKit) 上使用现代 Web 应用（如 DeepSeek Harness Web GUI）时，经常会遇到一系列严重影响体验的底层内核与手势冲突。本项目在研发过程中深入攻克了以下关键机制：</p>
+<h3>1. HTML5 拖拽属性（<code>draggable="true"</code>）导致的触控滑动卡死</h3>
+<ul>
+<li><strong>问题表象</strong>：在左侧工作区列表中滑动时，10 次里有 8~9 次完全滑不动、像被锁死一样，只有极快猛甩才能偶尔滑一下。</li>
+<li><strong>深层根因</strong>：DSH 为了支持 PC 端鼠标拖拽排序，在每个会话行上声明了 <code>draggable={true}</code>。在 iPadOS 15+ 上，WebKit 支持了多任务拖放手势；当手指触碰带有 <code>draggable</code> 的 DOM 节点时，WebKit 会启动约 50ms 的长按拖拽识别等待。只要手指稍有自然停顿，WebKit 的 <code>DragGestureRecognizer</code> 就会抢占手势并强制派发取消信号，<strong>直接掐死纵向滚动</strong>！</li>
+<li><strong>解决对策</strong>：在 <code>touchstart</code> / <code>pointerdown</code> 捕获阶段第 0 毫秒即时剥离触碰链条上的 <code>draggable</code> 属性，配合 <code>MutationObserver</code> 和原型链封杀，确保 WebKit 100% 毫无延迟地分发为纵向顺滑滚动。</li>
+</ul>
+<h3>2. 会话切换时自带虚拟软键盘频繁弹起占半屏</h3>
+<ul>
+<li><strong>问题表象</strong>：在 iPad 上点击切换查看不同历史会话时，系统巨大的软键盘自动弹起遮挡半屏并引起视口剧烈抖动。</li>
+<li><strong>深层根因</strong>：DSH 核心的 <code>InputBar.tsx</code> 在 <code>sessionId</code> 切换时，React <code>useEffect</code> 默认会自动调用 <code>textarea.focus()</code>。桌面端用于快速输入，但在移动端触屏上会直接强行拉起系统软键盘。</li>
+<li><strong>解决对策（Keyboard Focus Guard）</strong>：在原型链层面拦截 <code>HTMLTextAreaElement.prototype.focus</code>。仅当检测到用户手指在过去 350ms 内<strong>真实直接点击了输入框本身</strong>时才放行聚焦；所有会话切换、页面加载引起的自动聚焦全部在底层被静默压制，<strong>浏览历史对话绝不再误弹键盘</strong>。</li>
+</ul>
+<h3>3. iPad 1024px 临界值抖动导致侧边栏自动缩窄</h3>
+<ul>
+<li><strong>问题表象</strong>：点击会话或者滑动后，左侧工作区突然自动折叠成只有图标的 56px 小窄条。</li>
+<li><strong>深层根因</strong>：DSH 内置 <code>SIDEBAR_AUTO_COLLAPSE = 1024</code> 阈值判定。iPad 屏幕分辨率恰好落在 1024px 临界线上；会话切换引起的重绘或微小尺寸波动（1023.5px 与 1024px 间横跳）会导致 DSH 误判进入手机窄屏模式并重置折叠状态。</li>
+<li><strong>解决对策（Sidebar Persistence）</strong>：智能识别平板屏幕（$\ge 768\text{px}$）并常驻锁定侧边栏展开状态，仅当用户主动点击左上角折叠按钮时才进行收起，切换会话永不缩水。</li>
+</ul>
+<h3>4. 局部滑动带跑整个页面（Overscroll Chaining &amp; PreventDefault）</h3>
+<ul>
+<li><strong>问题表象</strong>：手指在工作区滑动时，整张网页跟着上下晃动甚至触发浏览器下拉刷新。</li>
+<li><strong>深层根因</strong>：在 WebKit 触控管线中，当内部容器滑动如果未在拖拽时消费事件，WebKit 会将手势冒泡升级为整个 Window 窗口的弹性橡皮筋下拉（Rubberband Bounce）。</li>
+<li><strong>解决对策</strong>：在独占式树状触控引擎中，拖拽滑动时精准执行 <code>e.preventDefault()</code> 并对 <code>scrollTop</code> 实施严格物理边界收敛，切断全页回弹链条，页面稳如磐石。</li>
+</ul>
+<hr>
+<h2>✨ 核心特性一览</h2>
+<ul>
+<li>🎯 <strong>智能硬件感知</strong>：自动识别 <code>pointer: coarse</code>、多点触控与移动端环境，<strong>仅在触控屏上激活</strong>；桌面鼠标环境零开销、零干扰。</li>
+<li>⚡ <strong>独占式树状列表触控引擎（Dedicated Tree Scroller）</strong>：100% 毫秒级即时滑动响应，配合物理阻尼算法实现丝滑 ProMotion 惯性滑行。</li>
+<li>🛡️ <strong>软键盘智能防误弹守卫（Focus Guard）</strong>：彻底解决切换对话时虚拟输入法跳出占屏的痛点。</li>
+<li>📌 <strong>iPad 平板大屏侧边栏常驻守护</strong>：杜绝 1024px 临界值抖动引起的侧边栏自动缩窄。</li>
+<li>📏 <strong>精准原生滚动条渲染</strong>：彻底消除破碎变形与遮罩遮挡，等比例精准反映滚动进度。</li>
+<li>🔌 <strong>全域自动自适应（Future-Proof）</strong>：后续安装或开发的任何新 UI 插件无需单独写适配代码，自动享有触控优化。</li>
+</ul>
+<hr>
+<h2>🚀 安装与部署</h2>
+<h3>方式一：通过 npm / pnpm 安装（官方 npm 源）</h3>
+<pre><code># npm 安装
+npm install -D @anonyjcy/dsh-plugin-mobile-touch
+
+# pnpm 安装
+pnpm add -D @anonyjcy/dsh-plugin-mobile-touch
+
+# 运行 CLI 一键挂载到 DSH Web Profile
+npx @anonyjcy/dsh-plugin-mobile-touch install
+</code></pre>
+<h3>方式二：克隆仓库直接安装（本地使用）</h3>
+<pre><code>git clone https://github.com/AnonyJcy/dsh-plugin-mobile-touch.git
+cd dsh-plugin-mobile-touch
+
+# 一键挂载到 DSH Web Profile (~/.dsh/profiles/web)
+node bin/cli.js install
+
+# 检查安装状态与健康度
+node bin/cli.js status
+</code></pre>
+<hr>
+<h2>🛠️ CLI 命令一览</h2>
+<pre><code>node bin/cli.js install [profile]    # 挂载触控优化插件到 DSH profile（默认: web）
+node bin/cli.js uninstall [profile]  # 从 DSH profile 干净卸载插件
+node bin/cli.js verify [profile]     # 校验安装与软链接完整性
+node bin/cli.js status [profile]     # 查看当前安装状态与配置路径
+</code></pre>
+<hr>
+<h2>📄 开源许可证</h2>
+<p>本项目基于 <a href="https://github.com/AnonyJcy/dsh-plugin-mobile-touch/blob/HEAD/LICENSE">MIT License</a> 开源。</p>

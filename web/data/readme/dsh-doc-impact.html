@@ -1,0 +1,156 @@
+<h1>dsh-doc-impact</h1>
+<p>Deterministic documentation-impact enforcement for <a href="https://github.com/deepseek-ai/deepseek-harness">DeepSeek Harness</a>.</p>
+<p>The plugin links code and documentation into a declarative impact graph. When an
+agent changes files during a turn, <code>dsh-doc-impact</code> diffs the workspace against
+the turn baseline, matches the delta against project rules, and — before the
+turn closes — steers the agent to review or update the affected documents.
+Implementing the plugin as a standard Cordis extension means no DSH core
+changes (SPEC §14, §93).</p>
+<pre><code>packages/auth/src/session.ts changed
+
+→ docs/authentication.md
+→ docs/security/session-lifecycle.md
+</code></pre>
+<h2>Install</h2>
+<pre><code>dsh plugin --profile web add link:/path/to/dsh-doc-impact   # local checkout
+# or, once published:
+dsh plugin --profile web add dsh-doc-impact
+</code></pre>
+<p>Then restart the harness so the plugin is loaded.</p>
+<h2>Workspace configuration</h2>
+<p>Create <code>.dsh/doc-impact.yml</code> in the project the agent works on:</p>
+<pre><code>version: 1
+
+defaults:
+  mode: remind            # remind | require-review | require-resolution | require-update
+  scope: turn             # turn | session
+  changeDetection: auto   # auto | git | filesystem
+
+rules:
+  - id: auth-docs
+    description: Authentication behavior documentation
+    code:
+      include:
+        - packages/auth/**
+        - packages/server/src/auth/**
+      exclude:
+        - "**/*.test.ts"
+    docs:
+      - docs/authentication.md
+    direction: code-to-docs     # code-to-docs | docs-to-code | bidirectional
+    relation: documents         # documents | specification | synchronized | related
+    mode: require-resolution
+
+  # Concise form is also accepted:
+  - id: configuration-contract
+    code: [packages/config/**]
+    docs: [docs/configuration.md]
+    direction: bidirectional
+    relation: specification
+</code></pre>
+<p>Personal overrides belong in <code>.dsh/doc-impact.local.yml</code> (add it to
+<code>.gitignore</code>):</p>
+<pre><code>disabledRules:
+  - legacy-docs
+</code></pre>
+<h3>Plugin-level defaults (profile patch)</h3>
+<pre><code>- insert:
+    - id: doc-impact
+      name: dsh-doc-impact
+      config:
+        enabled: true
+        configFile: .dsh/doc-impact.yml
+        defaults:
+          mode: remind
+        safety:
+          maxReminderRounds: 2
+          onLimit: allow        # allow | warn | error
+        changeDetection:
+          maxSnapshotFiles: 10000
+        debug: false
+</code></pre>
+<h2>How it works</h2>
+<ol>
+<li><strong>Baseline</strong> — at the turn's first step the plugin records HEAD and the
+content hashes of every already-dirty file (git mode) or of all
+selector-matched files (filesystem fallback). Pre-existing user changes are
+therefore never attributed to the agent (SPEC §16-§19).</li>
+<li><strong>Stop check</strong> — on <code>agent/turn-stopping</code> the plugin diffs the workspace
+against the baseline (including commits the agent made mid-turn), matches
+the delta against the rules, and auto-resolves impacts whose targets were
+updated (SPEC §31, §88).</li>
+<li><strong>Steer</strong> — unresolved impacts produce one grouped reminder, and the agent
+gets another model step to update or review the documents.</li>
+<li><strong>Resolve</strong> — for strict modes the agent calls
+<code>doc_impact_resolve { ruleId, status, reason? }</code> with <code>reviewed-current</code>,
+<code>updated</code> (verified against the actual file delta), or <code>not-applicable</code>
+(non-empty reason required).</li>
+<li><strong>Loop protection</strong> — <code>remind</code> steers once per impact fingerprint; strict
+modes stop after <code>maxReminderRounds</code> and honor <code>onLimit</code> (fail-open by
+default, SPEC §34-§36).</li>
+</ol>
+<h2>Commands and tools</h2>
+<table>
+<thead>
+<tr>
+<th>Interface</th>
+<th>Purpose</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>/doc-impact</code></td>
+<td>current pending/resolved status</td>
+</tr>
+<tr>
+<td><code>/doc-impact check</code></td>
+<td>recompute impacts now</td>
+</tr>
+<tr>
+<td><code>/doc-impact explain &lt;ruleId&gt;</code></td>
+<td>show one rule and whether it is triggered</td>
+</tr>
+<tr>
+<td><code>/doc-impact changed</code></td>
+<td>files the plugin attributes to this agent</td>
+</tr>
+<tr>
+<td><code>doc_impact_resolve</code></td>
+<td>explicit resolution tool (strict modes)</td>
+</tr>
+<tr>
+<td><code>doc_impact_status</code></td>
+<td>read-only status tool</td>
+</tr>
+</tbody></table>
+<h2>Plugin Configuration UI</h2>
+<p>The plugin ships a browser half (<code>lib/client.js</code>, <code>exports "./client"</code>), so
+<strong>Settings → Plugins → Plugin Configuration</strong> shows a "Doc Impact" card bound
+to the <code>doc-impact</code> settings namespace. It follows the first-party card model:</p>
+<ul>
+<li>staged edits — nothing writes before <strong>Save</strong>; <strong>Discard</strong> drops drafts;</li>
+<li>the header carries an <strong>unsaved</strong> badge while drafts exist;</li>
+<li><strong>Save</strong> stays disabled until there is something to write (and while a draft
+is invalid or a save is in flight);</li>
+<li>every field shows whether saving would leave a user-layer override and, when
+one stands, a per-field <strong>Reset</strong> that reverts to the composition layer.</li>
+</ul>
+<p>Editable fields: <code>enabled</code>, <code>configFile</code>, default <code>mode</code>, <code>maxReminderRounds</code>,
+<code>onLimit</code>, <code>maxSnapshotFiles</code>, <code>debug</code>. The profile patch row's <code>config:</code> acts
+as the composition base under these user edits; the engine reads the merged
+view live (toggling <code>enabled</code> silences the plugin without a restart).</p>
+<h2>Development</h2>
+<pre><code>npm install
+npm run check   # typecheck + tests + build
+</code></pre>
+<p>The core (<code>src/config</code>, <code>src/graph</code>, <code>src/changes</code>, <code>src/engine</code>) is
+DSH-independent and testable without the harness; only <code>src/dsh</code> imports
+<code>@deepseek-ai</code> packages (SPEC §83, §92). Integration tests exercise real git
+repositories, including the Definition-of-Done scenario (SPEC §95).</p>
+<h2>Status</h2>
+<p>MVP scope per SPEC §80: code-to-docs / docs-to-code / bidirectional rules,
+glob include/exclude, git + filesystem baseline detectors, <code>agent/turn-stopping</code>
+continuation, reminder aggregation, <code>remind</code> + <code>require-resolution</code> (plus
+<code>require-review</code> / <code>require-update</code> modes), loop protection, commands, unit and
+integration tests.</p>
+<h2>License</h2>
+<p><a href="https://github.com/xarleyn/dsh-doc-impact/blob/HEAD/LICENSE">MIT</a></p>

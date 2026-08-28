@@ -1,0 +1,136 @@
+<h1>dsh-tools-manager</h1>
+<p>DSH 插件：以 tree 形式列出「插件 → 工具」，并支持全局启停单个工具。</p>
+<ul>
+<li><strong>Tree 列出工具</strong>：按来源插件分组，展示每个插件注册的全部工具（name / description）。</li>
+<li><strong>全局启停</strong>：对任意工具一键禁用/启用，跨会话持久化，立即生效（模型不可见 + 执行被拒，两层一致）。</li>
+<li><strong>UI 入口</strong>：设置页独立「工具管理」Tab（<code>settings.section</code> slot，与「MCP」Tab 同级）。</li>
+</ul>
+<h2>架构</h2>
+<h3>工具来源归属（tree 数据基础）</h3>
+<ul>
+<li><strong>归因算法</strong>（零源码修改）：<ol>
+<li>启动时快照 <code>ctx.tools.schemas()</code> 作基线，归到 <code>(baseline)</code> 分组。</li>
+<li>监听 Cordis <code>internal/plugin</code>（<code>fiber.name</code> = 插件名）→ 维护 <code>pendingPlugins</code> 栈。</li>
+<li>监听 <code>tools/change</code>（register/unregister/restriction 均触发，unfiltered）→ 对 <code>ctx.tools.schemas()</code> 做 diff：<ul>
+<li>新增工具 → 归因到栈顶（最近加载）插件；</li>
+<li>移除工具 → 从归属表删除。</li>
+</ul>
+</li>
+<li>插件卸载（<code>internal/status</code> DISPOSED）→ 其工具随 effect 自动注销，diff 自然移除。</li>
+</ol>
+</li>
+</ul>
+<h3>全局启停（两层一致，缺一不可）</h3>
+<table>
+<thead>
+<tr>
+<th>层</th>
+<th>缝</th>
+<th>实现</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>隐藏（模型不可见）</td>
+<td><code>system-prompt/assemble</code>（waterfall）</td>
+<td>过滤 <code>assembly.tools</code> 中 disabled 工具，返回变换后的 assembly</td>
+</tr>
+<tr>
+<td>拒执行（防绕过）</td>
+<td>全局 <code>ctx.tools.guard()</code>（plain ctx）</td>
+<td>disabled 工具返回 reason（如 <code>tool "X" is disabled by tools-manager: "X"</code>）</td>
+</tr>
+</tbody></table>
+<ul>
+<li>同一个 <code>disabled: Set&lt;string&gt;</code> 驱动两层，保证 prompt 与执行语义一致。</li>
+<li>覆盖场景：模型直调（guard 兜底）、run_code SDK 子调用（guard 兜底）、隐藏后模型不再发起。</li>
+<li>不依赖 <code>ctx.tools.restrict()</code>（其强制 scoped ctx，不能做全局过滤）。</li>
+</ul>
+<h3>持久化</h3>
+<ul>
+<li><code>ctx.settings.register('tools-manager', Config)</code> → 存 <code>$DSH_HOME/settings.yaml</code>，跨会话生效。</li>
+<li><code>Config</code>：<code>{ disabled: string[] }</code>（Schemastery schema，默认 <code>[]</code>）。</li>
+<li>设置变更即时应用（guard/assemble 读同一份 <code>disabled</code> 状态，无需重启）。</li>
+</ul>
+<h3>Host↔Client 通道</h3>
+<ul>
+<li>宿主 HTTP 路由：<code>ctx.webServer.register({ kind: 'prefix', path: '/tools-manager/api', handler })</code>。</li>
+<li>接口（JSON envelope）：<ul>
+<li><code>POST /tools-manager/api/list</code> → <code>{ ok, value: { plugins: [{ name, tools: [{ name, description, disabled }] }] } }</code></li>
+<li><code>POST /tools-manager/api/set</code> body <code>{ toolName, disabled }</code> → <code>{ ok, value: { plugins: [...] } }</code></li>
+<li>错误：<code>{ ok: false, error: { code, message } }</code></li>
+</ul>
+</li>
+</ul>
+<h2>开发</h2>
+<pre><code>pnpm install          # 安装依赖（link: 指向 ~/.dsh/source/current/）
+pnpm run typecheck    # tsc --noEmit
+pnpm test             # vitest run
+pnpm run build        # tsc (host) + build-client.mjs (client bundle) + tsc (types)
+</code></pre>
+<h3>目录结构</h3>
+<pre><code>src/
+├── index.ts              # Host 入口：name, inject, apply（registry + policy + gateway）
+├── config.ts             # Config schema (schemastery), ResolvedConfig, resolveConfig
+├── registry.ts           # ToolRegistry: 归因 diff（internal/plugin + tools/change）
+├── policy.ts             # installPolicy: system-prompt/assemble 过滤 + tools.guard
+├── settings.ts           # installToolsManagerSettings: 注册 namespace，返回 bridge
+├── gateway.ts            # registerHttpGateway: /tools-manager/api 前缀路由（list/set）
+└── client/
+    ├── index.ts              # Client 入口：settings.section slot 注册独立 Tab
+    ├── ToolsManagerPanel.tsx # 面板组件（tree + 开关，inline styles 对齐 mcp-manager）
+    └── locales.ts            # i18n (zh + en)
+</code></pre>
+<h2>运行</h2>
+<h3>本地安装</h3>
+<pre><code>dsh plugin --profile web add "link:D:/Projects/deepseek-harness/dsh-tools-manager"
+</code></pre>
+<h3>配置</h3>
+<p>默认配置（<code>cordis.patch.yml</code>）：</p>
+<pre><code>disabled: []    # 预置禁用的工具名列表（默认空）
+</code></pre>
+<p>运行时通过设置页「插件配置」分区的卡片修改，持久化到 <code>$DSH_HOME/settings.yaml</code>。</p>
+<h2>检查</h2>
+<pre><code>pnpm run typecheck &amp;&amp; pnpm test &amp;&amp; pnpm run build
+</code></pre>
+<p>验证 <code>lib/</code> 产物：</p>
+<ul>
+<li><code>lib/index.js</code> — host bundle（ESM）</li>
+<li><code>lib/client.js</code> — client bundle（CJS，<code>window.__ModuleLoader__.load</code> 包裹）</li>
+<li><code>lib/types/</code> — TypeScript 声明文件</li>
+<li><code>cordis.patch.yml</code> — bundle 配置层</li>
+</ul>
+<h2>已知边界</h2>
+<table>
+<thead>
+<tr>
+<th>风险</th>
+<th>影响</th>
+<th>缓解</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>归因偏移（插件运行期动态注册工具）</td>
+<td>tree 中工具挂错插件</td>
+<td>记录 Known Limitations；<code>list</code> 接口对未归属工具归到 <code>(unknown)</code> 分组</td>
+</tr>
+<tr>
+<td><code>system-prompt/assemble</code> 多监听时序</td>
+<td>其他插件也可能变换 tools</td>
+<td>本项目过滤只删 disabled，<code>next()</code> 委托其余；序靠后仍正确</td>
+</tr>
+<tr>
+<td>guard 与 assemble 双层不同步</td>
+<td>隐藏与拒执行不一致</td>
+<td>单一 <code>disabled</code> 状态源；单测断言两缝读同一状态</td>
+</tr>
+<tr>
+<td>settings 服务缺失</td>
+<td>启停不持久</td>
+<td>降级为内存态（仅本次运行生效），<code>set</code> 返回明确错误</td>
+</tr>
+<tr>
+<td><code>run_code</code> 模式</td>
+<td>模型经 SDK 子调用禁用工具</td>
+<td>guard 全局兜底拒绝；文档说明"禁用=执行不可达"</td>
+</tr>
+</tbody></table>

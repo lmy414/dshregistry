@@ -1,0 +1,608 @@
+<h1>agents-gitflow-guard</h1>
+<blockquote>
+<p><strong>Are you tired of agents skipping your GitFlow?</strong></p>
+</blockquote>
+<p>A configurable branch-role guard for AI coding agents — <a href="https://github.com/deepseek-ai/deepseek-harness">DeepSeek Harness</a> (DSH), Claude Code, Codex, OpenCode, Antigravity, and Pi.
+You define your own branches —
+<strong>integration</strong> (features merge in via PR/MR), <strong>preview</strong> (env endpoints), <strong>production</strong>, <strong>archive</strong> — each with its own update rules. Agents can't skip the flow, and sensitive merges stay in your hands.</p>
+<p><a href="https://github.com/FeatureAgents/AgentsGitFlowController/blob/HEAD/README.zh.md">中文文档</a> · <a href="https://github.com/FeatureAgents/AgentsGitFlowController/blob/HEAD/LICENSE">License</a></p>
+<p><a href="https://ko-fi.com/keanz21"><img src="https://img.shields.io/badge/ko--fi-FF5E5B?style=flat-square&amp;logo=ko-fi&amp;logoColor=white" alt="ko-fi"></a></p>
+<hr>
+<h2>Table of Contents</h2>
+<ul>
+<li><a href="#quick-start--30-seconds-to-a-guarded-repo">Quick Start — 30 seconds to a guarded repo</a></li>
+<li><a href="#why--the-problem-this-plugin-solves">Why — the problem this plugin solves</a></li>
+<li><a href="#who-this-is-for--scenarios--teams">Who this is for — scenarios &amp; teams</a></li>
+<li><a href="#what-it-does--capabilities">What it does — capabilities</a></li>
+<li><a href="#what-it-does-not-do--honest-limits">What it does NOT do — honest limits</a></li>
+<li><a href="#server-side-protection-vs-this-plugin">Server-side protection vs this plugin</a></li>
+<li><a href="#how-it-works--the-mechanism-in-three-lines">How it works — the mechanism in three lines</a></li>
+<li><a href="#configuration-reference">Configuration Reference</a></li>
+<li><a href="#gate-matrix--what-gets-blocked-what-passes">Gate Matrix — what gets blocked, what passes</a></li>
+<li><a href="#where-the-human-stays-in-control">Where the human stays in control</a></li>
+<li><a href="#installation-in-detail">Installation in detail</a></li>
+<li><a href="#faq">FAQ</a></li>
+<li><a href="#glossary">Glossary</a></li>
+<li><a href="#roadmap">Roadmap</a></li>
+<li><a href="#support">Support</a></li>
+<li><a href="#development">Development</a></li>
+<li><a href="#license">License</a></li>
+</ul>
+<hr>
+<h2>Quick Start — 30 seconds to a guarded repo</h2>
+<p><strong>Step 1 — install.</strong> All six clients consume the same npm package <code>agents-gitflow-guard</code> — pick yours:</p>
+<pre><code># DSH — in-process plugin; restart DSH afterwards (plugins load at startup)
+dsh plugin --profile web add agents-gitflow-guard@0.0.19
+</code></pre>
+<pre><code># Claude Code · Codex · OpenCode · Antigravity — standalone hooks, no DSH needed
+npm i -g agents-gitflow-guard@0.0.19
+</code></pre>
+<pre><code># Pi — in-process extension
+npm i -D agents-gitflow-guard@0.0.19
+</code></pre>
+<blockquote>
+<p><strong>Version gotcha</strong>: a bare <code>add</code> or unpinned <code>npm i</code> resolves whatever <code>latest</code> is at install time — on machines behind a stale npm/pnpm registry cache or mirror it may install an old version. If the installed version looks wrong, pin it explicitly. (DSH users: the pnpm peer-dependency <em>warning</em> is expected — DSH supplies <code>@deepseek-ai/cordis</code> / <code>@deepseek-ai/dsh-tools</code> through its shared profile module fallback at startup; the plugin works normally.)</p>
+<p>The hook clients (Claude Code · Codex · OpenCode · Antigravity) and Pi need one wiring step after install — walk the per-agent table in <a href="#installation-in-detail">Installation in detail</a>.</p>
+</blockquote>
+<p><strong>Step 2 — configure</strong>, create <code>gitflow-guard.config.json</code> in your <strong>project root</strong>:</p>
+<pre><code>{
+  "enabled": true,
+  "featurePattern": "feature/[\\w-]+",
+  "branches": {
+    "integration": ["develop"],   // integration: features merge in via PR, protected
+    "archive": ["main"]           // archive: archived by you after release
+  }
+}
+</code></pre>
+<p>This one file is the entire setup: <code>integration</code> is the <strong>only required</strong> role; <code>preview</code> / <code>production</code> / <code>archive</code> are optional — add them only if your flow needs them. The plugin is opt-in per project — absent or <code>enabled: false</code>, it does nothing.</p>
+<p><strong>Step 3 — verify.</strong> Ask the agent (or run in a DSH session) to <code>git push origin develop</code>. Expect the tool call to be denied:</p>
+<pre><code>Error: [gitflow-guard] blocked: Protected branch "develop" forbids direct push
+Next: Integration branch (develop) is updated via PR/MR from a feature branch: push the feature first, then `gh pr create --base develop` / `glab mr create --target-branch develop`.
+</code></pre>
+<p>Messages are English by default; add <code>"locale": "zh"</code> to the config to switch to Chinese (see <a href="#configuration-reference">Configuration Reference</a>).</p>
+<p><strong>Done.</strong> The guard is live for this repo. Keep reading for the <a href="#configuration-reference">Configuration</a> to map your own branches, or the <a href="#gate-matrix--what-gets-blocked-what-passes">Gate Matrix</a> for the full decision table.</p>
+<h3>Full walkthrough — one feature, end to end</h3>
+<p>Scenario: your team ships a login page (<code>feature/login-page</code>); <code>develop</code> is the integration branch, <code>main</code> the archive. What you and the agent experience at every step:</p>
+<table>
+<thead>
+<tr>
+<th>#</th>
+<th>what the agent runs</th>
+<th>plugin decision</th>
+<th>what you see</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>1</td>
+<td><code>git checkout -b feature/login-page</code> (from develop)</td>
+<td>✅ allow (feature work is free)</td>
+<td>branch created</td>
+</tr>
+<tr>
+<td>2</td>
+<td><code>git add . &amp;&amp; git commit -m "feat: login"</code></td>
+<td>✅ allow</td>
+<td>committed</td>
+</tr>
+<tr>
+<td>3</td>
+<td><code>git push -u origin feature/login-page</code></td>
+<td>✅ allow (pushing your feature is fine)</td>
+<td>pushed</td>
+</tr>
+<tr>
+<td>4</td>
+<td><code>git checkout develop &amp;&amp; git merge feature/login-page</code></td>
+<td>🚫 <strong>deny</strong> — integration branch is PR/MR-only</td>
+<td>must open a PR/MR into develop</td>
+</tr>
+<tr>
+<td>5</td>
+<td><code>gh pr create --base develop</code></td>
+<td>✅ allow (feature → integration via PR)</td>
+<td>PR created, you review &amp; merge</td>
+</tr>
+<tr>
+<td>6</td>
+<td><code>git push origin main</code> or merge into main</td>
+<td>🚫 <strong>deny</strong> — archive is user-hand only</td>
+<td>you archive develop → main yourself after release</td>
+</tr>
+</tbody></table>
+<p>Notice what the agent <em>cannot</em> do: merge a feature straight into <code>develop</code>, or touch <code>main</code> at all. Every sensitive merge is a deliberate human action in the PR/MR page or your own terminal.</p>
+<hr>
+<h2>Why — the problem this plugin solves</h2>
+<p>AI coding agents work in your repository. They are <em>told</em> — via system prompts, project instruction files (<code>AGENTS.md</code>, <code>CLAUDE.md</code>, <code>GEMINI.md</code>, <code>.cursorrules</code>, and similar), and project docs — to follow a merge flow: develop on a feature branch, merge into the integration branch (and your preview/production stages when you have them), and leave archive/production merges to you.</p>
+<p><strong>That is a soft rule.</strong> Agents skip it, reorder it, or simply "forget" it — not out of malice, but because soft instructions are optional to a model.</p>
+<p>This plugin turns the soft rule into a <strong>hard mechanism</strong>. Every git operation an agent attempts is checked against the <em>actual state of your local repository</em>. Violations are blocked before the command runs, with an explanation of why and what to do next.</p>
+<p>Nobody has to remember the rules — the rules are enforced.</p>
+<hr>
+<h2>Who this is for — scenarios &amp; teams</h2>
+<h3>Signs this plugin is for you</h3>
+<ul>
+<li>You have — or want — a defined branch flow, from a single <code>develop</code>-style integration branch up to multi-stage preview/production pipelines.</li>
+<li>An agent has already cut a corner: pushed straight into a protected branch, or merged somewhere it shouldn't. If it happened once, it will happen again — this plugin is the structural fix.</li>
+<li>You protect your integration/archive branches but don't want to rely on human review to catch every shortcut.</li>
+<li>Multiple features develop in parallel and land in one shared preview environment, and you want each entry to a stricter stage reviewed.</li>
+</ul>
+<h3>Concrete scenarios</h3>
+<ol>
+<li><strong>Solo developer + agent on client projects.</strong> You hand the agent a ticket; it "helps" by pushing straight into the integration branch. One small config file, and the agent physically cannot touch protected branches without a PR/MR — even when you're not watching.</li>
+<li><strong>Small team (3–10) with a CI-deployed preview.</strong> Staging auto-deploys on merge; one day an agent merged a feature into <code>develop</code> without review. From then on, every entry to the protected stages requires a PR/MR — a deliberate, audited act.</li>
+<li><strong>Enterprise with multi-env pipelines.</strong> Many preview endpoints plus a gated production and archive line — each role simply gets configured, and the guard scales without extra rules.</li>
+<li><strong>Async collaboration.</strong> You're not always online. The guard keeps the flow honest between your sessions; production/archive merges remain yours alone.</li>
+</ol>
+<p><strong>Not for you</strong> (see also <a href="#what-it-does-not-do--honest-limits">What it does NOT do</a>):</p>
+<ul>
+<li><strong>Trunk-based flow</strong> — everyone merges straight to one branch: the plugin would block constantly.</li>
+<li><strong>Personal repo without a defined flow</strong> — nothing to enforce, no value.</li>
+<li><strong>A team unwilling to give any branch a role</strong> — the plugin needs at least one <code>integration</code> branch to protect.</li>
+</ul>
+<hr>
+<h2>What it does — capabilities</h2>
+<ul>
+<li><strong>Blocks, before execution</strong>: direct push / force-push / delete of protected role branches (integration / preview / production / archive); agent merging into production or archive.</li>
+<li><strong>Role-driven, fully configurable</strong>: <code>integration</code> is the only required role; <code>preview</code> / <code>production</code> / <code>archive</code> are optional arrays of branch names or regexes, each with its own update rules (<code>pr</code> / <code>flexible</code>, <code>mergeBy</code>).</li>
+<li><strong>Merge-by-user where it matters</strong>: production &amp; archive merges stay in your hands — the plugin blocks the agent from clicking merge, so your action <em>is</em> the confirmation.</li>
+<li><strong>Works with any naming</strong>: branch names are mapped by your config, never hard-coded (see <a href="#configuration-reference">Configuration</a>).</li>
+<li><strong>Fully audited</strong>: every deny is appended to an audit log under your user state directory (<code>~/.local/state/gitflow-guard/</code>, <code>%LOCALAPPDATA%\gitflow-guard</code> on Windows) — outside the repository, never committed, outside the agent's writable sandbox, and shared across all linked worktrees of one repository.</li>
+<li><strong>Platform-agnostic core</strong>: pure local git; optionally consults <code>gh</code> (GitHub) or <code>glab</code> (GitLab) for PR/MR target resolution, and works fine without them.</li>
+</ul>
+<hr>
+<h2>What it does NOT do — honest limits</h2>
+<ul>
+<li><strong>It is not a security boundary.</strong> Command parsing is best-effort; an agent determined to obfuscate commands can evade text analysis.</li>
+<li><strong>It does not gate on CI platforms.</strong> CI status is logged as a reference only, never a hard gate. Real branch protection belongs in GitHub/GitLab settings, which can layer on top.</li>
+<li><strong>It is not a replacement for the flow itself.</strong> Your project must have at least one <code>integration</code> branch; if everyone pushes straight to one branch, this plugin will block constantly — don't enable it there.</li>
+<li><strong>Production/archive are not automated</strong> — they're deliberately left to your human click; the plugin only tells agents "no".</li>
+</ul>
+<hr>
+<h2>Server-side protection vs this plugin</h2>
+<p>Server-side branch protection (GitHub branch rules, GitLab protected branches) and this plugin solve <strong>different problems</strong>. They are complementary, not alternatives.</p>
+<table>
+<thead>
+<tr>
+<th>dimension</th>
+<th>server-side protection</th>
+<th>this plugin</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>what it governs</td>
+<td><em>who</em> may push / merge to protected branches (permissions)</td>
+<td><em>how</em> agents may enter the flow (workflow) — which role a merge lands in</td>
+</tr>
+<tr>
+<td>keeps agents from merging into production/archive</td>
+<td>no — it can't tell "agent did it"</td>
+<td>yes — production/archive merges are blocked for agents by default</td>
+</tr>
+<tr>
+<td>per-role flexibility</td>
+<td>one rule per branch on the host</td>
+<td>per-role <code>update</code> (<code>pr</code>/<code>flexible</code>) + <code>mergeBy</code> (<code>user</code>/<code>anyone</code>) in one config file</td>
+</tr>
+<tr>
+<td>scope</td>
+<td>every user of the repository, humans included</td>
+<td>DSH agents with the plugin configured (humans are not restricted)</td>
+</tr>
+<tr>
+<td>enforcement point</td>
+<td>server-side, at push / merge time</td>
+<td>local, before the command runs</td>
+</tr>
+<tr>
+<td>platform</td>
+<td>tied to the hosting service</td>
+<td>pure local git, platform-agnostic (<code>gh</code> / <code>glab</code> optional)</td>
+</tr>
+<tr>
+<td>bypassable by</td>
+<td>users with admin rights</td>
+<td>anyone working outside DSH, or a determined malicious agent</td>
+</tr>
+</tbody></table>
+<p>Why this matters: branch protection answers <em>"can this push happen at all?"</em>; this plugin answers <em>"may this agent enter this role, given the config?"</em>. The strongest setup uses <strong>both</strong> — the plugin keeps agents honest about the workflow, and branch protection guarantees that no one, agent or human, pushes straight to a protected branch.</p>
+<hr>
+<h2>How it works — the mechanism in three lines</h2>
+<ol>
+<li>An agent calls a shell tool (<code>pwsh</code> / <code>bash</code>) with a git command.</li>
+<li>The plugin classifies the command, resolves the branch roles from <code>gitflow-guard.config.json</code>, and applies the gate matrix.</li>
+<li>Violation → the tool call is <strong>denied before it runs</strong>, with a reason and the next step. Allowed → the command proceeds; every deny is audited to the user-level log (<code>~/.local/state/gitflow-guard/repos/&lt;repo&gt;-&lt;hash&gt;/audit.jsonl</code>).</li>
+</ol>
+<p>No chat-confirmation or permit store: sensitive merges (production / archive) are simply <strong>user-only</strong> — an agent may prepare the PR/MR, but the merge click stays yours.</p>
+<h3>Design principles — why it works</h3>
+<h4>1. Config is the single source of truth</h4>
+<p>Nothing about branch names or rules is hard-coded. <code>integration</code> is the only required role; <code>preview</code> / <code>production</code> / <code>archive</code> are optional arrays of exact names or regexes, each with its own <code>update</code> and <code>mergeBy</code>. The same binary scales from a solo <code>develop</code> to an enterprise multi-env pipeline.</p>
+<h4>2. Blocking happens before execution, not after</h4>
+<p>The plugin hooks the tool pipeline at <code>tools/pre-execute</code> — the decision point that runs <em>before</em> the command is dispatched. A <code>deny</code> there means the command <strong>never runs</strong>; the agent only ever sees the rejection. Post-hoc detection (scanning logs after the fact) can't work as enforcement — the damage would already be done.</p>
+<h4>3. The sensitive merges are unforgeably human</h4>
+<p>No plugin code decides "is this merge OK?" for production or archive. The gate simply refuses to let an <em>agent</em> perform those merges, so the only path is a PR/MR page where <strong>you</strong> click merge — and that click is the confirmation. There is no token, permit, or chat message an agent could forge to get past you.</p>
+<hr>
+<h2>Configuration Reference</h2>
+<h3>Branch roles — the model behind the checks</h3>
+<p>Only <strong><code>integration</code></strong> is required. Every other role is optional — configure what your flow actually uses, and each entry is an exact branch name <strong>or</strong> a regex pattern.</p>
+<pre><code>feature branches ──(free)──&gt; integration (integration branch; updates via PR/MR)
+                                   │
+                                   ├──&gt; preview (optional; env endpoints; updates via PR/MR)
+                                   │
+                                   └──&gt; production (optional; PR/MR + only you click merge)
+archive (optional; you archive after release)
+</code></pre>
+<table>
+<thead>
+<tr>
+<th>role</th>
+<th>config key</th>
+<th>required?</th>
+<th>enforced behavior</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong>feature</strong></td>
+<td><code>featurePattern</code></td>
+<td>—</td>
+<td>free: commit / push / sync / rebase</td>
+</tr>
+<tr>
+<td><strong>integration</strong></td>
+<td><code>branches.integration</code></td>
+<td>always</td>
+<td>no direct push (default <code>pr</code>); features merge in via PR/MR</td>
+</tr>
+<tr>
+<td><strong>preview</strong></td>
+<td><code>branches.preview</code> (array)</td>
+<td>optional</td>
+<td>no direct push; updates via PR/MR only (env endpoints)</td>
+</tr>
+<tr>
+<td><strong>production</strong></td>
+<td><code>branches.production</code> (array)</td>
+<td>optional</td>
+<td>PR/MR only; merge by user only (<code>mergeBy: "user"</code>)</td>
+</tr>
+<tr>
+<td><strong>archive</strong></td>
+<td><code>branches.archive</code> (array)</td>
+<td>optional</td>
+<td>archive PR/MR may be created by agents; the merge stays user-hand only</td>
+</tr>
+</tbody></table>
+<h3>Customizing branch names &amp; rules — any naming works</h3>
+<p><strong>Small team (solo / 2–3 devs) — minimal: integration only:</strong></p>
+<pre><code>{
+  "enabled": true,
+  "featurePattern": "feature/[\\w-]+",
+  "branches": { "integration": ["develop"] }
+}
+</code></pre>
+<p><strong>Larger team (multiple preview envs + production + archive):</strong></p>
+<pre><code>{
+  "enabled": true,
+  "featurePattern": "(topic|feature)/[\\w-]+",
+  "branches": {
+    "integration": ["develop", "topic/[\\w-]+"],
+    "preview": {
+      "branches": ["ita1", "itb1", "itb2", "sg", "vb", "r1-conf", "r1-ope", "r2-conf", "r2-ope"],
+      "update": "pr"
+    },
+    "production": {
+      "branches": ["prd-conf", "prd-ope"],
+      "update": "pr",
+      "mergeBy": "user"
+    },
+    "archive": ["main"]
+  }
+}
+</code></pre>
+<h3>Full field reference</h3>
+<pre><code>{
+  "enabled": true,                     // opt-in: file exists AND enabled=true
+  "featurePattern": "feature/[\\w-]+", // JS regex matching your working/feature branches
+  "branches": {
+    "integration": { "branches": ["develop"], "update": "pr" },  // REQUIRED
+    "preview":     { "branches": ["ita1"], "update": "pr" },     // optional
+    "production":  { "branches": ["prd"], "update": "pr", "mergeBy": "user" }, // optional
+    "archive":     ["main"]                                      // optional
+  },
+  "locale": "en",                      // optional: message language — any registered locale ('en'/'zh' built-in); unknown values warn in status and fall back to English
+  "strict": false,                     // optional: fail-closed — invalid config / internal errors block instead of warn-and-allow
+  "ci": { "enabled": true }            // optional: gh pr checks logged as reference
+}
+</code></pre>
+<ul>
+<li><p>Roles accept either an <strong>array</strong> (shorthand) or an <strong>object</strong> <code>{ branches, update?, mergeBy? }</code>.</p>
+</li>
+<li><p><code>update</code>: <code>pr</code> (default) = updates only via PR/MR; <code>flexible</code> = allow direct/local merges (small teams).</p>
+</li>
+<li><p><code>mergeBy</code> (production): <code>user</code> (default) = only you click merge; <code>anyone</code> = allow PR merge through.</p>
+</li>
+<li><p>Each branch entry is an exact name or a regex (auto-detected). <strong>Regex safety</strong>: branch patterns are authored by you and compiled as-is — avoid catastrophic-backtracking constructs (e.g. nested quantifiers like <code>(\w+)+</code>) in <code>featurePattern</code> and branch entries.</p>
+</li>
+<li><p><strong>Language</strong>: messages are English by default; add <code>"locale": "zh"</code> for Chinese, or pass <code>--locale &lt;en|zh&gt;</code> to any <code>gitflow-guard</code> subcommand (priority: CLI flag &gt; project config &gt; English). All user-facing text follows the locale — including CLI framework messages such as <code>--help</code>, unknown-command notices, and the empty-audit line.</p>
+</li>
+<li><p><strong>Custom locales</strong>: downstream packages can add a language at runtime — <code>import { registerLocale } from 'agents-gitflow-guard'</code>, call <code>registerLocale('fr', frDict)</code> with a dictionary covering exactly the same keys as built-in English (validated on registration), then set <code>"locale": "fr"</code> in the project config to activate it.</p>
+<pre><code>import { registerLocale, MESSAGE_KEYS } from 'agents-gitflow-guard'
+// MESSAGE_KEYS lists every key a dictionary must define (same set as built-in English);
+// registration throws if a key is missing or extra.
+const fr = { /* one entry per MESSAGE_KEYS, e.g. */ 'deny.header': ({ why }) =&gt; `[gitflow-guard] bloqué : ${why}` }
+registerLocale('fr', fr)
+</code></pre>
+</li>
+<li><p><strong>Unknown locales</strong>: an unregistered <code>"locale"</code> value falls back to English during interception (by design — hooks never stall on wording), so a typo is easy to miss; the one-line warning shows up in <code>gitflow-guard status</code>.</p>
+</li>
+<li><p><strong>Validation</strong>: <code>integration</code> is required; overlapping role entries are rejected; invalid regex is rejected. <strong>Any error disables the plugin for that project</strong> (reported) rather than applying a half-guessed setup.</p>
+</li>
+<li><p><strong>Strict mode</strong>: by default a broken config warns on stderr once and lets the command pass (fail-open, so a typo can't wedge your tooling). <code>"strict": true</code> flips config errors and internal errors to <strong>block</strong> (fail-closed) — for high-risk repos. A missing file or explicit <code>enabled: false</code> stays silent either way.</p>
+</li>
+</ul>
+<hr>
+<h2>Gate Matrix — what gets blocked, what passes</h2>
+<table>
+<thead>
+<tr>
+<th>agent action</th>
+<th>decision</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>commit / push feature / sync / rebase / read-only</td>
+<td>✅ allow</td>
+</tr>
+<tr>
+<td>direct push / force-push / delete integration / preview / production / archive</td>
+<td>🚫 block (integration/preview <code>flexible</code> direct push allowed)</td>
+</tr>
+<tr>
+<td>PR/MR: feature → integration / preview</td>
+<td>✅ allow</td>
+</tr>
+<tr>
+<td>PR/MR: feature → production</td>
+<td>✅ allow to create; <strong>merge blocked</strong> (you merge in UI)</td>
+</tr>
+<tr>
+<td>PR/MR into archive</td>
+<td>✅ create allowed; 🚫 merge blocked (you merge in UI)</td>
+</tr>
+<tr>
+<td>local <code>git merge feature/x</code> while on integration / preview</td>
+<td>🚫 block (PR/MR required); <code>update: flexible</code> allows</td>
+</tr>
+<tr>
+<td>chained commands (<code>checkout develop &amp;&amp; merge feature/x</code>)</td>
+<td>🚫 blocked — branch switches are simulated per segment, no bypass</td>
+</tr>
+<tr>
+<td>force-recreate a protected branch (<code>git checkout -B/-C &lt;branch&gt;</code> / <code>git switch -C</code>)</td>
+<td>🚫 block (direct ref-update gate)</td>
+</tr>
+<tr>
+<td>retarget/delete a protected branch via <code>git symbolic-ref</code></td>
+<td>🚫 block (direct ref-update gate)</td>
+</tr>
+<tr>
+<td><code>git cherry-pick</code> / <code>git revert</code> while on integration / preview / production / archive</td>
+<td>🚫 block (history rewrite on a protected branch); <code>-n</code> / <code>--no-commit</code> and <code>--abort</code>/<code>--continue</code>/<code>--skip</code>/<code>--quit</code> pass</td>
+</tr>
+<tr>
+<td><code>sudo</code>-wrapped git commands (privilege wrapper)</td>
+<td>🚫 wrapper peeled (<code>sudo -u …</code> included), underlying command gated</td>
+</tr>
+</tbody></table>
+<blockquote>
+<p>Two deliberate non-gates, so they don't get "closed" by accident later: <code>git tag -f</code> (moving a tag, even pointing at a protected branch) stays exempt — tags are outside the branch-role scope, same as <code>push --tags</code>; and a plain <code>git commit</code> on a protected branch stays allowed — the guard governs branch roles and merge paths, not content, and the following <code>git push</code> is still blocked (remote stays clean).</p>
+</blockquote>
+<p>The PR/MR target is resolved via <code>gh pr view</code> (GitHub) or <code>glab mr view</code> (GitLab). Without a platform CLI, the plugin is conservative.</p>
+<hr>
+<h2>Where the human stays in control</h2>
+<ul>
+<li><strong>Production merge</strong> and <strong>archive</strong> are user-only by default: an agent may help prepare the PR/MR, but <strong>you click the merge button</strong> — that click <em>is</em> the confirmation. There is no separate permit store to outsource that decision.</li>
+<li>Every deny is appended to the user-level audit log for review (<code>gitflow-guard audit</code>).</li>
+</ul>
+<hr>
+<h2>Installation in detail</h2>
+<p><strong>Prerequisite</strong>: <strong>Node.js ≥ 22</strong> on your <code>PATH</code> (the package <code>engines</code> floor and the lowest CI matrix tier). Every client consumes the <strong>same npm package</strong> <code>agents-gitflow-guard</code> — only the mounting step differs.</p>
+<table>
+<thead>
+<tr>
+<th>Agent</th>
+<th>Install command</th>
+<th>After that</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>DSH</td>
+<td><code>dsh plugin --profile web add agents-gitflow-guard@0.0.19</code></td>
+<td>restart DSH — the plugin auto-mounts as a profile layer</td>
+</tr>
+<tr>
+<td>Claude Code · Codex · OpenCode · Antigravity</td>
+<td><code>npm i -g agents-gitflow-guard@0.0.19</code></td>
+<td>wire a hook to the <code>gitflow-guard</code> binary (below)</td>
+</tr>
+<tr>
+<td>Pi</td>
+<td><code>npm i -D agents-gitflow-guard@0.0.19</code></td>
+<td>copy <code>pi/gitflow-guard.ts</code> into <code>.pi/extensions/</code> (below)</td>
+</tr>
+</tbody></table>
+<p><strong>DSH — in-process plugin</strong> (the standard path, already covered in <a href="#quick-start--30-seconds-to-a-guarded-repo">Quick Start</a>):</p>
+<pre><code>dsh plugin --profile web add agents-gitflow-guard@0.0.19    # pin recommended, see note above
+</code></pre>
+<p>Then restart DSH. Upgrades are the same command, followed by another restart.</p>
+<p><strong>From source</strong> — for contributors, or to run the latest checkout:</p>
+<pre><code>npm install &amp;&amp; npm run build
+dsh plugin --profile web add file:/path/to/agents-gitflow-guard
+</code></pre>
+<p>The package declares <code>dsh.bundle.patch</code>, so <code>dsh plugin add</code> automatically makes it a profile layer — no manual profile editing.</p>
+<p><strong>Standalone agent hooks</strong> — Claude Code / Codex / OpenCode / Antigravity, no DSH required. Install the CLI once, then reference the <code>gitflow-guard</code> binary in each hook config:</p>
+<pre><code>npm i -g agents-gitflow-guard@0.0.19   # provides the `gitflow-guard` binary
+</code></pre>
+<p>This repo ships project configs at <code>.claude/settings.json</code> (Claude Code), <code>.codex/hooks.json</code> (Codex), <code>.opencode/hook/hooks.yaml</code> (OpenCode) and <code>.agents/hooks.json</code> (Antigravity / Google); any other repo adds its own:</p>
+<pre><code>// Claude Code — .claude/settings.json
+{
+  "hooks": {
+    "PreToolUse": [
+      { "matcher": "Bash", "hooks": [{ "type": "command", "command": "gitflow-guard check --platform claude" }] }
+    ]
+  }
+}
+</code></pre>
+<pre><code>// Codex — .codex/hooks.json
+{
+  "hooks": {
+    "PreToolUse": [
+      { "matcher": "^Bash$", "hooks": [{ "type": "command", "command": "gitflow-guard check --platform codex" }] }
+    ]
+  }
+}
+</code></pre>
+<pre><code># OpenCode — .opencode/hook/hooks.yaml
+hooks:
+  - id: gitflow-guard
+    event: tool.before.bash
+    actions:
+      - bash: |
+          gitflow-guard check --platform opencode
+</code></pre>
+<pre><code>// Antigravity (Google) — .agents/hooks.json
+{
+  "gitflow-guard": {
+    "PreToolUse": [
+      { "matcher": "run_command", "hooks": [ { "type": "command", "command": "gitflow-guard check --platform antigravity" } ] }
+    ]
+  }
+}
+</code></pre>
+<pre><code>// Pi — .pi/settings.json (extensions resolve relative to .pi)
+{ "extensions": ["extensions/gitflow-guard.ts"] }
+</code></pre>
+<p>Pi loads extensions in-process (no stdin payload, no subprocess hook). Install the shipped entry point into the project and keep the package in devDependencies:</p>
+<pre><code>npm i -D agents-gitflow-guard@0.0.19
+mkdir -p .pi/extensions
+cp node_modules/agents-gitflow-guard/pi/gitflow-guard.ts .pi/extensions/gitflow-guard.ts
+</code></pre>
+<p><strong>GitHub Copilot — deliberately no hook here.</strong> Copilot ships its own guardrails for exactly this job: per-tool <strong>allow/deny/ask</strong> permissions and project <strong>rules</strong> (<code>rules.json</code> + <code>AGENTS.md</code>). Point Copilot users at the official docs instead of a plugin hook:</p>
+<ul>
+<li><p><a href="https://docs.github.com/en/copilot/how-tos/copilot-cli/use-copilot-cli/allowing-tools">Allowing and denying tool use (GitHub Docs)</a></p>
+</li>
+<li><p><a href="https://docs.github.com/en/copilot/customizing-copilot/adding-custom-rules-for-the-copilot-coding-agent">Adding custom rules for the Copilot coding agent (GitHub Docs)</a></p>
+</li>
+<li><p>Optional: Copilot also has a <a href="https://docs.github.com/en/copilot/reference/hooks-reference">hooks system</a> (<code>preToolUse</code> → <code>permissionDecision:"deny"</code>) if you want command-level interception.</p>
+</li>
+<li><p>The hook reads the payload on stdin and answers with that platform's protocol: Claude Code / OpenCode → <code>exit 2</code> (stderr is the reason + "next step" hint); Codex → JSON <code>{"hookSpecificOutput":{"permissionDecision":"deny",...}}</code> on stdout; Antigravity → JSON <code>{"decision":"deny","reason":...}</code> on stdout with <code>exit 0</code> (Antigravity requires exit 0 and rejects <code>hookSpecificOutput</code> / non-allow values). Pi has no stdin protocol: the in-process extension listens to the official <code>tool_call</code> event and denies via its return value <code>{ block: true, reason }</code> (the CLI subprocess only speaks the internal exit-2 contract).</p>
+</li>
+<li><p>Only the pre-tool event is needed: the guard blocks <em>before</em> the command runs. There is no permit to consume afterwards, so no post-tool hooks are required.</p>
+</li>
+<li><p>The examples above call the globally-installed <code>gitflow-guard</code> (<code>npm i -g</code>). If a hook subprocess can't see it on its <code>PATH</code>, point at the full binary path from <code>npm bin -g</code> — hook subprocesses may not inherit your interactive shell <code>PATH</code>. The <code>bin/gitflow-guard.mjs</code> paths in this repo's shipped configs only work from a checkout.</p>
+</li>
+<li><p>Fully opt-in: the hook does nothing unless the repo has <code>gitflow-guard.config.json</code> with <code>enabled: true</code>.</p>
+</li>
+</ul>
+<hr>
+<h2>FAQ</h2>
+<h3>My branches don't follow the default names — can I use it?</h3>
+<p>Yes — nothing about the branch names is fixed. <code>integration</code> is the only required role; its entries (and those of <code>preview</code> / <code>production</code> / <code>archive</code>) are any exact branch names or regex patterns you like. <code>featurePattern</code> tells the plugin how to recognize your working branches.</p>
+<p>A team that calls its integration branch <code>master</code>, adds a <code>beta</code> preview, and prefixes feature branches with <code>fix/</code> writes exactly that into the config; every block, report, and audit then speaks those names. There is no convention you must adopt — only a mapping you declare. See <a href="#customizing-branch-names--rules--any-naming-works">Customizing branch names &amp; rules</a>.</p>
+<hr>
+<h3>Do I need a preview/production/archive at all?</h3>
+<p>No. Add only the roles your flow actually has. A solo repo with just <code>develop</code> configures <code>integration: ["develop"]</code> and nothing else; an enterprise with ten environments adds the <code>preview</code> array and a <code>production</code> role. The rest stays off.</p>
+<hr>
+<h3>Is this a security tool?</h3>
+<p>No, and it is important that you don't treat it as one. It is a workflow guard: it makes an agreed process mechanically enforceable. Text-based command recognition is inherently best-effort — an agent determined to obfuscate a command can slip past the parser.</p>
+<p>Within its supported command forms, the role boundary is enforced locally: merging into a protected role branch (integration / preview / production / archive) requires the configured path (PR/MR, or a human merge for production/archive). Standard obfuscation wrappers are classified and blocked — shell wrappers (<code>sh -c</code> / <code>bash -lc</code>), subshells and backtick/<code>$()</code> nesting, <code>env</code>/<code>command</code>/<code>nohup</code>/<code>xargs</code>/<code>sudo</code> prefixes and <code>VAR=x</code> assignments, absolute paths, pipelines and <code>||</code> tails, git global options (<code>-C .</code>, <code>--git-dir=…</code>), wildcard refspecs (<code>refs/heads/*:refs/heads/*</code>), <code>git pull</code> used as fetch+merge, and the <code>send-pack</code>/<code>update-ref</code>/<code>symbolic-ref</code> plumbing; force-recreating a protected branch (<code>checkout -B</code>/<code>switch -C</code>) and cherry-pick/revert on a protected branch are blocked by the ref-update / ref-move gates. The executable adversarial corpus lives in <code>tests/accuracy-audit.spec.ts</code>.</p>
+<p>What remains <strong>locally non-defensible</strong>: direct forge-API calls (<code>gh api repos/…/pulls/N/merge</code>, <code>curl</code>) and commands inside interpreter subprocesses (<code>node -e "child_process.exec('git push …')"</code>); arbitrarily deep quoting or encoding stays best-effort by nature. The real, non-bypassable boundary lives in branch-protection rules on your hosting service. Use both — treat this guard as instant feedback and audit trail, not as a security boundary.</p>
+<hr>
+<h3>Why can't the agent just merge into production/archive itself?</h3>
+<p>Because the gate classifies those as <strong>user-only</strong> actions. The plugin denies the <em>merge</em> for production and for archive — creating a PR/MR stays allowed, so an agent can still draft a <code>develop</code> → <code>main</code> archive PR for you. The merge itself, however, has exactly one path: <strong>you</strong> clicking it — there is no permit, token, or chat message an agent could use to confer that power on itself.</p>
+<hr>
+<h3>Do I need the <code>gh</code> or <code>glab</code> CLI?</h3>
+<p>No. They are optional adapters used only to resolve what a <code>pr merge</code> / <code>mr merge</code> is targeting, so the gate can tell "merge into integration/preview" (okay) from "merge into production/archive" (blocked). When neither CLI can confirm the target — missing, unauthenticated, offline, or the query fails — the gate <strong>refuses the merge</strong>, even when run from a feature branch: that PR could actually point at production/archive. Retry once the CLI works, or let the user click merge. Everything else works the same. The core enforcement never touches a hosting service, which is why it works identically on GitHub, GitLab, self-hosted, or offline.</p>
+<hr>
+<h3>Will it block my normal work?</h3>
+<p>Deliberately, no. Everything a feature branch is for — committing, pushing, syncing from <code>integration</code>, rebasing, inspecting with read-only commands, running <code>gitflow-guard status</code> — is allowed without friction.</p>
+<p>The blocks are reserved for: (1) direct writes to protected role branches, and (2) an agent trying to merge into production or archive. If you ever see a block you believe is wrong, run <code>gitflow-guard status</code> — it shows exactly which role each local branch got, so a misjudgment is visible and correctable.</p>
+<hr>
+<h3>What if my config has a mistake?</h3>
+<p>A half-guessed setup is never applied by accident: any validation error disables the guard for that project and reports the errors.</p>
+<p>Common mistakes: missing <code>integration</code> (required), overlapping a branch across two roles (rejected explicitly), and a <code>featurePattern</code> that doesn't compile (rejected as invalid regex). The failure is loud and the file is one JSON object, so the fix is usually a thirty-second correction.</p>
+<hr>
+<h3>What exactly is checked against the local repository?</h3>
+<p>The current branch (<code>git branch --show-current</code>), and — only for <code>pr merge</code> / <code>mr merge</code> — the PR/MR target via <code>gh pr view</code> / <code>glab mr view</code>. Nothing about ancestry is needed, because the model is role-driven (which branch <em>is</em> the target) rather than order-driven.</p>
+<p>Nothing is written, no remote is contacted, and no hosting-service feature is required for the core checks. Production/archive merges are simply denied for agents; the human merge happens in your UI.</p>
+<hr>
+<h3>License / cost?</h3>
+<p>MIT, free, no strings. Use it, modify it, ship it — the only obligation is keeping the copyright notice.</p>
+<p>If it saves your team from a shortcut gone wrong, the coffee button at the top of this page is appreciated but never required. See <a href="#license">License</a>.</p>
+<hr>
+<h2>Glossary</h2>
+<table>
+<thead>
+<tr>
+<th>term</th>
+<th>meaning</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong>integration</strong></td>
+<td>the branch and only required role (<code>branches.integration</code>); features merge in via PR/MR; protected</td>
+</tr>
+<tr>
+<td><strong>preview</strong></td>
+<td>optional env-endpoint branches (<code>branches.preview</code>, array); updates via PR/MR only</td>
+</tr>
+<tr>
+<td><strong>production</strong></td>
+<td>optional production branches (<code>branches.production</code>, array); PR/MR + merge by user only</td>
+</tr>
+<tr>
+<td><strong>archive</strong></td>
+<td>optional post-release archive branch (<code>branches.archive</code>); user-hand only</td>
+</tr>
+<tr>
+<td><strong>feature branch</strong></td>
+<td>your working branch, matched by <code>featurePattern</code>; free zone</td>
+</tr>
+<tr>
+<td><strong>gate matrix</strong></td>
+<td>the decision table mapping each classified command to allow/deny</td>
+</tr>
+<tr>
+<td><strong>pre-execute</strong></td>
+<td>the tool-pipeline hook where denial happens — before the command runs</td>
+</tr>
+<tr>
+<td><strong>merge-by-user</strong></td>
+<td>production/archive merges stay in your hands — your click on the PR/MR is the confirmation</td>
+</tr>
+</tbody></table>
+<hr>
+<h2>Roadmap</h2>
+<ul>
+<li><strong>i18n — localized block messages</strong> ✅ (0.0.3): English by default, <code>"locale": "zh"</code> for Chinese.</li>
+<li><strong>v2 — audit sync</strong>: sync the user-level audit log across machines (audit is local-only today).</li>
+<li><strong>v2 — more pre-built templates</strong>: ready-made config templates for common flows (solo <code>develop</code>, multi-env enterprise) as community-contributed presets.</li>
+<li><strong>v2 — CI hard-gating research</strong>: whether <code>pr checks</code> could become a real gate without hurting the platform-agnostic core.</li>
+</ul>
+<p>Contributions welcome — see <a href="#development">Development</a>.</p>
+<hr>
+<h2>Support</h2>
+<p>The plugin is free and open source (MIT). If it saves you and your team from a shortcut gone wrong, a coffee is appreciated:</p>
+<p><a href="https://ko-fi.com/keanz21"><img src="https://ko-fi.com/img/githubbutton_sm.svg" alt="ko-fi"></a></p>
+<hr>
+<h2>Development</h2>
+<pre><code>npm install
+npm test          # unit tests: classify / gate / config / cli / repo / platform / i18n / index / accuracy-audit
+npm run typecheck     # tsc --noEmit, 0 errors
+npm run build         # tsdown → lib/ (CLI and plugin share the build)
+npm run verify:matrix # continuous cross-agent regression: DSH logic + zh-locale regression + Claude Code / Codex / OpenCode / Antigravity hook wiring + Pi extension
+</code></pre>
+<p><strong>Rule</strong>: any logic change must pass a 0-error build + all green tests + a green <code>verify:matrix</code> before done.</p>
+<p><strong>Adding a new agent client</strong> (e.g. Cursor / Windsurf): all of these must change in one commit — <code>src/platform.ts</code> (+tests, <code>HookPlatform</code> union), a repo hook config beside <code>.claude/settings.json</code> / <code>.codex/hooks.json</code>, <code>.agents/hooks/references/&lt;tool&gt;.md</code>, <code>scripts/verify-matrix.mjs</code>, the README hook section and the top tagline, <code>package.json</code> description/keywords, and <code>CHANGELOG</code>. Done only when <code>npm run verify:matrix</code> is green. (Same checklist in <a href="https://github.com/FeatureAgents/AgentsGitFlowController/blob/HEAD/AGENTS.md">AGENTS.md</a> §8; DSH and Pi are in-process clients covered by the exceptions noted there.)</p>
+<hr>
+<h2>License</h2>
+<p><a href="https://github.com/FeatureAgents/AgentsGitFlowController/blob/HEAD/LICENSE">MIT</a> © FeatureAgents</p>
+<p>Historical v0 design decisions (Chinese; superseded by the role-driven model shipped in 0.0.2 — current behavior is documented in this README): <a href="https://github.com/FeatureAgents/AgentsGitFlowController/blob/HEAD/docs/design.md">docs/design.md</a>.</p>

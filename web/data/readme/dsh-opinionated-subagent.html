@@ -1,0 +1,177 @@
+<h1>dsh-subagent-model</h1>
+<p>A minimal, opinionated <code>subagent</code> for DeepSeek Harness: you decide which models a child may run on, at which reasoning effort, and a correction reaches a working child at its next step instead of after its turn.</p>
+<h2>What it does</h2>
+<ul>
+<li><strong>Forces the child's model.</strong> <code>subagent</code> takes a required <code>model</code> argument whose choices are your allowlist. A child never silently inherits the conversation's model.</li>
+<li><strong>Forces the child's reasoning effort.</strong> Effort is set per route by you, not by the delegating agent — it has no effort argument and cannot inherit yours.</li>
+<li><strong>Refuses a wrong effort before spending anything.</strong> A configured effort is validated against that exact model's advertised set, before any provider call.</li>
+<li><strong>Steers a running child at its next step.</strong> The shipped <code>send_message</code> queues behind the whole current turn; a correction aimed at work in flight can land minutes late. This one joins the turn in progress.</li>
+<li><strong>Shows the route in the transcript.</strong> Each <code>subagent</code> call renders the model it ran on, so you never read the session log to check.</li>
+<li><strong>Configurable in the UI.</strong> Settings → Plugins, with effort dropdowns populated from what each model actually supports.</li>
+<li><strong>Neutral until you opt in.</strong> Installed, it behaves exactly like the shipped tool; forcing starts when you edit the allowlist.</li>
+</ul>
+<p>Every piece is optional and composes per row: mount only the delegation frontend, only the steering <code>send_message</code>, or both.</p>
+<h2>Why</h2>
+<p>A child started with no <code>agentOptions</code> inherits its parent's route: <code>resolveChildAgentOptions</code> spreads the parent's <code>provider</code>/<code>model</code> first, and the shipped <code>@deepseek-ai/dsh-tool-subagent</code> takes only <code>{ description, prompt }</code> — it exposes no way for a caller to choose. So a worker silently runs on whatever the main agent runs on.</p>
+<p>This plugin replaces that frontend. The <code>model</code> argument is <strong>required</strong>, its <code>enum</code> is your configured allowlist, and the chosen route plus its configured effort are pinned onto the child.</p>
+<h2>Installing changes nothing until you say so</h2>
+<p>The allowlist ships seeded with one entry, <code>inherit/current</code>, which explicitly follows the calling turn's own model and effort. So a fresh install behaves exactly like the shipped tool, and there is nothing to undo if you change your mind.</p>
+<p>Forcing is opt-in: add the routes you want, and <strong>remove <code>inherit/current</code></strong> to make inheritance impossible. While it is present the model may still name it, so it is a permission, not a fallback — the tool call visibly records which route the child ran on either way.</p>
+<p><code>inherit/current</code> resolves the route recorded for the current turn, not the session-creation model, so a mid-session model switch is respected.</p>
+<h2>How it forces the route</h2>
+<p>The harness splits these two facts, so the plugin uses two mechanisms:</p>
+<table>
+<thead>
+<tr>
+<th>Fact</th>
+<th>Mechanism</th>
+<th>Durable?</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>provider + model</td>
+<td><code>SubagentStartRequest.agentOptions</code>, which takes precedence over the inherited parent route</td>
+<td>yes — no bridge needed</td>
+</tr>
+<tr>
+<td>reasoning effort</td>
+<td><code>installModelSelection</code> on the child's own context at its <code>agent/created</code> edge</td>
+<td>reservation is in-memory; the child's first <code>request/header</code> becomes the authority</td>
+</tr>
+</tbody></table>
+<p><code>agentOptions</code> has no effort field — an effort reaches a request only through the <code>agent/request</code> waterfall. <code>lib/effort.js</code> uses the harness's own <code>installModelSelection</code> primitive (the same one the Web model picker uses), which also keeps prompt <code>{{model}}</code> interpolation and the logged <code>request/header</code> agreeing with what is actually sent.</p>
+<p><code>agent/created</code> is a synchronous publication boundary, so the selection is installed before the child can assemble a prompt or issue a request.</p>
+<h2>Install</h2>
+<pre><code>dsh plugin --profile web add /path/to/dsh-subagent-model
+</code></pre>
+<p>That mounts the <strong>host half</strong> only: the settings namespace that owns your allowlist. It registers no tool.</p>
+<p>The <strong>tool row</strong> belongs to an agent preset, because a delegation tool is per-agent composition and must <em>replace</em> the shipped row rather than sit beside it — two rows registering the same <code>subagent</code> name collide, and leaving the shipped one mounted would give the model a way to bypass this policy.</p>
+<p>In your preset's <code>agent.cordis.yml</code>, replace the <code>tool-subagent</code> row:</p>
+<pre><code>    - id: tool-subagent
+      name: dsh-subagent-model/spawn
+      config:
+        provider: spawn
+        toolName: subagent
+        backgroundMode: continuable   # or one-shot
+        maxDepth: 3                   # or provider-managed
+</code></pre>
+<h2>Configure</h2>
+<p><strong>Settings → Plugins → Subagent model.</strong> The card lists your allowed routes, each with an effort dropdown populated from what that exact model advertises, plus an "Add a route…" picker fed by the live model catalog. Edits stage locally and commit on <strong>Save</strong> through the revision-fenced settings scope, so a half-finished edit never reaches a running agent. The banner states plainly whether you are currently <em>inheriting</em> or <em>forcing</em>.</p>
+<p>Both halves ship in this one package: installing it puts the card on the settings page. The Plugins tab renders only namespaces a registered card claims, so there is no generic schema-driven form to fall back on.</p>
+<p>Equivalently, in <code>~/.dsh/settings.yaml</code>:</p>
+<pre><code>dsh-subagent-model:
+  routes:
+    - kiro/claude-opus-5
+    - deepseek/deepseek-chat
+    # - inherit/current   # remove to forbid inheriting the conversation's model
+  efforts:
+    kiro/claude-opus-5: high
+    deepseek/deepseek-chat: provider/default
+</code></pre>
+<ul>
+<li><code>routes</code> — the complete allowlist, spelled <code>provider/model-id</code>, plus the optional <code>inherit/current</code> entry. Only the <em>first</em> <code>/</code> splits a provider route, so a model id may itself contain slashes. Defaults to <code>[inherit/current]</code>.</li>
+<li><code>efforts</code> — effort per route. A route absent from the map, or set to <code>provider/default</code>, sends no explicit effort — and for <code>inherit/current</code> that means following the calling turn's own effort. Any other value must be an effort that exact model advertises; an unadvertised id is refused <strong>before</strong> any provider call rather than clamped. An explicit effort on <code>inherit/current</code> overrides the inherited one, so you can follow the model but pin the effort.</li>
+</ul>
+<p>Both are read at <strong>every</strong> tool call, so an edit applies to the next delegation with no restart.</p>
+<h2>Behavior worth knowing</h2>
+<ul>
+<li><strong>An empty allowlist unregisters the tool.</strong> It never falls back to the parent's model — silently inheriting is the exact behavior this plugin exists to prevent. The prompt section still states the rule so the model can explain the refusal.</li>
+<li><strong>A route that no longer resolves is skipped with a warning</strong>, and the remaining routes keep working. If none resolve, the tool is unregistered.</li>
+<li><strong>The model cannot choose an effort.</strong> There is no effort argument, and a child never inherits the parent's.</li>
+<li><strong>Settings are re-read inside <code>execute</code></strong>, so a schema captured a step ago cannot authorize a route you removed since.</li>
+<li><strong>Foreground calls are marked concurrency-unsafe</strong>, because they share one parent-matched effort reservation slot.</li>
+<li><strong>Each named provider is listed before its routes are resolved.</strong> <code>resolveModelInfo</code> is not required to discover capabilities itself: an adapter may answer it from a cache that only <code>listModels</code> fills, and report a static fallback list while that cache is cold. Without listing first, an effort the provider genuinely accepts is refused as unadvertised. Only providers your allowlist names are listed, so a delegation never wakes an unrelated adapter.</li>
+</ul>
+<h2>Config reference</h2>
+<table>
+<thead>
+<tr>
+<th>Field</th>
+<th>Default</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>provider</code></td>
+<td><code>spawn</code></td>
+<td>The <code>ctx.subagents</code> provider to start children on</td>
+</tr>
+<tr>
+<td><code>toolName</code></td>
+<td><code>subagent</code></td>
+<td>Model-facing tool name; must be unique among live tools</td>
+</tr>
+<tr>
+<td><code>backgroundMode</code></td>
+<td><code>continuable</code></td>
+<td><code>continuable</code> returns a durable subagent id reachable by <code>send_message</code>; <code>one-shot</code> defaults to waiting</td>
+</tr>
+<tr>
+<td><code>persona</code></td>
+<td>—</td>
+<td>Optional per-child persona shadowing the deployment persona</td>
+</tr>
+<tr>
+<td><code>maxDepth</code></td>
+<td><code>3</code></td>
+<td>Child recursion cap, or <code>provider-managed</code> to send none</td>
+</tr>
+</tbody></table>
+<h2>Seeing which model a subagent ran on</h2>
+<p>Each <code>subagent</code> call in the transcript renders one line: a state dot (running / done / failed), the word Subagent, the route the child runs on, and the call's short description.</p>
+<p>It is read-only and adds no logic. The route is the <code>model</code> argument the tool already requires, so nothing new is logged or computed. A call whose arguments cannot be read — still streaming, interrupted, or made by the shipped frontend, which has no <code>model</code> argument — renders the ordinary summary and claims no model rather than guessing one.</p>
+<p>The row claims the <code>subagent</code> tool name. A keyed tool view replaces the generic row rather than decorating it, so this is a deliberate takeover of that one name; every other tool keeps its shipped rendering. Setting a different <code>toolName</code> in the spawn row means calls fall back to the generic row.</p>
+<h2>Steering a running subagent</h2>
+<p><code>lib/control.js</code> is an optional <code>send_message</code> replacement. Mount it in place of the shipped control row:</p>
+<pre><code>    - id: tool-subagent-control
+      name: dsh-subagent-model/control
+</code></pre>
+<p>The shipped tool routes every delivery through <code>ctx.subagents.followup()</code>, which calls <code>Agent.followup()</code> and therefore targets <code>next-turn</code>. For a child that is mid-turn — running tools, one per step — the message is accepted and then waits for the whole turn to end, so a correction aimed at work in flight arrives after that work is done. Measured in a real session: a child counting to ten with one bash step per turn had a steer accepted at +7.4s and claimed at +54.9s, a 47.5-second stall.</p>
+<p>This version calls <code>Agent.steer()</code> for a running direct child, which targets <code>next-step</code> and is consumed at the next step boundary. Everything else is delegated to the native service unchanged: an idle, waiting, or absent child (it owns waking and cold resume), and any authority mismatch (it owns the authoritative rejection). Ownership accounting and settlement are untouched.</p>
+<p>The result reports which path ran, as <code>delivery: 'next-step'</code> or <code>'next-turn'</code>, so the model can tell whether a correction joined the current turn.</p>
+<p>A steer that races settlement is not silently lost: disposal clears the inbox, so if the child leaves the registry in the same tick, the delivery falls back to the native path.</p>
+<h2>Routes</h2>
+<table>
+<thead>
+<tr>
+<th>Route</th>
+<th>Purpose</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>GET /subagent-model/catalog</code></td>
+<td>The model catalog the settings card reads: every route with its native input modalities and advertised reasoning efforts, plus the <code>inherit/current</code> entry. Registered through a nested plugin injecting <code>webServer</code>, so the package still mounts in profiles with no web server.</td>
+</tr>
+</tbody></table>
+<h2>Tests</h2>
+<pre><code>npm test
+</code></pre>
+<p>51 tests, all passing. <code>policy.test.mjs</code> and <code>reservations.test.mjs</code> are dependency-free — the route, effort, and reservation-matching rules are pure and need no harness. <code>integration.test.mjs</code> mounts the tool on a real Cordis context with the real <code>ToolRuntime</code>/<code>SubagentRuntime</code> and asserts against a capture provider that the built <code>SubagentStartRequest</code> carries the chosen route, including that the seeded inherit route reproduces the shipped behavior. <code>defaults.test.mjs</code> pins the behavior-neutral seed. <code>client-card.test.mjs</code> exercises the browser card without a browser — it supplies a module loader and a React stub that records the element tree, then asserts the slot registration, that nothing is written before Save, that Save writes <code>efforts</code> before <code>routes</code>, and that a removed route takes its effort with it. It also pins every theme token the card names against the set the Theme provider publishes, because an invented token cannot fail loudly — CSS falls through to the literal fallback, so a typo renders the card unreadable rather than erroring. The harness-dependent suites self-skip when those packages are not resolvable.</p>
+<h3>Live end-to-end check</h3>
+<p><code>tests/live-headless.patch.yml</code> runs the real thing: it disables the profile's
+shipped <code>tool-subagent</code> row, mounts this frontend in its place, and pins the
+PARENT to a route that is not on the allowlist, so a child reaching the chosen
+model proves the route was forced rather than inherited.</p>
+<pre><code>dsh plugin --profile headless add /path/to/dsh-subagent-model
+dsh --profile headless --patch tests/live-headless.patch.yml \
+  "Use the subagent tool once with model antigravity/gemini-3.7-flash and prompt 'name your model'."
+</code></pre>
+<p>Verified on a real run: with the parent on <code>unlimited/claude-sonnet-5</code> and the
+allowlist forcing <code>antigravity/gemini-3.7-flash</code> at <code>high</code>, the child's durable
+<code>request/header</code> recorded <code>provider: antigravity</code>, <code>model: gemini-3.7-flash</code>,
+<code>reasoningEffort: high</code> — so the effort bridge reaches the actual request, not
+just the tool's label — and the child reported itself as Gemini 3.7 Flash.
+Naming a route the user removed is refused by the schema enum before execution.</p>
+<p>The parent route is pinned in the patch layer, but a <code>agent-default-model</code> block
+in <code>~/.dsh/settings.yaml</code> outranks it: set that to the same route, or remove it,
+or the run boots on whichever provider settings names.</p>
+<h2>Designed, not built</h2>
+<p><a href="https://github.com/dat-lequoc/dsh-opinionated-subagent/blob/HEAD/docs/refork-spec.md"><code>docs/refork-spec.md</code></a> specifies <code>refork_subagent</code>: continue a stalled or wrong-model child's <strong>whole</strong> conversation on a different route, by copying its completed-turn history into a new child rather than resuming the old one on a model that did not produce it.</p>
+<p>The spec is complete enough to implement from — every mechanism is cited in current source, the load-bearing assumption is measured on a real stalled child, and the two unverified risks are marked. Two constraints are worth knowing before asking for it: a child killed mid-turn loses that partial turn, because a seed must end at a <code>turn/end</code>; and combining a seeded child with continuable mode is a combination the shipped <code>fork</code> provider deliberately avoids, so it needs measuring first.</p>
+<h2>Known limitations</h2>
+<ul>
+<li><strong>The effort reservation is in-memory.</strong> A process restart between a child's creation and its first request loses the reserved effort, and that child falls back to its route's provider default. The route itself is durable, so this cannot silently change models.</li>
+<li><strong><code>lib/client.js</code> is a hand-written lazy-CJS factory.</strong> The repository's <code>tsdown</code> client preset is not published, so an out-of-tree package must reproduce that artifact format itself. The card therefore uses <code>React.createElement</code> directly and draws its own chrome — the client bundle-purity gate rejects value imports across plugins, so it cannot reuse the shipped card components.</li>
+<li><strong>The card needs the catalog route to offer choices.</strong> Without a web server the settings namespace still works from YAML; the picker and effort dropdowns are simply empty.</li>
+<li><strong>One tool row per provider.</strong> Two rows sharing a <code>toolName</code> collide at registration, by design.</li>
+</ul>

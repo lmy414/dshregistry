@@ -1,0 +1,169 @@
+<h1>dsh-py-codeact</h1>
+<p>A CodeAct agent loop for the DeepSeek Harness: the model's action space is a <strong>persistent IPython session</strong>, and harness tools are bridged into it as awaitables.</p>
+<pre><code># one cell
+from __dsh__.tools import read, glob
+import pandas as pd, io
+
+paths = await glob(pattern="data/*.csv")
+frames = [pd.read_csv(io.StringIO(await read(file_path=p))) for p in paths]
+df = pd.concat(frames)
+
+# a later cell — `df` is still bound, and so are `read`, `_`, `Out[1]`, everything
+df.groupby("region").revenue.sum().nlargest(3)
+</code></pre>
+<p><code>python</code> is the only tool the model can call directly. Everything else lives in <code>__dsh__.tools</code>, so the action space really is one tool — the CodeAct shape.</p>
+<p>Cells run through <code>InteractiveShell.run_cell_async</code>, so magics, <code>transform_cell</code>, top-level <code>await</code>, execution history, and IPython's traceback formatter all come for free. The shell setup and the LLM-specific touches below follow <a href="https://github.com/CNSeniorious000/temporary-mcp-servers/blob/main/ipython-mcp.py"><code>CNSeniorious000/temporary-mcp-servers:ipython-mcp.py</code></a>.</p>
+<h2>How it differs from dsh's built-in Code Mode</h2>
+<p>Same idea, opposite state model.</p>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>Code Mode (<code>run_code</code>)</th>
+<th>this plugin (<code>python</code>)</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>Language</td>
+<td>TypeScript (or Python via a backend)</td>
+<td>Python, in IPython</td>
+</tr>
+<tr>
+<td>State between calls</td>
+<td>none — one fresh worker per run</td>
+<td><strong>persists</strong> for the session</td>
+</tr>
+<tr>
+<td>Layer</td>
+<td>a <code>CodeRuntime</code> seam provider</td>
+<td>an ordinary tool plugin</td>
+</tr>
+<tr>
+<td>Tool surface</td>
+<td>a generated <code>tools</code> global</td>
+<td>the <code>__dsh__.tools</code> module</td>
+</tr>
+<tr>
+<td>Exclusivity</td>
+<td><code>tools.mode: code</code>, enforced by the registry</td>
+<td><code>mode: code</code>, via prompt assembly + a guard</td>
+</tr>
+<tr>
+<td>Result</td>
+<td>program logs + return value</td>
+<td>tagged stdout / return / traceback / note</td>
+</tr>
+</tbody></table>
+<p><strong>It is deliberately not a <code>CodeRuntime</code> backend.</strong> That seam's contract states <em>"no state survives between runs"</em>, and Code Mode's own Agent Note records a persistent REPL kernel as rejected-for-MVP, because cross-call state would be invisible to the session log. A persistent kernel cannot conform — so it owns its own process instead of implementing that interface.</p>
+<p>That tradeoff is real and inherited: the interpreter's live state cannot be reconstructed from a session replay. What IS in the log is every cell's source and every bridged tool call, which is enough to audit what happened.</p>
+<h2><code>__dsh__</code> — the seam</h2>
+<p><code>__dsh__</code> is a real package in <code>sys.modules</code>, so every import form resolves:</p>
+<pre><code>from __dsh__.tools import glob, grep  # the usual one
+import __dsh__.tools as T  # T.read(...)
+from __dsh__ import tools  # tools.read(...)
+</code></pre>
+<p>A dunder-named package reads as harness-owned, survives <code>%reset</code>, and leaves the obvious name <code>tools</code> free for the model's own variables.</p>
+<p><strong>Each tool is a real <code>async def</code>.</strong> dsh's description becomes its <code>__doc__</code> and its parameters become a keyword-only signature, so the REPL's own introspection does the explaining:</p>
+<pre><code>In [1]: read?
+Signature: read(*, file_path: 'str', offset: 'int' = Ellipsis, limit: 'int' = Ellipsis) -&gt; 'str'
+Docstring: Read a file from the workspace. Results include line numbers…
+</code></pre>
+<p>That is why the prompt block carries signatures only — the descriptions are one <code>?</code> away instead of resident in every request. Annotations are rendered host-side with dsh's own exported <code>jsonSchemaToPy</code>, so there is no second JSON-Schema mapper to drift.</p>
+<p>The <strong>return</strong> type comes from the tool's own <code>output</code> schema, by way of <code>ctx.tools.sdkSchemas(scope)</code> — the projection that carries it. It is the one annotation the model cannot recover by reading harder: a wrong argument fails loudly at the call, while an unknown return shape is only discoverable by calling once and printing the result, which costs a whole turn per tool. A tool that declares no output schema still renders <code>Any</code>; claiming a type nobody declared would be worse than admitting ignorance. The binding set is resent with every cell, because restrictions and mid-conversation tool changes can move a tool in or out between calls.</p>
+<h3>MCP tools work, with nothing special</h3>
+<p>MCP servers register into the same <code>ctx.tools</code> registry as everything else, so they arrive in <code>__dsh__.tools</code> like any other binding and dispatch through the same pipeline:</p>
+<pre><code>from __dsh__.tools import mcp__gh__github_graphql as gh
+
+data = await gh(query="{ viewer { login } }")
+</code></pre>
+<p>dsh's MCP client is explicitly aware of this route — its canonical value "retains the complete JSON MCP blocks and optional structured content for programmatic and Code Mode callers" — and the sub-call logs a <code>SUBTOOL</code> row like any other.</p>
+<p>Worth contrasting: Anthropic's server-side <a href="https://platform.claude.com/docs/en/agents-and-tools/tool-use/programmatic-tool-calling">programmatic tool calling</a> is <em>not</em> compatible with MCP tools. Owning the bridge host-side is what buys this.</p>
+<p>(A tool whose name is not a valid Python identifier cannot be <code>import</code>ed, but is still reachable as <code>getattr(__dsh__.tools, "odd-name")</code>. dsh's MCP naming — <code>mcp__&lt;server&gt;__&lt;tool&gt;</code> — always is one.)</p>
+<h2>Exclusive mode</h2>
+<p><code>mode: code</code> (the default) makes <code>python</code> the only directly callable tool:</p>
+<ul>
+<li>a <code>system-prompt/assemble</code> waterfall listener filters <code>assembly.tools</code> down to <code>python</code>, so the other schemas never enter the request;</li>
+<li>a <code>ctx.tools.guard()</code> denies a model-direct call to anything else and names the route back (<code>from __dsh__.tools import &lt;name&gt;</code>) — presentation alone is not enforcement, and a bare rejection reads as a broken deployment. Sub-dispatches carry a <code>parent</code> token and are exempt.</li>
+</ul>
+<p><code>ctx.tools.restrict()</code> cannot do the first job: it masks <em>global</em> tools only, and in a preset composition the tools are scope-local — "scoped registrations remain visible". The assemble waterfall is the layer that owns the model-facing list.</p>
+<p>The rule ships as its own prompt section at order 99, ahead of the 100–199 tool-guidance band, for the reason Code Mode orders its own code-only rule there: the model should read which tools it may call before it reads what each one is for. (Measured: moving it out of the band took it from character 4129 to 170.)</p>
+<p>Set <code>mode: both</code> to keep the native schemas alongside — useful while debugging a composition, not the CodeAct shape.</p>
+<h2>The <code>CodeAct</code> card</h2>
+<p>The browser half registers <code>tool.call.toolview</code> under <code>key: 'python'</code>, giving the call its own card:</p>
+<pre><code>CodeAct · count the markdown files at the root
+┌ python                                  copy ┐
+│ from __dsh__.tools import glob                │
+│ print(len(await glob(pattern="*.md")))        │
+└───────────────────────────────────────────────┘
+   Glob · *.md          ← native SUBTOOL row, untouched
+</code></pre>
+<p>The code body is the shipped <code>CodeBlock</code> primitive with <code>lang: "python"</code>, so the highlighting, the language label, and the copy button are dsh's own.</p>
+<p><strong>A client half is required, because nothing host-side can affect this row.</strong> <code>toolRowModel</code> ignores the <code>presentCall</code> view entirely and derives everything from the tool NAME plus raw args:</p>
+<pre><code>title   = TOOL_TITLES[toolName] ?? VARIANT_TITLES[classifyTool(toolName)]  // unknown → "Tool call"
+summary = variant === 'others' ? `${toolName} · ${base}` : base
+body    = deriveBody(variant, argsRaw)                                     // unknown → raw args JSON
+</code></pre>
+<p>and <code>classifyTool</code> reads a hardcoded map in which <code>run_code: 'code'</code> is the only entry that reaches the syntax-highlighted branch (with <code>lang: "typescript"</code> also hardcoded). <code>run_code</code> is a reserved name a plugin may not take. Upstream fix proposed in <a href="https://github.com/deepseek-ai/deepseek-harness/discussions/4724">discussion #4724</a>: let the call view carry <code>kind: 'execute'</code> plus a language.</p>
+<p><strong>SUBTOOL nesting survives by construction.</strong> <code>ToolCallBranch</code> renders <code>block.subCalls</code> as <em>siblings</em> of the slot occupant:</p>
+<pre><code>children: [renderSlot('tool.call.toolview', owner, { entryKey: toolName, fallback }), children]
+</code></pre>
+<p>so a registered toolview replaces the card body only. The slot contract says the same: "registering is additive for your own tool".</p>
+<p>The card is hand-written in the client module system's factory form (a classic script registering a CJS factory) rather than bundled — this package has no build step, and the card needs only React plus one shipped primitive.</p>
+<p>The key is the literal name <code>python</code>; a custom <code>toolName</code> falls back to the generic row.</p>
+<h2>SUBTOOL rows come free</h2>
+<p>Each bridged call appends the same two session events Code Mode uses:</p>
+<pre><code>session.append('tool/code-dispatch-start', { rootCallId, parentCallId, subCallId, name, arguments })
+session.append('tool/code-dispatch',       { ...same, isError, content })
+</code></pre>
+<p>They pair by <code>subCallId</code> (<code>&lt;parent&gt;:py:&lt;n&gt;</code>), and the settle event carries <code>tool/result</code>'s own vocabulary (<code>content</code> + <code>isError</code>) — so the trajectory UI renders them through the exact code path it uses for native calls, as <code>SUBTOOL</code> rows under the <code>python</code> call. No client change.</p>
+<p>Both types are in <code>KNOWN_SESSION_EVENT_TYPES</code>, so reusing them is supported. Note that an out-of-repo plugin cannot invent a <em>new</em> event type: the persistence read path refuses a log containing a type outside that set unless the event is marked <code>ignorable</code>, and a registration surface for downstream events is explicitly deferred upstream.</p>
+<p>Sub-dispatches carry the outer execution's <code>parent</code> token, so they re-enter the complete <code>pre-execute → guards → execute → post-execute → result</code> pipeline. The sandbox and approval stack still gate every tool call made from inside a cell.</p>
+<h2>What the model gets</h2>
+<ul>
+<li><strong>Magics.</strong> <code>%whos</code> to recall what it has bound, <code>%timeit</code>, <code>%run script.py</code>, <code>%%writefile</code>, <code>obj?</code> / <code>obj??</code>, <code>%cd</code>. Cheap self-orientation in a session it has partly forgotten.</li>
+<li><strong>History.</strong> <code>store_history=True</code>, so <code>_</code>, <code>__</code>, <code>_i3</code>, <code>Out[n]</code> all work.</li>
+<li><strong>Redundant-import hints.</strong> When an <code>import</code> rebinds a name to the object it already held, the result carries <code>`json` is already imported in this session — no need to re-import it.</code> A model driving a persistent REPL re-imports constantly; telling it is cheaper than letting it burn a line every cell. (Implemented with a <code>dict</code> subclass that watches top-level <code>STORE_NAME</code> and checks the preceding opcode was <code>IMPORT_NAME</code>/<code>IMPORT_FROM</code>, so <code>x = x</code> does not trip it.)</li>
+<li><strong>Readable reprs.</strong> <code>objprint</code> + IPython's <code>pretty</code> for objects whose own <code>__repr__</code> is <code>object.__repr__</code> — an agent reading values needs structure, not <code>&lt;Foo object at 0x…&gt;</code>.</li>
+<li><strong>Tagged observations.</strong> <code>&lt;stdout&gt;</code>, <code>&lt;stderr&gt;</code>, <code>&lt;return&gt;</code>, <code>&lt;traceback&gt;</code>, <code>&lt;note&gt;</code> — with four things possibly present at once, the model needs to know which is which. A plain successful value stays bare.</li>
+<li><strong>Introspection over prompt text.</strong> <code>read?</code> for one tool's full description, <code>dir(__dsh__.tools)</code> for the whole list, <code>%whos</code> for its own bindings.</li>
+</ul>
+<h2>Cancellation</h2>
+<p>An aborted turn sends an in-band <code>interrupt</code> frame, cancelling the running cell at any <code>await</code> point. <code>run_cell_async</code> catches the <code>CancelledError</code> itself, so the model is told plainly (<code>InterruptedError: the harness cancelled this cell. State is intact; the cell did not finish.</code>) rather than handed a raw traceback it might read as a bug in its own code. The session and every binding survive.</p>
+<p>A pure CPU loop (<code>while True: pass</code>) never reaches an await point. After <code>hardInterruptMs</code> (default 5s) the interpreter is SIGKILLed and the next call respawns it; that observation is prefixed with <code>[the interpreter was restarted; every earlier binding is gone]</code> so the model does not keep referring to variables that no longer exist.</p>
+<h2>Known limitations</h2>
+<ul>
+<li><p><strong>Native writes are not captured.</strong> stdout/stderr are captured at the Python level, so <code>print</code> is captured but a subprocess writing to fd 1 is not. Use <code>subprocess.run(..., capture_output=True)</code>, or <code>%run</code>. (Anything that does reach fd 1/2 — including IPython's own colored traceback, deliberately routed there — is retained only for the crash message.)</p>
+</li>
+<li><p><strong>Scope is not optional.</strong> The visible tool set comes from <code>ctx.tools.sdkSchemas(scope)</code> — the scope being the agent. Omitting it yields the <em>global</em> view, which in a preset composition holds only host-registered tools; the preset's own <code>read</code>/<code>bash</code>/<code>edit</code> live in the agent scope and vanish. The prompt section reads <code>assembly.scope</code>, and the kernel's name list is resent with every cell (restrictions and mid-conversation tool changes can move a tool in or out between calls).</p>
+</li>
+<li><p><strong>Pick a <code>toolName</code> nothing else answers to.</strong> With an MCP IPython server also mounted, a model told to "use the python tool" reaches for <code>mcp__py__ipython_execute_code</code> — which has no <code>tools</code> binding — and then reports that your tool does not exist.</p>
+</li>
+<li><p><strong>MCP return types are shapeless.</strong> An MCP tool's canonical value is the envelope (<code>content</code>, plus <code>structuredContent</code> when the server advertises an output schema), and <code>jsonSchemaToPy</code> collapses an object to <code>dict[str, Any]</code> — so the annotation says a dict arrives without saying which keys. dsh renders that shape as a <code>TypedDict</code> for Code Mode via <code>renderToolsSdkPy</code>, but that renderer emits a whole document in Code Mode's own <code>tools.name(args)</code> contract, not a line per signature. Since the envelope is uniform, a sentence of prose buys more here than a per-tool emitter that would duplicate dsh's mapper.</p>
+</li>
+<li><p><strong>Cold start.</strong> The PEP 723 environment is resolved on first use (<code>uv python find --script</code>). Warm afterwards; pass <code>python</code> to skip it.</p>
+<p>The interpreter is then spawned <strong>directly</strong>, never behind <code>uv run --script</code>. A wrapper stays in the process tree as the interpreter's parent: when it exits first, the interpreter is reparented to init, the handle the host holds reports an exit, and a perfectly live kernel looks dead — so the next cell respawns and the session's state vanishes with an <code>[the interpreter was restarted]</code> notice nothing actually caused. <code>alive</code> is likewise tracked from the exit event rather than read off <code>proc.killed</code>, which Node sets on any <code>kill()</code> call, including a signal the process survived.</p>
+</li>
+<li><p><strong>Containment, not a security boundary.</strong> A separate process with a curated environment, but model code can <code>import os</code>. Treat a session on this preset as shell access.</p>
+</li>
+<li><p><strong>One interpreter per conversation tree, one shell per agent.</strong> A subagent reuses the parent's process — sharing its event loop, <code>sys.modules</code>, installed packages and <code>__dsh__.shared</code> — but gets its own globals and its own tool catalogue. Costs an <code>init</code> frame, not another interpreter.</p>
+</li>
+<li><p><strong><code>__dsh__.shared</code></strong> is the one deliberate crack in that isolation: a module every agent in the process can read and write, for handing live objects across a fan-out with no serialization and no tokens.</p>
+</li>
+<li><p>Shells close with their session; the process goes when the last agent pointing at it does.</p>
+</li>
+</ul>
+<h2>Environment</h2>
+<p>By default the kernel gets an allowlist — <code>PATH</code>, <code>HOME</code>, <code>TMPDIR</code>, <code>LANG</code>, <code>LC_ALL</code>, <code>TERM</code> — not the empty environment the worker-thread runtime uses. CPython running IPython needs a profile dir and a <code>PATH</code> for shell escapes; the point is excluding ambient credentials, which an allowlist does just as well. <code>inheritEnv: true</code> passes the whole harness environment.</p>
+<p><code>COLUMNS</code>/<code>LINES</code> are pinned inside the kernel: with no TTY, <code>get_terminal_size()</code> falls back to 80×24 and wraps tracebacks and pretty output far narrower than the harness renders at.</p>
+<h2>Install</h2>
+<pre><code>dsh plugin --profile &lt;name&gt; add dsh-py-codeact
+</code></pre>
+<p>Then add the row from <code>example/agent.cordis.yml</code> to a preset you own.</p>
+<p>The kernel provisions its own Python from the PEP 723 header in <code>py/kernel.py</code>, so <code>uv</code> is the only prerequisite beyond dsh itself; the first cell pays for that resolve and later ones are warm.</p>
+<p><strong>For the card, also list the package in the profile's <code>dsh.profile.bundles</code></strong> (<code>~/.dsh/profiles/&lt;name&gt;/package.json</code>). The browser bundle is served only for packages named by an <em>enabled Loader entry</em>, and a preset's rows are per-session — they are not in the profile's entry list at boot, so a preset-only mount never gets its card. This package's own <code>cordis.patch.yml</code> therefore inserts one profile-level row carrying <code>uiOnly: true</code>, which makes the host half a no-op there: mounting it at profile level would register <code>python</code> globally and apply exclusive mode's guard to every preset. Never edit a shipped preset — copy it first (<code>ctx.agentPresets.copy('standard', 'py-codeact')</code>) and mount-validate the result with <code>standingKeyFor('py-codeact')</code>.</p>
+<h2>Verified end to end</h2>
+<p>Against <code>Macaron V1 Venti</code> on a real dsh session. Given a plain task — "read this CSV and tell me which region earned most", with no mention of Python or the module — the model imported from <code>__dsh__.tools</code>, ran the cell, and answered with a table. The request carried exactly one tool schema (<code>python</code>); all 33 others were reachable only from inside the cell, and the bridged <code>read</code> appears as a <code>SUBTOOL</code> row under the <code>python</code> call in the trajectory tab. A <code>headless</code> run completes and exits in ~11s.</p>
+<h2>Test</h2>
+<pre><code>node test/smoke.js
+</code></pre>
+<p>Drives the kernel and wire protocol directly, with no harness: state persistence, <code>store_history</code>, magics, redundant-import hints, top-level await, the tool bridge, <code>ToolCallError</code>, <code>asyncio.gather</code>, traceback recovery (and that ANSI never leaks into the captured stderr), in-band interrupt, and the SIGKILL escalation.</p>

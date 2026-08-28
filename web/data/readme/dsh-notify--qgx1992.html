@@ -1,0 +1,197 @@
+<h1>dsh-notify</h1>
+<p><strong>DSH 通知显示层插件（可插拔通知显示层的 web 侧）</strong>
+全局右上角 toast 栈，订阅桌面壳 <code>__dshExo</code> 桥事件（对话完成 / 服务事件 / 更新就绪），点击经官方 <code>dsh-client-runtime</code> 的 <code>sessions</code> store <strong>程序化激活会话</strong>（替代壳侧 <code>__reactFiber$</code> DOM hack）；无壳时自动降级订阅 <code>sessions</code> store 自绘轮次完成 toast。</p>
+<blockquote>
+<p>面向 DSH-Exoskeleton 设计文档 <a href="https://github.com/qgx1992/DSH-Exoskeleton/blob/main/docs/NOTIFICATION-PLUGIN-DESIGN.md"><code>docs/NOTIFICATION-PLUGIN-DESIGN.md</code></a> §6 实现。壳核分离不破坏：检测逻辑（zstd watcher / 服务健康 / 更新）留在主进程，本插件只负责<strong>显示与交互</strong>。</p>
+</blockquote>
+<hr>
+<h2>1. 解决什么问题</h2>
+<table>
+<thead>
+<tr>
+<th align="left">用户问题</th>
+<th align="left">本插件对应的解法</th>
+</tr>
+</thead>
+<tbody><tr>
+<td align="left"><strong>通知不弹 / 漏报</strong></td>
+<td align="left">桌面壳把事件经 webview 预加载桥（<code>__dshExo</code>）投递给页面内插件 → <code>auto</code> 决策「webview 在线优先」，dev/portable 无 System Toast 时通知仍然在页面内可见</td>
+</tr>
+<tr>
+<td align="left"><strong>点击跳错会话 / 跳不过去</strong></td>
+<td align="left">插件在页面内直接用官方 <code>@deepseek-ai/dsh-client-runtime/client</code> 的 <code>sessions</code> store <strong>程序化选中/打开会话（会话 ID 精确）</strong>，不再从壳外猜 DOM、不依赖 <code>__reactFiber$</code></td>
+</tr>
+<tr>
+<td align="left"><strong>每轮对话都通知，太吵</strong></td>
+<td align="left">显示层策略化：聚合窗口、每轮/聚合粒度由<strong>壳侧 hub</strong> 决定后下发（本插件只渲染）；无壳降级时同会话连发<strong>原位刷新</strong>而非堆积，避免覆盖层通知风暴</td>
+</tr>
+</tbody></table>
+<hr>
+<h2>2. 架构（两种数据源，运行时互斥）</h2>
+<pre><code>┌─ 壳桥模式（默认，覆盖式首选）────────────────────────────────────┐
+│  DSH-Exoskeleton 主进程 notification-hub（壳侧，P1）              │
+│   └─ webviewProvider（P2：WebContentsView 预加载桥 __dshExo）      │
+│        │ onEvent(ev)                              send()           │
+│        ▼                                                ▲          │
+│  ┌─ dsh web 页面 ─────────────────────────────────────────────┐   │
+│  │  dsh-notify 插件（本包）                                   │   │
+│  │   · 检测到 window.__dshExo → ready() 握手 → 订阅 onEvent    │   │
+│  │   · 渲染 toast 栈（按 kind 分级）                          │   │
+│  │   · 点击 → ctx.sessions.open(id) 程序化激活                 │   │
+│  │          → __dshExo.send('notify:click', …)                │   │
+│  └────────────────────────────────────────────────────────────┘   │
+└──────────────────────────────────────────────────────────────────┘
+
+┌─ 无壳降级（浏览器直开 dsh web，无 __dshExo）───────────────────┐
+│  dsh-notify 插件                                                │
+│   · 订阅 ctx.sessions.list，检测 completed 0→1 边缘（= 侧边栏    │
+│     绿色 "done"：运行中→完成且未选中）                            │
+│   · 自绘「对话完成」toast；点击 → ctx.sessions.open(id)          │
+│   · 页面内闭环，无 OS 通知                                        │
+└────────────────────────────────────────────────────────────────┘
+</code></pre>
+<ul>
+<li><strong>事件是"事实"，显示是"策略"</strong>：本插件只渲染壳/列表喂给它的完成事件，聚合/渠道等策略由壳侧 hub 决策。</li>
+<li>桥与降级互斥（有桥绝不再开 sessions 降级），天然无双通道重复。</li>
+</ul>
+<hr>
+<h2>3. 桥契约（<code>window.__dshExo</code>）</h2>
+<blockquote>
+<p>壳侧 P2 已落地（<code>src/preload/dsh-view.ts</code> + <code>window-manager.attachDshView</code> 挂 preload +
+<code>notification-hub</code> webview 通道），本契约即<strong>当前实现</strong>，供壳侧后续维护对齐。</p>
+</blockquote>
+<p>插件只消费<strong>最小白名单</strong> API，不依赖任何任意 IPC：</p>
+<pre><code>// 壳侧 → 页面（预加载桥 window.__dshExo，经 contextBridge 暴露）
+interface DshExoBridge {
+  /** 订阅壳推送的通知事件，返回取消函数 */
+  onEvent(cb: (ev: NotificationEvent) =&gt; void): () =&gt; void
+  /** 页面 → 壳：点击 / 已读回执 */
+  send(channel: 'notify:click' | 'notify:seen', payload: { id: string; sessionId?: string }): void
+  /** 页面 → 壳：握手（插件就绪后才投递，防事件丢失） */
+  ready(): void
+  /** 壳版本探针（仅用于日志） */
+  appInfo(): { version: string }
+}
+
+// 通知事件（与设计 §3.1 一致）
+type NotificationEventKind =
+  | 'session-done' | 'service-ready' | 'service-error' | 'service-restarting' | 'update-ready'
+
+interface NotificationEvent {
+  id: string
+  kind: NotificationEventKind
+  title: string
+  body: string
+  ts: number
+  session?: { sessionDir: string; workspace: string; uuid: string; file: string; turn?: number; project?: string; sessionTitle?: string; firstUserText?: string }
+  service?: { port?: number; error?: string; restartCount?: number }
+  update?: { version?: string }
+  actions?: { onClick?: () =&gt; void }   // 原生 provider 专用；webview 通道序列化后无回调
+}
+</code></pre>
+<p><strong>桥侧交互时序</strong>（壳实现参考）：</p>
+<pre><code>壳 webviewProvider 建桥（preload：sandbox+contextIsolation 暴露 __dshExo）
+  → 等页面 __dshExo.ready() 握手
+  → 握手后「webview 在线」，auto 决策投向 webview provider
+  → view.webContents.send('dsh-notify:event', ev) → preload 转发给 onEvent 订阅者
+  → 收到 notify:click → windowManager.show()（会话激活由插件侧 ctx.sessions.open 完成）
+  → 收到 notify:seen → hub 记录已读回执（R-26）
+未握手不投递（防漏报）；握手丢失 → native 兜底。
+</code></pre>
+<hr>
+<h2>4. 安装</h2>
+<h3>从包源（npm / GitHub，推荐 —— 任意机器可装）</h3>
+<pre><code># npm 源（发布后）
+dsh plugin --profile web add dsh-notify
+# GitHub 源
+dsh plugin --profile web add github:qgx1992/dsh-notify
+</code></pre>
+<p>桌面壳内也可用「插件」面板安装：目录会按 <code>dsh-plugin</code> topic / npm keywords 自动发现，一键安装。</p>
+<blockquote>
+<p>已知坑（AGENT.md §7.1）：新发布 &lt;24h 时 pnpm 供应链策略可能报
+<code>ERR_PNPM_MINIMUM_RELEASE_AGE_VIOLATION</code>，把该版本加进 profile 的
+<code>minimumReleaseAgeExclude</code> 白名单即可。</p>
+</blockquote>
+<h3>本地开发装法（改源码调试用）</h3>
+<pre><code># 因项目路径含空格+中文，link: 直连会在 dsh→pnpm 转发链里被拆坏；
+# 用无空格 junction 指向真实目录（改动实时生效，路径移动后需重建 junction）
+New-Item -ItemType Junction -Path "$env:USERPROFILE\dsh-notify-link" `
+  -Target "D:/A-my project/研究agent桌面端/DSH-Exoskeleton/plugins/dsh-notify"
+dsh plugin --profile web add link:C:/Users/QIU/dsh-notify-link
+</code></pre>
+<p>装完后：<code>dsh web</code> 重启生效（客户端 bundle 在启动时组合，仅刷页面不生效），
+页面刷新即加载 <code>/plugins/dsh-notify/client.js</code>。</p>
+<hr>
+<h2>5. 行为细节</h2>
+<ul>
+<li><strong>toast 栈</strong>：右上角，全局。按 kind 分级：对话完成=信息、服务就绪=成功、服务异常=错误、服务重启=警告、更新就绪=信息（左侧竖色条 + DSW 主题变量，自动适配亮/暗色）。</li>
+<li><strong>自动关闭</strong>：信息 8s / 成功 6s / 错误与更新 15s / 警告 12s；× 手动关闭；同屏上限 <strong>5 条</strong>（超出淘汰最旧）。</li>
+<li><strong>对话完成 toast</strong>：<code>项目「X」· 标题</code>（壳下发 body 原样渲染；无壳降级由插件按 <code>cwd</code> 项目名 + <code>displayTitle</code> 组装）。点击 → <code>ctx.sessions.open(sessionId)</code> 程序化激活 + <code>notify:click</code> 回传。</li>
+<li><strong>激活可靠性与防御</strong>：<code>open()</code> 前先校验会话 id 是否在列表（<code>unknown id</code> 会 fail loud，避免炸进插件）；列表瞬态（<code>phase=pending</code>）下每 500ms 重试至多 4 次；再点可按需复用 <code>byId</code> 精确 id。</li>
+<li><strong>已读回执</strong>：事件渲染即 <code>notify:seen</code>（壳侧 hub 用以上报投递成功/去重）。</li>
+<li><strong>i18n</strong>：独立 locale NS <code>dsh-notify</code>（zh/en）。<strong>data 前缀</strong>：<code>data-dsh-notify-*</code>。</li>
+<li><strong>DOM 纪律</strong>：toast 栈是插件自建的 <code>fixed</code> 覆盖容器，<strong>绝不搬动 DSH slot 渲染出的节点</strong>（搬节点 ↔ 框架重渲染互相触发会导致渲染进程 100% CPU 卡死，见 AGENT.md 已知坑）；卸载插件（fiber dispose）整体拆除样式 + 根容器 + 全部 toast。</li>
+<li><strong>静默降级</strong>：所有异常 try/catch，不向壳/页面抛。</li>
+</ul>
+<hr>
+<h2>6. 设计验证结论（对应设计文档 §11「待验证清单」）</h2>
+<table>
+<thead>
+<tr>
+<th align="left">#</th>
+<th align="left">待验证项</th>
+<th align="left">结论（本插件取证）</th>
+</tr>
+</thead>
+<tbody><tr>
+<td align="left">1</td>
+<td align="left"><code>dsh-client-runtime</code> 的 <code>sessions</code> store 是否暴露<strong>程序化选中/打开会话</strong>的 API</td>
+<td align="left">✅ <strong>存在</strong>。<code>ISessions.open(id: SessionId): void</code>（"Select a session as current"），实现 <code>SessionRuntime.open</code>；<code>ctx.sessions</code> 可见（inject <code>"sessions"</code> 后）。§6.3 首选路径可行</td>
+</tr>
+<tr>
+<td align="left">2</td>
+<td align="left">页面是否容忍注入 <code>__dshExo</code> 全局</td>
+<td align="left">插件侧只<strong>消费</strong>，不注入；<code>__dshExo</code> 命名冲突检测由壳侧 preload 负责（R-27，页面无同名全局时才注入）</td>
+</tr>
+<tr>
+<td align="left">4</td>
+<td align="left"><code>WebContentsView</code> + sandbox + preload + contextBridge 兼容性</td>
+<td align="left">壳侧 P2 阶段验证；本插件按标准 <code>contextBridge</code> 契约实现，无特殊前提</td>
+</tr>
+<tr>
+<td align="left">—</td>
+<td align="left">覆盖式 toast 渲染安全性</td>
+<td align="left">✅ 与生态先例（dsh-pet）同型：自建 <code>position: fixed</code> 容器 + <code>&lt;style&gt;</code>，不搬 slot 节点</td>
+</tr>
+</tbody></table>
+<p>无壳降级的"轮次完成"信号：<code>SessionSummary.completed</code>（侧边栏绿色 done 标记，
+<code>SessionManager</code> 在 running→idle 且未选中时 arming）。勘察结果见
+<code>@deepseek-ai/dsh-client-runtime/lib/types/client/contract/sessions.d.ts</code> 与
+<code>sessions/service.d.ts</code>。</p>
+<hr>
+<h2>7. 与 DSH-Exoskeleton 壳侧协作（P0–P2 已落地，P3/P4 约定）</h2>
+<p>壳侧已完成（本次同步交付，<code>npm run typecheck</code> / <code>npm test</code>（113 项）通过）：</p>
+<ul>
+<li><strong>P0 ✅</strong>：AUMID 对齐（<code>index.ts</code> <code>setAppUserModelId('io.dsh.exoskeleton')</code>，与 <code>electron-builder.yml</code> appId 一致）。</li>
+<li><strong>P1 ✅</strong>：<code>src/main/notification-hub.ts</code>（<code>dispatch</code> / 聚合策略 / Provider 路由 / 投递回执日志 R-26），原 <code>notify.ts</code> 降为 native 内部实现。</li>
+<li><strong>P2 ✅</strong>：<code>src/preload/dsh-view.ts</code> 预加载桥（<code>window.__dshExo</code> 白名单，R-27）+ <code>window-manager.attachDshView</code> 挂 preload + hub webview 通道（在线判定 = view attach &amp;&amp; 收到 <code>ready()</code> 握手）+ 三处事件源（session-watcher / index 服务事件 / updater）改走 hub。</li>
+</ul>
+<p><strong>约定</strong>：webview 通道下，壳收到 <code>notify:click</code> <strong>只需 <code>windowManager.show()</code></strong>，会话激活由插件 <code>ctx.sessions.open()</code> 完成 —— 这是替换 <code>activateSessionInWebUi</code> DOM hack 的关键收益；壳侧 <code>activateSessionInWebUi</code> 保留为 native 通道 / 页面异常时的兜底（<code>actions.onClick</code> 携带）。</p>
+<p><strong>P3 / P4（未做，按需后续）</strong>：把 <code>dsh-notify</code> 加入 <code>RECOMMENDED_PLUGINS</code> 默认预置/推荐；管理面板「设置」页渠道自检 + 通知渠道/粒度/聚合窗口 UI（现状：<code>notifyChannel</code> 默认 <code>auto</code> 已生效，粒度默认 <code>per-turn</code> 保持现状零回归，聚合窗口默认 20000ms，均可在 <code>config.json</code> 手动调整）。</p>
+<hr>
+<h2>8. 目录结构</h2>
+<pre><code>plugins/dsh-notify/
+├── package.json          # dsh.client.platform=web；dsh.client.inject 留空（不静态注入源码上下文）
+├── cordis.patch.yml      # bundle 挂载声明（insert 进 DSH 配置树）
+├── lib/
+│   ├── index.js          # 宿主（node 侧）入口：纯浏览器插件，无宿主行为
+│   └── client.js         # 浏览器 bundle：toast 栈 + 桥订阅 + 程序化激活 + 无壳降级 + i18n
+├── README.md             # 本文档
+└── LICENSE               # MIT
+</code></pre>
+<h2>9. 开发 / 发布</h2>
+<ul>
+<li>改 <code>lib/client.js</code> 后：<code>node --check lib/client.js</code> 语法校验 → <strong><code>node test/smoke.cjs</code> 冒烟测试</strong>（在无浏览器环境用最小 DOM shim 真实执行 <code>apply()</code>，覆盖：bundle 导出形状 / 无壳降级 completed 边缘弹 toast / 程序化激活 / 更新就绪 notify:install / 同事件去重 / 卸载拆除）→ 本地 <code>link:</code> 重装 → 重启 dsh web 实测。</li>
+<li><strong>当前默认本地分发</strong>：不推 GitHub、不 <code>npm publish</code>。版本语义化（改代码后 bump），README/description 维护好即可。</li>
+<li>平台标记：<code>dsh.client.platform = "web"</code>；<code>exports['./client']</code> 供模块系统组合 <code>/plugins/dsh-notify/client.js</code>。</li>
+</ul>

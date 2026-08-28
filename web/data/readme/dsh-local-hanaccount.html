@@ -1,0 +1,117 @@
+<h1>dsh-local-hanaccount</h1>
+<p>Open-source local account gate for the DeepSeek Harness Web profile.</p>
+<p><strong>Native model (unchanged):</strong> a <strong>workspace is a directory</strong>; <strong>sessions live inside that workspace</strong> (DSH <code>workspaceRegistry</code> + left sidebar WorkspaceBrowser). This plugin does <strong>not</strong> invent a second tree — it only gates login and scopes which directories each account may see/create.</p>
+<ul>
+<li>Local users only: v0.1 has <strong>no web registration</strong> and no remote account service.</li>
+<li>Users are configured in local Cordis/profile configuration.</li>
+<li>Login is remembered by a local cookie + local state file.</li>
+<li>Ordinary users may only use directories under their own account folder root.</li>
+<li>Admin users may also register arbitrary local paths.</li>
+<li>Per-account isolation is a <strong>view/guard</strong> over the shared native registry (cookie → ALS), not a separate session store.</li>
+</ul>
+<p>MIT licensed.</p>
+<h2>Install</h2>
+<pre><code>cd ~/.dsh/profiles/web
+pnpm add dsh-local-hanaccount
+</code></pre>
+<p>Add it to <code>dsh.profile.bundles</code> after the standard web bundle:</p>
+<pre><code>{
+  "dsh": {
+    "profile": {
+      "bundles": [
+        "@deepseek-ai/dsh-base",
+        "@deepseek-ai/dsh-web-app",
+        "dsh-local-hanaccount"
+      ]
+    }
+  }
+}
+</code></pre>
+<p>Restart <code>dsh web</code>.</p>
+<h2>Configure users</h2>
+<p>This plugin intentionally does not implement registration in v0.1. Configure local users by overriding the bundle row from the profile or home <code>cordis.patch.yml</code>:</p>
+<pre><code>- id: dsh-local-hanaccount
+  config:
+    # 注意：DSH patch 中 config 通常按整段替换，不是深合并；
+    # 因此这里把需要保留的配置项一起写出。
+    enabled: true
+    rememberLogin: true
+    dataDir: ""
+    users:
+      - username: admin
+        password: admin123
+        role: admin
+      - username: user1
+        password: user123
+        role: user
+</code></pre>
+<p>Passwords may be plain text. A simple SHA-256 form is also accepted:</p>
+<pre><code>users:
+  - username: user1
+    passwordSha256: "&lt;sha256-hex&gt;"
+    role: user
+</code></pre>
+<h2>Data layout</h2>
+<p>Default data directory:</p>
+<pre><code>$DSH_HOME/storages/dsh-local-hanaccount
+# or ~/.dsh/storages/dsh-local-hanaccount
+</code></pre>
+<p>Ordinary user workspace root:</p>
+<pre><code>&lt;dataDir&gt;/users/&lt;username&gt;/workspaces/
+</code></pre>
+<p>The plugin stores its own state in:</p>
+<pre><code>&lt;dataDir&gt;/state.json
+</code></pre>
+<p>Deleting a workspace from the UI removes the plugin record and the native registry entry when available; it does not delete the physical directory.</p>
+<h2>Security boundary</h2>
+<p>v0.1 provides a Web UI login overlay and enforces permissions on the plugin's own APIs. It does not claim to be a global DSH HTTP middleware and does not patch DSH core. If a future DSH version exposes a supported workspace/session middleware hook, v2 can add deeper native filtering and account administration.</p>
+<h2>Account-scoped native workspaces</h2>
+<p>Same as stock DSH:</p>
+<table>
+<thead>
+<tr>
+<th>Native concept</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>Workspace</td>
+<td>A filesystem directory registered in <code>workspaceRegistry</code></td>
+</tr>
+<tr>
+<td>Session</td>
+<td>Lives under that workspace (<code>sessionIds</code> on the workspace entity)</td>
+</tr>
+<tr>
+<td>UI</td>
+<td>Left sidebar WorkspaceBrowser — create workspace = pick/create folder; open sessions under it</td>
+</tr>
+</tbody></table>
+<p>What this plugin adds:</p>
+<ul>
+<li><strong>Login gate</strong> + account cookie.</li>
+<li><strong>Host patch</strong> on <code>workspaceRegistry.list</code> / <code>create</code> / <code>resolveByPath</code> scoped by ALS from that cookie (<code>/api</code> HTTP <strong>and</strong> <code>events.host</code> / <code>events.mux</code> upgrades). Ordinary users cannot create outside their account root; list only shows their root (plus recorded admin externals).</li>
+<li><strong>Directory picker</strong> (<code>host.listDirectory</code> / <code>createDirectory</code>): non-admin browse home is the account workspace root; paths outside are clamped back. Workspace create remaps outside picks to <code>&lt;accountRoot&gt;/&lt;basename&gt;</code>.</li>
+<li><strong>Client filter</strong> on <code>WorkspaceManager.upsert</code> / <code>installViews</code> so <code>host/workspace-changed</code> fan-out cannot show another account’s rows.</li>
+<li><strong>Session list filter</strong> (host <code>sessions.list</code> + <code>sessionPersistence.list</code>, plus client <code>SessionManager</code>) so other accounts’ sessions do not leak into <strong>未分组</strong>.</li>
+<li><strong>Account panel</strong> for login/logout and showing the account root path — <strong>not</strong> a parallel workspace UI. Admin「登记外部路径」入口已隐藏（host API 仍保留，需要时再恢复 UI）。</li>
+<li>When ALS has no user (internal callers), methods pass through (logged once).</li>
+</ul>
+<p>Identity for registry guards is <strong>never</strong> last-login <code>currentUser</code>. Not a global DSH HTTP auth middleware.</p>
+<hr>
+<h2>Changelog</h2>
+<h3>v0.1.1（2026-08-18）</h3>
+<p><strong>修复：删除工作区文件夹后，重启会被“加回来”</strong></p>
+<ul>
+<li><strong>问题</strong>：用户在工作区里删除不需要的文件夹后，只要重启服务（或重启页面），被删的文件夹又会重新出现、并重新注册为工作区。</li>
+<li><strong>原因</strong>：插件在启动时执行 <code>reAdoptAll()</code>，把 <code>state.json</code> 中记录的每个工作区重新“收养”进原生 <code>workspaceRegistry</code>。<code>ensureNativeWorkspace()</code> 对被删目录走 <code>resolveByPath</code> 无果后，会调用 <code>workspaceRegistry.create()</code> 重建——普通用户分支的 <code>patchedCreate</code> 会先 <code>mkdirSync(target, { recursive: true })</code> 把目录直接再建出来；同时 <code>state.json</code> 里的残留记录不会清理，列表里也继续显示。</li>
+<li><strong>修复</strong>：<ol>
+<li><code>ensureNativeWorkspace()</code> 入口增加存在性检查——目录已被删除（<code>existsSync(ws.path)</code> 为假）的工作区直接跳过，不再收养、不再重建目录；</li>
+<li><code>reAdoptAll()</code> 对被删除目录的工作区记录调用 <code>deleteWorkspace()</code> 清理，重启后列表与文件系统都不会“又加回来”。</li>
+</ol>
+</li>
+<li><strong>回归测试</strong>：新增 2 个用例（<code>reAdoptAll does not recreate workspaces whose directory was deleted</code>、<code>ensureNativeWorkspace skips workspaces whose directory was deleted</code>），共 13 个用例全部通过。</li>
+</ul>
+<blockquote>
+<p>说明：删除文件系统文件夹 ≠ 调用插件 DELETE 工作区接口。此修复让“删除文件夹”成为最终删除动作，无需再在界面上额外删除工作区记录。</p>
+</blockquote>

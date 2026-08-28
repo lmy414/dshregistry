@@ -1,0 +1,103 @@
+<h1>dsh-web-search-glm</h1>
+<p>Zhipu GLM-backed search provider for the dsh (<code>ctx.web</code>) seam. It executes the native <code>web_search_20250305</code> server tool through GLM's Anthropic-compatible endpoint and maps GLM's <code>web_search_prime</code> result blocks to normalized search sources.</p>
+<h2>How it works</h2>
+<p>The outgoing request is shaped exactly like the official <code>@deepseek-ai/dsh-web-search-deepseek</code> provider's: <code>POST {baseURL}/messages</code> carrying the <code>web_search_20250305</code> server tool (bounded by <code>max_uses</code>), the <code>anthropic-version</code> header, <code>redirect: "error"</code>, and full <code>AbortSignal</code> support.</p>
+<p>The difference is entirely in the response mapping. Instead of Anthropic-standard <code>web_search_tool_result</code> blocks, GLM returns its own pair of blocks:</p>
+<ul>
+<li><code>server_tool_use</code> blocks named <code>web_search_prime</code>, paired with</li>
+<li><code>tool_result</code> blocks whose <code>content</code> is a stringified Python-repr list of search results.</li>
+</ul>
+<p>The provider pairs <code>server_tool_use</code> with <code>tool_result</code> by id (multiple searches in one response are merged), parses the content (<code>JSON.parse</code> first, then a small hand-written Python-repr tokenizer), maps each <code>{title, link, content}</code> entry to <code>{url, title, snippet}</code>, and dedupes by <code>url</code>.</p>
+<p>If the response contains no usable structured search results, the search fails with <code>WEB_PROVIDER_ERROR</code> — there is no scraping or prose fallback, matching the official provider's semantics. On non-2xx responses the server-side error message is passed through verbatim (still <code>WEB_PROVIDER_ERROR</code>). Other codes: <code>WEB_PROVIDER_CREDENTIAL_MISSING</code> when no API key resolves, <code>WEB_ABORTED</code> on cancellation.</p>
+<p>Observed endpoint behavior (live test, 2026-08-27): GLM does not reject nonsense queries — it still executes the web search and returns ~10 sources, so the "no results" branch is rarely taken; this is endpoint behavior, not something the provider configures. Searches on this endpoint were billed under the GLM Coding Plan, like chat traffic.</p>
+<h2>Install</h2>
+<p>From the dsh plugin marketplace (once the package is listed):</p>
+<pre><code>dsh plugin --profile &lt;profile&gt; add dsh-web-search-glm
+</code></pre>
+<p>Or from a local checkout:</p>
+<pre><code>dsh plugin --profile &lt;profile&gt; add /path/to/dsh-web-search-glm
+</code></pre>
+<p><strong>Either way, you must explicitly select the provider.</strong> <code>dsh-web</code> reads its selection from the <code>web</code> row's config — the <code>dsh-base</code> bundle pins <code>deepseek-official</code>, and a <code>web:</code> section in <code>~/.dsh/settings.yaml</code> has no effect there. Override it in your profile's own patch layer, <code>~/.dsh/profiles/&lt;profile&gt;/cordis.patch.yml</code> (applied after every bundle layer):</p>
+<pre><code># ~/.dsh/profiles/web/cordis.patch.yml
+- id: web
+  config:
+    searchProvider: glm
+</code></pre>
+<p>A patch replaces the targeted row's whole <code>config</code> — restate every key the base row owns (today just <code>searchProvider</code>).</p>
+<p>Exporting <code>DSH_WEB_SEARCH_PROVIDER=glm</code> in the launching environment works too.</p>
+<p>Without this, if the official <code>@deepseek-ai/dsh-web-search-deepseek</code> provider is also installed and available, more than one search provider is simultaneously <code>available()</code> and dsh-web throws <code>WEB_PROVIDER_AMBIGUOUS</code> rather than guessing.</p>
+<h2>Configuration</h2>
+<p>Settings live in the <code>web-search-glm</code> section of <code>~/.dsh/settings.yaml</code>:</p>
+<table>
+<thead>
+<tr>
+<th>Key</th>
+<th>Default</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>apiKey</code></td>
+<td>—</td>
+<td>Literal API key (secret). Prefer the <code>apiKeyEnv</code> credential reference.</td>
+</tr>
+<tr>
+<td><code>apiKeyEnv</code></td>
+<td><code>ZAI_API_KEY</code></td>
+<td>Credential reference name. Keep it in sync with the <code>apiKeyEnv</code> of the <code>zai</code> provider in your dsh settings so both read one stored key.</td>
+</tr>
+<tr>
+<td><code>baseURL</code></td>
+<td><code>https://open.bigmodel.cn/api/anthropic/v1</code></td>
+<td>Anthropic-compatible endpoint; <code>/messages</code> is appended by the provider. The overseas deployment can point to <code>https://api.z.ai/api/anthropic/v1</code>.</td>
+</tr>
+<tr>
+<td><code>model</code></td>
+<td><code>glm-5.3</code></td>
+<td>Model that executes the native web search. Verified live — see <a href="#model-notes">Model notes</a>.</td>
+</tr>
+<tr>
+<td><code>apiVersion</code></td>
+<td><code>2023-06-01</code></td>
+<td>Value of the <code>anthropic-version</code> header.</td>
+</tr>
+<tr>
+<td><code>maxTokens</code></td>
+<td><code>4096</code></td>
+<td>Upper bound on generated tokens for the Messages request.</td>
+</tr>
+<tr>
+<td><code>maxUses</code></td>
+<td><code>5</code></td>
+<td>Maximum <code>web_search</code> server-tool uses per request.</td>
+</tr>
+</tbody></table>
+<p>Example:</p>
+<pre><code># ~/.dsh/settings.yaml — plugin options (provider selection lives in the
+# profile patch, see Install):
+web-search-glm:
+  apiKeyEnv: ZAI_API_KEY
+  # baseURL: https://api.z.ai/api/anthropic/v1   # overseas endpoint
+  # model: glm-5.3-flash                         # verified alternative, see Model notes
+</code></pre>
+<p><strong>Credential resolution chain.</strong> The key is resolved per search, in order: a literal <code>apiKey</code> set in the <code>web-search-glm</code> section → the credentials service via the <code>apiKeyEnv</code> reference → a launch-environment variable of the same name. If nothing resolves, the search fails with <code>WEB_PROVIDER_CREDENTIAL_MISSING</code>.</p>
+<p><strong>Endpoint environment fallback.</strong> If the <code>web-search-glm</code> section does not set <code>baseURL</code>, the launching environment's <code>GLM_SEARCH_BASE_URL</code> is consulted before the built-in default. The variable is deliberately distinct from any chat-completions base-URL variable — search speaks the Anthropic-compatible Messages API under its own address (mirroring upstream <code>DEEPSEEK_SEARCH_BASE_URL</code>).</p>
+<h2>Model notes</h2>
+<ul>
+<li><code>glm-5.3</code> (default) — verified live on 2026-08-27: english and chinese queries each returned 10 sources through the native web search.</li>
+<li><code>glm-5.3-flash</code> — verified live on 2026-08-27: all four smoke cases (english / chinese / nonsense / bad-key) behaved identically to <code>glm-5.3</code>, with real searches executed (english and chinese each returned 10 sources). A working alternative — set <code>model: glm-5.3-flash</code> to use it.</li>
+<li><code>glm-5-flash</code> — does not exist on this endpoint. Every request is rejected by the server with <code>[1214][modelCode：不存在]</code> (surfaced as <code>WEB_PROVIDER_ERROR</code>). Do not use this name.</li>
+</ul>
+<p>The package default stays <code>glm-5.3</code>; it is not changed merely because the flash variant is available.</p>
+<h2>Compatibility</h2>
+<ul>
+<li>Targets the dsh plugin seam protocol of <code>dsh &gt;= 0.1.1-rc.2</code> (peer dependencies <code>@deepseek-ai/dsh-*</code> <code>^0.1.1-rc.2</code>).</li>
+<li>MIT License — see <a href="https://github.com/Noemm/dsh-web-search-glm/blob/HEAD/LICENSE">LICENSE</a>.</li>
+</ul>
+<h2>Development</h2>
+<ul>
+<li><code>npm test</code> — parser unit tests on the built-in <code>node:test</code> runner; no extra dev dependencies. Fixtures are real captured GLM responses under <code>test/fixtures/</code>.</li>
+<li><code>npm run capture</code> — one-off live capture that refreshes <code>test/fixtures/</code> (<code>scripts/capture.mjs</code>). Needs <code>ZAI_API_KEY</code> (falls back to <code>ANTHROPIC_AUTH_TOKEN</code>).</li>
+<li><code>npm run smoke</code> — live-endpoint smoke run of four cases (english / chinese / nonsense / bad-key): <code>node scripts/smoke.mjs [model]</code>. Needs <code>ZAI_API_KEY</code> (falls back to <code>ANTHROPIC_AUTH_TOKEN</code>).</li>
+</ul>
+<p>The live scripts intentionally live in <code>scripts/</code>, not <code>test/</code> — Node 26's <code>node --test</code> auto-discovery would execute them during <code>npm test</code> — and they are not shipped in the published npm package.</p>

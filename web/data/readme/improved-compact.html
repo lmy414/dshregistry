@@ -1,0 +1,140 @@
+<h1>improved-compact</h1>
+<p><code>improved-compact</code> 是 DeepSeek Harness（DSH）的仓库外上下文压缩 Provider。它禁用基础 profile 中的 <code>compaction-basic</code> 并作为唯一 Provider 继续提供同一个 <code>ctx.compaction</code> 服务，同时复用上游已经验证的事务式摘要、工具调用配对、session log 重放、手动 <code>/compact</code> 和上下文溢出恢复机制。</p>
+<p>候选策略在上游实现之上增加五项确定性保护：</p>
+<ul>
+<li><strong>分层触发：</strong> 默认在窗口 60% 时先做无模型裁剪，80% 时才调用摘要模型；</li>
+<li><strong>工具感知裁剪：</strong> 保留头尾，并从被删除的中段恢复目标、约束、纠正、错误、路径、命令和 <code>key=value</code> 精确行；<code>request_user_input</code>、goal 和 todo 类工具默认不裁剪；</li>
+<li><strong>纠正优先：</strong> 同一赋值采用 last-write-wins，旧值不会因为更早出现而覆盖后续纠正；</li>
+<li><strong>用户与精确值保护：</strong> 最近一条直接用户消息在其尾部不超过硬阈值 50% 时原文保留，否则以有界 <code>Verbatim Anchors</code> 写入 checkpoint；疑似密码、密钥和 token 行不会被复制进该附录；</li>
+<li><strong>摘要质量门：</strong> 缺失或乱序的原生八段 checkpoint 拒绝落盘；连续压缩时将摘要限定为 1800 个 Unicode code points，按完整行和章节裁剪，避免重复摘要膨胀与语义漂移。</li>
+</ul>
+<p>所有模型可见替换都使用上游 <code>compaction/prune</code> 或 <code>compaction/summary</code> 事件，引用被替换的原始 event seq；插件不新增 DSH 当前持久化目录无法识别的私有 session event。卸载插件 fiber 会同步卸载 <code>ctx.compaction</code> 及自动监听器，不持有定时器、观察器或后台任务。</p>
+<h2>开发</h2>
+<p>要求 Node.js <code>^22.19.0 || &gt;=24.0.0</code> 和 pnpm 11。</p>
+<pre><code>pnpm install
+pnpm run check
+</code></pre>
+<p>构建产物位于 <code>lib/</code>。</p>
+<p>基线与候选评测见 <a href="https://github.com/muou000/improved-compact/blob/HEAD/evals/README.md"><code>evals/README.md</code></a>。它们针对同一固定 DSH checkout、数据集和评分器，量化关键信息召回、后续结构化查询、工具配对、连续压缩漂移、token 节省和稳定性：</p>
+<pre><code>pnpm run eval:baseline:native -- --dsh-root /path/to/deepseek-harness --runs 5
+pnpm run eval:candidate:native -- --dsh-root /path/to/deepseek-harness --runs 5
+</code></pre>
+<p>使用 DSH 已配置的真实模型进行重复评测：</p>
+<pre><code>pnpm run eval:baseline:model -- --provider openai --model gpt-5.6-luna --runs 5
+pnpm run eval:candidate:model -- --provider openai --model gpt-5.6-luna --runs 5
+</code></pre>
+<p>当前基线结果见 <a href="https://github.com/muou000/improved-compact/blob/HEAD/evals/reports/BASELINE-2026-08-27-dsh-native-v1.md"><code>evals/reports/BASELINE-2026-08-27-dsh-native-v1.md</code></a> 和 <a href="https://github.com/muou000/improved-compact/blob/HEAD/evals/reports/BASELINE-2026-08-27-gpt-5.6-luna-v1.md"><code>evals/reports/BASELINE-2026-08-27-gpt-5.6-luna-v1.md</code></a>，候选对照与限制见 <a href="https://github.com/muou000/improved-compact/blob/HEAD/evals/reports/EXPERIMENT-2026-08-27-improved-compact-v1.md"><code>evals/reports/EXPERIMENT-2026-08-27-improved-compact-v1.md</code></a>。</p>
+<h2>配置</h2>
+<p>基础字段（<code>thresholdRatio</code>、<code>retainRatio</code>/<code>retainTokens</code>、摘要模型、重试和 <code>modelPolicies</code>）与 <code>compaction-basic</code> 保持一致。新增字段如下：</p>
+<table>
+<thead>
+<tr>
+<th>字段</th>
+<th align="right">默认值</th>
+<th>作用</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>softPruneRatio</code></td>
+<td align="right"><code>0.6</code></td>
+<td>进入确定性工具结果裁剪层；必须小于所有硬摘要阈值</td>
+</tr>
+<tr>
+<td><code>protectedRecentUserMessages</code></td>
+<td align="right"><code>1</code></td>
+<td>自动压缩时尝试原文保留的最近直接用户消息数</td>
+</tr>
+<tr>
+<td><code>maxProtectedTailRatio</code></td>
+<td align="right"><code>0.5</code></td>
+<td>用户消息及其后续尾部可占硬阈值的最大比例；超过后改用摘要锚点</td>
+</tr>
+<tr>
+<td><code>validateSummaryStructure</code></td>
+<td align="right"><code>true</code></td>
+<td>要求八个原生章节存在、唯一且有序</td>
+</tr>
+<tr>
+<td><code>repeatSummaryMaxChars</code></td>
+<td align="right"><code>1800</code></td>
+<td>只约束包含旧 checkpoint 的连续摘要；<code>0</code> 关闭</td>
+</tr>
+<tr>
+<td><code>toolResult.thresholdChars</code></td>
+<td align="right"><code>8192</code></td>
+<td>工具结果进入裁剪的字符阈值</td>
+</tr>
+<tr>
+<td><code>toolResult.headChars</code> / <code>tailChars</code></td>
+<td align="right"><code>3072</code> / <code>1024</code></td>
+<td>原文头尾预算</td>
+</tr>
+<tr>
+<td><code>toolResult.signalChars</code></td>
+<td align="right"><code>2048</code></td>
+<td>从中段恢复的高信号行预算</td>
+</tr>
+<tr>
+<td><code>toolResult.protectedToolNames</code></td>
+<td align="right">approval/goal/todo 工具</td>
+<td>永不裁剪的工具名列表</td>
+</tr>
+<tr>
+<td><code>verbatimAnchors.maxChars</code> / <code>maxAnchors</code></td>
+<td align="right"><code>4096</code> / <code>64</code></td>
+<td>checkpoint 精确附录预算；任一为 <code>0</code> 时关闭</td>
+</tr>
+<tr>
+<td><code>logLifecycle</code></td>
+<td align="right"><code>false</code></td>
+<td>输出加载/卸载诊断；实际压缩决策仍通过标准 logger 可观察</td>
+</tr>
+</tbody></table>
+<p>错误配置会在插件加载时失败，例如软阈值与硬阈值重叠、头尾预算放不进工具阈值、重复工具名或重复摘要上限小于固定章节骨架。</p>
+<h2>安装到 DSH profile</h2>
+<p>在该目录的上一级执行：</p>
+<pre><code>dsh plugin --profile compact-dev add ./improved-compact
+dsh --profile compact-dev --dump-config
+</code></pre>
+<p>源码仓库目录与安装后的插件标识均为 <code>improved-compact</code>。</p>
+<p>配置层会按原生 package name 校验并禁用基础 Provider，插入候选 row，同时关闭会抢先丢弃中段的原生均匀 pruner：</p>
+<pre><code>- id: compaction-basic
+  name: '@deepseek-ai/dsh-compaction-basic'
+  disabled: true
+
+- insert:
+    - id: improved-compact
+      name: improved-compact
+      config:
+        softPruneRatio: 0.6
+        thresholdRatio: 0.8
+        retainRatio: 0.16
+        protectedRecentUserMessages: 1
+        maxProtectedTailRatio: 0.5
+        validateSummaryStructure: true
+        repeatSummaryMaxChars: 1800
+        logLifecycle: false
+
+- id: tool-result-pruner
+  name: '@deepseek-ai/dsh-compaction-tool-result-pruner'
+  disabled: true
+</code></pre>
+<p>需要覆盖时，在 profile 的 <code>cordis.patch.yml</code> 中重述目标 row 的完整 <code>config</code>。<code>modelPolicies</code> 可为不同 provider/model 设置不同硬阈值和保留预算；<code>softPruneRatio</code> 必须低于其中每个已解析硬阈值。</p>
+<p>卸载：</p>
+<pre><code>dsh plugin --profile compact-dev remove improved-compact
+</code></pre>
+<p>移除 <code>improved-compact</code> 后，其 patch 不再参与组合，基础 profile 的 <code>@deepseek-ai/dsh-compaction-basic</code> 和 <code>@deepseek-ai/dsh-compaction-tool-result-pruner</code> 会恢复；已有 session log 无需迁移，因为候选只写上游标准事件。上线时仍建议先使用影子或小比例 canary，并保留移除插件作为回滚点。</p>
+<h2>已知边界</h2>
+<ul>
+<li>高信号提取是确定性规则，不做 LLM 语义分类；未带标签、路径、命令或赋值形态的中段自然语言仍可能被删除。</li>
+<li>rich content block 的顺序会保留，但字符预算只计算 text block；图像等非文本块不会被压缩。</li>
+<li>容量感知用户尾部保护可能因小窗口或超长单轮而降级为 checkpoint 锚点，这是为保证压缩可收敛的显式取舍。</li>
+<li>当前评测是 4 个开发用合成场景、每种策略 5 次，不是未见 holdout；真实项目上的任务成功率与隐私/安全红队仍需另行验证。</li>
+</ul>
+<h2>目录结构</h2>
+<pre><code>src/               配置、策略引擎、语义裁剪与摘要保护
+tests/             单元、回放、生命周期和真实 Loader 组合测试
+evals/             共享数据集、评分器、基线/候选运行器与报告
+cordis.patch.yml   安装到 profile 时应用的配置层
+tsdown.config.ts   ESM 与类型声明构建
+</code></pre>
